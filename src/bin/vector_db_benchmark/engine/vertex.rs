@@ -1238,24 +1238,22 @@ impl VertexEngine {
             object,
             jsonl.len() as f64 / (1024.0 * 1024.0)
         );
-        let token = self.access_token()?;
-        let upload_url = format!(
-            "https://storage.googleapis.com/upload/storage/v1/b/{}/o",
-            bucket
-        );
-        let resp = self
-            .client
-            .post(&upload_url)
-            .bearer_auth(&token)
-            .query(&[("uploadType", "media"), ("name", object.as_str())])
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(jsonl)
-            .send()
-            .map_err(|e| format!("GCS staging upload failed: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            return Err(format!("GCS staging upload returned {status}: {body}"));
+        // Stage the JSONL to GCS via `gsutil cp` (resumable + parallel-composite)
+        // rather than a single in-memory `uploadType=media` POST. Simple media
+        // upload buffers the whole body and runs under the client timeout, so a
+        // multi-GiB batch (e.g. 1M x 2048-d ~= 41 GiB) always fails with
+        // "error sending request". gsutil chunks and resumes.
+        let local_path = format!("/tmp/vdbb-batch-{}.json", self.display_name);
+        std::fs::write(&local_path, jsonl.as_bytes())
+            .map_err(|e| format!("failed writing local staging file {local_path}: {e}"))?;
+        let gcs_dest = format!("gs://{}/{}", bucket, object);
+        let gs_status = std::process::Command::new("gsutil")
+            .args(["-q", "cp", local_path.as_str(), gcs_dest.as_str()])
+            .status()
+            .map_err(|e| format!("failed to spawn gsutil for staging: {e}"))?;
+        let _ = std::fs::remove_file(&local_path);
+        if !gs_status.success() {
+            return Err(format!("gsutil cp of staging JSONL to {gcs_dest} failed: {gs_status}"));
         }
 
         // 2. Point the index at the staged folder and trigger the rebuild.
