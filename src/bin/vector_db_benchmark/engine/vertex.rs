@@ -1253,7 +1253,9 @@ impl VertexEngine {
             .map_err(|e| format!("failed to spawn gsutil for staging: {e}"))?;
         let _ = std::fs::remove_file(&local_path);
         if !gs_status.success() {
-            return Err(format!("gsutil cp of staging JSONL to {gcs_dest} failed: {gs_status}"));
+            return Err(format!(
+                "gsutil cp of staging JSONL to {gcs_dest} failed: {gs_status}"
+            ));
         }
 
         // 2. Point the index at the staged folder and trigger the rebuild.
