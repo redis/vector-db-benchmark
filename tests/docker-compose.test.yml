@@ -176,6 +176,19 @@ services:
       timeout: 3s
       retries: 10
 
+  kividb:
+    image: quay.io/kividbio/kividb:v1.0.2-full
+    # KiviDB listens on 6380 internally (not 6379). The image ships no
+    # redis-cli/valkey-cli, but it does include bash, so the healthcheck opens
+    # a raw TCP connection to the server port to confirm readiness.
+    ports:
+      - "6386:6380"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6380"]
+      interval: 1s
+      timeout: 3s
+      retries: 15
+
   chroma:
     image: chromadb/chroma:1.0.0
     environment:

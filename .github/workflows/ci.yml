@@ -301,6 +301,27 @@ jobs:
       if: always()
       run: docker compose -f tests/docker-compose.test.yml down
 
+  integration-kividb:
+    name: Integration tests (KiviDB)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y libhdf5-dev pkg-config
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Start KiviDB
+      run: docker compose -f tests/docker-compose.test.yml up -d kividb --wait
+
+    - name: Run KiviDB integration tests
+      run: KIVIDB_PORT=6386 cargo test --test integration_kividb --release -- --test-threads=1
+
+    - name: Stop KiviDB
+      if: always()
+      run: docker compose -f tests/docker-compose.test.yml down
+
   integration-chroma:
     name: Integration tests (Chroma)
     runs-on: ubuntu-latest
