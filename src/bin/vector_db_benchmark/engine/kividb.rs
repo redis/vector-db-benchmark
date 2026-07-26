@@ -227,17 +227,27 @@ impl KividbEngine {
         cmd.arg("EF_CONSTRUCTION").arg(self.config.ef_construction);
 
         // Filterable metadata fields (mirrors redis.rs/dragonfly.rs):
-        // keyword/uuid/bool exact strings -> TAG (SEPARATOR ; for multi-valued
-        // `labels`); int/float/datetime (stored as epoch) -> NUMERIC; full-text
-        // -> TEXT. GEO is intentionally never declared: KiviDB's schema
-        // (`FieldType`) has no Geo variant at all, unlike Dragonfly's
-        // parser-level rejection of `$param` geo bounds — there is simply
-        // nothing to declare here, matching Chroma/Milvus.
+        // keyword/uuid/bool exact strings -> TAG; int/float/datetime (stored as
+        // epoch) -> NUMERIC; full-text -> TEXT.
+        //
+        // Two KiviDB-specific departures from the RediSearch schema (both
+        // verified live against the FT.CREATE parser):
+        //   * NO `SEPARATOR` modifier. KiviDB's FT.CREATE rejects it outright
+        //     ("unknown field type"), and a KiviDB TAG value is atomic — it is
+        //     never split on any separator (a query `@f:{b}` does not match a
+        //     stored `a;b;c`). So we declare a bare TAG (exact whole-string
+        //     match). A consequence is that multi-valued `labels` arrays are
+        //     not individually filterable on KiviDB (like geo below); scalar
+        //     keyword/uuid/bool filtering is unaffected.
+        //   * GEO is never declared: KiviDB's schema (`FieldType`) has no Geo
+        //     variant at all, unlike Dragonfly's parser-level rejection of
+        //     `$param` geo bounds — there is simply nothing to declare here,
+        //     matching Chroma/Milvus.
         if let Some(schema) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) {
             for (field_name, field_type) in schema {
                 match field_type.as_str().unwrap_or("") {
                     "keyword" | "uuid" | "bool" => {
-                        cmd.arg(field_name).arg("TAG").arg("SEPARATOR").arg(";");
+                        cmd.arg(field_name).arg("TAG");
                     }
                     "int" | "float" | "datetime" => {
                         cmd.arg(field_name).arg("NUMERIC");
