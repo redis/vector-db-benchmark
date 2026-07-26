@@ -20,6 +20,7 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 | **Dragonfly** (Dragonfly Search) | `redis` 1.3 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*](#dragonfly-note) |
 | **Vertex AI** (Vector Search) | `reqwest` (Vertex AI REST v1) | HTTP/REST (cloud) | L2, Cosine, Dot | Yes [\*\*\*\*](#vertex-note) |
 | **Chroma** | `reqwest` (Chroma v2 REST API) | HTTP/REST | L2, Cosine, IP | Yes [\*\*\*\*\*](#chroma-note) |
+| **KiviDB** | `redis` 1.3 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*\*\*\*](#kividb-note) |
 
 <a id="valkey-client-note"></a>
 \* **Valkey client note:** Valkey GLIDE has no published Rust crate ([valkey-io/valkey-glide#828](https://github.com/valkey-io/valkey-glide/issues/828), closed NOT_PLANNED). The GLIDE maintainers recommend using `redis-rs` for Rust and upstream their improvements to it. The `redis` crate works with Valkey since it speaks the same RESP protocol.
@@ -35,6 +36,9 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 
 <a id="chroma-note"></a>
 \*\*\*\*\* **Chroma note:** Uses **Chroma** (OSS) via its **v2 REST API** — a collection of records (`ids` + `embeddings` + scalar `metadatas`) queried with `query` + a `where` document. **Metadata filters** map directly onto the canonical model: `match` → `$eq`, `match_any` → `$in`, `range` → `$gte`/`$gt`/`$lte`/`$lt`, and **AND / OR / nested boolean** to Chroma's native `$and` / `$or` (which nest arbitrarily). Supported datatypes: **keyword, int, float, bool, uuid, datetime** (stored as epoch-seconds int, like Milvus, so numeric range operators apply). **Full-text** (`{match:{text}}`) is supported via `where_document` `$contains` — the `text`-typed field's value is uploaded as each record's Chroma `document`. **NOT supported** by Chroma's metadata engine (those conditions are dropped, like Dragonfly's documented limits): **geo-radius** and multi-valued **`labels` arrays** (Chroma metadata values are scalar only). Runs over HTTP/REST via Docker; set the host port with `CHROMA_PORT` (default `8000`, test compose maps `8003`), and optionally `CHROMA_COLLECTION` / `CHROMA_TENANT` / `CHROMA_DATABASE`. Distance space (`l2`/`cosine`/`ip`) is set per collection from the dataset metric.
+
+<a id="kividb-note"></a>
+\*\*\*\*\*\* **KiviDB note:** [KiviDB](https://kividb.io) is a Redis-wire-compatible (RESP2) data store that implements a RediSearch-compatible `FT.*` subset (`FT.CREATE`/`FT.SEARCH`/`FT.INFO`/`FT.DROPINDEX`, `VECTOR` HNSW/FLAT, `*=>[KNN k @field $blob AS score]`). Supports **vector KNN + metadata filtering** exactly like Redis/Valkey/Dragonfly: TAG/NUMERIC/TEXT datatypes, `match`/`match_any`/`range`, and AND/OR/nested boolean. **GEO** is not supported — unlike Dragonfly (which has a GEO field type but rejects this tool's `$param` geo bounds at the query-parser level), KiviDB's schema has no GEO field type at all, so geo fields are never declared or filtered (like Chroma/Milvus). KiviDB's `FT.CREATE` supports only the **float32** vector type. One real protocol difference worth knowing: KiviDB's `FT.INFO` does not expose RediSearch's `num_docs`/`percent_indexed` — it reports HNSW graph state directly instead (`hnsw_live_count`, `hnsw_compaction_in_progress`), because it builds each vector's HNSW entry synchronously inside the `HSET` that stores it (no async backfill phase exists to report progress on); `wait_for_indexing` polls those fields instead and returns immediately as a result. RESP2 only (no RESP3 opt-in). Set the host port with `KIVIDB_PORT` (default `6379`).
 
 <details>
 <summary><b>Runbook: benchmarking against Vertex AI</b></summary>
@@ -175,7 +179,7 @@ Options:
     -h, --help                 Print help
 ```
 
-### Per-config index isolation (Redis / Valkey / Dragonfly)
+### Per-config index isolation (Redis / Valkey / Dragonfly / KiviDB)
 
 Each engine config gets its **own** RediSearch index and keyspace, derived from the
 config `name`: index `"<base>:<config>"` (base `idx`) with docs keyed
@@ -184,8 +188,8 @@ against one server and coexist, so you can upload every config once and then
 search each in a later `--skip-upload` pass — each config reads its own graph, and
 memory is reported per-index via `FT.INFO` (issue #151-4).
 
-- `REDIS_INDEX_NAME` / `VALKEY_INDEX_NAME` / `DRAGONFLY_INDEX_NAME` now set the
-  **base namespace**, not the whole index name; the config name is always appended.
+- `REDIS_INDEX_NAME` / `VALKEY_INDEX_NAME` / `DRAGONFLY_INDEX_NAME` / `KIVIDB_INDEX_NAME`
+  now set the **base namespace**, not the whole index name; the config name is always appended.
   Set `<VAR>_EXACT=1` to use the base verbatim (single-config "point at an
   out-of-band index" case — combining it with >1 config for that engine is a
   startup error).
@@ -540,6 +544,7 @@ src/
         milvus.rs                     # Milvus engine (REST)
         mongodb_engine.rs             # MongoDB Atlas Search engine
         valkey.rs                     # Valkey engine (RESP protocol)
+        kividb.rs                     # KiviDB engine (RESP protocol)
         turbopuffer.rs                # Turbopuffer engine (cloud API)
         redis_utils.rs                # Shared utils for Redis-protocol engines
 experiments/configurations/           # Engine configuration JSON files
