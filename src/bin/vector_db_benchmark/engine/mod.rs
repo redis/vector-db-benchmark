@@ -10,6 +10,7 @@ mod chroma;
 mod dragonfly;
 mod elasticsearch;
 pub mod index_naming;
+mod kividb;
 mod milvus;
 mod mongodb_engine;
 mod opensearch;
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant};
 pub use chroma::ChromaEngine;
 pub use dragonfly::DragonflyEngine;
 pub use elasticsearch::ElasticsearchEngine;
+pub use kividb::KividbEngine;
 pub use milvus::MilvusEngine;
 pub use mongodb_engine::MongoDBEngine;
 pub use opensearch::OpenSearchEngine;
@@ -486,10 +488,11 @@ pub fn create_engine(engine_config: &EngineConfig, host: &str) -> Result<Box<dyn
         "valkey" => Ok(Box::new(ValkeyEngine::new(engine_config, host)?)),
         "turbopuffer" => Ok(Box::new(TurbopufferEngine::new(engine_config, host)?)),
         "dragonfly" => Ok(Box::new(DragonflyEngine::new(engine_config, host)?)),
+        "kividb" => Ok(Box::new(KividbEngine::new(engine_config, host)?)),
         "vertex" => Ok(Box::new(VertexEngine::new(engine_config, host)?)),
         "chroma" => Ok(Box::new(ChromaEngine::new(engine_config, host)?)),
         other => Err(format!(
-            "Unsupported engine type: '{}'. Supported: 'redis', 'vectorsets', 'elasticsearch', 'opensearch', 'qdrant', 'weaviate', 'pgvector', 'milvus', 'mongodb', 'valkey', 'turbopuffer', 'dragonfly', 'vertex', 'chroma'.",
+            "Unsupported engine type: '{}'. Supported: 'redis', 'vectorsets', 'elasticsearch', 'opensearch', 'qdrant', 'weaviate', 'pgvector', 'milvus', 'mongodb', 'valkey', 'turbopuffer', 'dragonfly', 'kividb', 'vertex', 'chroma'.",
             other
         )),
     }
