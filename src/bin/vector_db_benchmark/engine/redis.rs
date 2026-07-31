@@ -1606,6 +1606,24 @@ fn is_svs(algorithm: &str) -> bool {
     algorithm.to_uppercase().contains("SVS")
 }
 
+/// Resolve the runtime search-window value bound as `$EF` (see
+/// `build_knn_query_str`). Calibration writes to `search_params.ef` when
+/// `calibration_param` is `"ef"` (HNSW), but SVS-VAMANA calibrates
+/// `"SEARCH_WINDOW_SIZE"`, which lands in the `extra` catch-all instead —
+/// so that key is checked as a fallback.
+fn resolve_ef(params: &SearchParams) -> i64 {
+    let inner = params.search_params.as_ref();
+    inner
+        .and_then(|sp| sp.ef)
+        .or_else(|| {
+            inner
+                .and_then(|sp| sp.extra.as_ref())
+                .and_then(|e| e.get("SEARCH_WINDOW_SIZE"))
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(64)
+}
+
 fn build_knn_query_str(
     algorithm: &str,
     hybrid_policy: &str,
@@ -1999,11 +2017,7 @@ impl Engine for RedisEngine {
             redis_utils::ensure_index_exists(&mut conn, &self.config.index_name)?;
         }
 
-        let ef = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.ef)
-            .unwrap_or(64);
+        let ef = resolve_ef(params);
         let parallel = params.parallel.unwrap_or(1) as usize;
         let hybrid_policy = std::env::var("REDIS_HYBRID_POLICY").unwrap_or_default();
         let query_timeout: i64 = std::env::var("REDIS_QUERY_TIMEOUT")
@@ -2417,11 +2431,7 @@ impl Engine for RedisEngine {
             redis_utils::ensure_index_exists(&mut conn, &self.config.index_name)?;
         }
 
-        let ef = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.ef)
-            .unwrap_or(64);
+        let ef = resolve_ef(params);
         let parallel = params.parallel.unwrap_or(1) as usize;
         let hybrid_policy = std::env::var("REDIS_HYBRID_POLICY").unwrap_or_default();
         let query_timeout: i64 = std::env::var("REDIS_QUERY_TIMEOUT")
