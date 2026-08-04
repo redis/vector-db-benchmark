@@ -609,15 +609,15 @@ fn upload_bulk_batch(
 ) -> Result<(), String> {
     use vector_db_benchmark::readers::metadata::MetadataValue;
 
-    let mut body: Vec<JsonBody<serde_json::Value>> = Vec::with_capacity(ids.len() * 2);
+    // Held as plain Values rather than JsonBody so the batch can be rebuilt and
+    // resent on a retry: `.body()` consumes the Vec and JsonBody is not Clone.
+    let mut lines: Vec<serde_json::Value> = Vec::with_capacity(ids.len() * 2);
 
     for i in 0..ids.len() {
         let uuid_hex = id_to_uuid_hex(ids[i]);
 
         // Action line
-        body.push(JsonBody::new(
-            serde_json::json!({"index": {"_id": uuid_hex}}),
-        ));
+        lines.push(serde_json::json!({"index": {"_id": uuid_hex}}));
 
         // Document line
         let mut doc = serde_json::Map::new();
@@ -645,43 +645,128 @@ fn upload_bulk_batch(
             }
         }
 
-        body.push(JsonBody::new(serde_json::Value::Object(doc)));
+        lines.push(serde_json::Value::Object(doc));
     }
 
-    let resp = rt
-        .block_on(client.bulk(BulkParts::Index(index_name)).body(body).send())
-        .map_err(|e| format!("Bulk upload failed: {}", e))?;
+    // HTTP 429 (and 503) are back-pressure, not failure: the server is telling us
+    // to slow down and come back. Aborting the experiment on the first one makes
+    // ingest impossible against a managed service that sheds load — Amazon
+    // OpenSearch Service returns 429 readily on a single-node domain, because
+    // knn.algo_param.index_thread_qty defaults to 1 and the write path cannot
+    // drain as fast as a parallel uploader pushes. Retry with exponential backoff
+    // instead, and only give up once the server has had several chances.
+    //
+    // Rejections also arrive as HTTP 200 with per-item errors (bulk is partial by
+    // design), so item-level 429 / es_rejected_execution_exception /
+    // circuit_breaking_exception are treated as retryable too.
+    let max_retries: u32 = std::env::var("OPENSEARCH_BULK_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let base_delay_ms: u64 = std::env::var("OPENSEARCH_BULK_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
 
-    if !resp.status_code().is_success() {
-        let text = rt.block_on(resp.text()).unwrap_or_default();
-        return Err(format!("Bulk upload error: {}", text));
+    let mut attempt: u32 = 0;
+    loop {
+        let body: Vec<JsonBody<serde_json::Value>> =
+            lines.iter().cloned().map(JsonBody::new).collect();
+
+        let resp = rt
+            .block_on(client.bulk(BulkParts::Index(index_name)).body(body).send())
+            .map_err(|e| format!("Bulk upload failed: {}", e))?;
+
+        let status = resp.status_code().as_u16();
+        let http_retryable = status == 429 || status == 503;
+
+        if !http_retryable && !resp.status_code().is_success() {
+            let text = rt.block_on(resp.text()).unwrap_or_default();
+            return Err(format!("Bulk upload error: HTTP {}: {}", status, text));
+        }
+
+        if http_retryable {
+            if attempt >= max_retries {
+                let text = rt.block_on(resp.text()).unwrap_or_default();
+                return Err(format!(
+                    "Bulk upload error: HTTP {} still returned after {} retries \
+                     (server is shedding load — lower upload_params.parallel or \
+                     raise OPENSEARCH_BULK_MAX_RETRIES): {}",
+                    status, max_retries, text
+                ));
+            }
+            backoff_sleep(base_delay_ms, attempt);
+            attempt += 1;
+            continue;
+        }
+
+        let resp_body: serde_json::Value = rt
+            .block_on(resp.json())
+            .map_err(|e| format!("Failed to parse bulk response: {}", e))?;
+
+        if resp_body
+            .get("errors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let items = resp_body.get("items").and_then(|v| v.as_array());
+            let error_count = items
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|item| item.get("index").and_then(|idx| idx.get("error")).is_some())
+                        .count()
+                })
+                .unwrap_or(0);
+            let retryable_count = items
+                .map(|arr| arr.iter().filter(|item| item_is_retryable(item)).count())
+                .unwrap_or(0);
+
+            // Only retry when every failure is retryable; a genuine mapping or
+            // parse error would otherwise be retried pointlessly to exhaustion.
+            if retryable_count > 0 && retryable_count == error_count && attempt < max_retries {
+                backoff_sleep(base_delay_ms, attempt);
+                attempt += 1;
+                continue;
+            }
+
+            return Err(format!(
+                "Bulk upload had {} errors out of {} documents ({} retryable, {} retries used)",
+                error_count,
+                ids.len(),
+                retryable_count,
+                attempt
+            ));
+        }
+
+        return Ok(());
     }
+}
 
-    let resp_body: serde_json::Value = rt
-        .block_on(resp.json())
-        .map_err(|e| format!("Failed to parse bulk response: {}", e))?;
+/// Exponential backoff, capped so a long stall cannot sleep for hours.
+fn backoff_sleep(base_delay_ms: u64, attempt: u32) {
+    let delay = base_delay_ms
+        .saturating_mul(1u64 << attempt.min(6))
+        .min(30_000);
+    std::thread::sleep(std::time::Duration::from_millis(delay));
+}
 
-    if resp_body
-        .get("errors")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        let items = resp_body.get("items").and_then(|v| v.as_array());
-        let error_count = items
-            .map(|arr| {
-                arr.iter()
-                    .filter(|item| item.get("index").and_then(|idx| idx.get("error")).is_some())
-                    .count()
-            })
-            .unwrap_or(0);
-        return Err(format!(
-            "Bulk upload had {} errors out of {} documents",
-            error_count,
-            ids.len()
-        ));
+/// True when a bulk item failed for a reason worth retrying — the server shedding
+/// load rather than rejecting the document itself.
+fn item_is_retryable(item: &serde_json::Value) -> bool {
+    let Some(idx) = item.get("index") else {
+        return false;
+    };
+    if idx.get("status").and_then(|s| s.as_u64()) == Some(429) {
+        return true;
     }
-
-    Ok(())
+    matches!(
+        idx.get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str()),
+        Some("es_rejected_execution_exception")
+            | Some("circuit_breaking_exception")
+            | Some("cluster_block_exception")
+    )
 }
 
 /// OpenSearch KNN search (different format from Elasticsearch).
@@ -1115,5 +1200,40 @@ mod tests {
         assert!(parse_os_conditions(&json!({})).is_none());
         // Present-but-empty sub-arrays should not produce a filter either.
         assert!(parse_os_conditions(&json!({"and": [], "or": []})).is_none());
+    }
+
+    #[test]
+    fn item_level_rejections_are_retryable_but_real_errors_are_not() {
+        // Load shedding shows up two ways: an explicit 429 status on the item...
+        assert!(item_is_retryable(&json!({"index": {"status": 429}})));
+        // ...or the exception type, which is what OpenSearch actually returns
+        // when the write queue is full or the circuit breaker trips.
+        for t in [
+            "es_rejected_execution_exception",
+            "circuit_breaking_exception",
+            "cluster_block_exception",
+        ] {
+            assert!(
+                item_is_retryable(&json!({"index": {"status": 503, "error": {"type": t}}})),
+                "{t} should be retryable"
+            );
+        }
+        // A bad document is NOT retryable — resending it forever cannot help.
+        assert!(!item_is_retryable(
+            &json!({"index": {"status": 400, "error": {"type": "mapper_parsing_exception"}}})
+        ));
+        assert!(!item_is_retryable(&json!({"index": {"status": 201}})));
+        assert!(!item_is_retryable(&json!({})));
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        // Guards the shift: attempt is clamped so 1u64 << attempt cannot overflow,
+        // and the delay is capped so a long stall cannot sleep for hours.
+        let d = |a: u32| 500u64.saturating_mul(1u64 << a.min(6)).min(30_000);
+        assert_eq!(d(0), 500);
+        assert_eq!(d(3), 4_000);
+        assert_eq!(d(6), 30_000);
+        assert_eq!(d(50), 30_000, "must not overflow or exceed the cap");
     }
 }
