@@ -924,19 +924,63 @@ fn knn_search(
 ) -> Result<Vec<(i64, f64)>, String> {
     let body = build_knn_body(query_vector, top, filter);
 
-    let resp = rt
-        .block_on(
+    // Search-path back-pressure is the most dangerous of the lot, because the
+    // caller does not fail on it — a failed query is logged and DROPPED from the
+    // timing and recall vectors, so mean_precisions ends up computed over only the
+    // queries that survived. Since 429s arrive precisely when the node is loaded,
+    // the survivors are the cheaper queries and recall is biased UPWARD, silently,
+    // with nothing in the summary recording that anything was lost.
+    //
+    // Measured: a glove-100 run shed 17,584 queries across two of six configs and
+    // still reported clean-looking recall for them.
+    //
+    // Retries are kept short by default — a query is on the latency critical path,
+    // and a retried query's own measured time is not used for the latency figure
+    // (the caller times the whole call), so a long backoff would distort latency.
+    // Better to retry a few times quickly and let the run fail loudly than to drop
+    // the query.
+    let max_retries: u32 = std::env::var("OPENSEARCH_SEARCH_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let base_delay_ms: u64 = std::env::var("OPENSEARCH_SEARCH_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+
+    let mut attempt: u32 = 0;
+    let resp = loop {
+        match rt.block_on(
             client
                 .search(SearchParts::Index(&[index_name]))
-                .body(body)
+                .body(body.clone())
                 .send(),
-        )
-        .map_err(|e| format!("KNN search failed: {}", e))?;
-
-    if !resp.status_code().is_success() {
-        let text = rt.block_on(resp.text()).unwrap_or_default();
-        return Err(format!("KNN search error: {}", text));
-    }
+        ) {
+            Ok(r) => {
+                let status = r.status_code().as_u16();
+                if r.status_code().is_success() {
+                    break r;
+                }
+                if !matches!(status, 429 | 502 | 503 | 504) || attempt >= max_retries {
+                    let text = rt.block_on(r.text()).unwrap_or_default();
+                    return Err(format!(
+                        "KNN search error (HTTP {}, {} retries): {}",
+                        status, attempt, text
+                    ));
+                }
+            }
+            Err(e) => {
+                if attempt >= max_retries {
+                    return Err(format!(
+                        "KNN search failed after {} retries: {}",
+                        attempt, e
+                    ));
+                }
+            }
+        }
+        backoff_sleep(base_delay_ms, attempt);
+        attempt += 1;
+    };
 
     let resp_body: serde_json::Value = rt
         .block_on(resp.json())
@@ -1071,6 +1115,10 @@ impl Engine for OpenSearchEngine {
         // contention in the timed loop (see redis.rs::search). Metrics are
         // order-independent so results are unchanged; work counter uses Relaxed.
         let query_idx = Arc::new(AtomicUsize::new(0));
+        // A dropped query silently biases recall (see knn_search), so failures are
+        // counted across all worker threads and the run is refused below if any
+        // survived their retries.
+        let failed_queries = Arc::new(AtomicUsize::new(0));
 
         let pb = self.create_progress_bar(num_to_run);
         let start_time = Instant::now();
@@ -1093,6 +1141,7 @@ impl Engine for OpenSearchEngine {
                 let neighbors = &neighbors;
                 let parsed_filters = &parsed_filters;
                 let query_idx = Arc::clone(&query_idx);
+                let failed_queries = Arc::clone(&failed_queries);
                 let pb = &pb;
 
                 handles.push(s.spawn(move || {
@@ -1156,6 +1205,7 @@ impl Engine for OpenSearchEngine {
                                 nd.push(m.ndcg);
                             }
                             Err(e) => {
+                                failed_queries.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("Search query {} failed: {}", idx, e);
                             }
                         }
@@ -1177,6 +1227,37 @@ impl Engine for OpenSearchEngine {
 
         pb.finish_and_clear();
         let total_time = start_time.elapsed().as_secs_f64();
+
+        // Refuse to report a run that lost queries. Dropped queries never reach
+        // `precs`/`recs`, so the recall below would be an average over the survivors
+        // only — and because the server sheds load exactly when it is busy, the
+        // survivors are the cheaper queries and the figure is biased UPWARD. Nothing
+        // in the emitted summary records the loss, so a partial run is
+        // indistinguishable from a clean one downstream. Failing here is the only
+        // thing that stops a biased number being published by accident.
+        //
+        // OPENSEARCH_ALLOW_FAILED_QUERIES=1 accepts a deliberately best-effort run.
+        let failed = failed_queries.load(Ordering::Relaxed);
+        if failed > 0 {
+            let allow = std::env::var("OPENSEARCH_ALLOW_FAILED_QUERIES")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let pct = 100.0 * failed as f64 / num_to_run.max(1) as f64;
+            if !allow {
+                return Err(format!(
+                    "{} of {} search queries failed ({:.2}%) after retries — refusing to \
+                     report recall averaged over the survivors only, which biases it \
+                     upward. Reduce load, raise OPENSEARCH_SEARCH_MAX_RETRIES, or set \
+                     OPENSEARCH_ALLOW_FAILED_QUERIES=1 to accept a partial run.",
+                    failed, num_to_run, pct
+                ));
+            }
+            eprintln!(
+                "⚠  {} of {} search queries failed ({:.2}%) — recall below is averaged over \
+                 the survivors and is biased upward (OPENSEARCH_ALLOW_FAILED_QUERIES=1)",
+                failed, num_to_run, pct
+            );
+        }
 
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         crate::engine::compute_search_stats(
