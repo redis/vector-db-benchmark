@@ -673,12 +673,32 @@ fn upload_bulk_batch(
         let body: Vec<JsonBody<serde_json::Value>> =
             lines.iter().cloned().map(JsonBody::new).collect();
 
-        let resp = rt
-            .block_on(client.bulk(BulkParts::Index(index_name)).body(body).send())
-            .map_err(|e| format!("Bulk upload failed: {}", e))?;
+        // A dropped connection or read timeout fails here, BEFORE any HTTP status
+        // exists, so status-based retry never sees it. Over a multi-hour ingest a
+        // single transient reset would otherwise discard the whole run.
+        let resp = match rt.block_on(client.bulk(BulkParts::Index(index_name)).body(body).send()) {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt >= max_retries {
+                    return Err(format!(
+                        "Bulk upload failed after {} retries: {} \
+                         (transport error — the server may be dropping connections \
+                         under load; lower upload_params.parallel or batch_size)",
+                        max_retries, e
+                    ));
+                }
+                backoff_sleep(base_delay_ms, attempt);
+                attempt += 1;
+                continue;
+            }
+        };
 
         let status = resp.status_code().as_u16();
-        let http_retryable = status == 429 || status == 503;
+        // 429 = write queue full. 503 = unavailable. 502/504 = the managed
+        // service's front door gave up, which happens both transiently and when a
+        // single bulk request is simply too big — retrying distinguishes them,
+        // since a size problem survives every attempt.
+        let http_retryable = matches!(status, 429 | 502 | 503 | 504);
 
         if !http_retryable && !resp.status_code().is_success() {
             let text = rt.block_on(resp.text()).unwrap_or_default();
@@ -688,11 +708,16 @@ fn upload_bulk_batch(
         if http_retryable {
             if attempt >= max_retries {
                 let text = rt.block_on(resp.text()).unwrap_or_default();
+                let hint = if matches!(status, 502 | 504 | 413) {
+                    "request is likely too large — lower upload_params.batch_size \
+                     (bulk bytes scale with vector dimension)"
+                } else {
+                    "server is shedding load — lower upload_params.parallel or \
+                     raise OPENSEARCH_BULK_MAX_RETRIES"
+                };
                 return Err(format!(
-                    "Bulk upload error: HTTP {} still returned after {} retries \
-                     (server is shedding load — lower upload_params.parallel or \
-                     raise OPENSEARCH_BULK_MAX_RETRIES): {}",
-                    status, max_retries, text
+                    "Bulk upload error: HTTP {} still returned after {} retries ({}): {}",
+                    status, max_retries, hint, text
                 ));
             }
             backoff_sleep(base_delay_ms, attempt);
