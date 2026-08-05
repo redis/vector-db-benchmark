@@ -114,22 +114,61 @@ impl OpenSearchEngine {
         pb
     }
 
+    /// Delete the benchmark index, tolerating the transient states a *managed*
+    /// cluster puts an index into.
+    ///
+    /// Amazon OpenSearch Service takes automated snapshots on a schedule that
+    /// cannot be disabled, and deleting an index caught in one fails with
+    /// HTTP 400 `snapshot_in_progress_exception`. Because every config in a grid
+    /// starts by dropping the previous index, a single unlucky snapshot window
+    /// otherwise fails not just that config but every config after it — observed
+    /// as 1/6 completing and 5/6 dying on "Failed to delete index: status 400".
+    ///
+    /// 503 is the other transient case (cluster-manager busy). Both are retried;
+    /// anything else fails immediately.
+    ///
+    /// The response body is included in the error. Without it "status 400" is
+    /// undiagnosable — the cause has to be guessed from the outside.
     fn delete_index(&self) -> Result<(), String> {
-        let resp = self
-            .rt
-            .block_on(
-                self.client
-                    .indices()
-                    .delete(IndicesDeleteParts::Index(&[&self.index_name]))
-                    .send(),
-            )
-            .map_err(|e| format!("Failed to delete index: {}", e))?;
+        let max_retries: u32 = std::env::var("OPENSEARCH_INDEX_OP_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let base_delay_ms: u64 = std::env::var("OPENSEARCH_INDEX_OP_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
 
-        let status = resp.status_code().as_u16();
-        if status == 200 || status == 404 {
-            Ok(())
-        } else {
-            Err(format!("Failed to delete index: status {}", status))
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .rt
+                .block_on(
+                    self.client
+                        .indices()
+                        .delete(IndicesDeleteParts::Index(&[&self.index_name]))
+                        .send(),
+                )
+                .map_err(|e| format!("Failed to delete index: {}", e))?;
+
+            let status = resp.status_code().as_u16();
+            if status == 200 || status == 404 {
+                return Ok(());
+            }
+
+            let body = self.rt.block_on(resp.text()).unwrap_or_default();
+            let retryable = status == 503
+                || (status == 400 && body.contains("snapshot_in_progress"))
+                || body.contains("cluster_block_exception");
+
+            if !retryable || attempt >= max_retries {
+                return Err(format!(
+                    "Failed to delete index: status {} after {} retries: {}",
+                    status, attempt, body
+                ));
+            }
+            backoff_sleep(base_delay_ms, attempt);
+            attempt += 1;
         }
     }
 
@@ -215,23 +254,53 @@ impl OpenSearchEngine {
             }
         });
 
-        let resp = self
-            .rt
-            .block_on(
-                self.client
-                    .indices()
-                    .create(IndicesCreateParts::Index(&self.index_name))
-                    .body(body)
-                    .send(),
-            )
-            .map_err(|e| format!("Failed to create index: {}", e))?;
+        // Same transient-state problem as delete_index: a cluster whose manager
+        // thread pool is busy answers create-index with
+        // `process_cluster_event_timeout_exception` (503) rather than creating it.
+        // Retrying rides that out instead of failing the config — and every config
+        // after it, since each one starts by creating its index.
+        let max_retries: u32 = std::env::var("OPENSEARCH_INDEX_OP_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let base_delay_ms: u64 = std::env::var("OPENSEARCH_INDEX_OP_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
 
-        if !resp.status_code().is_success() {
-            let body = self.rt.block_on(resp.text()).unwrap_or_default();
-            return Err(format!("Failed to create index: {}", body));
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .rt
+                .block_on(
+                    self.client
+                        .indices()
+                        .create(IndicesCreateParts::Index(&self.index_name))
+                        .body(body.clone())
+                        .send(),
+                )
+                .map_err(|e| format!("Failed to create index: {}", e))?;
+
+            if resp.status_code().is_success() {
+                return Ok(());
+            }
+
+            let status = resp.status_code().as_u16();
+            let text = self.rt.block_on(resp.text()).unwrap_or_default();
+            let retryable = status == 503
+                || status == 429
+                || text.contains("process_cluster_event_timeout_exception")
+                || text.contains("cluster_block_exception");
+
+            if !retryable || attempt >= max_retries {
+                return Err(format!(
+                    "Failed to create index (HTTP {}, {} retries): {}",
+                    status, attempt, text
+                ));
+            }
+            backoff_sleep(base_delay_ms, attempt);
+            attempt += 1;
         }
-
-        Ok(())
     }
 
     fn upload_parallel(
