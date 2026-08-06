@@ -28,6 +28,8 @@ struct OpenSearchConfig {
     ef_construction: i64,
     batch_size: usize,
     parallel: usize,
+    /// None = inherit the cluster default (previous behaviour).
+    number_of_shards: Option<i64>,
 }
 
 pub struct OpenSearchEngine {
@@ -76,6 +78,16 @@ impl OpenSearchEngine {
             .and_then(|v| v.as_i64())
             .unwrap_or(500) as usize;
 
+        // See create_index: shard count materially changes OpenSearch vector
+        // performance and the Service default has differed from open-source
+        // OpenSearch, so it must be settable rather than inherited silently.
+        let number_of_shards = engine_config
+            .collection_params
+            .as_ref()
+            .and_then(|c| c.extra.as_ref())
+            .and_then(|e| e.get("number_of_shards"))
+            .and_then(|v| v.as_i64());
+
         let base_url = build_base_url(host, port);
 
         let rt = tokio::runtime::Runtime::new()
@@ -92,6 +104,7 @@ impl OpenSearchEngine {
                 ef_construction,
                 batch_size,
                 parallel,
+                number_of_shards,
             },
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             base_url,
@@ -238,17 +251,32 @@ impl OpenSearchEngine {
             }
         }
 
+        // Shard count is a first-order factor for OpenSearch vector search, not a
+        // detail: Amazon OpenSearch Service historically defaulted an index to FIVE
+        // primary shards while open-source OpenSearch defaults to one, and an
+        // internal 2024 benchmark that tested both found 5 clearly better for
+        // precision vs qps/latency/index-time — the 1-shard config "deeply impacts
+        // OpenSearch indexing speed and precision". Leaving it unset silently
+        // inherits whatever the cluster default happens to be for that version,
+        // which makes runs incomparable across versions and can hand OpenSearch the
+        // worse of two configurations without anyone choosing it.
+        //
+        // Set from collection_params.number_of_shards; unset preserves the previous
+        // behaviour (cluster default) so existing configs are unaffected.
+        let mut index_settings = serde_json::json!({
+            "knn": true,
+            // Indexing-throughput tuning: no replicas and no periodic
+            // refresh, since the benchmark bulk-loads all data up front and
+            // force-merges before searching.
+            "number_of_replicas": 0,
+            "refresh_interval": -1,
+        });
+        if let Some(n) = self.config.number_of_shards {
+            index_settings["number_of_shards"] = serde_json::Value::from(n);
+        }
+
         let body = serde_json::json!({
-            "settings": {
-                "index": {
-                    "knn": true,
-                    // Indexing-throughput tuning: no replicas and no periodic
-                    // refresh, since the benchmark bulk-loads all data up front and
-                    // force-merges before searching.
-                    "number_of_replicas": 0,
-                    "refresh_interval": -1,
-                }
-            },
+            "settings": { "index": index_settings },
             "mappings": {
                 "properties": properties,
             }
