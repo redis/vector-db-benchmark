@@ -993,6 +993,16 @@
     "description": "Knowledge embeddings"
   },
   {
+    "name": "dbpedia-openai-100K-1536-angular",
+    "vector_size": 1536,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "dbpedia-openai-100K-1536-angular/dbpedia_openai_100K",
+    "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/dbpedia_openai_100K.tgz",
+    "vector_count": 100000,
+    "description": "Knowledge embeddings, 100K subset. This is the dataset upstream's continuous benchmark runs, so results here are directly comparable with published qdrant/vector-db-benchmark numbers; it is also small enough for a quick end-to-end run."
+  },
+  {
     "name": "dbpedia-openai-1M-1536-angular",
     "vector_size": 1536,
     "distance": "cosine",
@@ -1349,6 +1359,19 @@
     "description": "Multi-tenancy: many tenants share ONE index; every query is scoped to a single tenant via an exact keyword match on the `tenant` field (schema tenant:keyword), with recall measured against the nearest neighbours WITHIN that tenant only. Analogous to upstream qdrant/vector-db-benchmark random-768-*-tenants. NOTE: locally-generated placeholder — no public download link yet (follow-up), so selecting this name without local files errors by design; the multi-tenancy engine path is exercised end-to-end by the tenancy integration tests (tests/common write_tenant_project + test_binary_{redis,valkey}_tenancy)."
   },
   {
+    "name": "random-768-100-tenants",
+    "vector_size": 768,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "random-768-100-tenants/random_keywords_1m_768_vocab_100",
+    "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/random_keywords_1m_768_vocab_100.tgz",
+    "schema": {
+      "a": "keyword"
+    },
+    "vector_count": 1000000,
+    "description": "Multi-tenancy at 100 tenants: 1M points share ONE index and every query is scoped to a single tenant by an exact keyword match on `a`, with recall measured within that tenant only. Unlike random-768-25-tenants (locally generated, no link) this one DOWNLOADS, so it is the reproducible multi-tenancy run. The tenant field is `a`, matching the upstream tarball."
+  },
+  {
     "name": "cohere-768-1M",
     "vector_size": 768,
     "distance": "dot",
@@ -1367,6 +1390,24 @@
     "link": "https://dbyiw3u3rf9yr.cloudfront.net/corpora/vectorsearch/cohere-wikipedia-22-12-en-embeddings/documents-10m.hdf5.bz2",
     "vector_count": 10000000,
     "description": "Wikipedia embeddings"
+  },
+  {
+    "name": "msmarco-sparse-100K",
+    "distance": "dot",
+    "type": "sparse",
+    "path": "msmarco-sparse/100K",
+    "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-100K.tar.gz",
+    "vector_count": 100000,
+    "description": "MS MARCO learned-sparse (SPLADE-style) embeddings — the public sparse benchmark used upstream. Ships data.csr + queries.csr + binary results.gt ground truth; no vector_size, since sparse vectors are unbounded-dimension. Scored by dot product (MIPS), so distance is dot, NOT cosine. Requires an engine with sparse support (Qdrant)."
+  },
+  {
+    "name": "msmarco-sparse-1M",
+    "distance": "dot",
+    "type": "sparse",
+    "path": "msmarco-sparse/1M",
+    "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-1M.tar.gz",
+    "vector_count": 1000000,
+    "description": "1M-point variant of msmarco-sparse-100K. Same layout (data.csr + queries.csr + results.gt), dot/MIPS scoring."
   },
   {
     "name": "synthetic-sparse-300",
