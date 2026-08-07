@@ -33,6 +33,13 @@ pub struct HnswConfig {
         alias = "ef_construction"
     )]
     pub ef_construction: Option<i64>,
+    /// Qdrant: keep the HNSW graph on disk (mmap) instead of in RAM.
+    pub on_disk: Option<bool>,
+    /// Qdrant: per-payload-value graph links. `m: 0` + `payload_m: k` builds
+    /// graphs only per tenant/payload value — the multi-tenancy layout.
+    pub payload_m: Option<i64>,
+    /// Qdrant: store vectors inline with the graph links (on-disk locality).
+    pub inline_storage: Option<bool>,
 }
 
 /// Elasticsearch index_options (lowercase keys)

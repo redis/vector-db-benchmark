@@ -13,17 +13,18 @@ use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use qdrant_client::qdrant::quantization_config::Quantization;
 use qdrant_client::qdrant::vectors_config::Config;
 use qdrant_client::qdrant::{
-    BinaryQuantization, CompressionRatio, Condition, CreateCollectionBuilder, DatetimeRange,
-    DeleteCollectionBuilder, Distance, FieldType, Filter, Fusion, HnswConfigDiff,
-    MaxOptimizationThreads, NamedVectors, OptimizersConfigDiff, PointStruct, PrefetchQueryBuilder,
-    ProductQuantization, QuantizationSearchParams, QuantizationType, Query, QueryPointsBuilder,
-    ScalarQuantization, SearchParams as QdrantSearchParams, SparseVectorParamsBuilder,
-    SparseVectorsConfigBuilder, Timestamp, Vector, VectorInput, VectorParamsBuilder, VectorsConfig,
+    payload_index_params::IndexParams, BinaryQuantization, CompressionRatio, Condition,
+    CreateCollectionBuilder, Datatype, DatetimeRange, DeleteCollectionBuilder, Distance, FieldType,
+    Filter, Fusion, HnswConfigDiff, KeywordIndexParams, MaxOptimizationThreads, NamedVectors,
+    OptimizersConfigDiff, PointStruct, PrefetchQueryBuilder, ProductQuantization,
+    QuantizationSearchParams, QuantizationType, Query, QueryPointsBuilder, ScalarQuantization,
+    SearchParams as QdrantSearchParams, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
+    Timestamp, UuidIndexParams, Vector, VectorInput, VectorParamsBuilder, VectorsConfig,
     VectorsConfigBuilder,
 };
 use qdrant_client::{Payload, Qdrant};
 
-use crate::config::{EngineConfig, SearchParams};
+use crate::config::{EngineConfig, HnswConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
 use vector_db_benchmark::readers::metadata::MetadataItem;
@@ -45,8 +46,9 @@ pub struct QdrantEngine {
     search_params: Vec<SearchParams>,
     /// Raw collection_params JSON to pass through to Qdrant
     collection_params_extra: serde_json::Value,
-    hnsw_m: Option<u64>,
-    hnsw_ef_construct: Option<u64>,
+    /// Typed `collection_params.hnsw_config`: m / ef_construct plus the on-disk
+    /// knobs (`on_disk`, `payload_m`, `inline_storage`).
+    hnsw: Option<HnswConfig>,
     /// Tokio runtime for async operations
     rt: tokio::runtime::Runtime,
     /// Shared Qdrant client (wrapped in Arc for thread-safe sharing)
@@ -116,12 +118,13 @@ impl QdrantEngine {
             .map(|e| serde_json::to_value(e).unwrap_or_default())
             .unwrap_or(serde_json::json!({}));
 
-        let typed_hnsw = engine_config
+        // HNSW params come from the TYPED collection_params.hnsw_config field
+        // (serde captures "m"/"ef_construct" there via aliases; the flattened
+        // `extra` map never contains hnsw_config since it is a declared field).
+        let hnsw = engine_config
             .collection_params
             .as_ref()
-            .and_then(|cp| cp.hnsw_config.as_ref());
-        let hnsw_m = typed_hnsw.and_then(|h| h.m).map(|v| v as u64);
-        let hnsw_ef_construct = typed_hnsw.and_then(|h| h.ef_construction).map(|v| v as u64);
+            .and_then(|cp| cp.hnsw_config.clone());
 
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
@@ -148,8 +151,7 @@ impl QdrantEngine {
             api_key,
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             collection_params_extra,
-            hnsw_m,
-            hnsw_ef_construct,
+            hnsw,
             rt,
             client: Arc::new(client),
         })
@@ -190,42 +192,19 @@ impl QdrantEngine {
 
         let qdrant_distance = map_qdrant_distance(distance)?;
 
-        // HNSW params come from the TYPED collection_params.hnsw_config field
-        // (serde captures "m"/"ef_construct" there via aliases; the flattened
-        // `extra` map never contains hnsw_config since it is a declared field).
-        let hnsw_m = self.hnsw_m;
-        let hnsw_ef = self.hnsw_ef_construct;
-
-        // Optionally store vectors on disk (mmap) — collection_params.vectors_config.on_disk.
-        let vectors_on_disk = self
-            .collection_params_extra
-            .get("vectors_config")
-            .and_then(|v| v.get("on_disk"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let vector_params =
-            VectorParamsBuilder::new(vector_size as u64, qdrant_distance).on_disk(vectors_on_disk);
+        let vector_params = self.dense_vector_params(vector_size, qdrant_distance)?;
 
         let mut create_builder = CreateCollectionBuilder::new(&self.collection_name)
             .vectors_config(VectorsConfig {
                 config: Some(Config::Params(vector_params.build())),
             });
 
-        // Apply HNSW config if specified
-        if hnsw_m.is_some() || hnsw_ef.is_some() {
-            let mut hnsw_config = HnswConfigDiff::default();
-            if let Some(m) = hnsw_m {
-                hnsw_config.m = Some(m);
-            }
-            if let Some(ef) = hnsw_ef {
-                hnsw_config.ef_construct = Some(ef);
-            }
+        if let Some(hnsw_config) = self.hnsw_config_diff() {
             create_builder = create_builder.hnsw_config(hnsw_config);
         }
 
-        // Pass through optimizers_config + quantization_config (shared with the
-        // hybrid create path).
+        // Pass through optimizers_config + quantization_config + on_disk_payload
+        // (shared with the hybrid create path).
         create_builder = self.apply_optimizers_and_quantization(create_builder)?;
 
         self.rt
@@ -235,16 +214,86 @@ impl QdrantEngine {
         // Disable optimization during indexing.
         self.disable_indexing_optimizers();
 
-        self.create_payload_indexes(dataset);
+        self.create_payload_indexes(dataset)?;
 
         Ok(())
     }
 
+    /// Build the dense `VectorParams` from `collection_params.vectors_config`,
+    /// honouring `on_disk` (mmap the vectors) and `datatype`
+    /// (`float32`/`float16`/`uint8` — half/byte storage roughly halves or
+    /// quarters the vector footprint, so leaving it unread silently benchmarked
+    /// full-precision storage instead of what the config asked for).
+    fn dense_vector_params(
+        &self,
+        vector_size: i64,
+        qdrant_distance: Distance,
+    ) -> Result<VectorParamsBuilder, String> {
+        let vectors_config = self.collection_params_extra.get("vectors_config");
+        let vectors_on_disk = vectors_config
+            .and_then(|v| v.get("on_disk"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let mut params =
+            VectorParamsBuilder::new(vector_size as u64, qdrant_distance).on_disk(vectors_on_disk);
+
+        // An unrecognised datatype is a hard error, not a silent fallback to
+        // float32: the whole point of setting it is to measure that storage.
+        if let Some(dt) = vectors_config
+            .and_then(|v| v.get("datatype"))
+            .and_then(|v| v.as_str())
+        {
+            let datatype = match dt.to_lowercase().as_str() {
+                "float32" | "f32" | "default" => Datatype::Float32,
+                "float16" | "f16" => Datatype::Float16,
+                "uint8" | "u8" => Datatype::Uint8,
+                other => {
+                    return Err(format!(
+                        "unknown vectors_config.datatype {:?} (expected float32, float16 or uint8)",
+                        other
+                    ))
+                }
+            };
+            params = params.datatype(datatype);
+        }
+        Ok(params)
+    }
+
+    /// Build the Qdrant `HnswConfigDiff` from the typed
+    /// `collection_params.hnsw_config`. Returns `None` when nothing was
+    /// configured, leaving Qdrant's own defaults in place rather than sending an
+    /// empty diff. Shared by the dense and hybrid create paths.
+    ///
+    /// `m: 0` combined with `payload_m` is meaningful (build per-payload-value
+    /// graphs only — the multi-tenancy layout), so a zero is passed through
+    /// rather than treated as unset.
+    fn hnsw_config_diff(&self) -> Option<HnswConfigDiff> {
+        let h = self.hnsw.as_ref()?;
+        if h.m.is_none()
+            && h.ef_construction.is_none()
+            && h.on_disk.is_none()
+            && h.payload_m.is_none()
+            && h.inline_storage.is_none()
+        {
+            return None;
+        }
+        Some(HnswConfigDiff {
+            m: h.m.map(|v| v as u64),
+            ef_construct: h.ef_construction.map(|v| v as u64),
+            on_disk: h.on_disk,
+            payload_m: h.payload_m.map(|v| v as u64),
+            inline_storage: h.inline_storage,
+            ..Default::default()
+        })
+    }
+
     /// Apply `collection_params.optimizers_config` (rps-tuned segment / memmap
-    /// knobs) and `collection_params.quantization_config` (scalar/binary) to a
-    /// `CreateCollectionBuilder`. Shared verbatim by the dense-only and hybrid
-    /// create paths so the hybrid collection honours the SAME tuning (e.g.
-    /// qdrant-hybrid.json's `memmap_threshold`).
+    /// knobs), `collection_params.quantization_config` (scalar/binary) and
+    /// `collection_params.on_disk_payload` to a `CreateCollectionBuilder`.
+    /// Shared verbatim by the dense-only and hybrid create paths so the hybrid
+    /// collection honours the SAME tuning (e.g. qdrant-hybrid.json's
+    /// `memmap_threshold`).
     fn apply_optimizers_and_quantization(
         &self,
         mut create_builder: CreateCollectionBuilder,
@@ -268,6 +317,16 @@ impl QdrantEngine {
                 create_builder = create_builder.quantization_config(quantization);
             }
         }
+
+        // Keep payloads on disk instead of in RAM — the on-disk experiments pair
+        // this with vectors_config.on_disk and hnsw_config.on_disk.
+        if let Some(v) = self
+            .collection_params_extra
+            .get("on_disk_payload")
+            .and_then(|v| v.as_bool())
+        {
+            create_builder = create_builder.on_disk_payload(v);
+        }
         Ok(create_builder)
     }
 
@@ -290,36 +349,75 @@ impl QdrantEngine {
     }
 
     /// Create Qdrant payload indexes for the dataset's schema fields.
-    fn create_payload_indexes(&self, dataset: &Dataset) {
-        if let Some(schema) = &dataset.config.schema {
-            if let Some(schema_obj) = schema.as_object() {
-                for (field_name, field_type) in schema_obj {
-                    let ft = field_type.as_str().unwrap_or("");
-                    let qdrant_type = match ft {
-                        "int" => FieldType::Integer,
-                        "keyword" => FieldType::Keyword,
-                        "text" => FieldType::Text,
-                        "float" => FieldType::Float,
-                        "geo" => FieldType::Geo,
-                        "uuid" => FieldType::Uuid,
-                        // Bools are stored as the STRING "true"/"false" (readers::metadata
-                        // has no Bool variant), so index them as Keyword — a Bool index
-                        // would index nothing for a string payload and the filter would
-                        // silently match zero points.
-                        "bool" => FieldType::Keyword,
-                        "datetime" => FieldType::Datetime,
-                        _ => continue,
-                    };
-                    let _ = self.rt.block_on(self.client.create_field_index(
-                        qdrant_client::qdrant::CreateFieldIndexCollectionBuilder::new(
-                            &self.collection_name,
-                            field_name.clone(),
-                            qdrant_type,
-                        ),
+    ///
+    /// `collection_params.payload_index_params` refines individual keyword/uuid
+    /// indexes with `is_tenant` (group points by that value on disk — the
+    /// multi-tenancy layout) and `on_disk` (keep the index off the heap). A key
+    /// that is not in the dataset schema is a hard error, matching upstream:
+    /// otherwise a typo'd field name silently produces an unrefined index and the
+    /// run looks like it measured a tenant-optimised layout when it did not.
+    fn create_payload_indexes(&self, dataset: &Dataset) -> Result<(), String> {
+        let schema = dataset.config.schema.as_ref().and_then(|s| s.as_object());
+        let index_params = self
+            .collection_params_extra
+            .get("payload_index_params")
+            .and_then(|v| v.as_object());
+
+        if let Some(params) = index_params {
+            for field in params.keys() {
+                if !schema.is_some_and(|s| s.contains_key(field)) {
+                    return Err(format!(
+                        "collection_params.payload_index_params names {:?}, which is not in the \
+                         schema of dataset {}",
+                        field, dataset.config.name
                     ));
                 }
             }
         }
+
+        let Some(schema_obj) = schema else {
+            return Ok(());
+        };
+        for (field_name, field_type) in schema_obj {
+            let ft = field_type.as_str().unwrap_or("");
+            let qdrant_type = match ft {
+                "int" => FieldType::Integer,
+                "keyword" => FieldType::Keyword,
+                "text" => FieldType::Text,
+                "float" => FieldType::Float,
+                "geo" => FieldType::Geo,
+                "uuid" => FieldType::Uuid,
+                // Bools are stored as the STRING "true"/"false" (readers::metadata
+                // has no Bool variant), so index them as Keyword — a Bool index
+                // would index nothing for a string payload and the filter would
+                // silently match zero points.
+                "bool" => FieldType::Keyword,
+                "datetime" => FieldType::Datetime,
+                _ => continue,
+            };
+
+            let mut builder = qdrant_client::qdrant::CreateFieldIndexCollectionBuilder::new(
+                &self.collection_name,
+                field_name.clone(),
+                qdrant_type,
+            );
+            let field_params = index_params.and_then(|p| p.get(field_name));
+            if let Some(params) = build_payload_index_params(ft, field_params) {
+                builder = builder.field_index_params(params);
+            }
+
+            if let Err(e) = self.rt.block_on(self.client.create_field_index(builder)) {
+                // Not fatal (the index may already exist from a previous run), but
+                // never silent: a missing payload index turns every filtered query
+                // into a full scan, which reads as an engine result rather than a
+                // setup failure.
+                eprintln!(
+                    "Warning: failed to create payload index on {:?} ({}): {}",
+                    field_name, ft, e
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Create a sparse-vector collection with a single named "sparse" vector.
@@ -331,7 +429,7 @@ impl QdrantEngine {
         self.rt
             .block_on(self.client.create_collection(create_builder))
             .map_err(|e| format!("Failed to create sparse collection: {}", e))?;
-        self.create_payload_indexes(dataset);
+        self.create_payload_indexes(dataset)?;
         Ok(())
     }
 
@@ -345,16 +443,11 @@ impl QdrantEngine {
         let vector_size = dataset.vector_size();
         let qdrant_distance = map_qdrant_distance(distance)?;
 
-        // Named dense vector "dense" (per-vector HNSW config if requested).
-        let mut dense_params = VectorParamsBuilder::new(vector_size as u64, qdrant_distance);
-        if self.hnsw_m.is_some() || self.hnsw_ef_construct.is_some() {
-            let mut hnsw_config = HnswConfigDiff::default();
-            if let Some(m) = self.hnsw_m {
-                hnsw_config.m = Some(m);
-            }
-            if let Some(ef) = self.hnsw_ef_construct {
-                hnsw_config.ef_construct = Some(ef);
-            }
+        // Named dense vector "dense" (same vectors_config + HNSW handling as the
+        // dense-only path, so on_disk/datatype/payload_m are not silently lost
+        // just because the dataset is hybrid).
+        let mut dense_params = self.dense_vector_params(vector_size, qdrant_distance)?;
+        if let Some(hnsw_config) = self.hnsw_config_diff() {
             dense_params = dense_params.hnsw_config(hnsw_config);
         }
         let mut dense_cfg = VectorsConfigBuilder::default();
@@ -378,7 +471,7 @@ impl QdrantEngine {
         // Throttle optimizer threads during indexing, same as the dense path.
         self.disable_indexing_optimizers();
 
-        self.create_payload_indexes(dataset);
+        self.create_payload_indexes(dataset)?;
         Ok(())
     }
 
@@ -821,6 +914,41 @@ fn parse_compression_ratio(s: &str) -> Result<CompressionRatio, String> {
     }
 }
 
+/// Build the per-field `IndexParams` for one schema field from its
+/// `payload_index_params` entry (`is_tenant` / `on_disk`).
+///
+/// Only keyword and uuid indexes take these — that is also the only pair
+/// upstream refines, and the rest of Qdrant's index-params messages do not carry
+/// `is_tenant`. Returns `None` when there is nothing to refine, so the index is
+/// created with plain defaults (the previous behaviour for every field).
+/// `bool` maps onto the keyword index here for the same reason it does above:
+/// bools are stored as the strings "true"/"false".
+fn build_payload_index_params(
+    field_type: &str,
+    field_params: Option<&serde_json::Value>,
+) -> Option<IndexParams> {
+    let params = field_params?;
+    let is_tenant = params.get("is_tenant").and_then(|v| v.as_bool());
+    let on_disk = params.get("on_disk").and_then(|v| v.as_bool());
+    if is_tenant.is_none() && on_disk.is_none() {
+        return None;
+    }
+
+    match field_type {
+        "keyword" | "bool" => Some(IndexParams::KeywordIndexParams(KeywordIndexParams {
+            is_tenant,
+            on_disk,
+            ..Default::default()
+        })),
+        "uuid" => Some(IndexParams::UuidIndexParams(UuidIndexParams {
+            is_tenant,
+            on_disk,
+            ..Default::default()
+        })),
+        _ => None,
+    }
+}
+
 /// Translate a `quantization_config` JSON object into a Qdrant `Quantization`.
 /// Recognizes `scalar` (int8 default, rejects other types), `product` (requires
 /// a valid `compression`), and `binary`. Returns `Ok(None)` when none of those
@@ -1084,6 +1212,15 @@ impl Engine for QdrantEngine {
             })
         });
 
+        // Whether to return payloads with each hit. Default false — recall only
+        // needs ids, and shipping payloads back would tax the wire for every
+        // engine unevenly. Upstream's on-disk experiments set it true on purpose,
+        // to price payload retrieval, so honour it when asked.
+        let with_payload = params
+            .knob("with_payload")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Search-time quantization params (rescore/oversampling) from the config's
         // search_params.quantization object — mirrors python rest.SearchParams(**params).
         let quantization_params: Option<QuantizationSearchParams> = params
@@ -1259,7 +1396,7 @@ impl Engine for QdrantEngine {
                                 .query(Query::new_fusion(Fusion::Rrf))
                                 .prefetch(vec![dense_pf, sparse_pf])
                                 .limit(top as u64)
-                                .with_payload(false)
+                                .with_payload(with_payload)
                         } else if is_sparse {
                             let sv = &sparse_queries[idx];
                             QueryPointsBuilder::new(collection_name.clone())
@@ -1269,12 +1406,12 @@ impl Engine for QdrantEngine {
                                 ))
                                 .using("sparse")
                                 .limit(top as u64)
-                                .with_payload(false)
+                                .with_payload(with_payload)
                         } else {
                             let mut qb = QueryPointsBuilder::new(collection_name.clone())
                                 .query(queries[idx].clone())
                                 .limit(top as u64)
-                                .with_payload(false);
+                                .with_payload(with_payload);
                             if hnsw_ef.is_some() || quantization_params.is_some() {
                                 qb = qb.params(QdrantSearchParams {
                                     hnsw_ef,
@@ -1541,8 +1678,11 @@ fn parse_qdrant_metrics(text: &str) -> serde_json::Map<String, serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::{
-        build_qdrant_filter, parse_compression_ratio, parse_qdrant_metrics, parse_rfc3339_timestamp,
+        build_payload_index_params, build_qdrant_filter, parse_compression_ratio,
+        parse_qdrant_metrics, parse_rfc3339_timestamp, IndexParams, QdrantEngine,
     };
+    use crate::config::{DatasetConfig, EngineConfig};
+    use crate::dataset::Dataset;
     use qdrant_client::qdrant::{condition::ConditionOneOf, CompressionRatio, FieldCondition};
     use serde_json::json;
 
@@ -1551,6 +1691,167 @@ mod tests {
             ConditionOneOf::Field(fc) => fc,
             other => panic!("expected FieldCondition, got {:?}", other),
         }
+    }
+
+    /// Build an engine from a `collection_params` object. The gRPC client is lazy,
+    /// so this needs no live Qdrant — it exercises config → request translation.
+    fn engine_with_collection_params(collection_params: serde_json::Value) -> QdrantEngine {
+        let cfg: EngineConfig = serde_json::from_value(json!({
+            "name": "qdrant-unit",
+            "engine": "qdrant",
+            "collection_params": collection_params,
+        }))
+        .expect("engine config should parse");
+        QdrantEngine::new(&cfg, "localhost").expect("client construction is lazy")
+    }
+
+    fn dataset_with_schema(schema: serde_json::Value) -> Dataset {
+        Dataset::new(DatasetConfig {
+            name: "qdrant-unit-ds".to_string(),
+            dataset_type: Some("tar".to_string()),
+            path: json!("/nonexistent"),
+            distance: Some("cosine".to_string()),
+            vector_size: Some(4),
+            vector_count: None,
+            link: None,
+            schema: Some(schema),
+            description: None,
+        })
+    }
+
+    // ── collection_params.hnsw_config: the on-disk knobs ───────────────────
+
+    /// `m: 0` + `payload_m` is the multi-tenancy layout (no global graph, one
+    /// graph per payload value). Zero must survive as Some(0), not be dropped.
+    #[test]
+    fn hnsw_diff_forwards_on_disk_payload_m_and_inline_storage() {
+        let e = engine_with_collection_params(json!({
+            "hnsw_config": { "m": 0, "ef_construct": 256, "on_disk": true,
+                             "payload_m": 16, "inline_storage": true }
+        }));
+        let diff = e
+            .hnsw_config_diff()
+            .expect("configured hnsw must yield a diff");
+        assert_eq!(
+            diff.m,
+            Some(0),
+            "m: 0 must be forwarded, not treated as unset"
+        );
+        assert_eq!(diff.ef_construct, Some(256));
+        assert_eq!(diff.on_disk, Some(true));
+        assert_eq!(diff.payload_m, Some(16));
+        assert_eq!(diff.inline_storage, Some(true));
+    }
+
+    /// No hnsw_config, or one carrying nothing we understand, leaves Qdrant's
+    /// defaults alone rather than sending an empty diff.
+    #[test]
+    fn hnsw_diff_is_none_when_unconfigured() {
+        assert!(engine_with_collection_params(json!({}))
+            .hnsw_config_diff()
+            .is_none());
+        assert!(engine_with_collection_params(json!({"hnsw_config": {}}))
+            .hnsw_config_diff()
+            .is_none());
+    }
+
+    // ── collection_params.vectors_config.datatype ──────────────────────────
+
+    #[test]
+    fn dense_vector_params_forwards_datatype_and_on_disk() {
+        for (spelling, expected) in [
+            ("float16", super::Datatype::Float16),
+            ("f16", super::Datatype::Float16),
+            ("uint8", super::Datatype::Uint8),
+            ("float32", super::Datatype::Float32),
+        ] {
+            let e = engine_with_collection_params(
+                json!({"vectors_config": {"on_disk": true, "datatype": spelling}}),
+            );
+            let params = e
+                .dense_vector_params(128, super::Distance::Cosine)
+                .unwrap()
+                .build();
+            assert_eq!(
+                params.datatype,
+                Some(expected as i32),
+                "datatype {:?} should map to {:?}",
+                spelling,
+                expected
+            );
+            assert_eq!(params.on_disk, Some(true));
+        }
+    }
+
+    /// Silently falling back to float32 would benchmark different storage than
+    /// the config asked for, so an unknown datatype must fail the run.
+    #[test]
+    fn dense_vector_params_rejects_unknown_datatype() {
+        let e = engine_with_collection_params(json!({"vectors_config": {"datatype": "bfloat16"}}));
+        let err = match e.dense_vector_params(128, super::Distance::Cosine) {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown datatype must not be accepted"),
+        };
+        assert!(err.contains("bfloat16"), "got: {}", err);
+    }
+
+    #[test]
+    fn dense_vector_params_defaults_to_in_memory_float32() {
+        let e = engine_with_collection_params(json!({}));
+        let params = e
+            .dense_vector_params(64, super::Distance::Cosine)
+            .unwrap()
+            .build();
+        assert_eq!(params.datatype, None);
+        assert_eq!(params.on_disk, Some(false));
+    }
+
+    // ── collection_params.payload_index_params ─────────────────────────────
+
+    #[test]
+    fn payload_index_params_refine_keyword_and_uuid_only() {
+        let p = json!({"is_tenant": true, "on_disk": true});
+        match build_payload_index_params("keyword", Some(&p)) {
+            Some(IndexParams::KeywordIndexParams(k)) => {
+                assert_eq!(k.is_tenant, Some(true));
+                assert_eq!(k.on_disk, Some(true));
+            }
+            other => panic!("expected keyword params, got {:?}", other),
+        }
+        // bool is stored as the string "true"/"false", hence a keyword index.
+        assert!(matches!(
+            build_payload_index_params("bool", Some(&p)),
+            Some(IndexParams::KeywordIndexParams(_))
+        ));
+        match build_payload_index_params("uuid", Some(&p)) {
+            Some(IndexParams::UuidIndexParams(u)) => assert_eq!(u.is_tenant, Some(true)),
+            other => panic!("expected uuid params, got {:?}", other),
+        }
+        // Types whose index params carry no is_tenant/on_disk stay unrefined.
+        assert!(build_payload_index_params("int", Some(&p)).is_none());
+        assert!(build_payload_index_params("geo", Some(&p)).is_none());
+        // Nothing to refine → plain default index.
+        assert!(build_payload_index_params("keyword", None).is_none());
+        assert!(build_payload_index_params("keyword", Some(&json!({}))).is_none());
+    }
+
+    /// A payload_index_params key that is not in the dataset schema is a config
+    /// typo. Ignoring it would leave the index unrefined while the run reports as
+    /// if it had measured a tenant-optimised layout.
+    #[test]
+    fn payload_index_params_naming_unknown_field_is_rejected() {
+        let e = engine_with_collection_params(json!({
+            "payload_index_params": { "tenant_id": { "is_tenant": true } }
+        }));
+        let err = e
+            .create_payload_indexes(&dataset_with_schema(json!({"a": "keyword"})))
+            .unwrap_err();
+        assert!(err.contains("tenant_id"), "got: {}", err);
+
+        // A dataset with NO schema cannot satisfy any key either.
+        let mut no_schema = dataset_with_schema(json!({}));
+        no_schema.config.schema = None;
+        assert!(e.create_payload_indexes(&no_schema).is_err());
     }
 
     #[test]

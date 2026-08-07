@@ -1283,3 +1283,156 @@ fn test_generate_dataset_binary_sparse_end_to_end() {
         "generated sparse precision {precision:.3} < 0.9"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Collection-parameter passthrough (upstream parity): the on-disk / tenant
+// knobs used by upstream's on-disk experiments must reach the SERVER, not just
+// parse.
+//
+// These are exactly the knobs that fail silently: a dropped
+// `hnsw_config.on_disk` still produces a working collection with plausible
+// recall — it just benchmarks an in-memory graph while the config, the result
+// file and the run name all say "on disk". Behavioural teeth (as used for
+// quantization) cannot separate those two, so this test READS THE COLLECTION
+// CONFIG BACK from a live Qdrant instead.
+//
+// To make read-back possible the CLI is run with `--keep-data` (which skips the
+// usual teardown) into its own collection name.
+// ---------------------------------------------------------------------------
+
+/// Like `run_qdrant_binary`, but keeps the collection after the run and points
+/// the engine at `collection` so the caller can inspect the result.
+fn run_qdrant_binary_keep_collection(
+    root: &std::path::Path,
+    engine: &str,
+    dataset: &str,
+    collection: &str,
+) -> bool {
+    let out = std::process::Command::new(binary_path())
+        .args([
+            "--engines",
+            engine,
+            "--datasets",
+            dataset,
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--keep-data",
+        ])
+        .env("QDRANT_GRPC_PORT", QDRANT_GRPC_PORT.to_string())
+        .env("QDRANT_REST_PORT", QDRANT_REST_PORT.to_string())
+        .env("QDRANT_COLLECTION_NAME", collection)
+        .current_dir(root)
+        .output()
+        .expect("run vector-db-benchmark");
+    if !out.status.success() {
+        eprintln!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    out.status.success()
+}
+
+#[test]
+fn test_binary_qdrant_on_disk_and_tenant_collection_params() {
+    wait_for_qdrant();
+
+    let collection = "bench_on_disk_params";
+    let engine = "qdrant-on-disk-params";
+    let dataset = "tenant-on-disk";
+
+    // `search_params` is spelled `config` here on purpose: that is upstream's
+    // spelling, and this asserts the whole path (parse -> engine -> server)
+    // works with it, not just the serde alias.
+    let configs = serde_json::json!([{
+        "name": engine,
+        "engine": "qdrant",
+        "connection_params": {"timeout": 120},
+        "collection_params": {
+            "timeout": 120,
+            "vectors_config": { "on_disk": true, "datatype": "float16" },
+            // m: 0 + payload_m: build graphs per tenant value only — the
+            // multi-tenancy layout upstream benchmarks.
+            "hnsw_config": { "m": 0, "ef_construct": 64, "on_disk": true, "payload_m": 16 },
+            "on_disk_payload": true,
+            "payload_index_params": { "tenant": { "is_tenant": true, "on_disk": true } }
+        },
+        "search_params": [{ "parallel": 1, "config": { "hnsw_ef": 64 } }],
+        "upload_params": {"parallel": 1, "batch_size": 128}
+    }]);
+    let proj = common::write_tenant_project(dataset, &serde_json::to_string(&configs).unwrap(), 16);
+
+    let ok = run_qdrant_binary_keep_collection(&proj.root, engine, dataset, collection);
+
+    // Read the collection config back BEFORE asserting, so the collection is
+    // always cleaned up even when an assertion fails below.
+    let (rt, client) = create_grpc_client();
+    let info = if ok {
+        rt.block_on(client.collection_info(collection)).ok()
+    } else {
+        None
+    };
+    let _ = rt.block_on(client.delete_collection(collection));
+
+    assert!(ok, "{engine} run failed");
+    let info = info.expect("collection_info").result.expect("info result");
+
+    let config = info.config.expect("collection config");
+    let params = config.params.expect("collection params");
+    assert!(
+        params.on_disk_payload,
+        "on_disk_payload was not applied to the collection"
+    );
+
+    let hnsw = config.hnsw_config.expect("hnsw config");
+    assert_eq!(hnsw.m, Some(0), "hnsw_config.m: 0 did not reach the server");
+    assert_eq!(hnsw.ef_construct, Some(64));
+    assert_eq!(
+        hnsw.on_disk,
+        Some(true),
+        "hnsw_config.on_disk did not reach the server — the run would have \
+         benchmarked an IN-MEMORY graph while claiming to be on disk"
+    );
+    assert_eq!(
+        hnsw.payload_m,
+        Some(16),
+        "hnsw_config.payload_m did not reach the server"
+    );
+
+    // vectors_config: on_disk + float16 storage.
+    let vectors = params.vectors_config.expect("vectors config").config;
+    match vectors {
+        Some(qdrant_client::qdrant::vectors_config::Config::Params(vp)) => {
+            assert_eq!(vp.on_disk, Some(true), "vectors_config.on_disk not applied");
+            assert_eq!(
+                vp.datatype,
+                Some(qdrant_client::qdrant::Datatype::Float16 as i32),
+                "vectors_config.datatype float16 not applied — storage would be \
+                 full float32"
+            );
+        }
+        other => panic!("expected single dense vector params, got {other:?}"),
+    }
+
+    // payload_index_params: the keyword index on `tenant` must be a TENANT index
+    // kept on disk.
+    let schema = info
+        .payload_schema
+        .get("tenant")
+        .expect("tenant payload index should exist");
+    match schema.params.as_ref().and_then(|p| p.index_params.as_ref()) {
+        Some(qdrant_client::qdrant::payload_index_params::IndexParams::KeywordIndexParams(k)) => {
+            assert_eq!(
+                k.is_tenant,
+                Some(true),
+                "payload_index_params.is_tenant not applied — the index would not \
+                 be tenant-grouped"
+            );
+            assert_eq!(k.on_disk, Some(true), "payload index on_disk not applied");
+        }
+        other => panic!("expected keyword index params on `tenant`, got {other:?}"),
+    }
+}
