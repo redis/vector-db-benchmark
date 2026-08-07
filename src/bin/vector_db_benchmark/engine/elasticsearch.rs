@@ -887,7 +887,12 @@ impl Engine for ElasticsearchEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let num_candidates = params.num_candidates.unwrap_or(100);
+        // Upstream nests this under `config`; accept the nested spelling too so an
+        // upstream configuration does not silently fall back to 100.
+        let num_candidates = params
+            .num_candidates
+            .or_else(|| params.knob("num_candidates").and_then(|v| v.as_i64()))
+            .unwrap_or(100);
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());

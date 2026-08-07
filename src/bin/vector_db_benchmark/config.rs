@@ -56,6 +56,12 @@ pub struct CollectionParams {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchParams {
     pub parallel: Option<i64>,
+    /// Per-search engine knobs. Upstream (qdrant/vector-db-benchmark) spells this
+    /// key `config`; accept BOTH so an upstream configuration file can be used
+    /// verbatim. Without the alias, `"config": {...}` was absorbed by the
+    /// `extra` catch-all below and silently dropped — the run then used default
+    /// `ef`/`hnsw_ef` while reporting as if it had been tuned.
+    #[serde(alias = "config")]
     pub search_params: Option<InnerSearchParams>,
     pub top: Option<i64>,
     pub num_candidates: Option<i64>,
@@ -76,10 +82,31 @@ pub struct SearchParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InnerSearchParams {
+    /// HNSW search-time breadth. Upstream's redis configs spell it `EF`
+    /// (uppercase, matching the FT.SEARCH runtime attribute), so accept both.
+    #[serde(alias = "EF")]
     pub ef: Option<i64>,
     /// Catch-all for additional search params (e.g., SEARCH_WINDOW_SIZE, data_type)
     #[serde(flatten)]
     pub extra: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+impl SearchParams {
+    /// Resolve an engine-specific search knob by name, accepting it either
+    /// nested under `search_params` / `config` or flat at the entry's top level.
+    ///
+    /// Upstream nests EVERY knob under `config` (`num_candidates`,
+    /// `knn.algo_param.ef_search`, `hnsw_ef`, …) while several of our own
+    /// configurations put them flat. Engines resolve through here so both
+    /// shapes work and neither is silently ignored. Nested wins over flat,
+    /// being the more specific placement.
+    pub fn knob(&self, key: &str) -> Option<&serde_json::Value> {
+        self.search_params
+            .as_ref()
+            .and_then(|sp| sp.extra.as_ref())
+            .and_then(|e| e.get(key))
+            .or_else(|| self.extra.as_ref().and_then(|e| e.get(key)))
+    }
 }
 
 /// Engine configuration from experiments/configurations/*.json
@@ -399,6 +426,72 @@ mod tests {
 
         // Missing file → hard error (not a silent fall-through to the glob).
         assert!(read_engine_configs(Some("/no/such/file.json")).is_err());
+    }
+
+    // Upstream spells the per-search knob object `config`. Before the alias it
+    // landed in the flattened `extra` catch-all and was silently dropped, so a
+    // verbatim upstream file ran with default ef while REPORTING as tuned.
+    #[test]
+    fn upstream_config_key_is_accepted_as_search_params() {
+        let sp: SearchParams =
+            serde_json::from_value(json!({"parallel": 8, "config": {"hnsw_ef": 128}})).unwrap();
+        assert_eq!(sp.parallel, Some(8));
+        assert_eq!(
+            sp.knob("hnsw_ef").and_then(|v| v.as_u64()),
+            Some(128),
+            "`config` must populate search_params, not the extra catch-all"
+        );
+        // And it must NOT also linger in `extra` under the raw key.
+        assert!(sp.extra.is_none_or(|e| !e.contains_key("config")));
+    }
+
+    // Our own spelling keeps working, and uppercase `EF` (upstream's redis
+    // configs) resolves to the same typed field as lowercase `ef`.
+    #[test]
+    fn our_search_params_key_and_uppercase_ef_still_work() {
+        let ours: SearchParams =
+            serde_json::from_value(json!({"parallel": 1, "search_params": {"ef": 64}})).unwrap();
+        assert_eq!(
+            ours.search_params.as_ref().and_then(|sp| sp.ef),
+            Some(64),
+            "our historical `search_params` spelling must keep working"
+        );
+
+        let upstream_redis: SearchParams =
+            serde_json::from_value(json!({"parallel": 100, "config": {"EF": 512}})).unwrap();
+        assert_eq!(
+            upstream_redis.search_params.as_ref().and_then(|sp| sp.ef),
+            Some(512),
+            "upstream redis `EF` must map onto the typed ef field"
+        );
+    }
+
+    // Engines read knobs through SearchParams::knob, which accepts either
+    // placement. Nested is more specific and therefore wins.
+    #[test]
+    fn knob_resolves_nested_and_flat_with_nested_winning() {
+        let nested: SearchParams =
+            serde_json::from_value(json!({"config": {"num_candidates": 16}})).unwrap();
+        assert_eq!(
+            nested.knob("num_candidates").and_then(|v| v.as_i64()),
+            Some(16)
+        );
+
+        let flat: SearchParams =
+            serde_json::from_value(json!({"knn.algo_param.ef_search": 256})).unwrap();
+        assert_eq!(
+            flat.knob("knn.algo_param.ef_search")
+                .and_then(|v| v.as_i64()),
+            Some(256)
+        );
+
+        let both: SearchParams =
+            serde_json::from_value(json!({"num_candidates_x": 1, "config": {"k": 2}, "k": 3}))
+                .unwrap();
+        assert_eq!(both.knob("k").and_then(|v| v.as_i64()), Some(2));
+
+        let neither: SearchParams = serde_json::from_value(json!({"parallel": 1})).unwrap();
+        assert!(neither.knob("k").is_none());
     }
 
     #[test]
