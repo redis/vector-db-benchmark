@@ -28,6 +28,8 @@ struct OpenSearchConfig {
     ef_construction: i64,
     batch_size: usize,
     parallel: usize,
+    /// None = inherit the cluster default (previous behaviour).
+    number_of_shards: Option<i64>,
 }
 
 pub struct OpenSearchEngine {
@@ -76,6 +78,16 @@ impl OpenSearchEngine {
             .and_then(|v| v.as_i64())
             .unwrap_or(500) as usize;
 
+        // See create_index: shard count materially changes OpenSearch vector
+        // performance and the Service default has differed from open-source
+        // OpenSearch, so it must be settable rather than inherited silently.
+        let number_of_shards = engine_config
+            .collection_params
+            .as_ref()
+            .and_then(|c| c.extra.as_ref())
+            .and_then(|e| e.get("number_of_shards"))
+            .and_then(|v| v.as_i64());
+
         let base_url = build_base_url(host, port);
 
         let rt = tokio::runtime::Runtime::new()
@@ -92,6 +104,7 @@ impl OpenSearchEngine {
                 ef_construction,
                 batch_size,
                 parallel,
+                number_of_shards,
             },
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             base_url,
@@ -114,22 +127,61 @@ impl OpenSearchEngine {
         pb
     }
 
+    /// Delete the benchmark index, tolerating the transient states a *managed*
+    /// cluster puts an index into.
+    ///
+    /// Amazon OpenSearch Service takes automated snapshots on a schedule that
+    /// cannot be disabled, and deleting an index caught in one fails with
+    /// HTTP 400 `snapshot_in_progress_exception`. Because every config in a grid
+    /// starts by dropping the previous index, a single unlucky snapshot window
+    /// otherwise fails not just that config but every config after it — observed
+    /// as 1/6 completing and 5/6 dying on "Failed to delete index: status 400".
+    ///
+    /// 503 is the other transient case (cluster-manager busy). Both are retried;
+    /// anything else fails immediately.
+    ///
+    /// The response body is included in the error. Without it "status 400" is
+    /// undiagnosable — the cause has to be guessed from the outside.
     fn delete_index(&self) -> Result<(), String> {
-        let resp = self
-            .rt
-            .block_on(
-                self.client
-                    .indices()
-                    .delete(IndicesDeleteParts::Index(&[&self.index_name]))
-                    .send(),
-            )
-            .map_err(|e| format!("Failed to delete index: {}", e))?;
+        let max_retries: u32 = std::env::var("OPENSEARCH_INDEX_OP_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let base_delay_ms: u64 = std::env::var("OPENSEARCH_INDEX_OP_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
 
-        let status = resp.status_code().as_u16();
-        if status == 200 || status == 404 {
-            Ok(())
-        } else {
-            Err(format!("Failed to delete index: status {}", status))
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .rt
+                .block_on(
+                    self.client
+                        .indices()
+                        .delete(IndicesDeleteParts::Index(&[&self.index_name]))
+                        .send(),
+                )
+                .map_err(|e| format!("Failed to delete index: {}", e))?;
+
+            let status = resp.status_code().as_u16();
+            if status == 200 || status == 404 {
+                return Ok(());
+            }
+
+            let body = self.rt.block_on(resp.text()).unwrap_or_default();
+            let retryable = status == 503
+                || (status == 400 && body.contains("snapshot_in_progress"))
+                || body.contains("cluster_block_exception");
+
+            if !retryable || attempt >= max_retries {
+                return Err(format!(
+                    "Failed to delete index: status {} after {} retries: {}",
+                    status, attempt, body
+                ));
+            }
+            backoff_sleep(base_delay_ms, attempt);
+            attempt += 1;
         }
     }
 
@@ -199,39 +251,84 @@ impl OpenSearchEngine {
             }
         }
 
+        // Shard count is a first-order factor for OpenSearch vector search, not a
+        // detail: Amazon OpenSearch Service historically defaulted an index to FIVE
+        // primary shards while open-source OpenSearch defaults to one, and an
+        // internal 2024 benchmark that tested both found 5 clearly better for
+        // precision vs qps/latency/index-time — the 1-shard config "deeply impacts
+        // OpenSearch indexing speed and precision". Leaving it unset silently
+        // inherits whatever the cluster default happens to be for that version,
+        // which makes runs incomparable across versions and can hand OpenSearch the
+        // worse of two configurations without anyone choosing it.
+        //
+        // Set from collection_params.number_of_shards; unset preserves the previous
+        // behaviour (cluster default) so existing configs are unaffected.
+        let mut index_settings = serde_json::json!({
+            "knn": true,
+            // Indexing-throughput tuning: no replicas and no periodic
+            // refresh, since the benchmark bulk-loads all data up front and
+            // force-merges before searching.
+            "number_of_replicas": 0,
+            "refresh_interval": -1,
+        });
+        if let Some(n) = self.config.number_of_shards {
+            index_settings["number_of_shards"] = serde_json::Value::from(n);
+        }
+
         let body = serde_json::json!({
-            "settings": {
-                "index": {
-                    "knn": true,
-                    // Indexing-throughput tuning: no replicas and no periodic
-                    // refresh, since the benchmark bulk-loads all data up front and
-                    // force-merges before searching.
-                    "number_of_replicas": 0,
-                    "refresh_interval": -1,
-                }
-            },
+            "settings": { "index": index_settings },
             "mappings": {
                 "properties": properties,
             }
         });
 
-        let resp = self
-            .rt
-            .block_on(
-                self.client
-                    .indices()
-                    .create(IndicesCreateParts::Index(&self.index_name))
-                    .body(body)
-                    .send(),
-            )
-            .map_err(|e| format!("Failed to create index: {}", e))?;
+        // Same transient-state problem as delete_index: a cluster whose manager
+        // thread pool is busy answers create-index with
+        // `process_cluster_event_timeout_exception` (503) rather than creating it.
+        // Retrying rides that out instead of failing the config — and every config
+        // after it, since each one starts by creating its index.
+        let max_retries: u32 = std::env::var("OPENSEARCH_INDEX_OP_MAX_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let base_delay_ms: u64 = std::env::var("OPENSEARCH_INDEX_OP_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
 
-        if !resp.status_code().is_success() {
-            let body = self.rt.block_on(resp.text()).unwrap_or_default();
-            return Err(format!("Failed to create index: {}", body));
+        let mut attempt: u32 = 0;
+        loop {
+            let resp = self
+                .rt
+                .block_on(
+                    self.client
+                        .indices()
+                        .create(IndicesCreateParts::Index(&self.index_name))
+                        .body(body.clone())
+                        .send(),
+                )
+                .map_err(|e| format!("Failed to create index: {}", e))?;
+
+            if resp.status_code().is_success() {
+                return Ok(());
+            }
+
+            let status = resp.status_code().as_u16();
+            let text = self.rt.block_on(resp.text()).unwrap_or_default();
+            let retryable = status == 503
+                || status == 429
+                || text.contains("process_cluster_event_timeout_exception")
+                || text.contains("cluster_block_exception");
+
+            if !retryable || attempt >= max_retries {
+                return Err(format!(
+                    "Failed to create index (HTTP {}, {} retries): {}",
+                    status, attempt, text
+                ));
+            }
+            backoff_sleep(base_delay_ms, attempt);
+            attempt += 1;
         }
-
-        Ok(())
     }
 
     fn upload_parallel(
@@ -609,15 +706,15 @@ fn upload_bulk_batch(
 ) -> Result<(), String> {
     use vector_db_benchmark::readers::metadata::MetadataValue;
 
-    let mut body: Vec<JsonBody<serde_json::Value>> = Vec::with_capacity(ids.len() * 2);
+    // Held as plain Values rather than JsonBody so the batch can be rebuilt and
+    // resent on a retry: `.body()` consumes the Vec and JsonBody is not Clone.
+    let mut lines: Vec<serde_json::Value> = Vec::with_capacity(ids.len() * 2);
 
     for i in 0..ids.len() {
         let uuid_hex = id_to_uuid_hex(ids[i]);
 
         // Action line
-        body.push(JsonBody::new(
-            serde_json::json!({"index": {"_id": uuid_hex}}),
-        ));
+        lines.push(serde_json::json!({"index": {"_id": uuid_hex}}));
 
         // Document line
         let mut doc = serde_json::Map::new();
@@ -645,43 +742,153 @@ fn upload_bulk_batch(
             }
         }
 
-        body.push(JsonBody::new(serde_json::Value::Object(doc)));
+        lines.push(serde_json::Value::Object(doc));
     }
 
-    let resp = rt
-        .block_on(client.bulk(BulkParts::Index(index_name)).body(body).send())
-        .map_err(|e| format!("Bulk upload failed: {}", e))?;
+    // HTTP 429 (and 503) are back-pressure, not failure: the server is telling us
+    // to slow down and come back. Aborting the experiment on the first one makes
+    // ingest impossible against a managed service that sheds load — Amazon
+    // OpenSearch Service returns 429 readily on a single-node domain, because
+    // knn.algo_param.index_thread_qty defaults to 1 and the write path cannot
+    // drain as fast as a parallel uploader pushes. Retry with exponential backoff
+    // instead, and only give up once the server has had several chances.
+    //
+    // Rejections also arrive as HTTP 200 with per-item errors (bulk is partial by
+    // design), so item-level 429 / es_rejected_execution_exception /
+    // circuit_breaking_exception are treated as retryable too.
+    let max_retries: u32 = std::env::var("OPENSEARCH_BULK_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let base_delay_ms: u64 = std::env::var("OPENSEARCH_BULK_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
 
-    if !resp.status_code().is_success() {
-        let text = rt.block_on(resp.text()).unwrap_or_default();
-        return Err(format!("Bulk upload error: {}", text));
+    let mut attempt: u32 = 0;
+    loop {
+        let body: Vec<JsonBody<serde_json::Value>> =
+            lines.iter().cloned().map(JsonBody::new).collect();
+
+        // A dropped connection or read timeout fails here, BEFORE any HTTP status
+        // exists, so status-based retry never sees it. Over a multi-hour ingest a
+        // single transient reset would otherwise discard the whole run.
+        let resp = match rt.block_on(client.bulk(BulkParts::Index(index_name)).body(body).send()) {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt >= max_retries {
+                    return Err(format!(
+                        "Bulk upload failed after {} retries: {} \
+                         (transport error — the server may be dropping connections \
+                         under load; lower upload_params.parallel or batch_size)",
+                        max_retries, e
+                    ));
+                }
+                backoff_sleep(base_delay_ms, attempt);
+                attempt += 1;
+                continue;
+            }
+        };
+
+        let status = resp.status_code().as_u16();
+        // 429 = write queue full. 503 = unavailable. 502/504 = the managed
+        // service's front door gave up, which happens both transiently and when a
+        // single bulk request is simply too big — retrying distinguishes them,
+        // since a size problem survives every attempt.
+        let http_retryable = matches!(status, 429 | 502 | 503 | 504);
+
+        if !http_retryable && !resp.status_code().is_success() {
+            let text = rt.block_on(resp.text()).unwrap_or_default();
+            return Err(format!("Bulk upload error: HTTP {}: {}", status, text));
+        }
+
+        if http_retryable {
+            if attempt >= max_retries {
+                let text = rt.block_on(resp.text()).unwrap_or_default();
+                let hint = if matches!(status, 502 | 504 | 413) {
+                    "request is likely too large — lower upload_params.batch_size \
+                     (bulk bytes scale with vector dimension)"
+                } else {
+                    "server is shedding load — lower upload_params.parallel or \
+                     raise OPENSEARCH_BULK_MAX_RETRIES"
+                };
+                return Err(format!(
+                    "Bulk upload error: HTTP {} still returned after {} retries ({}): {}",
+                    status, max_retries, hint, text
+                ));
+            }
+            backoff_sleep(base_delay_ms, attempt);
+            attempt += 1;
+            continue;
+        }
+
+        let resp_body: serde_json::Value = rt
+            .block_on(resp.json())
+            .map_err(|e| format!("Failed to parse bulk response: {}", e))?;
+
+        if resp_body
+            .get("errors")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let items = resp_body.get("items").and_then(|v| v.as_array());
+            let error_count = items
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|item| item.get("index").and_then(|idx| idx.get("error")).is_some())
+                        .count()
+                })
+                .unwrap_or(0);
+            let retryable_count = items
+                .map(|arr| arr.iter().filter(|item| item_is_retryable(item)).count())
+                .unwrap_or(0);
+
+            // Only retry when every failure is retryable; a genuine mapping or
+            // parse error would otherwise be retried pointlessly to exhaustion.
+            if retryable_count > 0 && retryable_count == error_count && attempt < max_retries {
+                backoff_sleep(base_delay_ms, attempt);
+                attempt += 1;
+                continue;
+            }
+
+            return Err(format!(
+                "Bulk upload had {} errors out of {} documents ({} retryable, {} retries used)",
+                error_count,
+                ids.len(),
+                retryable_count,
+                attempt
+            ));
+        }
+
+        return Ok(());
     }
+}
 
-    let resp_body: serde_json::Value = rt
-        .block_on(resp.json())
-        .map_err(|e| format!("Failed to parse bulk response: {}", e))?;
+/// Exponential backoff, capped so a long stall cannot sleep for hours.
+fn backoff_sleep(base_delay_ms: u64, attempt: u32) {
+    let delay = base_delay_ms
+        .saturating_mul(1u64 << attempt.min(6))
+        .min(30_000);
+    std::thread::sleep(std::time::Duration::from_millis(delay));
+}
 
-    if resp_body
-        .get("errors")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        let items = resp_body.get("items").and_then(|v| v.as_array());
-        let error_count = items
-            .map(|arr| {
-                arr.iter()
-                    .filter(|item| item.get("index").and_then(|idx| idx.get("error")).is_some())
-                    .count()
-            })
-            .unwrap_or(0);
-        return Err(format!(
-            "Bulk upload had {} errors out of {} documents",
-            error_count,
-            ids.len()
-        ));
+/// True when a bulk item failed for a reason worth retrying — the server shedding
+/// load rather than rejecting the document itself.
+fn item_is_retryable(item: &serde_json::Value) -> bool {
+    let Some(idx) = item.get("index") else {
+        return false;
+    };
+    if idx.get("status").and_then(|s| s.as_u64()) == Some(429) {
+        return true;
     }
-
-    Ok(())
+    matches!(
+        idx.get("error")
+            .and_then(|e| e.get("type"))
+            .and_then(|t| t.as_str()),
+        Some("es_rejected_execution_exception")
+            | Some("circuit_breaking_exception")
+            | Some("cluster_block_exception")
+    )
 }
 
 /// OpenSearch KNN search (different format from Elasticsearch).
@@ -745,19 +952,63 @@ fn knn_search(
 ) -> Result<Vec<(i64, f64)>, String> {
     let body = build_knn_body(query_vector, top, filter);
 
-    let resp = rt
-        .block_on(
+    // Search-path back-pressure is the most dangerous of the lot, because the
+    // caller does not fail on it — a failed query is logged and DROPPED from the
+    // timing and recall vectors, so mean_precisions ends up computed over only the
+    // queries that survived. Since 429s arrive precisely when the node is loaded,
+    // the survivors are the cheaper queries and recall is biased UPWARD, silently,
+    // with nothing in the summary recording that anything was lost.
+    //
+    // Measured: a glove-100 run shed 17,584 queries across two of six configs and
+    // still reported clean-looking recall for them.
+    //
+    // Retries are kept short by default — a query is on the latency critical path,
+    // and a retried query's own measured time is not used for the latency figure
+    // (the caller times the whole call), so a long backoff would distort latency.
+    // Better to retry a few times quickly and let the run fail loudly than to drop
+    // the query.
+    let max_retries: u32 = std::env::var("OPENSEARCH_SEARCH_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let base_delay_ms: u64 = std::env::var("OPENSEARCH_SEARCH_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+
+    let mut attempt: u32 = 0;
+    let resp = loop {
+        match rt.block_on(
             client
                 .search(SearchParts::Index(&[index_name]))
-                .body(body)
+                .body(body.clone())
                 .send(),
-        )
-        .map_err(|e| format!("KNN search failed: {}", e))?;
-
-    if !resp.status_code().is_success() {
-        let text = rt.block_on(resp.text()).unwrap_or_default();
-        return Err(format!("KNN search error: {}", text));
-    }
+        ) {
+            Ok(r) => {
+                let status = r.status_code().as_u16();
+                if r.status_code().is_success() {
+                    break r;
+                }
+                if !matches!(status, 429 | 502 | 503 | 504) || attempt >= max_retries {
+                    let text = rt.block_on(r.text()).unwrap_or_default();
+                    return Err(format!(
+                        "KNN search error (HTTP {}, {} retries): {}",
+                        status, attempt, text
+                    ));
+                }
+            }
+            Err(e) => {
+                if attempt >= max_retries {
+                    return Err(format!(
+                        "KNN search failed after {} retries: {}",
+                        attempt, e
+                    ));
+                }
+            }
+        }
+        backoff_sleep(base_delay_ms, attempt);
+        attempt += 1;
+    };
 
     let resp_body: serde_json::Value = rt
         .block_on(resp.json())
@@ -892,6 +1143,10 @@ impl Engine for OpenSearchEngine {
         // contention in the timed loop (see redis.rs::search). Metrics are
         // order-independent so results are unchanged; work counter uses Relaxed.
         let query_idx = Arc::new(AtomicUsize::new(0));
+        // A dropped query silently biases recall (see knn_search), so failures are
+        // counted across all worker threads and the run is refused below if any
+        // survived their retries.
+        let failed_queries = Arc::new(AtomicUsize::new(0));
 
         let pb = self.create_progress_bar(num_to_run);
         let start_time = Instant::now();
@@ -914,6 +1169,7 @@ impl Engine for OpenSearchEngine {
                 let neighbors = &neighbors;
                 let parsed_filters = &parsed_filters;
                 let query_idx = Arc::clone(&query_idx);
+                let failed_queries = Arc::clone(&failed_queries);
                 let pb = &pb;
 
                 handles.push(s.spawn(move || {
@@ -977,6 +1233,7 @@ impl Engine for OpenSearchEngine {
                                 nd.push(m.ndcg);
                             }
                             Err(e) => {
+                                failed_queries.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("Search query {} failed: {}", idx, e);
                             }
                         }
@@ -998,6 +1255,37 @@ impl Engine for OpenSearchEngine {
 
         pb.finish_and_clear();
         let total_time = start_time.elapsed().as_secs_f64();
+
+        // Refuse to report a run that lost queries. Dropped queries never reach
+        // `precs`/`recs`, so the recall below would be an average over the survivors
+        // only — and because the server sheds load exactly when it is busy, the
+        // survivors are the cheaper queries and the figure is biased UPWARD. Nothing
+        // in the emitted summary records the loss, so a partial run is
+        // indistinguishable from a clean one downstream. Failing here is the only
+        // thing that stops a biased number being published by accident.
+        //
+        // OPENSEARCH_ALLOW_FAILED_QUERIES=1 accepts a deliberately best-effort run.
+        let failed = failed_queries.load(Ordering::Relaxed);
+        if failed > 0 {
+            let allow = std::env::var("OPENSEARCH_ALLOW_FAILED_QUERIES")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let pct = 100.0 * failed as f64 / num_to_run.max(1) as f64;
+            if !allow {
+                return Err(format!(
+                    "{} of {} search queries failed ({:.2}%) after retries — refusing to \
+                     report recall averaged over the survivors only, which biases it \
+                     upward. Reduce load, raise OPENSEARCH_SEARCH_MAX_RETRIES, or set \
+                     OPENSEARCH_ALLOW_FAILED_QUERIES=1 to accept a partial run.",
+                    failed, num_to_run, pct
+                ));
+            }
+            eprintln!(
+                "⚠  {} of {} search queries failed ({:.2}%) — recall below is averaged over \
+                 the survivors and is biased upward (OPENSEARCH_ALLOW_FAILED_QUERIES=1)",
+                failed, num_to_run, pct
+            );
+        }
 
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         crate::engine::compute_search_stats(
@@ -1115,5 +1403,40 @@ mod tests {
         assert!(parse_os_conditions(&json!({})).is_none());
         // Present-but-empty sub-arrays should not produce a filter either.
         assert!(parse_os_conditions(&json!({"and": [], "or": []})).is_none());
+    }
+
+    #[test]
+    fn item_level_rejections_are_retryable_but_real_errors_are_not() {
+        // Load shedding shows up two ways: an explicit 429 status on the item...
+        assert!(item_is_retryable(&json!({"index": {"status": 429}})));
+        // ...or the exception type, which is what OpenSearch actually returns
+        // when the write queue is full or the circuit breaker trips.
+        for t in [
+            "es_rejected_execution_exception",
+            "circuit_breaking_exception",
+            "cluster_block_exception",
+        ] {
+            assert!(
+                item_is_retryable(&json!({"index": {"status": 503, "error": {"type": t}}})),
+                "{t} should be retryable"
+            );
+        }
+        // A bad document is NOT retryable — resending it forever cannot help.
+        assert!(!item_is_retryable(
+            &json!({"index": {"status": 400, "error": {"type": "mapper_parsing_exception"}}})
+        ));
+        assert!(!item_is_retryable(&json!({"index": {"status": 201}})));
+        assert!(!item_is_retryable(&json!({})));
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        // Guards the shift: attempt is clamped so 1u64 << attempt cannot overflow,
+        // and the delay is capped so a long stall cannot sleep for hours.
+        let d = |a: u32| 500u64.saturating_mul(1u64 << a.min(6)).min(30_000);
+        assert_eq!(d(0), 500);
+        assert_eq!(d(3), 4_000);
+        assert_eq!(d(6), 30_000);
+        assert_eq!(d(50), 30_000, "must not overflow or exceed the cap");
     }
 }
