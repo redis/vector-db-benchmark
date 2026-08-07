@@ -9,7 +9,7 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 | **Redis** (RediSearch) | `redis` 1.3 | Redis protocol | L2, Cosine, IP | Yes |
 | **VectorSets** | `redis` 1.3 | Redis protocol | L2, Cosine | Yes |
 | **Elasticsearch** | `elasticsearch` 8.15 | HTTP/REST | L2, Cosine | Yes |
-| **OpenSearch** | `opensearch` 2.4 | HTTP/REST | L2, Cosine | Yes |
+| **OpenSearch** | `opensearch` 2.4 | HTTP/REST | L2, Cosine | Yes [\*\*\*\*\*\*\*](#opensearch-note) |
 | **Qdrant** | `qdrant-client` 1.18 | gRPC | L2, Cosine, Dot | Yes |
 | **PgVector** | `postgres` 0.19 + `pgvector` 0.4 | PostgreSQL | L2, Cosine | Yes |
 | **Weaviate** | `tonic` 0.12 / `prost` 0.13 (gRPC) + `reqwest` (REST) | gRPC (search) + HTTP/REST (schema) [\*\*](#weaviate-protocol-note) | L2, Cosine, Dot | Yes |
@@ -39,6 +39,27 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 
 <a id="kividb-note"></a>
 \*\*\*\*\*\* **KiviDB note:** [KiviDB](https://kividb.io) is a Redis-wire-compatible (RESP2) data store that implements a RediSearch-compatible `FT.*` subset (`FT.CREATE`/`FT.SEARCH`/`FT.INFO`/`FT.DROPINDEX`, `VECTOR` HNSW/FLAT, `*=>[KNN k @field $blob AS score]`). Supports **vector KNN + metadata filtering** exactly like Redis/Valkey/Dragonfly: TAG/NUMERIC/TEXT datatypes, `match`/`match_any`/`range`, and AND/OR/nested boolean. **GEO** is not supported — unlike Dragonfly (which has a GEO field type but rejects this tool's `$param` geo bounds at the query-parser level), KiviDB's schema has no GEO field type at all, so geo fields are never declared or filtered (like Chroma/Milvus). KiviDB's `FT.CREATE` supports only the **float32** vector type. One real protocol difference worth knowing: KiviDB's `FT.INFO` does not expose RediSearch's `num_docs`/`percent_indexed` — it reports HNSW graph state directly instead (`hnsw_live_count`, `hnsw_compaction_in_progress`), because it builds each vector's HNSW entry synchronously inside the `HSET` that stores it (no async backfill phase exists to report progress on); `wait_for_indexing` polls those fields instead and returns immediately as a result. RESP2 only (no RESP3 opt-in). Set the host port with `KIVIDB_PORT` (default `6379`).
+
+<a id="opensearch-note"></a>
+\*\*\*\*\*\*\* **OpenSearch note:** Connection is set with `OPENSEARCH_PORT` (default `9200`), `OPENSEARCH_INDEX` (default `bench`), `OPENSEARCH_TIMEOUT` seconds (default `300`), and `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD`.
+
+**Shard count** is read from `collection_params.number_of_shards`. Leave it unset to inherit the cluster default — but note that default is **1 on open-source OpenSearch and historically 5 on Amazon OpenSearch Service**, and shard count materially changes vector indexing speed and precision, so a run that leaves it unset is not comparable across engine versions or deployments. `elasticsearch.rs` pins `number_of_shards: 1`, so pin it here too for an apples-to-apples ES-vs-OS comparison. The effective value is printed per config (`OpenSearch: HNSW { … }, number_of_shards: 5|cluster-default`), and a present-but-non-integer value is a hard error rather than a silent fallback to the default.
+
+**Retries against a managed domain.** Amazon OpenSearch Service returns states an open-source single-node cluster never produces: HTTP 429 on bulk (its `knn.algo_param.index_thread_qty` defaults to 1, so HNSW graph building is single-threaded and cannot drain as fast as a parallel uploader pushes), 400 `snapshot_in_progress_exception` on delete (automated snapshots cannot be disabled), 503 `process_cluster_event_timeout_exception` on create, and 502/504 from the front door on force-merge. All four paths retry with jittered exponential backoff, tunable with:
+
+| Variable | Default | Applies to |
+|---|---|---|
+| `OPENSEARCH_BULK_MAX_RETRIES` | `8` | bulk upload |
+| `OPENSEARCH_BULK_RETRY_BASE_MS` | `500` | bulk upload |
+| `OPENSEARCH_INDEX_OP_MAX_RETRIES` | `10` | create / delete / refresh / force-merge |
+| `OPENSEARCH_INDEX_OP_RETRY_BASE_MS` | `2000` | create / delete / refresh / force-merge |
+| `OPENSEARCH_SEARCH_MAX_RETRIES` | `5` | search |
+| `OPENSEARCH_SEARCH_RETRY_BASE_MS` | `50` | search |
+| `OPENSEARCH_SEARCH_RETRY_BUDGET_MS` | `2000` | search (total wall-clock ceiling per query) |
+
+Search retries are deliberately short and additionally bounded by a wall-clock budget, because a single transport attempt can block for `OPENSEARCH_TIMEOUT`. **Backoff is excluded from the reported latency**: a retried query is billed only for the attempt that produced its result, so the percentiles stay comparable with engines that do not retry. Queries that needed a retry are counted and reported separately (`⚠ N of M search queries succeeded only after a retry`), since clean latency figures would otherwise hide that the server was shedding load.
+
+Dropped queries are handled uniformly across all engines, not here: `failed_queries` is recorded in the results JSON and warned about, and `--fail-on-dropped-queries` makes it fatal. See that flag's help for why it is off by default.
 
 <details>
 <summary><b>Runbook: benchmarking against Vertex AI</b></summary>

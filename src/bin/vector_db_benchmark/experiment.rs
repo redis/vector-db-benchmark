@@ -460,6 +460,9 @@ fn run_single_experiment(
     // AFTER server-metadata snapshot (taken once all reps complete) can be
     // embedded alongside the BEFORE snapshot in every file.
     let mut pending_saves: Vec<(usize, SearchParams, crate::engine::SearchResults)> = Vec::new();
+    // Configs that lost queries, collected so --fail-on-dropped-queries can fail
+    // the run *after* every result file is written rather than instead of it.
+    let mut dropped_query_failures: Vec<String> = Vec::new();
     let skip_vector_index = args.skip_vector_index;
 
     if !args.skip_search {
@@ -795,6 +798,16 @@ fn run_single_experiment(
                                 results.requested_queries,
                                 results.num_queries,
                             );
+                            // Under --fail-on-dropped-queries the run must not end
+                            // green, but the abort is deferred to after the results
+                            // are written below. Returning here would discard every
+                            // config already in `pending_saves` — a whole sweep lost
+                            // to one shed query in its last config, which is the
+                            // cascade this guard is supposed to prevent, not cause.
+                            dropped_query_failures.push(format!(
+                                "search #{}: {}/{} queries dropped",
+                                search_id, results.failed_queries, results.requested_queries
+                            ));
                         }
                         if let Some(target_qps) = results.target_qps {
                             println!(
@@ -878,6 +891,21 @@ fn run_single_experiment(
             server_metadata_after.as_ref(),
             args.dump_raw_latencies,
         )?;
+    }
+
+    // Now that the evidence is on disk, honour --fail-on-dropped-queries. Every
+    // engine drops a failed query from the latency/recall vectors, so this gate is
+    // engine-agnostic by construction: it reads the `failed_queries` that
+    // `compute_search_stats` derives for all of them.
+    if args.fail_on_dropped_queries && !dropped_query_failures.is_empty() {
+        return Err(format!(
+            "{} search config(s) lost queries and --fail-on-dropped-queries is set: {}. \
+             Recall/latency for these cover the surviving subset only, which biases recall \
+             upward. Results were still written; re-run with less load, or drop the flag to \
+             accept a partial run.",
+            dropped_query_failures.len(),
+            dropped_query_failures.join("; ")
+        ));
     }
 
     // Display precision summary and save summary JSON

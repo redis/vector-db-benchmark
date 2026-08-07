@@ -73,6 +73,28 @@ pub struct Args {
     )]
     pub exit_on_error: bool,
 
+    /// Fail the run if any search query was dropped, instead of only warning.
+    ///
+    /// Dropped queries never reach the latency/recall vectors, so the reported
+    /// figures cover the surviving subset only — and because a server sheds load
+    /// exactly when it is busy, the survivors are the cheaper queries and recall
+    /// is biased upward. `failed_queries` is always recorded and warned about
+    /// (see `SearchResults::failed_queries`); this makes it fatal for runs whose
+    /// numbers are going to be published, so a partial result cannot be quoted by
+    /// accident. Off by default: a partial run still carries the strongest
+    /// available overload signal, and discarding it loses that.
+    ///
+    /// Applies to every engine. Results files are still written before the run
+    /// fails, so the evidence survives.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    pub fail_on_dropped_queries: bool,
+
     /// Overall wall-clock budget in seconds: stop launching new experiments once
     /// total elapsed exceeds this (any in-flight experiment finishes). 0 disables.
     #[arg(long, default_value = "86400.0")]
@@ -195,6 +217,20 @@ mod tests {
         assert!(parse(&["--exit-on-error"]).exit_on_error, "bare → true");
         assert!(!parse(&["--exit-on-error", "false"]).exit_on_error);
         assert!(!parse(&["--exit-on-error=false"]).exit_on_error);
+    }
+
+    #[test]
+    fn fail_on_dropped_queries_defaults_off_and_accepts_all_forms() {
+        // Default OFF is load-bearing: a partial run still carries the strongest
+        // available overload signal, and flipping this default would turn every
+        // load-shedding run into no data at all.
+        assert!(
+            !parse(&[]).fail_on_dropped_queries,
+            "omitted → false (warn, don't fail)"
+        );
+        assert!(parse(&["--fail-on-dropped-queries"]).fail_on_dropped_queries);
+        assert!(parse(&["--fail-on-dropped-queries", "true"]).fail_on_dropped_queries);
+        assert!(!parse(&["--fail-on-dropped-queries=false"]).fail_on_dropped_queries);
     }
 
     #[test]
