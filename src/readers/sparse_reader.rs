@@ -178,6 +178,85 @@ pub fn write_sparse_matrix(path: &str, rows: &[SparseVector]) -> Result<(), Stri
     Ok(())
 }
 
+/// Read a binary k-NN ground-truth file (`results.gt`), the format shipped by
+/// the public `msmarco-sparse-*` datasets and produced by upstream's
+/// `knn_result_read`:
+///
+/// ```text
+/// [ n: u32 ][ d: u32 ]
+/// [ ids:    i32 × (n × d) ]
+/// [ scores: f32 × (n × d) ]
+/// ```
+///
+/// `n` is the query count and `d` the neighbours per query. Only the ids are
+/// returned — recall is computed from ids alone, and the scores block is
+/// engine-independent.
+///
+/// The file length MUST be exactly `8 + n*d*8`. A truncated or mis-declared file
+/// is rejected rather than read short: short ground truth silently DEFLATES
+/// measured recall, which is worse than a failed run.
+pub fn read_gt_neighbours(path: &str) -> Result<Vec<Vec<i64>>, String> {
+    let file = File::open(Path::new(path)).map_err(|e| format!("open {}: {}", path, e))?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut r = BufReader::new(file);
+
+    let mut header = [0u8; 8];
+    r.read_exact(&mut header)
+        .map_err(|e| format!("read {} header: {}", path, e))?;
+    let n = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let d = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+
+    let count = n
+        .checked_mul(d)
+        .ok_or_else(|| format!("ground-truth n*d overflow in {}", path))?;
+    // 4 bytes per id + 4 per score, plus the 8-byte header.
+    let expected = count
+        .checked_mul(8)
+        .and_then(|b| b.checked_add(8))
+        .ok_or_else(|| format!("ground-truth size overflow in {}", path))?;
+    if expected as u64 != file_len {
+        return Err(format!(
+            "ground-truth {} declares {} queries × {} neighbours ({} bytes) but the file is {} bytes",
+            path, n, d, expected, file_len
+        ));
+    }
+
+    let ids = read_u32_array(&mut r, count, file_len, i32::from_le_bytes)?;
+    Ok(ids
+        .chunks(d.max(1))
+        .take(n)
+        .map(|c| c.iter().map(|&i| i as i64).collect())
+        .collect())
+}
+
+/// Write a `results.gt` ground-truth file (used by tests / fixtures). Every row
+/// must have the same neighbour count, as the format stores a single `d`.
+pub fn write_gt_neighbours(path: &str, rows: &[Vec<i64>]) -> Result<(), String> {
+    use std::io::Write;
+    let d = rows.first().map(|r| r.len()).unwrap_or(0);
+    if rows.iter().any(|r| r.len() != d) {
+        return Err("ground-truth rows must all have the same length".to_string());
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(d as u32).to_le_bytes());
+    for row in rows {
+        for &id in row {
+            buf.extend_from_slice(&(id as i32).to_le_bytes());
+        }
+    }
+    // Scores are not read back, but the block must exist for the length check.
+    for row in rows {
+        for _ in row {
+            buf.extend_from_slice(&0f32.to_le_bytes());
+        }
+    }
+    let mut f = File::create(Path::new(path)).map_err(|e| e.to_string())?;
+    f.write_all(&buf).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +371,67 @@ mod tests {
         b.extend_from_slice(&nnz.to_le_bytes()); // index_pointer[0] == nnz
         let f = write_tmp(&b);
         assert!(read_sparse_matrix(f.path().to_str().unwrap()).is_err());
+    }
+
+    // ---- results.gt (binary ground truth) ----
+
+    #[test]
+    fn round_trips_gt_neighbours() {
+        let rows = vec![vec![7i64, 3, 11], vec![0, 1, 2]];
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_test_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        write_gt_neighbours(&path, &rows).unwrap();
+        let read = read_gt_neighbours(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read, rows);
+    }
+
+    #[test]
+    fn gt_empty_file_reads_as_no_queries() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u32.to_le_bytes()); // n = 0
+        b.extend_from_slice(&0u32.to_le_bytes()); // d = 0
+        let f = write_tmp(&b);
+        assert_eq!(
+            read_gt_neighbours(f.path().to_str().unwrap()).unwrap(),
+            Vec::<Vec<i64>>::new()
+        );
+    }
+
+    /// A header promising more neighbours than the file holds must Err. Reading
+    /// it short would silently deflate recall for every engine.
+    #[test]
+    fn gt_rejects_truncated_file() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u32.to_le_bytes()); // n = 2
+        b.extend_from_slice(&10u32.to_le_bytes()); // d = 10 -> needs 8 + 160 bytes
+        b.extend_from_slice(&1i32.to_le_bytes()); // only one id present
+        let f = write_tmp(&b);
+        let err = read_gt_neighbours(f.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("but the file is"), "unexpected error: {}", err);
+    }
+
+    /// A header whose n*d overflows must Err, not wrap or OOM.
+    #[test]
+    fn gt_rejects_size_overflow() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        let f = write_tmp(&b);
+        assert!(read_gt_neighbours(f.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn gt_writer_rejects_ragged_rows() {
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_ragged_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(write_gt_neighbours(&path, &[vec![1i64, 2], vec![3]]).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

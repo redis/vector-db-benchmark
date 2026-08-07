@@ -8,8 +8,8 @@ use crate::config::{datasets_dir, DatasetConfig};
 use crate::download;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
-    read_compound_data, read_compound_queries, read_hdf5_vectors, read_jsonl_queries,
-    read_jsonl_vectors, read_npy_vectors, read_sparse_matrix, SparseVector,
+    read_compound_data, read_compound_queries, read_gt_neighbours, read_hdf5_vectors,
+    read_jsonl_queries, read_jsonl_vectors, read_npy_vectors, read_sparse_matrix, SparseVector,
 };
 
 /// Dataset wrapper that provides access to vectors and metadata
@@ -221,8 +221,19 @@ impl Dataset {
         Ok((ids, vectors))
     }
 
-    /// Read sparse queries from `<dir>/queries.csr` and ground-truth neighbours
-    /// from `<dir>/neighbours.jsonl` (one JSON array of ids per line).
+    /// Read sparse queries from `<dir>/queries.csr` plus ground-truth neighbours.
+    ///
+    /// Two ground-truth layouts are accepted, because the public sparse datasets
+    /// and our generated fixtures differ:
+    ///
+    /// * `neighbours.jsonl` — one JSON array of ids per line (our generator, and
+    ///   the layout the dense/compound readers already use).
+    /// * `results.gt` — the binary `n × d` ids+scores block shipped by the
+    ///   `msmarco-sparse-*` datasets.
+    ///
+    /// `neighbours.jsonl` wins when both exist, so a locally regenerated fixture
+    /// overrides a downloaded one. Neither present is an error naming both, since
+    /// searching without ground truth would report a meaningless recall.
     pub fn read_sparse_queries(&self) -> Result<(Vec<SparseVector>, Vec<Vec<i64>>), String> {
         let dir = self.get_path()?;
         let queries = read_sparse_matrix(
@@ -231,13 +242,25 @@ impl Dataset {
                 .ok_or("Invalid queries.csr path")?,
         )?;
 
-        let gt_path = dir.join("neighbours.jsonl");
-        let neighbours: Vec<Vec<i64>> = std::fs::read_to_string(&gt_path)
-            .map_err(|e| format!("read {}: {}", gt_path.display(), e))?
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str::<Vec<i64>>(l).map_err(|e| e.to_string()))
-            .collect::<Result<_, _>>()?;
+        let jsonl_path = dir.join("neighbours.jsonl");
+        let gt_path = dir.join("results.gt");
+        let neighbours: Vec<Vec<i64>> = if jsonl_path.exists() {
+            std::fs::read_to_string(&jsonl_path)
+                .map_err(|e| format!("read {}: {}", jsonl_path.display(), e))?
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str::<Vec<i64>>(l).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?
+        } else if gt_path.exists() {
+            read_gt_neighbours(gt_path.to_str().ok_or("Invalid results.gt path")?)?
+        } else {
+            return Err(format!(
+                "no ground truth for sparse dataset {}: expected {} or {}",
+                self.config.name,
+                jsonl_path.display(),
+                gt_path.display()
+            ));
+        };
         Ok((queries, neighbours))
     }
 
@@ -414,7 +437,9 @@ fn read_neighbours_strict(path: &std::path::Path) -> Result<Vec<Vec<i64>>, Strin
 mod tests {
     use super::*;
     use crate::config::DatasetConfig;
-    use vector_db_benchmark::readers::{write_npy_vectors, write_sparse_matrix};
+    use vector_db_benchmark::readers::{
+        write_gt_neighbours, write_npy_vectors, write_sparse_matrix,
+    };
 
     /// Build a `Dataset` whose `path` is an absolute temp dir (so `get_path`
     /// resolves to it directly — `datasets_dir().join(abs)` == `abs`).
@@ -484,6 +509,72 @@ mod tests {
         assert_eq!(dq, dense_q);
         assert_eq!(sq, sparse_q);
         assert_eq!(nb, vec![vec![0i64, 1]]);
+    }
+
+    /// Build a sparse `Dataset` rooted at an absolute temp dir.
+    fn sparse_dataset(dir: &std::path::Path) -> Dataset {
+        let mut cfg = hybrid_dataset(dir).config;
+        cfg.name = "sparse-unit".to_string();
+        cfg.dataset_type = Some("sparse".to_string());
+        Dataset::new(cfg)
+    }
+
+    /// The public `msmarco-sparse-*` datasets ship binary `results.gt` rather
+    /// than `neighbours.jsonl`; both layouts must read.
+    #[test]
+    fn reads_sparse_ground_truth_from_results_gt() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let queries = vec![SparseVector {
+            indices: vec![0, 4],
+            values: vec![1.0, 2.0],
+        }];
+        write_sparse_matrix(p.join("queries.csr").to_str().unwrap(), &queries).unwrap();
+        write_gt_neighbours(p.join("results.gt").to_str().unwrap(), &[vec![9i64, 4, 1]]).unwrap();
+
+        let (q, nb) = sparse_dataset(p).read_sparse_queries().unwrap();
+        assert_eq!(q, queries);
+        assert_eq!(nb, vec![vec![9i64, 4, 1]]);
+    }
+
+    /// A regenerated local fixture must win over a downloaded binary one.
+    #[test]
+    fn sparse_neighbours_jsonl_takes_precedence_over_results_gt() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_sparse_matrix(
+            p.join("queries.csr").to_str().unwrap(),
+            &[SparseVector {
+                indices: vec![0],
+                values: vec![1.0],
+            }],
+        )
+        .unwrap();
+        write_gt_neighbours(p.join("results.gt").to_str().unwrap(), &[vec![7i64]]).unwrap();
+        std::fs::write(p.join("neighbours.jsonl"), "[42]\n").unwrap();
+
+        let (_, nb) = sparse_dataset(p).read_sparse_queries().unwrap();
+        assert_eq!(nb, vec![vec![42i64]]);
+    }
+
+    /// No ground truth at all must fail loudly and name both candidates — a run
+    /// without ground truth would report a meaningless recall.
+    #[test]
+    fn sparse_without_any_ground_truth_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_sparse_matrix(
+            p.join("queries.csr").to_str().unwrap(),
+            &[SparseVector {
+                indices: vec![0],
+                values: vec![1.0],
+            }],
+        )
+        .unwrap();
+
+        let err = sparse_dataset(p).read_sparse_queries().unwrap_err();
+        assert!(err.contains("neighbours.jsonl"), "got: {}", err);
+        assert!(err.contains("results.gt"), "got: {}", err);
     }
 
     /// Helper: write the four hybrid data files (2 docs / 1 query) into `p`,
