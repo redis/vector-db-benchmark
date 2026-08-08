@@ -2,6 +2,7 @@
 //!
 //! Implements the Engine trait for Redis VectorSets (VADD/VSIM commands).
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -16,6 +17,7 @@ use super::redis_utils;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
+use vector_db_benchmark::parsers::datetime_to_epoch_secs;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 
 /// VectorSets engine configuration
@@ -27,6 +29,12 @@ pub struct VectorSetsConfig {
     pub cas: bool,
     pub batch_size: usize,
     pub parallel: usize,
+    /// Schema fields declared `datetime`, primed from the dataset schema. Their
+    /// ISO-8601 string values are stored as epoch-seconds NUMBERS on VADD so the
+    /// numeric VSIM range filter (`.ts >= <epoch>`) compares like with like.
+    /// `Arc`-wrapped because `VectorSetsConfig` is cloned into each upload
+    /// worker thread. Mirrors `redis::RedisEngineConfig::datetime_fields`.
+    pub datetime_fields: Arc<HashSet<String>>,
 }
 
 pub struct VectorSetsEngine {
@@ -94,6 +102,7 @@ impl VectorSetsEngine {
                 cas,
                 batch_size,
                 parallel,
+                datetime_fields: Arc::new(HashSet::new()),
             },
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             commandstats_baseline: None,
@@ -246,39 +255,11 @@ fn vadd_batch(
         }
 
         // Attach metadata as JSON attributes for FILTER support
-        if let Some(meta) = &metadata[i] {
-            if !meta.fields.is_empty() {
-                let mut map = serde_json::Map::new();
-                for (k, v) in &meta.fields {
-                    match v {
-                        MetadataValue::String(s) => {
-                            map.insert(k.clone(), serde_json::Value::String(s.clone()));
-                        }
-                        MetadataValue::Int(n) => {
-                            map.insert(k.clone(), serde_json::Value::from(*n));
-                        }
-                        MetadataValue::Float(f) => {
-                            map.insert(k.clone(), serde_json::json!(*f));
-                        }
-                        MetadataValue::Labels(labels) => {
-                            map.insert(
-                                k.clone(),
-                                serde_json::Value::Array(
-                                    labels
-                                        .iter()
-                                        .map(|l| serde_json::Value::String(l.clone()))
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        MetadataValue::Geo { lon, lat } => {
-                            map.insert(k.clone(), serde_json::json!({"lon": lon, "lat": lat}));
-                        }
-                    }
-                }
-                let json_str = serde_json::Value::Object(map).to_string();
-                cmd.arg("SETATTR").arg(json_str);
-            }
+        if let Some(json_str) = metadata[i]
+            .as_ref()
+            .and_then(|m| metadata_to_attr_json(config, m))
+        {
+            cmd.arg("SETATTR").arg(json_str);
         }
 
         pipe.add_command(cmd);
@@ -287,6 +268,69 @@ fn vadd_batch(
     pipe.query::<()>(conn)
         .map_err(|e| format!("VADD batch error: {}", e))?;
     Ok(())
+}
+
+/// Render one document's metadata as the JSON object attached by
+/// `VADD … SETATTR`, or `None` when there is nothing to attach. Shared by the
+/// upload batch and the mixed-workload update path so BOTH store the identical
+/// representation (notably datetime → epoch seconds, see [`encode_string_attr`]).
+fn metadata_to_attr_json(config: &VectorSetsConfig, meta: &MetadataItem) -> Option<String> {
+    if meta.fields.is_empty() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    for (k, v) in &meta.fields {
+        let value = match v {
+            MetadataValue::String(s) => encode_string_attr(config, k, s),
+            MetadataValue::Int(n) => serde_json::Value::from(*n),
+            MetadataValue::Float(f) => serde_json::json!(*f),
+            MetadataValue::Labels(labels) => serde_json::Value::Array(
+                labels
+                    .iter()
+                    .map(|l| serde_json::Value::String(l.clone()))
+                    .collect(),
+            ),
+            MetadataValue::Geo { lon, lat } => serde_json::json!({"lon": lon, "lat": lat}),
+        };
+        map.insert(k.clone(), value);
+    }
+    Some(serde_json::Value::Object(map).to_string())
+}
+
+/// Render a string metadata field as the JSON attribute value stored by
+/// `VADD … SETATTR`.
+///
+/// A field the dataset schema declares `datetime` carries an ISO-8601 string
+/// (e.g. `"2021-04-11T00:00:00+00:00"`), but VSIM `FILTER` has no date type and
+/// its comparison operators are NUMERIC — so the value is stored as an
+/// epoch-seconds NUMBER, exactly what [`build_range_clause`] emits for an ISO
+/// bound. Storing the ISO string instead would make every datetime range filter
+/// match nothing. Mirrors `redis::encode_string_field` (and milvus/chroma, which
+/// likewise store datetimes as epoch ints). A value that is not parseable as a
+/// datetime (already an epoch, or a non-datetime field) is stored verbatim.
+fn encode_string_attr(config: &VectorSetsConfig, key: &str, value: &str) -> serde_json::Value {
+    if config.datetime_fields.contains(key) {
+        if let Some(epoch) = datetime_to_epoch_secs(value) {
+            return serde_json::Value::from(epoch as i64);
+        }
+    }
+    serde_json::Value::String(value.to_string())
+}
+
+/// Collect the schema field names typed `datetime`. Pure so it can be primed
+/// from `configure()` (upload path) and from `search()`/`search_mixed()` (the
+/// `--skip-upload` path, where `configure()` never runs) and unit-tested without
+/// a full `Dataset`. Mirrors `redis::prime_datetime_fields`.
+fn prime_datetime_fields(schema: Option<&serde_json::Value>) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Some(schema) = schema.and_then(|s| s.as_object()) {
+        for (field, ty) in schema {
+            if ty.as_str() == Some("datetime") {
+                set.insert(field.clone());
+            }
+        }
+    }
+    set
 }
 
 /// Encode a query vector to the FP32 little-endian blob VSIM expects.
@@ -397,39 +441,8 @@ fn vadd_single(
         cmd.arg("CAS");
     }
 
-    if let Some(meta) = metadata {
-        if !meta.fields.is_empty() {
-            let mut map = serde_json::Map::new();
-            for (k, v) in &meta.fields {
-                match v {
-                    MetadataValue::String(s) => {
-                        map.insert(k.clone(), serde_json::Value::String(s.clone()));
-                    }
-                    MetadataValue::Int(n) => {
-                        map.insert(k.clone(), serde_json::Value::from(*n));
-                    }
-                    MetadataValue::Float(f) => {
-                        map.insert(k.clone(), serde_json::json!(*f));
-                    }
-                    MetadataValue::Labels(labels) => {
-                        map.insert(
-                            k.clone(),
-                            serde_json::Value::Array(
-                                labels
-                                    .iter()
-                                    .map(|l| serde_json::Value::String(l.clone()))
-                                    .collect(),
-                            ),
-                        );
-                    }
-                    MetadataValue::Geo { lon, lat } => {
-                        map.insert(k.clone(), serde_json::json!({"lon": lon, "lat": lat}));
-                    }
-                }
-            }
-            let json_str = serde_json::Value::Object(map).to_string();
-            cmd.arg("SETATTR").arg(json_str);
-        }
+    if let Some(json_str) = metadata.and_then(|m| metadata_to_attr_json(config, m)) {
+        cmd.arg("SETATTR").arg(json_str);
     }
 
     cmd.query::<()>(conn)
@@ -445,7 +458,12 @@ impl Engine for VectorSetsEngine {
         &self.search_params
     }
 
-    fn configure(&mut self, _dataset: &Dataset) -> Result<(), String> {
+    fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // Record which schema fields are `datetime` so upload stores them as
+        // epoch seconds (see `encode_string_attr`).
+        self.config.datetime_fields =
+            Arc::new(prime_datetime_fields(dataset.config.schema.as_ref()));
+
         let mut conn = self.get_connection()?;
 
         println!(
@@ -524,6 +542,10 @@ impl Engine for VectorSetsEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // Re-prime for the `--skip-upload` path, where `configure()` never ran
+        // (the mixed harness re-uploads/updates docs from `search_mixed`).
+        self.config.datetime_fields =
+            Arc::new(prime_datetime_fields(dataset.config.schema.as_ref()));
         let ef = params
             .search_params
             .as_ref()
@@ -763,6 +785,10 @@ impl Engine for VectorSetsEngine {
         num_queries: i64,
         ratio: &UpdateSearchRatio,
     ) -> Result<SearchResults, String> {
+        // Mixed re-VADDs documents, so the datetime→epoch encoding must be primed
+        // here too (this path also runs under `--skip-upload`).
+        self.config.datetime_fields =
+            Arc::new(prime_datetime_fields(dataset.config.schema.as_ref()));
         let ef = params
             .search_params
             .as_ref()
@@ -1065,7 +1091,15 @@ fn build_filter_expression(conditions: &serde_json::Value) -> Option<String> {
     if obj.is_empty() {
         return None;
     }
+    build_group(obj)
+}
 
+/// Build one boolean GROUP (a `{and:[…], or:[…]}` object) into a VSIM FILTER
+/// sub-expression: `and` entries joined by `and`, `or` entries joined by `or`
+/// inside parentheses, the two then ANDed. Recursive — an entry inside `and`/`or`
+/// may itself be a group, so this and [`build_clauses`] call each other. Mirrors
+/// `redis::build_group` / `build_subfilters`.
+fn build_group(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     let and_entries = obj.get("and").and_then(|v| v.as_array());
     let or_entries = obj.get("or").and_then(|v| v.as_array());
 
@@ -1096,6 +1130,18 @@ fn build_clauses(entries: &[serde_json::Value]) -> Vec<String> {
     let mut clauses = Vec::new();
     for entry in entries {
         if let Some(entry_obj) = entry.as_object() {
+            // Nested GROUP: an entry carrying an `and`/`or` key is a sub-tree,
+            // not a field leaf. Recurse and keep it as ONE parenthesised clause
+            // so `{"or":[{"and":[…]},{"and":[…]}]}` keeps its shape. Without this
+            // arm the entry matched no field leaf, every clause was dropped, and
+            // a nested condition left VSIM with NO FILTER — a full unfiltered
+            // search (same silent-wrong class as the datetime bug, issue #220).
+            if entry_obj.contains_key("and") || entry_obj.contains_key("or") {
+                if let Some(expr) = build_group(entry_obj) {
+                    clauses.push(format!("({})", expr));
+                }
+                continue;
+            }
             for (field_name, field_filters) in entry_obj {
                 if let Some(filter_obj) = field_filters.as_object() {
                     for (condition_type, criteria) in filter_obj {
@@ -1245,20 +1291,14 @@ fn never_match_clause(field_name: &str) -> String {
 fn build_range_clause(field_name: &str, criteria: &serde_json::Value) -> Option<String> {
     let mut parts = Vec::new();
 
-    // Only numeric bounds constrain the range; a null/non-numeric bound carries no
-    // constraint and is skipped (matching redis/valkey/qdrant/es/os/weaviate/milvus/
-    // pgvector) — otherwise `format_number` would fall back to "0" and emit `.n > 0`.
-    if let Some(gt) = criteria.get("gt").filter(|v| v.is_number()) {
-        parts.push(format!(".{} > {}", field_name, format_number(gt)));
-    }
-    if let Some(gte) = criteria.get("gte").filter(|v| v.is_number()) {
-        parts.push(format!(".{} >= {}", field_name, format_number(gte)));
-    }
-    if let Some(lt) = criteria.get("lt").filter(|v| v.is_number()) {
-        parts.push(format!(".{} < {}", field_name, format_number(lt)));
-    }
-    if let Some(lte) = criteria.get("lte").filter(|v| v.is_number()) {
-        parts.push(format!(".{} <= {}", field_name, format_number(lte)));
+    // Only representable bounds constrain the range; a null / non-numeric,
+    // non-datetime bound carries no constraint and is skipped (matching
+    // redis/valkey/qdrant/es/os/weaviate/milvus/pgvector) — otherwise
+    // `number_literal` would have to invent a "0" and emit `.n > 0`.
+    for (key, op) in [("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<=")] {
+        if let Some(lit) = criteria.get(key).and_then(number_literal) {
+            parts.push(format!(".{} {} {}", field_name, op, lit));
+        }
     }
 
     if parts.is_empty() {
@@ -1268,13 +1308,35 @@ fn build_range_clause(field_name: &str, criteria: &serde_json::Value) -> Option<
     }
 }
 
-fn format_number(value: &serde_json::Value) -> String {
+/// Render a range bound as a VSIM numeric literal.
+///
+/// VSIM `FILTER` comparison operators are NUMERIC — there is no date type — so an
+/// ISO-8601 / RFC-3339 bound is converted to epoch seconds, the same
+/// representation `encode_string_attr` stores for a `datetime` schema field. A
+/// numeric string is passed through as a number too (so a raw-epoch bound works).
+/// Mirrors `valkey::number_literal` / `redis::insert_number_param`, both of which
+/// route through the shared `parsers::datetime_to_epoch_secs`.
+///
+/// Without the datetime arm BOTH bounds of a `{"gte":"<iso>","lt":"<iso>"}` range
+/// were dropped, `build_range_clause` returned `None`, and VSIM ran with NO
+/// `FILTER` argument — a full unfiltered search scored against filtered ground
+/// truth (issue #220; 1 in 4 queries of the shipped `synthetic-filter-32`).
+fn number_literal(value: &serde_json::Value) -> Option<String> {
     if let Some(i) = value.as_i64() {
-        i.to_string()
+        Some(i.to_string())
     } else if let Some(f) = value.as_f64() {
-        f.to_string()
+        Some(f.to_string())
+    } else if let Some(s) = value.as_str() {
+        if let Some(epoch) = datetime_to_epoch_secs(s) {
+            // Epoch is whole seconds — emit as an integer literal.
+            Some((epoch as i64).to_string())
+        } else if s.parse::<f64>().is_ok() {
+            Some(s.to_string())
+        } else {
+            None
+        }
     } else {
-        "0".to_string()
+        None
     }
 }
 
@@ -1367,8 +1429,12 @@ mod vsim_parse_tests {
 
 #[cfg(test)]
 mod filter_expr_tests {
-    use super::build_filter_expression;
+    use super::{
+        build_filter_expression, encode_string_attr, prime_datetime_fields, VectorSetsConfig,
+    };
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::Arc;
 
     // ── scalar match / range (grammar baseline) ──
 
@@ -1630,6 +1696,130 @@ mod filter_expr_tests {
         // A non-scalar (array) value matches no scalar arm → clause dropped → None.
         assert!(
             build_filter_expression(&json!({"and":[{"n":{"match":{"value":[1,2]}}}]})).is_none()
+        );
+    }
+
+    // ── issue #220: datetime range bounds ──────────────────────────────────
+
+    #[test]
+    fn range_iso_datetime_bounds_become_epoch_seconds() {
+        // Both bounds used to be rejected by `.filter(|v| v.is_number())`, so the
+        // whole clause was None and VSIM ran with NO FILTER (full unfiltered
+        // search scored against filtered ground truth). Now each ISO bound is
+        // converted to epoch seconds, matching how upload stores the attribute.
+        assert_eq!(
+            range_expr(json!({"gte":"2021-04-11T00:00:00+00:00","lt":"2021-10-28T00:00:00+00:00"}))
+                .unwrap(),
+            ".n >= 1618099200 and .n < 1635379200"
+        );
+    }
+
+    #[test]
+    fn range_epoch_string_bound_passes_through() {
+        // A raw-epoch string bound is a valid numeric literal (mirrors
+        // valkey::number_literal), so it is NOT dropped either.
+        assert_eq!(
+            range_expr(json!({"gte":"1609459200"})).unwrap(),
+            ".n >= 1609459200"
+        );
+    }
+
+    #[test]
+    fn range_non_datetime_string_bound_is_skipped() {
+        // An unparseable string still carries no constraint → clause skipped.
+        assert!(range_expr(json!({"gte":"not-a-date"})).is_none());
+    }
+
+    #[test]
+    fn datetime_range_condition_emits_a_filter() {
+        // End-to-end shape of the shipped synthetic-filter-32 datetime query.
+        assert_eq!(
+            build_filter_expression(&json!({"and":[
+                {"ts":{"range":{"gte":"2021-01-01T00:00:00Z","lt":"2021-01-02T00:00:00Z"}}}
+            ]})),
+            Some(".ts >= 1609459200 and .ts < 1609545600".to_string())
+        );
+    }
+
+    #[test]
+    fn datetime_schema_field_is_stored_as_epoch_number() {
+        // Upload MUST store the same representation the filter compares against;
+        // an ISO string attribute would never satisfy `.ts >= <epoch>`.
+        let mut config = test_config();
+        config.datetime_fields = Arc::new(HashSet::from(["ts".to_string()]));
+        assert_eq!(
+            encode_string_attr(&config, "ts", "2021-01-01T00:00:00Z"),
+            json!(1609459200i64)
+        );
+        // Non-datetime field → verbatim string.
+        assert_eq!(
+            encode_string_attr(&config, "color", "2021-01-01T00:00:00Z"),
+            json!("2021-01-01T00:00:00Z")
+        );
+        // Datetime-typed field holding a non-ISO value → verbatim (already epoch).
+        assert_eq!(
+            encode_string_attr(&config, "ts", "1609459200"),
+            json!("1609459200")
+        );
+    }
+
+    #[test]
+    fn prime_datetime_fields_selects_only_datetime_schema_fields() {
+        let schema = json!({"ts":"datetime","price":"int","brand":"keyword"});
+        let got = prime_datetime_fields(Some(&schema));
+        assert_eq!(got, HashSet::from(["ts".to_string()]));
+        assert!(prime_datetime_fields(None).is_empty());
+    }
+
+    fn test_config() -> VectorSetsConfig {
+        VectorSetsConfig {
+            quant: "NOQUANT".to_string(),
+            m: 16,
+            ef_construction: 200,
+            cas: true,
+            batch_size: 64,
+            parallel: 1,
+            datetime_fields: Arc::new(HashSet::new()),
+        }
+    }
+
+    // ── issue #220 follow-on: nested boolean groups ────────────────────────
+
+    #[test]
+    fn nested_or_of_and_groups_keeps_its_shape() {
+        // `(color == red AND size >= 50) OR (color == blue AND size < 10)`.
+        // Each `{"and":[…]}` entry used to match no field leaf → every clause
+        // dropped → None → VSIM ran UNFILTERED.
+        let cond = json!({"or":[
+            {"and":[{"color":{"match":{"value":"red"}}},{"size":{"range":{"gte":50}}}]},
+            {"and":[{"color":{"match":{"value":"blue"}}},{"size":{"range":{"lt":10}}}]},
+        ]});
+        assert_eq!(
+            build_filter_expression(&cond),
+            Some(
+                "((.color == \"red\" and .size >= 50) or (.color == \"blue\" and .size < 10))"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn flat_condition_string_is_unchanged_by_the_nesting_support() {
+        // Regression guard: adding the recursion must not perturb the flat
+        // top-level emission (no extra parentheses).
+        assert_eq!(
+            build_filter_expression(&json!({"and":[
+                {"brand":{"match":{"value":"apple"}}},
+                {"price":{"range":{"gte":100}}},
+            ]})),
+            Some(".brand == \"apple\" and .price >= 100".to_string())
+        );
+        assert_eq!(
+            build_filter_expression(&json!({"or":[
+                {"brand":{"match":{"value":"apple"}}},
+                {"price":{"range":{"gte":100}}},
+            ]})),
+            Some("(.brand == \"apple\" or .price >= 100)".to_string())
         );
     }
 }

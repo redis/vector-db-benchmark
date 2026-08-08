@@ -754,6 +754,25 @@ pub fn write_datetime_project(
     engine_configs_json: &str,
     dim: usize,
 ) -> FilterProject {
+    write_datetime_project_metric(dataset_name, engine_configs_json, dim, GtMetric::L2)
+}
+
+/// Cosine-ground-truth variant of [`write_datetime_project`] for engines that
+/// rank by cosine similarity (VectorSets).
+pub fn write_datetime_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_datetime_project_metric(dataset_name, engine_configs_json, dim, GtMetric::Cosine)
+}
+
+fn write_datetime_project_metric(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    metric: GtMetric,
+) -> FilterProject {
     use chrono::{Duration, TimeZone, Utc};
     let base = Utc.timestamp_opt(1_609_459_200, 0).unwrap(); // 2021-01-01T00:00:00Z
     let iso_for = move |day: i64| (base + Duration::days(day)).to_rfc3339();
@@ -763,7 +782,7 @@ pub fn write_datetime_project(
         dataset_name,
         engine_configs_json,
         dim,
-        GtMetric::L2,
+        metric,
         serde_json::json!({ "ts": "datetime" }),
         move |id| serde_json::json!({ "ts": iso_for(id as i64) }),
         serde_json::json!({ "and": [ { "ts": { "range": { "gte": gte, "lt": lt } } } ] }),
@@ -894,11 +913,30 @@ pub fn write_nested_filter_project(
     engine_configs_json: &str,
     dim: usize,
 ) -> FilterProject {
+    write_nested_filter_project_metric(dataset_name, engine_configs_json, dim, GtMetric::L2)
+}
+
+/// Cosine-ground-truth variant of [`write_nested_filter_project`] for engines
+/// that rank by cosine similarity (VectorSets).
+pub fn write_nested_filter_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_nested_filter_project_metric(dataset_name, engine_configs_json, dim, GtMetric::Cosine)
+}
+
+fn write_nested_filter_project_metric(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    metric: GtMetric,
+) -> FilterProject {
     write_filter_project(
         dataset_name,
         engine_configs_json,
         dim,
-        GtMetric::L2,
+        metric,
         serde_json::json!({ "color": "keyword", "size": "int" }),
         move |id| {
             serde_json::json!({

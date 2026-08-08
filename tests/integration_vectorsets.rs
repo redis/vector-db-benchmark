@@ -187,6 +187,86 @@ fn test_binary_vectorsets_bool_filter() {
     );
 }
 
+/// End-to-end DATETIME range filter: `ts IN [day 100, day 300)` over ISO-8601
+/// bounds (issue #220). This is the regression test for a LIVE WRONG NUMBER: the
+/// range builder rejected every non-numeric bound, so both ISO bounds were
+/// dropped, the clause became `None`, and VSIM ran with **no FILTER argument** —
+/// a full UNFILTERED search scored against datetime-filtered ground truth. That
+/// failure returns plenty of results and no error, so this asserts RECALL (a
+/// "query succeeded" assertion would have passed against the bug — measured on a
+/// live redis:8.8.0: recall 0.520 unfiltered vs 1.000 fixed).
+///
+/// It pins BOTH halves of the fix, which must agree on the stored representation:
+/// upload writes the `datetime`-typed attribute as epoch seconds, and the filter
+/// emits epoch-second bounds. Reverting either half turns this test red.
+#[test]
+fn test_binary_vectorsets_datetime() {
+    wait_for_vectorsets();
+
+    let name = "vectorsets-dt";
+    let proj = common::write_datetime_cosine_project("vs-dt", &vectorsets_config(name), 8);
+    assert!(
+        proj.matching_docs >= proj.top,
+        "fixture must have >= top matching docs (got {})",
+        proj.matching_docs
+    );
+
+    let port = test_port().to_string();
+    assert!(
+        common::run_binary(
+            &proj.root,
+            name,
+            "vs-dt",
+            TEST_HOST,
+            &[("REDIS_PORT", port.as_str())],
+        ),
+        "vectorsets datetime run failed"
+    );
+
+    let recall = common::read_recall(&proj.root, name);
+    println!("vectorsets datetime range recall={:.3}", recall);
+    assert!(
+        recall >= 0.9,
+        "vectorsets datetime range recall {:.3} < 0.9 (ISO bounds dropped → unfiltered VSIM?)",
+        recall
+    );
+}
+
+/// End-to-end NESTED boolean group: `(color == red AND size >= 50) OR
+/// (color == blue AND size < 10)`. `build_clauses` had no `and`/`or` recursion
+/// branch, so each `{"and":[…]}` entry matched no field leaf, every clause was
+/// dropped and — exactly as with the datetime bug — VSIM ran UNFILTERED. Recall
+/// is the only detector: the unfiltered nearest neighbours differ from the
+/// ~120-doc nested set (measured live: 0.260 broken vs 1.000 fixed).
+#[test]
+fn test_binary_vectorsets_nested_filter() {
+    wait_for_vectorsets();
+
+    let name = "vectorsets-nested";
+    let proj = common::write_nested_filter_cosine_project("vs-nested", &vectorsets_config(name), 8);
+    assert!(proj.matching_docs >= proj.top);
+
+    let port = test_port().to_string();
+    assert!(
+        common::run_binary(
+            &proj.root,
+            name,
+            "vs-nested",
+            TEST_HOST,
+            &[("REDIS_PORT", port.as_str())],
+        ),
+        "vectorsets nested filter run failed"
+    );
+
+    let recall = common::read_recall(&proj.root, name);
+    println!("vectorsets nested filter recall={:.3}", recall);
+    assert!(
+        recall >= 0.9,
+        "vectorsets nested filter recall {:.3} < 0.9 (nested group dropped → unfiltered VSIM?)",
+        recall
+    );
+}
+
 /// End-to-end MIXED harness (`--update-search-ratio`) at `parallel: 4`: drives
 /// the VectorSets mixed path (VSIM search + VADD update) with a real multi-worker
 /// join-merge of the thread-local sample buffers. Cosine ground truth (VectorSets
