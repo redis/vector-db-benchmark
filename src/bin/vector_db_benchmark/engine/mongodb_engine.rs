@@ -19,6 +19,7 @@ use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
+use vector_db_benchmark::start_gate::WorkerPool;
 
 const DEFAULT_DB: &str = "bench";
 const DEFAULT_COLLECTION: &str = "vectors";
@@ -1387,16 +1388,13 @@ impl Engine for MongoDBEngine {
 
         let pb = self.create_progress_bar(num_to_run);
 
-        // Barrier-synchronized start so connection setup AND the cold first query
-        // fall OUTSIDE the measured window (mirrors the Redis/Vertex engines).
-        // Every worker connects + primes, then blocks on `ready`; the main thread
-        // stamps the shared start instant into `start_cell` and releases `go`, so
-        // the measurement clock starts only once all workers are warm and poised.
-        // A worker that fails to connect MUST still pass both barriers before
-        // returning, or the run would deadlock.
-        let ready = Arc::new(std::sync::Barrier::new(parallel + 1));
-        let go = Arc::new(std::sync::Barrier::new(parallel + 1));
-        let start_cell = Arc::new(std::sync::OnceLock::<Instant>::new());
+        // Gate-synchronized start so connection setup AND the cold first query
+        // fall OUTSIDE the measured window. Every worker connects + primes, then
+        // parks at the gate; `WorkerPool::start` stamps the shared start instant and
+        // releases everyone, so the measurement clock starts only once all workers
+        // are warm and poised. The gate is count-agnostic: a worker that fails to
+        // set up, panics, or is never started by the OS settles its ticket and turns
+        // the run into a hard error instead of a hang (#214).
 
         let uri = self.uri.clone();
         let db_name = self.db_name.clone();
@@ -1408,8 +1406,8 @@ impl Engine for MongoDBEngine {
         let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(parallel);
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "mongodb-search", parallel);
             for _ in 0..parallel {
                 let uri = uri.clone();
                 let db_name = db_name.clone();
@@ -1418,12 +1416,9 @@ impl Engine for MongoDBEngine {
                 let tops = &tops;
                 let pipelines = &pipelines;
                 let query_idx = Arc::clone(&query_idx);
-                let ready = Arc::clone(&ready);
-                let go = Arc::clone(&go);
-                let start_cell = Arc::clone(&start_cell);
                 let pb = &pb;
 
-                handles.push(s.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();
@@ -1433,10 +1428,11 @@ impl Engine for MongoDBEngine {
 
                     let client = match Client::with_uri_str(&uri) {
                         Ok(c) => c,
-                        Err(_) => {
-                            // Still cross both barriers so peers aren't stranded.
-                            ready.wait();
-                            go.wait();
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("mongodb-search worker setup failed: {e}"));
                             return (t, p, r, mr, nd);
                         }
                     };
@@ -1451,11 +1447,11 @@ impl Engine for MongoDBEngine {
                         let _ = send_search(&coll, prime_pipeline);
                     }
 
-                    // Signal "connected + primed", then block until the main thread
+                    // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
-                    ready.wait();
-                    go.wait();
-                    let _start_time = *start_cell.get().unwrap();
+                    let Some(_start_time) = ticket.arrive_and_wait() else {
+                        return (t, p, r, mr, nd);
+                    };
 
                     loop {
                         let idx = query_idx.fetch_add(1, Ordering::Relaxed);
@@ -1504,33 +1500,26 @@ impl Engine for MongoDBEngine {
                         pb.inc(pb_pending);
                     }
                     (t, p, r, mr, nd)
-                }));
+                })?;
             }
 
-            // All workers are connected + primed and waiting on `ready`. Stamp the
-            // shared start instant, then release everyone via `go` so the measured
-            // window excludes connection setup and the cold first query.
-            ready.wait();
-            let st = Instant::now();
-            start_cell.set(st).ok();
-            go.wait();
+            // Every worker is connected + primed and parked at the gate.
+            // Stamp the shared measurement start and release them together.
+            let (per_worker, measured_start) = pool.start()?;
 
-            for h in handles {
-                let (t, p, r, mr, nd) = h.join().unwrap();
+            for (t, p, r, mr, nd) in per_worker {
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
                 mrr_vals.extend(mr);
                 ndcg_vals.extend(nd);
             }
-        });
+            Ok(measured_start)
+        })?;
 
         pb.finish_and_clear();
         // total_time excludes connection setup and the cold first query.
-        let total_time = start_cell
-            .get()
-            .map(|st| st.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        let total_time = measured_start.elapsed().as_secs_f64();
 
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         crate::engine::compute_search_stats(

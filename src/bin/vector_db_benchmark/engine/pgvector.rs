@@ -18,6 +18,67 @@ use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{
     is_multivalued_keyword_field, MetadataItem, MetadataValue,
 };
+use vector_db_benchmark::start_gate::WorkerPool;
+
+/// Warn when `parallel` cannot fit in the server's connection budget.
+///
+/// Best effort: any failure to read the budget is silently ignored — this must
+/// never be the thing that stops a run.
+fn warn_if_over_connection_budget(conn_str: &str, parallel: usize) {
+    let Ok(mut client) = postgres::Client::connect(conn_str, postgres::NoTls) else {
+        return;
+    };
+    let scalar = |client: &mut postgres::Client, sql: &str| -> Option<i64> {
+        let row = client.query_one(sql, &[]).ok()?;
+        row.try_get::<_, String>(0).ok()?.parse().ok()
+    };
+    let Some(max_conns) = scalar(&mut client, "SHOW max_connections") else {
+        return;
+    };
+    let reserved = scalar(&mut client, "SHOW superuser_reserved_connections").unwrap_or(0);
+    let in_use: i64 = client
+        .query_one("SELECT count(*) FROM pg_stat_activity", &[])
+        .ok()
+        .and_then(|r| r.try_get(0).ok())
+        .unwrap_or(0);
+    // `in_use` counts this advisory connection, which is closed on return.
+    let available = (max_conns - reserved - in_use + 1).max(0);
+    if (parallel as i64) > available {
+        eprintln!(
+            "\t⚠ WARNING: parallel={parallel} exceeds this server's connection budget \
+             (max_connections={max_conns}, superuser_reserved={reserved}, {in_use} in use \
+             → {available} available). Each search worker holds one connection for the whole \
+             run, so the run will FAIL rather than quietly measure fewer workers. Raise \
+             max_connections or lower parallel."
+        );
+    }
+}
+
+/// Render a `postgres::Error` usefully.
+///
+/// `postgres::Error`'s own `Display` is the literal string `"db error"`; the
+/// server's message — `FATAL: sorry, too many clients already`, the single most
+/// likely reason a worker cannot connect at high `parallel` — lives in the
+/// `DbError` behind it. Without this, the whole diagnostic for a `parallel` that
+/// exceeds `max_connections` reads `36 failed setup: ... db error`.
+fn describe_pg_error(e: &postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let mut msg = format!("{}: {}", db.severity(), db.message());
+        if let Some(hint) = db.hint() {
+            msg.push_str(&format!(" (hint: {hint})"));
+        }
+        return msg;
+    }
+    // Not a server-side error (TLS, DNS, refused socket): walk the source chain,
+    // whose leaf carries the real cause.
+    let mut msg = e.to_string();
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(cause) = src {
+        msg.push_str(&format!(": {cause}"));
+        src = cause.source();
+    }
+    msg
+}
 
 /// Map a dataset schema field type to a Postgres column type. Returns None for
 /// types pgvector can't filter on with a plain scalar column (e.g. geo).
@@ -442,16 +503,25 @@ impl Engine for PgVectorEngine {
         let conn_str = self.connection_string();
         let distance_op = self.distance_op.clone();
 
-        // Barrier-synchronized start so per-worker connection setup AND the cold
-        // first query fall OUTSIDE the measured window (mirrors redis/vertex).
-        // Every worker connects + primes, then blocks on `ready`; the main thread
-        // stamps the shared start instant into `start_cell` and releases `go`, so
-        // the measurement clock starts only once all workers are warm and poised.
-        // A worker that fails to connect MUST still pass both barriers before
-        // returning, or the run would deadlock.
-        let ready = Arc::new(std::sync::Barrier::new(parallel + 1));
-        let go = Arc::new(std::sync::Barrier::new(parallel + 1));
-        let start_cell = Arc::new(std::sync::OnceLock::<Instant>::new());
+        // Every worker holds its own connection for the whole run, so `parallel`
+        // is a claim on the server's connection budget. Exceeding it used to
+        // publish a run labelled `parallel=N` that N-k workers actually ran; it
+        // is now a hard error, which is correct but opaque at the point of
+        // failure. Warn here, with the arithmetic, rather than leaving the
+        // operator to infer it from k identical "too many clients" strings.
+        //
+        // Advisory only: this is racy by construction, and a pooler in front of
+        // Postgres makes `max_connections` meaningless. The start gate remains
+        // the authority.
+        warn_if_over_connection_budget(&conn_str, parallel);
+
+        // Gate-synchronized start so connection setup AND the cold first query
+        // fall OUTSIDE the measured window. Every worker connects + primes, then
+        // parks at the gate; `WorkerPool::start` stamps the shared start instant and
+        // releases everyone, so the measurement clock starts only once all workers
+        // are warm and poised. The gate is count-agnostic: a worker that fails to
+        // set up, panics, or is never started by the OS settles its ticket and turns
+        // the run into a hard error instead of a hang (#214).
 
         let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
@@ -459,8 +529,8 @@ impl Engine for PgVectorEngine {
         let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(parallel);
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "pgvector-search", parallel);
             for _ in 0..parallel {
                 let conn_str = conn_str.clone();
                 let distance_op = distance_op.clone();
@@ -468,11 +538,9 @@ impl Engine for PgVectorEngine {
                 let neighbors = &neighbors;
                 let parsed_filters = &parsed_filters;
                 let query_idx = Arc::clone(&query_idx);
-                let ready = Arc::clone(&ready);
-                let go = Arc::clone(&go);
                 let pb = &pb;
 
-                handles.push(s.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();
@@ -481,10 +549,14 @@ impl Engine for PgVectorEngine {
 
                     let mut conn = match postgres::Client::connect(&conn_str, postgres::NoTls) {
                         Ok(c) => c,
-                        Err(_) => {
-                            // Still cross both barriers so peers aren't stranded.
-                            ready.wait();
-                            go.wait();
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!(
+                                "pgvector-search worker connect failed: {}",
+                                describe_pg_error(&e)
+                            ));
                             return (t, p, r, mr, nd);
                         }
                     };
@@ -532,10 +604,11 @@ impl Engine for PgVectorEngine {
                         let _ = conn.query(&prime_sql, &prime_params);
                     }
 
-                    // Signal "connected + primed", then block until the main thread
+                    // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
-                    ready.wait();
-                    go.wait();
+                    if ticket.arrive_and_wait().is_none() {
+                        return (t, p, r, mr, nd);
+                    }
 
                     loop {
                         let idx = query_idx.fetch_add(1, Ordering::Relaxed);
@@ -606,34 +679,27 @@ impl Engine for PgVectorEngine {
                         pb.inc(1);
                     }
                     (t, p, r, mr, nd)
-                }));
+                })?;
             }
 
-            // All workers spawned. Wait until every one is connected + primed,
-            // stamp the shared start instant, then release them together so the
-            // measurement clock excludes connection setup and the cold first query.
-            ready.wait();
-            let st = Instant::now();
-            start_cell.set(st).ok();
-            go.wait();
+            // Every worker is connected + primed and parked at the gate.
+            // Stamp the shared measurement start and release them together.
+            let (per_worker, measured_start) = pool.start()?;
 
-            for h in handles {
-                let (t, p, r, mr, nd) = h.join().unwrap();
+            for (t, p, r, mr, nd) in per_worker {
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
                 mrr_vals.extend(mr);
                 ndcg_vals.extend(nd);
             }
-        });
+            Ok(measured_start)
+        })?;
 
         pb.finish_and_clear();
         // total_time excludes connection setup and the cold first query: it is
-        // measured from the barrier release stamped into `start_cell`.
-        let total_time = start_cell
-            .get()
-            .map(|st| st.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        // measured from the gate release stamp.
+        let total_time = measured_start.elapsed().as_secs_f64();
 
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         crate::engine::compute_search_stats(
