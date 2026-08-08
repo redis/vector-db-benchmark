@@ -17,6 +17,7 @@ use turbopuffer_client::Client;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
 /// One upload batch: ids, their vectors, and optional per-item metadata.
@@ -202,7 +203,9 @@ fn to_turbopuffer_metric(distance: &str) -> &str {
 ///
 /// Turbopuffer filters look like:
 ///   ["And", [["field_name", "Eq", value], ...]]
-fn parse_turbopuffer_filter(conditions: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn parse_turbopuffer_filter(
+    conditions: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let obj = conditions.as_object()?;
 
     // Handle "and" / "or" top-level keys
@@ -506,10 +509,8 @@ impl Engine for TurbopufferEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<serde_json::Value>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_turbopuffer_filter))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<serde_json::Value>> =
+            conditions.resolve_all("Turbopuffer", parse_turbopuffer_filter)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {

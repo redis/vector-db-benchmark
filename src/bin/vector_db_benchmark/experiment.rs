@@ -367,6 +367,14 @@ pub fn run(args: &Args) -> Result<(), String> {
                 is_last_config,
                 number_of_shards.as_ref(),
             ) {
+                // Name the sweep point. Under `--exit-on-error false` this line
+                // is all the operator gets, and a bare engine-side message
+                // (e.g. a #219 filter refusal) cannot otherwise be traced back
+                // to the config/dataset pair that produced it.
+                let e = format!(
+                    "[config={} dataset={}] {}",
+                    engine_config.name, dataset_name, e
+                );
                 eprintln!("Experiment failed: {}", e);
                 if args.exit_on_error {
                     pb.finish_and_clear();

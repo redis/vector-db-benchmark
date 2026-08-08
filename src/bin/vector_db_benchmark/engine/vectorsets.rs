@@ -17,6 +17,7 @@ use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
 use vector_db_benchmark::parsers::datetime_to_epoch_secs;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 
 /// VectorSets engine configuration
@@ -553,10 +554,8 @@ impl Engine for VectorSetsEngine {
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
         // Pre-build filter expressions for each query
-        let filters: Vec<Option<String>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(build_filter_expression))
-            .collect();
+        let filters: Vec<QueryFilter<String>> =
+            conditions.resolve_all("VectorSets", build_filter_expression)?;
 
         // Precompute the encoded query blobs BEFORE the timed region so the
         // per-query window wraps ONLY the RPC round-trip + reply parse (matching
@@ -787,10 +786,8 @@ impl Engine for VectorSetsEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let filters: Vec<Option<String>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(build_filter_expression))
-            .collect();
+        let filters: Vec<QueryFilter<String>> =
+            conditions.resolve_all("VectorSets", build_filter_expression)?;
 
         // Read vectors for updates
         let normalize = dataset.needs_normalization();
@@ -1066,7 +1063,7 @@ impl Engine for VectorSetsEngine {
 //   .field == "value"   .field > 10   .field in ["a", "b"]
 
 /// Build a VectorSets FILTER expression from JSON conditions.
-fn build_filter_expression(conditions: &serde_json::Value) -> Option<String> {
+pub(crate) fn build_filter_expression(conditions: &serde_json::Value) -> Option<String> {
     let obj = conditions.as_object()?;
     if obj.is_empty() {
         return None;

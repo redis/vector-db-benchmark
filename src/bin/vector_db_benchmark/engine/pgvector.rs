@@ -14,6 +14,7 @@ use postgres::types::ToSql;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{
     is_multivalued_keyword_field, MetadataItem, MetadataValue,
 };
@@ -422,10 +423,8 @@ impl Engine for PgVectorEngine {
         // SQL text is stable per filter shape (values are `$N` placeholders, not
         // inlined), so the server reuses one prepared plan across queries in a
         // run. Filter placeholders start at $3 ($1 = query vector, $2 = LIMIT).
-        let parsed_filters: Vec<Option<(String, Vec<PgValue>)>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(|v| parse_pg_conditions(v, 3)))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<(String, Vec<PgValue>)>> =
+            conditions.resolve_all("pgvector", |v| parse_pg_conditions(v, 3))?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {
@@ -672,7 +671,7 @@ fn map_pg_distance_ops(distance: &str) -> Result<(&'static str, &'static str), S
 /// the server reuses one plan. Each variant owns its data and lends a
 /// `&(dyn ToSql + Sync)` for binding via `as_sql`.
 #[derive(Debug, Clone, PartialEq)]
-enum PgValue {
+pub(crate) enum PgValue {
     Text(String),
     Int(i64),
     Float(f64),
@@ -718,7 +717,7 @@ impl FilterBuilder {
 /// value takes (callers pass 3: $1 = query vector, $2 = LIMIT). The template
 /// text depends only on the filter *shape* (fields/operators), never on the
 /// values, so distinct queries in a run share one prepared statement.
-fn parse_pg_conditions(
+pub(crate) fn parse_pg_conditions(
     conditions: &serde_json::Value,
     first_param: usize,
 ) -> Option<(String, Vec<PgValue>)> {

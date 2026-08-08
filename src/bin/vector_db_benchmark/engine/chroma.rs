@@ -23,6 +23,7 @@ use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
 use vector_db_benchmark::parsers::datetime_to_epoch_secs;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 
 const DEFAULT_COLLECTION: &str = "benchmark";
@@ -376,7 +377,7 @@ fn combine(mut ops: Vec<serde_json::Value>, key: &str) -> Option<serde_json::Val
 /// Build a Chroma `where` document from the canonical `{and,or}` filter model.
 /// Recursive: an entry that is itself an `{and:[...]}`/`{or:[...]}` group nests
 /// natively via `$and`/`$or`.
-fn build_chroma_where(conditions: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn build_chroma_where(conditions: &serde_json::Value) -> Option<serde_json::Value> {
     let obj = conditions.as_object()?;
     if obj.is_empty() {
         return None;
@@ -496,7 +497,9 @@ fn build_chroma_leaf(
 /// text matches. NOTE: because `where` and `where_document` are separate query
 /// params that Chroma ANDs, a filter that ORs a text match with a metadata
 /// condition can't be expressed — such queries aren't emitted by our generators.
-fn build_chroma_where_document(conditions: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn build_chroma_where_document(
+    conditions: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let obj = conditions.as_object()?;
     let mut clauses = Vec::new();
     if let Some(items) = obj.get("and").and_then(|v| v.as_array()) {
@@ -624,13 +627,25 @@ impl Engine for ChromaEngine {
         let parallel = params.parallel.unwrap_or(1) as usize;
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let wheres: Vec<Option<serde_json::Value>> = conditions
+        // Chroma splits one filter tree across two query params it ANDs server
+        // side: metadata leaves go to `where`, full-text leaves to
+        // `where_document`. Either builder alone may legitimately produce
+        // nothing (a purely-text filter has no `where`), so the #219 guard is
+        // applied to the PAIR — only a filter that yields neither is a drop.
+        let filters: Vec<QueryFilter<(Option<serde_json::Value>, Option<serde_json::Value>)>> =
+            conditions.resolve_all("Chroma", |c| {
+                match (build_chroma_where(c), build_chroma_where_document(c)) {
+                    (None, None) => None,
+                    pair => Some(pair),
+                }
+            })?;
+        let wheres: Vec<Option<serde_json::Value>> = filters
             .iter()
-            .map(|c| c.as_ref().and_then(build_chroma_where))
+            .map(|f| f.as_ref().and_then(|(w, _)| w.clone()))
             .collect();
-        let where_docs: Vec<Option<serde_json::Value>> = conditions
+        let where_docs: Vec<Option<serde_json::Value>> = filters
             .iter()
-            .map(|c| c.as_ref().and_then(build_chroma_where_document))
+            .map(|f| f.as_ref().and_then(|(_, d)| d.clone()))
             .collect();
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
