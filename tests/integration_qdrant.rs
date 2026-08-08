@@ -692,6 +692,143 @@ fn test_binary_qdrant_match_any() {
     assert!(recall >= 0.9, "qdrant match_any recall {:.3} < 0.9", recall);
 }
 
+/// #222, server-side premise: an EMPTY `Filter` is MATCH-ALL, not "no matches"
+/// and not an error. This is why `parse_qdrant_conditions` must return `None`
+/// rather than `Some(Filter{must:[],should:[]})` when every leaf of an `and`
+/// group drops — sending that filter runs the query completely unconstrained
+/// while the code believes it filtered. Live-asserted so the premise cannot
+/// silently change under a Qdrant upgrade.
+#[test]
+fn test_qdrant_empty_filter_is_match_all() {
+    wait_for_qdrant();
+    delete_collection();
+
+    let (rt, client) = create_grpc_client();
+    use qdrant_client::qdrant::{
+        vectors_config::Config, Condition, CreateCollectionBuilder, Distance, FieldType, Filter,
+        PointStruct, SearchPointsBuilder, VectorParamsBuilder, VectorsConfig,
+    };
+
+    rt.block_on(
+        client.create_collection(CreateCollectionBuilder::new(COLLECTION).vectors_config(
+            VectorsConfig {
+                config: Some(Config::Params(
+                    VectorParamsBuilder::new(4, Distance::Euclid).build(),
+                )),
+            },
+        )),
+    )
+    .unwrap();
+    rt.block_on(client.create_field_index(
+        qdrant_client::qdrant::CreateFieldIndexCollectionBuilder::new(
+            COLLECTION,
+            "category",
+            FieldType::Keyword,
+        ),
+    ))
+    .unwrap();
+
+    let (ids, vectors) = generate_test_vectors(20, 4);
+    let points: Vec<PointStruct> = ids
+        .iter()
+        .zip(vectors.iter())
+        .map(|(id, vec)| {
+            let mut payload = qdrant_client::Payload::new();
+            payload.insert("category", if *id % 2 == 0 { "A" } else { "B" });
+            PointStruct::new(*id as u64, vec.clone(), payload)
+        })
+        .collect();
+    rt.block_on(client.upsert_points(
+        qdrant_client::qdrant::UpsertPointsBuilder::new(COLLECTION, points).wait(true),
+    ))
+    .unwrap();
+
+    let hits = |filter: Option<Filter>| -> usize {
+        let mut b = SearchPointsBuilder::new(COLLECTION, vectors[0].clone(), 100);
+        if let Some(f) = filter {
+            b = b.filter(f);
+        }
+        rt.block_on(client.search_points(b)).unwrap().result.len()
+    };
+
+    let unfiltered = hits(None);
+    let empty_filter = hits(Some(Filter::default()));
+    let real_filter = hits(Some(Filter {
+        must: vec![Condition::matches("category", "A".to_string())],
+        ..Default::default()
+    }));
+
+    assert_eq!(unfiltered, 20, "fixture should hold 20 points");
+    assert_eq!(
+        empty_filter, unfiltered,
+        "an empty Filter must be understood as MATCH-ALL ({} vs {}) — the whole \
+         point of the #222 guard",
+        empty_filter, unfiltered
+    );
+    assert_eq!(real_filter, 10, "a real filter must actually constrain");
+
+    delete_collection();
+}
+
+/// #222 defect 3, end-to-end: a float `match.any` used to have its members
+/// deleted by `filter_map(as_str)`, leaving an EMPTY `MatchAny` — which Qdrant
+/// happily evaluates to zero hits, so the run reported **recall 0 as a
+/// benchmark result**. It must now fail the run instead. Built by rewriting the
+/// conditions of the standard match_any fixture, so everything else about the
+/// project is a known-good configuration.
+#[test]
+fn test_binary_qdrant_float_match_any_fails_instead_of_reporting_zero_recall() {
+    wait_for_qdrant();
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "qdrant-ma-float", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1, "search_params": {"hnsw_ef": 128}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "match-any-float-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+
+    // Rewrite every query's condition to a FLOAT match_any (unrepresentable in
+    // Qdrant's Match, which has keyword/integer variants only).
+    let tests_path = proj
+        .root
+        .join("datasets")
+        .join("match-any-float-test")
+        .join("tests.jsonl");
+    let rewritten: Vec<String> = std::fs::read_to_string(&tests_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["conditions"] =
+                serde_json::json!({"and": [{"size": {"match": {"any": [1.5, 2.5]}}}]});
+            v.to_string()
+        })
+        .collect();
+    std::fs::write(&tests_path, rewritten.join("\n")).unwrap();
+
+    let grpc = QDRANT_GRPC_PORT.to_string();
+    let rest = QDRANT_REST_PORT.to_string();
+    assert!(
+        !common::run_binary(
+            &proj.root,
+            "qdrant-ma-float",
+            "match-any-float-test",
+            "localhost",
+            &[
+                ("QDRANT_GRPC_PORT", grpc.as_str()),
+                ("QDRANT_REST_PORT", rest.as_str()),
+            ],
+        ),
+        "a float match_any must FAIL the run, not report a recall number"
+    );
+}
+
 /// Geo-radius filter end-to-end (previously untested for qdrant). `geo` -> a Geo
 /// payload index + `Condition::geo_radius`; recall vs haversine ground truth.
 #[test]

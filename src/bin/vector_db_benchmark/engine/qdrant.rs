@@ -728,23 +728,35 @@ fn map_qdrant_distance(distance: &str) -> Result<Distance, String> {
     }
 }
 
-fn parse_qdrant_conditions(conditions: &serde_json::Value) -> Option<Filter> {
-    let obj = conditions.as_object()?;
+fn parse_qdrant_conditions(conditions: &serde_json::Value) -> Result<Option<Filter>, String> {
+    let Some(obj) = conditions.as_object() else {
+        return Ok(None);
+    };
     if obj.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let must = obj
-        .get("and")
-        .and_then(|v| v.as_array())
-        .map(|entries| build_qdrant_subfilters(entries));
-    let should = obj
-        .get("or")
-        .and_then(|v| v.as_array())
-        .map(|entries| build_qdrant_subfilters(entries));
+    // EMPTINESS GUARD (mirrors elasticsearch.rs `.filter(|f| !f.is_empty())`):
+    // an `and`/`or` array whose every leaf DROPPED must collapse the whole arm
+    // back to `None`, not to `Some(vec![])`. Without this, `must.is_none()` is
+    // false, the function returns `Some(Filter{must:[], should:[]})`, and the
+    // search path attaches an EMPTY filter — which Qdrant evaluates as
+    // match-all. The query then runs effectively UNFILTERED while every check
+    // downstream (`Option::is_some()`, "a filter was built") says it filtered.
+    let build_arm = |key: &str| -> Result<Option<Vec<Condition>>, String> {
+        match obj.get(key).and_then(|v| v.as_array()) {
+            Some(entries) => {
+                let conds = build_qdrant_subfilters(entries)?;
+                Ok((!conds.is_empty()).then_some(conds))
+            }
+            None => Ok(None),
+        }
+    };
+    let must = build_arm("and")?;
+    let should = build_arm("or")?;
 
     if must.is_none() && should.is_none() {
-        return None;
+        return Ok(None);
     }
 
     let mut filter = Filter::default();
@@ -755,10 +767,10 @@ fn parse_qdrant_conditions(conditions: &serde_json::Value) -> Option<Filter> {
         filter.should = s;
     }
 
-    Some(filter)
+    Ok(Some(filter))
 }
 
-fn build_qdrant_subfilters(entries: &[serde_json::Value]) -> Vec<Condition> {
+fn build_qdrant_subfilters(entries: &[serde_json::Value]) -> Result<Vec<Condition>, String> {
     let mut filters = Vec::new();
     for entry in entries {
         let Some(entry_obj) = entry.as_object() else {
@@ -772,7 +784,7 @@ fn build_qdrant_subfilters(entries: &[serde_json::Value]) -> Vec<Condition> {
         // Flattening the sub-tree's leaves into the parent must/should would
         // change the boolean meaning and collapse recall.
         if entry_obj.contains_key("and") || entry_obj.contains_key("or") {
-            if let Some(sub) = parse_qdrant_conditions(entry) {
+            if let Some(sub) = parse_qdrant_conditions(entry)? {
                 filters.push(Condition {
                     condition_one_of: Some(
                         qdrant_client::qdrant::condition::ConditionOneOf::Filter(sub),
@@ -785,22 +797,33 @@ fn build_qdrant_subfilters(entries: &[serde_json::Value]) -> Vec<Condition> {
         for (field_name, field_filters) in entry_obj {
             if let Some(filter_obj) = field_filters.as_object() {
                 for (cond_type, criteria) in filter_obj {
-                    if let Some(f) = build_qdrant_filter(field_name, cond_type, criteria) {
+                    if let Some(f) = build_qdrant_filter(field_name, cond_type, criteria)? {
                         filters.push(f);
                     }
                 }
             }
         }
     }
-    filters
+    Ok(filters)
 }
 
 /// Parse an ISO-8601 / RFC 3339 datetime string into a protobuf Timestamp.
+///
+/// RFC-3339 first (sub-second precision preserved), then the SAME wider set of
+/// forms every other engine accepts via `parsers::datetime_to_epoch_secs`
+/// (naive `T`/space-separated datetimes, date-only). Keeping Qdrant stricter
+/// than the rest would make an unparseable bound — now a hard error, see
+/// `build_qdrant_filter` — fire on configs that run fine everywhere else.
 fn parse_rfc3339_timestamp(s: &str) -> Option<Timestamp> {
-    let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
-    Some(Timestamp {
-        seconds: dt.timestamp(),
-        nanos: dt.timestamp_subsec_nanos() as i32,
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(Timestamp {
+            seconds: dt.timestamp(),
+            nanos: dt.timestamp_subsec_nanos() as i32,
+        });
+    }
+    vector_db_benchmark::parsers::datetime_to_epoch_secs(s).map(|secs| Timestamp {
+        seconds: secs as i64,
+        nanos: 0,
     })
 }
 
@@ -874,70 +897,132 @@ fn build_qdrant_filter(
     field_name: &str,
     condition_type: &str,
     criteria: &serde_json::Value,
-) -> Option<Condition> {
+) -> Result<Option<Condition>, String> {
     match condition_type {
         "match" => {
-            let criteria_obj = criteria.as_object()?;
+            let Some(criteria_obj) = criteria.as_object() else {
+                return Ok(None);
+            };
             // match_any: value in a list (keywords or integers).
             if let Some(any) = criteria_obj.get("any").and_then(|v| v.as_array()) {
                 if !any.is_empty() && any.iter().all(|v| v.is_i64()) {
                     let vals: Vec<i64> = any.iter().filter_map(|v| v.as_i64()).collect();
-                    return Some(Condition::matches(field_name.to_string(), vals));
+                    return Ok(Some(Condition::matches(field_name.to_string(), vals)));
                 }
+                // DECISION (#222): a member Qdrant cannot express is a HARD
+                // ERROR, never a silent drop. Qdrant's `MatchValue` protobuf
+                // has exactly Keyword / Integer / Boolean / Text / Keywords /
+                // Integers / Except* / Phrase / TextAny — there is NO float
+                // variant, so a float `any` list (which pgvector supports, see
+                // pgvector.rs `match_any_float_list_binds_double_array_any`)
+                // simply cannot be sent as a MatchAny. The previous code ran
+                // `filter_map(as_str)` over the list, which deleted every
+                // non-string member and produced an EMPTY MatchAny — a
+                // condition matching nothing, i.e. recall 0 reported as an
+                // engine result. Erroring makes the unsupported combination
+                // impossible to mistake for a benchmark number. (Emulating
+                // float equality with `Range{gte:v, lte:v}` was rejected: it
+                // silently switches to a different index/comparison than the
+                // `match` the config asked for, and is exactly the kind of
+                // quiet substitution this issue is about.)
+                if !any.iter().all(|v| v.is_string()) {
+                    return Err(format!(
+                        "Qdrant match.any on field `{}` requires an all-integer or \
+                         all-string list; got {}. Qdrant's Match supports keywords \
+                         and integers only (no floats), so this filter cannot be \
+                         expressed — fix the dataset/config rather than run an \
+                         unfiltered or empty-match query.",
+                        field_name, criteria
+                    ));
+                }
+                // All-string list (or an EMPTY list, which stays an empty
+                // MatchAny: "value in {}" is unsatisfiable, matching nothing —
+                // the same choice pgvector makes in
+                // `match_any_empty_list_matches_nothing`).
                 let vals: Vec<String> = any
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
-                return Some(Condition::matches(field_name.to_string(), vals));
+                return Ok(Some(Condition::matches(field_name.to_string(), vals)));
             }
             // match_text: full-text match.
             if let Some(text) = criteria_obj.get("text").and_then(|v| v.as_str()) {
-                return Some(Condition::matches_text(
+                return Ok(Some(Condition::matches_text(
                     field_name.to_string(),
                     text.to_string(),
-                ));
+                )));
             }
             // exact match on keyword / integer / bool.
-            let value = criteria_obj.get("value")?;
+            let Some(value) = criteria_obj.get("value") else {
+                return Ok(None);
+            };
             if let Some(s) = value.as_str() {
-                Some(Condition::matches(field_name.to_string(), s.to_string()))
+                Ok(Some(Condition::matches(
+                    field_name.to_string(),
+                    s.to_string(),
+                )))
             } else if let Some(b) = value.as_bool() {
                 // Bools are stored+indexed as the STRING "true"/"false", so match
                 // the string form. A native boolean Match never matches the string
                 // payload and silently returns zero points (0 recall).
                 let token = if b { "true" } else { "false" };
-                Some(Condition::matches(
+                Ok(Some(Condition::matches(
                     field_name.to_string(),
                     token.to_string(),
-                ))
+                )))
             } else {
-                value
+                Ok(value
                     .as_i64()
-                    .map(|n| Condition::matches(field_name.to_string(), n))
+                    .map(|n| Condition::matches(field_name.to_string(), n)))
             }
         }
         "range" => {
-            let criteria_obj = criteria.as_object()?;
+            let Some(criteria_obj) = criteria.as_object() else {
+                return Ok(None);
+            };
             // A string bound means an ISO-8601 datetime range rather than numeric.
             let is_datetime = ["lt", "gt", "lte", "gte"]
                 .iter()
                 .any(|k| criteria_obj.get(*k).map(|v| v.is_string()).unwrap_or(false));
             if is_datetime {
-                let ts = |k: &str| {
-                    criteria_obj
-                        .get(k)
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_rfc3339_timestamp)
+                // A datetime bound that is PRESENT but does not parse used to
+                // yield `None` for that bound. With every bound unparseable the
+                // result was `DatetimeRange{lt:None,gt:None,gte:None,lte:None}`
+                // — a present but VACUOUS condition matching every point, the
+                // exact shape the numeric arm below already guards against
+                // (#115). Worse, a PARTIALLY parsed range silently WIDENS,
+                // which dropping-when-all-bounds-are-None would not catch. So
+                // every present, non-null bound must parse or the clause is an
+                // error; this branch is only entered when at least one bound is
+                // a string, so a vacuous DatetimeRange is now unconstructible.
+                let ts = |k: &str| -> Result<Option<Timestamp>, String> {
+                    match criteria_obj.get(k) {
+                        None | Some(serde_json::Value::Null) => Ok(None),
+                        Some(v) => v
+                            .as_str()
+                            .and_then(parse_rfc3339_timestamp)
+                            .map(Some)
+                            .ok_or_else(|| {
+                                format!(
+                                    "Qdrant datetime range on field `{}` has an \
+                                     unparseable `{}` bound: {}. Expected an RFC-3339 \
+                                     timestamp (e.g. 2023-01-01T00:00:00Z); emitting the \
+                                     range without it would match everything.",
+                                    field_name, k, v
+                                )
+                            }),
+                    }
                 };
-                return Some(Condition::datetime_range(
+                let dt_range = DatetimeRange {
+                    lt: ts("lt")?,
+                    gt: ts("gt")?,
+                    gte: ts("gte")?,
+                    lte: ts("lte")?,
+                };
+                return Ok(Some(Condition::datetime_range(
                     field_name.to_string(),
-                    DatetimeRange {
-                        lt: ts("lt"),
-                        gt: ts("gt"),
-                        gte: ts("gte"),
-                        lte: ts("lte"),
-                    },
-                ));
+                    dt_range,
+                )));
             }
             let mut range = qdrant_client::qdrant::Range::default();
             if let Some(lt) = criteria_obj.get("lt").and_then(|v| v.as_f64()) {
@@ -963,26 +1048,30 @@ fn build_qdrant_filter(
                 && range.lte.is_none()
                 && range.gte.is_none()
             {
-                return None;
+                return Ok(None);
             }
-            Some(Condition::range(field_name.to_string(), range))
+            Ok(Some(Condition::range(field_name.to_string(), range)))
         }
         "geo" => {
-            let lat = criteria.get("lat")?.as_f64()?;
-            let lon = criteria.get("lon")?.as_f64()?;
+            let (Some(lat), Some(lon)) = (
+                criteria.get("lat").and_then(|v| v.as_f64()),
+                criteria.get("lon").and_then(|v| v.as_f64()),
+            ) else {
+                return Ok(None);
+            };
             let radius = criteria
                 .get("radius")
                 .and_then(|r| r.as_f64())
                 .unwrap_or(1000.0);
-            Some(Condition::geo_radius(
+            Ok(Some(Condition::geo_radius(
                 field_name.to_string(),
                 qdrant_client::qdrant::GeoRadius {
                     center: Some(qdrant_client::qdrant::GeoPoint { lon, lat }),
                     radius: radius as f32,
                 },
-            ))
+            )))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1142,10 +1231,15 @@ impl Engine for QdrantEngine {
             (Vec::<Vec<f32>>::new(), sq, nb, Vec::<Option<Filter>>::new())
         } else {
             let (q, nb, conditions) = dataset.read_queries()?;
+            // An unrepresentable filter is an ERROR here, not a `None` that
+            // would quietly run the query unfiltered (#222).
             let pf: Vec<Option<Filter>> = conditions
                 .iter()
-                .map(|c| c.as_ref().and_then(parse_qdrant_conditions))
-                .collect();
+                .map(|c| match c.as_ref() {
+                    Some(cond) => parse_qdrant_conditions(cond),
+                    None => Ok(None),
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             (
                 q,
                 Vec::<vector_db_benchmark::readers::SparseVector>::new(),
@@ -1584,7 +1678,9 @@ mod tests {
 
     #[test]
     fn builds_match_any_integers() {
-        let c = build_qdrant_filter("cat", "match", &json!({"any": [1, 2, 3]})).unwrap();
+        let c = build_qdrant_filter("cat", "match", &json!({"any": [1, 2, 3]}))
+            .unwrap()
+            .unwrap();
         let fc = field_condition(&c);
         assert_eq!(fc.key, "cat");
         assert!(fc.r#match.is_some(), "match_any should set a Match");
@@ -1592,7 +1688,9 @@ mod tests {
 
     #[test]
     fn builds_match_text() {
-        let c = build_qdrant_filter("body", "match", &json!({"text": "hello"})).unwrap();
+        let c = build_qdrant_filter("body", "match", &json!({"text": "hello"}))
+            .unwrap()
+            .unwrap();
         let fc = field_condition(&c);
         assert_eq!(fc.key, "body");
         assert!(fc.r#match.is_some());
@@ -1603,14 +1701,18 @@ mod tests {
         use qdrant_client::qdrant::r#match::MatchValue;
         // Bools are stored as the string "true"/"false", so the filter must match
         // the STRING keyword, NOT a native boolean (which matches 0 points).
-        let c = build_qdrant_filter("flag", "match", &json!({"value": true})).unwrap();
+        let c = build_qdrant_filter("flag", "match", &json!({"value": true}))
+            .unwrap()
+            .unwrap();
         let m = field_condition(&c).r#match.expect("match present");
         assert_eq!(
             m.match_value,
             Some(MatchValue::Keyword("true".to_string())),
             "bool true must match keyword \"true\", not a native boolean"
         );
-        let c = build_qdrant_filter("flag", "match", &json!({"value": false})).unwrap();
+        let c = build_qdrant_filter("flag", "match", &json!({"value": false}))
+            .unwrap()
+            .unwrap();
         let m = field_condition(&c).r#match.expect("match present");
         assert_eq!(
             m.match_value,
@@ -1620,13 +1722,16 @@ mod tests {
 
     #[test]
     fn range_with_string_bound_becomes_datetime_range() {
-        let dt =
-            build_qdrant_filter("ts", "range", &json!({"gte": "2023-01-01T00:00:00Z"})).unwrap();
+        let dt = build_qdrant_filter("ts", "range", &json!({"gte": "2023-01-01T00:00:00Z"}))
+            .unwrap()
+            .unwrap();
         let fc = field_condition(&dt);
         assert!(fc.datetime_range.is_some(), "string bound → datetime_range");
         assert!(fc.range.is_none());
 
-        let num = build_qdrant_filter("n", "range", &json!({"gte": 5, "lt": 10})).unwrap();
+        let num = build_qdrant_filter("n", "range", &json!({"gte": 5, "lt": 10}))
+            .unwrap()
+            .unwrap();
         let fc = field_condition(&num);
         assert!(fc.range.is_some(), "numeric bounds → numeric range");
         assert!(fc.datetime_range.is_none());
@@ -1674,7 +1779,7 @@ rest_responses_total{method=\"GET\"} 42
             {"a":{"match":{"value":"x"}}},
             {"b":{"match":{"value":"y"}}},
         ]});
-        let filter = parse_qdrant_conditions(&cond).unwrap();
+        let filter = parse_qdrant_conditions(&cond).unwrap().unwrap();
         assert_eq!(filter.should.len(), 2, "or → 2 should entries");
         assert!(filter.must.is_empty(), "or-only leaves must empty");
     }
@@ -1685,7 +1790,7 @@ rest_responses_total{method=\"GET\"} 42
             "and":[{"a":{"match":{"value":"x"}}}],
             "or":[{"b":{"match":{"value":"y"}}},{"c":{"match":{"value":"z"}}}],
         });
-        let filter = parse_qdrant_conditions(&cond).unwrap();
+        let filter = parse_qdrant_conditions(&cond).unwrap().unwrap();
         assert_eq!(filter.must.len(), 1);
         assert_eq!(filter.should.len(), 2);
     }
@@ -1693,7 +1798,9 @@ rest_responses_total{method=\"GET\"} 42
     // ── Range operators ────────────────────────────────────────────────────
 
     fn numeric_range(criteria: serde_json::Value) -> qdrant_client::qdrant::Range {
-        let c = build_qdrant_filter("n", "range", &criteria).unwrap();
+        let c = build_qdrant_filter("n", "range", &criteria)
+            .unwrap()
+            .unwrap();
         field_condition(&c).range.expect("numeric range")
     }
 
@@ -1738,13 +1845,17 @@ rest_responses_total{method=\"GET\"} 42
     // vectorsets null-bound fix (#115) and the other engines, which drop it.
     #[test]
     fn range_unknown_op_only_is_none() {
-        assert!(build_qdrant_filter("n", "range", &json!({"foo":5})).is_none());
+        assert!(build_qdrant_filter("n", "range", &json!({"foo":5}))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn range_null_bound_only_is_none() {
         assert!(
-            build_qdrant_filter("n", "range", &json!({"gte": serde_json::Value::Null})).is_none()
+            build_qdrant_filter("n", "range", &json!({"gte": serde_json::Value::Null}))
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1762,6 +1873,7 @@ rest_responses_total{method=\"GET\"} 42
     #[test]
     fn geo_with_radius_sets_center_and_radius() {
         let c = build_qdrant_filter("loc", "geo", &json!({"lat":20.0,"lon":10.0,"radius":500}))
+            .unwrap()
             .unwrap();
         let gr = field_condition(&c).geo_radius.expect("geo_radius");
         let center = gr.center.expect("center");
@@ -1772,15 +1884,25 @@ rest_responses_total{method=\"GET\"} 42
 
     #[test]
     fn geo_without_radius_uses_default_1000() {
-        let c = build_qdrant_filter("loc", "geo", &json!({"lat":20.0,"lon":10.0})).unwrap();
+        let c = build_qdrant_filter("loc", "geo", &json!({"lat":20.0,"lon":10.0}))
+            .unwrap()
+            .unwrap();
         let gr = field_condition(&c).geo_radius.expect("geo_radius");
         assert_eq!(gr.radius, 1000.0);
     }
 
     #[test]
     fn geo_missing_lat_or_lon_is_none() {
-        assert!(build_qdrant_filter("loc", "geo", &json!({"lon":10.0,"radius":500})).is_none());
-        assert!(build_qdrant_filter("loc", "geo", &json!({"lat":20.0,"radius":500})).is_none());
+        assert!(
+            build_qdrant_filter("loc", "geo", &json!({"lon":10.0,"radius":500}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            build_qdrant_filter("loc", "geo", &json!({"lat":20.0,"radius":500}))
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ── Distance-metric mapping ────────────────────────────────────────────
@@ -1801,7 +1923,9 @@ rest_responses_total{method=\"GET\"} 42
 
     #[test]
     fn exact_match_int_sets_match() {
-        let c = build_qdrant_filter("n", "match", &json!({"value":5})).unwrap();
+        let c = build_qdrant_filter("n", "match", &json!({"value":5}))
+            .unwrap()
+            .unwrap();
         assert!(field_condition(&c).r#match.is_some());
     }
 
@@ -1809,12 +1933,16 @@ rest_responses_total{method=\"GET\"} 42
     fn exact_match_float_is_none() {
         // Qdrant `Match` supports keyword/integer/bool only — a float exact value
         // matches no arm and is dropped (float filtering uses range instead).
-        assert!(build_qdrant_filter("n", "match", &json!({"value":1.5})).is_none());
+        assert!(build_qdrant_filter("n", "match", &json!({"value":1.5}))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn exact_match_array_value_is_none() {
-        assert!(build_qdrant_filter("n", "match", &json!({"value":[1,2]})).is_none());
+        assert!(build_qdrant_filter("n", "match", &json!({"value":[1,2]}))
+            .unwrap()
+            .is_none());
     }
 
     // ── parse_qdrant_conditions edge cases + subfilter builder ──────────────
@@ -1822,7 +1950,7 @@ rest_responses_total{method=\"GET\"} 42
 
     #[test]
     fn empty_conditions_object_is_none() {
-        assert!(parse_qdrant_conditions(&json!({})).is_none());
+        assert!(parse_qdrant_conditions(&json!({})).unwrap().is_none());
     }
 
     #[test]
@@ -1831,7 +1959,7 @@ rest_responses_total{method=\"GET\"} 42
             {"a":{"match":{"value":"x"}}},
             {"b":{"match":{"value":"y"}}},
         ]});
-        let filter = parse_qdrant_conditions(&cond).unwrap();
+        let filter = parse_qdrant_conditions(&cond).unwrap().unwrap();
         assert_eq!(filter.must.len(), 2, "and → 2 must entries");
         assert!(filter.should.is_empty(), "and-only leaves should empty");
     }
@@ -1840,7 +1968,7 @@ rest_responses_total{method=\"GET\"} 42
     fn subfilters_build_match_any_keyword_list() {
         // A keyword match_any list → one Condition carrying a keyword Match.
         let entries = vec![json!({"cat":{"match":{"any":["a","b"]}}})];
-        let conds = build_qdrant_subfilters(&entries);
+        let conds = build_qdrant_subfilters(&entries).unwrap();
         assert_eq!(conds.len(), 1);
         let fc = field_condition(&conds[0]);
         assert_eq!(fc.key, "cat");
@@ -1848,6 +1976,149 @@ rest_responses_total{method=\"GET\"} 42
             fc.r#match.is_some(),
             "match_any keyword list should set a Match"
         );
+    }
+
+    // ── #222: no filter may ever be sent that silently matches everything ───
+
+    #[test]
+    fn and_group_whose_every_leaf_drops_yields_no_filter() {
+        // Every leaf here is un-buildable: an unknown condition type, an
+        // unknown range operator, and a null bound. Pre-fix this returned
+        // `Some(Filter{must:[], should:[]})` — an EMPTY filter, which Qdrant
+        // evaluates as MATCH-ALL, so the query ran unfiltered while the code
+        // (and any `is_some()` check) believed it was filtered.
+        let cond = json!({"and":[
+            {"a":{"nosuchop":{"value":"x"}}},
+            {"n":{"range":{"foo":5}}},
+            {"m":{"range":{"gte": serde_json::Value::Null}}},
+        ]});
+        let filter = parse_qdrant_conditions(&cond).unwrap();
+        assert!(
+            filter.is_none(),
+            "an `and` whose leaves all drop must produce NO filter, got {:?} \
+             (an empty Filter is match-all in Qdrant)",
+            filter
+        );
+    }
+
+    #[test]
+    fn or_group_whose_every_leaf_drops_yields_no_filter() {
+        let cond = json!({"or":[{"a":{"nosuchop":{"value":"x"}}}]});
+        assert!(parse_qdrant_conditions(&cond).unwrap().is_none());
+    }
+
+    #[test]
+    fn and_with_one_surviving_leaf_still_filters() {
+        // The guard must not throw away a group that still has real leaves.
+        let cond = json!({"and":[
+            {"a":{"nosuchop":{"value":"x"}}},
+            {"color":{"match":{"value":"red"}}},
+        ]});
+        let filter = parse_qdrant_conditions(&cond).unwrap().unwrap();
+        assert_eq!(filter.must.len(), 1);
+        assert!(filter.should.is_empty());
+    }
+
+    #[test]
+    fn nested_group_whose_leaves_all_drop_is_not_attached() {
+        // A nested `{and:[...]}` that collapses must not be pushed as an empty
+        // sub-Filter condition (match-all inside a `must`).
+        let cond = json!({"and":[
+            {"and":[{"a":{"nosuchop":{"value":"x"}}}]},
+            {"color":{"match":{"value":"red"}}},
+        ]});
+        let filter = parse_qdrant_conditions(&cond).unwrap().unwrap();
+        assert_eq!(
+            filter.must.len(),
+            1,
+            "only the surviving leaf may be attached, got {:?}",
+            filter.must
+        );
+    }
+
+    #[test]
+    fn unparseable_datetime_bound_is_an_error_not_a_vacuous_range() {
+        // Pre-fix: every bound failed to parse, yielding
+        // `DatetimeRange{lt:None,gt:None,gte:None,lte:None}` — a condition
+        // present in the request that matches EVERY point.
+        let err = build_qdrant_filter("ts", "range", &json!({"gte":"not-a-date"})).unwrap_err();
+        assert!(
+            err.contains("gte"),
+            "error should name the bad bound: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn partially_unparseable_datetime_bound_is_an_error_not_a_widened_range() {
+        // The dangerous half-case: `gte` parses, `lt` does not, so the range
+        // silently loses its upper bound and matches far more than asked.
+        assert!(build_qdrant_filter(
+            "ts",
+            "range",
+            &json!({"gte":"2023-01-01T00:00:00Z","lt":"whenever"}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn datetime_bounds_accept_the_same_forms_as_every_other_engine() {
+        // `parsers::datetime_to_epoch_secs` (used by the other engines) accepts
+        // naive and date-only forms; Qdrant must not hard-error on a config
+        // that runs fine everywhere else.
+        for s in [
+            "2023-01-01T00:00:00Z",
+            "2023-01-01T00:00:00",
+            "2023-01-01 00:00:00",
+            "2023-01-01",
+        ] {
+            let c = build_qdrant_filter("ts", "range", &json!({ "gte": s }))
+                .unwrap_or_else(|e| panic!("{} should parse: {}", s, e))
+                .unwrap();
+            let dt = field_condition(&c).datetime_range.expect("datetime range");
+            assert_eq!(
+                dt.gte.expect("gte bound").seconds,
+                1_672_531_200,
+                "{} should be 2023-01-01T00:00:00Z",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_match_any_is_never_silently_emptied() {
+        // Pre-fix: `filter_map(as_str)` deleted every non-string member, so a
+        // float list became an EMPTY MatchAny — matching nothing, i.e. recall 0
+        // reported as an engine result. Qdrant's MatchValue has no float
+        // variant, so this combination is a hard error (see build_qdrant_filter).
+        let err = build_qdrant_filter("score", "match", &json!({"any":[1.5, 2.5]})).unwrap_err();
+        assert!(
+            err.contains("score"),
+            "error should name the field: {}",
+            err
+        );
+
+        // Mixed int/string is equally unrepresentable (MatchAny is homogeneous).
+        assert!(build_qdrant_filter("cat", "match", &json!({"any":["a", 1]})).is_err());
+        // Mixed int/float too: not all-i64, so it would have been emptied.
+        assert!(build_qdrant_filter("cat", "match", &json!({"any":[1, 2.5]})).is_err());
+        // …and the error must propagate out of the whole condition tree rather
+        // than degrading into "no filter" (which would run unfiltered).
+        assert!(
+            parse_qdrant_conditions(&json!({"and":[{"score":{"match":{"any":[1.5]}}}]})).is_err()
+        );
+
+        // Homogeneous lists still build, including the empty list, which stays
+        // an unsatisfiable "value in {}" (same choice pgvector makes).
+        assert!(build_qdrant_filter("cat", "match", &json!({"any":[1, 2]}))
+            .unwrap()
+            .is_some());
+        assert!(build_qdrant_filter("cat", "match", &json!({"any":["a"]}))
+            .unwrap()
+            .is_some());
+        assert!(build_qdrant_filter("cat", "match", &json!({"any":[]}))
+            .unwrap()
+            .is_some());
     }
 
     // ── Quantization config builder ─────────────────────────────────────────
