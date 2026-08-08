@@ -592,6 +592,13 @@ pub fn save_summary(
         "precision_summary": precision_summary,
         "concurrency_curve": concurrency_curve,
         "uncalibrated_configs": uncalibrated,
+        // Configuration files this run could not load, and therefore every
+        // configuration they define that never ran. Only ever non-empty when
+        // --allow-partial-configs was passed (otherwise the run refuses to
+        // start), and carried here for the same reason as uncalibrated_configs
+        // above: the stderr warning has long scrolled away by the time anyone
+        // reads the artifact, so a truncated sweep has to say so itself (#239).
+        "skipped_config_files": crate::config::skipped_config_files(),
     });
 
     if let Some(upload) = upload_json {
@@ -746,6 +753,61 @@ mod tests {
         )
         .unwrap();
         assert!(v["uncalibrated_configs"].as_array().unwrap().is_empty());
+    }
+
+    /// A run started with `--allow-partial-configs` measured fewer configurations
+    /// than the directory declares, so the artifact has to say so — the stderr
+    /// warning is long gone by the time anyone reads it, exactly the reasoning
+    /// behind `uncalibrated_configs` in #217 (#239).
+    ///
+    /// This is the ONLY test that mutates the process-wide recorder, so it
+    /// cannot race a sibling; it resets the recorder before asserting the
+    /// default-empty case so the rest of the suite is unaffected.
+    #[test]
+    fn summary_records_the_config_files_the_run_could_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::record_skipped_config_files(vec![crate::config::SkippedConfigFile {
+            path: "experiments/configurations/qdrant-on-disk.json".to_string(),
+            error: "invalid type: string \"true\", expected a boolean".to_string(),
+        }]);
+        save_summary(
+            "redis-test",
+            "partial",
+            &[prec_entry(0.99, 100.0, false)],
+            None,
+            dir.path(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("redis-test-partial-summary.json")).unwrap(),
+        )
+        .unwrap();
+        let skipped = v["skipped_config_files"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1, "{v}");
+        assert!(skipped[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("qdrant-on-disk.json"));
+        assert!(skipped[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid type"));
+
+        // Default state: no skipped files, empty array present in the schema.
+        crate::config::record_skipped_config_files(Vec::new());
+        save_summary(
+            "redis-test",
+            "complete",
+            &[prec_entry(0.99, 100.0, false)],
+            None,
+            dir.path(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("redis-test-complete-summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(v["skipped_config_files"].as_array().unwrap().is_empty());
     }
 
     #[test]

@@ -18,6 +18,15 @@ pub struct Args {
     #[arg(long)]
     pub engines_file: Option<String>,
 
+    /// Run even when some `experiments/configurations/*.json` file failed to
+    /// load. Off by default: serde rejects a whole file on one bad entry, so
+    /// under a wildcard `--engines` (the default is `*`) the sweep would just get
+    /// smaller and still exit 0, publishing a truncated peak QPS and Pareto
+    /// frontier. With this flag the run proceeds and records the offending files
+    /// under `skipped_config_files` in every summary JSON it writes (#239).
+    #[arg(long, default_value = "false")]
+    pub allow_partial_configs: bool,
+
     /// Dataset patterns to run (supports wildcards, repeatable)
     #[arg(long, default_value = "*")]
     pub datasets: Vec<String>,
