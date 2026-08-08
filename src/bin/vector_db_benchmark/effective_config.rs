@@ -2226,24 +2226,33 @@ mod tests {
         let _recording = begin_experiment(&cfg, json!({"host": "b"}));
 
         let s = snapshot();
+        // Assert on the keys THIS test seeded rather than on total emptiness.
+        // Equally strong against the mutation (deleting `reset()` leaves exactly
+        // these behind) and immune to another test writing to the process-wide
+        // recorder in the window between `begin_experiment` and `snapshot` —
+        // `engine::index_naming`'s tests do resolve through it. Total clearing
+        // is covered deterministically by `begin_clears_every_accumulating_field`,
+        // which owns a private `Recorder`.
         assert!(
-            s["env"].as_object().unwrap().is_empty(),
-            "config A's env observations survived into config B: {}",
+            s["env"].get("VDBB_TEST_BLEED").is_none(),
+            "config A's env observation survived into config B: {}",
             s["env"]
         );
         assert!(
-            s["effective"].as_object().unwrap().is_empty(),
+            s["effective"].get("config_a_only").is_none()
+                && s["effective"].get("VDBB_TEST_BLEED").is_none(),
             "config A's resolved knobs survived into config B: {}",
             s["effective"]
         );
+        let overridden = serde_json::to_string(&s["overridden"]).unwrap();
         assert!(
-            s["overridden"].as_array().unwrap().is_empty(),
-            "config A's overrides survived into config B"
+            !overridden.contains("config_a_knob"),
+            "config A's overrides survived into config B: {overridden}"
         );
-        assert_eq!(
-            s["ignored_declared_keys"]["keys"],
-            json!([]),
-            "config A's ignored keys survived into config B"
+        let ignored = serde_json::to_string(&s["ignored_declared_keys"]["keys"]).unwrap();
+        assert!(
+            !ignored.contains("config_a_ignored"),
+            "config A's ignored keys survived into config B: {ignored}"
         );
         // …and config B's own declaration is in place.
         assert_eq!(s["invocation"]["host"], "b");

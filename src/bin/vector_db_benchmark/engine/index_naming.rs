@@ -101,6 +101,11 @@ mod tests {
     /// the separator or the default base has to be made deliberately.
     #[test]
     fn vectorsets_configs_derive_distinct_keys() {
+        // `derive_index_name` / `index_name_exact` resolve through the process-wide
+        // recorder (#212), so they must serialize with every other test that drives
+        // it — otherwise an observation lands between another test's
+        // `begin_experiment` and its `snapshot()`.
+        let _recorder_lock = crate::effective_config::test_lock();
         let a = derive_index_name("VECTORSETS_INDEX_NAME_UNSET_236", "idx", "vectorsets-fp32");
         let b = derive_index_name("VECTORSETS_INDEX_NAME_UNSET_236", "idx", "vectorsets-q8");
         assert_eq!(a, "idx:vectorsets-fp32");
@@ -117,6 +122,11 @@ mod tests {
     /// so no other test observes it.
     #[test]
     fn exact_pin_drops_the_config_suffix() {
+        // `derive_index_name` / `index_name_exact` resolve through the process-wide
+        // recorder (#212), so they must serialize with every other test that drives
+        // it — otherwise an observation lands between another test's
+        // `begin_experiment` and its `snapshot()`.
+        let _recorder_lock = crate::effective_config::test_lock();
         let base_env = "VECTORSETS_INDEX_NAME_EXACTTEST_236";
         std::env::set_var(base_env, "myvset");
         std::env::set_var(format!("{base_env}_EXACT"), "1");
