@@ -8,8 +8,9 @@ use crate::config::{datasets_dir, DatasetConfig};
 use crate::download;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
-    read_compound_data, read_compound_queries, read_gt_neighbours, read_hdf5_vectors,
-    read_jsonl_queries, read_jsonl_vectors, read_npy_vectors, read_sparse_matrix, SparseVector,
+    hdf5_train_row_count, npy_row_count, read_compound_data, read_compound_queries,
+    read_gt_neighbours, read_hdf5_vectors, read_jsonl_queries, read_jsonl_vectors,
+    read_npy_vectors, read_sparse_matrix, SparseVector,
 };
 
 /// Dataset wrapper that provides access to vectors and metadata
@@ -84,6 +85,225 @@ impl Dataset {
         )
     }
 
+    /// The dataset's corpus path on local disk, WITHOUT triggering a download.
+    /// `None` when the corpus isn't present yet, or the path is dict-style
+    /// (`h5-multi`), which has no single corpus file.
+    fn local_path(&self) -> Option<PathBuf> {
+        let p = datasets_dir().join(self.config.path.as_str()?);
+        p.exists().then_some(p)
+    }
+
+    /// How many vectors the LOCAL corpus *actually* holds, measured from the
+    /// files themselves — NPY/HDF5 shape headers (a ~128-byte read, never the
+    /// multi-GB payload) or a JSONL line count.
+    ///
+    /// `Ok(None)` means "not measurable here": the corpus isn't downloaded yet,
+    /// or the layout has no cheap row count (`sparse` CSR, `h5-multi` parts).
+    /// Callers must treat `None` as "unknown", never as zero.
+    pub fn measured_vector_count(&self) -> Result<Option<u64>, String> {
+        let Some(path) = self.local_path() else {
+            return Ok(None);
+        };
+        let dataset_type = self.config.dataset_type.as_deref().unwrap_or("");
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        // Resolve to the concrete file whose header/lines we measure.
+        let effective = match dataset_type {
+            // Compound and hybrid layouts both keep the dense corpus in
+            // <dir>/vectors.npy (hybrid is a superset of the sparse layout).
+            "tar" | "hybrid" => "npy",
+            "hdf5" | "h5" => "hdf5",
+            "jsonl" => "jsonl",
+            // No declared type: fall back to the file extension, exactly as
+            // read_vectors() does.
+            "" => match ext.as_str() {
+                "npy" => "npy",
+                "hdf5" | "h5" => "hdf5",
+                "jsonl" => "jsonl",
+                _ => return Ok(None),
+            },
+            // "sparse" (CSR) and "h5-multi" (many part files) are not measured
+            // here, so they fall back to the declared count via
+            // `unmeasurable_corpus_is_present`.
+            //
+            // This matters now: `msmarco-sparse-100K` / `-1M` are `sparse` AND
+            // declare a vector_count, so their gate target IS the declared
+            // number. What keeps that honest is the path-size CI check in
+            // config.rs — their leaf segments (`100K`, `1M`) advertise their
+            // size, so a wrong count fails CI from datasets.json alone, with no
+            // corpus on disk. The residual it does NOT cover is a correct count
+            // paired with the wrong `data.csr` (the two sizes share one query
+            // set), which would let the gate skip early.
+            //
+            // Closing that properly is cheap and worth doing: the CSR header's
+            // FIRST i64 is n_row, so a 24-byte read yields an exact row count —
+            // the same trick `npy_row_count` uses. Deliberately left out of the
+            // merge that introduced this collision so it lands with its own
+            // tests rather than riding in as a conflict resolution.
+            _ => return Ok(None),
+        };
+
+        match effective {
+            "npy" => {
+                let npy = if path.is_dir() {
+                    path.join("vectors.npy")
+                } else {
+                    path
+                };
+                if !npy.exists() {
+                    return Ok(None);
+                }
+                let s = npy.to_str().ok_or("Invalid vectors.npy path encoding")?;
+                npy_row_count(s).map(Some)
+            }
+            "hdf5" => {
+                let s = path.to_str().ok_or("Invalid HDF5 path encoding")?;
+                hdf5_train_row_count(s).map(Some)
+            }
+            _ => {
+                let file = if path.is_dir() {
+                    path.join("vectors.jsonl")
+                } else {
+                    path
+                };
+                if !file.exists() {
+                    return Ok(None);
+                }
+                count_nonempty_lines(&file).map(Some)
+            }
+        }
+    }
+
+    /// Cross-check the declared `vector_count` in `datasets.json` against the
+    /// corpus actually on disk (#224).
+    ///
+    /// `vector_count` is not decorative — Redis's shared-corpus mode (#188) uses
+    /// it as the "is the corpus fully uploaded?" gate, so an UNDER-declared count
+    /// lets a partially-populated keyspace pass as complete and the sweep then
+    /// measures recall over a fraction of the corpus, silently, with no error.
+    /// That direction is therefore a hard error: there is no benign reading of
+    /// "the corpus has more vectors than we claim".
+    ///
+    /// The opposite direction (declared > actual) only makes every consumer more
+    /// conservative — the completeness gate can never be satisfied early, so the
+    /// worst case is a redundant re-upload. It is still a metadata bug (it is
+    /// what `--list-datasets` prints), so it warns loudly but does not abort a
+    /// run over a corpus that is merely smaller than advertised.
+    pub fn validate_vector_count(&self) -> Result<(), String> {
+        let declared = self
+            .config
+            .vector_count
+            .filter(|&n| n > 0)
+            .map(|n| n as u64);
+        let measured = self.measured_vector_count()?;
+        if let (Some(d), Some(m)) = (declared, measured) {
+            self.compare_counts(d, m)?;
+        }
+        Ok(())
+    }
+
+    fn compare_counts(&self, declared: u64, measured: u64) -> Result<(), String> {
+        if declared == measured {
+            return Ok(());
+        }
+        if measured > declared {
+            return Err(format!(
+                "dataset '{}' declares vector_count {} in datasets.json but its corpus at {} \
+                 actually holds {} vectors. A declared count SMALLER than the corpus makes the \
+                 shared-corpus completeness gate (#188) accept a partially-uploaded keyspace as \
+                 complete, which silently collapses recall (#224). Fix vector_count in \
+                 datasets/datasets.json (or point the dataset at the corpus it describes).",
+                self.config.name,
+                declared,
+                self.local_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unknown>".into()),
+                measured,
+            ));
+        }
+        eprintln!(
+            "WARNING: dataset '{}' declares vector_count {} but its corpus holds only {} vectors. \
+             Benchmarks will run over the {} vectors that exist; fix vector_count in \
+             datasets/datasets.json (it is what --list-datasets reports).",
+            self.config.name, declared, measured, measured,
+        );
+        Ok(())
+    }
+
+    /// The number of uploaded points that means "this corpus is fully present",
+    /// for engine-side completeness gates such as Redis shared-corpus mode
+    /// (#188 upload-once / build-many).
+    ///
+    /// Prefers the MEASURED corpus size over the declared `vector_count`, so a
+    /// wrong number in `datasets.json` can no longer authorise an early skip
+    /// (#224). It falls back to the declared count ONLY for the layouts that
+    /// genuinely have no cheap row count (`sparse`, `h5-multi`) and whose corpus
+    /// files are all present; everything else must be measured or is reported as
+    /// `Ok(None)` — which callers must read as "cannot confirm completeness, do
+    /// NOT skip".
+    ///
+    /// The fallback is keyed on `dataset_type`, never on "some directory
+    /// exists". A measurable layout whose corpus file is missing — a `tar`
+    /// dataset whose directory was created by an interrupted `extract_tgz`
+    /// (`vectors.npy` is the LAST member of `arxiv.tar.gz`, so this is the
+    /// normal shape of a truncated download), or one whose big `vectors.npy`
+    /// was deleted to reclaim disk while `tests.jsonl` stayed behind so queries
+    /// still work — must NOT be waved through on the declared number. That is
+    /// #224 all over again, just reached from the corpus side.
+    pub fn corpus_completeness_target(&self) -> Result<Option<u64>, String> {
+        let declared = self
+            .config
+            .vector_count
+            .filter(|&n| n > 0)
+            .map(|n| n as u64);
+        let measured = self.measured_vector_count()?;
+        if let (Some(d), Some(m)) = (declared, measured) {
+            self.compare_counts(d, m)?;
+        }
+        if measured.is_some() {
+            return Ok(measured);
+        }
+        if self.unmeasurable_corpus_is_present() {
+            Ok(declared)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Whether this is one of the layouts with no cheap row count AND all of its
+    /// corpus files are on disk (no download attempted).
+    ///
+    /// Measurable layouts always answer `false`: they have a row count, so they
+    /// must be measured rather than trusted. Only `sparse` (CSR) and `h5-multi`
+    /// (many part files) may fall back to the declared count, and only when the
+    /// files they need actually exist.
+    fn unmeasurable_corpus_is_present(&self) -> bool {
+        match self.config.dataset_type.as_deref().unwrap_or("") {
+            "sparse" => self
+                .local_path()
+                .is_some_and(|p| p.join("data.csr").exists()),
+            "h5-multi" => self
+                .config
+                .path
+                .as_object()
+                .and_then(|o| o.get("data"))
+                .and_then(|d| d.as_array())
+                .is_some_and(|parts| {
+                    !parts.is_empty()
+                        && parts.iter().all(|p| {
+                            p.get("path")
+                                .and_then(|p| p.as_str())
+                                .is_some_and(|s| datasets_dir().join(s).exists())
+                        })
+                }),
+            _ => false,
+        }
+    }
+
     /// Read all vectors and metadata from the dataset
     #[allow(clippy::type_complexity)]
     pub fn read_vectors(
@@ -91,6 +311,11 @@ impl Dataset {
         normalize: bool,
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>, Vec<Option<MetadataItem>>), String> {
         let path = self.get_path()?;
+        // Cross-check declared vs. actual corpus size on every read — this is the
+        // first point at which the corpus is guaranteed present (get_path may
+        // have just downloaded it), so it is where a bad vector_count surfaces
+        // as an error instead of as silently-wrong recall (#224).
+        self.validate_vector_count()?;
         let path_str = path.to_str().ok_or("Invalid path encoding")?;
         let dataset_type = self.config.dataset_type.as_deref().unwrap_or("");
 
@@ -322,6 +547,8 @@ impl Dataset {
         normalize: bool,
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>, Vec<SparseVector>), String> {
         let dir = self.get_path()?;
+        // Same declared-vs-actual cross-check as read_vectors (#224).
+        self.validate_vector_count()?;
         let (_ids, dense_vectors) = read_npy_vectors(
             dir.join("vectors.npy")
                 .to_str()
@@ -438,6 +665,22 @@ impl Dataset {
     }
 }
 
+/// Count the non-blank lines of a JSONL corpus — one line per vector, matching
+/// what `read_jsonl_vectors` yields (it skips blank lines). Streamed, so a large
+/// `vectors.jsonl` is never held in memory.
+fn count_nonempty_lines(path: &std::path::Path) -> Result<u64, String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let mut count = 0u64;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("read {}: {}", path.display(), e))?;
+        if !line.trim().is_empty() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Parse a `neighbours.jsonl` ground-truth file (one JSON id-array per line)
 /// with STRICT line alignment: every line must be a valid id-array so that row
 /// `i` is unambiguously query `i`'s ground truth. A blank OR unparseable line in
@@ -476,6 +719,80 @@ mod tests {
     use vector_db_benchmark::readers::{
         write_gt_neighbours, write_npy_vectors, write_sparse_matrix,
     };
+
+    /// A dataset of the given `dataset_type` rooted at an absolute temp path.
+    fn dataset_at(
+        path: &std::path::Path,
+        dataset_type: &str,
+        vector_count: Option<i64>,
+    ) -> Dataset {
+        Dataset::new(DatasetConfig {
+            name: "count-unit".to_string(),
+            dataset_type: Some(dataset_type.to_string()),
+            path: serde_json::Value::String(path.to_str().unwrap().to_string()),
+            distance: Some("l2".to_string()),
+            vector_size: Some(3),
+            vector_count,
+            link: None,
+            schema: None,
+            description: None,
+        })
+    }
+
+    /// The corpus, not `datasets.json`, is the authority on how many vectors
+    /// exist (#224) — for both the compound layout and plain JSONL.
+    #[test]
+    fn measures_the_corpus_from_the_files_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors: Vec<Vec<f32>> = (0..42).map(|i| vec![i as f32, 0.0, 0.0]).collect();
+        write_npy_vectors(dir.path().join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+        let ds = dataset_at(dir.path(), "tar", Some(42));
+        assert_eq!(ds.measured_vector_count().unwrap(), Some(42));
+        ds.validate_vector_count().expect("declared matches corpus");
+
+        let jsonl_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            jsonl_dir.path().join("vectors.jsonl"),
+            "[1.0,0.0,0.0]\n\n[0.0,1.0,0.0]\n[0.0,0.0,1.0]\n",
+        )
+        .unwrap();
+        let ds = dataset_at(jsonl_dir.path(), "jsonl", Some(3));
+        assert_eq!(
+            ds.measured_vector_count().unwrap(),
+            Some(3),
+            "blank lines are not vectors (read_jsonl_vectors skips them)"
+        );
+    }
+
+    /// An UNDER-declared count is the #224 failure and must abort the read; an
+    /// OVER-declared one only makes consumers more conservative, so it warns and
+    /// lets the run proceed over the vectors that actually exist.
+    #[test]
+    fn count_mismatch_is_fatal_only_when_the_corpus_is_bigger_than_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors: Vec<Vec<f32>> = (0..500).map(|i| vec![i as f32, 0.0, 0.0]).collect();
+        write_npy_vectors(dir.path().join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+
+        let under = dataset_at(dir.path(), "tar", Some(100));
+        let err = under
+            .validate_vector_count()
+            .expect_err("corpus larger than declared must be fatal");
+        assert!(err.contains("500"), "{err}");
+        assert!(
+            under.read_vectors(false).is_err(),
+            "read_vectors must surface the mismatch rather than benchmark a lie"
+        );
+
+        let over = dataset_at(dir.path(), "tar", Some(100_000));
+        over.validate_vector_count()
+            .expect("corpus smaller than declared only warns");
+        assert_eq!(over.read_vectors(false).unwrap().1.len(), 500);
+
+        // A dataset with no declared count is unconstrained.
+        let silent = dataset_at(dir.path(), "tar", None);
+        silent.validate_vector_count().unwrap();
+        assert_eq!(silent.corpus_completeness_target().unwrap(), Some(500));
+    }
 
     /// Build a `Dataset` whose `path` is an absolute temp dir (so `get_path`
     /// resolves to it directly — `datasets_dir().join(abs)` == `abs`).

@@ -1065,7 +1065,7 @@
       "garment_group_name": "keyword",
       "detail_desc": "text"
     },
-    "vector_count": 105542,
+    "vector_count": 105100,
     "description": "Fashion product embeddings"
   },
   {
@@ -1075,7 +1075,7 @@
     "type": "tar",
     "path": "h-and-m-2048-angular-no-filters/hnm_no_filters",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/hnm_no_filters.tgz",
-    "vector_count": 105542,
+    "vector_count": 105100,
     "description": "Fashion product embeddings"
   },
   {
@@ -1090,7 +1090,7 @@
       "labels": "keyword",
       "submitter": "keyword"
     },
-    "vector_count": 2205995,
+    "vector_count": 2138591,
     "description": "Academic paper embeddings"
   },
   {
@@ -1100,7 +1100,7 @@
     "type": "tar",
     "path": "arxiv-titles-384-angular/arxiv_no_filters",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/arxiv_no_filters.tar.gz",
-    "vector_count": 2205995,
+    "vector_count": 2138591,
     "description": "Academic paper embeddings"
   },
   {
@@ -1324,7 +1324,7 @@
       "a": "keyword",
       "b": "keyword"
     },
-    "vector_count": 100,
+    "vector_count": 1000000,
     "description": "Synthetic data"
   },
   {
@@ -1334,7 +1334,7 @@
     "type": "tar",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/random_keywords_1m_vocab_10_no_filters.tgz",
     "path": "random-100-match-kw-small-vocab/random_keywords_1m_vocab_10_no_filters",
-    "vector_count": 100,
+    "vector_count": 1000000,
     "description": "Synthetic data"
   },
   {

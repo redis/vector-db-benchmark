@@ -6,10 +6,51 @@ Script to add missing vector_count and description fields to datasets.json
 import json
 import re
 
-def estimate_vector_count(name):
-    """Estimate vector count from dataset name patterns"""
+_MAGNITUDE = {'k': 10 ** 3, 'm': 10 ** 6, 'g': 10 ** 9, 'b': 10 ** 9}
+
+
+def _size_from_corpus_path(path):
+    """Corpus size advertised by the corpus filename itself, or None.
+
+    Only the LEAF path segment is considered (so a family directory like
+    `yandex-1B-200-angular/` cannot override the `..._100k` corpus inside it),
+    and the LAST magnitude token in it wins.
+    """
+    if not isinstance(path, str):
+        return None
+    segments = [s for s in path.split('/') if s]
+    if not segments:
+        return None
+    size = None
+    for token in re.split(r'[_\-.]', segments[-1]):
+        match = re.fullmatch(r'(\d+)([kKmMgGbB])', token)
+        if not match:
+            continue
+        candidate = int(match.group(1)) * _MAGNITUDE[match.group(2).lower()]
+        # Ignore absurd magnitudes rather than letting one erase a valid earlier
+        # token, so this stays byte-for-byte equivalent to the Rust twin in
+        # config.rs (which declines anything that overflows i64).
+        if candidate <= 2 ** 63 - 1:
+            size = candidate
+    return size
+
+
+def estimate_vector_count(name, path=None):
+    """Estimate vector count from dataset name patterns.
+
+    The dataset NAME is an unreliable source: `random-100-match-kw-small-vocab-*`
+    is named for its 100 dimensions of query vocabulary, not its corpus size, but
+    points at `random_keywords_1m_vocab_10` — a 1,000,000-point corpus. Guessing
+    100 from the name is what produced the silently-wrong recall in issue #224.
+    So when the CORPUS PATH names its own magnitude (`..._1m`, `..._100k`),
+    that wins over anything read out of the name.
+    """
+    from_path = _size_from_corpus_path(path)
+    if from_path is not None:
+        return from_path
+
     name_lower = name.lower()
-    
+
     # Direct patterns
     if '1b' in name_lower or '1billion' in name_lower or '1g' in name_lower:
         return 1000000000
@@ -48,9 +89,9 @@ def estimate_vector_count(name):
     elif 'dbpedia' in name_lower:
         return 1000000
     elif 'h-and-m' in name_lower:
-        return 105542
+        return 105100  # measured: vectors.npy shape (105100, 2048)
     elif 'arxiv' in name_lower:
-        return 2205995
+        return 2138591  # measured: vectors.npy shape (2138591, 384)
     elif 'laion-small-clip' in name_lower:
         return 100000
     elif 'random-match' in name_lower or 'random-range' in name_lower or 'random-geo' in name_lower:
@@ -110,7 +151,7 @@ def main():
         
         # Add vector_count if missing
         if 'vector_count' not in dataset:
-            vector_count = estimate_vector_count(dataset['name'])
+            vector_count = estimate_vector_count(dataset['name'], dataset.get('path'))
             dataset['vector_count'] = vector_count
             updated = True
             print(f"Added vector_count {vector_count} to {dataset['name']}")

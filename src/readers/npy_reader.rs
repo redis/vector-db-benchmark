@@ -5,6 +5,26 @@ use ndarray_npy::{ReadNpyExt, WriteNpyExt};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read};
 
+/// Parse the `shape` tuple's dimensions out of an NPY header dict string, e.g.
+/// `{'descr': '<f4', 'fortran_order': False, 'shape': (100, 25), }` -> `[100, 25]`.
+/// Returns `None` if the tuple can't be located or holds a non-integer.
+fn parse_npy_shape_dims(header: &str) -> Option<Vec<u64>> {
+    let shape_idx = header.find("'shape'")?;
+    let rest = &header[shape_idx..];
+    let open = rest.find('(')?;
+    let close = rest[open..].find(')')? + open;
+    let inner = &rest[open + 1..close];
+    let mut dims = Vec::new();
+    for part in inner.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        dims.push(t.parse::<u64>().ok()?);
+    }
+    Some(dims)
+}
+
 /// Parse the element count and item size (bytes) from an NPY header dict string,
 /// e.g. `{'descr': '<f4', 'fortran_order': False, 'shape': (100, 25), }`.
 /// Returns `None` if the fields can't be located (caller then skips the
@@ -21,42 +41,40 @@ fn parse_npy_shape_itemsize(header: &str) -> Option<(u64, u64)> {
     let itemsize: u64 = digits.parse().ok()?;
 
     // 'shape' -> product of the integers inside the (...) tuple.
-    let shape_idx = header.find("'shape'")?;
-    let rest = &header[shape_idx..];
-    let open = rest.find('(')?;
-    let close = rest[open..].find(')')? + open;
-    let inner = &rest[open + 1..close];
     let mut count: u64 = 1;
-    for part in inner.split(',') {
-        let t = part.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let dim: u64 = t.parse().ok()?;
+    for dim in parse_npy_shape_dims(header)? {
         count = count.checked_mul(dim)?;
     }
     Some((count, itemsize))
 }
 
-/// Reject NPY files whose header declares more bytes than the file can possibly
-/// contain, BEFORE handing them to `ndarray-npy` (which otherwise allocates the
-/// declared header/data up front and can OOM on a corrupt/hostile header).
-/// A mismatched magic or an unparseable header falls through to the real parser.
-fn validate_npy_size_bound(path: &str) -> Result<(), String> {
+/// An NPY file's header, read without touching the (potentially multi-GB) data
+/// payload: the raw dict text plus the byte offset where the data begins and the
+/// file's real length.
+struct NpyHeader {
+    dict: String,
+    data_start: u64,
+    file_len: u64,
+}
+
+/// Read ONLY the NPY header (magic + length prefix + dict) — never the data.
+/// Returns `Ok(None)` when the file is too short or lacks the NPY magic, so the
+/// caller can fall through and let the real parser report the error.
+fn read_npy_header(path: &str) -> Result<Option<NpyHeader>, String> {
     let mut file = File::open(path).map_err(|e| format!("Failed to open NPY file: {}", e))?;
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
 
     let mut prefix = [0u8; 12];
     if file.read_exact(&mut prefix[..10]).is_err() {
-        return Ok(()); // too short to be NPY; let the real parser report it
+        return Ok(None); // too short to be NPY; let the real parser report it
     }
     if &prefix[0..6] != b"\x93NUMPY" {
-        return Ok(());
+        return Ok(None);
     }
     let major = prefix[6];
     let (header_len, header_start) = if major >= 2 {
         if file.read_exact(&mut prefix[10..12]).is_err() {
-            return Ok(());
+            return Ok(None);
         }
         let hl = u32::from_le_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]) as u64;
         (hl, 12u64)
@@ -76,12 +94,11 @@ fn validate_npy_size_bound(path: &str) -> Result<(), String> {
         ));
     }
 
-    // The declared data payload must also fit in the file.
     let mut header = vec![0u8; header_len as usize];
     if file.read_exact(&mut header).is_err() {
-        return Ok(());
+        return Ok(None);
     }
-    let header = String::from_utf8_lossy(&header);
+    let header = String::from_utf8_lossy(&header).into_owned();
 
     // Guard against pathological headers that make the downstream Python-dict
     // parser (`ndarray-npy`) blow up. A valid NPY header is a flat dict
@@ -110,21 +127,56 @@ fn validate_npy_size_bound(path: &str) -> Result<(), String> {
         ));
     }
 
-    if let Some((count, itemsize)) = parse_npy_shape_itemsize(&header) {
+    Ok(Some(NpyHeader {
+        dict: header,
+        data_start: header_end,
+        file_len,
+    }))
+}
+
+/// Reject NPY files whose header declares more bytes than the file can possibly
+/// contain, BEFORE handing them to `ndarray-npy` (which otherwise allocates the
+/// declared header/data up front and can OOM on a corrupt/hostile header).
+/// A mismatched magic or an unparseable header falls through to the real parser.
+fn validate_npy_size_bound(path: &str) -> Result<(), String> {
+    let Some(header) = read_npy_header(path)? else {
+        return Ok(());
+    };
+
+    // The declared data payload must also fit in the file.
+    if let Some((count, itemsize)) = parse_npy_shape_itemsize(&header.dict) {
         let data_bytes = count
             .checked_mul(itemsize)
             .ok_or_else(|| "NPY shape * itemsize overflow".to_string())?;
-        let total = header_end
+        let total = header
+            .data_start
             .checked_add(data_bytes)
             .ok_or_else(|| "NPY total size overflow".to_string())?;
-        if total > file_len {
+        if total > header.file_len {
             return Err(format!(
                 "NPY declares {} data bytes but file has only {}",
-                data_bytes, file_len
+                data_bytes, header.file_len
             ));
         }
     }
     Ok(())
+}
+
+/// Number of rows (the first `shape` dimension) declared by an NPY file, read
+/// from its ~128-byte header WITHOUT loading the data payload.
+///
+/// This is the ground truth for "how many vectors does this corpus actually
+/// hold?" and is cheap enough to call on a multi-GB `vectors.npy` in a hot path
+/// (#224: a declared `vector_count` that disagrees with the corpus silently
+/// corrupted recall, so the corpus itself must be the authority).
+pub fn npy_row_count(path: &str) -> Result<u64, String> {
+    let header =
+        read_npy_header(path)?.ok_or_else(|| format!("{}: not a readable NPY file", path))?;
+    let dims = parse_npy_shape_dims(&header.dict)
+        .ok_or_else(|| format!("{}: could not parse NPY 'shape' from header", path))?;
+    dims.first()
+        .copied()
+        .ok_or_else(|| format!("{}: NPY 'shape' tuple is empty", path))
 }
 
 /// Read vectors from NPY file, returning (ids, vectors).
@@ -269,5 +321,23 @@ mod tests {
         let (ids, read) = read_npy_vectors(path, false).unwrap();
         assert_eq!(ids, vec![0, 1]);
         assert_eq!(read, vectors);
+    }
+
+    /// `npy_row_count` must report the ROW count (first shape dim), not the
+    /// element count — it is what the shared-corpus completeness gate compares
+    /// against (#224) — and must not read the data payload.
+    #[test]
+    fn row_count_reads_rows_from_the_header_only() {
+        let vectors: Vec<Vec<f32>> = (0..7).map(|i| vec![i as f32; 5]).collect();
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let path = f.path().to_str().unwrap();
+        write_npy_vectors(path, &vectors).unwrap();
+        assert_eq!(npy_row_count(path).unwrap(), 7);
+    }
+
+    #[test]
+    fn row_count_rejects_a_non_npy_file() {
+        let f = write_tmp(b"this is not an NPY file at all, not even close");
+        assert!(npy_row_count(f.path().to_str().unwrap()).is_err());
     }
 }
