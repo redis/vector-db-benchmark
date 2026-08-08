@@ -364,12 +364,22 @@ impl OpenSearchEngine {
     /// `max_num_segments(1)` mirrors `elasticsearch.rs`, and the parity matters
     /// more than it looks: a segment is one HNSW graph, and a k-NN query searches
     /// every segment of every shard and merges the per-segment result lists. So
-    /// segment count moves BOTH recall and latency. Leaving OpenSearch on Lucene's
-    /// dynamic merge policy while Elasticsearch is pinned to one segment makes the
-    /// two engines structurally incomparable, and makes the OpenSearch side
-    /// irreproducible on its own terms — the merge policy's answer depends on
-    /// ingest timing, batch size and thread count, so two runs of the *same*
-    /// config can land on different segment counts. (#210)
+    /// segment count moves BOTH recall and latency.
+    ///
+    /// Latency, because N segments means N graph traversals plus an N-way merge
+    /// instead of one. Recall, because each segment holds 1/N of the corpus, and a
+    /// *fixed* `ef` explores a far larger *fraction* of a small graph than of a
+    /// big one — eighty-five ~14k-doc graphs are close to exhaustively searched at
+    /// ef=128, one 1.18M-doc graph is nowhere near. (Note it is NOT that each
+    /// segment gets its own `ef` budget: Lucene passes each segment the global
+    /// `k`.) Measured on glove-25-angular, 85 searchable segments vs 1: recall
+    /// 0.9850 → 0.9405 at ef=128, 0.9977 → 0.9930 at ef=512.
+    ///
+    /// So leaving OpenSearch on Lucene's dynamic merge policy while Elasticsearch
+    /// is pinned to one segment makes the two engines structurally incomparable,
+    /// and makes the OpenSearch side irreproducible on its own terms — the merge
+    /// policy's answer depends on ingest timing, batch size and thread count, so
+    /// two runs of the *same* config can land on different segment counts. (#210)
     ///
     /// Retried on the same transient states as the other index ops. This is the op
     /// that most needs them: it is the longest-running of the four, it is what a
@@ -386,15 +396,11 @@ impl OpenSearchEngine {
     fn force_merge(&self) -> Result<(), String> {
         println!("Forcing merge into 1 segment...");
 
-        // Named for what it is rather than after the transport setter: a local
-        // called `request_timeout` is indistinguishable, to the shipped-config
-        // knob guard's token search, from an engine reading
-        // `connection_params.request_timeout` — which this does not do.
-        let merge_deadline = self.force_merge_timeout();
+        let request_timeout = self.force_merge_timeout()?;
         retry_index_op(
             &self.rt,
             "Force merge",
-            index_op_policy(),
+            index_op_policy().with_budget(self.force_merge_budget(request_timeout)?),
             |status| (200..300).contains(&status),
             index_maintenance_retryable,
             || {
@@ -403,7 +409,7 @@ impl OpenSearchEngine {
                         .indices()
                         .forcemerge(IndicesForcemergeParts::Index(&[&self.index_name]))
                         .max_num_segments(1)
-                        .request_timeout(merge_deadline)
+                        .request_timeout(request_timeout)
                         .send(),
                 )
             },
@@ -468,16 +474,39 @@ impl OpenSearchEngine {
     /// merge cost. Combined with the capped backoff (~3.5 min total across the 10
     /// attempts), the budget is sane for the longer operation.
     ///
-    /// Overridable via `OPENSEARCH_FORCE_MERGE_TIMEOUT` (seconds); the arithmetic
-    /// lives in [`resolve_force_merge_timeout`] so it is testable without an
-    /// engine or a cluster.
-    fn force_merge_timeout(&self) -> std::time::Duration {
-        resolve_force_merge_timeout(
+    /// Overridable via `OPENSEARCH_FORCE_MERGE_TIMEOUT` (seconds, `0` = no
+    /// client-side deadline); the arithmetic lives in
+    /// [`resolve_force_merge_timeout`] so it is testable without an engine or a
+    /// cluster.
+    fn force_merge_timeout(&self) -> Result<std::time::Duration, String> {
+        Ok(resolve_force_merge_timeout(
             self.timeout,
-            std::env::var("OPENSEARCH_FORCE_MERGE_TIMEOUT")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok()),
-        )
+            parse_env_secs("OPENSEARCH_FORCE_MERGE_TIMEOUT")?,
+        ))
+    }
+
+    /// Wall-clock ceiling on `force_merge` *including* its retries.
+    ///
+    /// Per-attempt bounds stop bounding anything once the per-attempt bound is an
+    /// hour: `retry_index_op` treats every transport error as retryable, so 11
+    /// attempts × 3600 s is an ~11 h worst case for a single call. The search path
+    /// has carried a wall-clock budget for exactly this reason
+    /// (`SearchRetryPolicy`); raising the index path's per-attempt bound 12×
+    /// without one would have left force-merge as the only unbounded operation in
+    /// the engine.
+    ///
+    /// Default: twice the per-attempt timeout — room for one full-length attempt
+    /// plus one full-length retry, and no more. Override with
+    /// `OPENSEARCH_FORCE_MERGE_BUDGET` (seconds, `0` = unlimited).
+    fn force_merge_budget(
+        &self,
+        per_attempt: std::time::Duration,
+    ) -> Result<Option<std::time::Duration>, String> {
+        Ok(match parse_env_secs("OPENSEARCH_FORCE_MERGE_BUDGET")? {
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => Some(per_attempt.saturating_mul(2)),
+        })
     }
 
     /// Wait for the index to report at least yellow before the search phase runs.
@@ -506,9 +535,30 @@ impl OpenSearchEngine {
     /// primaries are active; asking for yellow keeps the ES semantics while
     /// staying immune to unrelated indices.
     ///
-    /// Note the health API answers HTTP 200 with `"timed_out": true` when the
-    /// status was NOT reached, so a status-only check (what `retry_index_op`
-    /// offers) would read a timeout as success. Hence the explicit body check.
+    /// On a missed status both shipped engines answer **HTTP 408** with
+    /// `"timed_out": true` (verified against OpenSearch 3.7.0 and Elasticsearch
+    /// 9.4.3), so the status range does the work. [`cluster_health_settled`] also
+    /// rejects a `"timed_out": true` body carrying a 2xx, which is what
+    /// `cluster.health.return_200_for_cluster_health_timeout` produces on the
+    /// Elasticsearch versions that support it — defence in depth, not the
+    /// behaviour of the containers this repo tests against.
+    ///
+    /// This runs as the tail of `force_merge`, i.e. after a completed ingest AND a
+    /// completed merge, and that shapes the error handling:
+    ///
+    /// * Transient states retry ([`cluster_health_retryable`]).
+    /// * **401/403 warn and continue.** On AWS OpenSearch with fine-grained access
+    ///   control, `cluster:monitor/health` is routinely denied even when the index
+    ///   actions this tool needs are granted. Failing there would throw away a
+    ///   multi-hour ingest over a *monitoring* permission — and the merge and
+    ///   refresh that actually determine the measured index state have already
+    ///   succeeded, so the wait is belt-and-braces, not correctness. Retrying an
+    ///   authorization decision 11 times first (~14.5 min) would be pure waste.
+    ///   This is a NEW failure mode introduced by adding the wait, on exactly the
+    ///   managed domains the index-scoping above exists to protect, so it is
+    ///   handled here rather than inherited.
+    /// * Anything else fails, because it means we genuinely cannot tell whether the
+    ///   cluster settled.
     fn wait_for_cluster_health(&self) -> Result<(), String> {
         println!("Waiting for OpenSearch yellow status...");
 
@@ -526,12 +576,30 @@ impl OpenSearchEngine {
             ) {
                 Ok(resp) => {
                     let status = resp.status_code().as_u16();
-                    match self.rt.block_on(resp.json::<serde_json::Value>()) {
-                        Ok(body) => {
+                    match self.rt.block_on(resp.text()) {
+                        Ok(text) => {
+                            let body = serde_json::from_str::<serde_json::Value>(&text)
+                                .unwrap_or(serde_json::Value::Null);
                             if cluster_health_settled(status, &body) {
                                 return Ok(());
                             }
-                            format!("HTTP {}: {}", status, body)
+                            if is_authorization_denied(status) {
+                                println!(
+                                    "  ⚠ cluster health not observable (HTTP {}): {}. \
+                                     The force merge and refresh already succeeded, so the \
+                                     index state is correct; continuing without the settle \
+                                     check. Grant cluster:monitor/health to restore it.",
+                                    status, text
+                                );
+                                return Ok(());
+                            }
+                            if !cluster_health_retryable(status) {
+                                return Err(format!(
+                                    "Cluster health wait failed (HTTP {}, {} retries): {}",
+                                    status, attempt, text
+                                ));
+                            }
+                            format!("HTTP {}: {}", status, text)
                         }
                         Err(e) => format!("HTTP {}, body unreadable: {}", status, e),
                     }
@@ -1060,6 +1128,9 @@ fn backoff_sleep(base_delay_ms: u64, attempt: u32) -> std::time::Duration {
 struct RetryPolicy {
     max_retries: u32,
     base_delay_ms: u64,
+    /// Optional wall-clock ceiling across *all* attempts. `None` = bounded by
+    /// attempt count alone, which is only safe while each attempt is short.
+    budget: Option<std::time::Duration>,
 }
 
 impl RetryPolicy {
@@ -1073,7 +1144,12 @@ impl RetryPolicy {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default_base_ms),
+            budget: None,
         }
+    }
+
+    fn with_budget(self, budget: Option<std::time::Duration>) -> Self {
+        Self { budget, ..self }
     }
 }
 
@@ -1099,6 +1175,7 @@ fn retry_index_op<S>(
 where
     S: FnMut() -> Result<opensearch::http::response::Response, opensearch::Error>,
 {
+    let started = std::time::Instant::now();
     let mut attempt: u32 = 0;
     loop {
         let last_error = match send() {
@@ -1136,6 +1213,23 @@ where
                 "{} failed after {} retries: {}",
                 what, attempt, last_error
             ));
+        }
+        // Attempt count alone stops bounding anything once a single attempt may
+        // run for an hour (force merge), so an operation that asked for a
+        // wall-clock ceiling gets one. Checked before sleeping: there is no point
+        // backing off into a budget that is already spent.
+        if let Some(budget) = policy.budget {
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                return Err(format!(
+                    "{} exceeded its {:.0}s wall-clock budget after {} retries ({:.0}s elapsed): {}",
+                    what,
+                    budget.as_secs_f64(),
+                    attempt,
+                    elapsed.as_secs_f64(),
+                    last_error
+                ));
+            }
         }
         backoff_sleep(policy.base_delay_ms, attempt);
         attempt += 1;
@@ -1246,6 +1340,35 @@ fn index_maintenance_retryable(status: u16, body: &str) -> bool {
 /// `OpenSearchEngine::force_merge_timeout`.
 const FORCE_MERGE_TIMEOUT_SECS: u64 = 3_600;
 
+/// What `OPENSEARCH_FORCE_MERGE_TIMEOUT=0` resolves to: a deadline far enough out
+/// that it never fires. `0` conventionally means "no limit", and the transport
+/// requires *some* duration, so "no limit" is spelled as a century rather than as
+/// `Duration::ZERO` — which reqwest would treat as an already-expired deadline,
+/// failing every attempt before a byte left the process and discarding a
+/// completed ingest.
+const FORCE_MERGE_TIMEOUT_UNLIMITED: std::time::Duration =
+    std::time::Duration::from_secs(100 * 365 * 24 * 3_600);
+
+/// Read a seconds-valued environment variable, failing loudly on a value that is
+/// present but unusable.
+///
+/// `.parse().ok()` would silently reinstate the default for `3600s`, `1h` or
+/// `-1` — the exact "silently ignored setting" failure `parse_number_of_shards`
+/// exists to prevent in this same file. An operator who sets a merge timeout and
+/// gets the default instead is worse off than one who gets an error.
+fn parse_env_secs(var: &str) -> Result<Option<u64>, String> {
+    match std::env::var(var) {
+        Err(_) => Ok(None),
+        Ok(raw) => raw.trim().parse::<u64>().map(Some).map_err(|_| {
+            format!(
+                "{} must be a whole number of seconds (got {:?}). Use 0 for no limit; \
+                 suffixes like \"1h\" or \"3600s\" are not accepted.",
+                var, raw
+            )
+        }),
+    }
+}
+
 /// Resolve one force-merge attempt's request timeout.
 ///
 /// Split from `OpenSearchEngine::force_merge_timeout` so the rule is testable
@@ -1254,25 +1377,46 @@ fn resolve_force_merge_timeout(
     client_timeout_secs: u64,
     override_secs: Option<u64>,
 ) -> std::time::Duration {
-    // Never *below* the client-wide timeout: an operator who raised
-    // OPENSEARCH_TIMEOUT for a big corpus meant it for this call too. An explicit
-    // OPENSEARCH_FORCE_MERGE_TIMEOUT wins outright, including downwards — that is
-    // the whole point of an explicit override.
-    let secs = override_secs.unwrap_or_else(|| client_timeout_secs.max(FORCE_MERGE_TIMEOUT_SECS));
-    std::time::Duration::from_secs(secs)
+    match override_secs {
+        // 0 means "no client-side deadline", not "expire immediately".
+        Some(0) => FORCE_MERGE_TIMEOUT_UNLIMITED,
+        // An explicit override wins outright, including downwards — that is the
+        // whole point of an explicit override.
+        Some(secs) => std::time::Duration::from_secs(secs),
+        // Never *below* the client-wide timeout: an operator who raised
+        // OPENSEARCH_TIMEOUT for a big corpus meant it for this call too.
+        None => std::time::Duration::from_secs(client_timeout_secs.max(FORCE_MERGE_TIMEOUT_SECS)),
+    }
 }
 
 /// Whether a `_cluster/health?wait_for_status=…` response means "settled".
 ///
-/// The trap this encodes: the health API answers **HTTP 200 with
-/// `"timed_out": true`** when the requested status was NOT reached within
-/// `timeout`. A status-only check therefore reads "never went yellow" as success
-/// and lets the search phase start against a cluster that is still moving shards.
-/// An absent `timed_out` is treated as settled — the field is always present on a
-/// real response, and inventing a failure from a missing field would hard-fail a
-/// finished ingest over a response-shape change.
+/// Both engines this repo tests against answer a missed status with **HTTP 408**
+/// and `"timed_out": true` (verified on OpenSearch 3.7.0 and Elasticsearch
+/// 9.4.3), so the status range does the work. The `timed_out` check is defence in
+/// depth for the 2xx-carrying variant that
+/// `cluster.health.return_200_for_cluster_health_timeout` produces on the
+/// Elasticsearch versions supporting it (the flag is not recognised on OpenSearch
+/// 3.7.0): there, a status-only check would read "never went yellow" as success
+/// and start the search phase against a cluster still moving shards.
+///
+/// An absent `timed_out` is treated as settled — inventing a failure from a
+/// missing field would hard-fail a finished ingest over a response-shape change.
 fn cluster_health_settled(status: u16, body: &serde_json::Value) -> bool {
     (200..300).contains(&status) && body.get("timed_out").and_then(|v| v.as_bool()) != Some(true)
+}
+
+/// Health-check statuses worth another attempt: the back-pressure and gateway
+/// statuses, plus 408 — the timeout answer itself, which just means the cluster
+/// had not settled *yet*.
+fn cluster_health_retryable(status: u16) -> bool {
+    status == 408 || http_status_retryable(status)
+}
+
+/// Whether a response means "you may not ask", as opposed to "it went wrong".
+/// Retrying an authorization decision cannot change it.
+fn is_authorization_denied(status: u16) -> bool {
+    matches!(status, 401 | 403)
 }
 
 /// Retry budget shared by every index-level operation (create, delete, refresh,
@@ -1614,26 +1758,37 @@ impl Engine for OpenSearchEngine {
             vectors.len() as f64 / upload_time
         );
 
-        // Explicit refresh (refresh_interval is disabled during upload) so the
-        // documents are searchable, then merge segments. `force_merge` refreshes
-        // again on its way out — see the note there: the merge is invisible to
-        // queries until it does. Include this refresh+merge time in total_time
-        // for cross-engine comparability (mirrors mongodb; matches v0's
-        // post_upload() timing). Pinning the merge to one segment makes this
-        // phase much longer than it used to be (#210).
+        // Force merge, which flushes and then refreshes — see `force_merge`; the
+        // merge is invisible to queries until that refresh, so it is also what
+        // makes the documents searchable here.
         //
-        // This pre-merge refresh is deliberately KEPT. It was once a candidate
-        // for removal on the grounds that `elasticsearch.rs` went straight from
-        // upload to force-merge, so the refresh was billed to OpenSearch's
-        // `index_time` and not to Elasticsearch's — an asymmetry in the very
-        // metric #210 exists to make comparable. #248 closed that gap from the
-        // other side: Elasticsearch now disables refresh during upload and runs
-        // the same explicit `refresh()` immediately before its own force-merge,
-        // inside its own timed index phase. The two engines are therefore
-        // symmetric here already, and dropping this call would re-open the
-        // asymmetry in the opposite direction rather than close it.
+        // There is deliberately no refresh BEFORE the merge, so that each engine
+        // spends exactly ONE refresh inside its timed index phase:
+        //
+        //   elasticsearch.rs   refresh -> force_merge(1)
+        //   opensearch.rs      force_merge(1) -> refresh
+        //
+        // Since #248 both engines disable periodic refresh during upload
+        // (`refresh_interval: -1`) and both need one explicit refresh to make the
+        // result searchable. Only the placement differs, and it has to: an
+        // Elasticsearch force merge swaps the external searcher onto the merged
+        // segment, an OpenSearch one does not (measured — ES 9.4.3 reports
+        // 1 segment / 1 searchable straight after the merge; OpenSearch 3.7.0
+        // reports 4 / 3, with the merged segment at `"search": false`). So on
+        // OpenSearch the refresh MUST follow the merge.
+        //
+        // An earlier revision of this comment argued the pre-merge refresh should
+        // be kept because #248 gave Elasticsearch one too, making the engines
+        // symmetric. That reasoning misses the refresh `force_merge` now performs
+        // on its way out: keeping a pre-merge refresh as well would bill
+        // OpenSearch TWO refreshes against Elasticsearch's one, re-opening the
+        // asymmetry rather than closing it. Measured cost of the redundant
+        // refresh on 1.18M docs: ~1 s.
+        //
+        // Include the merge time in total_time for cross-engine comparability
+        // (mirrors mongodb; matches v0's post_upload() timing). Pinning the merge
+        // to one segment makes this phase much longer than it used to be (#210).
         let index_start = Instant::now();
-        self.refresh()?;
         self.force_merge()?;
         let index_time = index_start.elapsed().as_secs_f64();
 
@@ -2791,11 +2946,52 @@ mod tests {
         );
     }
 
-    // #210: `_cluster/health?wait_for_status=yellow` answers HTTP 200 with
-    // `"timed_out": true` when the status was NOT reached. Accepting on status
-    // alone would read "never went yellow" as success and start the search phase
-    // against a cluster still applying the post-merge state — precisely the
-    // measurement contamination the wait exists to prevent.
+    // `0` conventionally means "no limit". Resolving it to Duration::ZERO would
+    // make reqwest reject every attempt before sending a byte (the deadline is
+    // already past), so all 11 attempts fail instantly and a COMPLETED ingest is
+    // discarded — the loudest possible misreading of "unlimited".
+    #[test]
+    fn force_merge_timeout_zero_means_unlimited_not_instant_failure() {
+        let resolved = resolve_force_merge_timeout(300, Some(0));
+        assert!(
+            !resolved.is_zero(),
+            "0 must not resolve to an already-expired deadline"
+        );
+        assert!(
+            resolved >= std::time::Duration::from_secs(10 * 365 * 24 * 3_600),
+            "0 must resolve to a deadline that never fires in practice, got {resolved:?}"
+        );
+    }
+
+    // A present-but-unusable value must fail loudly rather than silently
+    // reinstating the default — the same rule `parse_number_of_shards` enforces
+    // in this file.
+    #[test]
+    fn env_secs_rejects_present_but_unusable_values() {
+        let var = "OPENSEARCH_TEST_SECS_PARSE";
+        // SAFETY: this variable is touched by no other test or thread.
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(
+            parse_env_secs(var),
+            Ok(None),
+            "absent = inherit the default"
+        );
+
+        for bad in ["3600s", "1h", "-1", "", "1.5", "abc"] {
+            unsafe { std::env::set_var(var, bad) };
+            let err = parse_env_secs(var).expect_err(&format!("{bad:?} must be rejected"));
+            assert!(err.contains(var), "error must name the variable: {err}");
+        }
+        unsafe { std::env::set_var(var, " 0 ") };
+        assert_eq!(parse_env_secs(var), Ok(Some(0)), "0 is a legal value");
+        unsafe { std::env::set_var(var, "1800") };
+        assert_eq!(parse_env_secs(var), Ok(Some(1_800)));
+        unsafe { std::env::remove_var(var) };
+    }
+
+    // #210: `_cluster/health?wait_for_status=yellow` reports a missed status as
+    // HTTP 408 on BOTH shipped engines (verified against OpenSearch 3.7.0 and
+    // Elasticsearch 9.4.3), and 408 must not be mistaken for success.
     #[test]
     fn cluster_health_timeout_is_not_mistaken_for_success() {
         use serde_json::json;
@@ -2804,16 +3000,69 @@ mod tests {
             200,
             &json!({"status": "green", "timed_out": false})
         ));
+        // The real shape both engines return on a missed status.
+        assert!(
+            !cluster_health_settled(408, &json!({"status": "yellow", "timed_out": true})),
+            "HTTP 408 + timed_out:true is the shipped timeout response"
+        );
+        // Defence in depth for the 2xx-carrying variant produced by
+        // `cluster.health.return_200_for_cluster_health_timeout` on the
+        // Elasticsearch versions that support it.
         assert!(
             !cluster_health_settled(200, &json!({"status": "red", "timed_out": true})),
-            "HTTP 200 + timed_out:true means the status was never reached"
+            "a timed_out body must lose even when it arrives with a 2xx"
         );
         // Absent field: treat as settled rather than hard-failing a finished
         // ingest over a response-shape change.
         assert!(cluster_health_settled(200, &json!({"status": "green"})));
-        // Transport-level failures are still failures.
         assert!(!cluster_health_settled(503, &json!({"timed_out": false})));
-        assert!(!cluster_health_settled(408, &json!({"timed_out": false})));
+    }
+
+    // The health wait is the TAIL of force_merge, so what it does with a failure
+    // decides the fate of an already-completed ingest. 408 is "not settled yet"
+    // and must retry; an authorization denial must not be retried at all (it
+    // cannot change), and is handled by the caller as a warning.
+    #[test]
+    fn cluster_health_retries_transient_states_but_never_authorization() {
+        for status in [408, 429, 502, 503, 504] {
+            assert!(cluster_health_retryable(status), "{status} must retry");
+        }
+        for status in [401, 403] {
+            assert!(
+                !cluster_health_retryable(status),
+                "{status} must not burn the retry budget"
+            );
+            assert!(is_authorization_denied(status));
+        }
+        // A genuine error is neither retryable nor an authorization decision, so
+        // it surfaces as a hard failure with the body attached.
+        assert!(!cluster_health_retryable(400));
+        assert!(!is_authorization_denied(404));
+        assert!(!is_authorization_denied(503));
+    }
+
+    // Raising the per-attempt force-merge bound 12x (300 s -> 3600 s) without a
+    // wall-clock ceiling would leave an ~11 h worst case for one force_merge,
+    // since retry_index_op treats every transport error as retryable.
+    #[test]
+    fn retry_policy_budget_defaults_off_and_is_opt_in() {
+        let base = RetryPolicy {
+            max_retries: 10,
+            base_delay_ms: 2_000,
+            budget: None,
+        };
+        assert!(
+            base.budget.is_none(),
+            "other index ops keep count-only bounds"
+        );
+
+        let bounded = base.with_budget(Some(std::time::Duration::from_secs(7_200)));
+        assert_eq!(bounded.budget, Some(std::time::Duration::from_secs(7_200)));
+        // The budget must not disturb the rest of the policy.
+        assert_eq!(bounded.max_retries, base.max_retries);
+        assert_eq!(bounded.base_delay_ms, base.base_delay_ms);
+        // Explicitly unlimited stays unlimited.
+        assert_eq!(base.with_budget(None).budget, None);
     }
 
     #[test]
