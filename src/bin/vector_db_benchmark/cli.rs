@@ -58,8 +58,10 @@ pub struct Args {
     /// otherwise. It also aborts when the probe for the server-side count FAILS
     /// (restrictive ACLs, unreachable server), and when the dataset's own
     /// expected row count cannot be determined even after the corpus has been
-    /// fetched — an unmeasurable layout with no `vector_count`, or a corpus that
-    /// is neither on this machine nor downloadable (#290).
+    /// resolved — an unmeasurable layout with no `vector_count`, a dataset that
+    /// is not on this machine, or a dataset directory that is here but has lost
+    /// its corpus file (#290). Note the last one is not re-downloaded: a path
+    /// that already exists is never re-fetched, whatever its link says.
     ///
     /// It does NOT abort when an engine simply has no row-count probe wired up
     /// (Chroma, Milvus, Weaviate, Turbopuffer, Vertex): that prints a note and

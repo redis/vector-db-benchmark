@@ -72,6 +72,45 @@ fn read_u32_array<T>(
         .collect())
 }
 
+/// Number of rows a CSR file declares, read from its 24-byte header WITHOUT
+/// parsing the matrix.
+///
+/// The sibling of [`crate::readers::npy_row_count`], and for the same reason: it
+/// makes the corpus — not `datasets.json` — the authority on how many vectors
+/// exist (#224). Until this existed, `sparse` was the one shipped layout with no
+/// cheap row count, so the `--skip-upload` reuse check had to TRUST the declared
+/// `vector_count`; a wrong declaration then classified a correct corpus as
+/// `Short` (false abort) or a genuinely short one as `Surplus` (warn, and publish
+/// the wrong number) — the exact failure class #290 exists to close, reached
+/// through the datasets.json door.
+///
+/// Cost is a 24-byte read, so this is safe to call on a multi-GB `data.csr`.
+/// Validation is deliberately minimal and matches what the header alone can
+/// support: the first `i64` must be non-negative, and the file must be at least
+/// as long as the three-`i64` header. Everything structural (index_pointer
+/// monotonicity, nnz agreement) is [`read_sparse_matrix`]'s job — a count read
+/// must not have to parse the matrix to answer.
+pub fn csr_row_count(path: &str) -> Result<u64, String> {
+    let file = File::open(Path::new(path)).map_err(|e| format!("open {}: {}", path, e))?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_len < 24 {
+        return Err(format!(
+            "{}: not a readable CSR file ({} bytes, header needs 24)",
+            path, file_len
+        ));
+    }
+    let mut r = BufReader::new(file);
+    let sizes = read_i64_le(&mut r, 3, file_len)?;
+    let n_row = sizes[0];
+    if n_row < 0 {
+        return Err(format!(
+            "{}: invalid CSR header (n_row {} is negative)",
+            path, n_row
+        ));
+    }
+    Ok(n_row as u64)
+}
+
 /// Parse a CSR file into a list of sparse vectors.
 pub fn read_sparse_matrix(path: &str) -> Result<Vec<SparseVector>, String> {
     let file = File::open(Path::new(path)).map_err(|e| format!("open {}: {}", path, e))?;
@@ -348,6 +387,44 @@ mod tests {
         f.write_all(bytes).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// `csr_row_count` reads n_row from the 24-byte header and must agree with
+    /// what `read_sparse_matrix` actually yields — the whole point is that it is
+    /// a cheap substitute for parsing, not a second opinion (#290 review).
+    #[test]
+    fn csr_row_count_matches_a_full_parse() {
+        for n in [0usize, 1, 150] {
+            let rows: Vec<SparseVector> = (0..n)
+                .map(|i| SparseVector {
+                    indices: vec![i as u32 % 5],
+                    values: vec![0.5],
+                })
+                .collect();
+            let f = tempfile::NamedTempFile::new().unwrap();
+            let path = f.path().to_str().unwrap().to_string();
+            write_sparse_matrix(&path, &rows).unwrap();
+            assert_eq!(csr_row_count(&path).unwrap(), n as u64, "n = {n}");
+            assert_eq!(read_sparse_matrix(&path).unwrap().len(), n, "n = {n}");
+        }
+    }
+
+    /// A count read must not be fooled by a file too short to hold a header, and
+    /// must not report a negative n_row as an enormous unsigned one. Both would
+    /// feed a bogus "expected rows" straight into the --skip-upload verdict.
+    #[test]
+    fn csr_row_count_rejects_a_truncated_or_negative_header() {
+        let short = write_tmp(&[0u8; 23]);
+        let err = csr_row_count(short.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not a readable CSR file"), "{err}");
+
+        let mut b = Vec::new();
+        b.extend_from_slice(&(-5i64).to_le_bytes()); // n_row
+        b.extend_from_slice(&1i64.to_le_bytes());
+        b.extend_from_slice(&0i64.to_le_bytes());
+        let neg = write_tmp(&b);
+        let err = csr_row_count(neg.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("negative"), "{err}");
     }
 
     /// Header n_row so large that `(n_row + 1) * 8` overflows usize.

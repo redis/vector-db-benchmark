@@ -332,18 +332,26 @@ rules follow, and all three are enforced:
      empty corpus that publishes `mean_recall: 0.0` with `failed_queries: 0` and
      exit 0. Where the count comes from depends on the layout, and so does the
      remedy:
-     - measurable layouts (`tar`, `h5`, `jsonl`, `hybrid` — 53 of the 57 shipped
-       datasets) read it from the corpus file's header/line count. **The check
-       fetches the dataset first**, using the same `get_path()` the search phase
-       is about to call, so "not downloaded yet" is not an error — only a corpus
-       that is neither present nor fetchable is. The realistic case is a corpus
-       file deleted to reclaim disk while `tests.jsonl` (queries + ground truth)
-       stayed behind, so the run still searches and still publishes.
-     - `sparse` and `h5-multi` have no cheap row count, so the number comes from
-       `vector_count` in `datasets.json` — and, unlike the shared-corpus upload
-       gate, **without** requiring every corpus file to be present locally, since
-       `--skip-upload` never uploads. Missing `vector_count` is the error, and
-       the message says so.
+     - measurable layouts (`tar`, `h5`, `jsonl`, `hybrid`, and `sparse` — 56 of
+       the 57 shipped datasets) read it from the corpus file's header or line
+       count. **The check resolves the dataset first**, using the same
+       `get_path()` the search phase is about to call, so a dataset that is
+       simply not downloaded yet is fetched rather than rejected. Two things it
+       does *not* do, both worth knowing: it resolves only **after** the
+       server-side probe succeeds, so an unreachable server still aborts without
+       paying for a download; and it does **not** re-fetch a dataset whose
+       directory already exists. That second one is the realistic failure — a
+       corpus file deleted to reclaim disk while `tests.jsonl` (queries + ground
+       truth) stayed behind, so the run would still search and still publish. A
+       valid `link` will not repair it; delete the directory or restore the file.
+       The error says which of the two you have.
+     - `h5-multi` is the one layout with no cheap row count — its total is the
+       sum of 100 part headers — so its number comes from `vector_count` in
+       `datasets.json`, and, unlike the shared-corpus upload gate, **without**
+       requiring every part to be present locally, since `--skip-upload` never
+       uploads. Missing `vector_count` is the error, and the message says so.
+       `sparse` uses the same fallback only when `data.csr` is absent; when it is
+       present the header is read and the declaration is checked, not trusted.
 
      `--allow-partial-corpus` waives it, and the waiver is recorded.
    - no count read back for the engine → a printed note that the reuse went

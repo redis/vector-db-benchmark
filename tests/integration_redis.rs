@@ -3315,7 +3315,7 @@ fn test_binary_redis_skip_upload_without_keep_data_preserves_corpus() {
 /// swallowed-`Err` half of #290 — `reuse_expected_rows` already returned `Err`
 /// for it on master; it was the caller that turned that into "cannot verify".
 ///
-/// RED on unfixed master `cff7e3a`: every guarded run here exits 0 and writes a
+/// RED on unfixed master `7ed81eb`: every guarded run here exits 0 and writes a
 /// search result file; the empty-corpus one publishes `mean_recall` 0.0 with
 /// `corpus_reuse.status` `"unverified"` and `failed_queries` 0.
 #[test]
@@ -3437,8 +3437,14 @@ fn test_binary_redis_skip_upload_unverifiable_corpus_is_fatal() {
     assert!(
         intact_out.contains("has nothing to compare against")
             && intact_out.contains("config 'cfg290unver'")
-            && intact_out.contains("is not on this machine to be measured"),
-        "the error must name the missing side of the comparison.\n{intact_out}"
+            // The dataset DIRECTORY is still here — only vectors.npy is gone —
+            // and `get_path()` returns early on an existing path, so nothing was
+            // fetched and nothing could be. The message must say that, not imply
+            // a download was attempted (#290 review).
+            && intact_out.contains("but its corpus file is not in it")
+            && intact_out.contains("never re-downloaded"),
+        "the error must name the missing side of the comparison, and the real \
+         remedy for a directory that exists without its corpus.\n{intact_out}"
     );
     assert!(
         !wrote_search_result(),
@@ -3496,6 +3502,15 @@ fn test_binary_redis_skip_upload_unverifiable_corpus_is_fatal() {
     assert_eq!(reuse["expected_rows"], serde_json::Value::Null);
     assert_eq!(reuse["actual_rows"], 0);
     assert_eq!(reuse["waived_by_allow_partial_corpus"], true);
+    // A waived run is a PUBLISHED result whose count was never checked, so the
+    // reason has to travel in the file — `probe_failed` has carried `detail`
+    // since #238 and this arm now matches it (#290 review).
+    assert!(
+        reuse["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("but its corpus file is not in it")),
+        "the waived artifact must record WHY the count was unknown: {reuse}"
+    );
     assert_eq!(
         ft_info_num_docs(&mut conn, "idx:cfg290unver"),
         0,
@@ -3562,13 +3577,20 @@ fn test_binary_redis_skip_upload_unverifiable_corpus_is_fatal() {
 /// The load-bearing assertion is `corpus_reuse.status == "verified"` with
 /// `expected_rows == 400`. That is stronger than "the run succeeded": it is only
 /// reachable if the corpus was fetched BEFORE the count was measured. It is RED
-/// on both trees for different reasons — master `cff7e3a` succeeds but records
+/// on both trees for different reasons — master `7ed81eb` succeeds but records
 /// `"unverified"` with `expected_rows: null` (the search phase downloaded the
 /// corpus *after* the check), and `ce51f65` aborts outright.
 ///
 /// The final phase is the control that keeps the fetch-first step from simply
 /// disabling the guard: same corpus-absent state with the `link` removed, so
-/// nothing can fetch it, must still be a hard error.
+/// nothing can resolve it, must still be a hard error.
+///
+/// That control asserts WHERE the run stopped, not just that it stopped. Exit
+/// code and the message text are both satisfied by a neutered guard, because the
+/// search phase's own `get_path()` fails on an unresolvable dataset and prints
+/// the same reason as a warning — a reviewer demonstrated exactly that mutation
+/// passing an earlier version of this test. The discriminating assertions are
+/// the absence of `Experiment stage: Search` and of `Dataset path not found`.
 #[test]
 fn test_binary_redis_skip_upload_fetches_the_dataset_before_judging_it() {
     wait_for_redis();
@@ -3680,6 +3702,12 @@ fn test_binary_redis_skip_upload_fetches_the_dataset_before_judging_it() {
         "the server-side corpus must still be complete"
     );
 
+    let wrote_search_result = || {
+        fs::read_dir(&results_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("-search-"))
+    };
     let bin = binary_path();
     let run = || {
         let mut cmd = Command::new(&bin);
@@ -3743,11 +3771,33 @@ fn test_binary_redis_skip_upload_fetches_the_dataset_before_judging_it() {
     );
     assert!(
         !out2.status.success(),
-        "a corpus that is neither present nor fetchable must still abort.\n{combined2}"
+        "a corpus that is not on this machine and cannot be resolved must still abort.\n{combined2}"
     );
     assert!(
-        combined2.contains("is not on this machine to be measured"),
+        combined2.contains("has no corpus at"),
         "the error must name the corpus, not the layout.\n{combined2}"
+    );
+    // The assertions above are NOT enough on their own, and saying so is the
+    // point of this comment. A neutered guard — `CorpusSizeUnknown` downgraded
+    // to warn-and-continue — still exits non-zero here, because the search
+    // phase's own `get_path()` cannot resolve the dataset either, and still
+    // prints the reason as a warning. Both would pass while the guard did
+    // nothing. What separates them is WHERE the run stopped: the guard aborts
+    // before the search phase begins, so neither the stage banner nor the
+    // reader's own failure may appear.
+    assert!(
+        !combined2.contains("Experiment stage: Search"),
+        "the reuse check must reject this BEFORE the search phase — reaching it \
+         means the guard did not fire and something else failed the run.\n{combined2}"
+    );
+    assert!(
+        !combined2.contains("WARNING: --skip-upload"),
+        "the guard must REJECT here, not warn: a warning means the arm was \
+         downgraded and the run died downstream instead.\n{combined2}"
+    );
+    assert!(
+        !wrote_search_result(),
+        "the rejected run must not leave a search result file behind"
     );
 
     drop(server); // the listener closes with the test process
