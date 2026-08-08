@@ -29,6 +29,7 @@ use vector_db_benchmark::start_gate::WorkerPool;
 use crate::config::{EngineConfig, HnswConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
 const DEFAULT_COLLECTION: &str = "benchmark";
@@ -1001,7 +1002,9 @@ fn unrepresentable(what: &str, detail: &str) -> String {
 /// object, was `{}`, or carried `and`/`or` arrays that were literally empty.
 /// Anything that was asked for but could not be built is an `Err`, never a
 /// silent `None`: see [`unrepresentable`].
-fn parse_qdrant_conditions(conditions: &serde_json::Value) -> Result<Option<Filter>, String> {
+pub(crate) fn parse_qdrant_conditions(
+    conditions: &serde_json::Value,
+) -> Result<Option<Filter>, String> {
     let Some(obj) = conditions.as_object() else {
         return Ok(None);
     };
@@ -1137,40 +1140,6 @@ fn build_qdrant_subfilters(entries: &[serde_json::Value]) -> Result<Vec<Conditio
         }
     }
     Ok(filters)
-}
-
-/// Turn one query's `conditions` value into the filter attached to its request.
-///
-/// This is the call site #219 named: `.map(|c| c.as_ref().and_then(parse))`
-/// collapsed two different states into the same `None`, and `None` downstream
-/// means "omit the filter". The two are kept apart here:
-///
-/// * genuinely **no** conditions (`null`, or a literally empty `{}`) → `Ok(None)`;
-///   the query is unfiltered and so is its ground truth, which is correct.
-/// * conditions that are **present** but produced no filter → `Err`; running
-///   those unfiltered against filtered ground truth is the silent wrong number.
-///
-/// `parse_qdrant_conditions` already returns `Ok(None)` for an empty object, so
-/// any non-empty input arriving here by definition dropped something.
-///
-/// A JSON `null` counts as "no conditions". This is load-bearing, not defensive:
-/// `compound_reader.rs` builds the vector with `row.get("conditions").cloned()`,
-/// so a row spelling `"conditions": null` — which is EVERY row of the shipped
-/// `random_keywords_1m_vocab_10_no_filters` dataset — arrives as
-/// `Some(Value::Null)`, not `None`. Treating that as a dropped filter would fail
-/// a dataset whose queries are genuinely, intentionally unfiltered.
-fn parse_query_filter(conditions: Option<&serde_json::Value>) -> Result<Option<Filter>, String> {
-    let Some(cond) = conditions.filter(|c| !c.is_null()) else {
-        return Ok(None);
-    };
-    match parse_qdrant_conditions(cond)? {
-        Some(f) => Ok(Some(f)),
-        None if cond.as_object().is_none_or(|o| !o.is_empty()) => Err(unrepresentable(
-            &format!("query filter {cond}"),
-            "it produced no condition at all",
-        )),
-        None => Ok(None),
-    }
 }
 
 /// Parse a datetime bound string into a protobuf Timestamp.
@@ -1926,20 +1895,23 @@ impl Engine for QdrantEngine {
         let hybrid_prefetch_limit = prefetch_limit.unwrap_or(50);
         let (queries, sparse_queries, neighbors, parsed_filters) = if is_hybrid {
             let (dq, sq, nb) = dataset.read_hybrid_queries()?;
-            (dq, sq, nb, Vec::<Option<Filter>>::new())
+            (dq, sq, nb, Vec::<QueryFilter<Filter>>::new())
         } else if is_sparse {
             let (sq, nb) = dataset.read_sparse_queries()?;
-            (Vec::<Vec<f32>>::new(), sq, nb, Vec::<Option<Filter>>::new())
+            (
+                Vec::<Vec<f32>>::new(),
+                sq,
+                nb,
+                Vec::<QueryFilter<Filter>>::new(),
+            )
         } else {
             let (q, nb, conditions) = dataset.read_queries()?;
             // "no conditions" and "conditions that produced no filter" are NOT
-            // the same thing — `parse_query_filter` keeps them apart, so an
+            // the same thing — `try_resolve_all` keeps them apart, so an
             // unrepresentable filter fails the run instead of quietly running
             // the query unfiltered against filtered ground truth (#219/#222).
-            let pf: Vec<Option<Filter>> = conditions
-                .iter()
-                .map(|c| parse_query_filter(c.as_ref()))
-                .collect::<Result<Vec<_>, String>>()?;
+            let pf: Vec<QueryFilter<Filter>> =
+                conditions.try_resolve_all("Qdrant", parse_qdrant_conditions)?;
             (
                 q,
                 Vec::<vector_db_benchmark::readers::SparseVector>::new(),
@@ -2092,7 +2064,7 @@ impl Engine for QdrantEngine {
                                     ..Default::default()
                                 });
                             }
-                            if let Some(filter) = &parsed_filters[idx] {
+                            if let Some(filter) = parsed_filters[idx].as_ref() {
                                 qb = qb.filter(filter.clone());
                             }
                             qb
@@ -2997,7 +2969,18 @@ rest_responses_total{method=\"GET\"} 42
     }
 
     // ── parse_qdrant_conditions edge cases + subfilter builder ──────────────
-    use super::{build_qdrant_subfilters, parse_query_filter};
+    use super::build_qdrant_subfilters;
+
+    /// The production path resolves conditions through
+    /// `QueryConditions::try_resolve_all`, which is where the "declared but
+    /// dropped" rule lives (`query_filter.rs`). These tests exercise that exact
+    /// rule for one query, so they go through the same function.
+    fn parse_query_filter(
+        conditions: Option<&serde_json::Value>,
+    ) -> Result<Option<Filter>, String> {
+        vector_db_benchmark::query_filter::resolve("Qdrant", 0, conditions, parse_qdrant_conditions)
+            .map(vector_db_benchmark::query_filter::QueryFilter::into_inner)
+    }
 
     #[test]
     fn empty_conditions_object_is_none() {

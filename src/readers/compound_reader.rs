@@ -97,7 +97,35 @@ pub fn read_compound_vectors_only(
 ///
 /// Returns (query_vectors, neighbors, conditions).
 #[allow(clippy::type_complexity)]
+/// Read `tests.jsonl`: query vectors, ground-truth ids, and per-query filter
+/// conditions.
+///
+/// The conditions come back as a [`QueryConditions`], never as raw JSON. That is
+/// the #219 guard: an engine cannot get at the per-query `conditions` value
+/// except through `query_filter`'s resolvers, which refuse to turn a declared
+/// filter into an unfiltered query. [`read_compound_queries_raw`] keeps the raw
+/// vector for this crate's own tests.
 pub fn read_compound_queries(
+    dir_path: &str,
+    normalize: bool,
+) -> Result<
+    (
+        Vec<Vec<f32>>,
+        Vec<Vec<i64>>,
+        crate::query_filter::QueryConditions,
+    ),
+    String,
+> {
+    let (queries, neighbors, conditions) = read_compound_queries_raw(dir_path, normalize)?;
+    Ok((
+        queries,
+        neighbors,
+        crate::query_filter::QueryConditions::new(conditions),
+    ))
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn read_compound_queries_raw(
     dir_path: &str,
     normalize: bool,
 ) -> Result<(Vec<Vec<f32>>, Vec<Vec<i64>>, Vec<Option<serde_json::Value>>), String> {

@@ -15,6 +15,7 @@ use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
 use vector_db_benchmark::parsers::datetime_to_epoch_secs;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{is_multivalued_keyword_field, MetadataItem};
 use vector_db_benchmark::start_gate::WorkerPool;
 
@@ -1148,7 +1149,7 @@ fn map_milvus_metric_type(distance: &str) -> Result<&'static str, String> {
 }
 
 /// Milvus uses string-based filter expressions like "field == value && field > 10"
-fn parse_milvus_conditions(conditions: &serde_json::Value) -> Option<String> {
+pub(crate) fn parse_milvus_conditions(conditions: &serde_json::Value) -> Option<String> {
     let obj = conditions.as_object()?;
     if obj.is_empty() {
         return None;
@@ -1468,10 +1469,8 @@ impl Engine for MilvusEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<String>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_milvus_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<String>> =
+            conditions.resolve_all("Milvus", parse_milvus_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {

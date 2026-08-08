@@ -17,6 +17,7 @@ use rand::{seq::SliceRandom, SeedableRng};
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::start_gate::WorkerPool;
 
@@ -157,15 +158,13 @@ impl MongoDBEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (_queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<Document>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_mongo_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<Document>> =
+            conditions.resolve_all("MongoDB", parse_mongo_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
 
         let runnable_indices: Vec<usize> = (0..parsed_filters.len())
-            .filter(|&i| parsed_filters[i].is_some())
+            .filter(|&i| parsed_filters[i].is_filtered())
             .collect();
 
         if runnable_indices.is_empty() {
@@ -1038,7 +1037,7 @@ fn vector_search(
 }
 
 /// Parse filter conditions into MongoDB query document.
-fn parse_mongo_conditions(conditions: &serde_json::Value) -> Option<Document> {
+pub(crate) fn parse_mongo_conditions(conditions: &serde_json::Value) -> Option<Document> {
     let obj = conditions.as_object()?;
     if obj.is_empty() {
         return None;
@@ -1342,10 +1341,8 @@ impl Engine for MongoDBEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<Document>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_mongo_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<Document>> =
+            conditions.resolve_all("MongoDB", parse_mongo_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {
@@ -1564,10 +1561,8 @@ impl Engine for MongoDBEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<Document>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_mongo_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<Document>> =
+            conditions.resolve_all("MongoDB", parse_mongo_conditions)?;
 
         // Read vectors for updates
         let normalize = dataset.needs_normalization();

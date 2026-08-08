@@ -26,6 +26,7 @@ use super::weaviate_grpc::weaviate_v1::{
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::start_gate::{AbortGateOnDrop, StartGate, WorkerPool};
 
@@ -936,7 +937,9 @@ fn map_weaviate_distance(distance: &str) -> Result<&'static str, String> {
     }
 }
 
-fn parse_weaviate_conditions(conditions: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn parse_weaviate_conditions(
+    conditions: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let obj = conditions.as_object()?;
     if obj.is_empty() {
         return None;
@@ -1335,10 +1338,8 @@ impl Engine for WeaviateEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<serde_json::Value>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_weaviate_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<serde_json::Value>> =
+            conditions.resolve_all("Weaviate", parse_weaviate_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {
@@ -1402,11 +1403,14 @@ impl Engine for WeaviateEngine {
         // Count over the executed slice only (`--num-queries` may cap the run).
         let grpc_filters: Vec<Option<Filters>> = parsed_filters[..num_to_run]
             .iter()
-            .map(|f| f.as_ref().and_then(where_json_to_grpc_filters))
+            .map(|f| match f.as_ref() {
+                Some(where_json) => where_json_to_grpc_filters(where_json),
+                None => None,
+            })
             .collect();
         let num_filtered = parsed_filters[..num_to_run]
             .iter()
-            .filter(|f| f.is_some())
+            .filter(|f| f.is_filtered())
             .count();
         // Filtered queries whose condition the gRPC proto can't express. If any
         // exist we keep the WHOLE run on GraphQL (single transport, never
@@ -1415,7 +1419,7 @@ impl Engine for WeaviateEngine {
         let untranslatable = parsed_filters[..num_to_run]
             .iter()
             .zip(&grpc_filters)
-            .filter(|(orig, translated)| orig.is_some() && translated.is_none())
+            .filter(|(orig, translated)| orig.is_filtered() && translated.is_none())
             .count();
         let use_grpc = grpc_ep.is_some() && untranslatable == 0;
 

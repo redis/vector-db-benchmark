@@ -51,6 +51,7 @@ use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{Engine, SearchResults, UploadStats};
 use crate::metrics::compute_metrics;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, doc_key_to_id, doc_key_to_id_opt};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::start_gate::WorkerPool;
 
@@ -979,10 +980,8 @@ impl Engine for DragonflyEngine {
         // Per-query prefilters, reusing redis's RediSearch filter builder (same
         // FT.SEARCH syntax). Dragonfly Search supports hybrid filtered KNN, so a
         // query with `conditions` runs `(prefilter)=>[KNN...]` instead of `*`.
-        let parsed_filters: Vec<Option<ParsedFilter>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+            conditions.resolve_all("Dragonfly", parse_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {

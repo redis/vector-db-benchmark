@@ -24,6 +24,7 @@ use crate::engine::{
 };
 use crate::metrics::compute_metrics;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, parse_ft_search_response};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 use vector_db_benchmark::start_gate::WorkerPool;
 
@@ -786,16 +787,14 @@ impl RedisEngine {
         let (_queries, neighbors, conditions) = dataset.read_queries()?;
 
         // Parse all conditions up front
-        let parsed_filters: Vec<Option<ParsedFilter>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+            conditions.resolve_all("Redis", parse_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
 
         // Only queries that have filter conditions
         let runnable_indices: Vec<usize> = (0..parsed_filters.len())
-            .filter(|&i| parsed_filters[i].is_some())
+            .filter(|&i| parsed_filters[i].is_filtered())
             .collect();
 
         if runnable_indices.is_empty() {
@@ -2072,10 +2071,8 @@ impl Engine for RedisEngine {
         }
 
         // Parse all conditions up front (before timing begins)
-        let parsed_filters: Vec<Option<ParsedFilter>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+            conditions.resolve_all("Redis", parse_conditions)?;
 
         // When top is explicitly set, use it for all queries.
         // When not set, use per-query ground truth count (matches Python v0 behavior
@@ -2472,10 +2469,8 @@ impl Engine for RedisEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<ParsedFilter>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+            conditions.resolve_all("Redis", parse_conditions)?;
 
         // Read vectors for updates
         let normalize = dataset.needs_normalization();

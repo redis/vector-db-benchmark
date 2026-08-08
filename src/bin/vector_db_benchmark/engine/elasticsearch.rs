@@ -20,6 +20,7 @@ use vector_db_benchmark::start_gate::WorkerPool;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
 /// Shard count this engine creates its index with. Not configurable: it is
@@ -556,7 +557,7 @@ fn es_similarity(distance: &str) -> Result<&'static str, String> {
 
 // ── Elasticsearch condition parser ─────────────────────────────────────
 
-fn parse_es_conditions(conditions: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn parse_es_conditions(conditions: &serde_json::Value) -> Option<serde_json::Value> {
     let obj = conditions.as_object()?;
     if obj.is_empty() {
         return None;
@@ -995,10 +996,8 @@ impl Engine for ElasticsearchEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<serde_json::Value>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_es_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<serde_json::Value>> =
+            conditions.resolve_all("Elasticsearch", parse_es_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {

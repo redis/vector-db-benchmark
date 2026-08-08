@@ -2089,9 +2089,64 @@ mod shipped_config_knob_guard {
     /// moving `ef` to `collection_params.hnsw_config.ef` passed on engines that
     /// merely mention `hnsw_config`. Parent proxying is gone; field access still
     /// counts, since `h.m` contains the whole token `m`.
+    ///
+    /// A bare method CALL — `.leaf(..)` — is not evidence. Those are almost
+    /// always a client-library builder setter that merely shares a name with the
+    /// knob: `opensearch.rs` calls reqwest's `.request_timeout(..)` on the
+    /// force-merge and cluster-health requests with a value derived from
+    /// OPENSEARCH_FORCE_MERGE_TIMEOUT, and never consults
+    /// `connection_params.request_timeout`. Counting that as a read would have
+    /// silently retired issue #245's KNOWN_UNREAD entry as paid-off debt.
+    ///
+    /// The asymmetry is deliberate. Discounting a real read costs a loud, easily
+    /// diagnosed failure ("no source file of that engine ever reads it") that a
+    /// human resolves in a minute. Accepting a fake read costs silence, which is
+    /// the failure mode this whole guard exists to prevent — so when the two are
+    /// in tension, err toward loud. An engine that genuinely reads a knob only
+    /// through a same-named getter can add a field access, or the knob can be
+    /// listed in `KNOWN_UNREAD` with the reason.
     fn knob_is_read(source: &str, knob_path: &str) -> bool {
         let leaf = canonical(knob_path.rsplit('.').next().unwrap_or(knob_path));
-        contains_token(source, leaf)
+        token_occurrences(source, leaf).any(|at| !is_method_call(source, at, leaf))
+    }
+
+    /// Byte offsets of every whole-token occurrence of `token` in `haystack`.
+    fn token_occurrences<'a>(
+        haystack: &'a str,
+        token: &'a str,
+    ) -> impl Iterator<Item = usize> + 'a {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let bytes = haystack.as_bytes();
+        let mut from = 0usize;
+        std::iter::from_fn(move || {
+            while let Some(pos) = haystack[from..].find(token) {
+                let start = from + pos;
+                let end = start + token.len();
+                from = start + 1;
+                let before_ok = start == 0 || !is_word(bytes[start - 1] as char);
+                let after_ok = end >= bytes.len() || !is_word(bytes[end] as char);
+                if before_ok && after_ok {
+                    return Some(start);
+                }
+            }
+            None
+        })
+    }
+
+    /// Whether the occurrence at `at` is a method call `.token(` rather than a
+    /// field access or a plain identifier.
+    ///
+    /// Deliberately does NOT skip whitespace before the dot: `foo\n    .bar(` is
+    /// a chained builder call and is treated as one, which is exactly the shape
+    /// a fluent client library produces.
+    fn is_method_call(source: &str, at: usize, token: &str) -> bool {
+        let dotted = source[..at].trim_end().ends_with('.');
+        let called = source[at + token.len()..]
+            .bytes()
+            .find(|b| !b.is_ascii_whitespace())
+            .map(|b| b == b'(')
+            .unwrap_or(false);
+        dotted && called
     }
 
     /// Every knob declared by a shipped config must be read by its engine.
@@ -2307,6 +2362,36 @@ mod shipped_config_knob_guard {
         assert!(
             !knob_is_read("cp.hnsw_config.as_ref()", "collection_params.hnsw_config.M"),
             "mentioning hnsw_config must not vouch for the M leaf"
+        );
+
+        // A builder setter is not a read. This is the shape that broke when #246
+        // met master: opensearch.rs gained reqwest `.request_timeout(..)` calls
+        // whose value comes from OPENSEARCH_FORCE_MERGE_TIMEOUT, and the guard
+        // concluded the engine now read `connection_params.request_timeout` —
+        // which would have retired issue #245's KNOWN_UNREAD entry as paid debt.
+        assert!(
+            !knob_is_read(
+                ".forcemerge(x)\n.max_num_segments(1)\n.request_timeout(merge_deadline)\n.send()",
+                "connection_params.request_timeout"
+            ),
+            "a chained `.request_timeout(..)` builder call is a transport setter, \
+             not evidence that the engine reads the config knob of that name"
+        );
+        // ...but any non-call mention still counts, so a real read is never lost.
+        assert!(
+            knob_is_read(
+                "let t = cp.request_timeout.unwrap_or(300);",
+                "connection_params.request_timeout"
+            ),
+            "field access must still count as a read"
+        );
+        assert!(
+            knob_is_read(
+                ".request_timeout(cfg.request_timeout)",
+                "connection_params.request_timeout"
+            ),
+            "forwarding the config value INTO the setter is a genuine read, and \
+             the argument occurrence is not itself a method call"
         );
         // THE relocation defence, tested directly rather than only via the
         // whole-corpus sweep. Token matching cannot stop `hnsw_config.ef`
