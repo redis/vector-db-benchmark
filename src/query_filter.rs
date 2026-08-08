@@ -77,7 +77,27 @@
 //!    the binary's `dataset.rs` builds one for the HDF5/JSONL formats. The net
 //!    is a source-level test —
 //!    `filter_guard::no_engine_erases_its_conditions_with_the_unfiltered_constructor`
-//!    — not the type system.
+//!    — not the type system. (A derived `Default` would have been a second,
+//!    quieter spelling of the same thing, reachable through `..Default::
+//!    default()`; it is not derived. `new` is a third, but it is `pub(crate)`
+//!    of the library crate and so unreachable from any engine — the crate
+//!    boundary closes that one, not the scan.)
+//!
+//! ## The ceiling on the source-level nets
+//!
+//! `engine/filter_guard.rs` adds two source scans (every `read_queries()` in an
+//! engine file is paired with a resolver; no engine constructs a
+//! `QueryConditions`). Neither can see a **helper hop**: a function outside
+//! `engine/` that returns a blanked `QueryConditions`, called from a perfectly
+//! ordinary-looking `.resolve_all("Redis", parse_conditions)?` site, rebuilds
+//! #219 in compiling, fully silent form with both scans green. No per-file
+//! scan can see that, and this one does not claim to.
+//!
+//! What forces the hop in the first place is [`QueryFilter`]'s private
+//! constructors and `QueryConditions::new` being `pub(crate)` of the *library*
+//! crate — an engine, which lives in the binary, cannot call it at all. The
+//! types are the wall; the scans are a second line that catches the careless
+//! case, not the determined one.
 //!
 //! # What counts as "no filter declared"
 //!
@@ -164,7 +184,11 @@ impl<T: std::ops::Deref> QueryFilter<T> {
 /// `filter_guard::every_engine_read_of_query_conditions_is_paired_with_a_resolver`.
 #[must_use = "a dataset's filter conditions must be resolved, not discarded: ignoring them \
               runs every query UNFILTERED against filtered ground truth (issue #219)"]
-#[derive(Debug, Clone, Default)]
+/// `Default` is deliberately NOT derived. A derived `Default` is a public
+/// erasing constructor reachable by `..Default::default()` struct-update
+/// syntax: it yields length 0, `declared_count() == 0`, and an unfiltered run
+/// with no error. Nothing needs it, so it does not exist.
+#[derive(Debug, Clone)]
 pub struct QueryConditions {
     /// Dataset these came from, so a dropped filter can name it.
     dataset: String,

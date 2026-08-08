@@ -18,3 +18,4 @@
 {"query": [0.0, 2.0], "conditions": null, "closest_ids": [0]}
 {"query": [1.0, 2.0], "conditions": null, "closest_ids": [1]}
 {"query": [2.0, 2.0], "conditions": null, "closest_ids": [2]}
+{"query": [9.0, 3.0], "conditions": {}, "closest_ids": [9]}

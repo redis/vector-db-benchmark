@@ -276,6 +276,21 @@ fn render_redisearch<V: std::fmt::Debug>(f: &(String, HashMap<String, V>)) -> St
 /// This is reachable by shipped code, not only by a mutant: `build_range_filter`
 /// and `build_geo_filter` in `redis.rs` both `*counter += 1` before they can
 /// `return None`, so `and(unparseable_range, keyword)` renumbers the survivor.
+///
+/// **Over-erasure is safe only because both sides of the comparison are
+/// erased.** `$b_1` and `$b_11` collide, as do `v_1` and `v_2`; since the
+/// comparison is `assert_ne!`, a collision can only make it fire when it should
+/// not — a false alarm, never a false pass. That reasoning holds for the
+/// sub-multiset comparison and **stops holding** the moment anything compares
+/// two renders of the *same* arity, which is exactly what the widening check
+/// (`and` emitted as `or`, a two-sided range emitted with one bound) listed as
+/// future work in the module docs would need. Do not reuse this function there
+/// without re-deriving its safety.
+///
+/// Digits are eaten only after `$` or `_`, so literal values survive: `Int(11)`
+/// stays `Int(11)`. [`the_ordinal_eraser_erases_ordinals_and_nothing_else`]
+/// pins that directly — the function is otherwise only exercised transitively,
+/// and both the identity function and "strip every digit" left all tests green.
 fn erase_placeholder_ordinals(render: &str) -> String {
     let bytes: Vec<char> = render.chars().collect();
     let mut out = String::with_capacity(render.len());
@@ -725,24 +740,159 @@ fn the_shipped_no_filters_datasets_stay_unfiltered_on_every_engine() {
 // Source-level nets for the escapes the type system cannot close
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn engine_sources() -> Vec<(String, String)> {
-    let dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/vector_db_benchmark/engine");
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("engine dir") {
-        let path = entry.expect("dir entry").path();
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // This file names every pattern it forbids.
-        if name == "filter_guard.rs" || path.extension().is_none_or(|e| e != "rs") {
+/// Strip `//` line comments and `/* */` block comments, respecting string and
+/// char literals.
+///
+/// Both source scans below run on the stripped text. Without this they are
+/// decorative in one direction and actively harmful in the other: a comment
+/// containing `.resolve_all(` satisfies the pairing scan while the real call is
+/// gutted, and — worse — a comment reading "NEVER call
+/// `QueryConditions::unfiltered` here" *trips* the other scan, so the guard
+/// would forbid documenting the very bug it removes.
+fn strip_comments(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let (mut i, mut in_str, mut in_char, mut raw_hashes) = (0usize, false, false, 0usize);
+    while i < b.len() {
+        if in_str {
+            // Raw strings (r#"..."#) have no escapes; normal strings do.
+            if raw_hashes > 0 {
+                if b[i] == '"' && b[i + 1..].iter().take(raw_hashes).all(|c| *c == '#') {
+                    in_str = false;
+                    out.push(b[i]);
+                    for _ in 0..raw_hashes {
+                        i += 1;
+                        out.push('#');
+                    }
+                    raw_hashes = 0;
+                    i += 1;
+                    continue;
+                }
+            } else if b[i] == '\\' {
+                out.push(b[i]);
+                if i + 1 < b.len() {
+                    out.push(b[i + 1]);
+                }
+                i += 2;
+                continue;
+            } else if b[i] == '"' {
+                in_str = false;
+            }
+            out.push(b[i]);
+            i += 1;
             continue;
         }
-        out.push((
-            name,
-            std::fs::read_to_string(&path).expect("read engine source"),
-        ));
+        if in_char {
+            if b[i] == '\\' {
+                out.push(b[i]);
+                if i + 1 < b.len() {
+                    out.push(b[i + 1]);
+                }
+                i += 2;
+                continue;
+            }
+            if b[i] == '\'' {
+                in_char = false;
+            }
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        if b[i] == '/' && b.get(i + 1) == Some(&'/') {
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == '/' && b.get(i + 1) == Some(&'*') {
+            let mut depth = 1;
+            i += 2;
+            while i < b.len() && depth > 0 {
+                if b[i] == '/' && b.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if b[i] == 'r' && matches!(b.get(i + 1), Some('"') | Some('#')) {
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while b.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if b.get(j) == Some(&'"') {
+                in_str = true;
+                raw_hashes = hashes;
+                out.extend(&b[i..=j]);
+                i = j + 1;
+                continue;
+            }
+        }
+        if b[i] == '"' {
+            in_str = true;
+        } else if b[i] == '\'' {
+            // Lifetimes (`'a`) are not char literals; a char literal closes.
+            let is_lifetime = b.get(i + 1).is_some_and(|c| c.is_alphabetic() || *c == '_')
+                && b.get(i + 2) != Some(&'\'');
+            if !is_lifetime {
+                in_char = true;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
     }
+    out
+}
+
+/// Every `.rs` file under `engine/`, recursively, with comments stripped.
+///
+/// Recursive because a non-recursive `read_dir` cannot see an engine that lives
+/// in a subdirectory (`engine/zz_sub/mod.rs`) and would silently exempt it.
+fn engine_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).expect("engine dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            // This file names every pattern it forbids.
+            if rel == "filter_guard.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read engine source");
+            out.push((rel, strip_comments(&src)));
+        }
+    }
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/vector_db_benchmark/engine");
+    let mut out = Vec::new();
+    walk(&root, &root, &mut out);
     out.sort();
     out
+}
+
+/// Count `needle` occurrences allowing arbitrary whitespace where `\s*` markers
+/// appear, so `QueryConditions :: unfiltered` reads the same as
+/// `QueryConditions::unfiltered`.
+fn count_loose(haystack: &str, parts: &[&str]) -> usize {
+    let compact: String = haystack.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.matches(&parts.concat()).count()
 }
 
 /// `#[must_use]` on `QueryConditions` does **not** catch an engine that ignores
@@ -759,12 +909,14 @@ fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
     let mut reads_total = 0usize;
     let mut resolves_total = 0usize;
     for (name, src) in engine_sources() {
-        let reads = src.matches("dataset.read_queries()").count();
+        // `.read_queries()` on ANY receiver: an engine that names it `ds`
+        // rather than `dataset` must not be exempt.
+        let reads = count_loose(&src, &[".read_queries()"]);
         let resolves =
-            src.matches(".resolve_all(").count() + src.matches(".try_resolve_all(").count();
+            count_loose(&src, &[".resolve_all("]) + count_loose(&src, &[".try_resolve_all("]);
         assert_eq!(
             reads, resolves,
-            "{name} calls dataset.read_queries() {reads}x but resolves conditions {resolves}x — \
+            "{name} calls .read_queries() {reads}x but resolves conditions {resolves}x — \
              an unresolved read runs every query UNFILTERED (issue #219)"
         );
         reads_total += reads;
@@ -783,14 +935,58 @@ fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
 /// swapping it in for a resolved value turns a filtered dataset into an
 /// unfiltered run with no error. Nothing in the type system stops an engine
 /// calling it; this does.
+///
+/// Scope of the three constructor names checked:
+///
+/// * `unfiltered` — the live one, and the only reason this test exists;
+/// * `new` — **already unreachable**. It is `pub(crate)` of the *library* crate
+///   and every engine is in the binary, so the crate boundary closes it, not
+///   this scan. Listed so that relaxing its visibility fails here.
+/// * `default` — `Default` is not derived on `QueryConditions`, precisely
+///   because `..Default::default()` would be a quiet second spelling of
+///   `unfiltered(0)`. Listed so that re-deriving it fails here.
+///
+/// Matching is whitespace-insensitive and follows `use ... as Alias` and
+/// `type Alias = QueryConditions` renames, and runs on comment-stripped source
+/// so that *documenting* the hazard is not itself a failure.
 #[test]
 fn no_engine_erases_its_conditions_with_the_unfiltered_constructor() {
     for (name, src) in engine_sources() {
-        assert!(
-            !src.contains("QueryConditions::unfiltered") && !src.contains("QueryConditions::new"),
-            "{name} constructs QueryConditions directly — only dataset.rs and the readers may \
-             (issue #219, documented escape 3)"
-        );
+        let mut names = vec!["QueryConditions".to_string()];
+        // `use ...::QueryConditions as QC;`
+        for (idx, _) in src.match_indices("QueryConditions as ") {
+            let alias: String = src[idx + "QueryConditions as ".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !alias.is_empty() {
+                names.push(alias);
+            }
+        }
+        // `type QCAlias = QueryConditions;`
+        for (idx, _) in src.match_indices("= QueryConditions") {
+            let head: String = src[..idx].chars().filter(|c| !c.is_whitespace()).collect();
+            if let Some(t) = head.rfind("type") {
+                let alias: String = head[t + "type".len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !alias.is_empty() {
+                    names.push(alias);
+                }
+            }
+        }
+        let compact: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        for ty in &names {
+            for ctor in ["unfiltered", "new", "default"] {
+                assert!(
+                    !compact.contains(&format!("{ty}::{ctor}(")),
+                    "{name} calls {ty}::{ctor}() — only dataset.rs and the readers may construct \
+                     QueryConditions, and erasing one runs every query UNFILTERED (issue #219, \
+                     documented escape 3)"
+                );
+            }
+        }
     }
 }
 
@@ -875,17 +1071,24 @@ fn shape_signature(cond: &Value) -> String {
 /// Read the checked-in fixture through the REAL reader, and require the table to
 /// match it exactly.
 ///
-/// Two things this pins that a hardcoded table cannot:
+/// **What this is and is not.** Both the table and the fixture are transcribed
+/// by hand from the shipped tarballs, so this does not make the shapes
+/// independently verified — it makes them *two synced copies of the same
+/// claim*, and a drift on either side fails. That is a real step up from a
+/// comment (it catches a table-only edit, a fixture-only edit, an added shape
+/// with no fixture row, and a deleted row) but it is not a census. The only
+/// independent check is
+/// [`any_locally_present_shipped_dataset_emits_only_known_shapes`], which
+/// prints SKIPPED in CI because every filter-bearing `tests.jsonl` is a
+/// gitignored download (`datasets/.gitignore` is `*/*`).
 ///
-/// * the shapes are data, so changing a table entry to a field or operator that
-///   no shipped dataset emits fails here rather than passing forever;
-/// * the `"conditions": null` rows travel the real `compound_reader` path, so
-///   the `Some(Value::Null)` trap is exercised by CI and not only by hand.
-///
-/// The fixture is transcribed from the shipped tarballs (see the module docs);
-/// none of them is checked into the repo — `datasets/.gitignore` is `*/*` and
-/// every filter-bearing `tests.jsonl` is a download — so the fixture is the only
-/// version of that data CI can see.
+/// The fixture's absent-condition rows do travel the real `compound_reader`
+/// path. `"conditions": null` and `"conditions": {}` are **different values**
+/// coming out of the reader — `Some(Value::Null)` vs `Some(Value::Object{})`,
+/// neither of them `None` — and both must resolve unfiltered; the library-side
+/// test `readers::tests::fixture_null_and_empty_conditions_are_distinct_values`
+/// pins the distinction, which cannot be seen from here because
+/// `QueryConditions` does not expose it.
 #[test]
 fn the_table_matches_the_shipped_condition_fixture() {
     let dir =
@@ -893,11 +1096,11 @@ fn the_table_matches_the_shipped_condition_fixture() {
     let (queries, _neighbors, conditions) =
         vector_db_benchmark::readers::read_compound_queries(dir.to_str().unwrap(), false)
             .expect("read the condition fixture");
-    assert_eq!(queries.len(), 20, "fixture row count");
+    assert_eq!(queries.len(), 21, "fixture row count");
     assert_eq!(
         conditions.declared_count(),
         17,
-        "17 declared shapes + 3 `\"conditions\": null` rows"
+        "17 declared shapes + 3 `\"conditions\": null` rows + 1 `{{}}` row"
     );
 
     // Recovering the raw conditions needs the echo escape documented in
@@ -910,8 +1113,9 @@ fn the_table_matches_the_shipped_condition_fixture() {
     assert_eq!(from_file.len(), 17);
     assert_eq!(
         echoed.iter().filter(|f| !f.is_filtered()).count(),
-        3,
-        "the three `null` rows must read back as unfiltered, not as declared filters"
+        4,
+        "the three `null` rows and the `{{}}` row must read back as unfiltered, not as \
+         declared filters"
     );
 
     let table = shipped_shapes();
@@ -1045,5 +1249,36 @@ fn any_locally_present_shipped_dataset_emits_only_known_shapes() {
         unknown.is_empty(),
         "shipped datasets on disk emit condition shapes the guard table does not cover:\n{}",
         unknown.join("\n")
+    );
+}
+
+/// Direct test of [`erase_placeholder_ordinals`]. Without it the function is
+/// only exercised transitively, and replacing its body with the identity
+/// function — or with "strip all digits" — leaves every other test green.
+#[test]
+fn the_ordinal_eraser_erases_ordinals_and_nothing_else() {
+    // RediSearch named params, in the query and in the sorted param list.
+    assert_eq!(
+        erase_placeholder_ordinals("(@b:{$b_1}) [b_1=Str(\"pPZIB\")]"),
+        "(@b:{$b_N}) [b_N=Str(\"pPZIB\")]"
+    );
+    // pgvector positional placeholders, including multi-digit.
+    assert_eq!(
+        erase_placeholder_ordinals("a = $3 AND b = $12"),
+        "a = $N AND b = $N"
+    );
+    // Literal values must survive: digits are eaten only after `$` or `_`.
+    assert_eq!(
+        erase_placeholder_ordinals("[a_0=Int(11), b_1=Float(0.5)]"),
+        "[a_N=Int(11), b_N=Float(0.5)]"
+    );
+    // An identity implementation fails the first case; "strip all digits" fails
+    // this one.
+    assert_eq!(erase_placeholder_ordinals("Int(11)"), "Int(11)");
+    // A leading-leaf drop is what this exists to expose: the two renders below
+    // differ only in the ordinal, and must compare equal after erasure.
+    assert_eq!(
+        erase_placeholder_ordinals("(@b:{$b_1})"),
+        erase_placeholder_ordinals("(@b:{$b_0})")
     );
 }

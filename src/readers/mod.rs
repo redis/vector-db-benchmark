@@ -470,6 +470,56 @@ mod tests {
         assert_eq!(neighbors[1], vec![30i64, 40]);
     }
 
+    /// The `Some(Value::Null)` trap, on the checked-in fixture, at the layer
+    /// that can still see raw JSON.
+    ///
+    /// `compound_reader` builds the vector with `row.get("conditions").cloned()`,
+    /// so a row spelling `"conditions": null` arrives as `Some(Value::Null)` —
+    /// NOT `None`, which is what a guard keyed on `is_some()` would need it to
+    /// be, and which is why every query of the shipped `*_no_filters` tarballs
+    /// would have failed. `"conditions": {}` arrives as a third, distinct value.
+    /// All three mean "no filter declared" to `query_filter`, but they are not
+    /// the same value, and this is the only place that can prove it.
+    #[test]
+    fn fixture_null_and_empty_conditions_are_distinct_values() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/shipped_conditions");
+        let (_q, _n, raw) =
+            compound_reader::read_compound_queries_raw(dir.to_str().unwrap(), false).unwrap();
+        assert_eq!(raw.len(), 21);
+
+        let nulls = raw
+            .iter()
+            .filter(|c| **c == Some(serde_json::Value::Null))
+            .count();
+        let empties = raw
+            .iter()
+            .filter(|c| **c == Some(serde_json::json!({})))
+            .count();
+        let absent = raw.iter().filter(|c| c.is_none()).count();
+        assert_eq!(
+            nulls, 3,
+            "`\"conditions\": null` must survive as Some(Null)"
+        );
+        assert_eq!(
+            empties, 1,
+            "`\"conditions\": {{}}` must survive as Some(Object)"
+        );
+        assert_eq!(
+            absent, 0,
+            "no fixture row omits the key, so none may read back as None"
+        );
+        assert_ne!(
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({})),
+            "null and {{}} are different values even though both mean 'no filter'"
+        );
+
+        // ...and all four resolve to an unfiltered query rather than an error.
+        let (_q, _n, guarded) = read_compound_queries(dir.to_str().unwrap(), false).unwrap();
+        assert_eq!(guarded.declared_count(), 17);
+    }
+
     #[test]
     fn test_compound_queries_with_conditions() {
         let dir = tempfile::tempdir().unwrap();
