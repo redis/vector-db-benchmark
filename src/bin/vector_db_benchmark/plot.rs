@@ -128,6 +128,20 @@ pub fn export_chart(args: &Args) -> Result<(), String> {
 /// Extract (precision, qps) points from a summary's `precision_summary` map,
 /// falling back to `search_results` if that's absent.
 fn parse_points(json: &Value) -> Vec<Point> {
+    // A summary without `metrics_schema_version` predates the #217 rename — or was
+    // written by upstream qdrant/vector-db-benchmark, whose `precision_summary`
+    // keys and `mean_precisions` values are recall@top rather than our
+    // precision-at-returned. The two shapes are indistinguishable, so the X axis
+    // cannot be honestly labelled for such a file; say so instead of charting it
+    // silently under our label.
+    if json.get("metrics_schema_version").is_none() {
+        eprintln!(
+            "WARNING: summary has no `metrics_schema_version` — its precision values are either \
+             ours from before the #217 rename (precision = hits / results returned) or upstream's \
+             (recall@top = hits / top). They are plotted on the same axis; re-run the benchmark to \
+             get an unambiguous summary."
+        );
+    }
     if let Some(map) = json.get("precision_summary").and_then(|v| v.as_object()) {
         let mut pts: Vec<Point> = map
             .iter()
@@ -143,12 +157,22 @@ fn parse_points(json: &Value) -> Vec<Point> {
         }
     }
     // Fallback: raw search_results entries.
+    //
+    // `mean_precisions` is read only for backwards compatibility with summary
+    // files written before schema version 2 (#217), where our precision shipped
+    // under that name. New files use `mean_precision_at_returned`. Note that a
+    // summary produced by upstream qdrant/vector-db-benchmark also has a
+    // `mean_precisions` field, but it holds recall@top — the two curves are not
+    // interchangeable, which is exactly why the key was renamed.
     json.get("search_results")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|e| {
-                    let precision = e.get("mean_precisions").and_then(|v| v.as_f64())?;
+                    let precision = e
+                        .get("mean_precision_at_returned")
+                        .or_else(|| e.get("mean_precisions"))
+                        .and_then(|v| v.as_f64())?;
                     let qps = e.get("rps").and_then(|v| v.as_f64())?;
                     Some(Point { precision, qps })
                 })
@@ -246,7 +270,10 @@ fn render_svg(title: &str, series: &[Series]) -> String {
         mt + plot_h
     ));
     svg.push_str(&format!(
-        r#"<text x="{}" y="{}" font-size="13" text-anchor="middle">Precision (recall@k)</text>"#,
+        // The X axis is our precision-at-returned (hits / results returned), NOT
+        // upstream's recall@top — the axis used to be labelled "recall@k", which
+        // is a different quantity (#217).
+        r#"<text x="{}" y="{}" font-size="13" text-anchor="middle">Precision@returned (hits / results returned)</text>"#,
         ml + plot_w / 2.0,
         h - 18.0
     ));
@@ -330,12 +357,47 @@ mod tests {
     #[test]
     fn parse_points_falls_back_to_search_results() {
         let json = serde_json::json!({
+            "metrics_schema_version": 2,
+            "search_results": [
+                {"mean_precision_at_returned": 0.8, "rps": 100.0},
+                {"mean_precision_at_returned": 0.95, "rps": 60.0}
+            ]
+        });
+        assert_eq!(parse_points(&json).len(), 2);
+    }
+
+    /// Summaries written before the #217 rename carry our precision under the
+    /// legacy `mean_precisions` key; charting them must keep working.
+    #[test]
+    fn parse_points_reads_legacy_mean_precisions_key() {
+        let json = serde_json::json!({
             "search_results": [
                 {"mean_precisions": 0.8, "rps": 100.0},
                 {"mean_precisions": 0.95, "rps": 60.0}
             ]
         });
-        assert_eq!(parse_points(&json).len(), 2);
+        let mut pts = parse_points(&json);
+        pts.sort_by(|a, b| a.precision.partial_cmp(&b.precision).unwrap());
+        assert_eq!(pts.len(), 2);
+        assert!((pts[0].precision - 0.8).abs() < 1e-9);
+    }
+
+    /// A file carrying both keys must prefer the new one (a hand-merged or
+    /// re-written summary must not silently fall back to the legacy value).
+    #[test]
+    fn parse_points_prefers_new_key_over_legacy() {
+        let json = serde_json::json!({
+            "search_results": [
+                {"mean_precision_at_returned": 0.42, "mean_precisions": 0.99, "rps": 10.0}
+            ]
+        });
+        let pts = parse_points(&json);
+        assert_eq!(pts.len(), 1);
+        assert!(
+            (pts[0].precision - 0.42).abs() < 1e-9,
+            "{}",
+            pts[0].precision
+        );
     }
 
     #[test]

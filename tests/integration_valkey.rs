@@ -1201,7 +1201,7 @@ fn test_binary_valkey_match_any_resp3() {
 /// End-to-end FILTER-ONLY harness (`--skip-vector-index`) at `parallel: 4` with
 /// `--queries 1000`, so the per-worker thread-local latency buffers are merged
 /// across threads (the join-merge path). Asserts the filter-only sentinel
-/// (`mean_precisions == -1`), full query accounting (requested == succeeded,
+/// (`mean_precision_at_returned == -1`), full query accounting (requested == succeeded,
 /// failed == 0) on a healthy run, positive RPS, and monotone linear percentiles.
 #[test]
 fn test_binary_valkey_filter_only() {
@@ -1234,7 +1234,7 @@ fn test_binary_valkey_filter_only() {
     );
 
     let r = common::read_results_obj(&proj.root, "valkey-no-vector");
-    let mp = r["mean_precisions"].as_f64().unwrap();
+    let mp = r["mean_precision_at_returned"].as_f64().unwrap();
     let rps = r["rps"].as_f64().unwrap();
     let p50 = r["p50_time"].as_f64().unwrap();
     let p95 = r["p95_time"].as_f64().unwrap();
@@ -1243,7 +1243,7 @@ fn test_binary_valkey_filter_only() {
     let succeeded = r["succeeded_queries"].as_u64().unwrap();
     let failed = r["failed_queries"].as_u64().unwrap();
     println!(
-        "valkey filter-only: mean_precisions={mp} rps={rps:.1} p50={p50} p95={p95} p99={p99} \
+        "valkey filter-only: mean_precision_at_returned={mp} rps={rps:.1} p50={p50} p95={p95} p99={p99} \
          requested={requested} succeeded={succeeded} failed={failed}"
     );
     assert_eq!(mp, -1.0, "filter-only sentinel lost");
@@ -1299,7 +1299,7 @@ fn test_binary_valkey_mixed_benchmark() {
 
     let r = common::read_results_obj(&proj.root, "valkey-mx");
     let recall = r["mean_recall"].as_f64().unwrap();
-    let precision = r["mean_precisions"].as_f64().unwrap();
+    let precision = r["mean_precision_at_returned"].as_f64().unwrap();
     let update_count = r["update_count"].as_u64().unwrap();
     let update_rps = r["update_rps"].as_f64().unwrap();
     let p50 = r["p50_time"].as_f64().unwrap();

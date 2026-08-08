@@ -70,7 +70,16 @@ pub struct UpdateSearchRatio {
 pub struct SearchResults {
     pub total_time: f64,
     pub mean_time: f64,
-    pub mean_precision: f64,
+    /// Mean per-query precision, denominator = results the engine actually
+    /// returned: `hits / |deduped results kept|`. Emitted as
+    /// `mean_precision_at_returned`, NOT as `mean_precisions` — upstream
+    /// `qdrant/vector-db-benchmark` publishes recall@top under that key (#217).
+    /// `-1.0` is the filter-only sentinel (no vector search, no quality metric).
+    pub mean_precision_at_returned: f64,
+    /// Mean per-query recall, denominator = the valid, deduped ground-truth ids
+    /// that exist in `expected[:top]` (so a query with 3 true neighbours can
+    /// reach 1.0). Equals upstream's `mean_precisions` only when every
+    /// ground-truth row is at least `top` wide.
     pub mean_recall: f64,
     /// 10th-percentile per-query recall — the "worst 10%" floor. A healthy mean
     /// with a near-zero p10 means a slice of queries return almost nothing (e.g.
@@ -89,7 +98,8 @@ pub struct SearchResults {
     pub p50_time: f64,
     pub p95_time: f64,
     pub p99_time: f64,
-    pub precisions: Vec<f64>,
+    /// Per-query precision-at-returned samples (see `mean_precision_at_returned`).
+    pub precisions_at_returned: Vec<f64>,
     pub latencies: Vec<f64>,
     pub top: usize,
     /// Number of *successful* queries folded into the latency/quality stats.
@@ -331,7 +341,7 @@ pub fn compute_search_stats(
     Ok(SearchResults {
         total_time,
         mean_time,
-        mean_precision: mean(precisions),
+        mean_precision_at_returned: mean(precisions),
         mean_recall: mean(recalls),
         recall_p10,
         mean_mrr: mean(mrrs),
@@ -346,7 +356,7 @@ pub fn compute_search_stats(
         p50_time: pct(0.50),
         p95_time: pct(0.95),
         p99_time: pct(0.99),
-        precisions: precisions.to_vec(),
+        precisions_at_returned: precisions.to_vec(),
         latencies: times.to_vec(),
         top,
         num_queries: times.len(),

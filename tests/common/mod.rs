@@ -1457,7 +1457,7 @@ pub fn run_binary_extra(
 
 /// Read the whole `results` object from an engine's search result JSON, so a
 /// test can assert on any field (percentiles, requested/failed_queries,
-/// update_* metrics, the mean_precisions sentinel, …). `engine` is the result
+/// update_* metrics, the mean_precision_at_returned sentinel, …). `engine` is the result
 /// filename prefix — note `--skip-vector-index` renames the engine to
 /// `<engine_type>-no-vector`, so pass that prefix for filter-only runs.
 pub fn read_results_obj(root: &Path, engine: &str) -> serde_json::Value {

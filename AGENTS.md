@@ -130,7 +130,22 @@ When migrating or modifying search logic, **always compare precision output** be
 }
 ```
 
-**Rust search result JSON** uses the same field names as Python v0 (`mean_precisions`, `rps`, `p50_time`, etc.). Both versions write to `results/` with filename format: `{engine}-{dataset}-search-{id}-{pid}-{timestamp}.json`.
+**Rust search result JSON** uses the same field names as Python v0 for timing/throughput (`rps`, `p50_time`, …). Both versions write to `results/` with filename format: `{engine}-{dataset}-search-{id}-{pid}-{timestamp}.json`.
+
+#### Quality metric keys: `mean_precisions` is NOT ours (#217)
+
+Python v0 — and upstream `qdrant/vector-db-benchmark`, `engine/base_client/search.py` — computes `len(ids & expected[:top]) / top`, i.e. **recall@top**, and publishes it under the key `mean_precisions`. Our Rust build emits, since **schema version 2**:
+
+| key | formula | notes |
+|---|---|---|
+| `mean_precision_at_returned` | `hits / |results returned|` | was `mean_precisions` before schema v2 — the rename is what closed #217 |
+| `mean_recall` | `hits / |valid ground-truth ids in expected[:top]|` | equals Python/upstream `mean_precisions` **only** when every ground-truth row has >= `top` valid ids |
+| `precisions_at_returned` | per-query array of the above precision | only under `--dump-raw-latencies`; was `precisions` |
+| `precision_at_returned_dist` | digest of that array | was `precision_dist` |
+
+Every result file carries a top-level `metrics_schema` block with these formulas plus a `ground_truth` width profile and a `comparable_to_upstream_mean_precisions` field naming the key (if any) that can be overlaid on upstream numbers. **We never emit a key named `mean_precisions`** — the same name for two formulas is the state that must not ship.
+
+Calibration (`calibration_precision`) targets `mean_precision_at_returned`; when the dataset's ground truth is narrower than `top` the target can be unreachable by construction, which the run now warns about and records in `params.calibration.reached_target`.
 
 ### How to compare precision
 
@@ -141,5 +156,5 @@ When migrating or modifying search logic, **always compare precision output** be
    # Rust
    ./target/release/vector-db-benchmark --engines "redis-m-16-ef-128" --datasets "h-and-m-2048-angular-filters"
    ```
-2. Compare `mean_precisions` (Python) vs `mean_precision` (Rust) — values should match within floating-point tolerance
-3. If precision differs, check: score conversion, neighbor ordering, distance metric, and top-k cutoff logic
+2. Compare `mean_precisions` (Python) vs **`mean_recall`** (Rust) — the matching pair; values should agree within floating-point tolerance on full-width ground truth. `scripts/v0_check.sh` does this mapping for you. Comparing Python `mean_precisions` against Rust `mean_precision_at_returned` compares recall with precision.
+3. If it differs, check: score conversion, neighbor ordering, distance metric, top-k cutoff logic — and whether the dataset's ground-truth rows are shorter than `top` (`metrics_schema.ground_truth.queries_with_fewer_than_top_neighbours` in the Rust output), in which case the two denominators legitimately disagree.
