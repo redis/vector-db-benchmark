@@ -352,12 +352,21 @@ pub fn run(args: &Args) -> Result<(), String> {
 
             let dataset = Dataset::new((*dataset_config).clone());
 
+            // Start this experiment's provenance recording BEFORE the engine is
+            // built — engines resolve most of their environment knobs in `new()`,
+            // and a sweep must not carry the previous configuration's knobs into
+            // this one's artifacts (#212).
+            crate::effective_config::begin_experiment(&engine_config, invocation_provenance(args));
+
             // Create engine
             let mut engine = create_engine(&engine_config, &args.host)?;
 
             // Shard count this run will be measured at, recorded in the result
             // files so it does not have to be inferred from the config name (#211).
             let number_of_shards = crate::engine::resolved_number_of_shards(&engine_config)?;
+            if let Some(shards) = number_of_shards.as_ref() {
+                crate::effective_config::record_effective("number_of_shards", shards.clone());
+            }
 
             // Run experiment phases
             if let Err(e) = run_single_experiment(
@@ -387,6 +396,28 @@ pub fn run(args: &Args) -> Result<(), String> {
 
     pb.finish_and_clear();
     Ok(())
+}
+
+/// The invocation facts that change what a run measures and live in neither the
+/// configuration file nor the environment (#212).
+///
+/// `host` and `skip_upload` are the two that most often explain a number.
+/// Without `host`, two runs against two different servers produced byte-identical
+/// provenance; without `skip_upload`, a run that searched an index some earlier
+/// config had built was distinguishable only by the absence of an upload file —
+/// which is exactly the evidence somebody holding a published summary does not
+/// have.
+pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
+    json!({
+        "host": args.host,
+        "engines_file": args.engines_file,
+        "skip_upload": args.skip_upload,
+        "skip_search": args.skip_search,
+        "keep_data": args.keep_data,
+        "reset_between_configs": args.reset_between_configs,
+        "skip_if_exists": args.skip_if_exists,
+        "allow_partial_configs": args.allow_partial_configs,
+    })
 }
 
 /// Parse "U:S" ratio string into UpdateSearchRatio.
@@ -1078,6 +1109,10 @@ fn run_single_experiment(
             &search_entries,
             None,
             &results_dir(),
+            &{
+                crate::effective_config::set_phase("run");
+                crate::effective_config::snapshot()
+            },
         )?;
     }
 
@@ -1412,6 +1447,13 @@ fn save_search_results(
         number_of_shards,
         ground_truth,
         calibration,
+        // Snapshotted here rather than inside the builder so the builder stays a
+        // pure function of its arguments and its tests do not race the
+        // process-wide recorder.
+        &{
+            crate::effective_config::set_phase("search");
+            crate::effective_config::snapshot()
+        },
     );
 
     let path = results_dir().join(&filename);
@@ -1439,6 +1481,7 @@ fn build_search_result_json(
     number_of_shards: Option<&serde_json::Value>,
     ground_truth: Option<&crate::ground_truth::GroundTruthProfile>,
     calibration: Option<&serde_json::Value>,
+    engine_params: &serde_json::Value,
 ) -> serde_json::Value {
     let mut result = json!({
         "params": {
@@ -1530,10 +1573,24 @@ fn build_search_result_json(
     // Shard count the index was built with. Recall and QPS both move with it, so
     // a published search result carries it instead of leaving it to be inferred
     // from the `experiment` (config) name (#211). Emitted only for the engines
-    // where it means something; the full engine-params block is #212.
+    // where it means something; it also appears inside `engine_params.effective`
+    // below, kept here at its established path for existing consumers.
     if let Some(shards) = number_of_shards {
         result["params"]["number_of_shards"] = shards.clone();
     }
+
+    // What this run resolved (#212): `collection_params`/`upload_params` as the
+    // configuration file spells them under `declared`, the environment-derived
+    // knobs under `effective`, which variables were consulted at all under
+    // `env`, the invocation flags that live in neither, and every
+    // declared-but-overridden value under `overridden`. Without this block two
+    // runs of the same config name against different hosts, or with different
+    // retry budgets, produce byte-identical `params` and different numbers.
+    //
+    // Read `effective_config`'s module docs before treating a missing key as
+    // proof of anything: `env` is complete for variables consulted so far, while
+    // `effective` covers only the knobs resolved through the recording helpers.
+    result["params"]["engine_params"] = engine_params.clone();
 
     // Opt-in full-fidelity archival: additionally emit the raw per-query arrays
     // exactly as before. Off by default so large runs stay ~1000x smaller.
@@ -1615,6 +1672,34 @@ fn save_upload_results(
         engine_name, dataset_name, stats.upload_count, timestamp
     );
 
+    crate::effective_config::set_phase("upload");
+    let result = build_upload_result_json(
+        engine_name,
+        dataset_name,
+        stats,
+        number_of_shards,
+        &crate::effective_config::snapshot(),
+    );
+
+    let path = results_dir().join(&filename);
+    fs::write(&path, serde_json::to_string_pretty(&result).unwrap())
+        .map_err(|e| format!("Failed to save results: {}", e))?;
+
+    println!("Results saved to: {:?}", path);
+    Ok(())
+}
+
+/// Build the upload-result JSON document. Split out for the same reason as
+/// [`build_search_result_json`]: the emitted key set is then unit-testable
+/// without writing a file, and deleting the provenance block from it fails a
+/// test rather than passing silently.
+fn build_upload_result_json(
+    engine_name: &str,
+    dataset_name: &str,
+    stats: &crate::engine::UploadStats,
+    number_of_shards: Option<&serde_json::Value>,
+    engine_params: &serde_json::Value,
+) -> serde_json::Value {
     let mut result = json!({
         "params": {
             "experiment": engine_name,
@@ -1631,18 +1716,23 @@ fn save_upload_results(
     });
     // Shard count is the one collection param that changes indexing throughput
     // outright, so it is recorded rather than left to be inferred from the config
-    // name (#211). Emitted only for the engines where it means something; the
-    // full engine-params block is #212.
+    // name (#211). Emitted only for the engines where it means something; it also
+    // appears inside `engine_params.effective` below.
     if let Some(shards) = number_of_shards {
         result["params"]["number_of_shards"] = shards.clone();
     }
 
-    let path = results_dir().join(&filename);
-    fs::write(&path, serde_json::to_string_pretty(&result).unwrap())
-        .map_err(|e| format!("Failed to save results: {}", e))?;
+    // Same provenance block as the search files (#212), tagged `phase: "upload"`.
+    // It is scoped to what had been resolved when this file was written, so a
+    // knob the engine only resolves during search is absent here. The phase tag
+    // is what keeps that readable as sequencing: without it the block's own
+    // semantics ("a variable never read does not appear") would make the upload
+    // file's silence assert that the run never consulted the variable, which is
+    // false at run level. Compare the search file, or the summary, for the
+    // whole-run view.
+    result["params"]["engine_params"] = engine_params.clone();
 
-    println!("Results saved to: {:?}", path);
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -1864,6 +1954,7 @@ mod tests {
                 None,
                 Some(&gt),
                 None,
+                &serde_json::json!({}),
             );
 
             let res = doc["results"].as_object().unwrap();
@@ -1918,6 +2009,7 @@ mod tests {
                 None,
                 None,
                 Some(&outcome.to_json()),
+                &serde_json::json!({}),
             );
             let cal = &doc["params"]["calibration"];
             assert_eq!(cal["reached_target"], false);
@@ -1938,6 +2030,268 @@ mod tests {
                 "{}",
                 note
             );
+        }
+    }
+
+    /// The capability #212 asks for: an artifact you can attribute to the
+    /// settings that produced it.
+    mod engine_params {
+        use super::super::build_search_result_json;
+        use crate::config::SearchParams;
+        use crate::engine::SearchResults;
+
+        fn doc(engine_params: &serde_json::Value) -> serde_json::Value {
+            build_search_result_json(
+                "redis-m-16-ef-128",
+                "glove-100-angular",
+                &serde_json::from_value::<SearchParams>(
+                    serde_json::json!({"parallel": 8, "top": 10}),
+                )
+                .unwrap(),
+                &SearchResults {
+                    top: 10,
+                    ..Default::default()
+                },
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                engine_params,
+            )
+        }
+
+        /// **This is the regression test for #212.**
+        ///
+        /// Two runs of ONE committed configuration, differing only in an
+        /// environment variable, must produce artifacts that can be told apart.
+        ///
+        /// Before this change they could not be: `params` carried only the
+        /// configuration *name*, the dataset, and the search knobs, and none of
+        /// those move when you export a variable. Delete the `engine_params`
+        /// assignment from `build_search_result_json` and this test fails with
+        /// two byte-identical documents — which is exactly the state that made
+        /// two historical claims this cycle provable only from git history and
+        /// not from the artifacts themselves.
+        ///
+        /// The knob is driven through [`crate::engine::build_redis_url`], real
+        /// engine code on the real resolution path, not a stand-in.
+        #[test]
+        fn same_config_differing_only_by_an_env_knob_yields_distinguishable_artifacts() {
+            let _l = crate::effective_config::test_lock();
+            let prev = std::env::var("REDIS_PORT").ok();
+
+            let run = |port: Option<&str>| {
+                match port {
+                    Some(p) => std::env::set_var("REDIS_PORT", p),
+                    None => std::env::remove_var("REDIS_PORT"),
+                }
+                crate::effective_config::reset();
+                let url = crate::engine::build_redis_url("bench-host");
+                (doc(&crate::effective_config::snapshot()), url)
+            };
+
+            let (default_port, default_url) = run(None);
+            let (tuned_port, tuned_url) = run(Some("7777"));
+
+            // Anchor the recorded value to the value the run USED. Without this
+            // both sides of the inequality below come from the same recorder
+            // call, and the test passes even if the recorder reports a port the
+            // engine never dialled — a provenance test that cannot detect the
+            // provenance being wrong.
+            assert!(
+                default_url.ends_with(":6379/"),
+                "default url was {default_url}"
+            );
+            assert!(tuned_url.ends_with(":7777/"), "tuned url was {tuned_url}");
+
+            match &prev {
+                Some(v) => std::env::set_var("REDIS_PORT", v),
+                None => std::env::remove_var("REDIS_PORT"),
+            }
+
+            assert_ne!(
+                default_port, tuned_port,
+                "two runs that used different settings produced identical artifacts"
+            );
+            assert_eq!(
+                default_port["params"]["engine_params"]["effective"]["REDIS_PORT"],
+                6379
+            );
+            assert_eq!(
+                tuned_port["params"]["engine_params"]["effective"]["REDIS_PORT"],
+                7777
+            );
+            // Everything a consumer already reads is untouched; the difference is
+            // confined to the provenance block.
+            assert_eq!(default_port["results"], tuned_port["results"]);
+            assert_eq!(
+                default_port["params"]["experiment"],
+                tuned_port["params"]["experiment"]
+            );
+        }
+
+        /// Drives the SAME entry point `experiment::run` uses, so deleting the
+        /// reset — or the whole call — fails here.
+        ///
+        /// An earlier version called `effective_config::reset()` directly and a
+        /// mutation campaign showed it: deleting the production `reset()` left
+        /// 754/754 green while a sweep's later configurations inherited the
+        /// earlier ones' knobs. A test that reaches past the wiring it is meant
+        /// to protect cannot detect the wiring being removed.
+        fn begin(cfg_name: &str, args: &crate::cli::Args) {
+            let raw = serde_json::json!({"name": cfg_name, "engine": "redis"});
+            let mut cfg: crate::config::EngineConfig = serde_json::from_value(raw.clone()).unwrap();
+            cfg.raw = Some(raw);
+            crate::effective_config::begin_experiment(
+                &cfg,
+                super::super::invocation_provenance(args),
+            );
+        }
+
+        #[test]
+        fn a_sweep_does_not_inherit_the_previous_configs_knobs() {
+            use clap::Parser;
+            let _l = crate::effective_config::test_lock();
+            let prev = std::env::var("REDIS_PORT").ok();
+            let args = crate::cli::Args::parse_from(["vdbb", "--host", "db-alpha"]);
+
+            std::env::set_var("REDIS_PORT", "7777");
+            begin("config-a", &args);
+            let _ = crate::engine::build_redis_url("h");
+            let config_a = doc(&crate::effective_config::snapshot());
+
+            // Second configuration of the same sweep, in the same process.
+            std::env::remove_var("REDIS_PORT");
+            begin("config-b", &args);
+            let _ = crate::engine::build_redis_url("h");
+            let config_b = doc(&crate::effective_config::snapshot());
+
+            match &prev {
+                Some(v) => std::env::set_var("REDIS_PORT", v),
+                None => std::env::remove_var("REDIS_PORT"),
+            }
+
+            let ep = |d: &serde_json::Value| d["params"]["engine_params"].clone();
+            assert_eq!(ep(&config_a)["effective"]["REDIS_PORT"], 7777);
+            assert_eq!(
+                ep(&config_b)["effective"]["REDIS_PORT"],
+                6379,
+                "configuration B inherited configuration A's port — the per-experiment \
+                 reset is not wired"
+            );
+            assert_eq!(
+                ep(&config_b)["env"]["REDIS_PORT"],
+                serde_json::Value::Null,
+                "configuration A's observation survived into configuration B"
+            );
+        }
+
+        /// The invocation facts that live in neither the config file nor the
+        /// environment, asserted THROUGH the wiring: two runs against two
+        /// different servers used to produce byte-identical provenance.
+        #[test]
+        fn invocation_reaches_the_artifact_with_host_and_skip_upload() {
+            use clap::Parser;
+            let _l = crate::effective_config::test_lock();
+
+            begin(
+                "cfg",
+                &crate::cli::Args::parse_from(["vdbb", "--host", "db-alpha"]),
+            );
+            let alpha = doc(&crate::effective_config::snapshot());
+
+            begin(
+                "cfg",
+                &crate::cli::Args::parse_from(["vdbb", "--host", "db-beta", "--skip-upload"]),
+            );
+            let beta = doc(&crate::effective_config::snapshot());
+
+            let inv = |d: &serde_json::Value| d["params"]["engine_params"]["invocation"].clone();
+            assert_eq!(inv(&alpha)["host"], "db-alpha");
+            assert_eq!(inv(&beta)["host"], "db-beta");
+            assert_eq!(inv(&alpha)["skip_upload"], false);
+            assert_eq!(
+                inv(&beta)["skip_upload"],
+                true,
+                "a run that searched an index it did not build must say so"
+            );
+            assert_ne!(
+                alpha, beta,
+                "same config, different server: the artifacts must differ"
+            );
+        }
+
+        /// The declared block reaches the artifact through the same entry point.
+        #[test]
+        fn declared_config_reaches_the_artifact() {
+            use clap::Parser;
+            let _l = crate::effective_config::test_lock();
+            begin("cfg", &crate::cli::Args::parse_from(["vdbb"]));
+            let d = doc(&crate::effective_config::snapshot());
+            assert!(d["params"]["engine_params"]["declared"].is_object());
+        }
+
+        /// The upload file carries it too, tagged with its phase — and #212's
+        /// indistinguishability has to be closed there as well, since
+        /// `upload_time` is one of the numbers the issue names.
+        #[test]
+        fn upload_result_carries_the_provenance_block_tagged_upload() {
+            use super::super::build_upload_result_json;
+            use crate::engine::UploadStats;
+
+            let stats = UploadStats {
+                parallel: 8,
+                batch_size: 64,
+                ..Default::default()
+            };
+            let ep = serde_json::json!({
+                "schema_version": 1,
+                "phase": "upload",
+                "effective": {"upload_parallel": 8},
+            });
+            let d = build_upload_result_json("redis-x", "glove", &stats, None, &ep);
+            assert_eq!(d["params"]["engine_params"]["phase"], "upload");
+            assert_eq!(
+                d["params"]["engine_params"]["effective"]["upload_parallel"],
+                8
+            );
+            // Existing keys keep their place.
+            assert_eq!(d["params"]["parallel"], 8);
+            assert_eq!(d["results"]["upload_count"], 0);
+
+            // Two uploads differing only in a knob are distinguishable.
+            let other = build_upload_result_json(
+                "redis-x",
+                "glove",
+                &stats,
+                None,
+                &serde_json::json!({"schema_version": 1, "phase": "upload",
+                                    "effective": {"upload_parallel": 32}}),
+            );
+            assert_ne!(d, other);
+            assert_eq!(d["results"], other["results"]);
+        }
+
+        /// The block is present, and shaped, on every search result.
+        #[test]
+        fn search_result_carries_the_provenance_block() {
+            let d = doc(&serde_json::json!({
+                "schema_version": 1,
+                "declared": {"collection_params": {"hnsw_config": {"M": 16}}},
+                "effective": {"m": 16},
+                "env": {"REDIS_PORT": null},
+                "overridden": [],
+                "ignored_declared_keys": [],
+            }));
+            let ep = &d["params"]["engine_params"];
+            assert_eq!(ep["schema_version"], 1);
+            assert_eq!(ep["declared"]["collection_params"]["hnsw_config"]["M"], 16);
+            assert_eq!(ep["effective"]["m"], 16);
+            // Pre-existing keys still sit where consumers expect them.
+            assert_eq!(d["params"]["parallel"], 8);
+            assert_eq!(d["params"]["top"], 10);
         }
     }
 }

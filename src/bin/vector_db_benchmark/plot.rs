@@ -366,6 +366,46 @@ mod tests {
         assert_eq!(parse_points(&json).len(), 2);
     }
 
+    /// The chart must read every generation of summary the `results/` tree holds:
+    /// pre-#217 files with no version marker at all, the version-2 files the
+    /// rename produced, and the version-3 files that carry `engine_params`
+    /// (#212). The new block is additive — it must not shift where the points
+    /// come from — and an old file must still chart rather than being rejected
+    /// for lacking it.
+    #[test]
+    fn parse_points_reads_v2_and_v3_summaries_identically() {
+        let results = serde_json::json!([
+            {"mean_precision_at_returned": 0.8, "rps": 100.0},
+            {"mean_precision_at_returned": 0.95, "rps": 60.0}
+        ]);
+        let v2 = serde_json::json!({
+            "metrics_schema_version": 2, "search_results": results,
+        });
+        let v3 = serde_json::json!({
+            "metrics_schema_version": 3,
+            "engine_params": {
+                "schema_version": 1,
+                "declared": {"collection_params": {"hnsw_config": {"M": 16}}},
+                "effective": {"m": 16, "REDIS_PORT": 7777},
+                "env": {"REDIS_PORT": "7777"},
+                "overridden": [], "ignored_declared_keys": [],
+            },
+            "search_results": results,
+        });
+        let unversioned = serde_json::json!({"search_results": results});
+
+        let sort = |mut p: Vec<Point>| {
+            p.sort_by(|a, b| a.precision.partial_cmp(&b.precision).unwrap());
+            p.into_iter()
+                .map(|p| (p.precision, p.qps))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![(0.8, 100.0), (0.95, 60.0)];
+        assert_eq!(sort(parse_points(&v2)), expected);
+        assert_eq!(sort(parse_points(&v3)), expected);
+        assert_eq!(sort(parse_points(&unversioned)), expected);
+    }
+
     /// Summaries written before the #217 rename carry our precision under the
     /// legacy `mean_precisions` key; charting them must keep working.
     #[test]

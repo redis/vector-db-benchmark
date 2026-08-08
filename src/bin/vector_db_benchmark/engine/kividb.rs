@@ -109,10 +109,7 @@ impl KividbEngine {
         // `quay.io/kividbio/kividb` image exposes 6380). Defaulting to 6379
         // meant an out-of-the-box run could not connect at all, or — worse —
         // silently benchmarked a real Redis that happened to be on 6379.
-        let port: u16 = std::env::var("KIVIDB_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6380);
+        let port: u16 = crate::effective_config::env_parsed("KIVIDB_PORT", 6380);
 
         // Extract HNSW config
         let (m, ef_construction) = engine_config
@@ -133,9 +130,9 @@ impl KividbEngine {
         // Upload concurrency/batch come from the engine config, but each can be
         // overridden at runtime via env (taking precedence over the config),
         // mirroring dragonfly.rs / valkey.rs.
-        let parallel = std::env::var("KIVIDB_UPLOAD_PARALLEL")
+        let parallel = crate::effective_config::env_var("KIVIDB_UPLOAD_PARALLEL")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .or_else(|| {
                 engine_config
                     .upload_params
@@ -145,10 +142,15 @@ impl KividbEngine {
                     .map(|v| v as usize)
             })
             .unwrap_or(100);
+        // Resolved from THREE sources (env > upload_params > default), so no
+        // single recorder helper sees the winner. Recording it here is what
+        // keeps `KIVIDB_UPLOAD_PARALLEL` from being a knob whose raw text is in
+        // the artifact while the value the upload actually ran at is not.
+        crate::effective_config::record_effective("upload_parallel", parallel);
 
-        let batch_size = std::env::var("KIVIDB_UPLOAD_BATCH_SIZE")
+        let batch_size = crate::effective_config::env_var("KIVIDB_UPLOAD_BATCH_SIZE")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .or_else(|| {
                 engine_config
                     .upload_params
@@ -158,6 +160,11 @@ impl KividbEngine {
                     .map(|v| v as usize)
             })
             .unwrap_or(64);
+        // Resolved from THREE sources (env > upload_params > default), so no
+        // single recorder helper sees the winner. Recording it here is what
+        // keeps `KIVIDB_UPLOAD_BATCH_SIZE` from being a knob whose raw text is in
+        // the artifact while the value the upload actually ran at is not.
+        crate::effective_config::record_effective("upload_batch_size", batch_size);
 
         Ok(Self {
             name: engine_config.name.clone(),
@@ -183,8 +190,8 @@ impl KividbEngine {
     }
 
     fn connect(host: &str, port: u16) -> Result<Connection, String> {
-        let auth = std::env::var("KIVIDB_AUTH").ok();
-        let user = std::env::var("KIVIDB_USER").ok();
+        let auth = crate::effective_config::env_var("KIVIDB_AUTH").ok();
+        let user = crate::effective_config::env_var("KIVIDB_USER").ok();
 
         let auth_part = match (&user, &auth) {
             (Some(u), Some(p)) => format!("{}:{}@", u, p),
@@ -2118,10 +2125,8 @@ impl Engine for KividbEngine {
             .and_then(|sp| sp.ef)
             .unwrap_or(64);
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let query_timeout: i64 = std::env::var("KIVIDB_QUERY_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60_000);
+        let query_timeout: i64 =
+            crate::effective_config::env_parsed("KIVIDB_QUERY_TIMEOUT", 60_000);
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());

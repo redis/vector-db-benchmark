@@ -473,17 +473,14 @@ pub trait Engine {
 ///
 /// Priority: `REDIS_URI` env var > `REDIS_USER`/`REDIS_AUTH` env vars + host/port.
 pub fn build_redis_url(host: &str) -> String {
-    if let Ok(uri) = std::env::var("REDIS_URI") {
+    if let Ok(uri) = crate::effective_config::env_var("REDIS_URI") {
         return uri;
     }
 
-    let port: u16 = std::env::var("REDIS_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6379);
+    let port: u16 = crate::effective_config::env_parsed("REDIS_PORT", 6379);
 
-    let auth = std::env::var("REDIS_AUTH").ok();
-    let user = std::env::var("REDIS_USER").ok();
+    let auth = crate::effective_config::env_var("REDIS_AUTH").ok();
+    let user = crate::effective_config::env_var("REDIS_USER").ok();
 
     let auth_part = match (&user, &auth) {
         (Some(u), Some(p)) => format!("{}:{}@", u, p),
@@ -511,28 +508,41 @@ pub fn build_redis_url(host: &str) -> String {
 /// - every other engine returns `None` and the key is omitted rather than
 ///   invented.
 ///
-/// This is deliberately one key, not the full engine-params block: capturing
-/// `collection_params` verbatim plus the env-derived knobs (`m`,
-/// `ef_construction`, retry budgets, `*_UPLOAD_PARALLEL`, …) for all 15 engines
-/// is tracked separately in #212.
+/// The rest of the engine-params block — `collection_params` verbatim plus the
+/// env-derived knobs — is assembled by [`crate::effective_config`] (#212); this
+/// function feeds `number_of_shards` into it.
 pub fn resolved_number_of_shards(
     engine_config: &EngineConfig,
 ) -> Result<Option<serde_json::Value>, String> {
+    let declared = engine_config
+        .collection_params
+        .as_ref()
+        .and_then(|c| c.extra.as_ref())
+        .and_then(|e| e.get("number_of_shards"));
+
     match engine_config.engine.as_deref() {
-        Some("opensearch") => {
-            let raw = engine_config
-                .collection_params
-                .as_ref()
-                .and_then(|c| c.extra.as_ref())
-                .and_then(|e| e.get("number_of_shards"));
-            Ok(Some(match opensearch::parse_number_of_shards(raw)? {
-                Some(n) => serde_json::Value::from(n),
-                None => serde_json::Value::from("cluster-default"),
-            }))
+        Some("opensearch") => Ok(Some(match opensearch::parse_number_of_shards(declared)? {
+            Some(n) => serde_json::Value::from(n),
+            None => serde_json::Value::from("cluster-default"),
+        })),
+        Some("elasticsearch") => {
+            let effective = serde_json::Value::from(elasticsearch::ES_NUMBER_OF_SHARDS);
+            // A config that declares a shard count for Elasticsearch does not get
+            // one: `build_index_settings` hardcodes the constant. Emitting only
+            // the winner would leave the artifact agreeing with a config file the
+            // run did not obey, so both sides are recorded (#212).
+            if let Some(d) = declared {
+                crate::effective_config::note_override(
+                    "collection_params.number_of_shards",
+                    d.clone(),
+                    effective.clone(),
+                    "the elasticsearch engine pins number_of_shards to \
+                     ES_NUMBER_OF_SHARDS in code (the ES/OS apples-to-apples \
+                     pairing, #235) and ignores the declared value",
+                );
+            }
+            Ok(Some(effective))
         }
-        Some("elasticsearch") => Ok(Some(serde_json::Value::from(
-            elasticsearch::ES_NUMBER_OF_SHARDS,
-        ))),
         _ => Ok(None),
     }
 }

@@ -48,15 +48,11 @@ pub struct WeaviateEngine {
 
 impl WeaviateEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("WEAVIATE_HTTP_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8080);
+        let port: u16 = crate::effective_config::env_parsed("WEAVIATE_HTTP_PORT", 8080);
 
-        let class_name =
-            std::env::var("WEAVIATE_CLASS_NAME").unwrap_or_else(|_| DEFAULT_CLASS_NAME.to_string());
+        let class_name = crate::effective_config::env_or("WEAVIATE_CLASS_NAME", DEFAULT_CLASS_NAME);
 
-        let api_key = std::env::var("WEAVIATE_API_KEY").ok();
+        let api_key = crate::effective_config::env_var("WEAVIATE_API_KEY").ok();
 
         let timeout = engine_config
             .connection_params
@@ -87,10 +83,7 @@ impl WeaviateEngine {
 
         // gRPC endpoint: same host, port 50051 (override via WEAVIATE_GRPC_PORT),
         // always plaintext h2c (self-hosted). Strip any scheme/port from `host`.
-        let grpc_port: u16 = std::env::var("WEAVIATE_GRPC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50051);
+        let grpc_port: u16 = crate::effective_config::env_parsed("WEAVIATE_GRPC_PORT", 50051);
         let host_only = host
             .trim_start_matches("https://")
             .trim_start_matches("http://")
@@ -1377,7 +1370,12 @@ impl Engine for WeaviateEngine {
         // async tasks on a shared runtime (one connection per task, HTTP/2);
         // GraphQL concurrency is blocking OS threads.
         let grpc_ep: Option<tonic::transport::Endpoint> =
-            if std::env::var("WEAVIATE_USE_GRAPHQL").is_ok() {
+            // `is_ok()` — the VALUE is discarded, so `WEAVIATE_USE_GRAPHQL=false`
+            // still selects GraphQL. Recording the resolved boolean means the
+            // artifact reports the transport that ran rather than the text that
+            // was set; the surprising engine semantics are unchanged here and
+            // tracked separately.
+            if crate::effective_config::env_present("WEAVIATE_USE_GRAPHQL") {
                 None
             } else {
                 match tonic::transport::Endpoint::from_shared(self.grpc_endpoint.clone()) {

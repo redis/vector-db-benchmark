@@ -80,10 +80,7 @@ pub struct ValkeyEngine {
 
 impl ValkeyEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("VALKEY_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6379);
+        let port: u16 = crate::effective_config::env_parsed("VALKEY_PORT", 6379);
 
         // Extract HNSW config
         let (m, ef_construction) = engine_config
@@ -147,8 +144,8 @@ impl ValkeyEngine {
     }
 
     fn connect(host: &str, port: u16) -> Result<Connection, String> {
-        let auth = std::env::var("VALKEY_AUTH").ok();
-        let user = std::env::var("VALKEY_USER").ok();
+        let auth = crate::effective_config::env_var("VALKEY_AUTH").ok();
+        let user = crate::effective_config::env_var("VALKEY_USER").ok();
 
         let auth_part = match (&user, &auth) {
             (Some(u), Some(p)) => format!("{}:{}@", u, p),
@@ -496,10 +493,8 @@ impl ValkeyEngine {
         }
 
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let query_timeout: i64 = std::env::var("VALKEY_QUERY_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60_000);
+        let query_timeout: i64 =
+            crate::effective_config::env_parsed("VALKEY_QUERY_TIMEOUT", 60_000);
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
@@ -561,8 +556,8 @@ impl ValkeyEngine {
                     let mut local_errs: Vec<String> = Vec::new();
                     let mut pb_pending: u64 = 0;
 
-                    let auth = std::env::var("VALKEY_AUTH").ok();
-                    let user = std::env::var("VALKEY_USER").ok();
+                    let auth = crate::effective_config::env_var("VALKEY_AUTH").ok();
+                    let user = crate::effective_config::env_var("VALKEY_USER").ok();
                     let auth_part = match (&user, &auth) {
                         (Some(u), Some(p)) => format!("{}:{}@", u, p),
                         (None, Some(p)) => format!(":{}@", p),
@@ -1490,10 +1485,11 @@ fn value_as_i64(v: &redis::Value) -> i64 {
 /// (`VALKEY_PROTOCOL=resp3`). Defaults to RESP2 (empty suffix). The FT.SEARCH
 /// response parser handles both shapes, so recall is identical either way.
 fn valkey_url_suffix() -> &'static str {
-    if std::env::var("VALKEY_PROTOCOL")
-        .map(|v| v.eq_ignore_ascii_case("resp3"))
-        .unwrap_or(false)
-    {
+    // `env_flag` records the protocol actually selected. With the plain shim,
+    // `VALKEY_PROTOCOL=" resp3 "` recorded `" resp3 "` and spoke RESP2 — the
+    // artifact showing what looks like a successful opt-in to the other wire
+    // protocol.
+    if crate::effective_config::env_flag("VALKEY_PROTOCOL", &["resp3"]) {
         "?protocol=resp3"
     } else {
         ""
@@ -1764,12 +1760,10 @@ impl Engine for ValkeyEngine {
             .and_then(|sp| sp.ef)
             .unwrap_or(64);
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let hybrid_policy = std::env::var("VALKEY_HYBRID_POLICY").unwrap_or_default();
+        let hybrid_policy = crate::effective_config::env_or("VALKEY_HYBRID_POLICY", "");
         // Valkey Search caps TIMEOUT at 60000ms
-        let query_timeout: i64 = std::env::var("VALKEY_QUERY_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60_000);
+        let query_timeout: i64 =
+            crate::effective_config::env_parsed("VALKEY_QUERY_TIMEOUT", 60_000);
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
@@ -1852,8 +1846,8 @@ impl Engine for ValkeyEngine {
                     let mut nd = Vec::new();
                     let mut pb_pending: u64 = 0;
 
-                    let auth = std::env::var("VALKEY_AUTH").ok();
-                    let user = std::env::var("VALKEY_USER").ok();
+                    let auth = crate::effective_config::env_var("VALKEY_AUTH").ok();
+                    let user = crate::effective_config::env_var("VALKEY_USER").ok();
                     let auth_part = match (&user, &auth) {
                         (Some(u), Some(p)) => format!("{}:{}@", u, p),
                         (None, Some(p)) => format!(":{}@", p),
@@ -2044,11 +2038,9 @@ impl Engine for ValkeyEngine {
             .and_then(|sp| sp.ef)
             .unwrap_or(64);
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let hybrid_policy = std::env::var("VALKEY_HYBRID_POLICY").unwrap_or_default();
-        let query_timeout: i64 = std::env::var("VALKEY_QUERY_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60_000);
+        let hybrid_policy = crate::effective_config::env_or("VALKEY_HYBRID_POLICY", "");
+        let query_timeout: i64 =
+            crate::effective_config::env_parsed("VALKEY_QUERY_TIMEOUT", 60_000);
 
         // Read queries and ground truth
         let query_path = dataset.get_path()?;

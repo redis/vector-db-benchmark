@@ -64,15 +64,12 @@ pub struct QdrantEngine {
 
 impl QdrantEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let grpc_port: u16 = std::env::var("QDRANT_GRPC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6334);
+        let grpc_port: u16 = crate::effective_config::env_parsed("QDRANT_GRPC_PORT", 6334);
 
-        let collection_name = std::env::var("QDRANT_COLLECTION_NAME")
-            .unwrap_or_else(|_| DEFAULT_COLLECTION.to_string());
+        let collection_name =
+            crate::effective_config::env_or("QDRANT_COLLECTION_NAME", DEFAULT_COLLECTION);
 
-        let api_key = std::env::var("QDRANT_API_KEY").ok();
+        let api_key = crate::effective_config::env_var("QDRANT_API_KEY").ok();
 
         let timeout = engine_config
             .connection_params
@@ -100,7 +97,7 @@ impl QdrantEngine {
             .trim_start_matches("http://")
             .trim_start_matches("https://");
 
-        let grpc_url = if let Ok(url) = std::env::var("QDRANT_URL") {
+        let grpc_url = if let Ok(url) = crate::effective_config::env_var("QDRANT_URL") {
             url
         } else {
             format!("http://{}:{}", clean_host, grpc_port)
@@ -108,13 +105,10 @@ impl QdrantEngine {
 
         // REST endpoint (default port 6333) for /metrics and /telemetry. Overridable
         // via QDRANT_REST_URL, or QDRANT_REST_PORT for just the port.
-        let rest_url = if let Ok(url) = std::env::var("QDRANT_REST_URL") {
+        let rest_url = if let Ok(url) = crate::effective_config::env_var("QDRANT_REST_URL") {
             url.trim_end_matches('/').to_string()
         } else {
-            let rest_port: u16 = std::env::var("QDRANT_REST_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(6333);
+            let rest_port: u16 = crate::effective_config::env_parsed("QDRANT_REST_PORT", 6333);
             format!("http://{}:{}", clean_host, rest_port)
         };
 
@@ -896,10 +890,8 @@ impl QdrantEngine {
         // Make the budget configurable (QDRANT_GREEN_WAIT_SECS) with a generous
         // default, and log indexing progress so a slow build is visible and
         // distinguishable from a genuinely stuck one.
-        let green_wait_secs: u64 = std::env::var("QDRANT_GREEN_WAIT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(14400); // 4h
+        let green_wait_secs: u64 =
+            crate::effective_config::env_parsed("QDRANT_GREEN_WAIT_SECS", 14400); // 4h
         let iterations = (green_wait_secs / 5).max(1);
         for i in 0..iterations {
             std::thread::sleep(std::time::Duration::from_secs(5));

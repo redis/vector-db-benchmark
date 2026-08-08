@@ -89,14 +89,11 @@ pub struct PgVectorEngine {
 
 impl PgVectorEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("PGVECTOR_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5432);
+        let port: u16 = crate::effective_config::env_parsed("PGVECTOR_PORT", 5432);
 
-        let dbname = std::env::var("PGVECTOR_DB").unwrap_or_else(|_| "postgres".to_string());
-        let user = std::env::var("PGVECTOR_USER").unwrap_or_else(|_| "postgres".to_string());
-        let password = std::env::var("PGVECTOR_PASSWORD").unwrap_or_else(|_| "passwd".to_string());
+        let dbname = crate::effective_config::env_or("PGVECTOR_DB", "postgres");
+        let user = crate::effective_config::env_or("PGVECTOR_USER", "postgres");
+        let password = crate::effective_config::env_or("PGVECTOR_PASSWORD", "passwd");
 
         // Extract HNSW config
         let (m, ef_construction) = engine_config

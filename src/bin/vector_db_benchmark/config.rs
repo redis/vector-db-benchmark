@@ -198,6 +198,17 @@ pub struct EngineConfig {
     /// When true, vectors are uploaded but not indexed; search is filter-only.
     #[serde(default)]
     pub skip_vector_index: bool,
+    /// This entry exactly as it appears in the configuration FILE.
+    ///
+    /// The typed fields above are lossy in three ways that matter to an artifact
+    /// claiming to record what was declared: serde injects `null` for every
+    /// undeclared `Option`, the aliases normalise `{"m","ef_construct"}` to
+    /// `{"M","EF_CONSTRUCTION"}`, and any key without a matching field
+    /// (`index_options.type`, `index_options.confidence_interval`) is dropped
+    /// outright. `#[serde(skip)]` so it round-trips as absent; populated by the
+    /// loaders below from a second, untyped parse of the same bytes.
+    #[serde(skip)]
+    pub raw: Option<serde_json::Value>,
 }
 
 /// Get the project root directory
@@ -465,7 +476,9 @@ pub fn read_engine_configs_from_dir(
         match serde_json::from_str::<Vec<EngineConfig>>(&content) {
             Ok(configs) => {
                 let file = path.display().to_string();
-                for (index, config) in configs.into_iter().enumerate() {
+                let raw = raw_entries(&content);
+                for (index, mut config) in configs.into_iter().enumerate() {
+                    config.raw = raw.get(index).cloned();
                     let origin = ConfigOrigin {
                         file: file.clone(),
                         index,
@@ -483,6 +496,62 @@ pub fn read_engine_configs_from_dir(
     }
     registry.into_result("engine configuration")?;
     Ok((all_configs, skipped))
+}
+
+/// Knobs shipped configs declare that their engine genuinely does NOT read.
+/// Pre-existing debt this guard surfaced, listed rather than silently
+/// excused — and asserted to still be unread, so a fix must delete its entry
+/// instead of leaving a stale exemption behind.
+///
+/// NOT a place to park new violations. Fix the engine or drop the key.
+const KNOWN_UNREAD: &[(&str, &str, &str)] = &[
+    (
+        "elasticsearch",
+        "connection_params.request_timeout",
+        "issue #245: engine takes its timeout from ELASTIC_TIMEOUT (default 300) \
+         and never consults the config; the shipped value 10000 has no effect. \
+         Units are ambiguous (s vs ms) and the two readings move behaviour in \
+         opposite directions, so the fix needs a deliberate decision.",
+    ),
+    (
+        "opensearch",
+        "connection_params.request_timeout",
+        "issue #245: same as elasticsearch, OPENSEARCH_TIMEOUT only.",
+    ),
+    // `qdrant collection_params.hnsw_config.on_disk` used to live here for
+    // issue #215. #215 landed, HnswConfig gained the field and qdrant.rs
+    // reads it, so the entry is gone — removed because the guard demanded it,
+    // not because anyone remembered to look.
+    (
+        "redis",
+        "collection_params.hnsw_config.DISTANCE_METRIC",
+        "HnswConfig has no DISTANCE_METRIC field; the distance actually comes \
+         from the dataset. Harmless but decorative - the key should be dropped \
+         from the calibration configs in a follow-up.",
+    ),
+];
+
+/// The same bytes, parsed untyped, so each entry's declared JSON survives the
+/// typed parse intact. Never fatal: the typed parse has already succeeded by the
+/// time this runs, so a failure here can only mean the two parsers disagree, and
+/// losing provenance must not cost the run.
+fn raw_entries(content: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str::<Vec<serde_json::Value>>(content).unwrap_or_default()
+}
+
+/// Knobs `engine`'s shipped configs declare that it genuinely does not read,
+/// with the reason, from the CI-asserted [`KNOWN_UNREAD`] inventory.
+///
+/// Exposed so the results JSON and the guard share ONE source of truth. They
+/// used to disagree by construction: the guard is `#[cfg(test)]` and said
+/// "declares a knob it never reads, documented debt (#245)", while the artifact
+/// for that same config reported nothing at all.
+pub fn known_unread_for(engine: &str) -> Vec<(&'static str, &'static str)> {
+    KNOWN_UNREAD
+        .iter()
+        .filter(|(e, _, _)| *e == engine)
+        .map(|(_, path, why)| (*path, *why))
+        .collect()
 }
 
 /// Read engine configs, reporting any file that could not be loaded.
@@ -506,7 +575,9 @@ pub fn read_engine_configs_reporting_skips(
             .map_err(|e| format!("failed to read --engines-file {}: {}", file, e))?;
         let configs: Vec<EngineConfig> = serde_json::from_str(&content)
             .map_err(|e| format!("invalid JSON in --engines-file {}: {}", file, e))?;
-        for (index, config) in configs.into_iter().enumerate() {
+        let raw = raw_entries(&content);
+        for (index, mut config) in configs.into_iter().enumerate() {
+            config.raw = raw.get(index).cloned();
             let origin = ConfigOrigin {
                 file: file.to_string(),
                 index,
@@ -1725,6 +1796,7 @@ mod tests {
 /// the key looks declared and parses without complaint.
 #[cfg(test)]
 mod shipped_config_knob_guard {
+    use super::KNOWN_UNREAD;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -1822,39 +1894,6 @@ mod shipped_config_knob_guard {
     /// entry here cannot excuse a container the engine ignores entirely.
     const PASSTHROUGH_CONTAINERS: &[(&str, &str)] =
         &[("weaviate", "collection_params.vectorIndexConfig")];
-
-    /// Knobs shipped configs declare that their engine genuinely does NOT read.
-    /// Pre-existing debt this guard surfaced, listed rather than silently
-    /// excused — and asserted to still be unread, so a fix must delete its entry
-    /// instead of leaving a stale exemption behind.
-    ///
-    /// NOT a place to park new violations. Fix the engine or drop the key.
-    const KNOWN_UNREAD: &[(&str, &str, &str)] = &[
-        (
-            "elasticsearch",
-            "connection_params.request_timeout",
-            "issue #245: engine takes its timeout from ELASTIC_TIMEOUT (default 300) \
-             and never consults the config; the shipped value 10000 has no effect. \
-             Units are ambiguous (s vs ms) and the two readings move behaviour in \
-             opposite directions, so the fix needs a deliberate decision.",
-        ),
-        (
-            "opensearch",
-            "connection_params.request_timeout",
-            "issue #245: same as elasticsearch, OPENSEARCH_TIMEOUT only.",
-        ),
-        // `qdrant collection_params.hnsw_config.on_disk` used to live here for
-        // issue #215. #215 landed, HnswConfig gained the field and qdrant.rs
-        // reads it, so the entry is gone — removed because the guard demanded it,
-        // not because anyone remembered to look.
-        (
-            "redis",
-            "collection_params.hnsw_config.DISTANCE_METRIC",
-            "HnswConfig has no DISTANCE_METRIC field; the distance actually comes \
-             from the dataset. Harmless but decorative - the key should be dropped \
-             from the calibration configs in a follow-up.",
-        ),
-    ];
 
     /// Every field [`EngineConfig`] declares. A root key outside this set is a
     /// typo that serde silently discards along with everything under it.
