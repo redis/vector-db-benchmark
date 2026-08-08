@@ -69,6 +69,13 @@ jobs:
       # job smoke-tests, now in the blocking suite.
       run: cargo test --test integration_cli --release
 
+    - name: Run measurement-overhead invariants (no container)
+      # `--lib --bins` does NOT build `tests/*.rs` integration targets, and no
+      # job named this one, so INV-2/INV-3 — the source-shape tripwires that
+      # keep the per-query timed loops lock-free and the percentiles unbiased —
+      # had never run in CI. INV-4/INV-4b (#214) join them here.
+      run: cargo test --test overhead_invariants --release
+
   integration-redis:
     name: Integration tests (Redis)
     runs-on: ubuntu-latest
