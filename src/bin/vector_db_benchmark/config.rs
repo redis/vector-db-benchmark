@@ -1105,9 +1105,9 @@ mod shipped_config_knob_guard {
         "opensearch",
         "connection_params.request_timeout",
         "#210/#246: opensearch.rs calls reqwest's `.request_timeout(..)` builder \
-         on the force-merge and cluster-health requests, and binds a local of the \
-         same name. All three are derived from OPENSEARCH_FORCE_MERGE_TIMEOUT / \
-         OPENSEARCH_TIMEOUT, never from connection_params, so issue #245's debt is \
+         on the force-merge and cluster-health requests. Both are derived from \
+         OPENSEARCH_FORCE_MERGE_TIMEOUT / OPENSEARCH_TIMEOUT, never from \
+         connection_params, so issue #245's debt is \
          untouched. Surfaced only when #246 merged with master: master added the \
          KNOWN_UNREAD entry while the engine had no such token, #246 added the \
          token while the branch had no such entry, and neither side fails alone.",

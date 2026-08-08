@@ -396,11 +396,15 @@ impl OpenSearchEngine {
     fn force_merge(&self) -> Result<(), String> {
         println!("Forcing merge into 1 segment...");
 
-        let request_timeout = self.force_merge_timeout()?;
+        // Named for what it is rather than after the transport setter: a local
+        // called `request_timeout` is indistinguishable, to the shipped-config
+        // knob guard's token search, from an engine reading
+        // `connection_params.request_timeout` — which this does not do.
+        let merge_deadline = self.force_merge_timeout()?;
         retry_index_op(
             &self.rt,
             "Force merge",
-            index_op_policy().with_budget(self.force_merge_budget(request_timeout)?),
+            index_op_policy().with_budget(self.force_merge_budget(merge_deadline)?),
             |status| (200..300).contains(&status),
             index_maintenance_retryable,
             || {
@@ -409,7 +413,7 @@ impl OpenSearchEngine {
                         .indices()
                         .forcemerge(IndicesForcemergeParts::Index(&[&self.index_name]))
                         .max_num_segments(1)
-                        .request_timeout(request_timeout)
+                        .request_timeout(merge_deadline)
                         .send(),
                 )
             },
