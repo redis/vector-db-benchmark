@@ -424,6 +424,48 @@ mod tests {
 
     // ---- results.gt (binary ground truth) ----
 
+    /// GOLDEN test: hand-written bytes, no writer involved.
+    ///
+    /// `round_trips_gt_neighbours` below CANNOT catch a wrong on-disk format —
+    /// `write_gt_neighbours` is a test-only encoder written against the same
+    /// assumptions as the decoder, so flipping BOTH to big-endian ids (or
+    /// swapping the ids and scores blocks) leaves the round-trip green. These
+    /// bytes pin the layout the real `msmacro-sparse-*.tar.gz` files use:
+    /// `[n: u32 LE][d: u32 LE][ids: i32 LE × n·d][scores: f32 × n·d]`, verified
+    /// byte-for-byte against the real 100K download (n=6980, d=10, file length
+    /// 558408 == 8 + 6980*10*8).
+    #[test]
+    fn gt_decodes_a_literal_little_endian_fixture() {
+        #[rustfmt::skip]
+        let bytes: &[u8] = &[
+            // header: n = 2, d = 3
+            0x02, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00,
+            // ids row 0: 1, 256, 65536  (each distinguishes LE from BE)
+            0x01, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x00,
+            // ids row 1: 0, 16777216, 2147483647 (i32::MAX)
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+            0xff, 0xff, 0xff, 0x7f,
+            // scores block: 6 f32. Never read, but it must FOLLOW the ids — if
+            // the two blocks were swapped these zero bytes would decode as ids.
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let f = write_tmp(bytes);
+        assert_eq!(
+            read_gt_neighbours(f.path().to_str().unwrap()).unwrap(),
+            vec![vec![1i64, 256, 65536], vec![0, 16_777_216, 2_147_483_647]],
+            "results.gt ids must be parsed as little-endian i32, ids block first"
+        );
+    }
+
     #[test]
     fn round_trips_gt_neighbours() {
         let rows = vec![vec![7i64, 3, 11], vec![0, 1, 2]];

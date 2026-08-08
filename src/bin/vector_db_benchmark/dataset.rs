@@ -276,6 +276,27 @@ impl Dataset {
                 neighbours.len()
             ));
         }
+
+        // Guard against pairing one corpus size's ground truth with another's.
+        // msmarco-sparse-100K and msmarco-sparse-1M ship the IDENTICAL 6980-query
+        // set, so a 100K `results.gt` sitting next to the 1M corpus passes the
+        // row-count check above and the reader's own length check — recall then
+        // silently collapses instead of failing. Ids outside the declared corpus
+        // are the only available signal.
+        if let Some(vector_count) = self.config.vector_count {
+            if let Some(&max_id) = neighbours.iter().flatten().max() {
+                if max_id >= vector_count {
+                    return Err(format!(
+                        "sparse ground truth for {} references point id {} but the dataset \
+                         declares only {} vectors — this ground truth does not belong to \
+                         this corpus (the msmarco-sparse sizes share one query set, so the \
+                         row counts match even when the corpora do not)",
+                        self.config.name, max_id, vector_count
+                    ));
+                }
+            }
+        }
+
         Ok((queries, neighbours))
     }
 
@@ -531,7 +552,38 @@ mod tests {
         let mut cfg = hybrid_dataset(dir).config;
         cfg.name = "sparse-unit".to_string();
         cfg.dataset_type = Some("sparse".to_string());
+        // Large enough that the ground-truth ids used by the other tests are in
+        // range; `sparse_ground_truth_from_the_wrong_corpus_errors` exercises the
+        // id-range guard deliberately.
+        cfg.vector_count = Some(100);
         Dataset::new(cfg)
+    }
+
+    /// msmarco-sparse-100K and msmarco-sparse-1M ship the IDENTICAL 6980 queries,
+    /// so pairing the 100K ground truth with the 1M corpus (or the reverse)
+    /// passes every row-count and file-length check and merely collapses recall.
+    /// Ids outside the declared corpus are the only signal, so they must Err.
+    #[test]
+    fn sparse_ground_truth_from_the_wrong_corpus_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_sparse_matrix(
+            p.join("queries.csr").to_str().unwrap(),
+            &[SparseVector {
+                indices: vec![0],
+                values: vec![1.0],
+            }],
+        )
+        .unwrap();
+        // vector_count is 100 → id 100 is one past the end of the corpus.
+        write_gt_neighbours(p.join("results.gt").to_str().unwrap(), &[vec![100i64]]).unwrap();
+
+        let err = sparse_dataset(p).read_sparse_queries().unwrap_err();
+        assert!(
+            err.contains("does not belong to"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     /// The public `msmarco-sparse-*` datasets ship binary `results.gt` rather

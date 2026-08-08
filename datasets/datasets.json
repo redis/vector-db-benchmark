@@ -1000,7 +1000,7 @@
     "path": "dbpedia-openai-100K-1536-angular/dbpedia_openai_100K",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/dbpedia_openai_100K.tgz",
     "vector_count": 100000,
-    "description": "Knowledge embeddings, 100K subset. This is the dataset that upstream's continuous benchmark runs, so results here are directly comparable with published qdrant/vector-db-benchmark numbers; it is also small enough for a quick end-to-end run."
+    "description": "Knowledge embeddings, 100K subset of the UPSTREAM dbpedia_openai_1M corpus (ann-filtered-benchmark bucket) — NOT a subset of the neighbouring dbpedia-openai-1M-* entries, which come from a different embedding model (text-embedding-3-large, redislabs bucket) even at the same 1536 dimensions, so numbers are not comparable across the two families. This is the dataset that upstream's continuous benchmark runs, so results here are directly comparable with published qdrant/vector-db-benchmark numbers; it is also small enough for a quick end-to-end run."
   },
   {
     "name": "dbpedia-openai-1M-1536-angular",
@@ -1398,7 +1398,7 @@
     "path": "msmarco-sparse/100K",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-100K.tar.gz",
     "vector_count": 100000,
-    "description": "MS MARCO learned-sparse (SPLADE-style) embeddings — the public sparse benchmark used upstream. Ships data.csr + queries.csr + binary results.gt ground truth; no vector_size, because nothing needs it: Qdrant's sparse collection takes no dimension, and every other engine refuses type=sparse outright. (The CSR header does declare ncol=30109; the readers do not surface it.) Scored by dot product (MIPS), not cosine — checked by hand against the scores in results.gt. Qdrant is the only engine with a sparse path."
+    "description": "MS MARCO learned-sparse (SPLADE-style) embeddings — the public sparse benchmark used upstream. Ships data.csr + queries.csr + binary results.gt ground truth; no vector_size, because nothing needs it: Qdrant's sparse collection takes no dimension, and every other engine refuses type=sparse outright. (The CSR header does declare ncol=30109; the readers do not surface it.) Scored by dot product (MIPS), not cosine — checked by hand against the scores in results.gt. Qdrant is the only engine with a sparse path. DO NOT 'fix' the msmacro/msmarco transposition in the link: 'msmacro-sparse-100K.tar.gz' is the real object name in the bucket (msmacro -> HTTP 200, msmarco -> HTTP 404). Only the dataset NAME is spelled correctly."
   },
   {
     "name": "msmarco-sparse-1M",
@@ -1407,7 +1407,7 @@
     "path": "msmarco-sparse/1M",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-1M.tar.gz",
     "vector_count": 1000000,
-    "description": "1M-point variant of msmarco-sparse-100K, sharing the identical 6980-query set. Same layout (data.csr + queries.csr + results.gt), dot/MIPS scoring. Qdrant is the only engine with a sparse path."
+    "description": "1M-point variant of msmarco-sparse-100K, sharing the identical 6980-query set. Same layout (data.csr + queries.csr + results.gt), dot/MIPS scoring. Qdrant is the only engine with a sparse path. Same 'msmacro' link spelling as the 100K entry — the real object name, not a typo to fix. Because both sizes ship the SAME 6980 queries, a results.gt from the wrong size passes every row-count check; the reader guards this by rejecting ground-truth ids >= vector_count."
   },
   {
     "name": "synthetic-sparse-300",
