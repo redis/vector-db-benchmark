@@ -25,13 +25,15 @@
 //! # The fix
 //!
 //! [`QueryConditions`] is the only thing `Dataset::read_queries` hands back, and
-//! it has **no accessor for the raw per-query JSON**. The only way to get from
-//! it to something you can attach to a request is one of the `resolve_*` methods
-//! here, and each makes "a declared filter produced nothing" an `Err`. Restoring
-//! the old expression at a call site does not compile: `Vec<Option<Value>>` is
-//! no longer what an engine receives, and [`QueryFilter`]'s inner `Option` is a
-//! private field with no public constructor, so an engine cannot mint
-//! "unfiltered" out of a parse that dropped something.
+//! it exposes **no field, iterator or getter for the raw per-query JSON** — the
+//! only way through it is one of the `resolve_*` methods here, and each makes "a
+//! declared filter produced nothing" an `Err`. (A *declared* condition can still
+//! be echoed back out through the resolver itself; see escape 2 below. An absent
+//! one cannot be, at all.) Restoring the old expression at a call site does not
+//! compile: `Vec<Option<Value>>` is no longer what an engine receives, and
+//! [`QueryFilter`]'s inner `Option` is a private field with no public
+//! constructor, so an engine cannot mint "unfiltered" out of a parse that
+//! dropped something.
 //!
 //! The three states are kept apart at the type level, in the return type
 //! `Result<Vec<QueryFilter<T>>, String>`:
@@ -44,8 +46,8 @@
 //!
 //! # What this does NOT guarantee — read before trusting it
 //!
-//! The guarantee is **"no silent `None`"**, not "no silent drop". Two escapes
-//! are outside what the type system can see, and both are live in-tree:
+//! The guarantee is **"no silent `None`"**, not "no silent drop". Three escapes
+//! are outside what the type system can see, and all three are live in-tree:
 //!
 //! 1. **A builder that keeps the leaves it understands and skips the rest.**
 //!    12 of the 15 builders are written that way (`build_subfilters` in
@@ -54,15 +56,28 @@
 //!    than the ground truth does. Nine shipped datasets emit 3 333 two-leaf
 //!    `and` conditions each -- 29 997 queries -- so this is reachable, not
 //!    theoretical. Measured on the branch that introduced this module:
-//!    VectorSets scores 0.2250 on an `and(keyword, geo)` corpus where Redis,
-//!    which expresses both leaves, scores 1.0000. Closing it is the per-builder
-//!    `Option -> Result` refactor tracked in its own issue; this module only
-//!    removes the "everything vanished" case.
-//! 2. **A builder that returns a match-all `T`.** `resolve_all("X", |c|
-//!    Some(c.clone()))` type-checks and rebuilds the #219 expression in one line
-//!    -- shorter than the correct spelling. Nothing here can tell a match-all
-//!    filter from a real one; `engine/filter_guard.rs` checks the builders
-//!    themselves for that.
+//!    VectorSets scored **0.3000** on an `and(keyword, geo)` corpus where Redis,
+//!    which expresses both leaves, scored **1.0000** (both on the corpus
+//!    described in the successor issue; a reviewer measured **0.2250** for
+//!    VectorSets on a differently-generated corpus of the same shape, with no
+//!    paired Redis figure). Closing this is the per-builder `Option -> Result`
+//!    refactor tracked in its own issue; this module only removes the
+//!    "everything vanished" case. A builder that WIDENS without losing a leaf —
+//!    `and` emitted as `or`, a two-sided range emitted with one bound — is in
+//!    the same disclaimed set, and `engine/filter_guard.rs` cannot see it
+//!    either.
+//! 2. **A builder that returns a match-all `T`, or echoes its input.**
+//!    `resolve_all("X", |c| Some(c.clone()))` type-checks and rebuilds the #219
+//!    expression in one line -- shorter than the correct spelling. Nothing here
+//!    can tell a match-all filter from a real one; `engine/filter_guard.rs`
+//!    checks the builders themselves for that.
+//! 3. **[`QueryConditions::unfiltered`] erases conditions.** It cannot fabricate
+//!    a filter, but swapping it in for a real `QueryConditions` turns a filtered
+//!    dataset into an unfiltered run with no error. It has to be public because
+//!    the binary's `dataset.rs` builds one for the HDF5/JSONL formats. The net
+//!    is a source-level test —
+//!    `filter_guard::no_engine_erases_its_conditions_with_the_unfiltered_constructor`
+//!    — not the type system.
 //!
 //! # What counts as "no filter declared"
 //!
@@ -140,9 +155,13 @@ impl<T: std::ops::Deref> QueryFilter<T> {
 /// Opaque by design: there is no way to read the raw JSON out of it, only to
 /// resolve it through one of the guarded constructors below.
 ///
-/// `#[must_use]`: silently dropping this value IS the bug in another spelling —
-/// an engine that destructures `read_queries()` and ignores the conditions runs
-/// every query unfiltered, and no other check would notice.
+/// `#[must_use]` covers only the narrow case of the value being discarded as a
+/// bare expression statement. It does **not** catch
+/// `let (q, n, _conditions) = read_queries()?;` — that form is silent, passes
+/// `clippy -D warnings`, and legitimately ships at `ground_truth.rs:68`, which
+/// needs the neighbours and has no filter to apply. The check that actually
+/// covers an engine ignoring its conditions is the source-level pairing test
+/// `filter_guard::every_engine_read_of_query_conditions_is_paired_with_a_resolver`.
 #[must_use = "a dataset's filter conditions must be resolved, not discarded: ignoring them \
               runs every query UNFILTERED against filtered ground truth (issue #219)"]
 #[derive(Debug, Clone, Default)]
@@ -168,8 +187,11 @@ impl QueryConditions {
     /// `n` queries that declare no filter — the HDF5/JSONL formats, which have
     /// nowhere to put conditions.
     ///
-    /// Public because the binary's `dataset.rs` builds these; unlike
-    /// [`Self::new`] it cannot express a filter, so it cannot launder one.
+    /// Public because the binary's `dataset.rs` builds these. Unlike
+    /// [`Self::new`] it cannot *fabricate* a filter — but it can **erase** every
+    /// real one, so it is escape 3 in the module docs, and
+    /// `filter_guard::no_engine_erases_its_conditions_with_the_unfiltered_constructor`
+    /// keeps engines away from it.
     pub fn unfiltered(n: usize) -> Self {
         Self {
             dataset: String::new(),

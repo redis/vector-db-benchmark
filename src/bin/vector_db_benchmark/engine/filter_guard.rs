@@ -16,8 +16,19 @@
 //! multi-leaf shapes — a builder that silently keeps a *subset* of the leaves,
 //! by comparing the rendered filter against the render of every proper
 //! sub-multiset of the same leaves ([`no_shipped_multi_leaf_filter_loses_a_leaf`]).
-//! It cannot catch a builder that renders a match-all filter for a real
-//! condition, and it only knows about the shapes listed here.
+//!
+//! It does **not** catch widening that still mentions every leaf, because the
+//! comparison is against sub-multisets only. Two live examples, both verified to
+//! survive this module: rendering a top-level `and` as `OR`, and dropping only
+//! the upper bound of a two-sided range. Both are silent-wrong-result bugs and
+//! both pass here. Nor can it catch a builder that renders a match-all filter
+//! for a real condition. Catching either needs a canonical *semantic* form to
+//! compare against, not a render; until then they sit in the same disclaimed set
+//! as the escapes listed in `query_filter.rs`.
+//!
+//! It also only knows about the shapes listed here — which is why
+//! [`the_table_matches_the_shipped_condition_fixture`] pins them against a
+//! checked-in file rather than a comment.
 //!
 //! ## Where the shapes come from
 //!
@@ -39,6 +50,17 @@
 //! `match_any_*`, `match_bool`, `range_datetime` and `range_int_lt` are emitted
 //! verbatim by `src/bin/generate_dataset.rs` for the locally generated
 //! `synthetic-filter-32` and `synthetic-selectivity-32`.
+//!
+//! **Provenance caveat.** Only 4 of the 57 registry datasets are on disk in a
+//! typical checkout (`datasets/.gitignore` is `*/*`, so every filter-bearing
+//! `tests.jsonl` is a download). Those four are censused for real by
+//! [`any_locally_present_shipped_dataset_emits_only_known_shapes`]; for the
+//! other 53 the claim rests on reading the two generators that produce them —
+//! the upstream ann-filtered-benchmark generator, whose operator vocabulary
+//! `v0/engine/base_client/parser.py` fixes at `match` | `range` | `geo`, and
+//! `src/bin/generate_dataset.rs`. Both were read and confirmed structurally.
+//! That is a structural argument, not a full census, and it is the weakest link
+//! in this module.
 //!
 //! The `schema` on each shape is the one `datasets.json` declares for the
 //! dataset that emits it; Vertex needs it to pick numeric vs string restricts.
@@ -232,7 +254,55 @@ type EngineResolver = fn(&Value, &HashMap<String, String>) -> Result<Option<Stri
 fn render_redisearch<V: std::fmt::Debug>(f: &(String, HashMap<String, V>)) -> String {
     let mut params: Vec<String> = f.1.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
     params.sort();
-    format!("{} [{}]", f.0, params.join(","))
+    erase_placeholder_ordinals(&format!("{} [{}]", f.0, params.join(",")))
+}
+
+/// Strip the ordinals out of parameter placeholders (`$b_1` -> `$b_N`,
+/// `$3` -> `$N`) before a render is compared.
+///
+/// Without this, [`no_shipped_multi_leaf_filter_loses_a_leaf`] is **void on the
+/// engines that number their parameters**. Redis, Valkey, Dragonfly and
+/// pgvector all thread a shared monotonic counter through the leaf builders, so
+/// a builder that silently drops the FIRST leaf renumbers the survivor:
+///
+/// ```text
+/// full = "(@b:{$b_1}) [b_1=Str(\"pPZIB\")]"     // leaf 0 vanished
+/// sub  = "(@b:{$b_0}) [b_0=Str(\"pPZIB\")]"     // leaf 0 removed from the input
+/// ```
+///
+/// Semantically identical, textually different — `assert_ne!` passes and the
+/// drop goes unseen. That was every one of Redis's `skip 0` comparisons.
+///
+/// This is reachable by shipped code, not only by a mutant: `build_range_filter`
+/// and `build_geo_filter` in `redis.rs` both `*counter += 1` before they can
+/// `return None`, so `and(unparseable_range, keyword)` renumbers the survivor.
+fn erase_placeholder_ordinals(render: &str) -> String {
+    let bytes: Vec<char> = render.chars().collect();
+    let mut out = String::with_capacity(render.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // `$3` / `$12` — a positional placeholder (pgvector).
+        if bytes[i] == '$' && bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+            out.push_str("$N");
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            continue;
+        }
+        // `_0` / `_17` — the counter suffix on a named param (RediSearch).
+        if bytes[i] == '_' && bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+            out.push_str("_N");
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// One entry per engine that reads `conditions`. Each closure calls the same
@@ -288,7 +358,7 @@ fn engines() -> Vec<(&'static str, EngineResolver)> {
         ("pgvector", |c, _| {
             through("pgvector", c, |v| {
                 Ok(super::pgvector::parse_pg_conditions(v, 3)
-                    .map(|(sql, vals)| format!("{sql} {vals:?}")))
+                    .map(|(sql, vals)| erase_placeholder_ordinals(&format!("{sql} {vals:?}"))))
             })
         }),
         ("turbopuffer", |c, _| {
@@ -564,6 +634,11 @@ fn every_known_gap_maps_to_a_live_cell() {
 /// type-homogeneous, so an engine either expresses all of its leaves or none of
 /// them. A heterogeneous multi-leaf condition — `and(keyword, geo)` — is exactly
 /// what this cannot save you from today, and it is the successor issue.
+///
+/// Scope, precisely: it catches renders that LOSE a leaf. It does not catch
+/// renders that keep every leaf but WIDEN — `and` emitted as `or`, or a
+/// two-sided range emitted with only its lower bound. Those still mention every
+/// leaf, so no sub-multiset comparison can see them.
 #[test]
 fn no_shipped_multi_leaf_filter_loses_a_leaf() {
     let engines = engines();
@@ -644,4 +719,331 @@ fn the_shipped_no_filters_datasets_stay_unfiltered_on_every_engine() {
         asserted += 1;
     }
     assert_eq!(asserted, 45, "all 15 engines must be exercised");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Source-level nets for the escapes the type system cannot close
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn engine_sources() -> Vec<(String, String)> {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/vector_db_benchmark/engine");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("engine dir") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        // This file names every pattern it forbids.
+        if name == "filter_guard.rs" || path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        out.push((
+            name,
+            std::fs::read_to_string(&path).expect("read engine source"),
+        ));
+    }
+    out.sort();
+    out
+}
+
+/// `#[must_use]` on `QueryConditions` does **not** catch an engine that ignores
+/// the conditions: it fires only when the whole tuple is a bare expression
+/// statement, and every engine destructures. `let (q, n, _conditions) = …` is
+/// silent, passes clippy, and already ships at `ground_truth.rs:68` (correctly,
+/// since ground truth has no filter to apply).
+///
+/// This is the net that actually covers it: inside `engine/`, every
+/// `dataset.read_queries()` must be paired with a resolver call in the same
+/// file. An engine that reads the conditions and throws them away fails here.
+#[test]
+fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
+    let mut reads_total = 0usize;
+    let mut resolves_total = 0usize;
+    for (name, src) in engine_sources() {
+        let reads = src.matches("dataset.read_queries()").count();
+        let resolves =
+            src.matches(".resolve_all(").count() + src.matches(".try_resolve_all(").count();
+        assert_eq!(
+            reads, resolves,
+            "{name} calls dataset.read_queries() {reads}x but resolves conditions {resolves}x — \
+             an unresolved read runs every query UNFILTERED (issue #219)"
+        );
+        reads_total += reads;
+        resolves_total += resolves;
+    }
+    assert_eq!(
+        (reads_total, resolves_total),
+        (23, 23),
+        "the read/resolve census changed; confirm the new site is guarded"
+    );
+}
+
+/// `QueryConditions::unfiltered(n)` has to be public because the binary's
+/// `dataset.rs` builds one for the HDF5/JSONL formats, which have nowhere to put
+/// conditions. It cannot fabricate a filter, but it CAN erase every real one —
+/// swapping it in for a resolved value turns a filtered dataset into an
+/// unfiltered run with no error. Nothing in the type system stops an engine
+/// calling it; this does.
+#[test]
+fn no_engine_erases_its_conditions_with_the_unfiltered_constructor() {
+    for (name, src) in engine_sources() {
+        assert!(
+            !src.contains("QueryConditions::unfiltered") && !src.contains("QueryConditions::new"),
+            "{name} constructs QueryConditions directly — only dataset.rs and the readers may \
+             (issue #219, documented escape 3)"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The shape table, checked against data rather than against a comment
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Structural signature of a condition: connective, and per leaf the operator
+/// plus the JSON types of its criteria — field names and literal values erased.
+/// Two conditions with the same signature exercise the same builder paths.
+fn shape_signature(cond: &Value) -> String {
+    fn type_of(v: &Value) -> &'static str {
+        match v {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(n) if n.is_i64() || n.is_u64() => "int",
+            Value::Number(_) => "float",
+            Value::String(_) => "str",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+    }
+    fn leaf(v: &Value, out: &mut String) {
+        let Some(obj) = v.as_object() else {
+            out.push_str("<non-object>");
+            return;
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for (key, spec) in obj {
+            if key == "and" || key == "or" {
+                let mut inner = String::new();
+                group(v, &mut inner);
+                parts.push(inner);
+                continue;
+            }
+            let mut ops: Vec<String> = Vec::new();
+            match spec.as_object() {
+                Some(spec_obj) => {
+                    for (op, criteria) in spec_obj {
+                        let mut crit: Vec<String> = match criteria.as_object() {
+                            Some(c) => c
+                                .iter()
+                                .map(|(k, v)| format!("{k}:{}", type_of(v)))
+                                .collect(),
+                            None => vec![type_of(criteria).to_string()],
+                        };
+                        crit.sort();
+                        ops.push(format!("{op}({})", crit.join(",")));
+                    }
+                }
+                None => ops.push(format!("<{}>", type_of(spec))),
+            }
+            ops.sort();
+            parts.push(ops.join("+"));
+        }
+        parts.sort();
+        out.push_str(&parts.join("&"));
+    }
+    fn group(v: &Value, out: &mut String) {
+        for conn in ["and", "or"] {
+            if let Some(items) = v.get(conn).and_then(|x| x.as_array()) {
+                let mut rendered: Vec<String> = items
+                    .iter()
+                    .map(|i| {
+                        let mut s = String::new();
+                        leaf(i, &mut s);
+                        s
+                    })
+                    .collect();
+                rendered.sort();
+                out.push_str(&format!("{conn}[{}]", rendered.join(",")));
+                return;
+            }
+        }
+        leaf(v, out);
+    }
+    let mut out = String::new();
+    group(cond, &mut out);
+    out
+}
+
+/// Read the checked-in fixture through the REAL reader, and require the table to
+/// match it exactly.
+///
+/// Two things this pins that a hardcoded table cannot:
+///
+/// * the shapes are data, so changing a table entry to a field or operator that
+///   no shipped dataset emits fails here rather than passing forever;
+/// * the `"conditions": null` rows travel the real `compound_reader` path, so
+///   the `Some(Value::Null)` trap is exercised by CI and not only by hand.
+///
+/// The fixture is transcribed from the shipped tarballs (see the module docs);
+/// none of them is checked into the repo — `datasets/.gitignore` is `*/*` and
+/// every filter-bearing `tests.jsonl` is a download — so the fixture is the only
+/// version of that data CI can see.
+#[test]
+fn the_table_matches_the_shipped_condition_fixture() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shipped_conditions");
+    let (queries, _neighbors, conditions) =
+        vector_db_benchmark::readers::read_compound_queries(dir.to_str().unwrap(), false)
+            .expect("read the condition fixture");
+    assert_eq!(queries.len(), 20, "fixture row count");
+    assert_eq!(
+        conditions.declared_count(),
+        17,
+        "17 declared shapes + 3 `\"conditions\": null` rows"
+    );
+
+    // Recovering the raw conditions needs the echo escape documented in
+    // `query_filter.rs`. Using it here is deliberate: a test may look, an engine
+    // may not, and the absent rows still come back unfiltered.
+    let echoed = conditions
+        .resolve_all("fixture", |c| Some(c.clone()))
+        .expect("the fixture must not contain a droppable condition");
+    let from_file: Vec<&Value> = echoed.iter().filter_map(|f| f.as_ref()).collect();
+    assert_eq!(from_file.len(), 17);
+    assert_eq!(
+        echoed.iter().filter(|f| !f.is_filtered()).count(),
+        3,
+        "the three `null` rows must read back as unfiltered, not as declared filters"
+    );
+
+    let table = shipped_shapes();
+    let mut in_table: Vec<String> = table.iter().map(|s| s.conditions.to_string()).collect();
+    let mut in_file: Vec<String> = from_file.iter().map(|c| c.to_string()).collect();
+    in_table.sort();
+    in_file.sort();
+    assert_eq!(
+        in_table, in_file,
+        "the guard's shape table and the checked-in shipped-condition fixture have drifted"
+    );
+}
+
+/// Slice the `conditions` value out of a `tests.jsonl` line without parsing the
+/// row (the query vector dominates it — up to 2048 floats).
+fn conditions_slice(line: &str) -> Option<&str> {
+    let start = line.find("\"conditions\":")? + "\"conditions\":".len();
+    let rest = line[start..].trim_start();
+    let offset = line.len() - rest.len();
+    if rest.starts_with("null") {
+        return Some("null");
+    }
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let (mut depth, mut in_str, mut escaped) = (0i32, false, false);
+    for (i, b) in bytes.iter().enumerate() {
+        match (in_str, escaped, b) {
+            (true, true, _) => escaped = false,
+            (true, false, b'\\') => escaped = true,
+            (true, false, b'"') => in_str = false,
+            (false, _, b'"') => in_str = true,
+            (false, _, b'{') => depth += 1,
+            (false, _, b'}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&line[offset..offset + i + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Opportunistic: when a real shipped tarball happens to be present (they are
+/// gitignored downloads, so CI will not have them), every distinct condition
+/// SIGNATURE in its `tests.jsonl` must already be covered by the table.
+///
+/// This is the check that would notice the table describing a dataset that does
+/// not exist. It prints and returns when no dataset is on disk — say so when
+/// quoting it, rather than counting it as CI coverage.
+#[test]
+fn any_locally_present_shipped_dataset_emits_only_known_shapes() {
+    let roots = [
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("datasets"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("v0/datasets"),
+    ];
+    let known: Vec<String> = shipped_shapes()
+        .iter()
+        .map(|s| shape_signature(&s.conditions))
+        .collect();
+
+    let mut found: Vec<(String, String, String)> = Vec::new(); // (dataset, signature, example)
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        // A compound dataset's `tests.jsonl` sits either directly under its
+        // registry directory (the locally generated sets) or one level deeper
+        // (the tarballs, which unpack into a named subdirectory).
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            candidates.push(entry.path());
+            if let Ok(inner) = std::fs::read_dir(entry.path()) {
+                candidates.extend(inner.flatten().map(|d| d.path()));
+            }
+        }
+        {
+            for sub in candidates {
+                let tests = sub.join("tests.jsonl");
+                if !tests.exists() {
+                    continue;
+                }
+                let Ok(file) = std::fs::File::open(&tests) else {
+                    continue;
+                };
+                let label = sub
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // Read line by line and slice out ONLY the `conditions` value:
+                // a shipped `tests.jsonl` row carries a 2048-float query vector,
+                // so parsing whole rows turns this into a three-minute test.
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+                    let Some(slice) = conditions_slice(&line) else {
+                        continue;
+                    };
+                    let Ok(cond) = serde_json::from_str::<Value>(slice) else {
+                        continue;
+                    };
+                    if cond.is_null() {
+                        continue;
+                    }
+                    let sig = shape_signature(&cond);
+                    if !found.iter().any(|(d, s, _)| d == &label && s == &sig) {
+                        found.push((label.clone(), sig, cond.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    if found.is_empty() {
+        println!(
+            "SKIPPED: no shipped tests.jsonl on disk (they are gitignored downloads). The \
+             table is pinned by the checked-in fixture instead."
+        );
+        return;
+    }
+    let mut unknown: Vec<String> = Vec::new();
+    for (dataset, sig, example) in &found {
+        println!("{dataset:34} {sig}");
+        if !known.contains(sig) {
+            unknown.push(format!("{dataset}: {sig}\n    e.g. {example}"));
+        }
+    }
+    assert!(
+        unknown.is_empty(),
+        "shipped datasets on disk emit condition shapes the guard table does not cover:\n{}",
+        unknown.join("\n")
+    );
 }

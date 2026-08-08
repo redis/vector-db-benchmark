@@ -1,0 +1,20 @@
+{"query": [0.0, 1.0], "conditions": {"and": [{"a": {"match": {"value": "giNHA"}}}]}, "closest_ids": [0]}
+{"query": [1.0, 1.0], "conditions": {"and": [{"a": {"match": {"value": "qOGCZ"}}}, {"b": {"match": {"value": "pPZIB"}}}]}, "closest_ids": [1]}
+{"query": [2.0, 1.0], "conditions": {"or": [{"a": {"match": {"value": "pPZIB"}}}, {"a": {"match": {"value": "qOGCZ"}}}]}, "closest_ids": [2]}
+{"query": [3.0, 1.0], "conditions": {"and": [{"a": {"match": {"value": 80}}}]}, "closest_ids": [3]}
+{"query": [4.0, 1.0], "conditions": {"and": [{"a": {"match": {"value": 80}}}, {"b": {"match": {"value": 2}}}]}, "closest_ids": [4]}
+{"query": [5.0, 1.0], "conditions": {"or": [{"a": {"match": {"value": 80}}}, {"a": {"match": {"value": 2}}}]}, "closest_ids": [5]}
+{"query": [6.0, 1.0], "conditions": {"and": [{"a": {"range": {"gt": 0.1, "lt": 0.9}}}]}, "closest_ids": [6]}
+{"query": [7.0, 1.0], "conditions": {"and": [{"a": {"range": {"gt": 0.1, "lt": 0.9}}}, {"b": {"range": {"gte": 0.2, "lte": 0.8}}}]}, "closest_ids": [7]}
+{"query": [8.0, 1.0], "conditions": {"and": [{"a": {"range": {"gt": 0.5}}}]}, "closest_ids": [8]}
+{"query": [9.0, 1.0], "conditions": {"and": [{"a": {"geo": {"lon": 116.0, "lat": -52.0, "radius": 326341.0}}}]}, "closest_ids": [9]}
+{"query": [10.0, 1.0], "conditions": {"and": [{"a": {"geo": {"lon": 116.0, "lat": -52.0, "radius": 326341.0}}}, {"b": {"geo": {"lon": 12.0, "lat": 40.0, "radius": 100000.0}}}]}, "closest_ids": [10]}
+{"query": [11.0, 1.0], "conditions": {"or": [{"a": {"geo": {"lon": 116.0, "lat": -52.0, "radius": 326341.0}}}, {"a": {"geo": {"lon": 120.0, "lat": -50.0, "radius": 50000.0}}}]}, "closest_ids": [11]}
+{"query": [12.0, 1.0], "conditions": {"and": [{"color": {"match": {"any": ["red", "blue"]}}}]}, "closest_ids": [12]}
+{"query": [13.0, 1.0], "conditions": {"and": [{"size": {"match": {"any": [1, 2, 3]}}}]}, "closest_ids": [13]}
+{"query": [14.0, 1.0], "conditions": {"and": [{"flag": {"match": {"value": true}}}]}, "closest_ids": [14]}
+{"query": [15.0, 1.0], "conditions": {"and": [{"ts": {"range": {"gte": "2021-04-11T00:00:00+00:00", "lt": "2021-10-28T00:00:00+00:00"}}}]}, "closest_ids": [15]}
+{"query": [16.0, 1.0], "conditions": {"and": [{"rank": {"range": {"lt": 20}}}]}, "closest_ids": [16]}
+{"query": [0.0, 2.0], "conditions": null, "closest_ids": [0]}
+{"query": [1.0, 2.0], "conditions": null, "closest_ids": [1]}
+{"query": [2.0, 2.0], "conditions": null, "closest_ids": [2]}
