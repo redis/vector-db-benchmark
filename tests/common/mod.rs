@@ -754,6 +754,25 @@ pub fn write_datetime_project(
     engine_configs_json: &str,
     dim: usize,
 ) -> FilterProject {
+    write_datetime_project_metric(dataset_name, engine_configs_json, dim, GtMetric::L2)
+}
+
+/// Cosine-ground-truth variant of [`write_datetime_project`] for engines that
+/// rank by cosine similarity (VectorSets).
+pub fn write_datetime_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_datetime_project_metric(dataset_name, engine_configs_json, dim, GtMetric::Cosine)
+}
+
+fn write_datetime_project_metric(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    metric: GtMetric,
+) -> FilterProject {
     use chrono::{Duration, TimeZone, Utc};
     let base = Utc.timestamp_opt(1_609_459_200, 0).unwrap(); // 2021-01-01T00:00:00Z
     let iso_for = move |day: i64| (base + Duration::days(day)).to_rfc3339();
@@ -763,11 +782,48 @@ pub fn write_datetime_project(
         dataset_name,
         engine_configs_json,
         dim,
-        GtMetric::L2,
+        metric,
         serde_json::json!({ "ts": "datetime" }),
         move |id| serde_json::json!({ "ts": iso_for(id as i64) }),
         serde_json::json!({ "and": [ { "ts": { "range": { "gte": gte, "lt": lt } } } ] }),
         |id| (100..300).contains(&id),
+    )
+}
+
+/// Same ISO-8601 timestamps as [`write_datetime_project`], but the schema
+/// declares `ts` as **`keyword`**, not `datetime`, and the query carries a
+/// **one-sided** `lt` bound.
+///
+/// This is the fixture for the storage-vs-filter DISAGREEMENT (PR #230 review
+/// M2): an engine that decides "is this a datetime?" from the SCHEMA on the
+/// storage side but from the VALUE on the filter side stores an ISO string here
+/// while comparing against an epoch number. VectorSets coerces a non-numeric
+/// attribute to `0` in a numeric comparison, so `.ts < <epoch>` then matches
+/// EVERY document — the query runs effectively unfiltered, with exit code 0 and
+/// no warning. Only recall detects it (measured live on redis 8.8: 0.800
+/// schema-gated vs 1.000 once both halves agree).
+///
+/// The one-sided bound is deliberate: a two-sided range degrades to zero hits,
+/// which is far more likely to be noticed. This is the quiet direction.
+pub fn write_datetime_keyword_schema_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    use chrono::{Duration, TimeZone, Utc};
+    let base = Utc.timestamp_opt(1_609_459_200, 0).unwrap(); // 2021-01-01T00:00:00Z
+    let iso_for = move |day: i64| (base + Duration::days(day)).to_rfc3339();
+    let lt = iso_for(200);
+    write_filter_project(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        GtMetric::Cosine,
+        // NOT "datetime" — the whole point of the fixture.
+        serde_json::json!({ "ts": "keyword" }),
+        move |id| serde_json::json!({ "ts": iso_for(id as i64) }),
+        serde_json::json!({ "and": [ { "ts": { "range": { "lt": lt } } } ] }),
+        |id| id < 200,
     )
 }
 
@@ -894,11 +950,30 @@ pub fn write_nested_filter_project(
     engine_configs_json: &str,
     dim: usize,
 ) -> FilterProject {
+    write_nested_filter_project_metric(dataset_name, engine_configs_json, dim, GtMetric::L2)
+}
+
+/// Cosine-ground-truth variant of [`write_nested_filter_project`] for engines
+/// that rank by cosine similarity (VectorSets).
+pub fn write_nested_filter_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_nested_filter_project_metric(dataset_name, engine_configs_json, dim, GtMetric::Cosine)
+}
+
+fn write_nested_filter_project_metric(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    metric: GtMetric,
+) -> FilterProject {
     write_filter_project(
         dataset_name,
         engine_configs_json,
         dim,
-        GtMetric::L2,
+        metric,
         serde_json::json!({ "color": "keyword", "size": "int" }),
         move |id| {
             serde_json::json!({

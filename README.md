@@ -234,6 +234,23 @@ memory is reported per-index via `FT.INFO` (issue #151-4).
   the sweep finishes. Unset (the default) keeps full per-config isolation — no
   behavior change.
 
+### VectorSets: datetime corpora written before #230 must be re-uploaded
+
+VSIM `FILTER` has no date type and its comparison operators are numeric, so since
+PR #230 a datetime metadata value is stored as an **epoch-seconds number** on
+`VADD … SETATTR`, and range/equality filters compare against epoch numbers. A
+corpus uploaded by any **pre-#230** binary holds ISO-8601 **strings** instead, and
+VSIM coerces a non-numeric attribute to `0` in a numeric comparison — so a
+`--skip-upload` search against such a corpus silently returns the wrong documents
+(a two-sided range matches nothing → recall 0; a one-sided `lt`/`lte` matches
+everything). **Re-upload before searching.**
+
+Unlike Redis/Valkey — where `--skip-upload` against a missing or mismatched index
+hard-errors (`redis_utils::ensure_index_exists`) — VectorSets has **no such
+guard**: it uses a single hardcoded key (`idx`), so there is not even a name
+change for the tool to detect. The stale corpus is found, the run succeeds, and
+only the recall number is wrong.
+
 ### Charts
 
 Render a QPS-vs-precision trade-off plot (SVG, no dependencies) from existing `*-summary.json` results — one colored series per engine, filtered by `--engines`/`--datasets`:

@@ -16,6 +16,7 @@ use super::redis_utils;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
+use vector_db_benchmark::parsers::datetime_to_epoch_secs;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 
 /// VectorSets engine configuration
@@ -246,39 +247,8 @@ fn vadd_batch(
         }
 
         // Attach metadata as JSON attributes for FILTER support
-        if let Some(meta) = &metadata[i] {
-            if !meta.fields.is_empty() {
-                let mut map = serde_json::Map::new();
-                for (k, v) in &meta.fields {
-                    match v {
-                        MetadataValue::String(s) => {
-                            map.insert(k.clone(), serde_json::Value::String(s.clone()));
-                        }
-                        MetadataValue::Int(n) => {
-                            map.insert(k.clone(), serde_json::Value::from(*n));
-                        }
-                        MetadataValue::Float(f) => {
-                            map.insert(k.clone(), serde_json::json!(*f));
-                        }
-                        MetadataValue::Labels(labels) => {
-                            map.insert(
-                                k.clone(),
-                                serde_json::Value::Array(
-                                    labels
-                                        .iter()
-                                        .map(|l| serde_json::Value::String(l.clone()))
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        MetadataValue::Geo { lon, lat } => {
-                            map.insert(k.clone(), serde_json::json!({"lon": lon, "lat": lat}));
-                        }
-                    }
-                }
-                let json_str = serde_json::Value::Object(map).to_string();
-                cmd.arg("SETATTR").arg(json_str);
-            }
+        if let Some(json_str) = metadata[i].as_ref().and_then(metadata_to_attr_json) {
+            cmd.arg("SETATTR").arg(json_str);
         }
 
         pipe.add_command(cmd);
@@ -287,6 +257,77 @@ fn vadd_batch(
     pipe.query::<()>(conn)
         .map_err(|e| format!("VADD batch error: {}", e))?;
     Ok(())
+}
+
+/// Render one document's metadata as the JSON object attached by
+/// `VADD … SETATTR`, or `None` when there is nothing to attach. Shared by the
+/// upload batch and the mixed-workload update path so BOTH store the identical
+/// representation (notably datetime → epoch seconds, see [`encode_string_attr`]).
+fn metadata_to_attr_json(meta: &MetadataItem) -> Option<String> {
+    if meta.fields.is_empty() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    for (k, v) in &meta.fields {
+        let value = match v {
+            MetadataValue::String(s) => encode_string_attr(s),
+            MetadataValue::Int(n) => serde_json::Value::from(*n),
+            MetadataValue::Float(f) => serde_json::json!(*f),
+            MetadataValue::Labels(labels) => serde_json::Value::Array(
+                labels
+                    .iter()
+                    .map(|l| serde_json::Value::String(l.clone()))
+                    .collect(),
+            ),
+            MetadataValue::Geo { lon, lat } => serde_json::json!({"lon": lon, "lat": lat}),
+        };
+        map.insert(k.clone(), value);
+    }
+    Some(serde_json::Value::Object(map).to_string())
+}
+
+/// THE datetime representation decision for this engine, in ONE place.
+///
+/// VSIM `FILTER` has no date type and its comparison operators are NUMERIC, so a
+/// datetime has to live as an epoch-seconds NUMBER. Both halves of the engine —
+/// what `VADD … SETATTR` WRITES ([`encode_string_attr`]) and what the query
+/// builders COMPARE AGAINST ([`number_literal`], [`build_match_clause`],
+/// [`build_match_any_clause`]) — route through this single predicate, so they can
+/// never disagree about whether a given string is a datetime.
+///
+/// It is deliberately **schema-free**. An earlier version gated only the storage
+/// half on `dataset.config.schema` while the query half converted any ISO-looking
+/// bound unconditionally; the two then disagreed for every datetime-carrying field
+/// NOT declared `datetime` (declared `keyword`, or no schema at all) and produced
+/// SILENT wrong recall: VSIM coerces a non-numeric string attribute to `0` in a
+/// numeric comparison (verified live on redis 8.8), so a two-sided range matched
+/// NOTHING while a one-sided `lt`/`lte` matched EVERYTHING — issue #220's exact
+/// failure class, reached by another route. Deciding from the VALUE alone makes
+/// the two halves agree by construction, with or without a schema.
+///
+/// Trade-off: a `keyword` field whose values happen to be ISO-8601 timestamps is
+/// stored numerically too. Range and equality filters stay correct (both sides
+/// convert), but the best-effort full-text form `"<text>" in .field` cannot match
+/// such a field. That is strictly better than the silent recall corruption above.
+fn epoch_literal(value: &str) -> Option<i64> {
+    datetime_to_epoch_secs(value).map(|secs| secs as i64)
+}
+
+/// Render a string metadata field as the JSON attribute value stored by
+/// `VADD … SETATTR`.
+///
+/// An ISO-8601 / RFC-3339 value is stored as an epoch-seconds NUMBER, exactly
+/// what [`build_range_clause`] emits for an ISO bound — see [`epoch_literal`] for
+/// why the decision is made from the value rather than from the schema. Storing
+/// the ISO string instead would make every datetime range filter match nothing.
+/// Mirrors `redis::encode_string_field` (and milvus/chroma, which likewise store
+/// datetimes as epoch ints). Anything not parseable as a datetime (already an
+/// epoch, a keyword, a bool token) is stored verbatim.
+fn encode_string_attr(value: &str) -> serde_json::Value {
+    match epoch_literal(value) {
+        Some(epoch) => serde_json::Value::from(epoch),
+        None => serde_json::Value::String(value.to_string()),
+    }
 }
 
 /// Encode a query vector to the FP32 little-endian blob VSIM expects.
@@ -397,39 +438,8 @@ fn vadd_single(
         cmd.arg("CAS");
     }
 
-    if let Some(meta) = metadata {
-        if !meta.fields.is_empty() {
-            let mut map = serde_json::Map::new();
-            for (k, v) in &meta.fields {
-                match v {
-                    MetadataValue::String(s) => {
-                        map.insert(k.clone(), serde_json::Value::String(s.clone()));
-                    }
-                    MetadataValue::Int(n) => {
-                        map.insert(k.clone(), serde_json::Value::from(*n));
-                    }
-                    MetadataValue::Float(f) => {
-                        map.insert(k.clone(), serde_json::json!(*f));
-                    }
-                    MetadataValue::Labels(labels) => {
-                        map.insert(
-                            k.clone(),
-                            serde_json::Value::Array(
-                                labels
-                                    .iter()
-                                    .map(|l| serde_json::Value::String(l.clone()))
-                                    .collect(),
-                            ),
-                        );
-                    }
-                    MetadataValue::Geo { lon, lat } => {
-                        map.insert(k.clone(), serde_json::json!({"lon": lon, "lat": lat}));
-                    }
-                }
-            }
-            let json_str = serde_json::Value::Object(map).to_string();
-            cmd.arg("SETATTR").arg(json_str);
-        }
+    if let Some(json_str) = metadata.and_then(metadata_to_attr_json) {
+        cmd.arg("SETATTR").arg(json_str);
     }
 
     cmd.query::<()>(conn)
@@ -446,6 +456,10 @@ impl Engine for VectorSetsEngine {
     }
 
     fn configure(&mut self, _dataset: &Dataset) -> Result<(), String> {
+        // NOTE: nothing schema-derived is cached here. The datetime
+        // representation is decided per VALUE by `epoch_literal`, which both the
+        // storage and the query half consult, so there is no schema state that
+        // could go stale on the `--skip-upload` path.
         let mut conn = self.get_connection()?;
 
         println!(
@@ -1057,7 +1071,15 @@ fn build_filter_expression(conditions: &serde_json::Value) -> Option<String> {
     if obj.is_empty() {
         return None;
     }
+    build_group(obj)
+}
 
+/// Build one boolean GROUP (a `{and:[…], or:[…]}` object) into a VSIM FILTER
+/// sub-expression: `and` entries joined by `and`, `or` entries joined by `or`
+/// inside parentheses, the two then ANDed. Recursive — an entry inside `and`/`or`
+/// may itself be a group, so this and [`build_clauses`] call each other. Mirrors
+/// `redis::build_group` / `build_subfilters`.
+fn build_group(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     let and_entries = obj.get("and").and_then(|v| v.as_array());
     let or_entries = obj.get("or").and_then(|v| v.as_array());
 
@@ -1088,7 +1110,37 @@ fn build_clauses(entries: &[serde_json::Value]) -> Vec<String> {
     let mut clauses = Vec::new();
     for entry in entries {
         if let Some(entry_obj) = entry.as_object() {
+            // Nested GROUP: an entry carrying an `and`/`or` key whose value is an
+            // ARRAY is a sub-tree, not a field leaf. Recurse and keep it as ONE
+            // parenthesised clause so `{"or":[{"and":[…]},{"and":[…]}]}` keeps its
+            // shape. Without this arm the entry matched no field leaf, every
+            // clause was dropped, and a nested condition left VSIM with NO FILTER
+            // — a full unfiltered search (same silent-wrong class as issue #220).
+            //
+            // Two things this arm must NOT do, both of which would re-introduce
+            // exactly that failure mode:
+            //  * Key off mere key PRESENCE. A field literally named `and`/`or`
+            //    carries a condition object (`{"and":{"match":{"value":"x"}}}`),
+            //    not an array; treating it as a group yields no clause at all and
+            //    the query runs UNFILTERED. `as_array()` distinguishes them.
+            //  * `continue` past the field-leaf loop. A mixed entry such as
+            //    `{"and":[…], "color":{"match":{"value":"red"}}}` would silently
+            //    DROP `color` and under-constrain the filter, so we fall through
+            //    and emit the sibling leaves as well. `build_group` itself only
+            //    ever consults the `and`/`or` keys, so nothing is double-emitted.
+            let is_group_key = |name: &str, value: &serde_json::Value| {
+                (name == "and" || name == "or") && value.is_array()
+            };
+            if entry_obj.iter().any(|(k, v)| is_group_key(k, v)) {
+                if let Some(expr) = build_group(entry_obj) {
+                    clauses.push(format!("({})", expr));
+                }
+            }
             for (field_name, field_filters) in entry_obj {
+                // Skip the group keys consumed above; every other key is a field.
+                if is_group_key(field_name, field_filters) {
+                    continue;
+                }
                 if let Some(filter_obj) = field_filters.as_object() {
                     for (condition_type, criteria) in filter_obj {
                         if let Some(expr) = build_clause(field_name, condition_type, criteria) {
@@ -1110,6 +1162,14 @@ fn build_clause(
     match condition_type {
         "match" => build_match_clause(field_name, criteria),
         "range" => build_range_clause(field_name, criteria),
+        // STILL OPEN, same silent-wrong class as issue #220: an unhandled
+        // condition type is DROPPED, and when it is the only condition VSIM runs
+        // with no FILTER at all. `"geo"` is the live instance — the point IS
+        // uploaded (see `metadata_to_attr_json`) but has no clause here, so every
+        // query of the shipped `random-geo-radius-{100,2048}-angular-filters`
+        // runs unfiltered against geo-filtered ground truth (issue #223). The
+        // generic guard that would turn "parsed to nothing" into a loud failure
+        // instead of an unfiltered search is issue #219.
         _ => None,
     }
 }
@@ -1157,7 +1217,10 @@ fn build_match_clause(field_name: &str, criteria: &serde_json::Value) -> Option<
         return Some(format!(".{} == \"{}\"", field_name, token));
     }
     if let Some(s) = value.as_str() {
-        Some(format!(".{} == \"{}\"", field_name, escape_str(s)))
+        // A datetime is stored as an epoch NUMBER (see `epoch_literal`), so the
+        // equality must be numeric too — a quoted ISO literal would compare a
+        // string against a number and match NOTHING.
+        Some(equality_clause(field_name, s))
     } else if let Some(n) = value.as_i64() {
         Some(format!(".{} == {}", field_name, n))
     } else {
@@ -1169,6 +1232,18 @@ fn build_match_clause(field_name: &str, criteria: &serde_json::Value) -> Option<
 /// then double quote).
 fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// `.field == <literal>` for a STRING query value, matching how upload stored it:
+/// an ISO-8601 value lives as an epoch NUMBER (see [`epoch_literal`]) and needs a
+/// BARE numeric literal, everything else needs a quoted string. Getting this wrong
+/// is silent — `.ts == "2021-01-01T00:00:00Z"` against epoch storage returns an
+/// empty result set with no error (verified live on redis 8.8).
+fn equality_clause(field_name: &str, value: &str) -> String {
+    match epoch_literal(value) {
+        Some(epoch) => format!(".{} == {}", field_name, epoch),
+        None => format!(".{} == \"{}\"", field_name, escape_str(value)),
+    }
 }
 
 /// Build a `match_any` (IN-list) clause as a per-element OR, covering keyword,
@@ -1205,9 +1280,12 @@ fn build_match_any_clause(field_name: &str, any: &[serde_json::Value]) -> String
                 if s.is_empty() {
                     None
                 } else if is_array_field {
+                    // `labels` is stored as a JSON array of raw strings — never
+                    // epoch-converted — so membership stays a string test.
                     Some(format!("\"{}\" in .{}", escape_str(s), field_name))
                 } else {
-                    Some(format!(".{} == \"{}\"", field_name, escape_str(s)))
+                    // Scalar: epoch-aware, matching the stored representation.
+                    Some(equality_clause(field_name, s))
                 }
             } else if let Some(i) = v.as_i64() {
                 Some(format!(".{} == {}", field_name, i))
@@ -1237,37 +1315,79 @@ fn never_match_clause(field_name: &str) -> String {
 fn build_range_clause(field_name: &str, criteria: &serde_json::Value) -> Option<String> {
     let mut parts = Vec::new();
 
-    // Only numeric bounds constrain the range; a null/non-numeric bound carries no
-    // constraint and is skipped (matching redis/valkey/qdrant/es/os/weaviate/milvus/
-    // pgvector) — otherwise `format_number` would fall back to "0" and emit `.n > 0`.
-    if let Some(gt) = criteria.get("gt").filter(|v| v.is_number()) {
-        parts.push(format!(".{} > {}", field_name, format_number(gt)));
-    }
-    if let Some(gte) = criteria.get("gte").filter(|v| v.is_number()) {
-        parts.push(format!(".{} >= {}", field_name, format_number(gte)));
-    }
-    if let Some(lt) = criteria.get("lt").filter(|v| v.is_number()) {
-        parts.push(format!(".{} < {}", field_name, format_number(lt)));
-    }
-    if let Some(lte) = criteria.get("lte").filter(|v| v.is_number()) {
-        parts.push(format!(".{} <= {}", field_name, format_number(lte)));
+    // Only representable bounds constrain the range; a null / non-numeric,
+    // non-datetime bound carries no constraint and is skipped (matching
+    // redis/valkey/qdrant/es/os/weaviate/milvus/pgvector) — otherwise
+    // `number_literal` would have to invent a "0" and emit `.n > 0`.
+    for (key, op) in [("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<=")] {
+        if let Some(lit) = criteria.get(key).and_then(number_literal) {
+            parts.push(format!(".{} {} {}", field_name, op, lit));
+        }
     }
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" and "))
+    match parts.len() {
+        0 => None,
+        1 => parts.pop(),
+        // Parenthesise a multi-bound range. VSIM binds `and` tighter than `or`
+        // (verified live on redis 8.8), so a bare `A and B` is correct TODAY even
+        // when this clause lands inside an `or` list — but that is an implicit
+        // dependency on the server's operator precedence. The parentheses make the
+        // grouping explicit and cost nothing.
+        _ => Some(format!("({})", parts.join(" and "))),
     }
 }
 
-fn format_number(value: &serde_json::Value) -> String {
+/// Render a range bound as a VSIM numeric literal.
+///
+/// VSIM `FILTER` comparison operators are NUMERIC — there is no date type — so an
+/// ISO-8601 / RFC-3339 bound is converted to epoch seconds, the same
+/// representation `encode_string_attr` stores (see [`epoch_literal`]). A numeric
+/// string is passed through as a number too (so a raw-epoch bound works). Mirrors
+/// `valkey::number_literal` / `redis::insert_number_param`, both of which route
+/// through the shared `parsers::datetime_to_epoch_secs`.
+///
+/// Without the datetime arm BOTH bounds of a `{"gte":"<iso>","lt":"<iso>"}` range
+/// were dropped, `build_range_clause` returned `None`, and VSIM ran with NO
+/// `FILTER` argument — a full unfiltered search scored against filtered ground
+/// truth (issue #220; 1 in 4 queries of the shipped `synthetic-filter-32`).
+///
+/// CRITICAL: the numeric-string arm emits the PARSED number, never the original
+/// string. Rust's parsers accept spellings the VSIM FILTER grammar does not, and
+/// re-emitting the raw text produced two distinct failures (both verified live on
+/// redis 8.8):
+///   * `"inf"` / `"NaN"` / `"+7"` → `ERR syntax error in FILTER expression`. A
+///     failed query is only `eprintln!`d and is then DROPPED from the recall and
+///     latency vectors, so the reported mean is quietly computed over fewer
+///     queries rather than scored 0 — a loud error that lands silently.
+///   * `".5"` → NO error and ZERO results: VSIM parses a leading `.` as a FIELD
+///     SELECTOR, so `.n >= .5` compares two fields. Wrong recall, no diagnostic.
+///
+/// Non-finite values have no VSIM literal at all and are rejected outright.
+fn number_literal(value: &serde_json::Value) -> Option<String> {
     if let Some(i) = value.as_i64() {
-        i.to_string()
+        Some(i.to_string())
     } else if let Some(f) = value.as_f64() {
-        f.to_string()
+        finite_literal(f)
+    } else if let Some(s) = value.as_str() {
+        if let Some(epoch) = epoch_literal(s) {
+            // Epoch is whole seconds — emit as an integer literal.
+            Some(epoch.to_string())
+        } else if let Ok(i) = s.parse::<i64>() {
+            // Integer-first, so a 19-digit epoch/ID keeps every digit (an f64
+            // round-trip would silently round it).
+            Some(i.to_string())
+        } else {
+            s.parse::<f64>().ok().and_then(finite_literal)
+        }
     } else {
-        "0".to_string()
+        None
     }
+}
+
+/// Render an `f64` as a VSIM numeric literal, rejecting the non-finite values
+/// (`inf`, `-inf`, `NaN`) that the FILTER grammar has no spelling for.
+fn finite_literal(f: f64) -> Option<String> {
+    f.is_finite().then(|| f.to_string())
 }
 
 #[cfg(test)]
@@ -1359,7 +1479,7 @@ mod vsim_parse_tests {
 
 #[cfg(test)]
 mod filter_expr_tests {
-    use super::build_filter_expression;
+    use super::{build_filter_expression, encode_string_attr};
     use serde_json::json;
 
     // ── scalar match / range (grammar baseline) ──
@@ -1392,9 +1512,11 @@ mod filter_expr_tests {
     #[test]
     fn range_bounds_joined_with_and() {
         let cond = json!({"and": [{"age": {"range": {"gt": 1, "gte": 2, "lt": 9, "lte": 8}}}]});
+        // Parenthesised: a multi-bound range is ONE clause and must stay one when
+        // it lands inside an `or` list, without leaning on VSIM's precedence.
         assert_eq!(
             build_filter_expression(&cond),
-            Some(".age > 1 and .age >= 2 and .age < 9 and .age <= 8".to_string())
+            Some("(.age > 1 and .age >= 2 and .age < 9 and .age <= 8)".to_string())
         );
     }
 
@@ -1586,10 +1708,11 @@ mod filter_expr_tests {
 
     #[test]
     fn range_two_sided_gte_lt() {
-        // Fixed order gt, gte, lt, lte joined by ` and `.
+        // Fixed order gt, gte, lt, lte joined by ` and `, parenthesised as one
+        // clause so the grouping survives being nested inside an `or`.
         assert_eq!(
             range_expr(json!({"gte":10,"lt":20})).unwrap(),
-            ".n >= 10 and .n < 20"
+            "(.n >= 10 and .n < 20)"
         );
     }
 
@@ -1622,6 +1745,251 @@ mod filter_expr_tests {
         // A non-scalar (array) value matches no scalar arm → clause dropped → None.
         assert!(
             build_filter_expression(&json!({"and":[{"n":{"match":{"value":[1,2]}}}]})).is_none()
+        );
+    }
+
+    // ── issue #220: datetime range bounds ──────────────────────────────────
+
+    #[test]
+    fn range_iso_datetime_bounds_become_epoch_seconds() {
+        // Both bounds used to be rejected by `.filter(|v| v.is_number())`, so the
+        // whole clause was None and VSIM ran with NO FILTER (full unfiltered
+        // search scored against filtered ground truth). Now each ISO bound is
+        // converted to epoch seconds, matching how upload stores the attribute.
+        assert_eq!(
+            range_expr(json!({"gte":"2021-04-11T00:00:00+00:00","lt":"2021-10-28T00:00:00+00:00"}))
+                .unwrap(),
+            "(.n >= 1618099200 and .n < 1635379200)"
+        );
+    }
+
+    #[test]
+    fn range_epoch_string_bound_passes_through() {
+        // A raw-epoch string bound is a valid numeric literal (mirrors
+        // valkey::number_literal), so it is NOT dropped either.
+        assert_eq!(
+            range_expr(json!({"gte":"1609459200"})).unwrap(),
+            ".n >= 1609459200"
+        );
+    }
+
+    #[test]
+    fn range_non_datetime_string_bound_is_skipped() {
+        // An unparseable string still carries no constraint → clause skipped.
+        assert!(range_expr(json!({"gte":"not-a-date"})).is_none());
+    }
+
+    #[test]
+    fn datetime_range_condition_emits_a_filter() {
+        // End-to-end shape of the shipped synthetic-filter-32 datetime query.
+        assert_eq!(
+            build_filter_expression(&json!({"and":[
+                {"ts":{"range":{"gte":"2021-01-01T00:00:00Z","lt":"2021-01-02T00:00:00Z"}}}
+            ]})),
+            Some("(.ts >= 1609459200 and .ts < 1609545600)".to_string())
+        );
+    }
+
+    #[test]
+    fn datetime_value_is_stored_as_epoch_number() {
+        // Upload MUST store the same representation the filter compares against;
+        // an ISO string attribute would never satisfy `.ts >= <epoch>`.
+        assert_eq!(
+            encode_string_attr("2021-01-01T00:00:00Z"),
+            json!(1609459200i64)
+        );
+        // A non-datetime string → verbatim.
+        assert_eq!(encode_string_attr("red"), json!("red"));
+        // Already an epoch (not ISO) → verbatim string, as before.
+        assert_eq!(encode_string_attr("1609459200"), json!("1609459200"));
+        // Bool tokens (readers store bools as "true"/"false" strings) → verbatim,
+        // so `.flag == "true"` keeps matching.
+        assert_eq!(encode_string_attr("true"), json!("true"));
+    }
+
+    // ── review M2: the storage half and the filter half must agree WITHOUT a
+    // schema. `encode_string_attr` used to be gated on `config.datetime_fields`
+    // (primed from `dataset.config.schema`) while the filter half converted any
+    // ISO bound unconditionally. For a datetime-carrying field NOT declared
+    // `datetime` the two disagreed and recall went silently wrong: VSIM coerces a
+    // non-numeric string attribute to `0`, so a two-sided range matched NOTHING
+    // and a one-sided `lt`/`lte` matched EVERYTHING (verified live, redis 8.8 —
+    // measured 0.800 on the schema-gated build). Both halves now decide from the
+    // VALUE alone, so they agree for `keyword`, for `datetime`, and for no schema
+    // at all.
+
+    #[test]
+    fn storage_and_filter_agree_on_datetime_without_any_schema() {
+        // The exact pair the engine emits for one document + one query bound.
+        // Before the fix the left side was `"2021-04-11T00:00:00+00:00"` (a
+        // string) while the right side was already `1618099200` (a number).
+        assert_eq!(
+            encode_string_attr("2021-04-11T00:00:00+00:00"),
+            json!(1618099200i64)
+        );
+        assert_eq!(
+            range_expr(json!({"gte":"2021-04-11T00:00:00+00:00"})).unwrap(),
+            ".n >= 1618099200"
+        );
+    }
+
+    #[test]
+    fn one_sided_datetime_bound_cannot_silently_match_everything() {
+        // The inversion that made this HIGH severity: with ISO-string storage a
+        // `lt`-only bound returned EVERY document (string coerced to 0 < epoch),
+        // exit code 0, no warning. Pinning both halves to the numeric
+        // representation is what prevents it, so assert them together.
+        assert_eq!(
+            range_expr(json!({"lt":"2021-10-28T00:00:00+00:00"})).unwrap(),
+            ".n < 1635379200"
+        );
+        let stored = encode_string_attr("2021-04-11T00:00:00+00:00");
+        assert!(
+            stored.is_number(),
+            "datetime must be stored numerically or `.n < <epoch>` matches ALL docs"
+        );
+    }
+
+    #[test]
+    fn datetime_equality_matches_the_stored_epoch_number() {
+        // review S2: the equality builders were schema-blind and emitted a QUOTED
+        // ISO literal against epoch-number storage → zero hits, no error.
+        assert_eq!(
+            build_filter_expression(&json!({"and":[
+                {"ts":{"match":{"value":"2021-01-01T00:00:00Z"}}}
+            ]})),
+            Some(".ts == 1609459200".to_string())
+        );
+        // match_any on a scalar datetime field, same rule.
+        assert_eq!(
+            build_filter_expression(&json!({"and":[
+                {"ts":{"match":{"any":["2021-01-01T00:00:00Z","2021-01-02T00:00:00Z"]}}}
+            ]})),
+            Some("(.ts == 1609459200 or .ts == 1609545600)".to_string())
+        );
+        // `labels` is a JSON array of raw strings — never epoch-converted, so its
+        // membership test must stay a STRING test.
+        assert_eq!(
+            build_filter_expression(&json!({"and":[
+                {"labels":{"match":{"any":["2021-01-01T00:00:00Z"]}}}
+            ]})),
+            Some("\"2021-01-01T00:00:00Z\" in .labels".to_string())
+        );
+    }
+
+    // ── review M1: a numeric-string bound must be emitted as the PARSED number.
+    // Rust's `f64`/`i64` parsers accept spellings the VSIM FILTER grammar does
+    // not; re-emitting the raw string produced a hard `ERR syntax error in FILTER
+    // expression` (and a failed query is only `eprintln!`d, then DROPPED from the
+    // recall/latency vectors — so the mean is quietly taken over fewer queries),
+    // or, for `".5"`, ZERO results with no error at all because VSIM reads a
+    // leading `.` as a FIELD SELECTOR. All verified live on redis 8.8.
+
+    #[test]
+    fn non_finite_string_bounds_are_rejected_not_emitted_raw() {
+        for bad in ["inf", "-inf", "infinity", "Infinity", "NaN", "nan"] {
+            assert!(
+                range_expr(json!({ "gte": bad })).is_none(),
+                "{bad:?} has no VSIM literal and must be dropped, not emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_only_numeric_spellings_are_normalised_to_vsim_literals() {
+        // `+7` and `.5` are valid Rust f64 syntax but NOT valid VSIM literals —
+        // `.n >= +7` is a syntax ERROR and `.n >= .5` silently compares against a
+        // field named `5`. Emit the parsed value instead.
+        assert_eq!(range_expr(json!({"gte":"+7"})).unwrap(), ".n >= 7");
+        assert_eq!(range_expr(json!({"gte":".5"})).unwrap(), ".n >= 0.5");
+        assert_eq!(range_expr(json!({"gte":"-.5"})).unwrap(), ".n >= -0.5");
+        // Forms VSIM DOES accept must not regress (both verified live).
+        assert_eq!(range_expr(json!({"gte":"1e5"})).unwrap(), ".n >= 100000");
+        assert_eq!(range_expr(json!({"gte":"0100"})).unwrap(), ".n >= 100");
+        // A 19-digit id must keep every digit (an f64 round-trip would round it).
+        assert_eq!(
+            range_expr(json!({"gte":"9007199254740993"})).unwrap(),
+            ".n >= 9007199254740993"
+        );
+    }
+
+    // ── issue #220 follow-on: nested boolean groups ────────────────────────
+
+    #[test]
+    fn nested_or_of_and_groups_keeps_its_shape() {
+        // `(color == red AND size >= 50) OR (color == blue AND size < 10)`.
+        // Each `{"and":[…]}` entry used to match no field leaf → every clause
+        // dropped → None → VSIM ran UNFILTERED.
+        let cond = json!({"or":[
+            {"and":[{"color":{"match":{"value":"red"}}},{"size":{"range":{"gte":50}}}]},
+            {"and":[{"color":{"match":{"value":"blue"}}},{"size":{"range":{"lt":10}}}]},
+        ]});
+        assert_eq!(
+            build_filter_expression(&cond),
+            Some(
+                "((.color == \"red\" and .size >= 50) or (.color == \"blue\" and .size < 10))"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn flat_condition_string_is_unchanged_by_the_nesting_support() {
+        // Regression guard: adding the recursion must not perturb the flat
+        // top-level emission (no extra parentheses).
+        assert_eq!(
+            build_filter_expression(&json!({"and":[
+                {"brand":{"match":{"value":"apple"}}},
+                {"price":{"range":{"gte":100}}},
+            ]})),
+            Some(".brand == \"apple\" and .price >= 100".to_string())
+        );
+        assert_eq!(
+            build_filter_expression(&json!({"or":[
+                {"brand":{"match":{"value":"apple"}}},
+                {"price":{"range":{"gte":100}}},
+            ]})),
+            Some("(.brand == \"apple\" or .price >= 100)".to_string())
+        );
+    }
+
+    // ── review M3: the nested-group arm must not swallow the rest of the entry.
+
+    #[test]
+    fn nested_group_entry_keeps_its_sibling_field_leaves() {
+        // The arm used to `continue` after recursing, so a mixed entry silently
+        // DROPPED `color` — an under-constrained filter, the same silent-wrong
+        // class this file is being fixed for. The group and the sibling leaf must
+        // BOTH be emitted.
+        let expr = build_filter_expression(&json!({"and":[
+            {
+                "and":[{"a":{"match":{"value":"x"}}},{"b":{"match":{"value":"y"}}}],
+                "color":{"match":{"value":"red"}},
+            }
+        ]}))
+        .expect("mixed group+leaf entry must produce a filter");
+        assert!(
+            expr.contains(".color == \"red\""),
+            "sibling leaf dropped: {expr}"
+        );
+        assert!(
+            expr.contains(".a == \"x\" and .b == \"y\""),
+            "nested group dropped: {expr}"
+        );
+    }
+
+    #[test]
+    fn field_literally_named_and_or_or_is_still_a_field_leaf() {
+        // Keying off key PRESENCE mistook a FIELD named `and`/`or` for a boolean
+        // group; `build_group` then found no array, returned None, every clause
+        // was dropped and VSIM ran UNFILTERED. Array-ness is the discriminator.
+        assert_eq!(
+            build_filter_expression(&json!({"and":[{"and":{"match":{"value":"x"}}}]})),
+            Some(".and == \"x\"".to_string())
+        );
+        assert_eq!(
+            build_filter_expression(&json!({"and":[{"or":{"range":{"gte":5}}}]})),
+            Some(".or >= 5".to_string())
         );
     }
 }
