@@ -906,6 +906,11 @@ pub fn write_geo_project(
 //   * 300 in the four corner regions, each at least 1.10 · radius away —
 //     OUTSIDE the circle, INSIDE the box.
 //
+// The two groups are INTERLEAVED by `id % 4`, not split at id 100, so the
+// in-circle set is never also a contiguous upload batch (`batch_size: 100` in
+// the geo configs). Without that, a failure that dropped every batch but the
+// first would score 1.000 with no filter applied.
+//
 // Ground truth is the top-10 over the 100 in-circle documents only (25 %
 // selectivity). An engine applying the true radius scores ~1.0; an engine
 // applying the bounding box, or no filter at all, searches all 400 and lands
@@ -913,12 +918,13 @@ pub fn write_geo_project(
 // below the 0.9 floor every filter test in this repo asserts.
 //
 // WHAT IT IS BLIND TO, stated so nobody over-reads it. The guard band is
-// [0.706544, 1.101281) * radius, so a radius anywhere in [-29.35 %, +10.13 %)
-// selects the identical 100 documents — a wrong radius in that band is a
-// provably equivalent mutant here (measured: x1.101 -> 100 docs, x1.11 -> 104,
-// x1.15 -> 128, x1.40 -> 400). The lower bound is tight and must not be rounded
-// outward: at x0.7065 the fixture already selects 98 and at x0.706 it selects
-// 96, so "-29.4 %" would overstate the band.
+// [0.706544407377, 1.101281084372] * radius, so a radius anywhere in that band
+// selects the identical 100 documents — a wrong radius there is a provably
+// equivalent mutant here (measured: x1.101 -> 100 docs, x1.11 -> 104,
+// x1.15 -> 128, x1.40 -> 400). Both bounds are INCLUSIVE and must be quoted to
+// full precision, not rounded: at x0.706544 the fixture already selects 98, and
+// x1.101281 still selects 100 — a 4e-7 rounding in either direction misstates it
+// in exactly the way this note warns about.
 //
 // Two more blind spots, both undisclosed until review. (a) A lat/lon SWAP
 // applied to both the storage and the query side selects the identical 100
@@ -985,16 +991,25 @@ fn write_geo_corner_project_metric(
     let radius = 20_000.0_f64;
     let (d_lat, d_lon) = geo_corner_offsets(q_lat, radius);
 
-    // (lat, lon) for document `id`. 0..99 inside the circle, 100..399 in the
-    // four corners of the box.
+    // (lat, lon) for document `id`. In-circle is `id % 4 == 0` — INTERLEAVED, not
+    // the first 100 — so the in-circle set is never also an upload batch.
+    //
+    // It used to be ids 0..99, and `batch_size` is 100 in the Milvus and MongoDB
+    // geo configs, so "the answer to every query" and "the first upload batch"
+    // were the same 100 documents. Any failure that left only the first batch
+    // resident, or that correlated with insertion order, would then score 1.000
+    // with no geo filter applied at all. Interleaving removes the coincidence:
+    // no contiguous run of 100 ids is the answer to anything here.
     let loc = move |id: usize| -> (f64, f64) {
-        if id < 100 {
-            // 10x10 grid over [-0.5, 0.5]^2 of the box half-widths: at most
-            // 0.707 · radius from the centre.
-            let (u, v) = (-0.5 + (id % 10) as f64 / 9.0, -0.5 + (id / 10) as f64 / 9.0);
+        if id.is_multiple_of(4) {
+            let k = id / 4; // 0..99
+                            // 10x10 grid over [-0.5, 0.5]^2 of the box half-widths: at most
+                            // 0.707 · radius from the centre.
+            let (u, v) = (-0.5 + (k % 10) as f64 / 9.0, -0.5 + (k / 10) as f64 / 9.0);
             (q_lat + v * d_lat, q_lon + u * d_lon)
         } else {
-            let k = id - 100;
+            // 0..299 over the ids that are NOT multiples of 4.
+            let k = id - id / 4 - 1;
             let span = GEO_CORNER_MAX - GEO_CORNER_MIN;
             let (u, v) = (
                 GEO_CORNER_MIN + span * (k % 15) as f64 / 14.0,

@@ -52,17 +52,17 @@ Which shipped dataset/engine pairs this stops today:
 | dataset | engines that now abort | why |
 |---|---|---|
 | `random-geo-radius-100-angular-filters`, `random-geo-radius-2048-angular-filters` | turbopuffer, chroma | neither filter DSL has a geo operator, an attribute-vs-attribute comparison, or any arithmetic, so an exact radius has no representation at all (#223). A bounding box is a *widening*, not a substitute. |
-| the same two | dragonfly | `configure()` declares no GEO field, so the shared RediSearch geo clause would target a field that does not exist. Previously it was emitted anyway (#223). |
+| the same two | dragonfly, valkey | neither `configure()` declares a GEO field, so the shared RediSearch geo clause targeted a field that does not exist. Previously it was emitted anyway (#223) — Dragonfly's is a builder limitation (it rejects `$param` placeholders and integer literals, not geo itself), Valkey's is an engine one (no GEO field type). |
 | the same two | kividb, vertex | already aborted before #219 |
 | `arxiv-titles-384-angular-filters` | kividb | multi-valued `labels` (see the KiviDB note) |
 
 Two operational consequences worth knowing:
 
 * **The check runs in `search()`, after `configure()` and `upload()`.** On the
-  geo datasets, chroma/turbopuffer/dragonfly will ingest the whole corpus and
-  *then*
+  geo datasets, chroma/turbopuffer/dragonfly/valkey will ingest the whole corpus
+  and *then*
   abort. KiviDB is the exception — it rejects in
-  `configure()`, before any ingest. Moving the check earlier for those three needs
+  `configure()`, before any ingest. Moving the check earlier for those four needs
   the dataset's conditions at configure time and is tracked separately; until
   then, budget the ingest time or exclude those datasets up front.
 * **With the default `--exit-on-error true`, one refusal ends the sweep.** A
@@ -602,14 +602,15 @@ scoped filters). Not every engine supports every feature natively — see each
 engine's note above for its exceptions (e.g. Dragonfly is KNN-only; Chroma has no
 geo or array metadata; Turbopuffer has no geo; Vertex errors on cross-field
 `or`/nested/geo). **geo-radius** is expressed by
-Qdrant/Redis/Valkey/Elasticsearch/OpenSearch/Weaviate/pgvector natively, by
-Milvus via a `Geometry` column and `ST_DWITHIN`, by MongoDB via `geoWithin`
-inside a `$search` pre-filter, and by VectorSets via an exact unit-vector dot
-product in its `FILTER` expression (#223). **Dragonfly, Chroma, Turbopuffer,
-KiviDB and Vertex do not express it** and refuse a geo dataset rather than
-running it under-filtered — Dragonfly because it never declares a GEO field (its
-geo-query parser rejects the `$param` placeholders the shared RediSearch builder
-emits), the others per their notes above. Each
+Qdrant/Redis/Elasticsearch/OpenSearch/Weaviate/pgvector natively, by Milvus via a
+`Geometry` column and `ST_DWITHIN`, by MongoDB via `geoWithin` inside a `$search`
+pre-filter, and by VectorSets via an exact unit-vector dot product in its
+`FILTER` expression (#223). **Valkey, Dragonfly, Chroma, Turbopuffer, KiviDB and
+Vertex do not express it** and refuse a geo dataset rather than running it
+under-filtered: Valkey Search has no GEO field type at all; Dragonfly Search
+*does* support geo but rejects the `$param` placeholders and integer literals
+this repo's shared RediSearch builder emits, so the field is not declared; the
+rest per their notes above. Each
 `(engine × feature)` combination is covered by an end-to-end `tests/integration_*`
 recall test that scores against filtered brute-force ground truth, so an engine
 that silently drops or mis-applies a filter fails its test.

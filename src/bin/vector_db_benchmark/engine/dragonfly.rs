@@ -239,7 +239,7 @@ impl DragonflyEngine {
         // Filterable metadata fields (mirrors redis.rs): keyword/uuid/bool exact
         // strings -> TAG (SEPARATOR ; so multi-valued `labels` match per element);
         // int/float/datetime (stored as epoch) -> NUMERIC; full-text -> TEXT;
-        // geo point -> GEO.
+        // geo point -> nothing: see the NOTE below, geo is NOT declared.
         if let Some(schema) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) {
             for (field_name, field_type) in schema {
                 match field_type.as_str().unwrap_or("") {

@@ -468,13 +468,26 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
     // Valkey, Elasticsearch, OpenSearch, Weaviate, pgvector and Qdrant already
     // did.
     //
-    // Dragonfly is NEW here and is a correction, not a regression. It shares
-    // RediSearch's builder, so this column used to render a geo filter for it —
-    // three asserted-green cells for a field `dragonfly::configure()`
-    // deliberately never declares (its geo-query parser rejects the `$param`
-    // placeholders the shared builder emits). `dragonfly::parse_conditions` now
-    // refuses geo, so the cells are REJECTED and the engine hard-errors on a geo
-    // dataset instead of sending a clause that cannot match.
+    // Dragonfly and Valkey are NEW here and are corrections, not regressions.
+    // Both used to render a geo filter in this matrix — six asserted-green cells
+    // for a field neither `configure()` declares — because both reach a
+    // RediSearch geo builder that does not care whether the field exists.
+    //
+    // Dragonfly's gap is the SHARED BUILDER, not the engine: Dragonfly Search
+    // DOES support geo, and `@loc:[20.0 10.0 500000.0 m]` returns results on a
+    // real GEO attribute (verified on df-v1.40.1). What it rejects is how this
+    // repo spells the query — parameter placeholders (`@loc:[$lon $lat $r m]`
+    // -> `ERR Query syntax error`) and integer literals (`[20 10 500000 m]`,
+    // same error). Teaching the builder to inline float literals for Dragonfly
+    // would close this; until then `configure()` declines to declare the field
+    // and `dragonfly::parse_conditions` refuses the condition. A reader must not
+    // conclude the engine cannot do geo.
+    //
+    // Valkey's gap IS the engine: Valkey Search has no GEO field type at all, so
+    // `configure()` cannot declare one and the emitted clause was rejected at
+    // query time (`'location' is not indexed as a numeric field`, verified
+    // live). Refusing up front turns a mid-run failure after a full ingest into
+    // #219's error before any ingest work.
     //
     // Chroma and Turbopuffer remain, and the entries below are the evidence
     // rather than a TODO. Both filter DSLs are a CLOSED enum of
@@ -494,11 +507,20 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
     (
         "dragonfly",
         "and_geo",
-        "#223 — configure() declares no GEO field: Dragonfly Search's geo-query parser rejects \
-         the `$param` placeholders the shared RediSearch builder emits",
+        "#223 — SHARED-BUILDER gap, not an engine one: Dragonfly Search does geo, but rejects \
+         the `$param` placeholders (and integer literals) this repo's RediSearch builder emits, \
+         so configure() declines to declare the field",
     ),
     ("dragonfly", "and_geo_x2", "#223"),
     ("dragonfly", "or_geo_x2", "#223"),
+    (
+        "valkey",
+        "and_geo",
+        "#223 — Valkey Search has no GEO field type, so configure() creates no such field and \
+         the emitted clause is rejected at query time",
+    ),
+    ("valkey", "and_geo_x2", "#223"),
+    ("valkey", "or_geo_x2", "#223"),
     (
         "turbopuffer",
         "and_geo",
@@ -641,7 +663,7 @@ fn every_shipped_condition_shape_is_expressible_or_a_tracked_gap() {
     );
     assert_eq!(
         (filtered, rejected),
-        (235, 20),
+        (232, 23),
         "the expressible/refused split changed — say why in the PR body"
     );
 }
@@ -728,7 +750,7 @@ fn every_known_gap_maps_to_a_live_cell() {
     let engine_names: Vec<&str> = engines().iter().map(|(n, _)| *n).collect();
     assert_eq!(
         KNOWN_GAPS.len(),
-        20,
+        23,
         "KNOWN_GAPS size changed — was that deliberate?"
     );
     for (engine, shape, why) in KNOWN_GAPS {
