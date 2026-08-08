@@ -2291,6 +2291,24 @@ fn test_binary_redis_geo() {
     run_filter_recall_test("redis-geo", "geo-test", common::write_geo_project);
 }
 
+/// The bounding-box-DISCRIMINATING geo fixture, run against RediSearch's native
+/// `@location:[lon lat r m]` as a CONTROL for issue #223.
+///
+/// `write_geo_project` above puts every document on one meridian, where a box
+/// and a circle select the same set. This one puts 300 of 400 documents in the
+/// corners of the bounding box, outside the circle: a correct radius scores
+/// ~1.0, a bounding box or no filter scores ~0.25. Running it on an engine whose
+/// geo filter was already correct is what proves 1.0 is reachable, so a failure
+/// on the engines fixed in #223 is the engine and not the fixture.
+#[test]
+fn test_binary_redis_geo_corner() {
+    run_filter_recall_test(
+        "redis-geo-corner",
+        "geo-corner-test",
+        common::write_geo_corner_project,
+    );
+}
+
 /// Multi-condition AND: `color == "red" AND size >= 50` in one query — verifies
 /// the engine intersects two clauses of different types (every other fixture
 /// filters on a single condition).

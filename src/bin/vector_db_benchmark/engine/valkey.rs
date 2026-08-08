@@ -26,6 +26,7 @@ use std::time::Instant;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
+use super::geo;
 use super::redis_utils;
 
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
@@ -248,7 +249,11 @@ impl ValkeyEngine {
                         "text" => {
                             cmd.arg(field_name).arg("TAG").arg("SEPARATOR").arg(";");
                         }
-                        // Valkey Search does not support GEO; skip silently.
+                        // Valkey Search has no GEO field type, so `geo` is
+                        // deliberately not declared here — and, since #223,
+                        // `parse_conditions` refuses a geo condition outright
+                        // rather than emitting a clause against a field this
+                        // loop never created.
                         _ => {}
                     }
                 }
@@ -899,6 +904,26 @@ pub(crate) fn parse_conditions(conditions: &serde_json::Value) -> Option<ParsedF
     if obj.is_empty() {
         return None;
     }
+    // Geo is refused for the WHOLE tree (issue #223), mirroring dragonfly.
+    //
+    // `configure()` never adds a GEO field to `FT.CREATE` — see the
+    // `"geo" => {}` note in the schema loop — but `build_leaf` still emitted
+    // `@f:[$lon $lat $r m]`, so a geo dataset sent a clause naming a field that
+    // is not in the index. Valkey Search rejects it at query time
+    // (`Invalid filter expression: 'location' is not indexed as a numeric
+    // field`, verified live on valkey/valkey-bundle), so this was a mid-run
+    // failure after a full ingest rather than silent wrong recall — but it was
+    // also an ASSERTED-green cell in `engine/filter_guard.rs`, whose dragonfly
+    // column had the identical shape.
+    //
+    // Whole-tree, not per-leaf: this builder keeps the leaves it understands, so
+    // `and(geo, keyword)` would otherwise emit the keyword clause alone and
+    // under-constrain the query — the partial-drop escape `query_filter.rs`
+    // documents. Refusing here makes `query_filter::resolve` raise #219's error
+    // up front instead.
+    if geo::conditions_mention_geo(conditions) {
+        return None;
+    }
 
     let mut counter: usize = 0;
     build_group(obj, &mut counter)
@@ -966,6 +991,10 @@ fn build_filter(
             }
         }
         "range" => build_range_filter(field_name, criteria, counter),
+        // Unreachable in production: `parse_conditions` refuses the whole tree
+        // before any leaf is built (#223). Kept so `build_geo_filter`'s own unit
+        // tests still pin the RediSearch spelling, in case Valkey Search gains a
+        // GEO field type and this becomes live again.
         "geo" => build_geo_filter(field_name, criteria, counter),
         _ => None,
     }

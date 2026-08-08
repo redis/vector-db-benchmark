@@ -12,7 +12,7 @@ use rand::SeedableRng;
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use redis::Connection;
 
-use super::redis_utils;
+use super::{geo, redis_utils};
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::index_naming::derive_index_name;
@@ -314,13 +314,31 @@ fn vadd_batch(
 /// Render one document's metadata as the JSON object attached by
 /// `VADD … SETATTR`, or `None` when there is nothing to attach. Shared by the
 /// upload batch and the mixed-workload update path so BOTH store the identical
-/// representation (notably datetime → epoch seconds, see [`encode_string_attr`]).
+/// representation (notably datetime → epoch seconds, see [`encode_string_attr`],
+/// and geo → three unit-vector components, see [`geo`]).
 fn metadata_to_attr_json(meta: &MetadataItem) -> Option<String> {
     if meta.fields.is_empty() {
         return None;
     }
     let mut map = serde_json::Map::new();
     for (k, v) in &meta.fields {
+        // Geo is the one field that becomes SEVERAL attributes, so it is handled
+        // before the scalar match rather than inside it.
+        //
+        // It used to be stored as the nested object `{"lon":..,"lat":..}`, which
+        // VSIM `FILTER` cannot read at all: selectors reach only TOP-LEVEL keys,
+        // and a selector landing on a non-scalar makes the whole expression
+        // evaluate to false (redis/modules/vector-sets `exprRun`). So the point
+        // was on the server and unusable — issue #223. What is stored now is the
+        // point's unit vector on the sphere as three top-level numbers, which is
+        // exactly what `geo::cap_expression` compares against; see `geo.rs` for
+        // why that is an EXACT great-circle radius test and not a bounding box.
+        if let MetadataValue::Geo { lon, lat } = v {
+            for (axis, component) in geo::COMPONENTS.iter().zip(geo::unit_vector(*lat, *lon)) {
+                map.insert(geo::component_field(k, axis), serde_json::json!(component));
+            }
+            continue;
+        }
         let value = match v {
             MetadataValue::String(s) => encode_string_attr(s),
             MetadataValue::Int(n) => serde_json::Value::from(*n),
@@ -331,9 +349,13 @@ fn metadata_to_attr_json(meta: &MetadataItem) -> Option<String> {
                     .map(|l| serde_json::Value::String(l.clone()))
                     .collect(),
             ),
-            MetadataValue::Geo { lon, lat } => serde_json::json!({"lon": lon, "lat": lat}),
+            // Handled above; a geo field never reaches here.
+            MetadataValue::Geo { .. } => continue,
         };
         map.insert(k.clone(), value);
+    }
+    if map.is_empty() {
+        return None;
     }
     Some(serde_json::Value::Object(map).to_string())
 }
@@ -1311,14 +1333,20 @@ fn build_clause(
     match condition_type {
         "match" => build_match_clause(field_name, criteria),
         "range" => build_range_clause(field_name, criteria),
-        // STILL OPEN, same silent-wrong class as issue #220: an unhandled
-        // condition type is DROPPED, and when it is the only condition VSIM runs
-        // with no FILTER at all. `"geo"` is the live instance — the point IS
-        // uploaded (see `metadata_to_attr_json`) but has no clause here, so every
-        // query of the shipped `random-geo-radius-{100,2048}-angular-filters`
-        // runs unfiltered against geo-filtered ground truth (issue #223). The
-        // generic guard that would turn "parsed to nothing" into a loud failure
-        // instead of an unfiltered search is issue #219.
+        // Geo-radius (issue #223). VSIM `FILTER` has no geo type and no function
+        // calls — no `sqrt`, no trigonometry — but it does have `*`, `+` and
+        // `>=` over several top-level attributes at once, and that is all an
+        // EXACT great-circle radius test needs once the point is stored as its
+        // unit vector on the sphere (`metadata_to_attr_json`). See `geo.rs`.
+        //
+        // Until this arm existed the clause was dropped, and when it was the
+        // only clause VSIM ran with NO FILTER: every query of the shipped
+        // `random-geo-radius-{100,2048}-angular-filters` searched the whole
+        // corpus while being scored against geo-filtered ground truth.
+        "geo" => geo::cap_expression(field_name, criteria, |f| format!(".{f}")),
+        // Any OTHER unhandled condition type is still dropped here; issue #219's
+        // guard (`query_filter::resolve`) turns that into a hard error rather
+        // than an unfiltered run.
         _ => None,
     }
 }
@@ -1628,8 +1656,142 @@ mod vsim_parse_tests {
 
 #[cfg(test)]
 mod filter_expr_tests {
-    use super::{build_filter_expression, encode_string_attr};
+    use super::{build_filter_expression, encode_string_attr, metadata_to_attr_json};
     use serde_json::json;
+    use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
+
+    // ── geo-radius (issue #223) ──
+    //
+    // The storage and the filter halves are asserted TOGETHER, and against the
+    // metre distance rather than against each other: the failure mode this
+    // closes is exactly the two halves disagreeing about a representation while
+    // each looks fine alone (see `epoch_literal`'s note on the datetime version
+    // of the same bug).
+
+    fn geo_item(field: &str, lat: f64, lon: f64) -> MetadataItem {
+        MetadataItem {
+            fields: vec![(field.to_string(), MetadataValue::Geo { lon, lat })],
+        }
+    }
+
+    /// The stored attribute is three TOP-LEVEL numbers. It used to be the nested
+    /// object `{"lon":..,"lat":..}`, which VSIM `FILTER` cannot read: selectors
+    /// reach only the first level, and a selector landing on a non-scalar makes
+    /// the whole expression false — so the point was on the server and no filter
+    /// could ever use it.
+    #[test]
+    fn geo_is_stored_as_three_top_level_unit_vector_components() {
+        let stored: serde_json::Value =
+            serde_json::from_str(&metadata_to_attr_json(&geo_item("loc", 40.0, -74.0)).unwrap())
+                .unwrap();
+        let obj = stored.as_object().unwrap();
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            ["loc__geo_x", "loc__geo_y", "loc__geo_z"]
+        );
+        assert!(obj.values().all(|v| v.is_number()), "{stored}");
+        assert!(
+            obj.get("loc").is_none(),
+            "the unusable nested object is gone"
+        );
+        let norm: f64 = obj.values().map(|v| v.as_f64().unwrap().powi(2)).sum();
+        assert!((norm - 1.0).abs() < 1e-12, "not a unit vector: {stored}");
+    }
+
+    #[test]
+    fn geo_emits_a_dot_product_over_the_stored_components() {
+        let expr = build_filter_expression(
+            &json!({"and":[{"loc":{"geo":{"lat":20.0,"lon":10.0,"radius":500.0}}}]}),
+        )
+        .unwrap();
+        for c in ["loc__geo_x", "loc__geo_y", "loc__geo_z"] {
+            assert!(expr.contains(&format!(".{c} * ")), "{expr}");
+        }
+        assert!(expr.starts_with('(') && expr.contains(") >= "), "{expr}");
+    }
+
+    /// Storage and filter, checked against HAVERSINE metres: for points on both
+    /// sides of the boundary the rendered predicate, evaluated on the stored
+    /// numbers, must agree with the metre distance. A wrong axis order, a wrong
+    /// earth radius, or a bounding box all break this.
+    #[test]
+    fn the_stored_components_and_the_rendered_predicate_agree_with_metres() {
+        let (q_lat, q_lon, radius) = (40.0_f64, -74.0_f64, 20_000.0_f64);
+        let expr = build_filter_expression(&json!({"and":[{"loc":{"geo":{
+            "lat": q_lat, "lon": q_lon, "radius": radius}}}]}))
+        .unwrap();
+        // Recover the three coefficients and the threshold from the rendering,
+        // so the test reads what the SERVER would read, not the internals.
+        let (lhs, rhs) = expr.split_once(") >= ").unwrap();
+        let coeffs: Vec<f64> = lhs
+            .trim_start_matches('(')
+            .split(" + ")
+            .map(|t| t.split(" * ").nth(1).unwrap().parse().unwrap())
+            .collect();
+        let threshold: f64 = rhs.parse().unwrap();
+
+        let mut checked = 0;
+        for d_lat in [0.0, 0.05, 0.1, 0.17, 0.2, 0.3, 1.0] {
+            for d_lon in [0.0, 0.05, 0.1, 0.22, 0.3, 1.0] {
+                let (lat, lon) = (q_lat + d_lat, q_lon + d_lon);
+                let stored: serde_json::Value = serde_json::from_str(
+                    &metadata_to_attr_json(&geo_item("loc", lat, lon)).unwrap(),
+                )
+                .unwrap();
+                let dot: f64 = ["loc__geo_x", "loc__geo_y", "loc__geo_z"]
+                    .iter()
+                    .zip(&coeffs)
+                    .map(|(k, c)| stored[*k].as_f64().unwrap() * c)
+                    .sum();
+                // Haversine on the same mean radius the fixtures use.
+                const R: f64 = 6_371_000.0;
+                let (p1, p2) = (q_lat.to_radians(), lat.to_radians());
+                let a = ((lat - q_lat).to_radians() / 2.0).sin().powi(2)
+                    + p1.cos() * p2.cos() * ((lon - q_lon).to_radians() / 2.0).sin().powi(2);
+                let metres = 2.0 * R * a.sqrt().asin();
+                if (metres - radius).abs() < 1.0 {
+                    continue;
+                }
+                assert_eq!(
+                    dot >= threshold,
+                    metres <= radius,
+                    "({lat},{lon}) is {metres} m away, radius {radius}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 30, "checked only {checked} points");
+        // And the grid must actually straddle the boundary — otherwise the
+        // assertion above is vacuously one-sided. (0.17, 0.22) is a bounding-box
+        // corner: inside the box, outside the circle.
+        let corner: serde_json::Value = serde_json::from_str(
+            &metadata_to_attr_json(&geo_item("loc", q_lat + 0.17, q_lon + 0.22)).unwrap(),
+        )
+        .unwrap();
+        let dot: f64 = ["loc__geo_x", "loc__geo_y", "loc__geo_z"]
+            .iter()
+            .zip(&coeffs)
+            .map(|(k, c)| corner[*k].as_f64().unwrap() * c)
+            .sum();
+        assert!(dot < threshold, "a bounding-box corner must be rejected");
+    }
+
+    /// An incomplete criteria object drops the clause, which
+    /// `query_filter::resolve` turns into a hard error — never a default radius.
+    #[test]
+    fn geo_missing_component_is_none() {
+        for bad in [
+            json!({"lat":20.0,"lon":10.0}),
+            json!({"lon":10.0,"radius":500}),
+            json!({"lat":20.0,"radius":500}),
+        ] {
+            assert_eq!(
+                build_filter_expression(&json!({"and":[{"loc":{"geo": bad}}]})),
+                None,
+                "{bad}"
+            );
+        }
+    }
 
     // ── scalar match / range (grammar baseline) ──
 

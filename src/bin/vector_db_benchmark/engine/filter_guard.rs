@@ -329,10 +329,15 @@ fn engines() -> Vec<(&'static str, EngineResolver)> {
                 Ok(super::redis::parse_conditions(v).map(|f| render_redisearch(&f)))
             })
         }),
-        // Dragonfly reuses redis.rs's RediSearch builder verbatim.
+        // Dragonfly reuses redis.rs's RediSearch builder for everything EXCEPT
+        // geo, which it refuses because `configure()` never declares a GEO
+        // field. It must be called through `dragonfly::parse_conditions`, not
+        // `redis::parse_conditions`: this column used to call the latter, so the
+        // matrix scored dragonfly FILTERED on all three geo shapes for a field
+        // the engine does not create.
         ("dragonfly", |c, _| {
             through("Dragonfly", c, |v| {
-                Ok(super::redis::parse_conditions(v).map(|f| render_redisearch(&f)))
+                Ok(super::dragonfly::parse_conditions(v).map(|f| render_redisearch(&f)))
             })
         }),
         ("valkey", |c, _| {
@@ -365,9 +370,22 @@ fn engines() -> Vec<(&'static str, EngineResolver)> {
                 Ok(super::milvus::parse_milvus_conditions(v))
             })
         }),
-        ("mongodb", |c, _| {
+        // MongoDB picks its query stage — and therefore its filter GRAMMAR —
+        // from the dataset schema: a geo-carrying dataset uses `$search` +
+        // the `vectorSearch` operator (the only MongoDB vector path with a geo
+        // pre-filter), everything else uses `$vectorSearch`. The resolver
+        // reproduces exactly that rule, so this column tests what production
+        // sends rather than a third code path.
+        ("mongodb", |c, schema| {
+            let declared = serde_json::json!(schema);
+            let dialect_is_search = super::mongodb_engine::schema_declares_geo(Some(&declared));
             through("MongoDB", c, |v| {
-                Ok(super::mongodb_engine::parse_mongo_conditions(v).map(|d| format!("{d:?}")))
+                if dialect_is_search {
+                    super::mongodb_engine::parse_mongo_search_conditions(v)
+                        .map(|d| d.map(|d| format!("{d:?}")))
+                } else {
+                    Ok(super::mongodb_engine::parse_mongo_conditions(v).map(|d| format!("{d:?}")))
+                }
             })
         }),
         ("pgvector", |c, _| {
@@ -439,48 +457,84 @@ fn through(
 /// every entry must name an engine and a shape that actually exist — all three
 /// are asserted, so an exemption cannot outlive the thing it exempts.
 const KNOWN_GAPS: &[(&str, &str, &str)] = &[
-    // ── #223: geo dropped by 5 engines on the 2 shipped geo-FILTER datasets ──
+    // ── #223: geo ───────────────────────────────────────────────────────────
     // (four datasets are geo-*named*; the two `-no-filters` twins are
     // `"conditions": null` throughout and stay green).
-    // Before this PR each of these returned `None` and the query ran with NO
-    // filter at all, scored against geo-filtered ground truth. The guard does
-    // not fix the gap; it stops the wrong number. Redis, Valkey, Dragonfly,
-    // Elasticsearch, OpenSearch, Weaviate, pgvector and Qdrant express geo.
+    //
+    // VectorSets, Milvus and MongoDB used to sit here and now express geo:
+    // VectorSets by comparing the stored unit vector against a cosine threshold
+    // (`engine::geo`), Milvus with the native `ST_DWITHIN` on a `Geometry`
+    // column, MongoDB with `geoWithin`/`circle` inside a `$search` stage. Redis,
+    // Valkey, Elasticsearch, OpenSearch, Weaviate, pgvector and Qdrant already
+    // did.
+    //
+    // Dragonfly and Valkey are NEW here and are corrections, not regressions.
+    // Both used to render a geo filter in this matrix — six asserted-green cells
+    // for a field neither `configure()` declares — because both reach a
+    // RediSearch geo builder that does not care whether the field exists.
+    //
+    // Dragonfly's gap is the SHARED BUILDER, not the engine: Dragonfly Search
+    // DOES support geo, and `@loc:[20.0 10.0 500000.0 m]` returns results on a
+    // real GEO attribute (verified on df-v1.40.1). What it rejects is how this
+    // repo spells the query — parameter placeholders (`@loc:[$lon $lat $r m]`
+    // -> `ERR Query syntax error`) and integer literals (`[20 10 500000 m]`,
+    // same error). Teaching the builder to inline float literals for Dragonfly
+    // would close this; until then `configure()` declines to declare the field
+    // and `dragonfly::parse_conditions` refuses the condition. A reader must not
+    // conclude the engine cannot do geo.
+    //
+    // Valkey's gap IS the engine: Valkey Search has no GEO field type at all, so
+    // `configure()` cannot declare one and the emitted clause was rejected at
+    // query time (`'location' is not indexed as a numeric field`, verified
+    // live). Refusing up front turns a mid-run failure after a full ingest into
+    // #219's error before any ingest work.
+    //
+    // Chroma and Turbopuffer remain, and the entries below are the evidence
+    // rather than a TODO. Both filter DSLs are a CLOSED enum of
+    // `field OP literal` comparisons — Chroma:
+    // `$eq $ne $gt $gte $lt $lte $in $nin $and $or`; Turbopuffer:
+    // `Eq NotEq In NotIn Lt Lte Gt Gte Any* Contains* Glob* Regex
+    // ContainsAllTokens ContainsAnyToken ContainsTokenSequence Fuzzy And Or Not`
+    // — with no geo primitive, no attribute-vs-attribute comparison, and no
+    // arithmetic anywhere in the filter grammar (Turbopuffer's arithmetic lives
+    // in `rank_by`, which its docs state "never affect[s] matching"). That
+    // closes every exact encoding: a spherical cap is not an axis-aligned box in
+    // any query-INDEPENDENT coordinate system, so no conjunction of range
+    // comparisons can carve it out, and the linear `x*qx + y*qy + z*qz >= c`
+    // form the other two use needs cross-field arithmetic neither has. A
+    // bounding box would admit up to √2·r away and is a widening, i.e. exactly
+    // the silently-wrong recall #219 exists to stop.
     (
-        "vectorsets",
+        "dragonfly",
         "and_geo",
-        "#223 — was silently dropped, now refused",
+        "#223 — SHARED-BUILDER gap, not an engine one: Dragonfly Search does geo, but rejects \
+         the `$param` placeholders (and integer literals) this repo's RediSearch builder emits, \
+         so configure() declines to declare the field",
     ),
-    ("vectorsets", "and_geo_x2", "#223"),
-    ("vectorsets", "or_geo_x2", "#223"),
+    ("dragonfly", "and_geo_x2", "#223"),
+    ("dragonfly", "or_geo_x2", "#223"),
     (
-        "milvus",
+        "valkey",
         "and_geo",
-        "#223 — was silently dropped, now refused",
+        "#223 — Valkey Search has no GEO field type, so configure() creates no such field and \
+         the emitted clause is rejected at query time",
     ),
-    ("milvus", "and_geo_x2", "#223"),
-    ("milvus", "or_geo_x2", "#223"),
+    ("valkey", "and_geo_x2", "#223"),
+    ("valkey", "or_geo_x2", "#223"),
     (
         "turbopuffer",
         "and_geo",
-        "#223 — was silently dropped, now refused",
+        "#223 — no geo operator and no arithmetic in the filter grammar",
     ),
     ("turbopuffer", "and_geo_x2", "#223"),
     ("turbopuffer", "or_geo_x2", "#223"),
     (
         "chroma",
         "and_geo",
-        "#223 — was silently dropped, now refused",
+        "#223 — `where` is a closed enum of field-OP-literal comparisons",
     ),
     ("chroma", "and_geo_x2", "#223"),
     ("chroma", "or_geo_x2", "#223"),
-    (
-        "mongodb",
-        "and_geo",
-        "#223 — was silently dropped, now refused",
-    ),
-    ("mongodb", "and_geo_x2", "#223"),
-    ("mongodb", "or_geo_x2", "#223"),
     // Already an explicit `Err` on master — behaviour unchanged by this PR.
     (
         "kividb",
@@ -609,9 +663,81 @@ fn every_shipped_condition_shape_is_expressible_or_a_tracked_gap() {
     );
     assert_eq!(
         (filtered, rejected),
-        (229, 26),
+        (232, 23),
         "the expressible/refused split changed — say why in the PR body"
     );
+}
+
+/// The MongoDB column above claims to route by SCHEMA the way production does.
+/// Nothing else checks that: `build_mongo_filter_entry` has its own MQL
+/// `$geoWithin` arm (for the `find()` path), so forcing the resolver to the MQL
+/// dialect leaves every geo cell resolving to `Some` and the whole matrix green.
+///
+/// This pins the routing itself — that the two dialects are genuinely different
+/// grammars and that a geo schema selects the `$search` one — so the column
+/// cannot silently start testing a filter MongoDB would never send.
+#[test]
+fn the_mongodb_column_tests_the_dialect_production_would_send() {
+    let geo = json!({"and": [{"a": {"geo": {"lon": 116.0, "lat": -52.0, "radius": 326_341.0}}}]});
+
+    // The routing rule, straight from the engine.
+    let geo_schema = json!({"a": "geo", "b": "geo"});
+    let kw_schema = json!({"a": "keyword", "b": "keyword"});
+    assert!(super::mongodb_engine::schema_declares_geo(Some(
+        &geo_schema
+    )));
+    assert!(!super::mongodb_engine::schema_declares_geo(Some(
+        &kw_schema
+    )));
+
+    // The two grammars are NOT interchangeable, so which one the column picks is
+    // observable. MQL puts the operator under the FIELD; the Search dialect puts
+    // the field under the OPERATOR.
+    let mql = super::mongodb_engine::parse_mongo_conditions(&geo)
+        .map(|d| format!("{d:?}"))
+        .expect("MQL renders a $geoWithin for the find() path");
+    let search = super::mongodb_engine::parse_mongo_search_conditions(&geo)
+        .expect("the search dialect must not error")
+        .map(|d| format!("{d:?}"))
+        .expect("the search dialect renders a geoWithin");
+    assert!(
+        mql.contains("$geoWithin") && mql.contains("$centerSphere"),
+        "{mql}"
+    );
+    assert!(
+        search.contains("geoWithin") && search.contains("circle") && !search.contains("$geoWithin"),
+        "{search}"
+    );
+    assert_ne!(mql, search, "the two dialects must be distinguishable");
+
+    // And the matrix cell for a geo-schema shape must be the SEARCH rendering.
+    let engines = engines();
+    let (_, mongodb) = engines
+        .iter()
+        .find(|(name, _)| *name == "mongodb")
+        .expect("mongodb column");
+    let schema: HashMap<String, String> =
+        [("a".to_string(), "geo".to_string())].into_iter().collect();
+    assert_eq!(mongodb(&geo, &schema), Ok(Some(search)));
+
+    // ...and for a non-geo schema, the same resolver must produce MQL. A keyword
+    // shape is the honest control: it renders in both dialects, differently.
+    let kw = json!({"and": [{"a": {"match": {"value": "red"}}}]});
+    let kw_schema: HashMap<String, String> = [("a".to_string(), "keyword".to_string())]
+        .into_iter()
+        .collect();
+    let kw_mql = super::mongodb_engine::parse_mongo_conditions(&kw)
+        .map(|d| format!("{d:?}"))
+        .unwrap();
+    let kw_search = super::mongodb_engine::parse_mongo_search_conditions(&kw)
+        .unwrap()
+        .map(|d| format!("{d:?}"))
+        .unwrap();
+    assert_ne!(
+        kw_mql, kw_search,
+        "the control shape must also distinguish them"
+    );
+    assert_eq!(mongodb(&kw, &kw_schema), Ok(Some(kw_mql)));
 }
 
 /// Every exemption must name an engine and a shape that exist. Otherwise a
@@ -624,7 +750,7 @@ fn every_known_gap_maps_to_a_live_cell() {
     let engine_names: Vec<&str> = engines().iter().map(|(n, _)| *n).collect();
     assert_eq!(
         KNOWN_GAPS.len(),
-        26,
+        23,
         "KNOWN_GAPS size changed — was that deliberate?"
     );
     for (engine, shape, why) in KNOWN_GAPS {

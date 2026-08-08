@@ -28,6 +28,13 @@ fn milvus_base_url() -> String {
     format!("http://{}:{}", MILVUS_HOST, port)
 }
 
+/// The port Milvus is listening on, as a string for the child process's env.
+/// Honours `MILVUS_PORT` exactly as [`milvus_base_url`] does, so a test suite
+/// pointed at a non-default server drives the binary there too.
+fn milvus_port_str() -> String {
+    std::env::var("MILVUS_PORT").unwrap_or_else(|_| MILVUS_PORT.to_string())
+}
+
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -158,8 +165,17 @@ fn read_back_indexes(collection: &str) -> std::collections::HashMap<String, Inde
 /// The scalar `indexType` the engine must create for a dataset schema type —
 /// the test's INDEPENDENT copy of `milvus_field_kind`'s decision, so a silent
 /// change to the engine's mapping fails here rather than passing by circularity.
-/// `None` = the type is not materialised as a column (only `geo`, issue #223).
+/// `None` = "not part of the every-field-is-indexed sweep": either the type is
+/// not materialised as a column at all, or it is a column that must stay
+/// UNINDEXED (`geo` — asserted separately by
+/// `assert_geo_column_present_and_unindexed`).
 fn expected_index_type(field_name: &str, schema_type: &str) -> Option<&'static str> {
+    // `geo` is a native `Geometry` column since #223, but deliberately UNINDEXED:
+    // Milvus' only Geometry index (RTREE) prunes with a box smaller than the cap
+    // and silently discards true hits. `None` here only means "not part of the
+    // every-field-is-indexed sweep"; the absence is asserted separately by
+    // `assert_geo_column_present_and_unindexed`, which also proves the column is
+    // there at all.
     if schema_type == "geo" {
         return None;
     }
@@ -278,6 +294,63 @@ fn assert_all_schema_fields_indexed(collection: &str, schema: &serde_json::Value
         actual_fields, expected_fields,
         "scalar indexes on '{}' do not match the declared schema",
         collection
+    );
+}
+
+/// The geo counterpart of [`assert_all_schema_fields_indexed`]: the `Geometry`
+/// column must EXIST and must have NO scalar index (issue #223).
+///
+/// Both halves matter, though not equally. "No index" alone is also what you get
+/// when the column was never created, so the column is confirmed present via
+/// `collections/describe` first — but master's actual regression (no geo column
+/// at all) never reaches this function: the run dies at INSERT with `has pass
+/// more field without dynamic schema` and the test fails earlier, at `milvus geo
+/// run failed`. The describe check is therefore defence-in-depth for a
+/// dynamic-schema variant, not the live guard for that regression. The
+/// index-absence assertion below IS the live guard: it fails the moment an RTREE
+/// exists, which no recall assertion here reliably does (see
+/// `test_binary_milvus_geo_edges`).
+fn assert_geo_column_present_and_unindexed(collection: &str, field: &str) {
+    let client = http_client();
+    let resp = client
+        .post(format!(
+            "{}/v2/vectordb/collections/describe",
+            milvus_base_url()
+        ))
+        .json(&serde_json::json!({ "collectionName": collection }))
+        .send()
+        .expect("collections/describe request failed");
+    let body: serde_json::Value = resp.json().expect("collections/describe not JSON");
+    let fields = body
+        .get("data")
+        .and_then(|d| d.get("fields"))
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let geo_field = fields
+        .iter()
+        .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(field))
+        .unwrap_or_else(|| {
+            panic!("collection '{collection}' has no '{field}' column at all: {fields:?}")
+        });
+    assert_eq!(
+        geo_field.get("type").and_then(|t| t.as_str()),
+        Some("Geometry"),
+        "'{field}' must be a Geometry column: {geo_field:?}"
+    );
+
+    let found = read_back_indexes(collection);
+    drop_collection(collection);
+    println!("milvus index read-back for '{collection}': {found:?}");
+    let vector = found
+        .get("vector")
+        .unwrap_or_else(|| panic!("collection '{collection}' has no vector index: {found:?}"));
+    assert_eq!(vector.index_type, "HNSW");
+    assert_index_covers_all_rows(collection, "vector", vector);
+    assert!(
+        !found.contains_key(field),
+        "'{field}' must stay UNINDEXED: Milvus' only Geometry index (RTREE) prunes with a box \
+         ~0.11 % smaller than the cap and silently discards in-cap documents (#223). Found {found:?}"
     );
 }
 
@@ -987,5 +1060,163 @@ fn test_binary_milvus_match_any_labels() {
         recall >= 0.9,
         "milvus multi-valued labels match_any recall {:.3} < 0.9",
         recall
+    );
+}
+
+/// Geo-radius end-to-end (issue #223).
+///
+/// Before this, `geo` hit `milvus_field_kind`'s `_ => return None`, so no column
+/// was materialised at all — and because upload still emitted the key against a
+/// collection with `enableDynamicField: false`, the run died at INSERT
+/// (`has pass more field without dynamic schema`) rather than searching
+/// unfiltered. Either way the shipped `random-geo-radius-*-angular-filters` were
+/// unrunnable on Milvus.
+///
+/// Now the point is a `Geometry` column holding OGC WKT `POINT(lon lat)`,
+/// deliberately UNINDEXED (see `milvus_field_kind`), filtered by
+/// `ST_DWITHIN(field, 'POINT(lon lat)', metres)` —
+/// which for a POINT column against a POINT query is an exact great-circle
+/// haversine test in the server (v2.6.19 `common/Geometry.h::dwithin`, R =
+/// 6 371 000 m, the same radius the fixture's ground truth uses).
+///
+/// The fixture is the bounding-box-discriminating one, so a filter that answered
+/// with the query's lat/lon BOX rather than its circle scores ~0.25 here.
+///
+/// What this fixture canNOT see is a prune box SMALLER than the cap — its
+/// in-circle documents all sit at <= 0.71 * radius, well inside any such box.
+/// Milvus has exactly that defect when the `Geometry` column is indexed, which
+/// is why this engine now leaves it unindexed (see `milvus_field_kind`);
+/// `test_binary_milvus_geo_edges` is the test that covers it.
+#[test]
+fn test_binary_milvus_geo() {
+    wait_for_milvus();
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "milvus-geo", "engine": "milvus",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100, "index_params": {"M": 16, "efConstruction": 200}}
+    }]);
+    let proj = common::write_geo_corner_project(
+        "geo-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    assert!(proj.matching_docs >= proj.top);
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "milvus-geo",
+            "geo-test",
+            "127.0.0.1",
+            &[
+                ("MILVUS_PORT", &milvus_port_str()),
+                ("MILVUS_COLLECTION_NAME", "bench_geo")
+            ],
+            &["--keep-data"],
+        ),
+        "milvus geo run failed"
+    );
+    // The Geometry column is the ONE column this engine deliberately leaves
+    // unindexed (#223 — an RTREE there drops true hits). Assert the column
+    // EXISTS and has no scalar index; "no index" on its own is also what a
+    // missing column looks like, which is what master actually did.
+    assert_geo_column_present_and_unindexed("bench_geo", "location");
+    let recall = common::read_recall(&proj.root, "milvus-geo");
+    println!("milvus geo recall={:.3}", recall);
+    assert!(recall >= 0.9, "milvus geo recall {:.3} < 0.9", recall);
+}
+
+/// The geo defects the corner fixture structurally cannot see (issue #223).
+///
+/// Milvus' `ST_DWITHIN` refine step is exact, but an `RTREE` on the `Geometry`
+/// column prunes first with a box built by
+/// `GISFunctionFilterExpr.cpp::create_bounding_box_for_dwithin`:
+///
+/// ```cpp
+/// const double metersPerDegreeLat = 111320.0;
+/// double lonOffset = distance_meters / (metersPerDegreeLat * std::cos(latRad));
+/// ```
+///
+/// 111 320 exceeds the true 111 194.93 m/degree, so the box is ~0.11 % SHORT in
+/// every direction; the flat `theta/cos(phi)` longitude term underestimates
+/// further at high latitude; and there is no antimeridian wrap. Every one of
+/// those discards documents that are inside the cap, before the exact refine
+/// runs, with no error — on the shipped
+/// `random-geo-radius-100-angular-filters` that is 806 of 12 500 ground-truth
+/// neighbours (6.4 %) and a hard top-25 recall ceiling of ~0.935.
+///
+/// Measured first-hand on `milvusdb/milvus:v2.6.19`, identical rows in two
+/// collections differing only by the RTREE: centre (81, 10) r = 200 km returned
+/// **14 of 20** in-cap documents with the index (the six at 0.9990-0.9995 *
+/// radius due north and south were pruned) and 20 of 20 without it; centre
+/// (0, 179.9) r = 200 km returned **4 of 8** with the index (every document
+/// across +180 was pruned) and 8 of 8 without.
+///
+/// WHICH ASSERTION ACTUALLY CATCHES IT — measured, not assumed. On this exact
+/// fixture the prune is severe: identical rows in two collections differing only
+/// by the index, queried with the engine's own emitted filter, give
+/// **76 of 150** in-cap documents for q0 and **112 of 150** for q1. Several of
+/// each query's ground-truth top-10 sit in the pruned set, so recall would
+/// collapse well under the 0.9 floor.
+///
+/// Yet re-adding the RTREE and re-running this test still scored **1.000**, and
+/// the reason is INDEX CREATION ORDER, not scale and not the query path:
+/// creating it in `collections/create`'s `indexParams` (before insert) prunes on
+/// BOTH `entities/query` and `entities/search`; creating it via `indexes/create`
+/// after insert + flush — which is what this engine does — does not prune at all
+/// at 400 rows. That is an artifact of ordering at this size, not a guarantee,
+/// so the column stays unindexed rather than relying on it.
+///
+/// The assertion that fires today is therefore
+/// [`assert_geo_column_present_and_unindexed`] (verified by re-adding the index:
+/// `'location' must stay UNINDEXED`), with the per-query recall floor as the
+/// backstop that would catch the prune under any ordering that does apply it.
+#[test]
+fn test_binary_milvus_geo_edges() {
+    wait_for_milvus();
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "milvus-geo-edge", "engine": "milvus",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100, "index_params": {"M": 16, "efConstruction": 200}}
+    }]);
+    let proj = common::write_geo_edge_project(
+        "geo-edge-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    assert!(proj.matching_docs >= proj.top);
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "milvus-geo-edge",
+            "geo-edge-test",
+            "127.0.0.1",
+            &[
+                ("MILVUS_PORT", &milvus_port_str()),
+                ("MILVUS_COLLECTION_NAME", "bench_geo_edge")
+            ],
+            &["--keep-data"],
+        ),
+        "milvus geo-edge run failed"
+    );
+    assert_geo_column_present_and_unindexed("bench_geo_edge", "location");
+    // Per-query, not just the mean: the antimeridian query and the
+    // high-latitude query fail for different reasons, and with only two queries
+    // a mean of 0.5 could be one perfect and one zero. `recall_dist.min` is the
+    // worst query, and `count` proves both actually ran.
+    // `read_results_obj` already unwraps the `results` object.
+    let r = common::read_results_obj(&proj.root, "milvus-geo-edge");
+    let dist = &r["recall_dist"];
+    let (count, worst, mean) = (
+        dist["count"].as_u64().expect("recall_dist.count"),
+        dist["min"].as_f64().expect("recall_dist.min"),
+        r["mean_recall"].as_f64().expect("mean_recall"),
+    );
+    println!("milvus geo-edge: queries={count} worst_recall={worst:.3} mean={mean:.3}");
+    assert_eq!(count, 2, "both query centres must have run");
+    assert!(
+        worst >= 0.9,
+        "milvus geo-edge worst-query recall {worst:.3} < 0.9 (mean {mean:.3})"
     );
 }
