@@ -166,7 +166,19 @@ fn strip_comments_and_strings(src: &str) -> String {
             }
             St::Str | St::Chr => {
                 if c == '\\' {
-                    out.push_str("  ");
+                    // An escape consumes two characters — but a `\`-plus-newline
+                    // string continuation's second character IS the newline, and
+                    // swallowing it shifts every line below it up by one. There
+                    // are 219 such continuations under `src/`, so the guards
+                    // would quote the wrong source line and, worse, match an
+                    // `INV-4-ALLOW:` marker against the wrong line: a marker
+                    // three lines above an unrelated barrier would exempt it.
+                    out.push(' ');
+                    match b.get(i + 1) {
+                        Some('\n') => out.push('\n'),
+                        Some(_) => out.push(' '),
+                        None => {}
+                    }
                     i += 2;
                     continue;
                 }
@@ -403,6 +415,17 @@ fn inv3_no_nearest_rank_percentile_indexing() {
     );
 }
 
+/// Does this raw line carry an `INV-4-ALLOW:` opt-out?
+fn line_carries_allow(line: Option<&str>) -> bool {
+    line.is_some_and(|l| l.contains("INV-4-ALLOW:"))
+}
+
+/// Is this raw line a STANDALONE `INV-4-ALLOW:` comment — one that annotates the
+/// line below it rather than the line it trails?
+fn standalone_allow(line: Option<&str>) -> bool {
+    line.is_some_and(|l| l.trim_start().starts_with("//") && l.contains("INV-4-ALLOW:"))
+}
+
 /// INV-4 — no fixed-count start barrier anywhere under `src/` (#214).
 ///
 /// Every engine used to synchronize its measured-window start with
@@ -448,11 +471,15 @@ fn inv4_no_fixed_count_start_barrier() {
             if !mentions_type {
                 continue;
             }
-            // The opt-out marker lives in a comment, so read the RAW line —
-            // either trailing the offending line, or on the line above it (a
-            // `use` statement reads better with the reason above it).
-            let marked = |n: usize| raw_lines.get(n).is_some_and(|l| l.contains("INV-4-ALLOW:"));
-            if marked(lineno) || (lineno > 0 && marked(lineno - 1)) {
+            // The opt-out marker lives in a comment, so read the RAW line. It
+            // may trail the offending line, or sit on the line immediately
+            // above as a STANDALONE comment (a `use` statement reads better
+            // with the reason above it). "Standalone" matters: a marker
+            // trailing line N must not also exempt line N+1, or one annotated
+            // barrier quietly covers its unannotated neighbour.
+            if line_carries_allow(raw_lines.get(lineno).copied())
+                || (lineno > 0 && standalone_allow(raw_lines.get(lineno - 1).copied()))
+            {
                 continue;
             }
             violations.push(format!(
@@ -577,5 +604,136 @@ fn inv4_bare_start_gate_users_hold_an_abort_guard() {
         "INV-4c VIOLATED (#214): a hand-driven start gate can be abandoned without releasing the \
          workers parked at it:\n{}",
         problems.join("\n")
+    );
+}
+
+/// The comment/string stripper must be line-for-line aligned with its input.
+///
+/// Every guard above reports `path:line` from the STRIPPED text and reads the
+/// `INV-4-ALLOW:` opt-out from the RAW line at that index, so the two must agree
+/// exactly. A `\`-plus-newline string continuation used to swallow its newline,
+/// which shifted everything below it up: violations quoted the wrong source
+/// line, a marker on the real line was ignored, and a marker three lines above
+/// an unrelated barrier silently exempted it. There are 219 such continuations
+/// under `src/`, so this was not a corner case — it was latent only because no
+/// `INV-4-ALLOW:` marker exists yet.
+#[test]
+fn stripper_is_line_for_line_aligned_with_its_input() {
+    // A continuation, an escaped quote, a raw string, a lifetime, a char
+    // literal, a block comment and a line comment — each on a known line.
+    let src = concat!(
+        "fn a() {\n",                                // 1
+        "    let s = \"one \\\n",                    // 2  <- `\`-continuation
+        "         two\";\n",                         // 3
+        "    let q = \"he said \\\"hi\\\"\";\n",     // 4
+        "    let r = r#\"raw \" not a close\n",      // 5
+        "       still raw\"#;\n",                    // 6
+        "    /* block\n",                            // 7
+        "       comment */\n",                       // 8
+        "    let c = '\\n';\n",                      // 9
+        "    let g: &'static str = \"x\";\n",        // 10
+        "    // Barrier::new(n + 1) in a comment\n", // 11
+        "    let ready = Barrier::new(n + 1);\n",    // 12
+        "}\n",                                       // 13
+    );
+    let stripped = strip_comments_and_strings(src);
+
+    assert_eq!(
+        stripped.lines().count(),
+        src.lines().count(),
+        "stripper changed the line count:\n--- raw ---\n{src}\n--- stripped ---\n{stripped}"
+    );
+
+    let raw: Vec<&str> = src.lines().collect();
+    let out: Vec<&str> = stripped.lines().collect();
+    for (i, (r, o)) in raw.iter().zip(out.iter()).enumerate() {
+        assert_eq!(
+            r.chars().count(),
+            o.chars().count(),
+            "line {} changed width: {r:?} -> {o:?}",
+            i + 1
+        );
+    }
+
+    // The only surviving `Barrier` must be the code one on line 12, not the
+    // comment on line 11 — and it must be reported as line 12.
+    let hits: Vec<usize> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("Barrier::"))
+        .map(|(i, _)| i + 1)
+        .collect();
+    assert_eq!(hits, vec![12], "stripped text:\n{stripped}");
+}
+
+/// The same alignment property, asserted over every real source file rather
+/// than a fixture — the fixture cannot anticipate the next construct someone
+/// writes.
+#[test]
+fn stripper_preserves_line_count_of_every_source_file() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0usize;
+    let mut continuations = 0usize;
+    for (path, stripped) in all_sources() {
+        let raw = fs::read_to_string(root.join(&path)).expect("read source");
+        continuations += raw.matches("\\\n").count();
+        assert_eq!(
+            stripped.lines().count(),
+            raw.lines().count(),
+            "{path}: stripping changed the line count, so every guard below the \
+             first offset line would quote the wrong source line and match \
+             `INV-4-ALLOW:` against the wrong one"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 20,
+        "expected to scan the whole tree, saw {checked} files"
+    );
+    assert!(
+        continuations > 100,
+        "expected the tree to still contain `\\`-continuations (the case this pins); \
+         saw {continuations}"
+    );
+}
+
+/// The `INV-4-ALLOW:` opt-out actually exempts the line it is written on, and
+/// only that line — the property the misalignment silently broke.
+#[test]
+fn inv4_allow_marker_exempts_only_its_own_line() {
+    // Reproduces the shape that failed: a `\`-continuation above the barriers.
+    // Line 4 carries a TRAILING marker (exempt, and only itself). Line 5 has
+    // none and must be reported even though line 4's marker is directly above
+    // it. Line 6 is a STANDALONE marker comment, so line 7 is exempt.
+    let src = concat!(
+        "fn a() {\n",
+        "    let msg = \"a long message \\\n",
+        "        continued here\";\n",
+        "    let x = Barrier::new(n + 1); // INV-4-ALLOW: pinned by test\n",
+        "    let y = Barrier::new(n + 1);\n",
+        "    // INV-4-ALLOW: annotates the line below\n",
+        "    let z = Barrier::new(n + 1);\n",
+        "}\n",
+    );
+    let stripped = strip_comments_and_strings(src);
+    let raw: Vec<&str> = src.lines().collect();
+
+    let mut unexempted = Vec::new();
+    for (lineno, line) in stripped.lines().enumerate() {
+        if !line.contains("Barrier::") {
+            continue;
+        }
+        if line_carries_allow(raw.get(lineno).copied())
+            || (lineno > 0 && standalone_allow(raw.get(lineno - 1).copied()))
+        {
+            continue;
+        }
+        unexempted.push(lineno + 1);
+    }
+    assert_eq!(
+        unexempted,
+        vec![5],
+        "line 4 (trailing marker) and line 7 (standalone marker above) must be exempt; \
+         line 5 must NOT be exempted by line 4's trailing marker"
     );
 }

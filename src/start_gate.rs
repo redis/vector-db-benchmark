@@ -56,12 +56,22 @@
 //! worker can *finish* — normally, by failing setup, or by panicking — settles
 //! its ticket.
 //!
-//! **What this does not cover.** A worker that never finishes still blocks the
-//! coordinator: [`StartGate::wait_ready`] has no deadline, so a setup step that
-//! hangs forever (a `connect()` against a blackholed endpoint with no timeout,
-//! say) hangs the run exactly as the barrier did. That is not a regression, and
-//! `--search-timeout` is the intended backstop, but it defaults to `0.0`. A
-//! gate-level deadline is tracked separately.
+//! **What this does not cover.**
+//!
+//! * A worker that never *finishes* still blocks the coordinator:
+//!   [`StartGate::wait_ready`] has no deadline, so a setup step that hangs
+//!   forever (a `connect()` against a blackholed endpoint with no timeout, say)
+//!   hangs the run exactly as the barrier did. That is not a regression, and
+//!   `--search-timeout` is the intended backstop, but it defaults to `0.0`.
+//!   A gate-level deadline is tracked separately.
+//! * `WorkerPool::spawn` minting the ticket defeats *accidental* omission — you
+//!   cannot forget to create one, mint one too few, or pair the wrong ticket
+//!   with the wrong worker, and the compiler enforces all three. It is not a
+//!   defence against a determined caller: `std::mem::forget(ticket)`, or
+//!   sending the ticket out of the closure over a channel, leaves it unsettled
+//!   and hangs `wait_ready` forever. Both require going out of your way, and
+//!   neither is reachable from the shape every harness uses; treat the ticket
+//!   as something the worker must consume before it returns.
 //!
 //! # Failure semantics: hard error, never "carry on with fewer"
 //!
