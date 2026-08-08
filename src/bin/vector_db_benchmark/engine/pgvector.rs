@@ -19,6 +19,66 @@ use vector_db_benchmark::readers::metadata::{
 };
 use vector_db_benchmark::start_gate::WorkerPool;
 
+/// Warn when `parallel` cannot fit in the server's connection budget.
+///
+/// Best effort: any failure to read the budget is silently ignored — this must
+/// never be the thing that stops a run.
+fn warn_if_over_connection_budget(conn_str: &str, parallel: usize) {
+    let Ok(mut client) = postgres::Client::connect(conn_str, postgres::NoTls) else {
+        return;
+    };
+    let scalar = |client: &mut postgres::Client, sql: &str| -> Option<i64> {
+        let row = client.query_one(sql, &[]).ok()?;
+        row.try_get::<_, String>(0).ok()?.parse().ok()
+    };
+    let Some(max_conns) = scalar(&mut client, "SHOW max_connections") else {
+        return;
+    };
+    let reserved = scalar(&mut client, "SHOW superuser_reserved_connections").unwrap_or(0);
+    let in_use: i64 = client
+        .query_one("SELECT count(*) FROM pg_stat_activity", &[])
+        .ok()
+        .and_then(|r| r.try_get(0).ok())
+        .unwrap_or(0);
+    // `in_use` counts this advisory connection, which is closed on return.
+    let available = (max_conns - reserved - in_use + 1).max(0);
+    if (parallel as i64) > available {
+        eprintln!(
+            "\t⚠ WARNING: parallel={parallel} exceeds this server's connection budget \
+             (max_connections={max_conns}, superuser_reserved={reserved}, {in_use} in use \
+             → {available} available). Each search worker holds one connection for the whole \
+             run, so the run will FAIL rather than quietly measure fewer workers. Raise \
+             max_connections or lower parallel."
+        );
+    }
+}
+
+/// Render a `postgres::Error` usefully.
+///
+/// `postgres::Error`'s own `Display` is the literal string `"db error"`; the
+/// server's message — `FATAL: sorry, too many clients already`, the single most
+/// likely reason a worker cannot connect at high `parallel` — lives in the
+/// `DbError` behind it. Without this, the whole diagnostic for a `parallel` that
+/// exceeds `max_connections` reads `36 failed setup: ... db error`.
+fn describe_pg_error(e: &postgres::Error) -> String {
+    if let Some(db) = e.as_db_error() {
+        let mut msg = format!("{}: {}", db.severity(), db.message());
+        if let Some(hint) = db.hint() {
+            msg.push_str(&format!(" (hint: {hint})"));
+        }
+        return msg;
+    }
+    // Not a server-side error (TLS, DNS, refused socket): walk the source chain,
+    // whose leaf carries the real cause.
+    let mut msg = e.to_string();
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(cause) = src {
+        msg.push_str(&format!(": {cause}"));
+        src = cause.source();
+    }
+    msg
+}
+
 /// Map a dataset schema field type to a Postgres column type. Returns None for
 /// types pgvector can't filter on with a plain scalar column (e.g. geo).
 fn pg_column_type(field_type: &str) -> Option<&'static str> {
@@ -444,6 +504,18 @@ impl Engine for PgVectorEngine {
         let conn_str = self.connection_string();
         let distance_op = self.distance_op.clone();
 
+        // Every worker holds its own connection for the whole run, so `parallel`
+        // is a claim on the server's connection budget. Exceeding it used to
+        // publish a run labelled `parallel=N` that N-k workers actually ran; it
+        // is now a hard error, which is correct but opaque at the point of
+        // failure. Warn here, with the arithmetic, rather than leaving the
+        // operator to infer it from k identical "too many clients" strings.
+        //
+        // Advisory only: this is racy by construction, and a pooler in front of
+        // Postgres makes `max_connections` meaningless. The start gate remains
+        // the authority.
+        warn_if_over_connection_budget(&conn_str, parallel);
+
         // Gate-synchronized start so connection setup AND the cold first query
         // fall OUTSIDE the measured window. Every worker connects + primes, then
         // parks at the gate; `WorkerPool::start` stamps the shared start instant and
@@ -459,7 +531,7 @@ impl Engine for PgVectorEngine {
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "pgvector-search");
+            let mut pool = WorkerPool::new(s, "pgvector-search", parallel);
             for _ in 0..parallel {
                 let conn_str = conn_str.clone();
                 let distance_op = distance_op.clone();
@@ -467,10 +539,9 @@ impl Engine for PgVectorEngine {
                 let neighbors = &neighbors;
                 let parsed_filters = &parsed_filters;
                 let query_idx = Arc::clone(&query_idx);
-                let ticket = pool.ticket();
                 let pb = &pb;
 
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();
@@ -483,7 +554,10 @@ impl Engine for PgVectorEngine {
                             // A worker that cannot set itself up would leave the run at a
                             // lower real concurrency than the `parallel` it reports. Settle
                             // the ticket with the reason; the coordinator makes it an error.
-                            ticket.fail(format!("pgvector-search worker setup failed: {e}"));
+                            ticket.fail(format!(
+                                "pgvector-search worker connect failed: {}",
+                                describe_pg_error(&e)
+                            ));
                             return (t, p, r, mr, nd);
                         }
                     };

@@ -1059,7 +1059,7 @@ impl Engine for ElasticsearchEngine {
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "elasticsearch-search");
+            let mut pool = WorkerPool::new(s, "elasticsearch-search", parallel);
             for _ in 0..parallel {
                 let base_url = base_url.clone();
                 let index_name = index_name.clone();
@@ -1067,10 +1067,9 @@ impl Engine for ElasticsearchEngine {
                 let tops = &tops;
                 let raw_bodies = &raw_bodies;
                 let query_idx = Arc::clone(&query_idx);
-                let ticket = pool.ticket();
                 let pb = &pb;
 
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();

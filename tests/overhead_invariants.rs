@@ -48,8 +48,228 @@ fn engine_dir() -> PathBuf {
 }
 
 fn read_engine(file: &str) -> String {
+    strip_comments_and_strings(&read_engine_raw(file))
+}
+
+/// The raw file, comments and all — for the few checks that need to see them.
+fn read_engine_raw(file: &str) -> String {
     let path = engine_dir().join(file);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e))
+}
+
+/// Blank out comments and string/char literals, preserving line structure.
+///
+/// Every guard in this file is a substring search over source text, and every
+/// one of them was previously blind to the difference between code and prose.
+/// That is not hypothetical: INV-4 bans the `Barrier` type, and all 14 engines
+/// used to carry a comment *describing* the barrier it removed — so the guard
+/// would have forbidden documenting the very bug it exists to prevent.
+/// Newlines are preserved so reported line numbers stay true.
+fn strip_comments_and_strings(src: &str) -> String {
+    #[derive(PartialEq)]
+    enum St {
+        Code,
+        Line,
+        Block,
+        Str,
+        Chr,
+        RawStr,
+    }
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut st = St::Code;
+    let mut depth = 0usize;
+    let mut hashes = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied().unwrap_or('\0');
+        match st {
+            St::Code => {
+                if c == '/' && next == '/' {
+                    st = St::Line;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == '/' && next == '*' {
+                    st = St::Block;
+                    depth = 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == 'r' && (next == '"' || next == '#') {
+                    let prev_ident = i > 0 && (b[i - 1].is_alphanumeric() || b[i - 1] == '_');
+                    if !prev_ident {
+                        let mut j = i + 1;
+                        let mut h = 0;
+                        while j < b.len() && b[j] == '#' {
+                            h += 1;
+                            j += 1;
+                        }
+                        if j < b.len() && b[j] == '"' {
+                            st = St::RawStr;
+                            hashes = h;
+                            out.push_str(&" ".repeat(j - i + 1));
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+                if c == '"' {
+                    st = St::Str;
+                    out.push(' ');
+                    i += 1;
+                    continue;
+                }
+                if c == '\'' {
+                    // lifetime (`'scope`) vs char literal: a char literal closes
+                    // within four characters.
+                    if let Some(k) = (1..=4).find(|k| b.get(i + k) == Some(&'\'')) {
+                        st = St::Chr;
+                        out.push_str(&" ".repeat(k));
+                        i += k;
+                        continue;
+                    }
+                }
+                out.push(c);
+                i += 1;
+            }
+            St::Line => {
+                if c == '\n' {
+                    st = St::Code;
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+            }
+            St::Block => {
+                if c == '/' && next == '*' {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == '*' && next == '/' {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        st = St::Code;
+                    }
+                    continue;
+                }
+                out.push(if c == '\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            St::Str | St::Chr => {
+                if c == '\\' {
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                let closing = if st == St::Str { '"' } else { '\'' };
+                if c == closing {
+                    st = St::Code;
+                }
+                out.push(if c == '\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            St::RawStr => {
+                if c == '"' {
+                    let mut h = 0;
+                    while b.get(i + 1 + h) == Some(&'#') {
+                        h += 1;
+                    }
+                    if h >= hashes {
+                        st = St::Code;
+                        out.push_str(&" ".repeat(1 + hashes));
+                        i += 1 + hashes;
+                        continue;
+                    }
+                }
+                out.push(if c == '\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Every `.rs` file under `src/`, as (repo-relative path, comment-stripped source).
+fn all_sources() -> Vec<(String, String)> {
+    fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    walk(&root.join("src"), &mut paths);
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| {
+            let src = fs::read_to_string(&p).expect("read source");
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, strip_comments_and_strings(&src))
+        })
+        .collect()
+}
+
+/// Engines that own a gate-synchronized parallel search, derived from
+/// `engine/mod.rs` rather than hardcoded, so a new engine is opted IN by
+/// default and must be explicitly excused.
+fn gated_engine_files() -> Vec<String> {
+    // Modules with no parallel timed search of their own, or no gate by design.
+    // Each needs a reason; adding a name here is the reviewable act.
+    const EXCUSED: &[(&str, &str)] = &[
+        ("index_naming", "pure helper, no engine"),
+        ("redis_utils", "pure helper, no engine"),
+        ("vertex_grpc", "transport codegen, no engine"),
+        ("weaviate_grpc", "transport codegen, no engine"),
+        ("filter_guard", "pure helper, no engine"),
+        (
+            "turbopuffer",
+            "no warm-up gate by design: its workers start on spawn (tracked separately)",
+        ),
+    ];
+    let mod_rs = read_engine_raw("mod.rs");
+    let mut gated = Vec::new();
+    for line in mod_rs.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("mod ")
+            .or_else(|| line.strip_prefix("pub mod "))
+        else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix(';') else {
+            continue;
+        };
+        if EXCUSED.iter().any(|(e, _)| *e == name) {
+            continue;
+        }
+        gated.push(format!("{name}.rs"));
+    }
+    assert!(
+        gated.len() >= 14,
+        "expected at least 14 gated engines from engine/mod.rs, found {}: {:?}",
+        gated.len(),
+        gated
+    );
+    gated
 }
 
 /// INV-2 — no per-query metric buffer is pushed through a cross-thread mutex in
@@ -183,7 +403,7 @@ fn inv3_no_nearest_rank_percentile_indexing() {
     );
 }
 
-/// INV-4 — no fixed-count start barrier in a search harness (#214).
+/// INV-4 — no fixed-count start barrier anywhere under `src/` (#214).
 ///
 /// Every engine used to synchronize its measured-window start with
 /// `Barrier::new(parallel + 1)`, a participant count fixed *before* the workers
@@ -194,81 +414,168 @@ fn inv3_no_nearest_rank_percentile_indexing() {
 /// nothing breaks the hang.
 ///
 /// The replacement is `vector_db_benchmark::start_gate`, whose wait is
-/// satisfied by ticket *outcomes* rather than a count. This guard fails the
-/// moment a fixed-count barrier reappears in an engine.
+/// satisfied by ticket *outcomes* rather than a count.
+///
+/// This bans the TYPE, not one spelling of the call, so a type alias, a UFCS
+/// call, `use std::sync::Barrier as B`, and a helper in a different directory
+/// are all caught. It scans comment-stripped source, so documenting the removed
+/// bug is fine. A future *legitimate* barrier (an upload rendezvous, say) opts
+/// out per line with an `INV-4-ALLOW:` marker and a reason — deliberately
+/// noisy, so it surfaces in review.
 #[test]
-fn inv4_no_fixed_count_start_barrier_in_search_harnesses() {
+fn inv4_no_fixed_count_start_barrier() {
+    // `start_gate.rs` owns the `legacy_*` tests that replicate the pre-fix
+    // barrier shape and assert it deadlocks. Banning `Barrier` there would
+    // delete the proof that the module is worth having.
+    const OWNS_THE_PROOF: &str = "src/start_gate.rs";
+
     let mut violations = Vec::new();
-    for entry in fs::read_dir(engine_dir()).expect("read engine dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+    for (path, src) in all_sources() {
+        if path == OWNS_THE_PROOF {
             continue;
         }
-        let src = fs::read_to_string(&path).expect("read engine source");
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let raw = fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&path))
+            .expect("read source");
+        let raw_lines: Vec<&str> = raw.lines().collect();
         for (lineno, line) in src.lines().enumerate() {
-            if line.contains("Barrier::new(") {
-                violations.push(format!("  {}:{} {}", name, lineno + 1, line.trim()));
+            let mentions_type = line.contains("Barrier::")
+                || line.contains("sync::Barrier")
+                || line.contains(" Barrier<")
+                || line.contains(": Barrier")
+                || line.contains("Barrier>")
+                || line.contains(", Barrier")
+                || line.contains("{Barrier");
+            if !mentions_type {
+                continue;
             }
-        }
-    }
-
-    assert!(
-        violations.is_empty(),
-        "INV-4 VIOLATED: a fixed-count start barrier reappeared in an engine. Sizing the \
-         wait before the workers exist deadlocks the run when the OS refuses a thread or a \
-         worker panics before arriving (#214) — use `vector_db_benchmark::start_gate::\
-         WorkerPool` / `StartGate`, whose wait is satisfied by ticket outcomes. \
-         Offenders:\n{}",
-        violations.join("\n")
-    );
-}
-
-/// INV-4b — every engine that fans out a timed search actually routes its start
-/// through the gate. Without this, INV-4 could be "satisfied" by an engine that
-/// grew some other fixed-count wait, or by one that silently lost its
-/// synchronized start altogether.
-#[test]
-fn inv4_search_harnesses_route_through_the_start_gate() {
-    // Engines with a parallel, gate-synchronized measured window. Turbopuffer is
-    // absent deliberately: it has no warm-up gate, its workers start on spawn.
-    const GATED: &[&str] = &[
-        "chroma.rs",
-        "dragonfly.rs",
-        "elasticsearch.rs",
-        "kividb.rs",
-        "milvus.rs",
-        "mongodb_engine.rs",
-        "opensearch.rs",
-        "pgvector.rs",
-        "qdrant.rs",
-        "redis.rs",
-        "valkey.rs",
-        "vectorsets.rs",
-        "vertex.rs",
-        "weaviate.rs",
-    ];
-
-    let mut missing = Vec::new();
-    for &file in GATED {
-        let src = read_engine(file);
-        let uses_gate = src.contains("start_gate::WorkerPool")
-            || src.contains("start_gate::{StartGate, WorkerPool}");
-        let arrives = src.contains("ticket.arrive_and_wait()");
-        if !uses_gate || !arrives {
-            missing.push(format!(
-                "  {} (imports gate: {}, parks at gate: {})",
-                file, uses_gate, arrives
+            // The opt-out marker lives in a comment, so read the RAW line —
+            // either trailing the offending line, or on the line above it (a
+            // `use` statement reads better with the reason above it).
+            let marked = |n: usize| raw_lines.get(n).is_some_and(|l| l.contains("INV-4-ALLOW:"));
+            if marked(lineno) || (lineno > 0 && marked(lineno - 1)) {
+                continue;
+            }
+            violations.push(format!(
+                "  {}:{} {}",
+                path,
+                lineno + 1,
+                raw_lines.get(lineno).unwrap_or(&"").trim()
             ));
         }
     }
 
     assert!(
-        missing.is_empty(),
-        "INV-4b VIOLATED: a search harness no longer starts its workers through \
-         `start_gate` (#214). Either it regressed to an ad-hoc synchronization \
-         primitive, or its warm-up gate was dropped and connection setup is back \
-         inside the measured window. Offenders:\n{}",
-        missing.join("\n")
+        violations.is_empty(),
+        "INV-4 VIOLATED: `std::sync::Barrier` reappeared under src/. Sizing a wait before the \
+         workers exist deadlocks the run when the OS refuses a thread or a worker panics before \
+         arriving (#214) — use `vector_db_benchmark::start_gate::WorkerPool` / `StartGate`, whose \
+         wait is satisfied by ticket outcomes. If a barrier here genuinely cannot deadlock, add \
+         `// INV-4-ALLOW: <reason>` on the line. Offenders:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// INV-4b — every engine that fans out a timed search actually routes its start
+/// through the gate, once per harness, in the right place.
+///
+/// Without this, INV-4 could be "satisfied" by an engine that grew some other
+/// fixed-count wait, or by one that dropped its synchronized start altogether.
+/// The engine list is derived from `engine/mod.rs`, so a new engine is opted in
+/// by default.
+#[test]
+fn inv4_search_harnesses_route_through_the_start_gate() {
+    let mut problems = Vec::new();
+
+    for file in gated_engine_files() {
+        let src = read_engine(&file);
+
+        // (a) it uses the gate at all.
+        let pools = src.matches("WorkerPool::new(").count();
+        let bare_gates = src.matches("StartGate::new()").count();
+        let harnesses = pools + bare_gates;
+        if harnesses == 0 {
+            problems.push(format!(
+                "  {file}: no `WorkerPool::new` / `StartGate::new` — the synchronized start is \
+                 gone, so connection setup and the cold first query are back inside the measured \
+                 window"
+            ));
+            continue;
+        }
+
+        // (b) exactly one park per harness. Catches un-gating ONE of the two
+        //     harnesses in weaviate (gRPC/GraphQL) or vertex (search/mixed).
+        let parks = src.matches("ticket.arrive_and_wait()").count();
+        if parks != harnesses {
+            problems.push(format!(
+                "  {file}: {harnesses} harness(es) but {parks} `ticket.arrive_and_wait()` call(s) \
+                 — one of them no longer parks at the gate"
+            ));
+        }
+
+        // (c) the abort verdict is honoured. `let _ = ticket.arrive_and_wait();`
+        //     compiles, satisfies `#[must_use]`, and silently lets every worker
+        //     run on its own clock after an aborted start.
+        if src.contains("let _ = ticket.arrive_and_wait()") {
+            problems.push(format!(
+                "  {file}: discards the `arrive_and_wait` verdict with `let _ =`. `None` means \
+                 the run was aborted; the worker must return, not measure"
+            ));
+        }
+
+        // (d) the park sits BELOW setup. Every gated harness reports at least one
+        //     setup failure through `ticket.fail(...)` before it parks; if the
+        //     first park precedes the first `fail`, the park was hoisted above
+        //     client construction / the prime query, putting connection setup
+        //     back inside the measured window — the regression (a) is meant to
+        //     catch and cannot.
+        let (Some(first_park), Some(first_fail)) = (
+            src.find("ticket.arrive_and_wait()"),
+            src.find("ticket.fail("),
+        ) else {
+            problems.push(format!(
+                "  {file}: no `ticket.fail(...)` — a worker that cannot set itself up is silently \
+                 reducing the run's real concurrency again"
+            ));
+            continue;
+        };
+        if first_park < first_fail {
+            problems.push(format!(
+                "  {file}: parks at the gate before its first setup-failure arm, so client \
+                 construction and the prime query happen AFTER the start stamp — connection setup \
+                 is back inside the measured window"
+            ));
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "INV-4b VIOLATED (#214):\n{}",
+        problems.join("\n")
+    );
+}
+
+/// INV-4c — the bare-`StartGate` harnesses hold an abort guard.
+///
+/// `WorkerPool` aborts its gate in `Drop`, so any early return from the scope
+/// closure releases parked workers. A harness driving `StartGate` by hand has no
+/// such cover: a coordinator panic between the first `ticket()` and `wait_ready`
+/// leaves the workers on a condvar nobody notifies, and whatever owns them (a
+/// tokio `Runtime`) then joins them forever — #214's own shape.
+#[test]
+fn inv4_bare_start_gate_users_hold_an_abort_guard() {
+    let mut problems = Vec::new();
+    for file in gated_engine_files() {
+        let src = read_engine(&file);
+        if src.contains("StartGate::new()") && !src.contains("AbortGateOnDrop::new(") {
+            problems.push(format!(
+                "  {file}: drives a bare `StartGate` without an `AbortGateOnDrop`"
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "INV-4c VIOLATED (#214): a hand-driven start gate can be abandoned without releasing the \
+         workers parked at it:\n{}",
+        problems.join("\n")
     );
 }

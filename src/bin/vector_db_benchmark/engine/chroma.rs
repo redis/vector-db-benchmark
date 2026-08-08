@@ -684,7 +684,7 @@ impl Engine for ChromaEngine {
         let query_url = format!("{}/collections/{}/query", self.api_base, self.collection_id);
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "chroma-search");
+            let mut pool = WorkerPool::new(s, "chroma-search", parallel);
             for _ in 0..parallel {
                 let query_url = query_url.clone();
                 let timeout = self.timeout;
@@ -692,10 +692,9 @@ impl Engine for ChromaEngine {
                 let tops = &tops;
                 let bodies = &bodies;
                 let query_idx = Arc::clone(&query_idx);
-                let ticket = pool.ticket();
                 let pb = &pb;
 
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();

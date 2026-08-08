@@ -37,9 +37,11 @@
 //! `Condvar`) with a spawn that reports failure instead of panicking
 //! (`thread::Builder::spawn_scoped`, which returns [`io::Result`]).
 //!
-//! Every worker is issued a [`WorkerTicket`] **before** it is spawned, and the
-//! gate only ever waits for *tickets to settle*, never for a number fixed in
-//! advance. A ticket settles in exactly one of three ways:
+//! Every worker is issued a [`WorkerTicket`] **before** it is spawned — by
+//! [`WorkerPool::spawn`] itself, which hands the ticket to the worker closure
+//! so it cannot be omitted or mismatched — and the gate only ever waits for
+//! *tickets to settle*, never for a number fixed in advance. A ticket settles
+//! in exactly one of three ways:
 //!
 //! | outcome | how | effect |
 //! |---|---|---|
@@ -49,9 +51,17 @@
 //!
 //! The `Drop` arm is what makes a panic (or a never-started thread, whose
 //! closure — and therefore ticket — is dropped by the failed `spawn_scoped`)
-//! settle its ticket during unwind. Progress is therefore guaranteed: the
-//! coordinator's wait is satisfied by *any* terminal outcome, so there is no
-//! arrival count left unmet.
+//! settle its ticket during unwind. The coordinator's wait is satisfied by
+//! *any* terminal outcome, so no arrival count is ever left unmet: every way a
+//! worker can *finish* — normally, by failing setup, or by panicking — settles
+//! its ticket.
+//!
+//! **What this does not cover.** A worker that never finishes still blocks the
+//! coordinator: [`StartGate::wait_ready`] has no deadline, so a setup step that
+//! hangs forever (a `connect()` against a blackholed endpoint with no timeout,
+//! say) hangs the run exactly as the barrier did. That is not a regression, and
+//! `--search-timeout` is the intended backstop, but it defaults to `0.0`. A
+//! gate-level deadline is tracked separately.
 //!
 //! # Failure semantics: hard error, never "carry on with fewer"
 //!
@@ -134,6 +144,13 @@ impl StartGate {
 
     /// Issue a ticket for one worker. Call this **before** spawning, so the
     /// ticket exists even if the spawn itself fails.
+    ///
+    /// Every worker counted by [`Self::wait_ready`] must own exactly one
+    /// ticket: a spawned worker without one never settles and hangs the
+    /// coordinator, and a ticket without a worker does the same. Thread-based
+    /// harnesses get that pairing for free from [`WorkerPool::spawn`]; a
+    /// harness calling this directly owns the invariant itself, and must also
+    /// hold an [`AbortGateOnDrop`] across the fan-out.
     pub fn ticket(self: &Arc<Self>) -> WorkerTicket {
         WorkerTicket {
             gate: Arc::clone(self),
@@ -150,7 +167,7 @@ impl StartGate {
     /// Public because not every harness fans out over scoped threads: the
     /// Weaviate gRPC path drives `tokio` tasks and coordinates the same gate by
     /// hand. Thread-based harnesses should use [`WorkerPool`] instead.
-    pub fn wait_ready(&self, expected: usize) -> Result<(), String> {
+    pub fn wait_ready(&self, label: &str, expected: usize) -> Result<(), String> {
         let mut st = self.lock();
         while st.settled < expected && st.phase != Phase::Aborted {
             st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
@@ -181,7 +198,7 @@ impl StartGate {
         self.cv.notify_all();
 
         Err(format!(
-            "only {ready} of {expected} search workers reached the start gate — {}. \
+            "only {ready} of {expected} {label} workers reached the start gate — {}. \
              Refusing to report a run at parallel={expected} that measured fewer workers",
             parts.join(", ")
         ))
@@ -227,6 +244,32 @@ enum Outcome {
     Ready,
     Lost,
     Failed(String),
+}
+
+/// Aborts a [`StartGate`] if it is still un-released when this guard drops.
+///
+/// [`WorkerPool`] does this in its own `Drop`. A harness that drives a bare
+/// `StartGate` — currently only the Weaviate gRPC path, which fans out `tokio`
+/// tasks rather than scoped threads — **must** hold one of these across the
+/// whole fan-out, declared *after* whatever owns the workers (the tokio
+/// `Runtime`, say) so that drop order aborts the gate before the workers are
+/// joined. Without it, a coordinator panic between the first `ticket()` and
+/// `wait_ready` leaves the parked workers on a condvar nobody will ever notify.
+///
+/// Aborting after a successful release is a no-op, so the guard needs no
+/// disarm and can simply fall out of scope on the happy path.
+pub struct AbortGateOnDrop(Arc<StartGate>);
+
+impl AbortGateOnDrop {
+    pub fn new(gate: &Arc<StartGate>) -> Self {
+        Self(Arc::clone(gate))
+    }
+}
+
+impl Drop for AbortGateOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// One worker's claim on the start gate.
@@ -324,10 +367,9 @@ fn injected_spawn_failure() -> bool {
 ///
 /// ```ignore
 /// let (results, measured_start) = std::thread::scope(|s| {
-///     let mut pool = WorkerPool::new(s, "redis-search");
+///     let mut pool = WorkerPool::new(s, "redis-search", parallel);
 ///     for _ in 0..parallel {
-///         let ticket = pool.ticket();
-///         pool.spawn(move || {
+///         pool.spawn(move |ticket| {
 ///             // ... connect + prime ...
 ///             let Some(start) = ticket.arrive_and_wait() else { return Default::default() };
 ///             // ... measured loop ...
@@ -336,30 +378,35 @@ fn injected_spawn_failure() -> bool {
 ///     pool.start()
 /// })?;
 /// ```
+///
+/// The pool mints each ticket and hands it to the worker closure, so a worker
+/// cannot be spawned without one and a ticket cannot be minted without a
+/// worker. That pairing is the whole deadlock-freedom argument; making it an
+/// API property rather than a convention is why there is no public `ticket()`
+/// here — see [`StartGate::ticket`] for the by-hand variant.
 pub struct WorkerPool<'scope, 'env: 'scope, T: Send + 'scope> {
     scope: &'scope Scope<'scope, 'env>,
     gate: Arc<StartGate>,
     handles: Vec<ScopedJoinHandle<'scope, T>>,
     label: &'static str,
+    /// How many workers the caller intends to run — the `parallel` the result
+    /// will be labelled with. Used for honest diagnostics, and checked against
+    /// the number actually spawned in [`Self::start_with`].
+    planned: usize,
 }
 
 impl<'scope, 'env: 'scope, T: Send + 'scope> WorkerPool<'scope, 'env, T> {
-    pub fn new(scope: &'scope Scope<'scope, 'env>, label: &'static str) -> Self {
+    pub fn new(scope: &'scope Scope<'scope, 'env>, label: &'static str, planned: usize) -> Self {
         Self {
             scope,
             gate: Arc::new(StartGate::new()),
             handles: Vec::new(),
             label,
+            planned,
         }
     }
 
-    /// Issue this worker's ticket. Must be called before [`Self::spawn`] and
-    /// moved into the worker closure.
-    pub fn ticket(&self) -> WorkerTicket {
-        self.gate.ticket()
-    }
-
-    /// Spawn one worker.
+    /// Spawn one worker, handing it its own start-gate ticket.
     ///
     /// Unlike `Scope::spawn`, an OS refusal (`EAGAIN` under `ulimit -u` or
     /// cgroup `pids.max`) is returned as `Err`, not a panic. The gate is
@@ -367,10 +414,16 @@ impl<'scope, 'env: 'scope, T: Send + 'scope> WorkerPool<'scope, 'env, T> {
     /// instead of being stranded when `thread::scope` joins them.
     pub fn spawn<F>(&mut self, f: F) -> Result<(), String>
     where
-        F: FnOnce() -> T + Send + 'scope,
+        F: FnOnce(WorkerTicket) -> T + Send + 'scope,
     {
         let index = self.handles.len();
         let name = format!("{}-{index}", self.label);
+        // Minted here, not by the caller: a spawned worker always has exactly
+        // one ticket, and a minted ticket always has exactly one worker. If the
+        // spawn below fails, the closure — and with it this ticket — is dropped,
+        // which settles it as lost.
+        let ticket = self.gate.ticket();
+        let f = move || f(ticket);
 
         #[cfg(test)]
         let spawned = if injected_spawn_failure() {
@@ -402,7 +455,7 @@ impl<'scope, 'env: 'scope, T: Send + 'scope> WorkerPool<'scope, 'env, T> {
                      limit (ulimit -u, cgroup pids.max)",
                     self.label,
                     index + 1,
-                    index + 1
+                    self.planned
                 ))
             }
         }
@@ -429,7 +482,18 @@ impl<'scope, 'env: 'scope, T: Send + 'scope> WorkerPool<'scope, 'env, T> {
         stamp: impl FnOnce() -> Instant,
     ) -> Result<(Vec<T>, Instant), String> {
         let expected = self.handles.len();
-        if let Err(e) = self.gate.wait_ready(expected) {
+        if expected != self.planned {
+            // Belt and braces on the caller's loop bound: reporting `parallel=N`
+            // for a run that only ever spawned N-1 workers is the same lie as
+            // losing one to the OS.
+            self.gate.abort();
+            self.drain();
+            return Err(format!(
+                "{} spawned {expected} workers but the run is labelled parallel={}",
+                self.label, self.planned
+            ));
+        }
+        if let Err(e) = self.gate.wait_ready(self.label, expected) {
             // `wait_ready` has already aborted the gate, so the parked workers
             // are on their way out. Join them here rather than leaving it to
             // `thread::scope`, which re-panics on an unjoined panicking thread
@@ -592,14 +656,63 @@ mod tests {
         worker: impl Fn(usize, WorkerTicket) -> usize + Sync,
     ) -> Result<(Vec<usize>, Instant), String> {
         std::thread::scope(|s| {
-            let mut pool = WorkerPool::new(s, "test");
+            let mut pool = WorkerPool::new(s, "test", parallel);
             for i in 0..parallel {
-                let ticket = pool.ticket();
                 let worker = &worker;
-                pool.spawn(move || worker(i, ticket))?;
+                pool.spawn(move |ticket| worker(i, ticket))?;
             }
             pool.start()
         })
+    }
+
+    #[test]
+    fn a_pool_that_spawns_fewer_workers_than_it_plans_is_an_error() {
+        // The ticket/worker pairing is an API property — `spawn` mints the
+        // ticket, so a worker cannot exist without one or vice versa. What the
+        // API cannot see is the caller's loop bound: spawning 3 workers for a
+        // point that will be published as `parallel=4` is the same lie as losing
+        // one to the OS, and used to be invisible.
+        let finished = finishes_within(PROMPT, || {
+            let err = std::thread::scope(|s| {
+                let mut pool: WorkerPool<'_, '_, ()> = WorkerPool::new(s, "test", 4);
+                for _ in 0..3 {
+                    pool.spawn(|ticket| {
+                        let _ = ticket.arrive_and_wait();
+                    })?;
+                }
+                pool.start()
+            })
+            .expect_err("spawning fewer workers than planned must be an error");
+            assert!(
+                err.contains("spawned 3 workers but the run is labelled parallel=4"),
+                "{err}"
+            );
+        });
+        assert!(finished, "a short-spawned pool hung instead of erroring");
+    }
+
+    #[test]
+    fn a_worker_that_settles_nothing_is_lost_not_hung() {
+        // The residual hazard the old `pool.ticket()` API allowed was a spawned
+        // worker with no ticket, which never settles. The closure-minted ticket
+        // makes that unrepresentable; the nearest reachable shape is a worker
+        // that simply returns, dropping its ticket. That must settle as lost.
+        let finished = finishes_within(PROMPT, || {
+            let err = run_pool(3, |i, ticket| {
+                if i == 1 {
+                    drop(ticket);
+                    return 0;
+                }
+                let _ = ticket.arrive_and_wait();
+                0
+            })
+            .expect_err("a worker that never reaches the gate must be an error");
+            assert!(
+                err.contains("only 2 of 3 test workers reached the start gate"),
+                "{err}"
+            );
+        });
+        assert!(finished, "a worker that dropped its ticket hung the pool");
     }
 
     #[test]
@@ -646,7 +759,7 @@ mod tests {
             })
             .expect_err("a worker that panics before the gate must be an error");
             assert!(
-                err.contains("only 3 of 4 search workers reached the start gate"),
+                err.contains("only 3 of 4 test workers reached the start gate"),
                 "error should quantify the shortfall: {err}"
             );
             assert!(
@@ -762,11 +875,10 @@ mod tests {
         let (_, start) = {
             let seen = Arc::clone(&seen);
             std::thread::scope(|s| {
-                let mut pool = WorkerPool::new(s, "test");
+                let mut pool = WorkerPool::new(s, "test", 3);
                 for _ in 0..3 {
-                    let ticket = pool.ticket();
                     let seen = Arc::clone(&seen);
-                    pool.spawn(move || {
+                    pool.spawn(move |ticket| {
                         let at = ticket.arrive_and_wait().expect("run must not abort");
                         seen.lock().unwrap().push(at);
                     })?;
@@ -810,12 +922,11 @@ mod tests {
             let gate_reached = Arc::clone(&gate_reached);
             move || {
                 let err = std::thread::scope(|s| {
-                    let mut pool: WorkerPool<'_, '_, ()> = WorkerPool::new(s, "test");
+                    let mut pool: WorkerPool<'_, '_, ()> = WorkerPool::new(s, "test", 3);
                     for _ in 0..2 {
-                        let ticket = pool.ticket();
                         let woke = Arc::clone(&woke);
                         let gate_reached = Arc::clone(&gate_reached);
-                        pool.spawn(move || {
+                        pool.spawn(move |ticket| {
                             gate_reached.wait();
                             assert!(
                                 ticket.arrive_and_wait().is_none(),
@@ -824,10 +935,13 @@ mod tests {
                             woke.fetch_add(1, Ordering::SeqCst);
                         })?;
                     }
-                    // Both workers are now parked at the gate.
-                    gate_reached.wait();
-                    let ticket = pool.ticket();
-                    ticket.fail("simulated late failure");
+                    // The third worker fails only once the first two have parked
+                    // — the ordering that used to strand them.
+                    let gate_reached = Arc::clone(&gate_reached);
+                    pool.spawn(move |ticket| {
+                        gate_reached.wait();
+                        ticket.fail("simulated late failure");
+                    })?;
                     pool.start()
                 })
                 .expect_err("the run must fail");
@@ -851,10 +965,9 @@ mod tests {
         let finished = finishes_within(PROMPT, || {
             let gate_reached = Arc::new(Barrier::new(2));
             let err: Result<(), String> = std::thread::scope(|s| {
-                let mut pool: WorkerPool<'_, '_, ()> = WorkerPool::new(s, "test");
-                let ticket = pool.ticket();
+                let mut pool: WorkerPool<'_, '_, ()> = WorkerPool::new(s, "test", 1);
                 let reached = Arc::clone(&gate_reached);
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     reached.wait();
                     let _ = ticket.arrive_and_wait();
                 })?;

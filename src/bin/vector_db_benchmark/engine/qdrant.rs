@@ -1989,7 +1989,7 @@ impl Engine for QdrantEngine {
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "qdrant-search");
+            let mut pool = WorkerPool::new(s, "qdrant-search", parallel);
             for _ in 0..parallel {
                 let grpc_url = grpc_url.clone();
                 let api_key = api_key.clone();
@@ -1999,10 +1999,9 @@ impl Engine for QdrantEngine {
                 let neighbors = &neighbors;
                 let parsed_filters = &parsed_filters;
                 let query_idx = Arc::clone(&query_idx);
-                let ticket = pool.ticket();
                 let pb = &pb;
 
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();

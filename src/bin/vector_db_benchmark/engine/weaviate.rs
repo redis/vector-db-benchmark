@@ -27,7 +27,7 @@ use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
 use vector_db_benchmark::readers::metadata::MetadataItem;
-use vector_db_benchmark::start_gate::{StartGate, WorkerPool};
+use vector_db_benchmark::start_gate::{AbortGateOnDrop, StartGate, WorkerPool};
 
 const DEFAULT_CLASS_NAME: &str = "Benchmark";
 
@@ -1520,10 +1520,26 @@ impl Engine for WeaviateEngine {
                 .enable_all()
                 .build()
                 .map_err(|e| format!("failed to build tokio runtime: {}", e))?;
+            // This is the one harness that drives a bare `StartGate` rather than
+            // `WorkerPool`: it fans out `tokio` tasks, not scoped threads.
             // `tokio::spawn` cannot fail, but a task can still panic before
             // reaching the gate, so the same count-agnostic ticket accounting
-            // applies here as in the thread-based harnesses.
+            // applies. Two hazards `WorkerPool` would otherwise cover:
+            //
+            //  * `AbortGateOnDrop` is declared AFTER `rt`, so it drops FIRST on
+            //    unwind. Without it, a panic in the coordinator future between
+            //    the first `ticket()` and `wait_ready` would leave the parked
+            //    tasks on a condvar nobody notifies, and `Runtime::drop` would
+            //    then join them forever — #214's own shape (found in review).
+            //  * the ticket/task pairing is by hand here; `WorkerPool::spawn`
+            //    mints the ticket itself precisely so it cannot be missed.
+            //
+            // Note also that `Builder::build()` above PANICS rather than
+            // returning `Err` when the OS refuses a thread, so this harness
+            // reports EAGAIN as a panic, not as the friendly message the
+            // thread-based harnesses produce. Loud, not hung.
             let gate = Arc::new(StartGate::new());
+            let _gate_guard = AbortGateOnDrop::new(&gate);
             let (collected, grpc_start): (Vec<SampleBuffers>, Instant) = rt.block_on(async {
                 let mut tasks = Vec::with_capacity(parallel);
                 for _ in 0..parallel {
@@ -1607,7 +1623,7 @@ impl Engine for WeaviateEngine {
                 }
                 // All tasks have connected + primed and are parked at the gate.
                 // Stamp the measurement start, then release everyone.
-                let start_err = gate.wait_ready(tasks.len()).err();
+                let start_err = gate.wait_ready("weaviate-grpc-search", tasks.len()).err();
                 let started_at = Instant::now();
                 if start_err.is_none() {
                     gate.release(started_at);
@@ -1644,7 +1660,7 @@ impl Engine for WeaviateEngine {
         } else {
             // ── GraphQL: blocking OS-thread fan-out (each thread its own client). ──
             measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-                let mut pool = WorkerPool::new(s, "weaviate-search");
+                let mut pool = WorkerPool::new(s, "weaviate-search", parallel);
                 for _ in 0..parallel {
                     let base_url = self.base_url.clone();
                     let class_name = self.class_name.clone();
@@ -1654,10 +1670,9 @@ impl Engine for WeaviateEngine {
                     let tops = Arc::clone(&tops);
                     let graphql_bodies = Arc::clone(&graphql_bodies);
                     let query_idx = Arc::clone(&query_idx);
-                    let ticket = pool.ticket();
                     let pb = &pb;
 
-                    pool.spawn(move || {
+                    pool.spawn(move |ticket| {
                         let mut t = Vec::new();
                         let mut p = Vec::new();
                         let mut r = Vec::new();

@@ -1829,7 +1829,7 @@ impl Engine for ValkeyEngine {
         let index_name = self.config.index_name.clone();
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "valkey-search");
+            let mut pool = WorkerPool::new(s, "valkey-search", parallel);
             for _ in 0..parallel {
                 let host = self.host.clone();
                 let port = self.port;
@@ -1841,10 +1841,9 @@ impl Engine for ValkeyEngine {
                 let query_strs = &query_strs;
                 let query_idx = Arc::clone(&query_idx);
                 let index_name = index_name.as_str();
-                let ticket = pool.ticket();
                 let pb = &pb;
 
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();

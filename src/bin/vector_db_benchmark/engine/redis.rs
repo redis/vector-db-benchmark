@@ -2164,7 +2164,7 @@ impl Engine for RedisEngine {
         }
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "redis-search");
+            let mut pool = WorkerPool::new(s, "redis-search", parallel);
             for _ in 0..parallel {
                 let redis_url = self.redis_url.clone();
                 let algorithm = self.config.algorithm.clone();
@@ -2175,10 +2175,9 @@ impl Engine for RedisEngine {
                 let query_strs = &query_strs;
                 let query_idx = Arc::clone(&query_idx);
                 let index_name = index_name.as_str();
-                let ticket = pool.ticket();
                 let pb = &pb;
 
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     // Thread-local sample buffers — no cross-thread synchronization
                     // in the timed loop.
                     let mut t = Vec::new();

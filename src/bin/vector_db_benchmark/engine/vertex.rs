@@ -1868,12 +1868,11 @@ impl Engine for VertexEngine {
         let mut late_queries = 0usize;
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "vertex-search");
+            let mut pool = WorkerPool::new(s, "vertex-search", workers);
             for worker_id in 0..workers {
                 let query_idx = Arc::clone(&query_idx);
                 let pb = &pb;
-                let ticket = pool.ticket();
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();
@@ -2237,13 +2236,12 @@ impl Engine for VertexEngine {
         let mut update_times: Vec<f64> = Vec::new();
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "vertex-mixed");
+            let mut pool = WorkerPool::new(s, "vertex-mixed", workers);
             for _ in 0..workers {
                 let search_idx = Arc::clone(&search_idx);
                 let update_idx = Arc::clone(&update_idx);
-                let ticket = pool.ticket();
                 let pb = &pb;
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();

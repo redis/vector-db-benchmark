@@ -598,17 +598,16 @@ impl Engine for VectorSetsEngine {
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "vectorsets-search");
+            let mut pool = WorkerPool::new(s, "vectorsets-search", parallel);
             for _ in 0..parallel {
                 let redis_url = self.redis_url.clone();
                 let neighbors = &neighbors;
                 let filters = &filters;
                 let encoded_queries = &encoded_queries;
                 let query_idx = Arc::clone(&query_idx);
-                let ticket = pool.ticket();
                 let pb = &pb;
 
-                pool.spawn(move || {
+                pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();
