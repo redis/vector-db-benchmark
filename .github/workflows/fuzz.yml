@@ -49,6 +49,10 @@ jobs:
             dict: csr
           - target: npy_roundtrip
             dict: npy
+          - target: gt_reader
+            dict: gt
+          - target: gt_roundtrip
+            dict: gt
     steps:
       - uses: actions/checkout@v4
 

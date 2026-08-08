@@ -389,10 +389,10 @@ impl OpenSearchEngine {
         // Cold-cache graph loading is warmed uniformly by the per-worker prime
         // query in `search` (mirrors redis/vertex), so no engine-specific
         // server-side `_knn/warmup` call is needed here.
+        // Accepted flat (our configs) or nested under `search_params`/`config`
+        // (upstream's) — see SearchParams::knob.
         let ef_search = params
-            .extra
-            .as_ref()
-            .and_then(|e| e.get("knn.algo_param.ef_search"))
+            .knob("knn.algo_param.ef_search")
             .and_then(|v| v.as_i64());
 
         if let Some(ef) = ef_search {

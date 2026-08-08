@@ -417,6 +417,17 @@ pub trait Engine {
     fn search_params(&self) -> &[SearchParams];
 
     /// Collect memory usage stats after upload (matches Python v0 get_memory_usage)
+    /// Whether this engine has a sparse / hybrid (dense+sparse) code path.
+    ///
+    /// Default `false`: only Qdrant implements one. The runner checks this BEFORE
+    /// resolving the dataset path, so pointing a sparse dataset at another engine
+    /// is skipped with a clear message instead of downloading hundreds of MB,
+    /// building an index at the fallback dimension, and only then failing in the
+    /// reader with "Unsupported dataset type: sparse".
+    fn supports_sparse(&self) -> bool {
+        false
+    }
+
     fn get_memory_usage(&mut self) -> Option<serde_json::Value> {
         None
     }

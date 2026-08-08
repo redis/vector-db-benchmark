@@ -293,11 +293,11 @@ Omitting the flag preserves the standard search-only benchmark behavior.
 
 ## Multi-tenancy
 
-Multi-tenancy benchmarks model many tenants sharing **one** index: every search is scoped to a single tenant via an exact keyword-equality filter on a `tenant` field (`schema: { "tenant": "keyword" }`), and recall is measured against the nearest neighbours **within that tenant only**. This reuses the standard keyword-TAG filter path (no engine-specific code) and mirrors upstream qdrant/vector-db-benchmark's `random-768-*-tenants` scenario (registered here as `random-768-25-tenants`). The per-query filter looks like `{"and":[{"tenant":{"match":{"value":"tenant_7"}}}]}`. Because ground truth is tenant-local, recall is a strong isolation signal — a leaked cross-tenant document displaces a correct neighbour and lowers recall — and the tests assert **exact** per-query recall (`== 1.0` against an exact search, one query per tenant), so any single cross-tenant leak fails the check. Redis and Valkey are covered end-to-end (over both RESP2 and RESP3) by the `test_binary_{redis,valkey}_tenancy` integration tests. (Recall is necessary but not by itself sufficient to *prove* zero leakage; strict per-id membership checking is a possible future hardening.)
+Multi-tenancy benchmarks model many tenants sharing **one** index: every search is scoped to a single tenant via an exact keyword-equality filter on a tenant field (`schema: { "<field>": "keyword" }` — the field is named `a` in `random-768-100-tenants` and `tenant` in `random-768-25-tenants`), and recall is measured against the nearest neighbours **within that tenant only**. This reuses the standard keyword-TAG filter path (no engine-specific code) and mirrors upstream qdrant/vector-db-benchmark's `random-768-*-tenants` scenario. Two are registered: **`random-768-100-tenants`** (1M points over 100 tenants) downloads, and is the reproducible one to benchmark with — note its tenant field is named `a` (`schema: { "a": "keyword" }`), matching the published tarball; `random-768-25-tenants` is a locally-generated placeholder using a `tenant` field. The per-query filter looks like `{"and":[{"tenant":{"match":{"value":"tenant_7"}}}]}` for the 25-tenant fixture, and `{"and":[{"a":{"match":{"value":"WLRCI"}}}]}` for the downloadable 100-tenant set (whose tenant ids are random 5-character strings). Because ground truth is tenant-local, recall is a strong isolation signal — a leaked cross-tenant document displaces a correct neighbour and lowers recall — and the tests assert **exact** per-query recall (`== 1.0` against an exact search, one query per tenant), so any single cross-tenant leak fails the check. Redis and Valkey are covered end-to-end (over both RESP2 and RESP3) by the `test_binary_{redis,valkey}_tenancy` integration tests. (Recall is necessary but not by itself sufficient to *prove* zero leakage; strict per-id membership checking is a possible future hardening.)
 
 ## Datasets
 
-Most datasets are automatically downloaded on first use. The image includes `random-100` (228KB) for quick smoke tests. (Exception: `random-768-25-tenants` is a locally-generated placeholder with no public download link yet — see the Multi-tenancy section.)
+Most datasets are automatically downloaded on first use. The image includes `random-100` (228KB) for quick smoke tests. (Exception: `random-768-25-tenants` is a locally-generated placeholder with no public download link — use the downloadable `random-768-100-tenants` instead; see the Multi-tenancy section.)
 
 | Dataset                                                                                                     | Dimensions |  Train size | Test size | Neighbors | Distance  |
 | ----------------------------------------------------------------------------------------------------------- | ---------: |  ---------: | --------: | --------: | --------- |
@@ -319,7 +319,11 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | [GIST-960: Image descriptors](http://ann-benchmarks.com)                                                   |        960 |   1,000,000 |     1,000 |       100 | L2        |
 | **Text and Knowledge Embeddings**                                                                          |            |             |           |           |           |
 | [DBpedia OpenAI-1M: Knowledge embeddings](https://www.dbpedia.org/)                                       |      1,536 |   1,000,000 |    10,000 |       100 | Cosine    |
+| [DBpedia OpenAI-100K: Knowledge embeddings](https://www.dbpedia.org/)                                     |      1,536 |     100,000 |     5,000 |        10 | Cosine    |
 | [LAION Small CLIP: Small CLIP embeddings](https://laion.ai/blog/laion-400-open-dataset/)                   |        512 |     100,000 |     1,000 |       100 | Cosine    |
+| **Sparse Vectors** (learned/lexical sparse embeddings — Qdrant is the only engine with a sparse path)        |            |             |           |           |           |
+| [MS MARCO Sparse-100K: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                |   *sparse* |     100,000 |     6,980 |        10 | Dot       |
+| [MS MARCO Sparse-1M: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                  |   *sparse* |   1,000,000 |     6,980 |        10 | Dot       |
 | **Yandex Datasets**                                                                                        |            |             |           |           |           |
 | [Yandex T2I: Text-to-image embeddings](https://research.yandex.com/)                                      |        200 |   1,000,000 |   100,000 |       100 | Dot       |
 | **Random and Synthetic**                                                                                   |            |             |           |           |           |
@@ -348,12 +352,20 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | Random Geo Radius-2048: Large synthetic geo queries (no filters)                                           |      2,048 |     100,000 |     1,000 |       100 | Cosine    |
 | Random Match Keyword Small Vocab-256: Small vocabulary keyword matching (with filters)                     |        256 |   1,000,000 |    10,000 |       100 | Cosine    |
 | Random Match Keyword Small Vocab-256: Small vocabulary keyword matching (no filters)                       |        256 |   1,000,000 |    10,000 |       100 | Cosine    |
+| **Multi-Tenancy** (many tenants share one index; every query scoped to one tenant)                          |            |             |           |           |           |
+| Random-768-100-tenants: 100 tenants, per-tenant scoped queries (tenant field `a`)                          |        768 |   1,000,000 |       200 |        25 | Cosine    |
 
 ### Generating local datasets
 
 The sparse-vector, hybrid (dense+sparse fusion), and multi-datatype filter code
 paths ship with **locally-generated** synthetic datasets — small, deterministic
-(fixed-seed) fixtures with **no public download link**. Generate them once with:
+(fixed-seed) fixtures with **no public download link**. (For sparse vectors at
+realistic scale, prefer the downloadable `msmarco-sparse-100K` / `-1M` in the
+table above; the synthetic fixture exists to exercise the code path fast. Both
+work: a sparse dataset's ground truth is read from either `neighbours.jsonl` —
+one JSON array of ids per query line, what the generator writes — or the binary
+`results.gt` those downloads ship.)
+Generate them once with:
 
 ```bash
 cargo run --release --bin generate-dataset          # writes into ./datasets

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use vector_db_benchmark::readers::{write_npy_vectors, write_sparse_matrix};
+use vector_db_benchmark::readers::{write_gt_neighbours, write_npy_vectors, write_sparse_matrix};
 use vector_db_benchmark::synthetic::{generate_hybrid, generate_sparse, HybridData, SparseData};
 
 /// Keyword values assigned round-robin to documents by `id % 4`.
@@ -1045,6 +1045,27 @@ pub struct SparseProject {
 /// dot-product (descending) ground truth. `engine_configs_json` is the verbatim
 /// `experiments/configurations/test.json`.
 pub fn write_sparse_project(dataset_name: &str, engine_configs_json: &str) -> SparseProject {
+    write_sparse_project_with_gt(dataset_name, engine_configs_json, false)
+}
+
+/// Same fixture, but the ground truth is written as the BINARY `results.gt`
+/// block the public `msmarco-sparse-*` datasets ship, with no `neighbours.jsonl`
+/// at all.
+///
+/// This is the only end-to-end exercise of the `results.gt` branch. Without it
+/// nothing proves the ids inside `results.gt` are 0-based row indices matching
+/// the ids the uploader assigns from `data.csr` row order — if they were 1-based
+/// (or document ids), recall on a published `msmarco-sparse-1M` run would be
+/// near zero and every other test in this repo would still be green.
+pub fn write_sparse_project_gt(dataset_name: &str, engine_configs_json: &str) -> SparseProject {
+    write_sparse_project_with_gt(dataset_name, engine_configs_json, true)
+}
+
+fn write_sparse_project_with_gt(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    binary_gt: bool,
+) -> SparseProject {
     const DIM: usize = 300;
     const NNZ: usize = 10;
     const N: usize = 150;
@@ -1070,7 +1091,11 @@ pub fn write_sparse_project(dataset_name: &str, engine_configs_json: &str) -> Sp
     fs::create_dir_all(root.join("results")).unwrap();
     write_sparse_matrix(ds_dir.join("data.csr").to_str().unwrap(), &data).unwrap();
     write_sparse_matrix(ds_dir.join("queries.csr").to_str().unwrap(), &queries).unwrap();
-    write_neighbours(&ds_dir, &neighbors);
+    if binary_gt {
+        write_gt_neighbours(ds_dir.join("results.gt").to_str().unwrap(), &neighbors).unwrap();
+    } else {
+        write_neighbours(&ds_dir, &neighbors);
+    }
 
     let datasets_json = serde_json::json!([{
         "name": dataset_name, "type": "sparse", "path": dataset_name,
