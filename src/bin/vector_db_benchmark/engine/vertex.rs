@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
@@ -46,6 +46,7 @@ use crate::engine::{
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
+use vector_db_benchmark::start_gate::WorkerPool;
 
 const DEFAULT_REGION: &str = "us-central1";
 const DEFAULT_MACHINE_TYPE: &str = "e2-standard-16";
@@ -1840,9 +1841,11 @@ impl Engine for VertexEngine {
         } else {
             num_to_run
         });
-        let closed_loop_start = Instant::now();
-        let open_loop_start = Arc::new(OnceLock::<Instant>::new());
-        let worker_ready = Arc::new(Barrier::new(workers + 1));
+        // Gate-synchronized start: every worker connects + primes, then parks at
+        // the gate, and the coordinator stamps one shared measurement start. The
+        // gate is count-agnostic, so a worker that fails to build its client,
+        // panics, or is never started by the OS makes the run a hard error rather
+        // than deadlocking the coordinator (#214).
 
         let queries = &queries;
         let neighbors = &neighbors;
@@ -1864,14 +1867,13 @@ impl Engine for VertexEngine {
         let mut dropped_queries = 0usize;
         let mut late_queries = 0usize;
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(workers);
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "vertex-search");
             for worker_id in 0..workers {
                 let query_idx = Arc::clone(&query_idx);
                 let pb = &pb;
-                let open_loop_start = Arc::clone(&open_loop_start);
-                let worker_ready = Arc::clone(&worker_ready);
-                handles.push(s.spawn(move || {
+                let ticket = pool.ticket();
+                pool.spawn(move || {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();
@@ -1893,20 +1895,19 @@ impl Engine for VertexEngine {
                     }) {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("Vertex worker client build failed: {}", e);
-                            // Always release the barrier (even on failure) so the
-                            // main thread isn't left blocked — the barrier and
-                            // connection-prime below are now unconditional, not
-                            // gated on timed_mode.
-                            worker_ready.wait();
+                            // A worker that cannot build its client would leave the
+                            // run at a lower real concurrency than the `parallel` it
+                            // reports; settle the ticket with the reason and let the
+                            // coordinator turn it into a hard error.
+                            ticket.fail(format!("vertex worker client build failed: {e}"));
                             return (t, p, r, mr, nd, sd, e2e, dropped, late);
                         }
                     };
 
-                    // Prime the connection with one discarded request, then wait at
-                    // the barrier, in EVERY mode (not just timed_mode). This keeps
-                    // the per-worker gRPC/TLS handshake + cold first RPC OUT of the
-                    // measured window: the main thread stamps the measurement start
+                    // Prime the connection with one discarded request, then park at
+                    // the gate, in EVERY mode (not just timed_mode). This keeps the
+                    // per-worker gRPC/TLS handshake + cold first RPC OUT of the
+                    // measured window: the coordinator stamps the measurement start
                     // only after all workers have connected. Previously the default
                     // closed-loop path skipped this, so its rps denominator included
                     // connection setup and understated QPS (#151-audit).
@@ -1923,17 +1924,12 @@ impl Engine for VertexEngine {
                         if let Err(e) = client.execute(prime_request) {
                             eprintln!("Vertex worker connection prime failed: {}", e);
                         }
-                        worker_ready.wait();
                     }
 
-                    // Measurement start is always set by the main thread after the
-                    // barrier; spin until it is visible so no measured request
-                    // predates the timer.
-                    let schedule_start = loop {
-                        if let Some(start) = open_loop_start.get() {
-                            break *start;
-                        }
-                        std::thread::yield_now();
+                    // Block until the coordinator stamps the shared measurement
+                    // start, so no measured request predates the timer.
+                    let Some(schedule_start) = ticket.arrive_and_wait() else {
+                        return (t, p, r, mr, nd, sd, e2e, dropped, late);
                     };
 
                     loop {
@@ -2025,23 +2021,20 @@ impl Engine for VertexEngine {
                         pb.inc(pb_pending);
                     }
                     (t, p, r, mr, nd, sd, e2e, dropped, late)
-                }));
+                })?;
             }
-            {
-                // Wait for every worker to finish connecting (barrier), then stamp
-                // the measurement start — unconditional now, so the default
-                // closed-loop rps denominator excludes connection setup, matching
-                // the open-loop/duration path.
-                worker_ready.wait();
-                let measurement_start = if open_loop.is_some() {
+            // Wait for every worker to finish connecting, then stamp the
+            // measurement start — unconditional, so the default closed-loop rps
+            // denominator excludes connection setup, matching the
+            // open-loop/duration path.
+            let (per_worker, measured_start) = pool.start_with(|| {
+                if open_loop.is_some() {
                     Instant::now() + Duration::from_millis(100)
                 } else {
                     Instant::now()
-                };
-                let _ = open_loop_start.set(measurement_start);
-            }
-            for h in handles {
-                let (t, p, r, mr, nd, sd, e2e, dropped, late) = h.join().unwrap();
+                }
+            })?;
+            for (t, p, r, mr, nd, sd, e2e, dropped, late) in per_worker {
                 latencies.extend(t);
                 precisions.extend(p);
                 recalls.extend(r);
@@ -2052,11 +2045,11 @@ impl Engine for VertexEngine {
                 dropped_queries += dropped;
                 late_queries += late;
             }
-        });
+            Ok(measured_start)
+        })?;
 
         pb.finish_and_clear();
-        let total_start = open_loop_start.get().copied().unwrap_or(closed_loop_start);
-        let total_time = total_start.elapsed().as_secs_f64();
+        let total_time = measured_start.elapsed().as_secs_f64();
 
         let succeeded = latencies.len();
         let attempted_queries = query_idx
@@ -2219,12 +2212,11 @@ impl Engine for VertexEngine {
         let search_idx = Arc::new(AtomicUsize::new(0));
         let update_idx = Arc::new(AtomicUsize::new(0));
         let pb = self.create_progress_bar(num_to_run);
-        // Fallback start; the measured window actually begins at `measured_start`,
-        // stamped after every worker has connected (below), so the rps denominator
-        // excludes per-worker gRPC/TLS connection setup (#151-audit).
-        let start_time = Instant::now();
-        let worker_ready = Arc::new(Barrier::new(workers + 1));
-        let measured_start = Arc::new(OnceLock::<Instant>::new());
+        // The measured window begins at the instant stamped after every worker has
+        // connected (below), so the rps denominator excludes per-worker gRPC/TLS
+        // connection setup (#151-audit). The gate is count-agnostic, so a worker
+        // that fails to build its clients, panics, or is never started by the OS
+        // makes the run a hard error instead of deadlocking it (#214).
 
         let queries = &queries;
         let neighbors = &neighbors;
@@ -2244,15 +2236,14 @@ impl Engine for VertexEngine {
         let mut ndcgs: Vec<f64> = Vec::new();
         let mut update_times: Vec<f64> = Vec::new();
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(workers);
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "vertex-mixed");
             for _ in 0..workers {
                 let search_idx = Arc::clone(&search_idx);
                 let update_idx = Arc::clone(&update_idx);
-                let worker_ready = Arc::clone(&worker_ready);
-                let measured_start = Arc::clone(&measured_start);
+                let ticket = pool.ticket();
                 let pb = &pb;
-                handles.push(s.spawn(move || {
+                pool.spawn(move || {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();
@@ -2271,8 +2262,9 @@ impl Engine for VertexEngine {
                     }) {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("Vertex mixed worker build failed: {e}");
-                            worker_ready.wait();
+                            // Settle the ticket so the run fails loudly rather than
+                            // silently measuring one worker short of `parallel`.
+                            ticket.fail(format!("vertex mixed worker build failed: {e}"));
                             return (t, p, r, mr, nd, ut);
                         }
                     };
@@ -2282,14 +2274,13 @@ impl Engine for VertexEngine {
                     {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("Vertex mixed update client build failed: {e}");
-                            worker_ready.wait();
+                            ticket.fail(format!("vertex mixed update client build failed: {e}"));
                             return (t, p, r, mr, nd, ut);
                         }
                     };
 
                     // Prime the query connection with one discarded search, then
-                    // wait at the barrier, so the measured window excludes the
+                    // park at the gate, so the measured window excludes the
                     // per-worker gRPC/TLS handshake + cold first RPC — both search
                     // rps and update_rps use total_time as denominator. Mirrors the
                     // closed-loop search() path.
@@ -2306,13 +2297,9 @@ impl Engine for VertexEngine {
                             eprintln!("Vertex mixed worker connection prime failed: {e}");
                         }
                     }
-                    worker_ready.wait();
                     // Don't issue a measured request before the timer starts.
-                    loop {
-                        if measured_start.get().is_some() {
-                            break;
-                        }
-                        std::thread::yield_now();
+                    if ticket.arrive_and_wait().is_none() {
+                        return (t, p, r, mr, nd, ut);
                     }
 
                     'outer: loop {
@@ -2389,14 +2376,12 @@ impl Engine for VertexEngine {
                         pb.inc(pb_pending);
                     }
                     (t, p, r, mr, nd, ut)
-                }));
+                })?;
             }
             // All workers have connected + primed; stamp the measured start now so
             // total_time excludes connection setup.
-            worker_ready.wait();
-            let _ = measured_start.set(Instant::now());
-            for h in handles {
-                let (t, p, r, mr, nd, ut) = h.join().unwrap();
+            let (per_worker, measured_start) = pool.start()?;
+            for (t, p, r, mr, nd, ut) in per_worker {
                 latencies.extend(t);
                 precisions.extend(p);
                 recalls.extend(r);
@@ -2404,14 +2389,10 @@ impl Engine for VertexEngine {
                 ndcgs.extend(nd);
                 update_times.extend(ut);
             }
-        });
+            Ok(measured_start)
+        })?;
         pb.finish_and_clear();
-        let total_time = measured_start
-            .get()
-            .copied()
-            .unwrap_or(start_time)
-            .elapsed()
-            .as_secs_f64();
+        let total_time = measured_start.elapsed().as_secs_f64();
 
         if latencies.is_empty() {
             return Err("No searches completed (all mixed queries failed)".to_string());

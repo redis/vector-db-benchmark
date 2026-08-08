@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod parsers;
 pub mod readers;
 pub mod redis_client;
+pub mod start_gate;
 pub mod synthetic;
 
 // Re-export commonly used types

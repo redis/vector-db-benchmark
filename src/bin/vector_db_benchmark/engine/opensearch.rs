@@ -16,6 +16,7 @@ use opensearch::indices::{
 };
 use opensearch::{BulkParts, OpenSearch, SearchParts};
 use uuid::Uuid;
+use vector_db_benchmark::start_gate::WorkerPool;
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
@@ -1505,17 +1506,13 @@ impl Engine for OpenSearchEngine {
         let timeout = self.timeout;
         let index_name = self.index_name.clone();
 
-        // Barrier-synchronized start so connection setup AND the cold first query
-        // fall OUTSIDE the measured window (mirrors the Redis/Vertex engines).
-        // Every worker builds its runtime + client and primes with one discarded
-        // query, then blocks on `ready`; the main thread stamps the shared start
-        // instant into `start_cell` and releases `go`, so the measurement clock
-        // starts only once all workers are warm and poised. A worker that fails to
-        // set up MUST still pass both barriers before returning, or the run would
-        // deadlock.
-        let ready = Arc::new(std::sync::Barrier::new(parallel + 1));
-        let go = Arc::new(std::sync::Barrier::new(parallel + 1));
-        let start_cell = Arc::new(std::sync::OnceLock::<Instant>::new());
+        // Gate-synchronized start so connection setup AND the cold first query
+        // fall OUTSIDE the measured window. Every worker connects + primes, then
+        // parks at the gate; `WorkerPool::start` stamps the shared start instant and
+        // releases everyone, so the measurement clock starts only once all workers
+        // are warm and poised. The gate is count-agnostic: a worker that fails to
+        // set up, panics, or is never started by the OS settles its ticket and turns
+        // the run into a hard error instead of a hang (#214).
 
         let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
@@ -1523,8 +1520,8 @@ impl Engine for OpenSearchEngine {
         let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(parallel);
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "opensearch-search");
             for _ in 0..parallel {
                 let base_url = base_url.clone();
                 let index_name = index_name.clone();
@@ -1532,12 +1529,11 @@ impl Engine for OpenSearchEngine {
                 let tops = &tops;
                 let raw_bodies = &raw_bodies;
                 let query_idx = Arc::clone(&query_idx);
-                let ready = Arc::clone(&ready);
-                let go = Arc::clone(&go);
+                let ticket = pool.ticket();
                 let retried_queries = Arc::clone(&retried_queries);
                 let pb = &pb;
 
-                handles.push(s.spawn(move || {
+                pool.spawn(move || {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
                     let mut r = Vec::new();
@@ -1549,18 +1545,21 @@ impl Engine for OpenSearchEngine {
                         .build()
                     {
                         Ok(rt) => rt,
-                        Err(_) => {
-                            // Still cross both barriers so peers aren't stranded.
-                            ready.wait();
-                            go.wait();
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
                             return (t, p, r, mr, nd);
                         }
                     };
                     let client = match create_os_client(&base_url, timeout) {
                         Ok(c) => c,
-                        Err(_) => {
-                            ready.wait();
-                            go.wait();
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
                             return (t, p, r, mr, nd);
                         }
                     };
@@ -1572,10 +1571,11 @@ impl Engine for OpenSearchEngine {
                         let _ = knn_send(&rt, &client, &index_name, &raw_bodies[0], search_policy);
                     }
 
-                    // Signal "connected + primed", then block until the main thread
+                    // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
-                    ready.wait();
-                    go.wait();
+                    if ticket.arrive_and_wait().is_none() {
+                        return (t, p, r, mr, nd);
+                    }
 
                     loop {
                         let idx = query_idx.fetch_add(1, Ordering::Relaxed);
@@ -1628,34 +1628,27 @@ impl Engine for OpenSearchEngine {
                         pb.inc(1);
                     }
                     (t, p, r, mr, nd)
-                }));
+                })?;
             }
 
-            // All workers are connected + primed and blocked on `go`. Stamp the
-            // shared measurement start and release them simultaneously. The cold
-            // setup is already behind the barrier.
-            ready.wait();
-            let st = Instant::now();
-            start_cell.set(st).ok();
-            go.wait();
+            // Every worker is connected + primed and parked at the gate.
+            // Stamp the shared measurement start and release them together.
+            let (per_worker, measured_start) = pool.start()?;
 
-            for h in handles {
-                let (t, p, r, mr, nd) = h.join().unwrap();
+            for (t, p, r, mr, nd) in per_worker {
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
                 mrr_vals.extend(mr);
                 ndcg_vals.extend(nd);
             }
-        });
+            Ok(measured_start)
+        })?;
 
         pb.finish_and_clear();
-        // Measure from the post-barrier start stamp (workers already primed), so
+        // Measure from the post-gate start stamp (workers already primed), so
         // total_time excludes connection setup and the cold first query.
-        let total_time = start_cell
-            .get()
-            .map(|st| st.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        let total_time = measured_start.elapsed().as_secs_f64();
 
         // Dropped queries are NOT refused here. `compute_search_stats` derives
         // `failed_queries` as `requested_queries - times.len()` for every engine,

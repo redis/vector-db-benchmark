@@ -182,3 +182,93 @@ fn inv3_no_nearest_rank_percentile_indexing() {
         violations.join("\n")
     );
 }
+
+/// INV-4 — no fixed-count start barrier in a search harness (#214).
+///
+/// Every engine used to synchronize its measured-window start with
+/// `Barrier::new(parallel + 1)`, a participant count fixed *before* the workers
+/// exist. Two ordinary failures then hang the run forever with no output: the
+/// OS refusing a thread (`Scope::spawn` panics; the workers already parked at
+/// the barrier are joined by `thread::scope` and never released), and a worker
+/// panicking before it arrives. `--search-timeout` defaults to `0.0`, so
+/// nothing breaks the hang.
+///
+/// The replacement is `vector_db_benchmark::start_gate`, whose wait is
+/// satisfied by ticket *outcomes* rather than a count. This guard fails the
+/// moment a fixed-count barrier reappears in an engine.
+#[test]
+fn inv4_no_fixed_count_start_barrier_in_search_harnesses() {
+    let mut violations = Vec::new();
+    for entry in fs::read_dir(engine_dir()).expect("read engine dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = fs::read_to_string(&path).expect("read engine source");
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        for (lineno, line) in src.lines().enumerate() {
+            if line.contains("Barrier::new(") {
+                violations.push(format!("  {}:{} {}", name, lineno + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "INV-4 VIOLATED: a fixed-count start barrier reappeared in an engine. Sizing the \
+         wait before the workers exist deadlocks the run when the OS refuses a thread or a \
+         worker panics before arriving (#214) — use `vector_db_benchmark::start_gate::\
+         WorkerPool` / `StartGate`, whose wait is satisfied by ticket outcomes. \
+         Offenders:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// INV-4b — every engine that fans out a timed search actually routes its start
+/// through the gate. Without this, INV-4 could be "satisfied" by an engine that
+/// grew some other fixed-count wait, or by one that silently lost its
+/// synchronized start altogether.
+#[test]
+fn inv4_search_harnesses_route_through_the_start_gate() {
+    // Engines with a parallel, gate-synchronized measured window. Turbopuffer is
+    // absent deliberately: it has no warm-up gate, its workers start on spawn.
+    const GATED: &[&str] = &[
+        "chroma.rs",
+        "dragonfly.rs",
+        "elasticsearch.rs",
+        "kividb.rs",
+        "milvus.rs",
+        "mongodb_engine.rs",
+        "opensearch.rs",
+        "pgvector.rs",
+        "qdrant.rs",
+        "redis.rs",
+        "valkey.rs",
+        "vectorsets.rs",
+        "vertex.rs",
+        "weaviate.rs",
+    ];
+
+    let mut missing = Vec::new();
+    for &file in GATED {
+        let src = read_engine(file);
+        let uses_gate = src.contains("start_gate::WorkerPool")
+            || src.contains("start_gate::{StartGate, WorkerPool}");
+        let arrives = src.contains("ticket.arrive_and_wait()");
+        if !uses_gate || !arrives {
+            missing.push(format!(
+                "  {} (imports gate: {}, parks at gate: {})",
+                file, uses_gate, arrives
+            ));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "INV-4b VIOLATED: a search harness no longer starts its workers through \
+         `start_gate` (#214). Either it regressed to an ad-hoc synchronization \
+         primitive, or its warm-up gate was dropped and connection setup is back \
+         inside the measured window. Offenders:\n{}",
+        missing.join("\n")
+    );
+}
