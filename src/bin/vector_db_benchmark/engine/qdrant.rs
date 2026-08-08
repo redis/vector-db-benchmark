@@ -1733,7 +1733,7 @@ impl Engine for QdrantEngine {
             // "cannot tell", and `unwrap_or(0)` would turn that into "the corpus
             // is gone" — the exact fabrication `ft_info_num_docs` is careful to
             // avoid (see its `missing_field_is_none_not_zero` test). None here
-            // lands in `Unverifiable`, which says so out loud.
+            // lands in `NoServerCount`, which says so out loud.
             Ok(info) => Ok(info
                 .result
                 .and_then(|r| r.points_count)

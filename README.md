@@ -324,6 +324,15 @@ rules follow, and all three are enforced:
      ES index, a shard that did not answer) → a hard error that says *probe
      failure*. It is never reported as "the corpus is empty": that names the wrong
      problem and invites a re-upload over a corpus that was fine.
+   - the **dataset's own expected row count cannot be determined** → a hard error
+     as well (issue #290). That count is measured from the corpus *file*, so this
+     is squarely a `--skip-upload` situation: a `sparse`/`h5-multi` layout whose
+     files are not on this machine, a corpus file deleted to reclaim disk while
+     `tests.jsonl` (queries + ground truth) stayed behind, or a header read that
+     failed. Until #290 it printed a note and ran anyway — and over an empty
+     corpus that publishes `mean_recall: 0.0` with `failed_queries: 0` and exit 0.
+     It is the same outcome as a short corpus with *less* information, not a
+     milder one. `--allow-partial-corpus` waives it, and the waiver is recorded.
    - no count implemented for the engine → a printed note that the reuse went
      unverified. Implemented for Redis, Valkey, Dragonfly, KiviDB, VectorSets,
      Qdrant, Elasticsearch, OpenSearch, pgvector and MongoDB. Chroma, Milvus and
@@ -338,7 +347,8 @@ rules follow, and all three are enforced:
    so reach for it last, and only deliberately.
 
 The verdict is recorded in every result file it applies to, under
-`params.corpus_reuse` (`status`, `expected_rows`, `actual_rows`,
+`params.corpus_reuse` (`status` — one of `verified`, `surplus`, `short`,
+`corpus_size_unknown`, `unverified` — plus `expected_rows`, `actual_rows`,
 `actual_is_estimate`, `waived_by_allow_partial_corpus`), and a rejected
 experiment is listed in the summary under `rejected_experiments` — otherwise a
 sweep that lost most of its configs produces a summary and a chart

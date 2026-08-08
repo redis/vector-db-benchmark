@@ -49,14 +49,18 @@ pub struct Args {
     pub skip_upload: bool,
 
     /// Downgrade the `--skip-upload` reuse precondition from a hard error to a
-    /// warning (issue #238).
+    /// warning (issues #238, #290).
     ///
     /// By default a `--skip-upload` run aborts when the engine holds fewer rows
     /// than the dataset declares — including zero, i.e. a missing index — because
     /// recall is scored against ground truth for the FULL corpus and a short
     /// corpus therefore publishes a wrong number under a config name that claims
-    /// otherwise. Set this to measure a deliberately partial corpus, or when the
-    /// server-side count cannot be read at all (restrictive ACLs).
+    /// otherwise. It also aborts when the check cannot be made at all: when the
+    /// server-side count cannot be read (restrictive ACLs, unreachable server),
+    /// and when the dataset's own expected row count cannot be determined —
+    /// typically because its corpus is not on this machine, which is exactly the
+    /// `--skip-upload` situation (#290). Set this to run anyway; the waiver is
+    /// recorded in the result file under `params.corpus_reuse`.
     #[arg(long, default_value = "false")]
     pub allow_partial_corpus: bool,
 
