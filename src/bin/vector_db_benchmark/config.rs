@@ -379,11 +379,7 @@ mod tests {
     /// => 1_000_000, `..._100k` => 100_000, `...-1G-...` => 1_000_000_000. The
     /// LAST such token wins. `None` when the name says nothing about size.
     fn path_implied_corpus_size(path: &serde_json::Value) -> Option<i64> {
-        let leaf = path
-            .as_str()?
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .next_back()?;
+        let leaf = path.as_str()?.split('/').rfind(|s| !s.is_empty())?;
         let mut implied = None;
         for tok in leaf.split(['_', '-', '.']) {
             let (digits, suffix) = tok.split_at(tok.len().checked_sub(1)?);
