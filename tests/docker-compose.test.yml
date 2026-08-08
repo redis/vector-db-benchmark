@@ -11,6 +11,12 @@ services:
 
   pgvector:
     image: pgvector/pgvector:pg18
+    # Every search worker holds one connection for the whole run, and the
+    # shipped `pgvector-single-node.json` has 25 points at `parallel: 100`.
+    # Postgres defaults to max_connections=100 with 3 reserved for superusers,
+    # so a stock server cannot seat them — which is now a hard error rather
+    # than a run labelled `parallel: 100` that 97 workers actually ran (#214).
+    command: ["postgres", "-c", "max_connections=200"]
     environment:
       POSTGRES_PASSWORD: "passwd"
     ports:

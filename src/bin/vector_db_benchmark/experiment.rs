@@ -621,6 +621,14 @@ fn run_single_experiment(
     // Configs that lost queries, collected so --fail-on-dropped-queries can fail
     // the run *after* every result file is written rather than instead of it.
     let mut dropped_query_failures: Vec<String> = Vec::new();
+    // A search point whose every repetition failed. Recorded rather than
+    // returned on the spot: an early `return` here would drop `pending_saves`
+    // on the floor, throwing away every point that already succeeded. The
+    // repo's stated policy for --fail-on-dropped-queries — "results files are
+    // still written before the run fails, so the evidence survives" — applies
+    // just as much to a hard search failure, and matters more now that a
+    // short-staffed worker pool is one of them (#214).
+    let mut fatal_search_error: Option<String> = None;
     let skip_vector_index = args.skip_vector_index;
 
     if !args.skip_search {
@@ -676,7 +684,7 @@ fn run_single_experiment(
             all_search_params.into_iter().enumerate().collect()
         };
 
-        for phase in &search_phases {
+        'search_phase: for phase in &search_phases {
             // --skip-vector-index: skip mixed phases (no vector updates to benchmark)
             if skip_vector_index && phase.is_some() {
                 continue;
@@ -1047,7 +1055,8 @@ fn run_single_experiment(
                         );
                         eprintln!("\t{}", msg);
                         if args.exit_on_error {
-                            return Err(msg);
+                            fatal_search_error = Some(msg);
+                            break 'search_phase;
                         }
                     }
                 }
@@ -1074,6 +1083,18 @@ fn run_single_experiment(
             ground_truth.as_ref(),
             calibration.as_ref(),
         )?;
+    }
+
+    // Only now that the completed points are on disk may a hard search failure
+    // end the run.
+    if let Some(msg) = fatal_search_error {
+        if !pending_saves.is_empty() {
+            eprintln!(
+                "\t↳ wrote {} completed search point(s) before failing, so the evidence survives",
+                pending_saves.len()
+            );
+        }
+        return Err(msg);
     }
 
     // Now that the evidence is on disk, honour --fail-on-dropped-queries. Every

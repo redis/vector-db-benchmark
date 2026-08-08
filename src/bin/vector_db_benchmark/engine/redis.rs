@@ -26,6 +26,7 @@ use crate::metrics::compute_metrics;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, parse_ft_search_response};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
+use vector_db_benchmark::start_gate::WorkerPool;
 
 /// Redis engine configuration
 #[derive(Clone)]
@@ -2148,16 +2149,14 @@ impl Engine for RedisEngine {
         // environment inside the per-query timed window.
         let index_name = self.config.index_name.clone();
 
-        // Barrier-synchronized start so connection setup AND the cold first query
+        // Gate-synchronized start so connection setup AND the cold first query
         // fall OUTSIDE the measured window — for open-loop and closed-loop-duration
         // alike (mirrors the Vertex engine). Every worker connects + primes, then
-        // blocks on `ready`; the main thread stamps the shared start instant into
-        // `start_cell` and releases `go`, so the measurement clock starts only once
-        // all workers are warm and poised. A worker that fails to connect MUST
-        // still pass both barriers before returning, or the run would deadlock.
-        let ready = Arc::new(std::sync::Barrier::new(parallel + 1));
-        let go = Arc::new(std::sync::Barrier::new(parallel + 1));
-        let start_cell = Arc::new(std::sync::OnceLock::<Instant>::new());
+        // parks at the gate; `WorkerPool::start` stamps the shared start instant
+        // and releases everyone, so the measurement clock starts only once all
+        // workers are warm and poised. The gate is count-agnostic: a worker that
+        // fails to connect, panics, or is never started by the OS settles its
+        // ticket and turns the run into an error instead of a hang (#214).
 
         let sample_capacity = if closed_loop_duration.is_some() {
             queries.len()
@@ -2183,8 +2182,8 @@ impl Engine for RedisEngine {
             return Err("dataset ground-truth shorter than query set".into());
         }
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(parallel);
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "redis-search", parallel);
             for _ in 0..parallel {
                 let redis_url = self.redis_url.clone();
                 let algorithm = self.config.algorithm.clone();
@@ -2195,12 +2194,9 @@ impl Engine for RedisEngine {
                 let query_strs = &query_strs;
                 let query_idx = Arc::clone(&query_idx);
                 let index_name = index_name.as_str();
-                let ready = Arc::clone(&ready);
-                let go = Arc::clone(&go);
-                let start_cell = Arc::clone(&start_cell);
                 let pb = &pb;
 
-                handles.push(s.spawn(move || {
+                pool.spawn(move |ticket| {
                     // Thread-local sample buffers — no cross-thread synchronization
                     // in the timed loop.
                     let mut t = Vec::new();
@@ -2216,18 +2212,19 @@ impl Engine for RedisEngine {
 
                     let client = match redis::Client::open(redis_url.as_str()) {
                         Ok(c) => c,
-                        Err(_) => {
-                            // Still cross both barriers so peers aren't stranded.
-                            ready.wait();
-                            go.wait();
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the
+                            // run at parallel-1 real concurrency while still being
+                            // reported as `parallel`. Settle the ticket with the
+                            // reason; the coordinator turns it into a hard error.
+                            ticket.fail(format!("redis client open failed: {e}"));
                             return (t, p, r, mr, nd, sd, e2e, dropped, late);
                         }
                     };
                     let mut conn = match client.get_connection() {
                         Ok(c) => c,
-                        Err(_) => {
-                            ready.wait();
-                            go.wait();
+                        Err(e) => {
+                            ticket.fail(format!("redis connect failed: {e}"));
                             return (t, p, r, mr, nd, sd, e2e, dropped, late);
                         }
                     };
@@ -2256,11 +2253,11 @@ impl Engine for RedisEngine {
                         let _ = exec_ft_search(&mut conn, &prime_cmd);
                     }
 
-                    // Signal "connected + primed", then block until the main thread
+                    // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
-                    ready.wait();
-                    go.wait();
-                    let start_time = *start_cell.get().unwrap();
+                    let Some(start_time) = ticket.arrive_and_wait() else {
+                        return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                    };
 
                     loop {
                         if closed_loop_duration
@@ -2374,19 +2371,15 @@ impl Engine for RedisEngine {
                         pb.inc(pb_pending);
                     }
                     (t, p, r, mr, nd, sd, e2e, dropped, late)
-                }));
+                })?;
             }
 
-            // All workers are connected + primed and blocked on `go`. Stamp the
+            // Every worker is connected + primed and parked at the gate. Stamp the
             // shared measurement start and release them simultaneously. No arrival
-            // offset is needed now — the cold setup is already behind the barrier.
-            ready.wait();
-            let st = Instant::now();
-            start_cell.set(st).ok();
-            go.wait();
+            // offset is needed now — the cold setup is already behind the gate.
+            let (per_worker, measured_start) = pool.start()?;
 
-            for h in handles {
-                let (t, p, r, mr, nd, sd, e2e, dropped, late) = h.join().unwrap();
+            for (t, p, r, mr, nd, sd, e2e, dropped, late) in per_worker {
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
@@ -2397,15 +2390,13 @@ impl Engine for RedisEngine {
                 dropped_queries += dropped;
                 late_queries += late;
             }
-        });
+            Ok(measured_start)
+        })?;
 
         pb.finish_and_clear();
-        // Measure from the post-barrier start stamp (workers already primed), so
+        // Measure from the post-gate start stamp (workers already primed), so
         // total_time excludes connection setup and the cold first query.
-        let total_time = start_cell
-            .get()
-            .map(|st| st.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        let total_time = measured_start.elapsed().as_secs_f64();
 
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         let attempted_queries = query_idx
