@@ -1712,6 +1712,21 @@ fn build_qdrant_filter(
 }
 
 impl Engine for QdrantEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238). `points_count` from the collection info — the same figure
+    /// `GET /collections/<name>` reports. A missing collection answers 0.
+    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+        match self
+            .rt
+            .block_on(self.client.collection_info(&self.collection_name))
+        {
+            Ok(info) => Ok(Some(info.result.and_then(|r| r.points_count).unwrap_or(0))),
+            // "collection doesn't exist" is a normal error reply here, and for
+            // this check it means the same thing as an empty collection.
+            Err(_) => Ok(Some(0)),
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

@@ -1874,6 +1874,14 @@ fn prime_datetime_fields(schema: Option<&serde_json::Value>) -> HashSet<String> 
 // ── Engine trait implementation ──────────────────────────────────────────
 
 impl Engine for RedisEngine {
+    /// Server-side corpus size for this config's index, for the `--skip-upload`
+    /// reuse precondition (issue #238). `FT.INFO <index>` → `num_docs`; a missing
+    /// index counts as 0 (the corpus to reuse is not there).
+    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+        let mut conn = self.get_connection()?;
+        redis_utils::ft_index_num_docs(&mut conn, &self.config.index_name)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

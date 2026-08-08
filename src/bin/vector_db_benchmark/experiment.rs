@@ -410,6 +410,158 @@ fn parse_update_search_ratio(s: &str) -> Result<UpdateSearchRatio, String> {
     Ok(UpdateSearchRatio { updates, searches })
 }
 
+/// Outcome of the `--skip-upload` reuse precondition check, split out so it can
+/// be unit-tested without a server (issue #238).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReusePrecondition {
+    /// Server-side count matches (or exceeds, see `Surplus`) what the dataset declares.
+    Ok { actual: u64, expected: u64 },
+    /// Nothing to check against: the dataset has no measurable corpus size, or
+    /// the engine cannot report a server-side count. Proceed with a note.
+    Unverifiable(String),
+    /// The server holds MORE rows than the dataset declares. Warn and continue:
+    /// leftovers from a bigger corpus change the reported recall, but so does
+    /// refusing to run, and unlike a short corpus this is often deliberate
+    /// (a shared prefix, a superset upload).
+    Surplus { actual: u64, expected: u64 },
+    /// The server holds FEWER rows than the dataset declares — including zero,
+    /// i.e. a missing index/collection. Fatal: every reported recall/precision
+    /// figure is computed against ground truth for the FULL corpus, so a short
+    /// corpus silently publishes the wrong number.
+    Short { actual: u64, expected: u64 },
+}
+
+/// Classify a server-side corpus count against what the dataset declares.
+pub fn classify_reuse_precondition(
+    expected: Option<u64>,
+    actual: Option<u64>,
+    engine_name: &str,
+) -> ReusePrecondition {
+    match (expected, actual) {
+        (None, _) => ReusePrecondition::Unverifiable(
+            "dataset does not declare (and cannot measure) a corpus size".to_string(),
+        ),
+        (Some(_), None) => ReusePrecondition::Unverifiable(format!(
+            "engine '{}' cannot report a server-side row count",
+            engine_name
+        )),
+        (Some(e), Some(a)) if a < e => ReusePrecondition::Short {
+            actual: a,
+            expected: e,
+        },
+        (Some(e), Some(a)) if a > e => ReusePrecondition::Surplus {
+            actual: a,
+            expected: e,
+        },
+        (Some(e), Some(a)) => ReusePrecondition::Ok {
+            actual: a,
+            expected: e,
+        },
+    }
+}
+
+/// Verify the promise `--skip-upload` makes: that the corpus it is told to reuse
+/// is actually there, and whole (issue #238).
+///
+/// The check reads state back off the live server (`FT.INFO`/`SCAN`,
+/// `GET /collections/<n>`, `_count`, `countDocuments`, `SELECT count(*)`, ...) —
+/// "search returned no error" is not evidence, and neither is recall: a run
+/// against a half-deleted Qdrant collection reports `mean_recall: 1.0`.
+///
+/// Repo policy on what is fatal: a short corpus changes the reported number, so
+/// it is a hard error; everything softer is a warning.
+fn check_corpus_reuse_precondition(
+    engine: &mut dyn Engine,
+    dataset: &Dataset,
+    args: &Args,
+) -> Result<(), String> {
+    // Nothing is measured, so nothing can be misreported.
+    if args.skip_search {
+        return Ok(());
+    }
+
+    // The expected count MEASURES the corpus on disk where it can, rather than
+    // trusting a declared `vector_count` that may be smaller than the real
+    // corpus (#224).
+    let expected = match dataset.corpus_completeness_target() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("\tNote: could not determine the dataset's corpus size ({e}); --skip-upload reuse left unverified");
+            None
+        }
+    };
+
+    let actual = match engine.corpus_row_count() {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!(
+                "--skip-upload: could not read the server-side corpus size for engine '{}' ({}). \
+                 The flag promises to reuse an already-loaded corpus, and that promise is now \
+                 unverified — a missing or partial index would be measured and reported as if it \
+                 were complete. Fix the connection, or pass --allow-partial-corpus to run anyway.",
+                engine.name(),
+                e
+            );
+            if args.allow_partial_corpus {
+                eprintln!("WARNING: {msg}");
+                return Ok(());
+            }
+            return Err(msg);
+        }
+    };
+
+    match classify_reuse_precondition(expected, actual, engine.name()) {
+        ReusePrecondition::Ok { actual, expected } => {
+            println!(
+                "Experiment stage: Reuse check — server holds {actual} of {expected} expected rows"
+            );
+            Ok(())
+        }
+        ReusePrecondition::Unverifiable(why) => {
+            println!(
+                "Experiment stage: Reuse check — SKIPPED ({why}); \
+                 --skip-upload is running against an unverified corpus"
+            );
+            Ok(())
+        }
+        ReusePrecondition::Surplus { actual, expected } => {
+            eprintln!(
+                "WARNING: --skip-upload: engine '{}' holds {} rows but dataset '{}' declares {} — \
+                 the extra rows are searchable and can displace true neighbours, so recall may be \
+                 understated.",
+                engine.name(),
+                actual,
+                dataset.config.name,
+                expected
+            );
+            Ok(())
+        }
+        ReusePrecondition::Short { actual, expected } => {
+            let what = if actual == 0 {
+                "is empty or missing"
+            } else {
+                "is incomplete"
+            };
+            let msg = format!(
+                "--skip-upload: the corpus you asked to reuse {what} — engine '{}' holds {} of the \
+                 {} rows dataset '{}' declares. Recall/precision are scored against ground truth \
+                 for the FULL corpus, so continuing would publish a wrong number under a config \
+                 name that claims otherwise. Re-upload (drop --skip-upload, add --keep-data), or \
+                 pass --allow-partial-corpus to measure the partial corpus deliberately.",
+                engine.name(),
+                actual,
+                expected,
+                dataset.config.name
+            );
+            if args.allow_partial_corpus {
+                eprintln!("WARNING: {msg}");
+                return Ok(());
+            }
+            Err(msg)
+        }
+    }
+}
+
 /// Run a single experiment (configure, upload, search)
 fn run_single_experiment(
     engine: &mut dyn Engine,
@@ -477,11 +629,23 @@ fn run_single_experiment(
             &upload_stats,
             number_of_shards,
         )?;
-    } else if args.skip_vector_index {
-        // --skip-upload + --skip-vector-index: data already uploaded, but we need
-        // a schema-only index (previous run's index was dropped by delete()).
-        println!("Experiment stage: Configure (creating schema-only index for filter-only search)");
-        engine.configure(dataset)?;
+    } else {
+        // `--skip-upload` means: the server already holds the corpus I want —
+        // do not create, drop, recreate or otherwise modify it. `configure()` is
+        // destructive on 13 of the 15 engines (FT.DROPINDEX ... DD, SCAN+UNLINK,
+        // collection.drop(), DROP TABLE, DELETE /collections/<n>, ...), so it must
+        // NOT run here under any flag combination.
+        //
+        // This used to have an `else if args.skip_vector_index` arm that called
+        // `configure()` "to create a schema-only index". It destroyed the corpus
+        // the flags had just promised to reuse and then measured the empty index
+        // without a word (issue #238) — verified live: Redis 400 -> 0 docs,
+        // Valkey 400 -> 0 keys, MongoDB 400 -> 0 documents, each still printing a
+        // QPS number and exiting 0. The arm is also unnecessary: the prior
+        // `--skip-vector-index --keep-data` upload runs under the SAME rewritten
+        // config name (`<engine>-no-vector`), so it left exactly the schema-only
+        // index this run needs.
+        check_corpus_reuse_precondition(engine, dataset, args)?;
     }
 
     // Build ordered search phases: pure search first, then mixed ratios ascending
@@ -1939,5 +2103,90 @@ mod tests {
                 note
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reuse_precondition_tests {
+    use super::{classify_reuse_precondition, ReusePrecondition};
+
+    // A corpus shorter than the dataset declares is the case that publishes a
+    // wrong recall under a config name claiming otherwise (issue #238).
+    #[test]
+    fn short_corpus_is_short() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(200), "redis-x"),
+            ReusePrecondition::Short {
+                actual: 200,
+                expected: 400
+            }
+        );
+    }
+
+    // A missing index/collection reports 0 rows. Same verdict as a truncated
+    // one: the corpus the flags promised to reuse is not there.
+    #[test]
+    fn missing_corpus_is_short_not_ok() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(0), "redis-x"),
+            ReusePrecondition::Short {
+                actual: 0,
+                expected: 400
+            }
+        );
+    }
+
+    #[test]
+    fn exact_match_is_ok() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(400), "redis-x"),
+            ReusePrecondition::Ok {
+                actual: 400,
+                expected: 400
+            }
+        );
+    }
+
+    // Extra rows affect the number too, but unlike a shortfall they are often
+    // deliberate (a shared prefix, a superset upload) — warn, do not abort.
+    #[test]
+    fn surplus_is_a_warning_not_an_error() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(401), "redis-x"),
+            ReusePrecondition::Surplus {
+                actual: 401,
+                expected: 400
+            }
+        );
+    }
+
+    // Nothing to compare against must never be silently reported as "Ok" — the
+    // runner has to say the reuse went unverified.
+    #[test]
+    fn unknown_expected_or_actual_is_unverifiable() {
+        assert!(matches!(
+            classify_reuse_precondition(None, Some(400), "redis-x"),
+            ReusePrecondition::Unverifiable(_)
+        ));
+        let why = match classify_reuse_precondition(Some(400), None, "chroma-y") {
+            ReusePrecondition::Unverifiable(w) => w,
+            other => panic!("expected Unverifiable, got {other:?}"),
+        };
+        assert!(
+            why.contains("chroma-y"),
+            "the note must name the engine that cannot count: {why}"
+        );
+    }
+
+    // Zero expected rows cannot make a zero-row server look short.
+    #[test]
+    fn zero_expected_never_fires() {
+        assert_eq!(
+            classify_reuse_precondition(Some(0), Some(0), "redis-x"),
+            ReusePrecondition::Ok {
+                actual: 0,
+                expected: 0
+            }
+        );
     }
 }

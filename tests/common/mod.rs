@@ -57,7 +57,7 @@ fn matches_labels_filter(id: usize) -> bool {
     MATCH_ANY_LABELS.iter().any(|q| l.contains(q))
 }
 
-const N_DOCS: usize = 400;
+pub const N_DOCS: usize = 400;
 const N_QUERIES: usize = 10;
 const TOP: usize = 10;
 

@@ -2842,3 +2842,233 @@ fn test_binary_redis_skip_upload_without_prior_upload_errors() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #238 — `--skip-upload` must NOT destroy the corpus it was told to reuse
+// ---------------------------------------------------------------------------
+
+/// Count keys under a literal prefix, server-side.
+fn count_prefix(conn: &mut Connection, prefix: &str) -> i64 {
+    redis::cmd("EVAL")
+        .arg("return #redis.call('keys', KEYS[1])")
+        .arg(1)
+        .arg(format!("{prefix}*"))
+        .query(conn)
+        .unwrap()
+}
+
+/// Regression test for #238: `--skip-upload --skip-vector-index` destroyed the
+/// corpus and then measured the empty index, reporting a QPS number and exiting
+/// 0.
+///
+/// The assertions read state back **off the live server** (`FT.INFO num_docs`
+/// plus a keyspace count), because the run's own output cannot detect this: on
+/// the unfixed binary phase 2 prints a perfectly ordinary QPS line.
+///
+/// RED on unfixed code: `configure()` ran on the skip-upload path and issued
+/// `FT.DROPINDEX idx:redis-no-vector DD`, so both counts come back 0 instead of
+/// 400 (verified live on redis 8.2: DBSIZE 400 -> 0).
+#[test]
+fn test_binary_redis_skip_upload_skip_vector_index_preserves_corpus() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "redis-238-keep", "engine": "redis",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "redis-238-keep-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = TEST_PORT.to_string();
+    let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
+
+    // Phase 1: build the filter-only corpus the second phase is told to reuse.
+    // `--skip-vector-index` rewrites the config name to `<engine>-no-vector`, so
+    // the index/keyspace phase 2 addresses is the one phase 1 wrote.
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "redis-238-keep",
+            "redis-238-keep-test",
+            "localhost",
+            &envs,
+            &["--skip-vector-index", "--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload with --skip-vector-index) failed"
+    );
+
+    let docs_before = ft_info_num_docs(&mut conn, "idx:redis-no-vector");
+    let keys_before = count_prefix(&mut conn, "redis-no-vector:");
+    assert_eq!(
+        docs_before,
+        common::N_DOCS as i64,
+        "phase 1 must leave a complete corpus indexed"
+    );
+    assert_eq!(keys_before, common::N_DOCS as i64, "phase 1 keyspace");
+
+    // Phase 2: the flag combination that means "do not upload, do not build an
+    // index, just use what is there".
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "redis-238-keep",
+            "redis-238-keep-test",
+            "localhost",
+            &envs,
+            &["--skip-upload", "--skip-vector-index", "--keep-data"],
+        ),
+        "phase 2 (--skip-upload --skip-vector-index) failed"
+    );
+
+    let docs_after = ft_info_num_docs(&mut conn, "idx:redis-no-vector");
+    let keys_after = count_prefix(&mut conn, "redis-no-vector:");
+    assert_eq!(
+        docs_after, docs_before,
+        "--skip-upload --skip-vector-index destroyed the indexed corpus \
+         ({docs_before} -> {docs_after} docs) — issue #238"
+    );
+    assert_eq!(
+        keys_after, keys_before,
+        "--skip-upload --skip-vector-index destroyed the keyspace \
+         ({keys_before} -> {keys_after} keys) — issue #238"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// Regression test for #238's second half: a `--skip-upload` run against a
+/// SHORT corpus must not quietly measure it.
+///
+/// Deleting half the docs leaves an index that answers every query without
+/// error, so no behavioural assertion catches it — and recall does not either
+/// (the same experiment on Qdrant reported `mean_recall: 1.0` with half the
+/// collection gone). Only a server-side row count does.
+///
+/// RED on unfixed code: phase 2 exits 0 and writes a search result file.
+#[test]
+fn test_binary_redis_skip_upload_short_corpus_is_fatal() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "redis-238-short", "engine": "redis",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "redis-238-short-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = TEST_PORT.to_string();
+    let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
+    let results_dir = proj.root.join("results");
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "redis-238-short",
+            "redis-238-short-test",
+            "localhost",
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:redis-238-short"),
+        common::N_DOCS as i64,
+        "phase 1 must leave a complete corpus"
+    );
+
+    // Amputate half the corpus behind the tool's back.
+    let half = common::N_DOCS / 2;
+    for id in 0..half {
+        let _: () = redis::cmd("UNLINK")
+            .arg(format!("redis-238-short:{id}"))
+            .query(&mut conn)
+            .unwrap();
+    }
+    let remaining = ft_info_num_docs(&mut conn, "idx:redis-238-short");
+    assert_eq!(remaining, half as i64, "half the corpus should remain");
+
+    delete_search_result_files(&results_dir);
+
+    let bin = binary_path();
+    let run = |extra: &[&str]| {
+        let mut cmd = Command::new(&bin);
+        cmd.args([
+            "--engines",
+            "redis-238-short",
+            "--datasets",
+            "redis-238-short-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ]);
+        cmd.args(extra);
+        cmd.env("REDIS_PORT", &port)
+            .current_dir(&proj.root)
+            .output()
+            .expect("run vector-db-benchmark")
+    };
+
+    let out = run(&[]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a half-deleted corpus must be a hard error \
+         (issue #238), but the run succeeded.\n{combined}"
+    );
+    assert!(
+        combined.contains("the corpus you asked to reuse is incomplete")
+            && combined.contains(&format!("holds {half} of the {} rows", common::N_DOCS)),
+        "the error must name the shortfall it found.\n{combined}"
+    );
+    let wrote_results = fs::read_dir(&results_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().contains("-search-"));
+    assert!(
+        !wrote_results,
+        "a rejected --skip-upload run must not leave a search result file behind"
+    );
+
+    // The guard must be deliberately overridable — and must never have been a
+    // reason to touch the data.
+    let out2 = run(&["--allow-partial-corpus"]);
+    assert!(
+        out2.status.success(),
+        "--allow-partial-corpus must downgrade the guard to a warning.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out2.stderr).contains("WARNING: --skip-upload"),
+        "the override must still warn"
+    );
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:redis-238-short"),
+        half as i64,
+        "the reuse check must never modify the corpus"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

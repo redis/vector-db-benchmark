@@ -376,6 +376,47 @@ pub fn ensure_index_exists(conn: &mut Connection, index_name: &str) -> Result<()
         })
 }
 
+/// `num_docs` from an `FT.INFO` reply (RESP2 flat array or RESP3 map).
+///
+/// This is the count the search actually sees — keys that exist but are not (yet)
+/// in the index cannot answer a query, so a raw keyspace count would overstate
+/// the corpus. Returns `None` when the reply carries no `num_docs` field.
+pub fn ft_info_num_docs(v: &redis::Value) -> Option<u64> {
+    let pairs: Vec<(String, &redis::Value)> = match v {
+        redis::Value::Map(m) => m.iter().map(|(k, val)| (value_to_string(k), val)).collect(),
+        redis::Value::Array(items) => items
+            .chunks_exact(2)
+            .map(|c| (value_to_string(&c[0]), &c[1]))
+            .collect(),
+        _ => return None,
+    };
+    pairs
+        .into_iter()
+        .find(|(k, _)| k == "num_docs")
+        .and_then(|(_, val)| match val {
+            redis::Value::Int(n) => u64::try_from(*n).ok(),
+            other => value_to_string(other).parse::<u64>().ok(),
+        })
+}
+
+/// Server-side corpus size for a RediSearch-family index, for the `--skip-upload`
+/// reuse precondition (issue #238).
+///
+/// A **missing** index answers `Ok(Some(0))` rather than an error: for this check
+/// "the index is gone" and "the index is empty" are the same fact — the corpus the
+/// user promised to reuse is not there. An index that exists but reports no
+/// `num_docs` answers `Ok(None)` ("cannot tell"), never a fabricated zero.
+pub fn ft_index_num_docs(conn: &mut Connection, index_name: &str) -> Result<Option<u64>, String> {
+    match redis::cmd("FT.INFO")
+        .arg(index_name)
+        .query::<redis::Value>(conn)
+    {
+        Ok(v) => Ok(ft_info_num_docs(&v)),
+        // FT.INFO on an absent index is an error reply, not a transport failure.
+        Err(_) => Ok(Some(0)),
+    }
+}
+
 /// Per-index memory footprint in bytes, summed from every `*_mb` size field of
 /// an `FT.INFO` reply (RESP2 flat array or RESP3 map). Under issue #151-4's
 /// coexistence mode the server-wide `used_memory` is the SUM of all resident
@@ -739,5 +780,68 @@ mod metadata_tests {
         let cfg = parse_kv_map(&reply);
         assert_eq!(cfg["maxmemory"], "0");
         assert_eq!(cfg["save"], "3600 1");
+    }
+}
+
+#[cfg(test)]
+mod num_docs_tests {
+    use super::ft_info_num_docs;
+    use redis::Value;
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    // RESP2: FT.INFO is a flat alternating array; num_docs arrives as a string.
+    #[test]
+    fn reads_num_docs_from_resp2_array() {
+        let v = Value::Array(vec![
+            bulk("index_name"),
+            bulk("idx:cfg"),
+            bulk("num_docs"),
+            bulk("400"),
+            bulk("indexing"),
+            Value::Int(0),
+        ]);
+        assert_eq!(ft_info_num_docs(&v), Some(400));
+    }
+
+    // RESP3: a map, and num_docs may be a native integer.
+    #[test]
+    fn reads_num_docs_from_resp3_map() {
+        let v = Value::Map(vec![
+            (bulk("index_name"), bulk("idx:cfg")),
+            (bulk("num_docs"), Value::Int(400)),
+        ]);
+        assert_eq!(ft_info_num_docs(&v), Some(400));
+    }
+
+    // No num_docs field → "cannot tell", never a fabricated 0: a 0 would be read
+    // as "the corpus is gone" and abort a legitimate --skip-upload run (#238).
+    #[test]
+    fn missing_field_is_none_not_zero() {
+        let v = Value::Array(vec![bulk("index_name"), bulk("idx:cfg")]);
+        assert_eq!(ft_info_num_docs(&v), None);
+        assert_eq!(ft_info_num_docs(&Value::Nil), None);
+    }
+
+    // An empty index legitimately reports 0.
+    #[test]
+    fn empty_index_reports_zero() {
+        let v = Value::Array(vec![bulk("num_docs"), bulk("0")]);
+        assert_eq!(ft_info_num_docs(&v), Some(0));
+    }
+
+    // A negative or unparseable value must not wrap into a huge u64.
+    #[test]
+    fn nonsense_values_are_none() {
+        assert_eq!(
+            ft_info_num_docs(&Value::Array(vec![bulk("num_docs"), Value::Int(-1)])),
+            None
+        );
+        assert_eq!(
+            ft_info_num_docs(&Value::Array(vec![bulk("num_docs"), bulk("many")])),
+            None
+        );
     }
 }
