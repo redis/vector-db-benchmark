@@ -231,19 +231,35 @@ impl QdrantEngine {
     /// (`float32`/`float16`/`uint8` — half/byte storage roughly halves or
     /// quarters the vector footprint, so leaving it unread silently benchmarked
     /// full-precision storage instead of what the config asked for).
+    ///
+    /// `on_disk` is forwarded ONLY when the config actually declares it. An
+    /// explicit `false` is NOT equivalent to omitting the field: verified on
+    /// qdrant v1.18.2 with `optimizers_config.memmap_threshold: 1` by inspecting
+    /// the resulting segment layout —
+    ///
+    /// * omitted        -> `vector_storage/matrix.dat`            (mmap'd, on disk)
+    /// * explicit false -> `vector_storage/vectors/chunk_0.mmap`  (kept in RAM)
+    /// * explicit true  -> `vector_storage/matrix.dat`
+    ///
+    /// so an explicit `false` OVERRIDES `memmap_threshold`. Defaulting to
+    /// `false` therefore silently disabled mmap for every experiment that drives
+    /// on-disk storage through the threshold alone: `qdrant-on-disk-default` and
+    /// all six `qdrant-mmap-*` configurations ran their vectors in RAM while
+    /// their names, configs and results all said otherwise.
     fn dense_vector_params(
         &self,
         vector_size: i64,
         qdrant_distance: Distance,
     ) -> Result<VectorParamsBuilder, String> {
         let vectors_config = self.collection_params_extra.get("vectors_config");
-        let vectors_on_disk = vectors_config
+
+        let mut params = VectorParamsBuilder::new(vector_size as u64, qdrant_distance);
+        if let Some(on_disk) = vectors_config
             .and_then(|v| v.get("on_disk"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let mut params =
-            VectorParamsBuilder::new(vector_size as u64, qdrant_distance).on_disk(vectors_on_disk);
+        {
+            params = params.on_disk(on_disk);
+        }
 
         // An unrecognised datatype is a hard error, not a silent fallback to
         // float32: the whole point of setting it is to measure that storage.
@@ -2085,15 +2101,51 @@ mod tests {
         assert!(err.contains("bfloat16"), "got: {}", err);
     }
 
+    /// REGRESSION: an OMITTED `vectors_config.on_disk` must stay omitted on the
+    /// wire — it must NOT be sent as an explicit `false`.
+    ///
+    /// Verified on qdrant v1.18.2 with `memmap_threshold: 1` by inspecting the
+    /// segment layout: omitted -> `vector_storage/matrix.dat` (mmap'd);
+    /// explicit `false` -> `vector_storage/vectors/chunk_0.mmap` (RAM);
+    /// `true` -> `matrix.dat`. An explicit `false` OVERRIDES `memmap_threshold`,
+    /// so `unwrap_or(false)` kept the vectors in RAM for `qdrant-on-disk-default`
+    /// and all six `qdrant-mmap-*` configurations.
     #[test]
-    fn dense_vector_params_defaults_to_in_memory_float32() {
+    fn omitted_vectors_on_disk_is_not_sent_as_explicit_false() {
         let e = engine_with_collection_params(json!({}));
         let params = e
             .dense_vector_params(64, super::Distance::Cosine)
             .unwrap()
             .build();
         assert_eq!(params.datatype, None);
-        assert_eq!(params.on_disk, Some(false));
+        assert_eq!(
+            params.on_disk, None,
+            "an omitted on_disk must not be sent at all — an explicit false \
+             overrides optimizers_config.memmap_threshold and pins the vectors in RAM"
+        );
+
+        // A vectors_config that exists but says nothing about on_disk is still
+        // "omitted".
+        let e = engine_with_collection_params(json!({"vectors_config": {"datatype": "uint8"}}));
+        assert_eq!(
+            e.dense_vector_params(64, super::Distance::Cosine)
+                .unwrap()
+                .build()
+                .on_disk,
+            None
+        );
+
+        // Both explicit values are forwarded verbatim.
+        for want in [true, false] {
+            let e = engine_with_collection_params(json!({"vectors_config": {"on_disk": want}}));
+            assert_eq!(
+                e.dense_vector_params(64, super::Distance::Cosine)
+                    .unwrap()
+                    .build()
+                    .on_disk,
+                Some(want)
+            );
+        }
     }
 
     // ── collection_params.payload_index_params ─────────────────────────────

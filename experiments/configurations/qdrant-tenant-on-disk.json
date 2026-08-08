@@ -1,6 +1,7 @@
 [
   {
     "name": "qdrant-tenant-on-disk",
+    "_comment": "TARGET DATASET: random-768-100-tenants (the only shipped dataset whose schema has the keyword field `a`). payload_index_params names `a`, so on any other dataset that refinement cannot be applied and the run is NOT measuring a tenant-optimised layout. Run it as: --engines qdrant-tenant-on-disk --datasets random-768-100-tenants.",
     "engine": "qdrant",
     "connection_params": { "timeout": 180 },
     "collection_params": {
