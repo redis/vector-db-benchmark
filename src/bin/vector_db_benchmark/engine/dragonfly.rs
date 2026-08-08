@@ -42,7 +42,8 @@ use std::time::Instant;
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use redis::Connection;
 
-use super::redis::{parse_conditions, ParsedFilter};
+use super::geo;
+use super::redis::ParsedFilter;
 use super::redis_utils;
 
 use crate::config::{EngineConfig, SearchParams};
@@ -238,7 +239,7 @@ impl DragonflyEngine {
         // Filterable metadata fields (mirrors redis.rs): keyword/uuid/bool exact
         // strings -> TAG (SEPARATOR ; so multi-valued `labels` match per element);
         // int/float/datetime (stored as epoch) -> NUMERIC; full-text -> TEXT;
-        // geo point -> GEO.
+        // geo point -> nothing: see the NOTE below, geo is NOT declared.
         if let Some(schema) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) {
             for (field_name, field_type) in schema {
                 match field_type.as_str().unwrap_or("") {
@@ -858,6 +859,31 @@ impl DragonflyEngine {
         self.commandstats_primed = true;
         Ok(())
     }
+}
+
+/// Dragonfly's filter builder: RediSearch's, minus geo.
+///
+/// `configure()` deliberately does NOT declare a GEO field (see the note there:
+/// Dragonfly Search accepts a GEO field but its geo-query parser rejects the
+/// `$param` placeholders the shared RediSearch builder emits). Calling
+/// `redis::parse_conditions` directly therefore produced a real-looking
+/// `@field:[$lon $lat $r m]` clause against a field that is not in the schema —
+/// a filter that cannot match what it claims to.
+///
+/// That was invisible in two places at once: nothing in the engine refused it,
+/// and `engine/filter_guard.rs`'s dragonfly column reuses this builder, so the
+/// matrix scored dragonfly FILTERED on all three shipped geo shapes — an
+/// asserted green cell for a field the engine never creates. Refusing here makes
+/// `query_filter::resolve` turn a geo dataset into the #219 hard error, which is
+/// what every other engine without geo already does.
+///
+/// Scoped deliberately: only geo is removed. Every other condition type is
+/// RediSearch's builder verbatim, which is the whole point of sharing it.
+pub(crate) fn parse_conditions(conditions: &serde_json::Value) -> Option<ParsedFilter> {
+    if geo::conditions_mention_geo(conditions) {
+        return None;
+    }
+    super::redis::parse_conditions(conditions)
 }
 
 impl Engine for DragonflyEngine {

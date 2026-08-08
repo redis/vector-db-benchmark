@@ -253,6 +253,10 @@ fn gated_engine_files() -> Vec<String> {
         ("weaviate_grpc", "transport codegen, no engine"),
         ("filter_guard", "pure helper, no engine"),
         (
+            "geo",
+            "pure helper, no engine: great-circle encoding shared by vectorsets and milvus",
+        ),
+        (
             "turbopuffer",
             "no warm-up gate by design: its workers start on spawn (tracked separately)",
         ),
