@@ -116,6 +116,17 @@ fn count_prefix_keys(conn: &mut Connection, prefix: &str) -> usize {
     count
 }
 
+/// Shared-corpus completeness test (#188): may this config skip its re-upload?
+///
+/// `existing` is the live key count under the shared prefix, `expected` the
+/// corpus size measured from the dataset on disk (see
+/// `Dataset::corpus_completeness_target`, #224 — never the raw declared
+/// `vector_count`, which can be wrong). Only a corpus that is fully present may
+/// be reused; anything short of it must upload.
+fn shared_corpus_is_complete(existing: usize, expected: u64) -> bool {
+    expected > 0 && existing as u64 >= expected
+}
+
 pub struct RedisEngine {
     name: String,
     redis_url: String,
@@ -1897,17 +1908,22 @@ impl Engine for RedisEngine {
         // with the full corpus (a prior config in the sweep uploaded it), skip the
         // re-upload entirely and just report it — this is what turns an N-config
         // sweep's ingest from N× into 1×. The index for THIS config was already
-        // (re)built over the shared corpus in configure()/create_index. The check
-        // requires the dataset's known vector_count; without it we can't confirm a
+        // (re)built over the shared corpus in configure()/create_index.
+        //
+        // The completeness target comes from `corpus_completeness_target()`, which
+        // MEASURES the corpus on disk rather than trusting the declared
+        // `vector_count` — a declared count smaller than the real corpus used to
+        // satisfy this gate after a fraction of the keys and hand the sweep a
+        // silently-truncated corpus (#224). `None` means we cannot confirm a
         // COMPLETE corpus, so we fall through and upload normally.
         if self.config.shared_corpus {
-            if let Some(expected) = dataset.config.vector_count.filter(|&n| n > 0) {
+            if let Some(expected) = dataset.corpus_completeness_target()? {
                 let mut conn = self.get_connection()?;
                 let existing = count_prefix_keys(&mut conn, &self.config.key_prefix);
-                if existing >= expected as usize {
+                if shared_corpus_is_complete(existing, expected) {
                     println!(
-                        "Shared corpus already populated ({existing} keys under prefix '{}'); \
-                         skipping re-upload (#188 upload-once/build-many).",
+                        "Shared corpus already populated ({existing}/{expected} keys under prefix \
+                         '{}'); skipping re-upload (#188 upload-once/build-many).",
                         self.config.key_prefix
                     );
                     return Ok(UploadStats {
@@ -2746,7 +2762,101 @@ impl Engine for RedisEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_vector, is_transient_conn_error, parse_conditions, FilterParamValue};
+    use super::{
+        encode_vector, is_transient_conn_error, parse_conditions, shared_corpus_is_complete,
+        FilterParamValue,
+    };
+    use crate::config::DatasetConfig;
+    use crate::dataset::Dataset;
+    use vector_db_benchmark::readers::write_npy_vectors;
+
+    /// A compound ("tar") dataset rooted at an absolute temp dir holding a real
+    /// `vectors.npy` of `rows` rows, declaring `declared` in datasets.json.
+    /// `datasets_dir().join(<abs>) == <abs>`, so the temp dir resolves directly.
+    fn corpus_dataset(dir: &std::path::Path, rows: usize, declared: i64) -> Dataset {
+        let vectors: Vec<Vec<f32>> = (0..rows).map(|i| vec![i as f32, 0.0, 0.0]).collect();
+        write_npy_vectors(dir.join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+        Dataset::new(DatasetConfig {
+            name: "shared-corpus-unit".to_string(),
+            dataset_type: Some("tar".to_string()),
+            path: serde_json::Value::String(dir.to_str().unwrap().to_string()),
+            distance: Some("l2".to_string()),
+            vector_size: Some(3),
+            vector_count: Some(declared),
+            link: None,
+            schema: None,
+            description: None,
+        })
+    }
+
+    /// #188 must keep working: a shared prefix holding the WHOLE corpus is
+    /// reused (no re-upload), while anything short of it uploads.
+    #[test]
+    fn shared_corpus_skips_only_when_the_corpus_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = corpus_dataset(dir.path(), 1000, 1000);
+
+        let expected = ds
+            .corpus_completeness_target()
+            .expect("declared count matches the corpus")
+            .expect("a measurable local corpus yields a target");
+        assert_eq!(expected, 1000);
+
+        // Complete (and over-complete) → skip the re-upload.
+        assert!(shared_corpus_is_complete(1000, expected));
+        assert!(shared_corpus_is_complete(1001, expected));
+        // Incomplete → must upload, however close it is.
+        assert!(!shared_corpus_is_complete(999, expected));
+        assert!(!shared_corpus_is_complete(100, expected));
+        assert!(!shared_corpus_is_complete(0, expected));
+    }
+
+    /// Regression for #224: `random-100-match-kw-small-vocab-*` declared
+    /// vector_count 100 over a 1,000,000-point corpus, so the gate accepted 100
+    /// keys as "already populated" and the sweep scored recall over 0.01% of the
+    /// corpus with no error. The declared count must never be able to do that.
+    #[test]
+    fn declared_count_below_the_real_corpus_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = corpus_dataset(dir.path(), 1000, 100);
+
+        let err = ds
+            .corpus_completeness_target()
+            .expect_err("under-declared vector_count must be a hard error");
+        assert!(err.contains("1000"), "err should name the real size: {err}");
+        assert!(
+            err.contains("100"),
+            "err should name the declared size: {err}"
+        );
+
+        // And the same corpus with the count corrected gates on the real size,
+        // so the 100 keys that used to satisfy the gate no longer do.
+        let fixed = corpus_dataset(dir.path(), 1000, 1000);
+        let expected = fixed.corpus_completeness_target().unwrap().unwrap();
+        assert!(!shared_corpus_is_complete(100, expected));
+    }
+
+    /// A corpus that isn't on disk can't be confirmed complete, so the gate has
+    /// no target and the upload proceeds — a stale keyspace is never waved
+    /// through on the strength of a declared number alone.
+    #[test]
+    fn absent_corpus_yields_no_completeness_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = Dataset::new(DatasetConfig {
+            name: "not-downloaded".to_string(),
+            dataset_type: Some("tar".to_string()),
+            path: serde_json::Value::String(
+                dir.path().join("missing").to_str().unwrap().to_string(),
+            ),
+            distance: Some("l2".to_string()),
+            vector_size: Some(3),
+            vector_count: Some(1_000_000),
+            link: None,
+            schema: None,
+            description: None,
+        });
+        assert_eq!(ds.corpus_completeness_target().unwrap(), None);
+    }
 
     #[test]
     fn transient_conn_errors_are_retryable() {

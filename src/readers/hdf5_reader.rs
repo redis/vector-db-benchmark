@@ -2,6 +2,21 @@
 
 use hdf5::File as Hdf5File;
 
+/// Number of rows in the HDF5 file's `train` dataset, read from the dataspace
+/// metadata WITHOUT loading any vector data. The corpus's own answer to "how
+/// many vectors are in here?" (#224).
+pub fn hdf5_train_row_count(path: &str) -> Result<u64, String> {
+    let file = Hdf5File::open(path).map_err(|e| format!("Failed to open HDF5 file: {}", e))?;
+    let train = file
+        .dataset("train")
+        .map_err(|e| format!("Failed to open 'train' dataset: {}", e))?;
+    train
+        .shape()
+        .first()
+        .map(|&n| n as u64)
+        .ok_or_else(|| format!("{}: HDF5 'train' dataset has no dimensions", path))
+}
+
 /// Read vectors from HDF5 file, returning (ids, vectors).
 /// If normalize is true, each vector is divided by its L2 norm.
 pub fn read_hdf5_vectors(path: &str, normalize: bool) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {

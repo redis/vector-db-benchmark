@@ -374,6 +374,99 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Corpus size advertised by a dataset's own corpus filename, when the leaf
+    /// path segment carries an unambiguous magnitude token — `random_keywords_1m`
+    /// => 1_000_000, `..._100k` => 100_000, `...-1G-...` => 1_000_000_000. The
+    /// LAST such token wins. `None` when the name says nothing about size.
+    fn path_implied_corpus_size(path: &serde_json::Value) -> Option<i64> {
+        let leaf = path
+            .as_str()?
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .next_back()?;
+        let mut implied = None;
+        for tok in leaf.split(['_', '-', '.']) {
+            let (digits, suffix) = tok.split_at(tok.len().checked_sub(1)?);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let scale: i64 = match suffix.to_ascii_lowercase().as_str() {
+                "k" => 1_000,
+                "m" => 1_000_000,
+                "g" | "b" => 1_000_000_000,
+                _ => continue,
+            };
+            implied = digits
+                .parse::<i64>()
+                .ok()
+                .and_then(|n| n.checked_mul(scale));
+        }
+        implied
+    }
+
+    /// #224: `random-100-match-kw-small-vocab-*` declared `vector_count: 100`
+    /// while pointing at `random_keywords_1m_vocab_10`, a 1,000,000-point corpus
+    /// (copy-pasted from the genuine `random-100` entry above it). Redis's
+    /// shared-corpus gate (#188) treats `vector_count` as "corpus is complete",
+    /// so it skipped the upload after 100 keys and the sweep scored recall over
+    /// 0.01% of the corpus — silently, with no error.
+    ///
+    /// This catches that class from `datasets.json` alone, with no corpus on
+    /// disk: whenever a corpus path names its own size, the declared count must
+    /// agree. (A dataset that is deliberately a subset of a named corpus should
+    /// be given a path that reflects its real size.)
+    #[test]
+    fn declared_vector_count_agrees_with_the_size_its_path_advertises() {
+        let configs = read_dataset_configs().expect("datasets.json must parse");
+        let mut checked = 0;
+        for (name, cfg) in &configs {
+            let Some(implied) = path_implied_corpus_size(&cfg.path) else {
+                continue;
+            };
+            checked += 1;
+            assert_eq!(
+                cfg.vector_count,
+                Some(implied),
+                "dataset '{name}' declares vector_count {:?} but its corpus path '{}' \
+                 advertises {implied} points (#224)",
+                cfg.vector_count,
+                cfg.path.as_str().unwrap_or_default(),
+            );
+        }
+        assert!(
+            checked >= 30,
+            "expected the size-in-path check to cover the bulk of datasets.json, covered {checked}"
+        );
+    }
+
+    #[test]
+    fn path_implied_corpus_size_only_fires_on_real_magnitude_tokens() {
+        let s = |v: &str| serde_json::Value::String(v.to_string());
+        // The #224 dataset: "1m" in the corpus name, "10" (vocab) must not win.
+        assert_eq!(
+            path_implied_corpus_size(&s(
+                "random-100-match-kw-small-vocab/random_keywords_1m_vocab_10"
+            )),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            path_implied_corpus_size(&s("yandex-1B-200-angular/yandex_t2i_gt_100k")),
+            Some(100_000),
+            "only the leaf segment counts, not the '1B' family directory"
+        );
+        assert_eq!(
+            path_implied_corpus_size(&s("laion-img-emb-768/laion-img-emb-768-1G-cosine.hdf5")),
+            Some(1_000_000_000)
+        );
+        // Dimension counts and bare numbers say nothing about corpus size.
+        assert_eq!(
+            path_implied_corpus_size(&s("arxiv-titles-384-angular/arxiv_no_filters")),
+            None
+        );
+        assert_eq!(path_implied_corpus_size(&s("random-100/")), None);
+        assert_eq!(path_implied_corpus_size(&json!({"data": []})), None);
+    }
+
     #[test]
     fn matches_pattern_exact_and_star() {
         assert!(matches_pattern("redis", "redis"));
