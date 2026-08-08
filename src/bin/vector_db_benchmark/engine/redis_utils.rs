@@ -376,6 +376,76 @@ pub fn ensure_index_exists(conn: &mut Connection, index_name: &str) -> Result<()
         })
 }
 
+/// `num_docs` from an `FT.INFO` reply (RESP2 flat array or RESP3 map).
+///
+/// This is the count the search actually sees — keys that exist but are not (yet)
+/// in the index cannot answer a query, so a raw keyspace count would overstate
+/// the corpus. Returns `None` when the reply carries no `num_docs` field.
+/// `FT.INFO` fields that carry the live document count, in preference order.
+///
+/// RediSearch (Redis / Valkey / Dragonfly) reports `num_docs`. **KiviDB does
+/// not** — its `FT.INFO` has no `num_docs` at all and reports `hnsw_live_count`
+/// instead, so reading only `num_docs` silently degraded the #238 reuse guard to
+/// "this engine cannot count" on KiviDB while the docs claimed otherwise.
+const FT_INFO_COUNT_FIELDS: [&str; 2] = ["num_docs", "hnsw_live_count"];
+
+pub fn ft_info_num_docs(v: &redis::Value) -> Option<u64> {
+    let pairs: Vec<(String, &redis::Value)> = match v {
+        redis::Value::Map(m) => m.iter().map(|(k, val)| (value_to_string(k), val)).collect(),
+        redis::Value::Array(items) => items
+            .chunks_exact(2)
+            .map(|c| (value_to_string(&c[0]), &c[1]))
+            .collect(),
+        _ => return None,
+    };
+    FT_INFO_COUNT_FIELDS.iter().find_map(|field| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == field)
+            .and_then(|(_, val)| match val {
+                redis::Value::Int(n) => u64::try_from(*n).ok(),
+                other => value_to_string(other).parse::<u64>().ok(),
+            })
+    })
+}
+
+/// Whether a `FT.INFO` error means "that index does not exist" as opposed to
+/// "the probe failed".
+///
+/// The distinction decides whether the #238 reuse guard may report a corpus size
+/// of 0. Only a server reply that names the index as unknown is a real zero;
+/// `NOPERM`, a dropped connection or a timeout say nothing about the corpus, and
+/// reporting them as 0 sends the user to re-upload a corpus that was fine.
+///
+/// Wordings differ per engine: RediSearch/KiviDB say "no such index", Valkey
+/// Search says "Index with name '<n>' not found".
+fn is_missing_index_error(e: &redis::RedisError) -> bool {
+    let msg = format!("{} {}", e.detail().unwrap_or_default(), e).to_lowercase();
+    msg.contains("no such index")
+        || msg.contains("unknown index")
+        || (msg.contains("index") && msg.contains("not found"))
+}
+
+/// Server-side corpus size for a RediSearch-family index, for the `--skip-upload`
+/// reuse precondition (issue #238).
+///
+/// - index missing → `Ok(Some(0))`: "the index is gone" and "the index is empty"
+///   are the same fact here — the corpus to reuse is not there.
+/// - index present but the reply carries no count field → `Ok(None)`
+///   ("cannot tell"), never a fabricated zero.
+/// - the probe itself failed (`NOPERM`, connection dropped) → `Err`, so the
+///   caller reports a probe failure rather than an imaginary empty corpus.
+pub fn ft_index_num_docs(conn: &mut Connection, index_name: &str) -> Result<Option<u64>, String> {
+    match redis::cmd("FT.INFO")
+        .arg(index_name)
+        .query::<redis::Value>(conn)
+    {
+        Ok(v) => Ok(ft_info_num_docs(&v)),
+        Err(e) if is_missing_index_error(&e) => Ok(Some(0)),
+        Err(e) => Err(format!("FT.INFO {index_name} failed: {e}")),
+    }
+}
+
 /// Per-index memory footprint in bytes, summed from every `*_mb` size field of
 /// an `FT.INFO` reply (RESP2 flat array or RESP3 map). Under issue #151-4's
 /// coexistence mode the server-wide `used_memory` is the SUM of all resident
@@ -739,5 +809,68 @@ mod metadata_tests {
         let cfg = parse_kv_map(&reply);
         assert_eq!(cfg["maxmemory"], "0");
         assert_eq!(cfg["save"], "3600 1");
+    }
+}
+
+#[cfg(test)]
+mod num_docs_tests {
+    use super::ft_info_num_docs;
+    use redis::Value;
+
+    fn bulk(s: &str) -> Value {
+        Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    // RESP2: FT.INFO is a flat alternating array; num_docs arrives as a string.
+    #[test]
+    fn reads_num_docs_from_resp2_array() {
+        let v = Value::Array(vec![
+            bulk("index_name"),
+            bulk("idx:cfg"),
+            bulk("num_docs"),
+            bulk("400"),
+            bulk("indexing"),
+            Value::Int(0),
+        ]);
+        assert_eq!(ft_info_num_docs(&v), Some(400));
+    }
+
+    // RESP3: a map, and num_docs may be a native integer.
+    #[test]
+    fn reads_num_docs_from_resp3_map() {
+        let v = Value::Map(vec![
+            (bulk("index_name"), bulk("idx:cfg")),
+            (bulk("num_docs"), Value::Int(400)),
+        ]);
+        assert_eq!(ft_info_num_docs(&v), Some(400));
+    }
+
+    // No num_docs field → "cannot tell", never a fabricated 0: a 0 would be read
+    // as "the corpus is gone" and abort a legitimate --skip-upload run (#238).
+    #[test]
+    fn missing_field_is_none_not_zero() {
+        let v = Value::Array(vec![bulk("index_name"), bulk("idx:cfg")]);
+        assert_eq!(ft_info_num_docs(&v), None);
+        assert_eq!(ft_info_num_docs(&Value::Nil), None);
+    }
+
+    // An empty index legitimately reports 0.
+    #[test]
+    fn empty_index_reports_zero() {
+        let v = Value::Array(vec![bulk("num_docs"), bulk("0")]);
+        assert_eq!(ft_info_num_docs(&v), Some(0));
+    }
+
+    // A negative or unparseable value must not wrap into a huge u64.
+    #[test]
+    fn nonsense_values_are_none() {
+        assert_eq!(
+            ft_info_num_docs(&Value::Array(vec![bulk("num_docs"), Value::Int(-1)])),
+            None
+        );
+        assert_eq!(
+            ft_info_num_docs(&Value::Array(vec![bulk("num_docs"), bulk("many")])),
+            None
+        );
     }
 }

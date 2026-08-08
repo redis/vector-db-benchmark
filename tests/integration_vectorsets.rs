@@ -633,3 +633,151 @@ fn test_vectorsets_exact_pin_with_two_configs_is_rejected_at_startup() {
     );
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// Issue #236 × #271 — the migration case the fix creates, and the guard that
+/// makes it loud.
+///
+/// A corpus written by a pre-#236 binary sits under the bare key `idx`. A
+/// current binary addresses `idx:<config>`, so `--skip-upload` finds nothing —
+/// and `VSIM` against a MISSING key returns an **empty array with no error**, so
+/// no amount of downstream inspection can tell "no data" from "no matches". Left
+/// unguarded this publishes a `mean_recall: 0.0` result file and exits 0: the
+/// repo's silent-wrong-result class, in the exact scenario this PR's migration
+/// note describes.
+///
+/// It is guarded, and by the mechanism that already exists rather than a second
+/// one: `--skip-upload` runs `check_corpus_reuse_precondition`, which calls
+/// `Engine::corpus_row_count` (#271 — `VCARD <key>` for VectorSets) and hard-errors
+/// when the server holds fewer rows than the dataset declares.
+///
+/// The legacy key is seeded with EXACTLY the expected row count. That is what
+/// makes the test sharp: a `corpus_row_count` that probed the old hardcoded `idx`
+/// — which is precisely what merging #271 into this branch produced before the
+/// key was threaded through it — would read 400 of 400, return `Ok`, and let the
+/// run proceed to measure the empty per-config key. The guard has to be reading
+/// THIS config's key for the error below to appear at all.
+///
+/// A positive control follows the negative one so the test cannot pass merely by
+/// the guard rejecting everything.
+#[test]
+fn test_vectorsets_skip_upload_hard_errors_on_a_pre_236_corpus() {
+    wait_for_vectorsets();
+
+    let name = "vectorsets-migrate";
+    // The migration is "un-suffixed base key" → "<base>:<config>". Reproduced here
+    // over a PRIVATE base rather than the real `idx`, for two reasons: the shape is
+    // identical (that is exactly what `VECTORSETS_INDEX_NAME_EXACT` writes), and the
+    // literal `idx` is global state that
+    // `test_vectorsets_two_configs_do_not_clobber_each_other` asserts is never
+    // written — two tests mutating it would race at default test threads, which is
+    // the very property #236 restored.
+    const BASE: &str = "idx236mig";
+    let key = format!("{BASE}:{name}");
+    const LEGACY_KEY: &str = BASE;
+
+    let proj = common::write_match_any_cosine_project("vs-migrate", &vectorsets_config(name), 8);
+    let n = expected_count(&proj.root);
+
+    let mut c = conn();
+    for k in [key.as_str(), LEGACY_KEY] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+
+    // Seed the pre-#236 corpus: `n` vectors under the bare shared key, i.e. the
+    // exact count a probe on the WRONG key would happily accept.
+    for id in 0..n {
+        let mut cmd = redis::cmd("VADD");
+        cmd.arg(LEGACY_KEY).arg("VALUES").arg(8);
+        for d in 0..8 {
+            cmd.arg((id as f64 * 0.001 + d as f64).to_string());
+        }
+        cmd.arg(id.to_string());
+        cmd.query::<i64>(&mut c).expect("seed legacy corpus");
+    }
+    assert_eq!(
+        vcard(&mut c, LEGACY_KEY),
+        n,
+        "legacy corpus must be seeded to exactly the expected row count"
+    );
+    assert_eq!(
+        vcard(&mut c, &key),
+        0,
+        "the per-config key must start empty"
+    );
+
+    let out = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            name,
+            "--datasets",
+            "vs-migrate",
+            "--host",
+            TEST_HOST,
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+        ])
+        .current_dir(&proj.root)
+        .env("REDIS_PORT", test_port().to_string())
+        .env("VECTORSETS_INDEX_NAME", BASE)
+        .output()
+        .expect("run vector-db-benchmark");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a pre-#236 corpus must FAIL, not publish recall 0.0: {combined}"
+    );
+    assert!(
+        combined.contains("the corpus you asked to reuse is empty or missing"),
+        "the failure must be the corpus-reuse guard reading THIS config's key, \
+         not an incidental error: {combined}"
+    );
+    // The whole point is that no number gets published.
+    let results = std::fs::read_dir(proj.root.join("results"))
+        .map(|d| d.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    assert_eq!(results, 0, "a rejected run must publish no result file");
+
+    // ── Positive control: the same flags against a corpus this config actually
+    // uploaded must succeed. Without this the assertions above would also pass
+    // against a guard that rejects unconditionally.
+    let _ = redis::cmd("DEL").arg(LEGACY_KEY).query::<i64>(&mut c);
+    let port = test_port().to_string();
+    let env = [
+        ("REDIS_PORT", port.as_str()),
+        ("VECTORSETS_INDEX_NAME", BASE),
+    ];
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "vs-migrate",
+            TEST_HOST,
+            &env,
+            &["--keep-data"]
+        ),
+        "upload run failed"
+    );
+    assert_eq!(vcard(&mut c, &key), n, "upload must land in '{key}'");
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "vs-migrate",
+            TEST_HOST,
+            &env,
+            &["--skip-upload", "--keep-data"]
+        ),
+        "--skip-upload against this config's OWN corpus must succeed"
+    );
+
+    for k in [key.as_str(), LEGACY_KEY] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+    std::fs::remove_dir_all(&proj.root).ok();
+}

@@ -52,7 +52,8 @@ docker run --rm --network host \
 | `--engines <PATTERN>` | Engine patterns to run (supports wildcards) | `*` |
 | `--datasets <PATTERN>` | Dataset patterns to run (supports wildcards) | `*` |
 | `--host <HOST>` | Redis / engine host | `localhost` |
-| `--skip-upload` | Skip the upload phase | — |
+| `--skip-upload` | Reuse the corpus already on the server (no configure, no upload); the runner verifies it server-side first | — |
+| `--allow-partial-corpus` | Downgrade the `--skip-upload` reuse check from a hard error to a warning | — |
 | `--skip-search` | Skip the search phase | — |
 | `--skip-if-exists` | Skip if results already exist | — |
 | `--parallels <N,N,...>` | Filter by parallel thread counts | — |

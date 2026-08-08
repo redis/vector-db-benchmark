@@ -57,7 +57,7 @@ fn matches_labels_filter(id: usize) -> bool {
     MATCH_ANY_LABELS.iter().any(|q| l.contains(q))
 }
 
-const N_DOCS: usize = 400;
+pub const N_DOCS: usize = 400;
 const N_QUERIES: usize = 10;
 const TOP: usize = 10;
 
@@ -1460,6 +1460,32 @@ pub fn run_binary_extra(
 /// update_* metrics, the mean_precision_at_returned sentinel, …). `engine` is the result
 /// filename prefix — note `--skip-vector-index` renames the engine to
 /// `<engine_type>-no-vector`, so pass that prefix for filter-only runs.
+/// Read the `params` block from the engine's search result JSON.
+///
+/// Used to assert on `params.corpus_reuse` — the recorded `--skip-upload`
+/// verdict (#238), which is the only thing distinguishing a verified run from a
+/// waived one in the artifact.
+pub fn read_params_obj(root: &Path, engine: &str) -> serde_json::Value {
+    read_result_doc(root, engine)["params"].clone()
+}
+
+/// The whole search-result document for `engine`.
+pub fn read_result_doc(root: &Path, engine: &str) -> serde_json::Value {
+    let pattern = format!("{}-*-search-*.json", engine);
+    let dir = root.join("results");
+    let path = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            glob::Pattern::new(&pattern)
+                .unwrap()
+                .matches(&p.file_name().unwrap().to_string_lossy())
+        })
+        .unwrap_or_else(|| panic!("no search result for {}", engine));
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
 pub fn read_results_obj(root: &Path, engine: &str) -> serde_json::Value {
     let pattern = format!("{}-*-search-*.json", engine);
     let dir = root.join("results");

@@ -2,7 +2,7 @@
 //!
 //! Requires Qdrant running on gRPC port 6335 and REST port 6334.
 //! Start with: docker compose -f tests/docker-compose.test.yml up -d qdrant
-//! Run with:   QDRANT_GRPC_PORT=6335 cargo test --test integration_qdrant -- --test-threads=1
+//! Run with:   qdrant_grpc_port()=6335 cargo test --test integration_qdrant -- --test-threads=1
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -15,17 +15,30 @@ mod common;
 // Helpers
 // ---------------------------------------------------------------------------
 
-const QDRANT_REST_PORT: u16 = 6334;
-const QDRANT_GRPC_PORT: u16 = 6335;
+/// Qdrant ports under test. Overridable so a session can run against its OWN
+/// container instead of the shared one — these tests delete the collection.
+fn qdrant_rest_port() -> u16 {
+    std::env::var("QDRANT_TEST_REST_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6334)
+}
+
+fn qdrant_grpc_port() -> u16 {
+    std::env::var("QDRANT_TEST_GRPC_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6335)
+}
 const QDRANT_HOST: &str = "127.0.0.1";
 const COLLECTION: &str = "bench_test";
 
 fn rest_url() -> String {
-    format!("http://{}:{}", QDRANT_HOST, QDRANT_REST_PORT)
+    format!("http://{}:{}", QDRANT_HOST, qdrant_rest_port())
 }
 
 fn grpc_url() -> String {
-    format!("http://{}:{}", QDRANT_HOST, QDRANT_GRPC_PORT)
+    format!("http://{}:{}", QDRANT_HOST, qdrant_grpc_port())
 }
 
 fn rest_client() -> reqwest::blocking::Client {
@@ -48,7 +61,7 @@ fn wait_for_qdrant() {
         if Instant::now() > deadline {
             panic!(
                 "Qdrant not available on port {} after 60s",
-                QDRANT_REST_PORT
+                qdrant_rest_port()
             );
         }
         thread::sleep(Duration::from_millis(500));
@@ -106,8 +119,8 @@ fn run_binary_capture(root: &std::path::Path, engine: &str, dataset: &str) -> (b
         "false",
     ])
     .current_dir(root)
-    .env("QDRANT_GRPC_PORT", QDRANT_GRPC_PORT.to_string())
-    .env("QDRANT_REST_PORT", QDRANT_REST_PORT.to_string());
+    .env("QDRANT_GRPC_PORT", qdrant_grpc_port().to_string())
+    .env("QDRANT_REST_PORT", qdrant_rest_port().to_string());
     let out = cmd.output().expect("run vector-db-benchmark");
     let combined = format!(
         "stdout:\n{}\nstderr:\n{}",
@@ -500,8 +513,8 @@ fn run_qdrant_binary(root: &std::path::Path, engine: &str, dataset: &str) -> boo
             "--skip-if-exists",
             "false",
         ])
-        .env("QDRANT_GRPC_PORT", QDRANT_GRPC_PORT.to_string())
-        .env("QDRANT_REST_PORT", QDRANT_REST_PORT.to_string())
+        .env("QDRANT_GRPC_PORT", qdrant_grpc_port().to_string())
+        .env("QDRANT_REST_PORT", qdrant_rest_port().to_string())
         .current_dir(root)
         .output()
         .expect("run vector-db-benchmark");
@@ -718,8 +731,8 @@ fn test_binary_qdrant_match_any() {
         proj.matching_docs
     );
 
-    let grpc = QDRANT_GRPC_PORT.to_string();
-    let rest = QDRANT_REST_PORT.to_string();
+    let grpc = qdrant_grpc_port().to_string();
+    let rest = qdrant_rest_port().to_string();
     assert!(
         common::run_binary(
             &proj.root,
@@ -1097,8 +1110,8 @@ fn test_binary_qdrant_geo() {
     let proj =
         common::write_geo_project("geo-test", &serde_json::to_string(&configs).unwrap(), dim);
     assert!(proj.matching_docs >= proj.top);
-    let grpc = QDRANT_GRPC_PORT.to_string();
-    let rest = QDRANT_REST_PORT.to_string();
+    let grpc = qdrant_grpc_port().to_string();
+    let rest = qdrant_rest_port().to_string();
     assert!(
         common::run_binary(
             &proj.root,
@@ -1135,8 +1148,8 @@ fn test_binary_qdrant_and_filter() {
         dim,
     );
     assert!(proj.matching_docs >= proj.top);
-    let grpc = QDRANT_GRPC_PORT.to_string();
-    let rest = QDRANT_REST_PORT.to_string();
+    let grpc = qdrant_grpc_port().to_string();
+    let rest = qdrant_rest_port().to_string();
     assert!(
         common::run_binary(
             &proj.root,
@@ -1174,8 +1187,8 @@ fn test_binary_qdrant_or_filter() {
     let proj =
         common::write_or_filter_project("or-test", &serde_json::to_string(&configs).unwrap(), dim);
     assert!(proj.matching_docs >= proj.top);
-    let grpc = QDRANT_GRPC_PORT.to_string();
-    let rest = QDRANT_REST_PORT.to_string();
+    let grpc = qdrant_grpc_port().to_string();
+    let rest = qdrant_rest_port().to_string();
     assert!(
         common::run_binary(
             &proj.root,
@@ -1216,8 +1229,8 @@ fn test_binary_qdrant_nested_filter() {
         dim,
     );
     assert!(proj.matching_docs >= proj.top);
-    let grpc = QDRANT_GRPC_PORT.to_string();
-    let rest = QDRANT_REST_PORT.to_string();
+    let grpc = qdrant_grpc_port().to_string();
+    let rest = qdrant_rest_port().to_string();
     assert!(
         common::run_binary(
             &proj.root,
@@ -1257,8 +1270,8 @@ fn test_binary_qdrant_uuid() {
     let proj =
         common::write_uuid_project("uuid-test", &serde_json::to_string(&configs).unwrap(), dim);
     assert!(proj.matching_docs >= proj.top);
-    let grpc = QDRANT_GRPC_PORT.to_string();
-    let rest = QDRANT_REST_PORT.to_string();
+    let grpc = qdrant_grpc_port().to_string();
+    let rest = qdrant_rest_port().to_string();
     assert!(
         common::run_binary(
             &proj.root,
@@ -1297,8 +1310,8 @@ fn test_binary_qdrant_selectivity() {
         dim,
     );
     assert!(proj.matching_docs >= proj.top);
-    let grpc = QDRANT_GRPC_PORT.to_string();
-    let rest = QDRANT_REST_PORT.to_string();
+    let grpc = qdrant_grpc_port().to_string();
+    let rest = qdrant_rest_port().to_string();
     assert!(
         common::run_binary(
             &proj.root,
@@ -1348,8 +1361,8 @@ fn test_binary_qdrant_match_any_labels() {
         proj.matching_docs
     );
 
-    let grpc = QDRANT_GRPC_PORT.to_string();
-    let rest = QDRANT_REST_PORT.to_string();
+    let grpc = qdrant_grpc_port().to_string();
+    let rest = qdrant_rest_port().to_string();
     assert!(
         common::run_binary(
             &proj.root,
@@ -1710,8 +1723,8 @@ fn run_qdrant_binary_keep_collection(
             "false",
             "--keep-data",
         ])
-        .env("QDRANT_GRPC_PORT", QDRANT_GRPC_PORT.to_string())
-        .env("QDRANT_REST_PORT", QDRANT_REST_PORT.to_string())
+        .env("QDRANT_GRPC_PORT", qdrant_grpc_port().to_string())
+        .env("QDRANT_REST_PORT", qdrant_rest_port().to_string())
         .env("QDRANT_COLLECTION_NAME", collection)
         .current_dir(root)
         .output()
@@ -1974,4 +1987,185 @@ fn test_binary_qdrant_sparse_binary_ground_truth_end_to_end() {
          not line up with the point ids the uploader assigns",
         precision
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #238 — `--skip-upload` reuse precondition, Qdrant
+// ---------------------------------------------------------------------------
+
+/// `points_count` straight off `GET /collections/<n>`.
+fn qdrant_points_count(collection: &str) -> u64 {
+    let v: serde_json::Value = rest_client()
+        .get(format!("{}/collections/{}", rest_url(), collection))
+        .send()
+        .expect("collection info")
+        .json()
+        .expect("collection info json");
+    v["result"]["points_count"].as_u64().unwrap_or(0)
+}
+
+/// Qdrant's `corpus_row_count()` is a live read, and a short collection is
+/// fatal — proven by deleting points behind the tool's back (#238).
+///
+/// Recall cannot serve as this guard: on a 100-point corpus whose ground truth
+/// lives in the low ids, deleting the UPPER half leaves `mean_recall: 1.0`.
+/// This test deletes the upper half deliberately, so it fails on the pre-fix
+/// branch exactly where a recall assertion would have passed.
+#[test]
+fn test_binary_qdrant_skip_upload_short_corpus_is_fatal() {
+    wait_for_qdrant();
+    delete_collection();
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238qd", "engine": "qdrant",
+        "search_params": [{"parallel": 1, "search_params": {"hnsw_ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg238qd-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let collection = std::env::var("QDRANT_COLLECTION_NAME").unwrap_or("benchmark".to_string());
+
+    let run = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(common::binary_path());
+        cmd.args([
+            "--engines",
+            "cfg238qd",
+            "--datasets",
+            "cfg238qd-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+        ])
+        .args(extra)
+        .current_dir(&proj.root)
+        .env("QDRANT_GRPC_PORT", qdrant_grpc_port().to_string())
+        .env("QDRANT_REST_PORT", qdrant_rest_port().to_string());
+        cmd.output().expect("run vector-db-benchmark")
+    };
+
+    assert!(
+        run(&["--keep-data", "--skip-search"]).status.success(),
+        "phase 1 (upload) failed"
+    );
+    assert_eq!(
+        qdrant_points_count(&collection),
+        common::N_DOCS as u64,
+        "phase 1 corpus"
+    );
+
+    // Delete the UPPER half: the half whose absence recall does NOT notice.
+    let half = common::N_DOCS / 2;
+    let ids: Vec<u64> = (half as u64..common::N_DOCS as u64).collect();
+    rest_client()
+        .post(format!(
+            "{}/collections/{}/points/delete?wait=true",
+            rest_url(),
+            collection
+        ))
+        .json(&serde_json::json!({ "points": ids }))
+        .send()
+        .expect("delete points");
+    assert_eq!(
+        qdrant_points_count(&collection),
+        half as u64,
+        "the amputation must be visible server-side"
+    );
+
+    let out = run(&["--skip-upload", "--keep-data"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a half-deleted Qdrant collection must be a hard error.\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!("holds {half} of the {} rows", common::N_DOCS)),
+        "the count must track the amputation, proving it is a live points_count read.\n{combined}"
+    );
+    assert_no_search_result(&proj.root, "cfg238qd");
+
+    // And the check itself must be read-only.
+    assert_eq!(
+        qdrant_points_count(&collection),
+        half as u64,
+        "the reuse check must never modify the corpus"
+    );
+
+    delete_collection();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// `--skip-upload` with NO `--keep-data` must not delete the collection (#238).
+///
+/// RED on the pre-fix branch: the collection is MISSING afterwards — the run
+/// printed a green reuse check, benchmarked, then ran `Cleanup (deleting index
+/// and data)` and exited 0.
+#[test]
+fn test_binary_qdrant_skip_upload_without_keep_data_preserves_corpus() {
+    wait_for_qdrant();
+    delete_collection();
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238qdnokeep", "engine": "qdrant",
+        "search_params": [{"parallel": 1, "search_params": {"hnsw_ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg238qdnokeep-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let collection = std::env::var("QDRANT_COLLECTION_NAME").unwrap_or("benchmark".to_string());
+
+    let run = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(common::binary_path());
+        cmd.args([
+            "--engines",
+            "cfg238qdnokeep",
+            "--datasets",
+            "cfg238qdnokeep-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+        ])
+        .args(extra)
+        .current_dir(&proj.root)
+        .env("QDRANT_GRPC_PORT", qdrant_grpc_port().to_string())
+        .env("QDRANT_REST_PORT", qdrant_rest_port().to_string());
+        cmd.output().expect("run vector-db-benchmark")
+    };
+
+    assert!(
+        run(&["--keep-data", "--skip-search"]).status.success(),
+        "phase 1 (upload) failed"
+    );
+    let before = qdrant_points_count(&collection);
+    assert_eq!(before, common::N_DOCS as u64, "phase 1 corpus");
+
+    // Deliberately NO --keep-data.
+    let out = run(&["--skip-upload"]);
+    assert!(
+        out.status.success(),
+        "phase 2 failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        qdrant_points_count(&collection),
+        before,
+        "--skip-upload without --keep-data deleted the collection it reused — issue #238"
+    );
+
+    delete_collection();
+    std::fs::remove_dir_all(&proj.root).ok();
 }
