@@ -945,7 +945,8 @@ impl RedisEngine {
         // Route latency stats through the shared percentile path (linear
         // interpolation) so filter-only is measured on the same footing as the
         // main search(). Filter-only has no precision/recall: signal that with the
-        // mean_precision == -1 sentinel, an empty precisions vec, and top == 0.
+        // mean_precision_at_returned == -1 sentinel, an empty precisions vec,
+        // and top == 0.
         let mut results = crate::engine::compute_search_stats(
             &times,
             &[],
@@ -957,7 +958,7 @@ impl RedisEngine {
             parallel,
             num_to_run,
         )?;
-        results.mean_precision = -1.0;
+        results.mean_precision_at_returned = -1.0;
         Ok(results)
     }
 

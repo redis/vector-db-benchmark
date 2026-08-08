@@ -364,7 +364,7 @@ fn test_binary_vectorsets_mixed_benchmark() {
 
     let r = common::read_results_obj(&proj.root, name);
     let recall = r["mean_recall"].as_f64().unwrap();
-    let precision = r["mean_precisions"].as_f64().unwrap();
+    let precision = r["mean_precision_at_returned"].as_f64().unwrap();
     let update_count = r["update_count"].as_u64().unwrap();
     let update_rps = r["update_rps"].as_f64().unwrap();
     let p50 = r["p50_time"].as_f64().unwrap();

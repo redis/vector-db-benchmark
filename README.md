@@ -340,7 +340,8 @@ Results JSON includes separate metrics for both operation types:
 {
   "results": {
     "rps": 5891.2,
-    "precision": 0.9785,
+    "mean_precision_at_returned": 0.9785,
+    "mean_recall": 0.9785,
     "p50_time": 0.00032,
     "p95_time": 0.00089,
     "p99_time": 0.00142,
@@ -395,8 +396,8 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | Random-100: Small synthetic dataset                                                                        |        100 |         100 |         9 |         9 | Cosine    |
 | Random-100-Euclidean: Small synthetic dataset                                                              |        100 |         100 |         9 |         9 | L2        |
 | **Filtered Search Datasets**                                                                               |            |             |           |           |           |
-| H&M-2048: Fashion product embeddings (with filters)                                                        |      2,048 |     105,542 |     2,000 |       100 | Cosine    |
-| H&M-2048: Fashion product embeddings (no filters)                                                          |      2,048 |     105,542 |     2,000 |       100 | Cosine    |
+| H&M-2048: Fashion product embeddings (with filters)                                                        |      2,048 |     105,542 |    10,000 |    ≤ 25 † | Cosine    |
+| H&M-2048: Fashion product embeddings (no filters)                                                          |      2,048 |     105,542 |    10,000 |        10 | Cosine    |
 | ArXiv-384: Academic paper embeddings (with filters)                                                        |        384 |   2,205,995 |    10,000 |       100 | Cosine    |
 | ArXiv-384: Academic paper embeddings (no filters)                                                          |        384 |   2,205,995 |    10,000 |       100 | Cosine    |
 | Random Match Keyword-100: Synthetic keyword matching (with filters)                                        |        100 |   1,000,000 |    10,000 |       100 | Cosine    |
@@ -419,6 +420,8 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | Random Match Keyword Small Vocab-256: Small vocabulary keyword matching (no filters)                       |        256 |   1,000,000 |    10,000 |       100 | Cosine    |
 | **Multi-Tenancy** (many tenants share one index; every query scoped to one tenant)                          |            |             |           |           |           |
 | Random-768-100-tenants: 100 tenants, per-tenant scoped queries (tenant field `a`)                          |        768 |   1,000,000 |       200 |        25 | Cosine    |
+
+† **The "Neighbors" column is the ground-truth width, and it bounds what recall can mean.** H&M-2048 (with filters) is not uniform: its 10,000 queries carry between **1 and 25** true neighbours (mean 23.4; 931 queries have fewer than 25), because a filtered query only has as many true neighbours as the filter admits. Our `mean_recall` divides by the neighbours that actually exist, so a 1-neighbour query can still score 1.0; upstream `qdrant/vector-db-benchmark` always divides by `top`, so the same query caps at `1/top`. A run's `metrics_schema.ground_truth` block reports the measured profile and the resulting ceiling — at `top: 100` H&M's ceiling is 0.233, so a `calibration_precision` above that is unreachable by construction. Configs that do not set `top` derive it from the ground-truth row width (25 here, 10 for the no-filters variant), which is why this matters mostly when `top` is set explicitly.
 
 ### Generating local datasets
 

@@ -62,9 +62,21 @@ failed = False
 print(f\"{'Metric':<20} {'Python v0':>15} {'Rust':>15} {'Status':>20}\")
 print('=' * 72)
 
+# Python v0 (like upstream qdrant/vector-db-benchmark) computes
+# len(ids & expected[:top]) / top and stores it under 'mean_precisions'. That is
+# recall@top, i.e. the Rust 'mean_recall' field — NOT the Rust
+# 'mean_precision_at_returned', whose denominator is the number of results the
+# engine returned (#217). The two agree only on full-width ground truth, which
+# every dataset this script runs has; comparing the wrong pair here is precisely
+# the mistake the rename was meant to make impossible.
+KEY_MAP = {
+    'mean_precisions': 'mean_recall',
+}
+
 for key in ['mean_precisions', 'rps', 'mean_time', 'p50_time', 'p95_time', 'p99_time']:
+    rs_key = KEY_MAP.get(key, key)
     pv = py_r.get(key, 0.0)
-    rv = rs_r.get(key, 0.0)
+    rv = rs_r.get(rs_key, 0.0)
 
     if key == 'mean_precisions':
         if abs(pv - rv) < 0.001:
@@ -81,7 +93,8 @@ for key in ['mean_precisions', 'rps', 'mean_time', 'p50_time', 'p95_time', 'p99_
     else:
         status = 'PASS (Rust <= Py)' if rv <= pv * 1.5 else 'WARN (Rust > Py)'
 
-    print(f'{key:<20} {pv:>15.6f} {rv:>15.6f} {status:>20}')
+    label = key if rs_key == key else f'{key}→{rs_key}'
+    print(f'{label:<20} {pv:>15.6f} {rv:>15.6f} {status:>20}')
 
 print()
 if failed:
