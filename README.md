@@ -344,12 +344,19 @@ experiment is listed in the summary under `rejected_experiments` — otherwise a
 sweep that lost most of its configs produces a summary and a chart
 indistinguishable from a complete one.
 
-**What the check cannot do: cardinality is not identity.** Only the four
-Redis-wire engines address a per-config index and keyspace (#151-4). MongoDB,
-pgvector, Elasticsearch/OpenSearch, Qdrant, Milvus and VectorSets each have ONE
-corpus object per server, shared by every config *and every dataset* — so a
-full-size corpus uploaded by a sibling config, or by a different dataset, passes.
-The count proves the corpus is the right SIZE, never that it is the right corpus.
+**What the check cannot do: cardinality is not identity.** Only the five
+Redis-wire engines address a per-config object: Redis / Valkey / Dragonfly /
+KiviDB each own an index plus a keyspace (#151-4), and VectorSets owns the single
+key `idx:<config>` (#236 — a vector set *is* one key). MongoDB, pgvector,
+Elasticsearch/OpenSearch, Qdrant and Milvus each have ONE corpus object per
+server, shared by every config *and every dataset* — so a full-size corpus
+uploaded by a sibling config, or by a different dataset, passes. The count proves
+the corpus is the right SIZE, never that it is the right corpus.
+
+On the five per-config engines a sibling's corpus does **not** pass, because the
+count is read from this config's own object. What still passes there is the same
+config re-run against a **different dataset** of equal size — the key is derived
+from the config name alone, not from the dataset.
 
 **pgvector's count is an estimate on purpose.** The engine never `VACUUM`s and
 forces `STORAGE PLAIN`, so `SELECT count(*) FROM items` plans a Seq Scan over the
@@ -382,7 +389,7 @@ config `name`: index `"<base>:<config>"` (base `idx`) with docs keyed
 `"<config>:<id>"`. This lets an M×EF_CONSTRUCTION **sweep** run all its configs
 against one server and coexist, so you can upload every config once and then
 search each in a later `--skip-upload` pass — each config reads its own graph, and
-memory is reported per-index via `FT.INFO` (issue #151-4).
+memory is reported per-config as `index_memory_bytes` (issue #151-4).
 
 **VectorSets** joined this in #236 with the same derivation and the same knobs, but
 a different shape: it has no RediSearch index and no doc keyspace — its entire
@@ -390,6 +397,21 @@ corpus is the **single key** `"<base>:<config>"` that `VADD`/`VSIM`/`VINFO`/`VCA
 address, so that key *is* the namespace and there is no doc-key prefix. Before #236
 every VectorSets config used the literal key `idx` and `configure()` opened with
 `DEL idx`, so starting a second config **deleted the first's entire corpus**.
+
+**Reading the memory numbers.** Every upload result file carries two figures, and
+on a coexisting sweep they mean different things:
+
+| field | source | scope |
+|---|---|---|
+| `index_memory_bytes` | `FT.INFO` (Redis / Valkey / Dragonfly / KiviDB), `MEMORY USAGE <key>` (VectorSets, #236) | **this config only** — the number to quote |
+| `used_memory` | `INFO memory` | **server-wide**: the SUM over every config resident at that moment |
+
+Before per-config isolation the two were interchangeable for VectorSets, because
+exactly one corpus could be resident. They are not interchangeable now, so a
+`used_memory` figure from a pre-#236 run and one from a current sweep are not
+comparable quantities. Note also that nothing deletes a legacy `idx` left by an old
+binary — it stays resident and inflates `used_memory` in every later result file
+until you `DEL` it.
 
 - `REDIS_INDEX_NAME` / `VALKEY_INDEX_NAME` / `DRAGONFLY_INDEX_NAME` / `KIVIDB_INDEX_NAME` /
   `VECTORSETS_INDEX_NAME` now set the **base namespace**, not the whole index name;
@@ -400,12 +422,23 @@ every VectorSets config used the literal key `idx` and `configure()` opened with
 - Indexes/keys written by any **pre-#151-4** binary are incompatible — re-upload.
   For VectorSets the equivalent cut-off is **pre-#236**: a corpus left under the bare
   `idx` key is neither found nor deleted by a current binary (`DEL idx` to reclaim it).
-  `--skip-upload` against a missing/mismatched index now **hard-errors** instead of
+  `--skip-upload` against a missing/mismatched index **hard-errors** instead of
   silently writing a `recall 0.0` file — including for VectorSets, where `VSIM`
   against a missing key returns an **empty array with no error**, so nothing
   downstream could otherwise tell "no data" from "no matches". The `VCARD`-based
-  corpus-reuse check (#238/#271) is what makes that promise true for the fifth
-  member of this family.
+  corpus-reuse check (#238/#271) is what makes that promise reach the fifth member
+  of this family.
+
+  **The guarantee is conditional on the tool knowing how many rows to expect.**
+  The check compares a server-side count against the corpus measured on disk; when
+  that expected count cannot be determined — sparse/`h5-multi` dataset layouts, an
+  unresolvable dataset path, or any error reading it — the verdict is
+  `Unverifiable`, which prints `Reuse check — SKIPPED` and **lets the run
+  proceed**. On that path a missing corpus is still measured and still published.
+  The result file records `params.corpus_reuse.status = "unverified"`, so it is not
+  silent, but it is not a hard error either: treat a `SKIPPED` line as "this run's
+  corpus was never verified" and check it yourself. (Inherited from #238/#271, not
+  specific to VectorSets.)
 - Two-phase coexistence sweep: `… --keep-data` (upload + search all configs,
   keep the data), then `… --skip-upload --keep-data --skip-if-exists false`
   (search each against its own index). Per-config prefixing stores N copies of
@@ -434,20 +467,32 @@ VSIM coerces a non-numeric attribute to `0` in a numeric comparison — so a
 (a two-sided range matches nothing → recall 0; a one-sided `lt`/`lte` matches
 everything). **Re-upload before searching.**
 
-`--skip-upload` does check that the corpus is **present and complete** on
-VectorSets too (`VCARD idx:<config>`, see above), but it cannot check that the
-corpus is *current*: a pre-#230 corpus is the right size and the wrong encoding,
-so it is found, the run succeeds, and only the recall number is wrong. That is the
-one failure mode left here.
+`--skip-upload` checks that the corpus is **present and complete** on VectorSets
+(`VCARD idx:<config>`, see above), but it cannot check that the corpus is
+*current*: a pre-#230 corpus is the right size and the wrong encoding, so it is
+found, the run succeeds, and only the recall number is wrong.
 
-Note the interaction with **#236**, which is a different cut-off. A corpus written
-by a pre-#236 binary sits under the bare key `idx`, not `idx:<config>`, so it is
-**not** found: `VCARD` answers 0, the reuse check classifies it `Short`, and the run
-is rejected. That is deliberate. `VSIM` against a missing key returns an **empty
-array with rc=0**, so the run would otherwise have published `recall 0.0` at an
-*inflated* QPS (an empty search returns instantly — measured 437 → 3413 QPS), with
-`failed_queries` still 0 and every guard keying off it silent. Re-upload, or
-`DEL idx` and re-upload.
+**In practice #236 makes that case unreachable by default**, because #230 shipped
+before #236: any corpus old enough to hold ISO-8601 strings is also old enough to
+sit under the bare key `idx`, where a current binary does not look for it. Such a
+corpus is **not** found — `VCARD idx:<config>` answers 0, the reuse check
+classifies it `Short`, and the run is rejected. That is deliberate: `VSIM` against
+a missing key returns an **empty array with rc=0**, so the run would otherwise have
+published `recall 0.0` at an *inflated* QPS (an empty search returns instantly —
+measured on a 400-vector corpus, `ef=400 parallel=1`: **637.6 QPS at recall 1.000
+with the corpus present, 2679.3 QPS at recall 0.000 with the key deleted** — 4.2×
+*faster* for measuring nothing), with `failed_queries: 0` in both runs and every guard keying off
+it silent. Re-upload, or `DEL idx` and re-upload.
+
+Exactly two things get you back to the wrong-encoding case, and neither is a
+migration path this README recommends:
+
+- `VECTORSETS_INDEX_NAME_EXACT=1` with the base left at `idx`, which pins a single
+  config onto the legacy key; or
+- renaming the legacy key by hand (`RENAME idx idx:<config>`).
+
+Both hand the old corpus to a current binary under a name it will accept. If you do
+either, you own the encoding check — the size check will pass.
 
 ### Charts
 

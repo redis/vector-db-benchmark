@@ -26,9 +26,12 @@ use vector_db_benchmark::start_gate::WorkerPool;
 #[derive(Clone)]
 pub struct VectorSetsConfig {
     /// The Redis key holding this config's vector set — the single addressable
-    /// namespace for VADD/VSIM/VINFO/DEL. Derived per config (#236, mirroring
-    /// #151-4) so two VectorSets configs on one server cannot clobber each
-    /// other's corpus. See [`VectorSetsEngine::new`].
+    /// namespace for VADD/VSIM/VINFO/VCARD/DEL. Derived per config (#236,
+    /// mirroring #151-4) so two VectorSets configs on one server cannot clobber
+    /// each other's corpus. See [`VectorSetsEngine::new`].
+    ///
+    /// This buys **data** isolation, not **measurement** isolation — see the
+    /// caveat in [`VectorSetsEngine::new`] before running two benchmarks at once.
     pub key: String,
     pub quant: String,
     pub m: i64,
@@ -108,14 +111,33 @@ impl VectorSetsEngine {
             redis_url,
             config: VectorSetsConfig {
                 // #236: VectorSets addresses ONE Redis key, and it used to be the
-                // literal `idx` for every config. Two configs (or two datasets, or
-                // two concurrent runs) on one server therefore shared one vector
-                // set and `configure()`'s `DEL` wiped the neighbour mid-flight.
-                // Derive it from the config name exactly as the Redis-wire engines
-                // derive their index name (#151-4), including the
-                // `VECTORSETS_INDEX_NAME` base override and its `_EXACT` pin.
-                // There is no key-prefix analogue: a vector set is a single key,
-                // not a keyspace of doc hashes, so this name IS the namespace.
+                // literal `idx` for every config. Two configs on one server
+                // therefore shared one vector set and `configure()`'s `DEL` wiped
+                // the neighbour mid-flight. Derive it from the config name exactly
+                // as the Redis-wire engines derive their index name (#151-4),
+                // including the `VECTORSETS_INDEX_NAME` base override and its
+                // `_EXACT` pin. There is no key-prefix analogue: a vector set is a
+                // single key, not a keyspace of doc hashes, so this name IS the
+                // namespace.
+                //
+                // SCOPE — read before relying on this for concurrency. The key is
+                // derived from the CONFIG NAME alone, so:
+                //  * two CONFIGS on one server are isolated (the fix);
+                //  * one config over two DATASETS still shares a key, and so do
+                //    two concurrent runs of the SAME config — identical to the
+                //    Redis family's design, hence not a regression, but not
+                //    covered either.
+                // And even for two configs this is DATA isolation, not
+                // MEASUREMENT isolation. `configure()` calls
+                // `redis_utils::reset_commandstats` → `CONFIG RESETSTAT`, which is
+                // server-GLOBAL: two concurrent runs each wipe the other's
+                // baseline, blinding `check_commandstats`' failed-call guard — the
+                // thing that catches a silently-failing VADD/VSIM. `INFO memory`
+                // is server-wide too (that half is handled: `get_memory_usage`
+                // also publishes a per-key `index_memory_bytes`). Concurrency was
+                // impossible before this change and is newly reachable, so the
+                // caveat is newly relevant: run concurrent VectorSets benchmarks
+                // on separate servers if the commandstats guard matters to you.
                 key: derive_index_name("VECTORSETS_INDEX_NAME", "idx", &engine_config.name),
                 quant,
                 m,

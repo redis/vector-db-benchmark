@@ -650,15 +650,25 @@ fn test_vectorsets_exact_pin_with_two_configs_is_rejected_at_startup() {
 /// `Engine::corpus_row_count` (#271 — `VCARD <key>` for VectorSets) and hard-errors
 /// when the server holds fewer rows than the dataset declares.
 ///
-/// The legacy key is seeded with EXACTLY the expected row count. That is what
-/// makes the test sharp: a `corpus_row_count` that probed the old hardcoded `idx`
-/// — which is precisely what merging #271 into this branch produced before the
-/// key was threaded through it — would read 400 of 400, return `Ok`, and let the
-/// run proceed to measure the empty per-config key. The guard has to be reading
-/// THIS config's key for the error below to appear at all.
+/// Where the teeth actually are, stated precisely because an earlier version of
+/// this comment got it wrong. The legacy key is seeded with exactly the expected
+/// row count, which *looks* like the load-bearing part — as if a probe hardcoded
+/// to `idx` would read 400 of 400 and wave the run through. It would not: this
+/// test runs over a PRIVATE base (`BASE` below, not the literal `idx`, for the
+/// isolation reason given there), so a hardcoded probe reads an empty `idx`, gets
+/// 0 of 400, and hard-errors — passing the negative half for the wrong reason.
 ///
-/// A positive control follows the negative one so the test cannot pass merely by
-/// the guard rejecting everything.
+/// The half that actually fails against a wrong-key probe is the **positive
+/// control** at the end: `--skip-upload` against the corpus this config really
+/// uploaded must SUCCEED, and a probe reading `idx` sees 0 there and rejects it.
+/// Verified by counterfactual — with `corpus_row_count` patched back to
+/// `.arg("idx")`, this test fails at the positive control, not at any assertion
+/// above it. (`test_vectorsets_corpus_row_count_tracks_the_live_key` fails too,
+/// and its `holds 200 of the 400 rows` assertion IS a direct wrong-key detector.)
+///
+/// The seeding still earns its place: it makes the scenario the realistic one (a
+/// legacy corpus present, not merely absent) and proves the run is rejected even
+/// when a full-size corpus is sitting right there on the server.
 #[test]
 fn test_vectorsets_skip_upload_hard_errors_on_a_pre_236_corpus() {
     wait_for_vectorsets();
@@ -891,6 +901,7 @@ fn test_vectorsets_index_memory_is_per_config_not_server_wide() {
 
     let proj_a = common::write_match_any_cosine_project("vs-mem-a", &vectorsets_config(name_a), 8);
     let proj_b = common::write_match_any_cosine_project("vs-mem-b", &vectorsets_config(name_b), 8);
+    let n_b = expected_count(&proj_b.root);
 
     let mut c = conn();
     for k in [key_a.as_str(), key_b.as_str()] {
@@ -953,6 +964,29 @@ fn test_vectorsets_index_memory_is_per_config_not_server_wide() {
     assert!(
         live_b > 0 && (b_with_a_index as f64) >= 0.5 * live_b as f64,
         "index_memory_bytes ({b_with_a_index}) must track MEMORY USAGE {key_b} ({live_b})"
+    );
+    // …and it SCALES with the corpus rather than reporting a constant. Every
+    // assertion above is satisfied by a fixed per-key overhead figure, which is
+    // the plausible way `MEMORY USAGE` could be meaningless here (a module type
+    // with no `mem_usage` callback reports bare key overhead). Compare against a
+    // one-element vector set of the same dimensionality on the same server: 400
+    // elements must cost an order of magnitude more than 1.
+    let tiny_key = "idx:vs-mem-tiny";
+    let _ = redis::cmd("DEL").arg(tiny_key).query::<i64>(&mut c);
+    let mut seed = redis::cmd("VADD");
+    seed.arg(tiny_key).arg("VALUES").arg(8);
+    for d in 0..8 {
+        seed.arg(d.to_string());
+    }
+    seed.arg("solo");
+    seed.query::<i64>(&mut c)
+        .expect("seed 1-element vector set");
+    let tiny = memory_usage(&mut c, tiny_key);
+    let _ = redis::cmd("DEL").arg(tiny_key).query::<i64>(&mut c);
+    assert!(
+        tiny > 0 && b_with_a_index > 10 * tiny,
+        "index_memory_bytes must scale with the corpus, not report a constant: \
+         {n_b} elements = {b_with_a_index} B vs 1 element = {tiny} B"
     );
     // And the two numbers demonstrably mean different things: the server-wide
     // figure accounts for far more than this config's corpus, which is exactly
