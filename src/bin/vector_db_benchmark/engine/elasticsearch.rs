@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use elasticsearch::http::request::JsonBody;
 use elasticsearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
-use elasticsearch::indices::{IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts};
+use elasticsearch::indices::{
+    IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts, IndicesRefreshParts,
+};
 use elasticsearch::params::WaitForStatus;
 use elasticsearch::{BulkParts, Elasticsearch, SearchParts};
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
@@ -193,11 +195,7 @@ impl ElasticsearchEngine {
 
         let body = serde_json::json!({
             "settings": {
-                "index": {
-                    "number_of_shards": 1,
-                    "number_of_replicas": 0,
-                    "refresh_interval": "10s",
-                }
+                "index": build_index_settings(),
             },
             "mappings": {
                 "_source": { "excludes": ["vector"] },
@@ -307,6 +305,52 @@ impl ElasticsearchEngine {
         Ok(())
     }
 
+    /// Make just-uploaded documents searchable.
+    ///
+    /// Required because `build_index_settings` sets `refresh_interval: -1`: with
+    /// no periodic refresh, documents sitting in the in-memory buffer are not
+    /// visible to search. An explicit `_refresh` is also *not* implied by the
+    /// force-merge that follows — force-merge rewrites segments, it does not
+    /// promise to reopen the searcher — and ES's "search idle" auto-refresh
+    /// escape hatch does not apply to an index with an explicit
+    /// `refresh_interval`. So this call is the thing that guarantees the search
+    /// phase sees the full corpus. Mirrors `opensearch.rs::refresh`.
+    ///
+    /// Retried on the same budget as force-merge: it runs after the whole
+    /// ingest, and failing it un-retried would discard a long upload.
+    fn refresh(&self) -> Result<(), String> {
+        println!("Refreshing index...");
+
+        let max_retries = 30;
+        let mut last_err = String::new();
+        for attempt in 0..=max_retries {
+            let result = self.rt.block_on(
+                self.client
+                    .indices()
+                    .refresh(IndicesRefreshParts::Index(&[&self.index_name]))
+                    .send(),
+            );
+
+            match result {
+                Ok(resp) if resp.status_code().is_success() => return Ok(()),
+                Ok(resp) => {
+                    last_err = format!("status {}", resp.status_code());
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+
+            if attempt < max_retries {
+                println!("Refresh retry {}/{}: {}", attempt, max_retries, last_err);
+            }
+        }
+        Err(format!(
+            "Refresh failed after {} retries: {}",
+            max_retries, last_err
+        ))
+    }
+
     fn force_merge(&self) -> Result<(), String> {
         println!("Forcing merge into 1 segment...");
 
@@ -376,6 +420,28 @@ impl ElasticsearchEngine {
         }
         Err("Elasticsearch cluster did not reach yellow status in time".to_string())
     }
+}
+
+/// Index-level settings applied at create time.
+///
+/// `refresh_interval: -1` disables periodic refresh for the duration of the
+/// benchmark. The whole dataset is indexed in one bulk phase, so a background
+/// refresh every N seconds only buys visibility nobody reads — while charging
+/// the ingest for segment creation the run never needs. Upstream qdrant's
+/// reference tool does the same for Elasticsearch
+/// (`engine/clients/elasticsearch/configure.py`: *"no refresh is required
+/// because we index all the data at once"*), and `opensearch.rs` already did.
+/// Leaving ES at the old `10s` made our ES upload throughput pessimistic
+/// against both.
+///
+/// Because nothing refreshes on a timer any more, `upload()` MUST issue an
+/// explicit `_refresh` before the search phase (see `ElasticsearchEngine::refresh`).
+fn build_index_settings() -> serde_json::Value {
+    serde_json::json!({
+        "number_of_shards": 1,
+        "number_of_replicas": 0,
+        "refresh_interval": -1,
+    })
 }
 
 /// Build the base URL with authentication from env vars.
@@ -857,10 +923,14 @@ impl Engine for ElasticsearchEngine {
             vectors.len() as f64 / upload_time
         );
 
-        // Force merge post-upload. Include the merge/index-settle time in
-        // total_time for cross-engine comparability (mirrors mongodb; matches
-        // v0's post_upload() timing).
+        // Explicit refresh (refresh_interval is disabled during upload) so the
+        // documents are searchable, then merge segments. Include this
+        // refresh+merge time in total_time for cross-engine comparability
+        // (mirrors opensearch/mongodb; matches v0's post_upload() timing) — the
+        // refresh work is not removed from the measurement, only moved out of
+        // the concurrent ingest and accounted for once.
         let index_start = Instant::now();
+        self.refresh()?;
         self.force_merge()?;
         let index_time = index_start.elapsed().as_secs_f64();
 
@@ -1092,6 +1162,26 @@ impl Engine for ElasticsearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Periodic refresh must stay disabled during ingest. `10s` here charged the
+    /// ES upload for segment refreshes that OpenSearch (`refresh_interval: -1`)
+    /// and upstream qdrant's reference client both skip, making our ES upload
+    /// throughput pessimistic — a competitor made to look worse than it is.
+    /// Regression guard for #240.
+    #[test]
+    fn index_settings_disable_periodic_refresh() {
+        let settings = build_index_settings();
+        assert_eq!(settings["refresh_interval"], serde_json::json!(-1));
+    }
+
+    /// The other half of the apples-to-apples ES-vs-OS pairing (#235): a single
+    /// shard and no replicas, matching `opensearch.rs`.
+    #[test]
+    fn index_settings_pin_single_shard_no_replicas() {
+        let settings = build_index_settings();
+        assert_eq!(settings["number_of_shards"], serde_json::json!(1));
+        assert_eq!(settings["number_of_replicas"], serde_json::json!(0));
+    }
 
     /// Load-bearing: the hoisted request body (pre-serialized to a RawValue) must
     /// be byte-identical to what the old inline `.body(value)` path put on the
