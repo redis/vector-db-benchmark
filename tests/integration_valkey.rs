@@ -1719,3 +1719,157 @@ fn test_valkey_skip_upload_without_prior_upload_errors() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #238 — `--skip-upload` must reuse the corpus, not destroy it
+// ---------------------------------------------------------------------------
+
+/// Valkey's destruction path differs from Redis's: no `DD` flag on
+/// `FT.DROPINDEX`, so `configure()` drops the index and then SCAN+UNLINKs every
+/// key under this config's prefix.
+///
+/// RED on the pre-fix branch: 400 keys -> 0, `num_docs` 400 -> 0, while the run
+/// printed a QPS line and exited 0.
+#[test]
+fn test_binary_valkey_skip_upload_skip_vector_index_preserves_corpus() {
+    wait_for_valkey();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238vk", "engine": "valkey",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg238vk-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("VALKEY_PORT", port.as_str())];
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238vk",
+            "cfg238vk-test",
+            "localhost",
+            &envs,
+            &["--skip-vector-index", "--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload with --skip-vector-index) failed"
+    );
+
+    let keys_before: i64 = redis::cmd("EVAL")
+        .arg("return #redis.call('keys', KEYS[1])")
+        .arg(1)
+        .arg("valkey-no-vector:*")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(keys_before, common::N_DOCS as i64, "phase 1 keyspace");
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238vk",
+            "cfg238vk-test",
+            "localhost",
+            &envs,
+            &["--skip-upload", "--skip-vector-index", "--keep-data"],
+        ),
+        "phase 2 (--skip-upload --skip-vector-index) failed"
+    );
+
+    let keys_after: i64 = redis::cmd("EVAL")
+        .arg("return #redis.call('keys', KEYS[1])")
+        .arg(1)
+        .arg("valkey-no-vector:*")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(
+        keys_after, keys_before,
+        "--skip-upload --skip-vector-index unlinked the corpus it was told to reuse \
+         ({keys_before} -> {keys_after} keys) — issue #238"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// `corpus_row_count()` must be a real server read, not a constant: amputate the
+/// corpus behind the tool's back and the reported number has to follow (#238).
+#[test]
+fn test_binary_valkey_skip_upload_short_corpus_is_fatal() {
+    wait_for_valkey();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238vkshort", "engine": "valkey",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg238vkshort-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = test_port().to_string();
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238vkshort",
+            "cfg238vkshort-test",
+            "localhost",
+            &[("VALKEY_PORT", port.as_str())],
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+
+    let half = common::N_DOCS / 2;
+    for id in 0..half {
+        let _: () = redis::cmd("UNLINK")
+            .arg(format!("cfg238vkshort:{id}"))
+            .query(&mut conn)
+            .unwrap();
+    }
+
+    let out = Command::new(binary_path())
+        .args([
+            "--engines",
+            "cfg238vkshort",
+            "--datasets",
+            "cfg238vkshort-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ])
+        .env("VALKEY_PORT", &port)
+        .current_dir(&proj.root)
+        .output()
+        .expect("run vector-db-benchmark");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a half-deleted valkey corpus must be a hard error.\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!("holds {half} of the {} rows", common::N_DOCS)),
+        "the count must track the amputation, proving it is a live server read.\n{combined}"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

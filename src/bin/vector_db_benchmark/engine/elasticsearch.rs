@@ -12,14 +12,14 @@ use elasticsearch::indices::{
     IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts, IndicesRefreshParts,
 };
 use elasticsearch::params::WaitForStatus;
-use elasticsearch::{BulkParts, Elasticsearch, SearchParts};
+use elasticsearch::{BulkParts, CountParts, Elasticsearch, SearchParts};
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use uuid::Uuid;
 use vector_db_benchmark::start_gate::WorkerPool;
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
-use crate::engine::{Engine, SearchResults, UploadStats};
+use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
@@ -891,6 +891,57 @@ fn extract_knn_hits(resp_body: &serde_json::Value) -> Result<Vec<(i64, f64)>, St
 // ── Engine trait implementation ──────────────────────────────────────────
 
 impl Engine for ElasticsearchEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238). `GET /<index>/_count`; a missing index (404) answers 0.
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
+        let resp = self
+            .rt
+            .block_on(
+                self.client
+                    .count(CountParts::Index(&[&self.index_name]))
+                    .send(),
+            )
+            .map_err(|e| format!("_count on index '{}' failed: {}", self.index_name, e))?;
+        // 404 = the index is not there, which for this check is the same as an
+        // empty one. Any other non-2xx (403, or 400 on a CLOSED index whose
+        // corpus is perfectly intact) is a probe failure, not a corpus of zero.
+        let status = resp.status_code().as_u16();
+        if status == 404 {
+            return Ok(Some(CorpusCount::exact(0)));
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "_count on index '{}' returned HTTP {} (the index may be closed or \
+                 unreadable; the corpus itself may be intact)",
+                self.index_name, status
+            ));
+        }
+        let body: serde_json::Value = self.rt.block_on(resp.json()).map_err(|e| {
+            format!(
+                "_count on index '{}' returned no JSON: {}",
+                self.index_name, e
+            )
+        })?;
+        // A shard that failed to answer makes the count a floor, not a total —
+        // reporting it as the corpus size would invent a shortfall on a degraded
+        // but intact cluster.
+        let failed_shards = body
+            .pointer("/_shards/failed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if failed_shards > 0 {
+            return Err(format!(
+                "_count on index '{}' had {} failed shard(s); the count is a floor, \
+                 not the corpus size",
+                self.index_name, failed_shards
+            ));
+        }
+        Ok(body
+            .get("count")
+            .and_then(|v| v.as_u64())
+            .map(CorpusCount::exact))
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

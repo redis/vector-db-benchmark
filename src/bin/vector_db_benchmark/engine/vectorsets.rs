@@ -15,7 +15,7 @@ use redis::Connection;
 use super::redis_utils;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
-use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
+use crate::engine::{CorpusCount, Engine, SearchResults, UpdateSearchRatio, UploadStats};
 use vector_db_benchmark::parsers::datetime_to_epoch_secs;
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
@@ -38,6 +38,16 @@ pub struct VectorSetsEngine {
     config: VectorSetsConfig,
     search_params: Vec<SearchParams>,
     commandstats_baseline: Option<redis_utils::CommandStatsBaseline>,
+    /// Whether `commandstats_baseline` was established by this process.
+    ///
+    /// `None` is ambiguous on its own: it means BOTH "CONFIG RESETSTAT succeeded,
+    /// so the server counters start at zero" and "configure() never ran, so
+    /// nothing was reset". On the `--skip-upload` path (#238) configure() is
+    /// skipped, and `check_commandstats` would then compare this run's failure
+    /// count against zero while the counters still hold every failure since the
+    /// server started — failing a search in which nothing actually failed. This
+    /// flag disambiguates so `search()` can prime the baseline exactly once.
+    commandstats_primed: bool,
 }
 
 impl VectorSetsEngine {
@@ -100,6 +110,7 @@ impl VectorSetsEngine {
             },
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             commandstats_baseline: None,
+            commandstats_primed: false,
         })
     }
 
@@ -448,7 +459,42 @@ fn vadd_single(
         .map_err(|e| format!("VADD update error: {}", e))
 }
 
+/// Establish the commandstats baseline if configure() did not (issue #238).
+impl VectorSetsEngine {
+    /// Idempotent and a no-op on the normal configure -> upload -> search path,
+    /// so the existing accounting is unchanged; it only rescues the
+    /// `--skip-upload` path, where nothing had reset the counters.
+    fn prime_commandstats_if_needed(&mut self) -> Result<(), String> {
+        if self.commandstats_primed {
+            return Ok(());
+        }
+        let mut conn = self.get_connection()?;
+        self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
+        self.commandstats_primed = true;
+        Ok(())
+    }
+}
+
 impl Engine for VectorSetsEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238). `VCARD idx` — the cardinality of the vector set this engine
+    /// searches. A missing key answers 0 (VCARD returns 0 for a non-existent key),
+    /// which is exactly the "nothing to reuse" verdict we want.
+    ///
+    /// The key is the hardcoded `idx` (issue #236): this count therefore cannot
+    /// distinguish two configs sharing one server, and neither can the search.
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
+        let mut conn = self.get_connection()?;
+        // VCARD answers 0 for a key that does not exist, so a missing corpus and
+        // an empty one are the same reply — which is the verdict we want. Any
+        // Err is a genuine probe failure and is propagated, never reported as 0.
+        let n: u64 = redis::cmd("VCARD")
+            .arg("idx")
+            .query(&mut conn)
+            .map_err(|e| format!("VCARD idx failed: {e}"))?;
+        Ok(Some(CorpusCount::exact(n)))
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -473,6 +519,7 @@ impl Engine for VectorSetsEngine {
         let _ = redis::cmd("DEL").arg("idx").query::<()>(&mut conn);
 
         self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
+        self.commandstats_primed = true;
         Ok(())
     }
 
@@ -540,6 +587,14 @@ impl Engine for VectorSetsEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // configure() normally resets the server's command counters and
+        // establishes the commandstats baseline; on the `--skip-upload` path it
+        // never runs (#238), so check_commandstats below would compare this run's
+        // failure count against zero while the counters still hold every failure
+        // since the server started — failing a run in which nothing failed.
+        // Idempotent no-op once primed; outside every timed window.
+        self.prime_commandstats_if_needed()?;
+
         let ef = params
             .search_params
             .as_ref()
@@ -766,6 +821,14 @@ impl Engine for VectorSetsEngine {
         num_queries: i64,
         ratio: &UpdateSearchRatio,
     ) -> Result<SearchResults, String> {
+        // configure() normally resets the server's command counters and
+        // establishes the commandstats baseline; on the `--skip-upload` path it
+        // never runs (#238), so check_commandstats below would compare this run's
+        // failure count against zero while the counters still hold every failure
+        // since the server started — failing a run in which nothing failed.
+        // Idempotent no-op once primed; outside every timed window.
+        self.prime_commandstats_if_needed()?;
+
         let ef = params
             .search_params
             .as_ref()
