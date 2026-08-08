@@ -14,13 +14,14 @@ use qdrant_client::qdrant::quantization_config::Quantization;
 use qdrant_client::qdrant::vectors_config::Config;
 use qdrant_client::qdrant::{
     payload_index_params::IndexParams, BinaryQuantization, CompressionRatio, Condition,
-    CreateCollectionBuilder, Datatype, DatetimeRange, DeleteCollectionBuilder, Distance, FieldType,
-    Filter, Fusion, HnswConfigDiff, KeywordIndexParams, MaxOptimizationThreads, NamedVectors,
+    CreateCollectionBuilder, Datatype, DatetimeIndexParams, DatetimeRange, DeleteCollectionBuilder,
+    Distance, FieldType, Filter, FloatIndexParams, Fusion, GeoIndexParams, HnswConfigDiff,
+    IntegerIndexParams, KeywordIndexParams, MaxOptimizationThreads, NamedVectors,
     OptimizersConfigDiff, PointStruct, PrefetchQueryBuilder, ProductQuantization,
     QuantizationSearchParams, QuantizationType, Query, QueryPointsBuilder, ScalarQuantization,
-    SearchParams as QdrantSearchParams, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
-    Timestamp, UuidIndexParams, Vector, VectorInput, VectorParamsBuilder, VectorsConfig,
-    VectorsConfigBuilder,
+    SearchParams as QdrantSearchParams, SparseIndexConfigBuilder, SparseVectorParamsBuilder,
+    SparseVectorsConfigBuilder, TextIndexParams, Timestamp, UuidIndexParams, Vector, VectorInput,
+    VectorParamsBuilder, VectorsConfig, VectorsConfigBuilder,
 };
 use qdrant_client::{Payload, Qdrant};
 
@@ -244,18 +245,7 @@ impl QdrantEngine {
             .and_then(|v| v.get("datatype"))
             .and_then(|v| v.as_str())
         {
-            let datatype = match dt.to_lowercase().as_str() {
-                "float32" | "f32" | "default" => Datatype::Float32,
-                "float16" | "f16" => Datatype::Float16,
-                "uint8" | "u8" => Datatype::Uint8,
-                other => {
-                    return Err(format!(
-                        "unknown vectors_config.datatype {:?} (expected float32, float16 or uint8)",
-                        other
-                    ))
-                }
-            };
-            params = params.datatype(datatype);
+            params = params.datatype(parse_datatype(dt)?);
         }
         Ok(params)
     }
@@ -270,11 +260,24 @@ impl QdrantEngine {
     /// rather than treated as unset.
     fn hnsw_config_diff(&self) -> Option<HnswConfigDiff> {
         let h = self.hnsw.as_ref()?;
+        // Any key inside hnsw_config that no engine reads is reported, not
+        // dropped — silently discarding one is the bug this branch exists to fix.
+        let unsupported = h.unsupported_keys();
+        if !unsupported.is_empty() {
+            eprintln!(
+                "Warning: unsupported collection_params.hnsw_config keys ignored: {} \
+                 (supported: m, ef_construct, on_disk, payload_m, inline_storage, \
+                 full_scan_threshold, max_indexing_threads)",
+                unsupported.join(", ")
+            );
+        }
         if h.m.is_none()
             && h.ef_construction.is_none()
             && h.on_disk.is_none()
             && h.payload_m.is_none()
             && h.inline_storage.is_none()
+            && h.full_scan_threshold.is_none()
+            && h.max_indexing_threads.is_none()
         {
             return None;
         }
@@ -284,20 +287,19 @@ impl QdrantEngine {
             on_disk: h.on_disk,
             payload_m: h.payload_m.map(|v| v as u64),
             inline_storage: h.inline_storage,
-            ..Default::default()
+            full_scan_threshold: h.full_scan_threshold.map(|v| v as u64),
+            max_indexing_threads: h.max_indexing_threads.map(|v| v as u64),
         })
     }
 
-    /// Apply `collection_params.optimizers_config` (rps-tuned segment / memmap
-    /// knobs), `collection_params.quantization_config` (scalar/binary) and
-    /// `collection_params.on_disk_payload` to a `CreateCollectionBuilder`.
-    /// Shared verbatim by the dense-only and hybrid create paths so the hybrid
-    /// collection honours the SAME tuning (e.g. qdrant-hybrid.json's
-    /// `memmap_threshold`).
-    fn apply_optimizers_and_quantization(
+    /// Apply the collection tuning that is valid for ANY collection shape:
+    /// `collection_params.optimizers_config` (rps-tuned segment / memmap knobs)
+    /// and `collection_params.on_disk_payload`. Shared by the dense, hybrid and
+    /// sparse create paths — quantization is separate because it is dense-only.
+    fn apply_optimizers_and_payload_storage(
         &self,
         mut create_builder: CreateCollectionBuilder,
-    ) -> Result<CreateCollectionBuilder, String> {
+    ) -> CreateCollectionBuilder {
         if let Some(opt) = self.collection_params_extra.get("optimizers_config") {
             let mut diff = OptimizersConfigDiff::default();
             if let Some(v) = opt.get("default_segment_number").and_then(|v| v.as_u64()) {
@@ -309,13 +311,19 @@ impl QdrantEngine {
             if let Some(v) = opt.get("memmap_threshold").and_then(|v| v.as_u64()) {
                 diff.memmap_threshold = Some(v);
             }
-            create_builder = create_builder.optimizers_config(diff);
-        }
-
-        if let Some(q) = self.collection_params_extra.get("quantization_config") {
-            if let Some(quantization) = build_quantization(q)? {
-                create_builder = create_builder.quantization_config(quantization);
+            // `max_optimization_threads` cannot be honoured: this harness forces
+            // it to 0 for the ingest window (disable_indexing_optimizers) and to
+            // Auto afterwards (wait_collection_green) so that index-build time is
+            // measured the same way for every engine. Upstream's configs do set
+            // it, so say what we do with it instead of dropping it silently.
+            if opt.get("max_optimization_threads").is_some() {
+                eprintln!(
+                    "Warning: collection_params.optimizers_config.max_optimization_threads is \
+                     ignored — this harness pins it to 0 during upload and Auto during the index \
+                     wait, so index-build time stays comparable across engines"
+                );
             }
+            create_builder = create_builder.optimizers_config(diff);
         }
 
         // Keep payloads on disk instead of in RAM — the on-disk experiments pair
@@ -327,7 +335,31 @@ impl QdrantEngine {
         {
             create_builder = create_builder.on_disk_payload(v);
         }
+        create_builder
+    }
+
+    /// Apply `collection_params.quantization_config` (scalar / product / binary).
+    /// DENSE-only: Qdrant quantizes dense vectors, so the sparse path warns
+    /// rather than calling this.
+    fn apply_quantization(
+        &self,
+        mut create_builder: CreateCollectionBuilder,
+    ) -> Result<CreateCollectionBuilder, String> {
+        if let Some(q) = self.collection_params_extra.get("quantization_config") {
+            if let Some(quantization) = build_quantization(q)? {
+                create_builder = create_builder.quantization_config(quantization);
+            }
+        }
         Ok(create_builder)
+    }
+
+    /// Both of the above, for the dense and hybrid create paths.
+    fn apply_optimizers_and_quantization(
+        &self,
+        create_builder: CreateCollectionBuilder,
+    ) -> Result<CreateCollectionBuilder, String> {
+        let create_builder = self.apply_optimizers_and_payload_storage(create_builder);
+        self.apply_quantization(create_builder)
     }
 
     /// Throttle optimizer threads to 0 during bulk indexing (re-enabled to auto
@@ -352,10 +384,15 @@ impl QdrantEngine {
     ///
     /// `collection_params.payload_index_params` refines individual keyword/uuid
     /// indexes with `is_tenant` (group points by that value on disk — the
-    /// multi-tenancy layout) and `on_disk` (keep the index off the heap). A key
-    /// that is not in the dataset schema is a hard error, matching upstream:
-    /// otherwise a typo'd field name silently produces an unrefined index and the
-    /// run looks like it measured a tenant-optimised layout when it did not.
+    /// multi-tenancy layout) and `on_disk` (keep the index off the heap).
+    ///
+    /// An entry that cannot take effect — a field absent from the dataset schema,
+    /// or one whose type has no `is_tenant`/`on_disk` (int, float, geo, text) —
+    /// WARNS loudly and continues. It is deliberately not fatal: upstream's own
+    /// `qdrant-on-disk.json` names fields (`a`, `d`) that our dataset schemas do
+    /// not all declare, and rejecting those would make the upstream file
+    /// unrunnable verbatim, which is the opposite of this branch's goal. The
+    /// warning is what stops the run from quietly passing as tenant-optimised.
     fn create_payload_indexes(&self, dataset: &Dataset) -> Result<(), String> {
         let schema = dataset.config.schema.as_ref().and_then(|s| s.as_object());
         let index_params = self
@@ -364,13 +401,29 @@ impl QdrantEngine {
             .and_then(|v| v.as_object());
 
         if let Some(params) = index_params {
-            for field in params.keys() {
-                if !schema.is_some_and(|s| s.contains_key(field)) {
-                    return Err(format!(
-                        "collection_params.payload_index_params names {:?}, which is not in the \
-                         schema of dataset {}",
-                        field, dataset.config.name
-                    ));
+            for (field, spec) in params {
+                let declared = schema.and_then(|s| s.get(field)).and_then(|v| v.as_str());
+                match declared {
+                    None => eprintln!(
+                        "Warning: collection_params.payload_index_params names {:?}, which is NOT \
+                         in the schema of dataset {} — no index is created for it, so {:?} has no \
+                         effect on this run",
+                        field, dataset.config.name, spec
+                    ),
+                    // `on_disk` works on every index type; `is_tenant` only on
+                    // keyword/uuid (and bool, which we index as a keyword).
+                    Some(ft)
+                        if spec.get("is_tenant").is_some()
+                            && !matches!(ft, "keyword" | "uuid" | "bool") =>
+                    {
+                        eprintln!(
+                            "Warning: payload_index_params.{}.is_tenant is ignored — a Qdrant {} \
+                             index has no is_tenant (only keyword, uuid and bool do); its on_disk \
+                             setting, if any, IS applied",
+                            field, ft
+                        )
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -421,11 +474,61 @@ impl QdrantEngine {
     }
 
     /// Create a sparse-vector collection with a single named "sparse" vector.
+    ///
+    /// Honours the SAME collection tuning as the dense path — `optimizers_config`,
+    /// `on_disk_payload`, and `vectors_config`'s `on_disk` / `datatype`, the last
+    /// two mapped onto the sparse index (which has its own equivalents). Without
+    /// this, running a sparse dataset under an on-disk config reported under an
+    /// "on-disk" run name while being entirely in memory.
+    ///
+    /// `hnsw_config` and `quantization_config` have no sparse equivalent in
+    /// Qdrant. They are NOT silently ignored: each warns, so a config asking for
+    /// something the sparse index cannot do says so instead of producing a
+    /// mislabelled result.
     fn create_sparse_collection(&self, dataset: &Dataset) -> Result<(), String> {
+        let vectors_config = self.collection_params_extra.get("vectors_config");
+        let mut index = SparseIndexConfigBuilder::default();
+        if let Some(on_disk) = vectors_config
+            .and_then(|v| v.get("on_disk"))
+            .and_then(|v| v.as_bool())
+        {
+            index = index.on_disk(on_disk);
+        }
+        if let Some(dt) = vectors_config
+            .and_then(|v| v.get("datatype"))
+            .and_then(|v| v.as_str())
+        {
+            index = index.datatype(parse_datatype(dt)?);
+        }
+
+        let mut sparse_params = SparseVectorParamsBuilder::default();
+        sparse_params = sparse_params.index(index.build());
         let mut sparse_cfg = SparseVectorsConfigBuilder::default();
-        sparse_cfg.add_named_vector_params("sparse", SparseVectorParamsBuilder::default());
-        let create_builder =
+        sparse_cfg.add_named_vector_params("sparse", sparse_params);
+
+        let mut create_builder =
             CreateCollectionBuilder::new(&self.collection_name).sparse_vectors_config(sparse_cfg);
+        create_builder = self.apply_optimizers_and_payload_storage(create_builder);
+
+        if self.hnsw.is_some() {
+            eprintln!(
+                "Warning: collection_params.hnsw_config is ignored for the SPARSE dataset {} \
+                 (Qdrant's sparse index has no HNSW graph)",
+                dataset.config.name
+            );
+        }
+        if self
+            .collection_params_extra
+            .get("quantization_config")
+            .is_some()
+        {
+            eprintln!(
+                "Warning: collection_params.quantization_config is ignored for the SPARSE dataset \
+                 {} (Qdrant quantization applies to dense vectors only) — this run is NOT quantized",
+                dataset.config.name
+            );
+        }
+
         self.rt
             .block_on(self.client.create_collection(create_builder))
             .map_err(|e| format!("Failed to create sparse collection: {}", e))?;
@@ -914,15 +1017,38 @@ fn parse_compression_ratio(s: &str) -> Result<CompressionRatio, String> {
     }
 }
 
+/// Map a `vectors_config.datatype` string onto Qdrant's `Datatype`.
+///
+/// `"default"` maps to `Datatype::Default` (let Qdrant choose), NOT to
+/// `Float32` — conflating them would misreport which storage was measured.
+/// An unrecognised value is an error rather than a silent fallback.
+fn parse_datatype(dt: &str) -> Result<Datatype, String> {
+    match dt.to_lowercase().as_str() {
+        "default" => Ok(Datatype::Default),
+        "float32" | "f32" => Ok(Datatype::Float32),
+        "float16" | "f16" => Ok(Datatype::Float16),
+        "uint8" | "u8" => Ok(Datatype::Uint8),
+        other => Err(format!(
+            "unknown vectors_config.datatype {:?} (expected default, float32, float16 or uint8)",
+            other
+        )),
+    }
+}
+
 /// Build the per-field `IndexParams` for one schema field from its
 /// `payload_index_params` entry (`is_tenant` / `on_disk`).
 ///
-/// Only keyword and uuid indexes take these — that is also the only pair
-/// upstream refines, and the rest of Qdrant's index-params messages do not carry
-/// `is_tenant`. Returns `None` when there is nothing to refine, so the index is
-/// created with plain defaults (the previous behaviour for every field).
-/// `bool` maps onto the keyword index here for the same reason it does above:
-/// bools are stored as the strings "true"/"false".
+/// The two parameters have DIFFERENT support in Qdrant, and conflating them
+/// silently drops config:
+/// * `on_disk` exists on every index-params message — keyword, uuid, integer,
+///   float, geo, text, bool and datetime.
+/// * `is_tenant` (group points by that value on disk) exists ONLY on keyword and
+///   uuid. `bool` is mapped onto the keyword index here for the same reason it is
+///   above: bools are stored as the strings "true"/"false".
+///
+/// So `{"some_int": {"on_disk": true}}` IS honoured, while `is_tenant` on a
+/// non-keyword field cannot be and is reported by the caller. Returns `None`
+/// when there is nothing to refine, leaving the index on plain defaults.
 fn build_payload_index_params(
     field_type: &str,
     field_params: Option<&serde_json::Value>,
@@ -934,19 +1060,40 @@ fn build_payload_index_params(
         return None;
     }
 
-    match field_type {
-        "keyword" | "bool" => Some(IndexParams::KeywordIndexParams(KeywordIndexParams {
+    Some(match field_type {
+        "keyword" | "bool" => IndexParams::KeywordIndexParams(KeywordIndexParams {
             is_tenant,
             on_disk,
             ..Default::default()
-        })),
-        "uuid" => Some(IndexParams::UuidIndexParams(UuidIndexParams {
+        }),
+        "uuid" => IndexParams::UuidIndexParams(UuidIndexParams {
             is_tenant,
             on_disk,
             ..Default::default()
-        })),
-        _ => None,
-    }
+        }),
+        // is_tenant does not exist on these; on_disk does, so forward it.
+        "int" => IndexParams::IntegerIndexParams(IntegerIndexParams {
+            on_disk,
+            ..Default::default()
+        }),
+        "float" => IndexParams::FloatIndexParams(FloatIndexParams {
+            on_disk,
+            ..Default::default()
+        }),
+        "geo" => IndexParams::GeoIndexParams(GeoIndexParams {
+            on_disk,
+            ..Default::default()
+        }),
+        "text" => IndexParams::TextIndexParams(TextIndexParams {
+            on_disk,
+            ..Default::default()
+        }),
+        "datetime" => IndexParams::DatetimeIndexParams(DatetimeIndexParams {
+            on_disk,
+            ..Default::default()
+        }),
+        _ => return None,
+    })
 }
 
 /// Translate a `quantization_config` JSON object into a Qdrant `Quantization`.
@@ -1202,15 +1349,20 @@ impl Engine for QdrantEngine {
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
 
-        // Build Qdrant search params
-        let hnsw_ef: Option<u64> = params.search_params.as_ref().and_then(|sp| {
-            sp.ef.map(|e| e as u64).or_else(|| {
-                sp.extra
-                    .as_ref()
-                    .and_then(|e| e.get("hnsw_ef"))
-                    .and_then(|v| v.as_u64())
-            })
-        });
+        // EVERY search knob below resolves through `knob()` (nested under
+        // `search_params`/`config`, or flat), so an entry cannot be half-applied.
+        // The asymmetry this replaces was worse than a plain drop: with only
+        // `with_payload` accepting the flat spelling, `{"with_payload": true,
+        // "hnsw_ef": 128}` returned payloads while silently searching at DEFAULT
+        // ef, i.e. the config looked honoured and was not.
+        // `ef` is exempt: serde captures it into the typed `search_params.ef`
+        // field, which `knob()` cannot see (see SearchParams::knob).
+        let hnsw_ef: Option<u64> = params
+            .search_params
+            .as_ref()
+            .and_then(|sp| sp.ef)
+            .map(|e| e as u64)
+            .or_else(|| params.knob("hnsw_ef").and_then(|v| v.as_u64()));
 
         // Whether to return payloads with each hit. Default false — recall only
         // needs ids, and shipping payloads back would tax the wire for every
@@ -1221,13 +1373,19 @@ impl Engine for QdrantEngine {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // Search only the already-indexed portion of the collection. Upstream's
+        // qdrant-single-node.json sets this and it materially changes RPS, so
+        // dropping it while honouring its neighbours in the same object would
+        // misreport a "faithfully tuned" run.
+        let indexed_only = params
+            .knob("indexed_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Search-time quantization params (rescore/oversampling) from the config's
         // search_params.quantization object — mirrors python rest.SearchParams(**params).
         let quantization_params: Option<QuantizationSearchParams> = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.extra.as_ref())
-            .and_then(|e| e.get("quantization"))
+            .knob("quantization")
             .map(|q| QuantizationSearchParams {
                 rescore: q.get("rescore").and_then(|v| v.as_bool()),
                 oversampling: q.get("oversampling").and_then(|v| v.as_f64()),
@@ -1237,11 +1395,7 @@ impl Engine for QdrantEngine {
         // Prefetch (two-stage retrieval / rescoring): search_params.prefetch =
         // { "limit": N, "params": { "hnsw_ef": .., "quantization": {..} } }.
         // Mirrors python `models.Prefetch(**prefetch, query=query_vector)`.
-        let prefetch = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.extra.as_ref())
-            .and_then(|e| e.get("prefetch"));
+        let prefetch = params.knob("prefetch");
         let prefetch_enabled = prefetch.is_some();
         let prefetch_limit = prefetch
             .and_then(|p| p.get("limit"))
@@ -1412,10 +1566,14 @@ impl Engine for QdrantEngine {
                                 .query(queries[idx].clone())
                                 .limit(top as u64)
                                 .with_payload(with_payload);
-                            if hnsw_ef.is_some() || quantization_params.is_some() {
+                            // `indexed_only` must widen this guard: gating on
+                            // hnsw_ef/quantization alone would drop a config that
+                            // sets ONLY indexed_only.
+                            if hnsw_ef.is_some() || quantization_params.is_some() || indexed_only {
                                 qb = qb.params(QdrantSearchParams {
                                     hnsw_ef,
                                     quantization: quantization_params,
+                                    indexed_only: Some(indexed_only),
                                     ..Default::default()
                                 });
                             }
@@ -1827,31 +1985,100 @@ mod tests {
             Some(IndexParams::UuidIndexParams(u)) => assert_eq!(u.is_tenant, Some(true)),
             other => panic!("expected uuid params, got {:?}", other),
         }
-        // Types whose index params carry no is_tenant/on_disk stay unrefined.
-        assert!(build_payload_index_params("int", Some(&p)).is_none());
-        assert!(build_payload_index_params("geo", Some(&p)).is_none());
         // Nothing to refine → plain default index.
         assert!(build_payload_index_params("keyword", None).is_none());
         assert!(build_payload_index_params("keyword", Some(&json!({}))).is_none());
     }
 
-    /// A payload_index_params key that is not in the dataset schema is a config
-    /// typo. Ignoring it would leave the index unrefined while the run reports as
-    /// if it had measured a tenant-optimised layout.
+    /// `on_disk` exists on EVERY Qdrant index-params message, not just
+    /// keyword/uuid — only `is_tenant` is keyword/uuid-only. Dropping `on_disk`
+    /// for an int/float/geo/text/datetime field would be a config-says-on-disk /
+    /// server-is-in-RAM run, the exact failure this branch exists to remove.
     #[test]
-    fn payload_index_params_naming_unknown_field_is_rejected() {
+    fn payload_index_params_forward_on_disk_for_every_indexable_type() {
+        let on_disk_only = json!({"on_disk": true});
+        for ft in ["int", "float", "geo", "text", "datetime"] {
+            let params = build_payload_index_params(ft, Some(&on_disk_only))
+                .unwrap_or_else(|| panic!("{ft} index must forward on_disk"));
+            let forwarded = match params {
+                IndexParams::IntegerIndexParams(p) => p.on_disk,
+                IndexParams::FloatIndexParams(p) => p.on_disk,
+                IndexParams::GeoIndexParams(p) => p.on_disk,
+                IndexParams::TextIndexParams(p) => p.on_disk,
+                IndexParams::DatetimeIndexParams(p) => p.on_disk,
+                other => panic!("unexpected params for {ft}: {other:?}"),
+            };
+            assert_eq!(forwarded, Some(true), "{ft} dropped on_disk");
+        }
+        assert!(build_payload_index_params("nonsense", Some(&on_disk_only)).is_none());
+    }
+
+    /// `"default"` must map to Qdrant's `Datatype::Default` (let the server
+    /// choose), NOT to Float32 — conflating them misreports which storage the run
+    /// actually measured.
+    #[test]
+    fn parse_datatype_covers_every_spelling() {
+        use super::parse_datatype;
+        for (s, want) in [
+            ("default", super::Datatype::Default),
+            ("float32", super::Datatype::Float32),
+            ("f32", super::Datatype::Float32),
+            ("float16", super::Datatype::Float16),
+            ("f16", super::Datatype::Float16),
+            ("uint8", super::Datatype::Uint8),
+            ("u8", super::Datatype::Uint8),
+            ("FLOAT16", super::Datatype::Float16),
+        ] {
+            assert_eq!(parse_datatype(s).unwrap(), want, "spelling {s:?}");
+        }
+        assert!(parse_datatype("bfloat16").is_err());
+    }
+
+    /// Every key inside `hnsw_config` that no engine reads must be reported, not
+    /// dropped — the silent drop of `on_disk` there is the bug this branch fixes,
+    /// so the next unrecognised key must not repeat it.
+    #[test]
+    fn hnsw_config_surfaces_unsupported_keys_and_forwards_the_new_ones() {
+        let e = engine_with_collection_params(json!({
+            "hnsw_config": { "m": 16, "full_scan_threshold": 20000,
+                             "max_indexing_threads": 4, "on_disc": true }
+        }));
+        assert_eq!(
+            e.hnsw.as_ref().expect("hnsw parsed").unsupported_keys(),
+            vec!["on_disc"],
+            "a typo'd hnsw_config key must be reported, not silently dropped"
+        );
+
+        let diff = e.hnsw_config_diff().expect("configured hnsw yields a diff");
+        assert_eq!(diff.full_scan_threshold, Some(20000));
+        assert_eq!(diff.max_indexing_threads, Some(4));
+    }
+
+    /// A `payload_index_params` key that cannot take effect WARNS and continues
+    /// rather than failing the run.
+    ///
+    /// It is deliberately not fatal: upstream's own `qdrant-on-disk.json` names
+    /// fields (`a`, `d`) that our dataset schemas do not all declare, so
+    /// rejecting them would make the upstream file unrunnable verbatim — the
+    /// opposite of this branch's goal. The warning is what keeps the run from
+    /// quietly passing as tenant-optimised. (There is no live server in a unit
+    /// test, so index creation itself warns too; what is asserted here is that
+    /// neither case is escalated to an error.)
+    #[test]
+    fn payload_index_params_naming_unknown_field_warns_but_does_not_fail() {
         let e = engine_with_collection_params(json!({
             "payload_index_params": { "tenant_id": { "is_tenant": true } }
         }));
-        let err = e
-            .create_payload_indexes(&dataset_with_schema(json!({"a": "keyword"})))
-            .unwrap_err();
-        assert!(err.contains("tenant_id"), "got: {}", err);
+        assert!(
+            e.create_payload_indexes(&dataset_with_schema(json!({"a": "keyword"})))
+                .is_ok(),
+            "an unusable payload_index_params key must warn, not abort the run"
+        );
 
-        // A dataset with NO schema cannot satisfy any key either.
+        // A dataset with NO schema declares no fields to index at all.
         let mut no_schema = dataset_with_schema(json!({}));
         no_schema.config.schema = None;
-        assert!(e.create_payload_indexes(&no_schema).is_err());
+        assert!(e.create_payload_indexes(&no_schema).is_ok());
     }
 
     #[test]

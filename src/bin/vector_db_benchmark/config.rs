@@ -40,6 +40,28 @@ pub struct HnswConfig {
     pub payload_m: Option<i64>,
     /// Qdrant: store vectors inline with the graph links (on-disk locality).
     pub inline_storage: Option<bool>,
+    /// Qdrant: below this many points a filtered search full-scans instead of
+    /// traversing the graph. Decisive for filtered / multi-tenant benchmarks.
+    pub full_scan_threshold: Option<i64>,
+    /// Qdrant: threads used to build the graph.
+    pub max_indexing_threads: Option<i64>,
+    /// Catch-all so an unrecognised key inside `hnsw_config` can be REPORTED
+    /// rather than silently discarded. Serde ignores undeclared fields by
+    /// default, which is how `on_disk` used to vanish here — the very bug this
+    /// branch fixes. Engines that consume hnsw_config warn on leftovers.
+    #[serde(flatten)]
+    pub extra: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl HnswConfig {
+    /// Keys inside `hnsw_config` that no engine reads. Returned so the caller can
+    /// warn: a typo'd or unsupported knob must not pass for a configured one.
+    pub fn unsupported_keys(&self) -> Vec<&str> {
+        self.extra
+            .as_ref()
+            .map(|e| e.keys().map(|k| k.as_str()).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Elasticsearch index_options (lowercase keys)
@@ -99,15 +121,30 @@ pub struct InnerSearchParams {
 }
 
 impl SearchParams {
-    /// Resolve an engine-specific search knob by name, accepting it either
-    /// nested under `search_params` / `config` or flat at the entry's top level.
+    /// Resolve an UNTYPED engine-specific search knob by name, accepting it
+    /// either nested under `search_params` / `config` or flat at the entry's top
+    /// level. Nested wins, being the more specific placement.
     ///
     /// Upstream nests EVERY knob under `config` (`num_candidates`,
     /// `knn.algo_param.ef_search`, `hnsw_ef`, …) while several of our own
-    /// configurations put them flat. Engines resolve through here so both
-    /// shapes work and neither is silently ignored. Nested wins over flat,
-    /// being the more specific placement.
+    /// configurations put them flat. Engines resolve through here so both shapes
+    /// work and neither is silently ignored.
+    ///
+    /// IMPORTANT — this searches only the two `extra` catch-alls, so it does NOT
+    /// see a key that serde captured into a TYPED field. That covers `ef` and
+    /// `EF` on the inner struct, and `parallel`, `top`, `num_candidates`,
+    /// `target_qps`, `duration_seconds`, `max_lateness_ms`, `calibration_param`
+    /// and `calibration_precision` on this one. For those, `knob()` sees only the
+    /// placement serde did NOT claim, so a caller must combine both — e.g.
+    /// Elasticsearch does `knob("num_candidates").or(params.num_candidates)`, and
+    /// engines read `search_params.ef` directly rather than `knob("ef")` (which
+    /// would find a flat `ef` while ignoring the nested one that configures the
+    /// run — hence the debug assertion below).
     pub fn knob(&self, key: &str) -> Option<&serde_json::Value> {
+        debug_assert_ne!(
+            key, "ef",
+            "`ef` is a typed field; read search_params.ef instead of knob(\"ef\")"
+        );
         self.search_params
             .as_ref()
             .and_then(|sp| sp.extra.as_ref())
@@ -499,6 +536,30 @@ mod tests {
 
         let neither: SearchParams = serde_json::from_value(json!({"parallel": 1})).unwrap();
         assert!(neither.knob("k").is_none());
+    }
+
+    /// `knob()` searches only the `extra` catch-alls, so it is BLIND to a key
+    /// serde captured into a typed field. Pinning that contract: a caller must
+    /// combine `knob()` with the typed field (as Elasticsearch does) — relying on
+    /// `knob()` alone for a declared name silently yields the default.
+    #[test]
+    fn knob_is_blind_to_typed_fields() {
+        // Flat `num_candidates` is a DECLARED field on SearchParams.
+        let flat: SearchParams =
+            serde_json::from_value(json!({"num_candidates": 16, "parallel": 1})).unwrap();
+        assert_eq!(flat.num_candidates, Some(16));
+        assert!(
+            flat.knob("num_candidates").is_none(),
+            "knob() must not be expected to see a typed field"
+        );
+
+        // Nested `ef` is declared on InnerSearchParams, so it lands there.
+        let nested_ef: SearchParams =
+            serde_json::from_value(json!({"config": {"ef": 64}})).unwrap();
+        assert_eq!(
+            nested_ef.search_params.as_ref().and_then(|sp| sp.ef),
+            Some(64)
+        );
     }
 
     #[test]

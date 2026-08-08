@@ -234,6 +234,11 @@ impl Dataset {
     /// `neighbours.jsonl` wins when both exist, so a locally regenerated fixture
     /// overrides a downloaded one. Neither present is an error naming both, since
     /// searching without ground truth would report a meaningless recall.
+    ///
+    /// The jsonl branch goes through `read_neighbours_strict` (blank lines are an
+    /// error, not skipped: skipping one shifts every later row up and scores each
+    /// query against its neighbour's truth), and the row count MUST equal the
+    /// query count — the same two guards the hybrid path already applies.
     pub fn read_sparse_queries(&self) -> Result<(Vec<SparseVector>, Vec<Vec<i64>>), String> {
         let dir = self.get_path()?;
         let queries = read_sparse_matrix(
@@ -245,12 +250,7 @@ impl Dataset {
         let jsonl_path = dir.join("neighbours.jsonl");
         let gt_path = dir.join("results.gt");
         let neighbours: Vec<Vec<i64>> = if jsonl_path.exists() {
-            std::fs::read_to_string(&jsonl_path)
-                .map_err(|e| format!("read {}: {}", jsonl_path.display(), e))?
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| serde_json::from_str::<Vec<i64>>(l).map_err(|e| e.to_string()))
-                .collect::<Result<_, _>>()?
+            read_neighbours_strict(&jsonl_path)?
         } else if gt_path.exists() {
             read_gt_neighbours(gt_path.to_str().ok_or("Invalid results.gt path")?)?
         } else {
@@ -261,6 +261,21 @@ impl Dataset {
                 gt_path.display()
             ));
         };
+
+        // Ground truth must be row-aligned with the queries. Without this, a
+        // short file makes the search loop index past the end of `neighbours`
+        // (a panic in every worker), and a `results.gt` header declaring a
+        // transposed shape — e.g. (n=2, d=4) for 4 queries of 2 neighbours,
+        // which has the identical byte length and so passes that reader's own
+        // length check — would score every query against the wrong truth.
+        if neighbours.len() != queries.len() {
+            return Err(format!(
+                "sparse ground-truth row mismatch in {}: {} queries vs {} neighbour rows",
+                dir.display(),
+                queries.len(),
+                neighbours.len()
+            ));
+        }
         Ok((queries, neighbours))
     }
 
@@ -555,6 +570,73 @@ mod tests {
 
         let (_, nb) = sparse_dataset(p).read_sparse_queries().unwrap();
         assert_eq!(nb, vec![vec![42i64]]);
+    }
+
+    /// Ground truth with fewer rows than there are queries must be REJECTED, not
+    /// returned short: the search loop indexes `neighbors[idx]` per query, so a
+    /// short file panicked every worker thread. Mirrors the hybrid path's guard.
+    #[test]
+    fn sparse_rejects_ground_truth_row_count_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_sparse_matrix(
+            p.join("queries.csr").to_str().unwrap(),
+            &[
+                SparseVector {
+                    indices: vec![0],
+                    values: vec![1.0],
+                },
+                SparseVector {
+                    indices: vec![1],
+                    values: vec![1.0],
+                },
+                SparseVector {
+                    indices: vec![2],
+                    values: vec![1.0],
+                },
+            ],
+        )
+        .unwrap();
+        // 3 queries but only 2 ground-truth rows.
+        write_gt_neighbours(
+            p.join("results.gt").to_str().unwrap(),
+            &[vec![1i64], vec![2i64]],
+        )
+        .unwrap();
+
+        let err = sparse_dataset(p).read_sparse_queries().unwrap_err();
+        assert!(
+            err.contains("row mismatch") && err.contains("3 queries"),
+            "got: {err}"
+        );
+    }
+
+    /// A blank line must be an error, never skipped: skipping shifts every later
+    /// row up one, scoring each query against its neighbour's truth — a silently
+    /// wrong recall. The hybrid path already rejects this via
+    /// `read_neighbours_strict`; the sparse path now shares it.
+    #[test]
+    fn sparse_rejects_blank_line_in_neighbours_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_sparse_matrix(
+            p.join("queries.csr").to_str().unwrap(),
+            &[
+                SparseVector {
+                    indices: vec![0],
+                    values: vec![1.0],
+                },
+                SparseVector {
+                    indices: vec![1],
+                    values: vec![1.0],
+                },
+            ],
+        )
+        .unwrap();
+        std::fs::write(p.join("neighbours.jsonl"), "[1]\n\n[2]\n").unwrap();
+
+        let err = sparse_dataset(p).read_sparse_queries().unwrap_err();
+        assert!(err.contains("blank line"), "got: {err}");
     }
 
     /// No ground truth at all must fail loudly and name both candidates — a run

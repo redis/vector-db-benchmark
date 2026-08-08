@@ -326,11 +326,13 @@ impl WeaviateEngine {
         client: &reqwest::blocking::Client,
         params: &SearchParams,
     ) -> Result<(), String> {
-        // Extract ef from search_params extra (vectorIndexConfig.ef)
+        // `vectorIndexConfig.ef`, accepted nested under `search_params`/`config`
+        // (upstream's spelling) or flat (ours) — see SearchParams::knob. Reading
+        // only the flat map meant an upstream-style `config: {...}` returned Ok
+        // WITHOUT patching the class, so every ef in the sweep silently ran at
+        // the build-time ef while the results file listed one row per ef.
         let ef = params
-            .extra
-            .as_ref()
-            .and_then(|e| e.get("vectorIndexConfig"))
+            .knob("vectorIndexConfig")
             .and_then(|v| v.get("ef"))
             .and_then(|v| v.as_i64());
 

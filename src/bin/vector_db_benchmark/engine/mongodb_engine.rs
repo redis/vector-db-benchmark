@@ -1234,8 +1234,12 @@ impl Engine for MongoDBEngine {
         }
 
         let parallel = params.parallel.unwrap_or(1) as usize;
+        // Accept the nested (upstream `config: {...}`) placement as well as the
+        // flat typed field, so an upstream-style entry is not silently ignored.
         let num_candidates_factor = params
-            .num_candidates
+            .knob("num_candidates")
+            .and_then(|v| v.as_i64())
+            .or(params.num_candidates)
             .unwrap_or(self.config.num_candidates_factor);
 
         let query_path = dataset.get_path()?;
@@ -1452,8 +1456,12 @@ impl Engine for MongoDBEngine {
         // Ensure numeric payloads written during updates use native BSON types.
         self.load_schema_types(dataset);
         let parallel = params.parallel.unwrap_or(1) as usize;
+        // Accept the nested (upstream `config: {...}`) placement as well as the
+        // flat typed field, so an upstream-style entry is not silently ignored.
         let num_candidates_factor = params
-            .num_candidates
+            .knob("num_candidates")
+            .and_then(|v| v.as_i64())
+            .or(params.num_candidates)
             .unwrap_or(self.config.num_candidates_factor);
 
         // Read queries and ground truth

@@ -1000,7 +1000,7 @@
     "path": "dbpedia-openai-100K-1536-angular/dbpedia_openai_100K",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/dbpedia_openai_100K.tgz",
     "vector_count": 100000,
-    "description": "Knowledge embeddings, 100K subset. This is the dataset upstream's continuous benchmark runs, so results here are directly comparable with published qdrant/vector-db-benchmark numbers; it is also small enough for a quick end-to-end run."
+    "description": "Knowledge embeddings, 100K subset. This is the dataset that upstream's continuous benchmark runs, so results here are directly comparable with published qdrant/vector-db-benchmark numbers; it is also small enough for a quick end-to-end run."
   },
   {
     "name": "dbpedia-openai-1M-1536-angular",
@@ -1369,7 +1369,7 @@
       "a": "keyword"
     },
     "vector_count": 1000000,
-    "description": "Multi-tenancy at 100 tenants: 1M points share ONE index and every query is scoped to a single tenant by an exact keyword match on `a`, with recall measured within that tenant only. Unlike random-768-25-tenants (locally generated, no link) this one DOWNLOADS, so it is the reproducible multi-tenancy run. The tenant field is `a`, matching the upstream tarball."
+    "description": "Multi-tenancy at 100 tenants: 1M points share ONE index and every query is scoped to a single tenant by an exact keyword match on `a`, with recall measured within that tenant only. Unlike random-768-25-tenants (locally generated, no link) this one DOWNLOADS, so it is the reproducible multi-tenancy run. The tenant field is `a`, matching the upstream tarball. NOTE: it ships only 200 test queries (25 neighbours each, 2 queries per tenant), so tail percentiles are computed from 200 samples — far fewer than the 5k-10k of the other sets; raise --repetitions if you need a stable p99."
   },
   {
     "name": "cohere-768-1M",
@@ -1398,7 +1398,7 @@
     "path": "msmarco-sparse/100K",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-100K.tar.gz",
     "vector_count": 100000,
-    "description": "MS MARCO learned-sparse (SPLADE-style) embeddings — the public sparse benchmark used upstream. Ships data.csr + queries.csr + binary results.gt ground truth; no vector_size, since sparse vectors are unbounded-dimension. Scored by dot product (MIPS), so distance is dot, NOT cosine. Requires an engine with sparse support (Qdrant)."
+    "description": "MS MARCO learned-sparse (SPLADE-style) embeddings — the public sparse benchmark used upstream. Ships data.csr + queries.csr + binary results.gt ground truth; no vector_size: the readers and engines derive it from the CSR files (whose header does declare ncol=30109). Scored by dot product (MIPS) — verified numerically against results.gt — so distance is dot, NOT cosine. Qdrant is the only engine with a sparse path."
   },
   {
     "name": "msmarco-sparse-1M",
@@ -1407,7 +1407,7 @@
     "path": "msmarco-sparse/1M",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-1M.tar.gz",
     "vector_count": 1000000,
-    "description": "1M-point variant of msmarco-sparse-100K. Same layout (data.csr + queries.csr + results.gt), dot/MIPS scoring."
+    "description": "1M-point variant of msmarco-sparse-100K, sharing the identical 6980-query set. Same layout (data.csr + queries.csr + results.gt), dot/MIPS scoring. Qdrant is the only engine with a sparse path."
   },
   {
     "name": "synthetic-sparse-300",

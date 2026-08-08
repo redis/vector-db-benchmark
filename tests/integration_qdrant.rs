@@ -1345,8 +1345,10 @@ fn test_binary_qdrant_on_disk_and_tenant_collection_params() {
     let dataset = "tenant-on-disk";
 
     // `search_params` is spelled `config` here on purpose: that is upstream's
-    // spelling, and this asserts the whole path (parse -> engine -> server)
-    // works with it, not just the serde alias.
+    // spelling, so this proves a config written that way runs end-to-end and
+    // still returns correct results. (It does NOT prove `hnsw_ef` reached the
+    // server — that only affects search quality/latency; the recall floor below
+    // is what would catch a search broken by this collection layout.)
     let configs = serde_json::json!([{
         "name": engine,
         "engine": "qdrant",
@@ -1360,7 +1362,9 @@ fn test_binary_qdrant_on_disk_and_tenant_collection_params() {
             "on_disk_payload": true,
             "payload_index_params": { "tenant": { "is_tenant": true, "on_disk": true } }
         },
-        "search_params": [{ "parallel": 1, "config": { "hnsw_ef": 64 } }],
+        // with_payload exercises the search knob added alongside these collection
+        // params; recall must stay correct with payloads coming back.
+        "search_params": [{ "parallel": 1, "config": { "hnsw_ef": 64, "with_payload": true } }],
         "upload_params": {"parallel": 1, "batch_size": 128}
     }]);
     let proj = common::write_tenant_project(dataset, &serde_json::to_string(&configs).unwrap(), 16);
@@ -1435,4 +1439,19 @@ fn test_binary_qdrant_on_disk_and_tenant_collection_params() {
         }
         other => panic!("expected keyword index params on `tenant`, got {other:?}"),
     }
+
+    // The layout above is the one most likely to break SEARCH rather than
+    // creation: `m: 0` means there is no global HNSW graph, so results can only
+    // come back via the per-tenant payload graphs, and float16 storage is lossy.
+    // Asserting the config alone would pass at recall 0. Ground truth here is
+    // tenant-local and exact (write_tenant_project), so this also catches a
+    // dropped tenant filter.
+    let recall = common::read_recall(&proj.root, engine);
+    println!("qdrant tenant/on-disk recall={recall:.3}");
+    assert!(
+        recall > 0.9,
+        "recall {recall:.3} <= 0.9 — the on-disk/tenant collection built, but search \
+         over it is broken (m:0 + payload_m graphs, float16 storage, or the tenant \
+         filter)"
+    );
 }
