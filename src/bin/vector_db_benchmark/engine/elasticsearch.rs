@@ -887,7 +887,15 @@ impl Engine for ElasticsearchEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let num_candidates = params.num_candidates.unwrap_or(100);
+        // Upstream nests this under `config`; accept the nested spelling too so an
+        // upstream configuration does not silently fall back to 100. Nested is
+        // checked FIRST, matching SearchParams::knob's documented precedence —
+        // reading the typed flat field first would invert it for this one knob.
+        let num_candidates = params
+            .knob("num_candidates")
+            .and_then(|v| v.as_i64())
+            .or(params.num_candidates)
+            .unwrap_or(100);
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());

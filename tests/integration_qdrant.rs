@@ -1673,3 +1673,305 @@ fn test_generate_dataset_binary_sparse_end_to_end() {
         "generated sparse precision {precision:.3} < 0.9"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Collection-parameter passthrough (upstream parity): the on-disk / tenant
+// knobs used by upstream's on-disk experiments must reach the SERVER, not just
+// parse.
+//
+// These are exactly the knobs that fail silently: a dropped
+// `hnsw_config.on_disk` still produces a working collection with plausible
+// recall — it just benchmarks an in-memory graph while the config, the result
+// file and the run name all say "on disk". Behavioural teeth (as used for
+// quantization) cannot separate those two, so this test READS THE COLLECTION
+// CONFIG BACK from a live Qdrant instead.
+//
+// To make read-back possible the CLI is run with `--keep-data` (which skips the
+// usual teardown) into its own collection name.
+// ---------------------------------------------------------------------------
+
+/// Like `run_qdrant_binary`, but keeps the collection after the run and points
+/// the engine at `collection` so the caller can inspect the result.
+fn run_qdrant_binary_keep_collection(
+    root: &std::path::Path,
+    engine: &str,
+    dataset: &str,
+    collection: &str,
+) -> bool {
+    let out = std::process::Command::new(binary_path())
+        .args([
+            "--engines",
+            engine,
+            "--datasets",
+            dataset,
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--keep-data",
+        ])
+        .env("QDRANT_GRPC_PORT", QDRANT_GRPC_PORT.to_string())
+        .env("QDRANT_REST_PORT", QDRANT_REST_PORT.to_string())
+        .env("QDRANT_COLLECTION_NAME", collection)
+        .current_dir(root)
+        .output()
+        .expect("run vector-db-benchmark");
+    if !out.status.success() {
+        eprintln!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    out.status.success()
+}
+
+#[test]
+fn test_binary_qdrant_on_disk_and_tenant_collection_params() {
+    wait_for_qdrant();
+
+    let collection = "bench_on_disk_params";
+    let engine = "qdrant-on-disk-params";
+    let dataset = "tenant-on-disk";
+
+    // `search_params` is spelled `config` here on purpose: that is upstream's
+    // spelling, so this proves a config written that way runs end-to-end and
+    // still returns correct results. (It does NOT prove `hnsw_ef` reached the
+    // server — that only affects search quality/latency; the recall floor below
+    // is what would catch a search broken by this collection layout.)
+    let configs = serde_json::json!([{
+        "name": engine,
+        "engine": "qdrant",
+        "connection_params": {"timeout": 120},
+        "collection_params": {
+            "timeout": 120,
+            "vectors_config": { "on_disk": true, "datatype": "float16" },
+            // m: 0 + payload_m: build graphs per tenant value only — the
+            // multi-tenancy layout upstream benchmarks.
+            "hnsw_config": { "m": 0, "ef_construct": 64, "on_disk": true, "payload_m": 16,
+                             "inline_storage": true },
+            // DELIBERATELY `false`. Qdrant v1.18.2 DEFAULTS on_disk_payload to
+            // true (verified live), so asserting `true` here would pass even with
+            // the forwarding deleted — a vacuous assertion. Only a real
+            // forwarding path can produce `false`.
+            "on_disk_payload": false,
+            "payload_index_params": { "tenant": { "is_tenant": true, "on_disk": true } }
+        },
+        // with_payload exercises the search knob added alongside these collection
+        // params; recall must stay correct with payloads coming back.
+        "search_params": [{ "parallel": 1, "config": { "hnsw_ef": 64, "with_payload": true } }],
+        "upload_params": {"parallel": 1, "batch_size": 128}
+    }]);
+    let proj = common::write_tenant_project(dataset, &serde_json::to_string(&configs).unwrap(), 16);
+
+    let ok = run_qdrant_binary_keep_collection(&proj.root, engine, dataset, collection);
+
+    // Read the collection config back BEFORE asserting, so the collection is
+    // always cleaned up even when an assertion fails below.
+    let (rt, client) = create_grpc_client();
+    let info = if ok {
+        rt.block_on(client.collection_info(collection)).ok()
+    } else {
+        None
+    };
+    let _ = rt.block_on(client.delete_collection(collection));
+
+    assert!(ok, "{engine} run failed");
+    let info = info.expect("collection_info").result.expect("info result");
+
+    let config = info.config.expect("collection config");
+    let params = config.params.expect("collection params");
+    assert!(
+        !params.on_disk_payload,
+        "on_disk_payload: false was not applied — the collection sits on Qdrant's \
+         own default (true), so the configured value never reached the server"
+    );
+
+    let hnsw = config.hnsw_config.expect("hnsw config");
+    assert_eq!(hnsw.m, Some(0), "hnsw_config.m: 0 did not reach the server");
+    assert_eq!(hnsw.ef_construct, Some(64));
+    assert_eq!(
+        hnsw.inline_storage,
+        Some(true),
+        "hnsw_config.inline_storage did not reach the server"
+    );
+    assert_eq!(
+        hnsw.on_disk,
+        Some(true),
+        "hnsw_config.on_disk did not reach the server — the run would have \
+         benchmarked an IN-MEMORY graph while claiming to be on disk"
+    );
+    assert_eq!(
+        hnsw.payload_m,
+        Some(16),
+        "hnsw_config.payload_m did not reach the server"
+    );
+
+    // vectors_config: on_disk + float16 storage.
+    let vectors = params.vectors_config.expect("vectors config").config;
+    match vectors {
+        Some(qdrant_client::qdrant::vectors_config::Config::Params(vp)) => {
+            assert_eq!(vp.on_disk, Some(true), "vectors_config.on_disk not applied");
+            assert_eq!(
+                vp.datatype,
+                Some(qdrant_client::qdrant::Datatype::Float16 as i32),
+                "vectors_config.datatype float16 not applied — storage would be \
+                 full float32"
+            );
+        }
+        other => panic!("expected single dense vector params, got {other:?}"),
+    }
+
+    // payload_index_params: the keyword index on `tenant` must be a TENANT index
+    // kept on disk.
+    let schema = info
+        .payload_schema
+        .get("tenant")
+        .expect("tenant payload index should exist");
+    match schema.params.as_ref().and_then(|p| p.index_params.as_ref()) {
+        Some(qdrant_client::qdrant::payload_index_params::IndexParams::KeywordIndexParams(k)) => {
+            assert_eq!(
+                k.is_tenant,
+                Some(true),
+                "payload_index_params.is_tenant not applied — the index would not \
+                 be tenant-grouped"
+            );
+            assert_eq!(k.on_disk, Some(true), "payload index on_disk not applied");
+        }
+        other => panic!("expected keyword index params on `tenant`, got {other:?}"),
+    }
+
+    // The layout above is the one most likely to break SEARCH rather than
+    // creation: `m: 0` means there is no global HNSW graph, so results can only
+    // come back via the per-tenant payload graphs, and float16 storage is lossy.
+    // Asserting the config alone would pass at recall 0. Ground truth here is
+    // tenant-local and exact (write_tenant_project), so this also catches a
+    // dropped tenant filter.
+    let recall = common::read_recall(&proj.root, engine);
+    println!("qdrant tenant/on-disk recall={recall:.3}");
+    assert!(
+        recall > 0.9,
+        "recall {recall:.3} <= 0.9 — the on-disk/tenant collection built, but search \
+         over it is broken (m:0 + payload_m graphs, float16 storage, or the tenant \
+         filter)"
+    );
+}
+
+/// REGRESSION: an OMITTED `vectors_config.on_disk` must NOT be sent as an
+/// explicit `false`.
+///
+/// Behavioural assertions cannot tell an mmap'd vector storage from an in-memory
+/// one — which is precisely why this survived — so this reads the collection
+/// config BACK from a live Qdrant and asserts the field is absent.
+///
+/// Why absence matters (verified on qdrant v1.18.2 at `memmap_threshold: 1` by
+/// inspecting the segment layout): omitting `on_disk` lets the optimizer mmap
+/// the vector storage (`vector_storage/matrix.dat`), while an explicit `false`
+/// OVERRIDES the threshold and pins the vectors in RAM
+/// (`vector_storage/vectors/chunk_0.mmap`). Sending `unwrap_or(false)` therefore
+/// silently disabled mmap for `qdrant-on-disk-default` and for all six
+/// `qdrant-mmap-*` configurations, whose names, configs and results all claimed
+/// on-disk storage.
+#[test]
+fn test_binary_qdrant_omitted_vectors_on_disk_stays_omitted() {
+    wait_for_qdrant();
+
+    let collection = "bench_omitted_on_disk";
+    let engine = "qdrant-omitted-on-disk";
+    let dataset = "omitted-on-disk";
+
+    // NOTE: no `vectors_config` at all — mmap is meant to be driven purely by
+    // optimizers_config.memmap_threshold, exactly like the qdrant-mmap-* configs.
+    let configs = serde_json::json!([{
+        "name": engine,
+        "engine": "qdrant",
+        "connection_params": {"timeout": 120},
+        "collection_params": {
+            "optimizers_config": { "memmap_threshold": 10000 },
+            "hnsw_config": { "m": 16, "ef_construct": 64 }
+        },
+        "search_params": [{ "parallel": 1, "config": { "hnsw_ef": 64 } }],
+        "upload_params": {"parallel": 1, "batch_size": 128}
+    }]);
+    let proj = common::write_tenant_project(dataset, &serde_json::to_string(&configs).unwrap(), 16);
+
+    let ok = run_qdrant_binary_keep_collection(&proj.root, engine, dataset, collection);
+
+    let (rt, client) = create_grpc_client();
+    let info = if ok {
+        rt.block_on(client.collection_info(collection)).ok()
+    } else {
+        None
+    };
+    let _ = rt.block_on(client.delete_collection(collection));
+
+    assert!(ok, "{engine} run failed");
+    let info = info.expect("collection_info").result.expect("info result");
+    let config = info.config.expect("collection config");
+    let params = config.params.expect("collection params");
+
+    match params.vectors_config.expect("vectors config").config {
+        Some(qdrant_client::qdrant::vectors_config::Config::Params(vp)) => {
+            assert_eq!(
+                vp.on_disk, None,
+                "an omitted vectors_config.on_disk was sent as an explicit value \
+                 ({:?}); an explicit `false` overrides memmap_threshold and pins \
+                 the vectors in RAM",
+                vp.on_disk
+            );
+        }
+        other => panic!("expected single dense vector params, got {other:?}"),
+    }
+
+    // The threshold itself must still have arrived, otherwise this test would
+    // pass vacuously on a collection that was never mmap-eligible to begin with.
+    let opt = config.optimizer_config.expect("optimizer config");
+    assert_eq!(opt.memmap_threshold, Some(10000));
+}
+
+/// End-to-end run over BINARY `results.gt` ground truth — the layout the public
+/// `msmarco-sparse-*` datasets ship, and the only branch of `read_sparse_queries`
+/// that no other test exercises (every other fixture writes `neighbours.jsonl`).
+///
+/// What this pins that a reader unit test cannot: the ids inside `results.gt`
+/// must be 0-based row indices lining up with the ids the uploader assigns from
+/// `data.csr` row order. If they were 1-based, or MS MARCO document ids, recall
+/// on a published `msmarco-sparse-1M` run would collapse to ~0 and every other
+/// test in this repo would still be green.
+#[test]
+fn test_binary_qdrant_sparse_binary_ground_truth_end_to_end() {
+    wait_for_qdrant();
+
+    let configs = serde_json::json!([{
+        "name": "qdrant-sparse-gt", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1}], "upload_params": {"parallel": 1, "batch_size": 50}
+    }]);
+    let proj =
+        common::write_sparse_project_gt("sparse-gt", &serde_json::to_string(&configs).unwrap());
+
+    // The fixture must carry ONLY the binary layout, otherwise this silently
+    // falls back to the jsonl branch and pins nothing.
+    let ds_dir = proj.root.join("datasets").join(&proj.dataset_name);
+    assert!(ds_dir.join("results.gt").exists(), "results.gt not written");
+    assert!(
+        !ds_dir.join("neighbours.jsonl").exists(),
+        "neighbours.jsonl would take precedence and hide the results.gt path"
+    );
+
+    assert!(
+        run_qdrant_binary(&proj.root, "qdrant-sparse-gt", "sparse-gt"),
+        "sparse results.gt run failed"
+    );
+    let precision = read_precision(&proj.root, "qdrant-sparse-gt");
+    println!(
+        "qdrant sparse (results.gt) precision={:.3} (top={})",
+        precision, proj.top
+    );
+    assert!(
+        precision >= 0.9,
+        "sparse results.gt precision {:.3} < 0.9 — the binary ground-truth ids do \
+         not line up with the point ids the uploader assigns",
+        precision
+    );
+}

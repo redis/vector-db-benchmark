@@ -1234,9 +1234,24 @@ impl Engine for MongoDBEngine {
         }
 
         let parallel = params.parallel.unwrap_or(1) as usize;
+        // Accept the nested (upstream `config: {...}`) placement as well as the
+        // flat typed field, so an upstream-style entry is not silently ignored.
         let num_candidates_factor = params
-            .num_candidates
+            .knob("num_candidates")
+            .and_then(|v| v.as_i64())
+            .or(params.num_candidates)
             .unwrap_or(self.config.num_candidates_factor);
+        // Atlas Vector Search has no `ef`: its only breadth knob is
+        // numCandidates. A config that sweeps `ef` therefore produces IDENTICAL
+        // runs, while the results JSON records the requested ef per row — a flat
+        // line that reads as a sweep. Say so rather than let it pass.
+        if params.search_params.as_ref().and_then(|sp| sp.ef).is_some() {
+            eprintln!(
+                "Warning: search_params.ef is ignored for MongoDB — Atlas Vector Search has no \
+                 `ef`; use num_candidates to vary search breadth. Rows differing only in ef are \
+                 the SAME configuration."
+            );
+        }
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
@@ -1452,9 +1467,24 @@ impl Engine for MongoDBEngine {
         // Ensure numeric payloads written during updates use native BSON types.
         self.load_schema_types(dataset);
         let parallel = params.parallel.unwrap_or(1) as usize;
+        // Accept the nested (upstream `config: {...}`) placement as well as the
+        // flat typed field, so an upstream-style entry is not silently ignored.
         let num_candidates_factor = params
-            .num_candidates
+            .knob("num_candidates")
+            .and_then(|v| v.as_i64())
+            .or(params.num_candidates)
             .unwrap_or(self.config.num_candidates_factor);
+        // Atlas Vector Search has no `ef`: its only breadth knob is
+        // numCandidates. A config that sweeps `ef` therefore produces IDENTICAL
+        // runs, while the results JSON records the requested ef per row — a flat
+        // line that reads as a sweep. Say so rather than let it pass.
+        if params.search_params.as_ref().and_then(|sp| sp.ef).is_some() {
+            eprintln!(
+                "Warning: search_params.ef is ignored for MongoDB — Atlas Vector Search has no \
+                 `ef`; use num_candidates to vary search breadth. Rows differing only in ef are \
+                 the SAME configuration."
+            );
+        }
 
         // Read queries and ground truth
         let query_path = dataset.get_path()?;
