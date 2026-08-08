@@ -495,12 +495,18 @@ impl VectorSetsEngine {
 
 impl Engine for VectorSetsEngine {
     /// Server-side corpus size, for the `--skip-upload` reuse precondition
-    /// (issue #238). `VCARD idx` — the cardinality of the vector set this engine
+    /// (issue #238). `VCARD <key>` — the cardinality of the vector set this engine
     /// searches. A missing key answers 0 (VCARD returns 0 for a non-existent key),
     /// which is exactly the "nothing to reuse" verdict we want.
     ///
-    /// The key is the hardcoded `idx` (issue #236): this count therefore cannot
-    /// distinguish two configs sharing one server, and neither can the search.
+    /// The key is this config's derived `idx:<config>` (#236), so unlike the
+    /// single-object engines the count is scoped to the corpus THIS config
+    /// uploaded — a sibling config's full-size corpus cannot certify as this
+    /// one's. It is also what makes the promise in the `--skip-upload` docs true
+    /// for VectorSets: `VSIM` against a missing key returns an empty array with
+    /// **no error**, so "the search succeeded" is not evidence of anything, and
+    /// this count is the only thing standing between a stale/absent corpus and a
+    /// published `recall 0.0` at inflated QPS.
     fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         let mut conn = self.get_connection()?;
         // VCARD answers 0 for a key that does not exist, so a missing corpus and
@@ -1118,6 +1124,13 @@ impl Engine for VectorSetsEngine {
     fn get_memory_usage(&mut self) -> Option<serde_json::Value> {
         let mut conn = self.get_connection().ok()?;
 
+        // Server-wide used_memory is kept only as a SECONDARY/global figure.
+        // Before #236 it was also the per-config figure, and correctly so: the
+        // hardcoded key plus a destructive `DEL` in `configure()` guaranteed
+        // exactly ONE resident corpus, so server total == this config's cost.
+        // Per-config keys make coexistence possible, which makes this number the
+        // SUM over every resident config. Mirrors the same caveat on redis.rs;
+        // the per-config figure below is the honest one.
         let info_str: String = redis::cmd("INFO").arg("memory").query(&mut conn).ok()?;
         let used_memory: i64 = info_str
             .lines()
@@ -1125,6 +1138,19 @@ impl Engine for VectorSetsEngine {
             .and_then(|l| l.strip_prefix("used_memory:"))
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
+
+        // Per-config memory. The FT engines get this from `FT.INFO`; `VINFO` has
+        // no memory field at all (verified live), but the corpus is a single key,
+        // so `MEMORY USAGE <key>` attributes it exactly. Reported under the same
+        // `index_memory_bytes` name the Redis-wire engines already publish, so
+        // downstream consumers need no special case. Best effort: a missing key or
+        // an older server degrades to null rather than to a wrong number.
+        let index_memory_bytes: Option<i64> = redis::cmd("MEMORY")
+            .arg("USAGE")
+            .arg(&self.config.key)
+            .query::<Option<i64>>(&mut conn)
+            .ok()
+            .flatten();
 
         // Vector-set stats via VINFO (quant-type, hnsw-m, vector-dim, size, ...).
         let index_info: Option<serde_json::Value> = redis::cmd("VINFO")
@@ -1135,6 +1161,7 @@ impl Engine for VectorSetsEngine {
 
         Some(serde_json::json!({
             "used_memory": used_memory,
+            "index_memory_bytes": index_memory_bytes,
             "shards": 1,
             "index_info": index_info,
         }))

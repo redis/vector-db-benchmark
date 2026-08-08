@@ -435,11 +435,19 @@ VSIM coerces a non-numeric attribute to `0` in a numeric comparison — so a
 everything). **Re-upload before searching.**
 
 `--skip-upload` does check that the corpus is **present and complete** on
-VectorSets too (`VCARD idx`, see above), but it cannot check that the corpus is
-*current*: a pre-#230 corpus is the right size and the wrong encoding. And because
-the engine uses a single hardcoded key (`idx`, issue #236), there is not even a
-name change for the tool to detect. A stale corpus of the right size is found, the
-run succeeds, and only the recall number is wrong.
+VectorSets too (`VCARD idx:<config>`, see above), but it cannot check that the
+corpus is *current*: a pre-#230 corpus is the right size and the wrong encoding,
+so it is found, the run succeeds, and only the recall number is wrong. That is the
+one failure mode left here.
+
+Note the interaction with **#236**, which is a different cut-off. A corpus written
+by a pre-#236 binary sits under the bare key `idx`, not `idx:<config>`, so it is
+**not** found: `VCARD` answers 0, the reuse check classifies it `Short`, and the run
+is rejected. That is deliberate. `VSIM` against a missing key returns an **empty
+array with rc=0**, so the run would otherwise have published `recall 0.0` at an
+*inflated* QPS (an empty search returns instantly — measured 437 → 3413 QPS), with
+`failed_queries` still 0 and every guard keying off it silent. Re-upload, or
+`DEL idx` and re-upload.
 
 ### Charts
 

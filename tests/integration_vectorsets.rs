@@ -781,3 +781,231 @@ fn test_vectorsets_skip_upload_hard_errors_on_a_pre_236_corpus() {
     }
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// Issue #238/#271 family test, the VectorSets member that #271 did not ship:
+/// `corpus_row_count()` must be a LIVE read of THIS config's key, not a constant
+/// and not the old shared `idx`. Amputate the corpus behind the tool's back and
+/// the reported number has to follow.
+///
+/// kividb / mongodb / qdrant / valkey each got this test in #271; VectorSets did
+/// not, which is exactly why CI could not see that its probe was hardcoded to
+/// `idx` while #236 moved every other site to `idx:<config>`.
+#[test]
+fn test_vectorsets_corpus_row_count_tracks_the_live_key() {
+    wait_for_vectorsets();
+
+    let name = "vectorsets-rowcount";
+    let key = format!("idx:{name}");
+    let proj = common::write_match_any_cosine_project("vs-rowcount", &vectorsets_config(name), 8);
+    let n = expected_count(&proj.root);
+
+    let mut c = conn();
+    let _ = redis::cmd("DEL").arg(&key).query::<i64>(&mut c);
+
+    let port = test_port().to_string();
+    let env = [("REDIS_PORT", port.as_str())];
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "vs-rowcount",
+            TEST_HOST,
+            &env,
+            &["--keep-data", "--skip-search"]
+        ),
+        "phase 1 (upload) failed"
+    );
+    assert_eq!(vcard(&mut c, &key), n, "upload must land in '{key}'");
+
+    // Amputate half the corpus with VREM, straight on the server.
+    let half = n / 2;
+    for id in 0..half {
+        let removed: i64 = redis::cmd("VREM")
+            .arg(&key)
+            .arg(id.to_string())
+            .query(&mut c)
+            .expect("VREM");
+        assert_eq!(removed, 1, "VREM must actually remove element {id}");
+    }
+    assert_eq!(vcard(&mut c, &key), n - half);
+
+    let out = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            name,
+            "--datasets",
+            "vs-rowcount",
+            "--host",
+            TEST_HOST,
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ])
+        .current_dir(&proj.root)
+        .env("REDIS_PORT", &port)
+        .output()
+        .expect("run vector-db-benchmark");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a half-deleted vectorsets corpus must be a hard error.\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!("holds {} of the {n} rows", n - half)),
+        "the count must track the amputation, proving it is a live read of '{key}' \
+         and not a constant or the old shared 'idx'.\n{combined}"
+    );
+
+    let _ = redis::cmd("DEL").arg(&key).query::<i64>(&mut c);
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// Per-config memory attribution (#236 follow-on).
+///
+/// `get_memory_usage` reports server-wide `INFO memory:used_memory`. That number
+/// was *correct* as a per-config figure before this PR — the hardcoded key plus a
+/// destructive `DEL` in `configure()` guaranteed exactly one resident corpus. Now
+/// that configs coexist it is the SUM over all of them, so every config after the
+/// first over-reports (2× here, N× on an N-config sweep — and the coexistence
+/// test above is precisely that scenario).
+///
+/// `VINFO` carries no memory field, but the corpus is a single key, so
+/// `MEMORY USAGE <key>` attributes it exactly. This asserts the per-config figure
+/// does NOT grow when a sibling config lands on the same server, while the global
+/// `used_memory` does — i.e. that the two numbers now mean different things and
+/// the per-config one is the honest one.
+#[test]
+fn test_vectorsets_index_memory_is_per_config_not_server_wide() {
+    wait_for_vectorsets();
+
+    let name_a = "vectorsets-mem-a";
+    let name_b = "vectorsets-mem-b";
+    let key_a = format!("idx:{name_a}");
+    let key_b = format!("idx:{name_b}");
+
+    let proj_a = common::write_match_any_cosine_project("vs-mem-a", &vectorsets_config(name_a), 8);
+    let proj_b = common::write_match_any_cosine_project("vs-mem-b", &vectorsets_config(name_b), 8);
+
+    let mut c = conn();
+    for k in [key_a.as_str(), key_b.as_str()] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+
+    let port = test_port().to_string();
+    let env = [("REDIS_PORT", port.as_str())];
+
+    assert!(
+        common::run_binary_extra(
+            &proj_a.root,
+            name_a,
+            "vs-mem-a",
+            TEST_HOST,
+            &env,
+            &["--keep-data", "--skip-search"]
+        ),
+        "config A upload failed"
+    );
+    let (a_alone_index, a_alone_used) = read_upload_memory(&proj_a.root, name_a);
+
+    assert!(
+        common::run_binary_extra(
+            &proj_b.root,
+            name_b,
+            "vs-mem-b",
+            TEST_HOST,
+            &env,
+            &["--keep-data", "--skip-search"]
+        ),
+        "config B upload failed"
+    );
+    let (b_with_a_index, b_with_a_used) = read_upload_memory(&proj_b.root, name_b);
+
+    println!(
+        "#236 memory attribution: A alone index={a_alone_index} used_memory={a_alone_used} | \
+         B with A resident index={b_with_a_index} used_memory={b_with_a_used} | \
+         MEMORY USAGE {key_a}={} {key_b}={}",
+        memory_usage(&mut c, &key_a),
+        memory_usage(&mut c, &key_b),
+    );
+
+    // The per-config figure is attributable: B's own corpus is the same shape as
+    // A's, so B's index memory must stay in A's ballpark even though the SERVER
+    // now holds both. A 1.5× ceiling is far below the 2× a summed figure gives.
+    assert!(
+        b_with_a_index > 0 && a_alone_index > 0,
+        "per-config index_memory_bytes must be reported for both configs \
+         (A={a_alone_index}, B={b_with_a_index})"
+    );
+    assert!(
+        (b_with_a_index as f64) < 1.5 * a_alone_index as f64,
+        "index_memory_bytes must be THIS config's corpus, not the server sum: \
+         A alone={a_alone_index}, B with A resident={b_with_a_index}"
+    );
+    // …and it tracks the actual key, within the slack of the engine's own
+    // bookkeeping between the upload snapshot and this read-back.
+    let live_b = memory_usage(&mut c, &key_b);
+    assert!(
+        live_b > 0 && (b_with_a_index as f64) >= 0.5 * live_b as f64,
+        "index_memory_bytes ({b_with_a_index}) must track MEMORY USAGE {key_b} ({live_b})"
+    );
+    // And the two numbers demonstrably mean different things: the server-wide
+    // figure accounts for far more than this config's corpus, which is exactly
+    // why it cannot serve as the per-config one. Asserted as a floor rather than
+    // as growth between the two runs — `used_memory` is global state that any
+    // concurrently-running test moves in either direction, and a flaky assertion
+    // about the number we are de-emphasising would be its own kind of wrong. The
+    // inequality only gets safer as other corpora land.
+    assert!(
+        b_with_a_used > 2 * b_with_a_index,
+        "server-wide used_memory ({b_with_a_used}) should dwarf this config's own \
+         corpus ({b_with_a_index}); if they are the same number, the per-config \
+         figure is just the server total again"
+    );
+    let _ = a_alone_used; // reported above; not asserted (see note)
+
+    for k in [key_a.as_str(), key_b.as_str()] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+    std::fs::remove_dir_all(&proj_a.root).ok();
+    std::fs::remove_dir_all(&proj_b.root).ok();
+}
+
+/// `MEMORY USAGE <key>`, or 0 when the key is absent.
+fn memory_usage(conn: &mut redis::Connection, key: &str) -> i64 {
+    redis::cmd("MEMORY")
+        .arg("USAGE")
+        .arg(key)
+        .query::<Option<i64>>(conn)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// `(index_memory_bytes, used_memory)` from an engine's upload result JSON.
+fn read_upload_memory(root: &std::path::Path, engine: &str) -> (i64, i64) {
+    let pattern = format!("{engine}-*-upload-*.json");
+    let dir = root.join("results");
+    let path = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            glob::Pattern::new(&pattern)
+                .unwrap()
+                .matches(&p.file_name().unwrap().to_string_lossy())
+        })
+        .unwrap_or_else(|| panic!("no upload result for {engine}"));
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mem = &v["results"]["memory_usage"];
+    (
+        mem["index_memory_bytes"].as_i64().unwrap_or(-1),
+        mem["used_memory"].as_i64().unwrap_or(-1),
+    )
+}
