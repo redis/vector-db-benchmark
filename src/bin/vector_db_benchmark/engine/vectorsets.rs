@@ -15,6 +15,7 @@ use redis::Connection;
 use super::redis_utils;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
+use crate::engine::index_naming::derive_index_name;
 use crate::engine::{CorpusCount, Engine, SearchResults, UpdateSearchRatio, UploadStats};
 use vector_db_benchmark::parsers::datetime_to_epoch_secs;
 use vector_db_benchmark::query_filter::QueryFilter;
@@ -24,6 +25,14 @@ use vector_db_benchmark::start_gate::WorkerPool;
 /// VectorSets engine configuration
 #[derive(Clone)]
 pub struct VectorSetsConfig {
+    /// The Redis key holding this config's vector set — the single addressable
+    /// namespace for VADD/VSIM/VINFO/VCARD/DEL. Derived per config (#236,
+    /// mirroring #151-4) so two VectorSets configs on one server cannot clobber
+    /// each other's corpus. See [`VectorSetsEngine::new`].
+    ///
+    /// This buys **data** isolation, not **measurement** isolation — see the
+    /// caveat in [`VectorSetsEngine::new`] before running two benchmarks at once.
+    pub key: String,
     pub quant: String,
     pub m: i64,
     pub ef_construction: i64,
@@ -101,6 +110,35 @@ impl VectorSetsEngine {
             name: engine_config.name.clone(),
             redis_url,
             config: VectorSetsConfig {
+                // #236: VectorSets addresses ONE Redis key, and it used to be the
+                // literal `idx` for every config. Two configs on one server
+                // therefore shared one vector set and `configure()`'s `DEL` wiped
+                // the neighbour mid-flight. Derive it from the config name exactly
+                // as the Redis-wire engines derive their index name (#151-4),
+                // including the `VECTORSETS_INDEX_NAME` base override and its
+                // `_EXACT` pin. There is no key-prefix analogue: a vector set is a
+                // single key, not a keyspace of doc hashes, so this name IS the
+                // namespace.
+                //
+                // SCOPE — read before relying on this for concurrency. The key is
+                // derived from the CONFIG NAME alone, so:
+                //  * two CONFIGS on one server are isolated (the fix);
+                //  * one config over two DATASETS still shares a key, and so do
+                //    two concurrent runs of the SAME config — identical to the
+                //    Redis family's design, hence not a regression, but not
+                //    covered either.
+                // And even for two configs this is DATA isolation, not
+                // MEASUREMENT isolation. `configure()` calls
+                // `redis_utils::reset_commandstats` → `CONFIG RESETSTAT`, which is
+                // server-GLOBAL: two concurrent runs each wipe the other's
+                // baseline, blinding `check_commandstats`' failed-call guard — the
+                // thing that catches a silently-failing VADD/VSIM. `INFO memory`
+                // is server-wide too (that half is handled: `get_memory_usage`
+                // also publishes a per-key `index_memory_bytes`). Concurrency was
+                // impossible before this change and is newly reachable, so the
+                // caveat is newly relevant: run concurrent VectorSets benchmarks
+                // on separate servers if the commandstats guard matters to you.
+                key: derive_index_name("VECTORSETS_INDEX_NAME", "idx", &engine_config.name),
                 quant,
                 m,
                 ef_construction,
@@ -231,7 +269,8 @@ impl VectorSetsEngine {
 }
 
 /// Execute a batch of VADD commands via pipeline.
-/// VADD idx FP32 <vec_bytes> <id> <quant> M <M> EF <EF_CONSTRUCTION> [CAS] [SETATTR '<json>']
+/// VADD <key> FP32 <vec_bytes> <id> <quant> M <M> EF <EF_CONSTRUCTION> [CAS] [SETATTR '<json>']
+/// (`<key>` is `config.key`, the per-config vector set — see [`VectorSetsConfig::key`].)
 fn vadd_batch(
     conn: &mut Connection,
     config: &VectorSetsConfig,
@@ -245,7 +284,7 @@ fn vadd_batch(
         let vec_bytes: Vec<u8> = vectors[i].iter().flat_map(|f| f.to_le_bytes()).collect();
 
         let mut cmd = redis::cmd("VADD");
-        cmd.arg("idx")
+        cmd.arg(&config.key)
             .arg("FP32")
             .arg(&vec_bytes[..])
             .arg(ids[i].to_string())
@@ -352,7 +391,7 @@ fn encode_query_vector(query_vector: &[f32]) -> Vec<u8> {
 }
 
 /// Execute VSIM query and return (id, score) pairs.
-/// VSIM idx FP32 <vec_bytes> WITHSCORES COUNT <top> EF <ef> [FILTER '<expr>' [FILTER-EF <n>]]
+/// VSIM <key> FP32 <vec_bytes> WITHSCORES COUNT <top> EF <ef> [FILTER '<expr>' [FILTER-EF <n>]]
 /// Response: alternating [id, score, id, score, ...]
 /// Score conversion: 1.0 - score (VectorSets: 1=identical, 0=opposite)
 ///
@@ -361,6 +400,7 @@ fn encode_query_vector(query_vector: &[f32]) -> Vec<u8> {
 /// parse (all legitimate server latency).
 fn vsim_search(
     conn: &mut Connection,
+    key: &str,
     vec_bytes: &[u8],
     top: usize,
     ef: i64,
@@ -368,7 +408,7 @@ fn vsim_search(
     filter_ef: Option<i64>,
 ) -> Result<Vec<(i64, f64)>, String> {
     let mut cmd = redis::cmd("VSIM");
-    cmd.arg("idx")
+    cmd.arg(key)
         .arg("FP32")
         .arg(vec_bytes)
         .arg("WITHSCORES")
@@ -437,7 +477,7 @@ fn vadd_single(
     let vec_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
 
     let mut cmd = redis::cmd("VADD");
-    cmd.arg("idx")
+    cmd.arg(&config.key)
         .arg("FP32")
         .arg(&vec_bytes[..])
         .arg(id.to_string())
@@ -477,21 +517,31 @@ impl VectorSetsEngine {
 
 impl Engine for VectorSetsEngine {
     /// Server-side corpus size, for the `--skip-upload` reuse precondition
-    /// (issue #238). `VCARD idx` — the cardinality of the vector set this engine
+    /// (issue #238). `VCARD <key>` — the cardinality of the vector set this engine
     /// searches. A missing key answers 0 (VCARD returns 0 for a non-existent key),
     /// which is exactly the "nothing to reuse" verdict we want.
     ///
-    /// The key is the hardcoded `idx` (issue #236): this count therefore cannot
-    /// distinguish two configs sharing one server, and neither can the search.
+    /// The key is this config's derived `idx:<config>` (#236), so unlike the
+    /// single-object engines the count is scoped to the corpus THIS config
+    /// uploaded — a sibling config's full-size corpus cannot certify as this
+    /// one's. It is also what makes the promise in the `--skip-upload` docs true
+    /// for VectorSets: `VSIM` against a missing key returns an empty array with
+    /// **no error**, so "the search succeeded" is not evidence of anything, and
+    /// this count is the only thing standing between a stale/absent corpus and a
+    /// published `recall 0.0` at inflated QPS.
     fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         let mut conn = self.get_connection()?;
         // VCARD answers 0 for a key that does not exist, so a missing corpus and
         // an empty one are the same reply — which is the verdict we want. Any
         // Err is a genuine probe failure and is propagated, never reported as 0.
+        // MERGE HAZARD (#236 × #271): this probe MUST name the same key the
+        // upload and the search name. It arrived hardcoded to `idx` while #236
+        // was moving every other site to the per-config key; counting `idx` here
+        // would report another config's corpus (or 0) as this one's verdict.
         let n: u64 = redis::cmd("VCARD")
-            .arg("idx")
+            .arg(&self.config.key)
             .query(&mut conn)
-            .map_err(|e| format!("VCARD idx failed: {e}"))?;
+            .map_err(|e| format!("VCARD {} failed: {e}", self.config.key))?;
         Ok(Some(CorpusCount::exact(n)))
     }
 
@@ -511,12 +561,20 @@ impl Engine for VectorSetsEngine {
         let mut conn = self.get_connection()?;
 
         println!(
-            "Using VectorSets with QUANT: {}, M: {}, EF_CONSTRUCTION: {}, CAS: {}",
-            self.config.quant, self.config.m, self.config.ef_construction, self.config.cas
+            "Using VectorSets key '{}' with QUANT: {}, M: {}, EF_CONSTRUCTION: {}, CAS: {}",
+            self.config.key,
+            self.config.quant,
+            self.config.m,
+            self.config.ef_construction,
+            self.config.cas
         );
 
-        // Delete existing key if any
-        let _ = redis::cmd("DEL").arg("idx").query::<()>(&mut conn);
+        // Delete THIS config's key if any. Scoped to the derived per-config key
+        // (#236), so a sibling config's vector set on the same server survives —
+        // before, this `DEL idx` wiped every VectorSets config's corpus.
+        let _ = redis::cmd("DEL")
+            .arg(&self.config.key)
+            .query::<()>(&mut conn);
 
         self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
         self.commandstats_primed = true;
@@ -653,6 +711,9 @@ impl Engine for VectorSetsEngine {
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(s, "vectorsets-search", parallel);
+            // Borrowed (not cloned) per worker: `&str` is Copy, and the scope
+            // guarantees `self` outlives every worker.
+            let key: &str = &self.config.key;
             for _ in 0..parallel {
                 let redis_url = self.redis_url.clone();
                 let neighbors = &neighbors;
@@ -697,6 +758,7 @@ impl Engine for VectorSetsEngine {
                         let prime_top = explicit_top.unwrap_or(10);
                         let _ = vsim_search(
                             &mut conn,
+                            key,
                             &encoded_queries[0],
                             prime_top,
                             ef,
@@ -734,6 +796,7 @@ impl Engine for VectorSetsEngine {
                         let query_start = Instant::now();
                         let results = vsim_search(
                             &mut conn,
+                            key,
                             &encoded_queries[idx],
                             top,
                             ef,
@@ -945,8 +1008,15 @@ impl Engine for VectorSetsEngine {
                             // measurement behavior exactly.
                             let query_start = Instant::now();
                             let vec_bytes = encode_query_vector(&queries[idx]);
-                            let results =
-                                vsim_search(&mut conn, &vec_bytes, top, ef, filter_ref, filter_ef);
+                            let results = vsim_search(
+                                &mut conn,
+                                &config.key,
+                                &vec_bytes,
+                                top,
+                                ef,
+                                filter_ref,
+                                filter_ef,
+                            );
                             let query_time = query_start.elapsed().as_secs_f64();
 
                             match results {
@@ -1065,13 +1135,24 @@ impl Engine for VectorSetsEngine {
 
     fn delete(&mut self) -> Result<(), String> {
         let mut conn = self.get_connection()?;
-        let _ = redis::cmd("DEL").arg("idx").query::<()>(&mut conn);
+        // Scoped to this config's key (#236): tearing one config down leaves the
+        // other configs sharing the server intact.
+        let _ = redis::cmd("DEL")
+            .arg(&self.config.key)
+            .query::<()>(&mut conn);
         Ok(())
     }
 
     fn get_memory_usage(&mut self) -> Option<serde_json::Value> {
         let mut conn = self.get_connection().ok()?;
 
+        // Server-wide used_memory is kept only as a SECONDARY/global figure.
+        // Before #236 it was also the per-config figure, and correctly so: the
+        // hardcoded key plus a destructive `DEL` in `configure()` guaranteed
+        // exactly ONE resident corpus, so server total == this config's cost.
+        // Per-config keys make coexistence possible, which makes this number the
+        // SUM over every resident config. Mirrors the same caveat on redis.rs;
+        // the per-config figure below is the honest one.
         let info_str: String = redis::cmd("INFO").arg("memory").query(&mut conn).ok()?;
         let used_memory: i64 = info_str
             .lines()
@@ -1080,15 +1161,29 @@ impl Engine for VectorSetsEngine {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
 
+        // Per-config memory. The FT engines get this from `FT.INFO`; `VINFO` has
+        // no memory field at all (verified live), but the corpus is a single key,
+        // so `MEMORY USAGE <key>` attributes it exactly. Reported under the same
+        // `index_memory_bytes` name the Redis-wire engines already publish, so
+        // downstream consumers need no special case. Best effort: a missing key or
+        // an older server degrades to null rather than to a wrong number.
+        let index_memory_bytes: Option<i64> = redis::cmd("MEMORY")
+            .arg("USAGE")
+            .arg(&self.config.key)
+            .query::<Option<i64>>(&mut conn)
+            .ok()
+            .flatten();
+
         // Vector-set stats via VINFO (quant-type, hnsw-m, vector-dim, size, ...).
         let index_info: Option<serde_json::Value> = redis::cmd("VINFO")
-            .arg("idx")
+            .arg(&self.config.key)
             .query::<redis::Value>(&mut conn)
             .ok()
             .map(|v| redis_utils::value_to_json(&v));
 
         Some(serde_json::json!({
             "used_memory": used_memory,
+            "index_memory_bytes": index_memory_bytes,
             "shards": 1,
             "index_info": index_info,
         }))
@@ -1100,7 +1195,7 @@ impl Engine for VectorSetsEngine {
         // VectorSets has no FT index; VINFO returns the vector-set metadata.
         // Errors on the BEFORE snapshot (vset not yet created) → index_info: null.
         let vinfo = redis::cmd("VINFO")
-            .arg("idx")
+            .arg(&self.config.key)
             .query::<redis::Value>(&mut conn)
             .ok()
             .map(|v| redis_utils::value_to_json(&v));

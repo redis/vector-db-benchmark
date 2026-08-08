@@ -1,5 +1,5 @@
 //! Per-config index-name and key-prefix derivation for the Redis-wire engines
-//! (Redis / Valkey / Dragonfly).
+//! (Redis / Valkey / Dragonfly / KiviDB / VectorSets).
 //!
 //! Issue #151-4: an M×EF_CONSTRUCTION sweep runs several configs of the same
 //! engine against one server. When every config used the literal index name
@@ -10,6 +10,12 @@
 //!
 //! The fix makes each config address a *disjoint* index + keyspace derived
 //! purely from `engine_config.name`, so N configs coexist on one server.
+//!
+//! VectorSets (#236) joined late. It has no FT index and no doc keyspace — its
+//! whole corpus is ONE Redis key that VADD/VSIM/VINFO/DEL address — so it uses
+//! [`derive_index_name`] for that key and has no use for [`derive_key_prefix`].
+//! The failure mode was identical and worse: `configure()` issued a literal
+//! `DEL idx`, so starting config B deleted config A's entire corpus outright.
 
 /// Map any char outside `[A-Za-z0-9_-]` to `_`. Guarantees: (a) the only `:` in
 /// a derived name/prefix is our own separator; (b) no SCAN glob metacharacters
@@ -87,6 +93,46 @@ mod tests {
             derive_index_name("NONEXISTENT_ENV_151_4", "idx", "redis-m-8"),
             "idx:redis-m-8"
         );
+    }
+
+    /// #236: two VectorSets configs must derive two DIFFERENT keys, because that
+    /// key is the whole corpus — a shared one means `configure()`'s `DEL` wipes
+    /// the sibling. Pinned to the literal expected strings so a future change to
+    /// the separator or the default base has to be made deliberately.
+    #[test]
+    fn vectorsets_configs_derive_distinct_keys() {
+        let a = derive_index_name("VECTORSETS_INDEX_NAME_UNSET_236", "idx", "vectorsets-fp32");
+        let b = derive_index_name("VECTORSETS_INDEX_NAME_UNSET_236", "idx", "vectorsets-q8");
+        assert_eq!(a, "idx:vectorsets-fp32");
+        assert_eq!(b, "idx:vectorsets-q8");
+        assert_ne!(a, b);
+        // And neither may be the bare legacy key that every config used to share.
+        assert_ne!(a, "idx");
+        assert_ne!(b, "idx");
+    }
+
+    /// The `_EXACT` escape hatch drops the config suffix entirely. Two configs
+    /// then DO collide by design — which is why `experiment::run`'s startup guard
+    /// rejects exact mode with >1 config for the engine. Uses a private env name
+    /// so no other test observes it.
+    #[test]
+    fn exact_pin_drops_the_config_suffix() {
+        let base_env = "VECTORSETS_INDEX_NAME_EXACTTEST_236";
+        std::env::set_var(base_env, "myvset");
+        std::env::set_var(format!("{base_env}_EXACT"), "1");
+        assert!(index_name_exact(base_env));
+        assert_eq!(
+            derive_index_name(base_env, "idx", "vectorsets-fp32"),
+            "myvset"
+        );
+        // Without the pin the base is still honoured, but the suffix returns.
+        std::env::remove_var(format!("{base_env}_EXACT"));
+        assert!(!index_name_exact(base_env));
+        assert_eq!(
+            derive_index_name(base_env, "idx", "vectorsets-fp32"),
+            "myvset:vectorsets-fp32"
+        );
+        std::env::remove_var(base_env);
     }
 
     #[test]
