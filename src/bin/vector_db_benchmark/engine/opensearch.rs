@@ -1045,7 +1045,9 @@ fn create_index_retryable(status: u16, body: &str) -> bool {
 /// cluster defaults to" state this setting exists to eliminate — and nothing
 /// downstream records the shard count, so the operator would have no way to
 /// notice. Failing at construction is the only place it can still be caught.
-fn parse_number_of_shards(raw: Option<&serde_json::Value>) -> Result<Option<i64>, String> {
+pub(crate) fn parse_number_of_shards(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<i64>, String> {
     match raw {
         None => Ok(None),
         Some(v) => match v.as_i64() {
@@ -2313,6 +2315,209 @@ mod tests {
                 "error must name the key: {err}"
             );
         }
+    }
+
+    /// Shipped-config guard (#211). Making the shard count settable buys nothing
+    /// while no shipped config sets it: `elasticsearch.rs` pins
+    /// `ES_NUMBER_OF_SHARDS`, so an unpinned OpenSearch config turns the
+    /// published head-to-head into 1-shard ES vs whatever the cluster happens to
+    /// default to (1 open-source, historically 5 on Amazon OpenSearch Service).
+    ///
+    /// `collection_params` is a `#[serde(flatten)]` catch-all, so deleting or
+    /// misspelling the key still parses cleanly and simply stops arriving — the
+    /// comparison would silently revert with a green build. This walks the real
+    /// shipped files through the exact
+    /// `collection_params.extra` → `parse_number_of_shards` path
+    /// `OpenSearchEngine::new` uses, so that regression fails CI instead.
+    ///
+    /// It globs *every* shipped configuration file rather than naming two, so an
+    /// `engine: "opensearch"` entry added to any third file is covered the day it
+    /// lands; the two files this repo ships additionally have their exact pin,
+    /// sweep size and HNSW grid asserted.
+    ///
+    /// Scope: this asserts a pin is PRESENT and carries the expected value. The
+    /// complementary generic check — that every knob a shipped config declares is
+    /// actually read by its target engine — is engine-agnostic and belongs in
+    /// `config.rs` (#216). Repo-wide duplicate config names are #239; the
+    /// uniqueness assertion below is scoped to opensearch so this test does not
+    /// inherit that failure.
+    #[test]
+    fn shipped_opensearch_configs_pin_their_shard_count() {
+        use std::collections::{HashMap, HashSet};
+
+        // (expected pin, number of sweep points) for the files this repo ships.
+        // The single-node pin is read from elasticsearch.rs rather than written
+        // as `1`, because "same shard count as ES" is the actual #211 invariant:
+        // moving the ES constant must fail here instead of silently unpairing the
+        // published ES-vs-OS comparison.
+        let known: HashMap<&str, (i64, usize)> = HashMap::from([
+            (
+                "opensearch-single-node.json",
+                (crate::engine::elasticsearch::ES_NUMBER_OF_SHARDS, 7),
+            ),
+            // Amazon OpenSearch Service's historical (ES-derived) per-index
+            // default. Deliberately NOT the ES constant: this file exists to
+            // measure the other shard count, not to pair with Elasticsearch.
+            ("opensearch-5-shard.json", (5_i64, 7)),
+        ]);
+
+        let dir = crate::config::project_root().join("experiments/configurations");
+        let paths: Vec<_> = glob::glob(dir.join("*.json").to_str().unwrap())
+            .expect("configuration glob is valid")
+            .flatten()
+            .collect();
+        assert!(
+            !paths.is_empty(),
+            "no configuration files found under {}",
+            dir.display()
+        );
+
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut grids: HashMap<&str, Vec<(i64, i64)>> = HashMap::new();
+        // (config name, file it came from) for every opensearch entry shipped.
+        let mut seen: Vec<(String, String)> = Vec::new();
+
+        for path in paths {
+            let file = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .expect("config filename is valid UTF-8")
+                .to_string();
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // A file that is not an array of configs is skipped by the production
+            // loader too; the `visited` check below still catches one of OUR files
+            // being emptied or corrupted into that state.
+            let Ok(raw) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+                continue;
+            };
+            if !raw
+                .iter()
+                .any(|c| c.get("engine").and_then(|e| e.as_str()) == Some("opensearch"))
+            {
+                continue;
+            }
+
+            let configs = crate::config::read_engine_configs(Some(
+                path.to_str().expect("config path is valid UTF-8"),
+            ))
+            .unwrap_or_else(|e| panic!("{file} ships opensearch configs and must parse: {e}"));
+            // read_engine_configs keys by name with last-write-wins, so a name
+            // reused inside one file silently *deletes* a sweep point: the run
+            // completes, the report is one row short, and nothing says so.
+            // (Across files this is #239 — engine-agnostic, fixed in config.rs.)
+            assert_eq!(
+                configs.len(),
+                raw.len(),
+                "{file} declares {} configs but only {} survive loading — duplicate \
+                 \"name\" values collapse silently (last-write-wins)",
+                raw.len(),
+                configs.len()
+            );
+
+            // Fail CLOSED on a file this test has never heard of. Checking only
+            // "pins something positive" would let a new OpenSearch config file
+            // ship an arbitrary shard count that no reviewer ever chose, which is
+            // the same class of accident as inheriting the cluster default.
+            // Registering it here forces the value to be a decision.
+            let Some(want) = known.get(file.as_str()).map(|(shards, _)| *shards) else {
+                panic!(
+                    "{file} declares engine \"opensearch\" configs but is not registered in \
+                     this guard. Add it to `known` with the shard count it is meant to \
+                     measure (and why), so the value is reviewed rather than inherited."
+                );
+            };
+
+            for (name, config) in &configs {
+                if config.engine.as_deref() != Some("opensearch") {
+                    continue;
+                }
+                // Read it exactly the way `OpenSearchEngine::new` does — off
+                // `collection_params.extra` and through `parse_number_of_shards`
+                // — so a key that is misspelled, mistyped, or moved one level up
+                // fails here for the same reason it would stop reaching the
+                // server. `CollectionParams` has no typed field that could absorb
+                // `number_of_shards` (only `hnsw_config` / `index_options`), and
+                // if one were ever added, `parse_number_of_shards(None)` returns
+                // `Ok(None)` and this assertion fails rather than passing blind.
+                let raw_shards = config
+                    .collection_params
+                    .as_ref()
+                    .and_then(|c| c.extra.as_ref())
+                    .and_then(|e| e.get("number_of_shards"));
+                assert_eq!(
+                    parse_number_of_shards(raw_shards),
+                    Ok(Some(want)),
+                    "{file}/{name} must pin collection_params.number_of_shards to \
+                     {want}; an unpinned config silently inherits the cluster \
+                     default, which is not comparable with elasticsearch.rs's \
+                     pinned {}",
+                    crate::engine::elasticsearch::ES_NUMBER_OF_SHARDS
+                );
+                seen.push((name.clone(), file.clone()));
+            }
+
+            if let Some((&key, &(_, want_len))) = known.get_key_value(file.as_str()) {
+                // Pin the sweep SIZE too: truncating the file leaves every
+                // surviving entry correctly pinned, so the loop above stays green
+                // while the published sweep quietly loses points.
+                assert_eq!(
+                    raw.len(),
+                    want_len,
+                    "{file} must ship {want_len} sweep points, found {}",
+                    raw.len()
+                );
+                let mut grid: Vec<(i64, i64)> = raw
+                    .iter()
+                    .map(|c| {
+                        let p = &c["collection_params"]["method"]["parameters"];
+                        let m = p["m"]
+                            .as_i64()
+                            .unwrap_or_else(|| panic!("{file}: entry missing method.parameters.m"));
+                        let ef = p["ef_construction"].as_i64().unwrap_or_else(|| {
+                            panic!("{file}: entry missing method.parameters.ef_construction")
+                        });
+                        (m, ef)
+                    })
+                    .collect();
+                grid.sort_unstable();
+                grids.insert(key, grid);
+                visited.insert(key);
+            }
+        }
+
+        let mut missing: Vec<&str> = known
+            .keys()
+            .copied()
+            .filter(|k| !visited.contains(k))
+            .collect();
+        missing.sort_unstable();
+        assert!(
+            missing.is_empty(),
+            "shipped OpenSearch config file(s) missing, emptied, unparsable, or no \
+             longer declaring engine \"opensearch\": {missing:?}"
+        );
+
+        // The two files differ in exactly one dimension — shard count. If their
+        // HNSW grids drift apart, "same sweep at 1 vs 5 shards" stops being true
+        // and the two result sets are no longer comparable to each other either.
+        assert_eq!(
+            grids["opensearch-single-node.json"], grids["opensearch-5-shard.json"],
+            "both shipped OpenSearch files must sweep the same (m, ef_construction) \
+             grid; only number_of_shards may differ"
+        );
+
+        // Engine configs from every file are globbed into one name-keyed map, so a
+        // reused name makes one shard count quietly shadow the other — exactly the
+        // failure this test exists to prevent. Scoped to opensearch here; the
+        // repo-wide version of this collision (vectorsets-fp32-default) is #239.
+        let unique: HashSet<&String> = seen.iter().map(|(name, _)| name).collect();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "opensearch config names must be unique across shipped files: {seen:?}"
+        );
     }
 
     #[test]

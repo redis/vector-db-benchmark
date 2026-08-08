@@ -1910,9 +1910,29 @@ impl Engine for RedisEngine {
                          skipping re-upload (#188 upload-once/build-many).",
                         self.config.key_prefix
                     );
+                    // Skipping the UPLOAD must not also skip waiting for the
+                    // INDEX. This config's index was created in configure() over
+                    // a keyspace that was already populated, so RediSearch
+                    // backfills it asynchronously from the existing hashes; the
+                    // uploading config waits for that below (via
+                    // `wait_for_indexing`) but a skipping config used to return
+                    // immediately and start searching a half-built index. That
+                    // reports low recall with no error — the same silent-wrong
+                    // -result failure the completeness gate above guards against,
+                    // one step later. It also keeps the sweep honest: index-build
+                    // time is part of ingest cost for every other config, so it
+                    // is counted in total_time here too (upload_time stays 0 —
+                    // the corpus really was uploaded once).
+                    let index_start = Instant::now();
+                    self.wait_for_indexing(existing)?;
+                    let index_time = index_start.elapsed().as_secs_f64();
+                    println!(
+                        "Index time (backfill over the shared corpus): {:.3}s",
+                        index_time
+                    );
                     return Ok(UploadStats {
                         upload_time: 0.0,
-                        total_time: 0.0,
+                        total_time: index_time,
                         upload_count: existing,
                         parallel: self.config.parallel,
                         batch_size: self.config.batch_size,

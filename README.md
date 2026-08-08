@@ -57,7 +57,27 @@ One real protocol difference worth knowing: KiviDB's `FT.INFO` does not expose R
 <a id="opensearch-note"></a>
 \*\*\*\*\*\*\* **OpenSearch note:** Connection is set with `OPENSEARCH_PORT` (default `9200`), `OPENSEARCH_INDEX` (default `bench`), `OPENSEARCH_TIMEOUT` seconds (default `300`), and `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD`.
 
-**Shard count** is read from `collection_params.number_of_shards`. Leave it unset to inherit the cluster default — but note that default is **1 on open-source OpenSearch and historically 5 on Amazon OpenSearch Service**, and shard count materially changes vector indexing speed and precision, so a run that leaves it unset is not comparable across engine versions or deployments. `elasticsearch.rs` pins `number_of_shards: 1`, so pin it here too for an apples-to-apples ES-vs-OS comparison. The effective value is printed per config (`OpenSearch: HNSW { … }, number_of_shards: 5|cluster-default`), and a present-but-non-integer value is a hard error rather than a silent fallback to the default.
+**Shard count** is read from `collection_params.number_of_shards`. Leave it unset to inherit the cluster default — but note that default is **1 on open-source OpenSearch and historically 5 on Amazon OpenSearch Service**, and shard count materially changes vector indexing speed and precision, so a run that leaves it unset is not comparable across engine versions or deployments. The effective value is printed per config (`OpenSearch: HNSW { … }, number_of_shards: 5|cluster-default`), and a present-but-non-integer value is a hard error rather than a silent fallback to the default.
+
+Every OpenSearch config shipped **in this (Rust) tree** pins it explicitly, so no published run inherits a default (#211). The resolved value is also written into every result file as `params.number_of_shards` (`"cluster-default"` if a custom config left it unpinned), so a run can be audited without reverse-engineering its config name. The legacy `v0/` Python tree is *not* pinned and cannot be: `v0/engine/clients/opensearch/configure.py` hardcodes its index settings and ignores `number_of_shards` entirely, while `v0/engine/clients/elasticsearch/configure.py` pins 1 — so v0's own ES-vs-OS pairing still has the #211 asymmetry.
+
+| Config file | `number_of_shards` | Use for |
+|---|---|---|
+| `experiments/configurations/opensearch-single-node.json` | `1` | Open-source / single-node OpenSearch. Matches `elasticsearch.rs`, which pins `ES_NUMBER_OF_SHARDS = 1`, so this is the ES-vs-OS head-to-head pairing (see the caveat below). |
+| `experiments/configurations/opensearch-5-shard.json` | `5` | A 5-shard index — the per-index default Amazon OpenSearch Service inherited from Elasticsearch and still applies on legacy/ES-derived domains. Same HNSW sweep, config names prefixed `opensearch-5-shard-`. |
+
+The 5-shard file is named for what it *does*, not for a deployment: a modern Amazon OpenSearch Service domain defaults to **1** shard per index, not 5, so "managed" would have been a claim about someone else's default that is no longer reliably true. Run it on a managed domain if you want to reproduce a legacy default, and set `number_of_shards` to whatever your own domain actually reports if you want to model it.
+
+**Do not compare `opensearch-5-shard-*` numbers against Elasticsearch.** `elasticsearch.rs` always builds a 1-shard index, so a 5-shard OpenSearch result against an ES result differs in shard count as well as engine and is not a head-to-head. Pair ES only with `opensearch-single-node.json`. Even that pairing is not yet fully matched: ES still bulk-loads with `refresh_interval: "10s"` while OpenSearch uses `-1`, so ES pays refresh work during ingest that OpenSearch does not — tracked in #240.
+
+Pick one file per run — they are exact and survive future renames:
+
+```
+--engines-file experiments/configurations/opensearch-single-node.json
+--engines-file experiments/configurations/opensearch-5-shard.json
+```
+
+Avoid selecting by glob here: `--engines 'opensearch-m-*'` matches only 6 of the 7 sweep points — it silently drops the `opensearch-default` (m=16, ef_construction=100) baseline, whose name lacks the `opensearch-m-` prefix — and a bare `--engines 'opensearch-*'` matches both files, sweeping two different shard counts into one report.
 
 **Retries against a managed domain.** Amazon OpenSearch Service returns states an open-source single-node cluster never produces: HTTP 429 on bulk (its `knn.algo_param.index_thread_qty` defaults to 1, so HNSW graph building is single-threaded and cannot drain as fast as a parallel uploader pushes), 400 `snapshot_in_progress_exception` on delete (automated snapshots cannot be disabled), 503 `process_cluster_event_timeout_exception` on create, and 502/504 from the front door on force-merge. All four paths retry with jittered exponential backoff, tunable with:
 
