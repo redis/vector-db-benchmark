@@ -1169,6 +1169,25 @@ mod shipped_config_knob_guard {
         Some(blob)
     }
 
+    /// If `knob_path` names a direct leaf of a [`TYPED_CONTAINERS`] struct that
+    /// the struct does not declare, return that container and its field set.
+    ///
+    /// This is the engine-independent half of the guard, and the only check that
+    /// survives token matching being defeated by a short common identifier.
+    fn undeclared_typed_leaf(knob_path: &str) -> Option<(&'static str, &'static [&'static str])> {
+        TYPED_CONTAINERS
+            .iter()
+            .find(|(c, _)| knob_path.starts_with(&format!("{}.", c)))
+            .and_then(|(container, allowed)| {
+                let rel = &knob_path[container.len() + 1..];
+                if !rel.contains('.') && !allowed.contains(&canonical(rel)) {
+                    Some((*container, *allowed))
+                } else {
+                    None
+                }
+            })
+    }
+
     /// Is `knob_path` (dotted) satisfied by the engine's source?
     ///
     /// The leaf token must ALWAYS be present verbatim. An earlier version let a
@@ -1281,22 +1300,15 @@ mod shipped_config_knob_guard {
                     // entry stay "used" long after the underlying bug was fixed
                     // — which is exactly what happened when #215 landed and made
                     // `hnsw_config.on_disk` a real, read knob.
-                    let schema_violation = TYPED_CONTAINERS
-                        .iter()
-                        .find(|(c, _)| knob.starts_with(&format!("{}.", c)))
-                        .and_then(|(container, allowed)| {
-                            let rel = &knob[container.len() + 1..];
-                            if !rel.contains('.') && !allowed.contains(&canonical(rel)) {
-                                Some(format!(
-                                    "{} [{}] declares '{}', but '{}' declares no such \
-                                     field (only {:?}) - it lands in the untyped \
-                                     catch-all that no engine reads as a knob, so it \
-                                     can never take effect (see issue #216)",
-                                    file_name, name, knob, container, allowed
-                                ))
-                            } else {
-                                None
-                            }
+                    let schema_violation =
+                        undeclared_typed_leaf(&knob).map(|(container, allowed)| {
+                            format!(
+                                "{} [{}] declares '{}', but '{}' declares no such \
+                                 field (only {:?}) - it lands in the untyped \
+                                 catch-all that no engine reads as a knob, so it \
+                                 can never take effect (see issue #216)",
+                                file_name, name, knob, container, allowed
+                            )
                         });
 
                     let reason = schema_violation.or_else(|| {
@@ -1403,6 +1415,37 @@ mod shipped_config_knob_guard {
             !knob_is_read("cp.hnsw_config.as_ref()", "collection_params.hnsw_config.M"),
             "mentioning hnsw_config must not vouch for the M leaf"
         );
+        // THE relocation defence, tested directly rather than only via the
+        // whole-corpus sweep. Token matching cannot stop `hnsw_config.ef`
+        // (qdrant, redis and pgvector all contain a bare `ef`); the schema check
+        // must, on every engine, because HnswConfig declares no such field.
+        assert!(
+            undeclared_typed_leaf("collection_params.hnsw_config.ef").is_some(),
+            "relocating `ef` under hnsw_config must be caught by the schema check"
+        );
+        // Fields the struct really declares must NOT be flagged - including the
+        // ones #215 added, which are read by qdrant.
+        for declared in [
+            "M",
+            "EF_CONSTRUCTION",
+            "ef_construct",
+            "on_disk",
+            "payload_m",
+            "inline_storage",
+            "full_scan_threshold",
+            "max_indexing_threads",
+        ] {
+            let path = format!("collection_params.hnsw_config.{}", declared);
+            assert!(
+                undeclared_typed_leaf(&path).is_none(),
+                "{} is a declared HnswConfig field and must not be flagged",
+                declared
+            );
+        }
+        // Nested paths are not direct leaves and are left to the token check.
+        assert!(undeclared_typed_leaf("collection_params.hnsw_config").is_none());
+        assert!(undeclared_typed_leaf("collection_params.vectors_config.on_disk").is_none());
+
         // The #216 bug must not survive being relocated one level: `ef` under
         // hnsw_config is still unread unless the leaf itself appears.
         assert!(
