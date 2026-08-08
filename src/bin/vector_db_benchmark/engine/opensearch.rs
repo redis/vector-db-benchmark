@@ -2315,6 +2315,69 @@ mod tests {
         }
     }
 
+    /// Shipped-config guard (#211). Making the shard count settable buys nothing
+    /// while no shipped config sets it: `elasticsearch.rs` hardcodes
+    /// `number_of_shards: 1`, so an unpinned OpenSearch config turns the
+    /// published head-to-head into 1-shard ES vs whatever the cluster happens to
+    /// default to (1 open-source, historically 5 on Amazon OpenSearch Service).
+    ///
+    /// `collection_params` is a `#[serde(flatten)]` catch-all, so deleting or
+    /// misspelling the key still parses cleanly and simply stops arriving — the
+    /// comparison would silently revert with a green build. This walks the real
+    /// shipped files through the exact
+    /// `collection_params.extra` → `parse_number_of_shards` path
+    /// `OpenSearchEngine::new` uses, so that regression fails CI instead.
+    #[test]
+    fn shipped_opensearch_configs_pin_their_shard_count() {
+        let mut seen: Vec<String> = Vec::new();
+        for (file, expected) in [
+            // Matches elasticsearch.rs's hardcoded 1 and the file's own name.
+            ("opensearch-single-node.json", 1_i64),
+            // Amazon OpenSearch Service's historical per-index default.
+            ("opensearch-managed.json", 5_i64),
+        ] {
+            let path = crate::config::project_root()
+                .join("experiments/configurations")
+                .join(file);
+            let configs = crate::config::read_engine_configs(Some(
+                path.to_str().expect("config path is valid UTF-8"),
+            ))
+            .unwrap_or_else(|e| panic!("{file} must parse: {e}"));
+            assert!(!configs.is_empty(), "{file} must ship at least one config");
+
+            for (name, config) in &configs {
+                assert_eq!(
+                    config.engine.as_deref(),
+                    Some("opensearch"),
+                    "{file}/{name} must target the opensearch engine"
+                );
+                let raw = config
+                    .collection_params
+                    .as_ref()
+                    .and_then(|c| c.extra.as_ref())
+                    .and_then(|e| e.get("number_of_shards"));
+                assert_eq!(
+                    parse_number_of_shards(raw),
+                    Ok(Some(expected)),
+                    "{file}/{name} must pin collection_params.number_of_shards to \
+                     {expected}; an unpinned config silently inherits the cluster \
+                     default, which is not comparable with elasticsearch.rs's \
+                     hardcoded 1"
+                );
+                seen.push(name.clone());
+            }
+        }
+        // Engine configs are globbed into one name-keyed map, so a name reused
+        // across the two files would make one shard count quietly shadow the
+        // other — exactly the failure this test exists to prevent.
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "config names must be unique across the shipped OpenSearch files: {seen:?}"
+        );
+    }
+
     #[test]
     fn index_maintenance_retries_gateway_and_transient_cluster_states() {
         // force-merge runs AFTER the whole ingest and is the op a managed front

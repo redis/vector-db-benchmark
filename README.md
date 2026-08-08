@@ -43,7 +43,16 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 <a id="opensearch-note"></a>
 \*\*\*\*\*\*\* **OpenSearch note:** Connection is set with `OPENSEARCH_PORT` (default `9200`), `OPENSEARCH_INDEX` (default `bench`), `OPENSEARCH_TIMEOUT` seconds (default `300`), and `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD`.
 
-**Shard count** is read from `collection_params.number_of_shards`. Leave it unset to inherit the cluster default — but note that default is **1 on open-source OpenSearch and historically 5 on Amazon OpenSearch Service**, and shard count materially changes vector indexing speed and precision, so a run that leaves it unset is not comparable across engine versions or deployments. `elasticsearch.rs` pins `number_of_shards: 1`, so pin it here too for an apples-to-apples ES-vs-OS comparison. The effective value is printed per config (`OpenSearch: HNSW { … }, number_of_shards: 5|cluster-default`), and a present-but-non-integer value is a hard error rather than a silent fallback to the default.
+**Shard count** is read from `collection_params.number_of_shards`. Leave it unset to inherit the cluster default — but note that default is **1 on open-source OpenSearch and historically 5 on Amazon OpenSearch Service**, and shard count materially changes vector indexing speed and precision, so a run that leaves it unset is not comparable across engine versions or deployments. The effective value is printed per config (`OpenSearch: HNSW { … }, number_of_shards: 5|cluster-default`), and a present-but-non-integer value is a hard error rather than a silent fallback to the default.
+
+Every shipped config pins it explicitly, so no published run inherits a default (#211):
+
+| Config file | `number_of_shards` | Use for |
+|---|---|---|
+| `experiments/configurations/opensearch-single-node.json` | `1` | Open-source / single-node OpenSearch. Matches `elasticsearch.rs`, which hardcodes `number_of_shards: 1`, so this is the apples-to-apples ES-vs-OS head-to-head. |
+| `experiments/configurations/opensearch-managed.json` | `5` | Amazon OpenSearch Service, whose per-index default has historically been 5. Same HNSW sweep, config names prefixed `opensearch-managed-`. |
+
+Pick one file per run (`--engines 'opensearch-m-*'` vs `--engines 'opensearch-managed-*'`); a bare `--engines 'opensearch-*'` glob matches both and would sweep two shard counts in one report.
 
 **Retries against a managed domain.** Amazon OpenSearch Service returns states an open-source single-node cluster never produces: HTTP 429 on bulk (its `knn.algo_param.index_thread_qty` defaults to 1, so HNSW graph building is single-threaded and cannot drain as fast as a parallel uploader pushes), 400 `snapshot_in_progress_exception` on delete (automated snapshots cannot be disabled), 503 `process_cluster_event_timeout_exception` on create, and 502/504 from the front door on force-merge. All four paths retry with jittered exponential backoff, tunable with:
 
