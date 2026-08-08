@@ -442,6 +442,29 @@ pub trait Engine {
         None
     }
 
+    /// Number of corpus rows this config would search, **read back off the live
+    /// server** (issue #238).
+    ///
+    /// This is the reuse precondition for `--skip-upload`: the flag asserts "the
+    /// corpus is already loaded", and the runner has to be able to check that
+    /// assertion against reality rather than trust it. A missing index/collection
+    /// answers `Ok(Some(0))` — indistinguishable from an empty one for this
+    /// purpose, and both are equally fatal to the reported recall.
+    ///
+    /// The count must cover exactly the keyspace/collection **this config**
+    /// searches (per-config prefix included), so a sibling config's corpus can
+    /// never be mistaken for this one's.
+    ///
+    /// Default `Ok(None)`: "this engine cannot report one". The runner then says
+    /// so and proceeds — an unverifiable engine must not become an unusable one.
+    /// `Err` means the probe itself failed (unreachable server, refused command);
+    /// the runner treats that as fatal unless `--allow-partial-corpus` is set,
+    /// because an unverified reuse is exactly how a partial index gets published
+    /// as a full one.
+    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
+
     /// Snapshot server reproducibility metadata (version, loaded modules +
     /// versions, full INFO/CONFIG). Default `None` (non-Redis engines are
     /// unaffected). Redis-wire engines override this to return

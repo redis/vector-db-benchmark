@@ -447,6 +447,22 @@ fn vadd_single(
 }
 
 impl Engine for VectorSetsEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238). `VCARD idx` — the cardinality of the vector set this engine
+    /// searches. A missing key answers 0 (VCARD returns 0 for a non-existent key),
+    /// which is exactly the "nothing to reuse" verdict we want.
+    ///
+    /// The key is the hardcoded `idx` (issue #236): this count therefore cannot
+    /// distinguish two configs sharing one server, and neither can the search.
+    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+        let mut conn = self.get_connection()?;
+        let n: u64 = redis::cmd("VCARD")
+            .arg("idx")
+            .query(&mut conn)
+            .map_err(|e| format!("VCARD idx failed: {e}"))?;
+        Ok(Some(n))
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

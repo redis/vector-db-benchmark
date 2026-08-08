@@ -1975,6 +1975,14 @@ fn redis_value_to_json(val: &redis::Value) -> serde_json::Value {
 // ── Engine trait implementation ──────────────────────────────────────────
 
 impl Engine for KividbEngine {
+    /// Server-side corpus size for this config's index, for the `--skip-upload`
+    /// reuse precondition (issue #238). `FT.INFO <index>` → `num_docs`; a missing
+    /// index counts as 0 (the corpus to reuse is not there).
+    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+        let mut conn = self.get_connection()?;
+        redis_utils::ft_index_num_docs(&mut conn, &self.config.index_name)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

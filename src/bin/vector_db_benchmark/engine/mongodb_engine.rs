@@ -1193,6 +1193,21 @@ fn json_to_bson(value: &serde_json::Value) -> mongodb::bson::Bson {
 // ── Engine trait implementation ──────────────────────────────────────────
 
 impl Engine for MongoDBEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238). `countDocuments({})` on the benchmark collection — an exact
+    /// count, not the metadata estimate, because the estimate can lag a drop and
+    /// report a corpus that is no longer there. A missing collection answers 0.
+    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+        let coll = self
+            .client
+            .database(&self.db_name)
+            .collection::<Document>(&self.collection_name);
+        match coll.count_documents(doc! {}).run() {
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Ok(Some(0)),
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1313,6 +1328,10 @@ impl Engine for MongoDBEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // `--skip-upload` never runs configure() (issue #238), so the schema type
+        // cache must be primed here too — without it a numeric filter would be
+        // built against string literals and quietly match nothing.
+        self.load_schema_types(dataset);
         if self.config.skip_vector_index {
             return self.search_filter_only(dataset, params, num_queries);
         }

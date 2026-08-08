@@ -14,7 +14,7 @@ use opensearch::indices::{
     IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts, IndicesPutSettingsParts,
     IndicesRefreshParts,
 };
-use opensearch::{BulkParts, OpenSearch, SearchParts};
+use opensearch::{BulkParts, CountParts, OpenSearch, SearchParts};
 use uuid::Uuid;
 
 use crate::config::{EngineConfig, SearchParams};
@@ -1350,6 +1350,29 @@ fn extract_knn_hits(resp_body: &serde_json::Value) -> Result<Vec<(i64, f64)>, St
 // ── Engine trait implementation ──────────────────────────────────────────
 
 impl Engine for OpenSearchEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238). `GET /<index>/_count`; a missing index (404) answers 0.
+    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+        let resp = self
+            .rt
+            .block_on(
+                self.client
+                    .count(CountParts::Index(&[&self.index_name]))
+                    .send(),
+            )
+            .map_err(|e| format!("_count on index '{}' failed: {}", self.index_name, e))?;
+        if resp.status_code().as_u16() == 404 {
+            return Ok(Some(0));
+        }
+        let body: serde_json::Value = self.rt.block_on(resp.json()).map_err(|e| {
+            format!(
+                "_count on index '{}' returned no JSON: {}",
+                self.index_name, e
+            )
+        })?;
+        Ok(body.get("count").and_then(|v| v.as_u64()))
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

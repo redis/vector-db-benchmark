@@ -239,7 +239,9 @@ Options:
     --host <HOST>              Redis/engine host [default: localhost]
     --parallels <N,N,...>      Filter by parallel thread counts
     --ef-runtime <N,N,...>     Filter by ef runtime values
-    --skip-upload              Skip the upload phase
+    --skip-upload              Reuse the corpus already on the server (no configure,
+                               no upload); verified against the live server first
+    --allow-partial-corpus     Downgrade that verification from a hard error to a warning
     --skip-search              Skip the search phase
     --skip-if-exists           Skip if results already exist
     --exit-on-error            Stop on first error
@@ -250,6 +252,47 @@ Options:
     --plot <OUTPUT.svg>        Render a QPS-vs-precision trade-off chart from results/
     -h, --help                 Print help
 ```
+
+### `--skip-upload`: reuse means reuse (issue #238)
+
+`--skip-upload` asserts *"the server already holds the corpus I want"*. Two rules
+follow, and both are enforced:
+
+1. **The configure phase never runs.** `configure()` is destructive on 13 of the
+   15 engines — `FT.DROPINDEX … DD` (Redis), `FT.DROPINDEX` + `SCAN`/`UNLINK`
+   (Valkey / Dragonfly / KiviDB), `collection.drop()` (MongoDB), `DROP TABLE`
+   (pgvector), `DELETE /collections/<n>` (Qdrant / Chroma / Weaviate / Milvus /
+   Turbopuffer), `DEL idx` (VectorSets). Until #238 the
+   `--skip-upload --skip-vector-index` combination still called it: the flags that
+   mean *"do not upload, do not build an index, just use what is there"* deleted
+   the corpus and then benchmarked the empty index — printing a QPS number and
+   exiting 0. Measured live: Redis 400 → 0 docs, Valkey 400 → 0 keys, MongoDB
+   400 → 0 documents.
+2. **The corpus is verified before anything is measured.** The runner reads the
+   row count back off the live server (`FT.INFO num_docs`, `GET /collections/<n>`
+   → `points_count`, `_count`, `countDocuments`, `SELECT count(*)`, `VCARD`) and
+   compares it with the dataset's measured corpus size:
+   - **fewer rows than the dataset declares — including zero, i.e. a missing
+     index — is a hard error.** Recall/precision are scored against ground truth
+     for the FULL corpus, so a short corpus publishes a wrong number under a
+     config name that claims otherwise. Nothing else catches this: a half-deleted
+     Qdrant collection answers every query without error and reports
+     `mean_recall: 1.0`.
+   - more rows than declared → warning (often deliberate: a shared prefix, a
+     superset upload).
+   - an engine that cannot report a count → a printed note that the reuse went
+     unverified. Counting is implemented for Redis, Valkey, Dragonfly, KiviDB,
+     VectorSets, Qdrant, Elasticsearch, OpenSearch, pgvector and MongoDB; Chroma,
+     Milvus, Weaviate, Turbopuffer and Vertex fall back to the note.
+
+   Pass `--allow-partial-corpus` to downgrade the hard error to a warning (a
+   deliberately partial corpus, or a server whose count cannot be read).
+
+Two-phase workflows are unchanged, and now provably non-destructive: upload with
+`--keep-data`, then re-run with `--skip-upload --keep-data --skip-if-exists false`.
+A filter-only two-phase run must pass `--skip-vector-index` in **both** phases —
+the flag renames the config to `<engine>-no-vector`, so phase 1 writes exactly the
+schema-only index phase 2 reuses.
 
 ### Per-config index isolation (Redis / Valkey / Dragonfly / KiviDB)
 
@@ -296,11 +339,12 @@ VSIM coerces a non-numeric attribute to `0` in a numeric comparison — so a
 (a two-sided range matches nothing → recall 0; a one-sided `lt`/`lte` matches
 everything). **Re-upload before searching.**
 
-Unlike Redis/Valkey — where `--skip-upload` against a missing or mismatched index
-hard-errors (`redis_utils::ensure_index_exists`) — VectorSets has **no such
-guard**: it uses a single hardcoded key (`idx`), so there is not even a name
-change for the tool to detect. The stale corpus is found, the run succeeds, and
-only the recall number is wrong.
+`--skip-upload` does check that the corpus is **present and complete** on
+VectorSets too (`VCARD idx`, see above), but it cannot check that the corpus is
+*current*: a pre-#230 corpus is the right size and the wrong encoding. And because
+the engine uses a single hardcoded key (`idx`, issue #236), there is not even a
+name change for the tool to detect. A stale corpus of the right size is found, the
+run succeeds, and only the recall number is wrong.
 
 ### Charts
 

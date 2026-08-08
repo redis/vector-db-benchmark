@@ -166,6 +166,20 @@ impl PgVectorEngine {
 }
 
 impl Engine for PgVectorEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238). `SELECT count(*) FROM items`; a missing table answers 0.
+    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+        let mut conn = self.connect()?;
+        match conn.query_one("SELECT count(*) FROM items", &[]) {
+            Ok(row) => {
+                let n: i64 = row.get(0);
+                Ok(Some(n.max(0) as u64))
+            }
+            // relation "items" does not exist → nothing to reuse.
+            Err(_) => Ok(Some(0)),
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
