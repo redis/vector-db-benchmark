@@ -506,3 +506,304 @@ mod tests {
         assert!(describe_engines(true).is_ok(), "verbose --describe engines");
     }
 }
+
+/// Guard against the "declared but never read" config bug class (issue #216).
+///
+/// `experiments/configurations/mongodb-single-node.json` shipped a 12-config x
+/// 8-point grid sweeping `collection_params.hnsw_config.{M,EF_CONSTRUCTION}` and
+/// `search_params.ef`. The MongoDB engine read none of them, so all 96 rows were
+/// the same measurement of one default index, published as a tradeoff curve.
+///
+/// Nothing caught it because both knobs *parse* perfectly: `hnsw_config` is
+/// absorbed by the typed [`CollectionParams::hnsw_config`] field and `ef` by
+/// [`InnerSearchParams::ef`], then silently dropped. `#[serde(deny_unknown_fields)]`
+/// cannot catch this — serde applies it through `#[serde(flatten)]` too, which
+/// would break the `extra` passthrough every engine depends on.
+///
+/// So instead of validating *parsing*, this guard validates *consumption*: for
+/// every entry in every shipped config, each declared knob must appear as a real
+/// token in the source of the engine that entry targets. It is a source-level
+/// check on purpose — it is the only thing that distinguishes "the engine reads
+/// this" from "serde accepted this and threw it away".
+///
+/// LOAD-BEARING: this walks the RAW JSON keys, never the typed structs and never
+/// [`CollectionParams::extra`]. Do not "simplify" it to inspect `extra` — the
+/// knobs behind issue #216 are *declared* fields, so serde consumes them into
+/// [`CollectionParams`]/[`InnerSearchParams`] and they never reach the flattened
+/// catch-all. An `extra`-based check reports MongoDB clean and misses all 96
+/// rows. Typed-but-unread is the more dangerous half of this bug class, because
+/// the key looks declared and parses without complaint.
+#[cfg(test)]
+mod shipped_config_knob_guard {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Engine name (as dispatched in `engine::create_engine`) -> the source
+    /// files that make up its read path.
+    const ENGINE_SOURCES: &[(&str, &[&str])] = &[
+        ("redis", &["redis.rs", "redis_utils.rs"]),
+        ("vectorsets", &["vectorsets.rs"]),
+        ("elasticsearch", &["elasticsearch.rs"]),
+        ("opensearch", &["opensearch.rs"]),
+        ("qdrant", &["qdrant.rs"]),
+        ("weaviate", &["weaviate.rs", "weaviate_grpc.rs"]),
+        ("pgvector", &["pgvector.rs"]),
+        ("milvus", &["milvus.rs"]),
+        ("mongodb", &["mongodb_engine.rs"]),
+        ("valkey", &["valkey.rs"]),
+        ("turbopuffer", &["turbopuffer.rs"]),
+        ("dragonfly", &["dragonfly.rs"]),
+        ("kividb", &["kividb.rs"]),
+        ("vertex", &["vertex.rs", "vertex_grpc.rs"]),
+        ("chroma", &["chroma.rs"]),
+    ];
+
+    /// Top-level `search_params[]` knobs consumed by the runner
+    /// (`experiment.rs`) rather than by any engine, so they are legitimately
+    /// absent from engine sources.
+    ///
+    /// Deliberately a fixed list of NAMES, not a grep of `experiment.rs`:
+    /// `experiment.rs` contains the literal `"ef"` for calibration, so grepping
+    /// it would have re-hidden exactly the `search_params.ef` bug this guard
+    /// exists to catch.
+    const FRAMEWORK_SEARCH_KNOBS: &[&str] = &[
+        "parallel",
+        "top",
+        "target_qps",
+        "duration_seconds",
+        "max_lateness_ms",
+        "calibration_param",
+        "calibration_precision",
+        // The inner `search_params` object itself is a container, not a knob.
+        "search_params",
+    ];
+
+    /// Resolve serde aliases to the field name the Rust source actually spells.
+    /// A config may say `EF_CONSTRUCTION`, `ef_construct` or `ef_construction`;
+    /// engines read `.ef_construction`.
+    fn canonical(leaf: &str) -> &str {
+        match leaf {
+            "M" => "m",
+            "EF_CONSTRUCTION" | "ef_construct" => "ef_construction",
+            other => other,
+        }
+    }
+
+    /// Whole-token search: `ef` must not be satisfied by `ef_construction`.
+    fn contains_token(haystack: &str, token: &str) -> bool {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let bytes = haystack.as_bytes();
+        let mut from = 0usize;
+        while let Some(pos) = haystack[from..].find(token) {
+            let start = from + pos;
+            let end = start + token.len();
+            let before_ok = start == 0 || !is_word(bytes[start - 1] as char);
+            let after_ok = end >= bytes.len() || !is_word(bytes[end] as char);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    }
+
+    /// Flatten a JSON object into dotted knob paths, recording each leaf.
+    fn collect_knobs(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        if let Some(obj) = value.as_object() {
+            for (key, child) in obj {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                out.insert(path.clone());
+                collect_knobs(child, &path, out);
+            }
+        }
+    }
+
+    fn engine_source(engine: &str) -> Option<String> {
+        let files = ENGINE_SOURCES
+            .iter()
+            .find(|(name, _)| *name == engine)
+            .map(|(_, files)| *files)?;
+        let dir = repo_root().join("src/bin/vector_db_benchmark/engine");
+        let mut blob = String::new();
+        for file in files {
+            blob.push_str(&std::fs::read_to_string(dir.join(file)).unwrap_or_default());
+            blob.push('\n');
+        }
+        Some(blob)
+    }
+
+    /// Is `knob_path` (dotted) satisfied by the engine's source?
+    ///
+    /// A leaf of one or two characters (`m`, `ef`) is unsearchable on its own —
+    /// short identifiers occur everywhere in Rust. For those the *parent*
+    /// container token carries the signal: reading `hnsw_config` at all is what
+    /// proves `hnsw_config.M` reaches the server. A short knob whose parent is
+    /// itself a bare container (`search_params.search_params.ef`) still has to be
+    /// found verbatim, which is what catches issue #216.
+    fn knob_is_read(source: &str, knob_path: &str) -> bool {
+        let parts: Vec<&str> = knob_path.split('.').collect();
+        let leaf = canonical(parts[parts.len() - 1]);
+        if leaf.len() > 2 {
+            return contains_token(source, leaf);
+        }
+        if parts.len() < 2 {
+            return contains_token(source, leaf);
+        }
+        let parent = parts[parts.len() - 2];
+        // `search_params` is the generic container every engine mentions; it
+        // carries no evidence that this particular knob is honoured.
+        if parent == "search_params" {
+            return contains_token(source, leaf);
+        }
+        contains_token(source, parent)
+    }
+
+    /// Every knob declared by a shipped config must be read by its engine.
+    #[test]
+    fn every_shipped_config_knob_is_read_by_its_engine() {
+        let dir = repo_root().join("experiments/configurations");
+        let mut violations: Vec<String> = Vec::new();
+        let mut checked_entries = 0usize;
+
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("configurations dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no shipped configs found in {:?}", dir);
+
+        for path in files {
+            let content = std::fs::read_to_string(&path).expect("read config");
+            let entries: Vec<serde_json::Value> = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue, // not an engine-config array
+            };
+            let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+
+            for entry in entries {
+                let engine = match entry.get("engine").and_then(|v| v.as_str()) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let source = match engine_source(engine) {
+                    Some(s) => s,
+                    None => {
+                        violations.push(format!(
+                            "{} [{}]: unknown engine '{}' - add it to ENGINE_SOURCES",
+                            file_name, name, engine
+                        ));
+                        continue;
+                    }
+                };
+                checked_entries += 1;
+
+                let mut knobs = BTreeSet::new();
+                if let Some(cp) = entry.get("collection_params") {
+                    collect_knobs(cp, "collection_params", &mut knobs);
+                }
+                if let Some(up) = entry.get("upload_params") {
+                    collect_knobs(up, "upload_params", &mut knobs);
+                }
+                if let Some(list) = entry.get("search_params").and_then(|v| v.as_array()) {
+                    for sp in list {
+                        collect_knobs(sp, "search_params", &mut knobs);
+                    }
+                }
+
+                for knob in knobs {
+                    let leaf = knob.rsplit('.').next().unwrap();
+                    // Runner-level knobs live directly under a search_params entry.
+                    if knob.starts_with("search_params.")
+                        && knob.matches('.').count() == 1
+                        && FRAMEWORK_SEARCH_KNOBS.contains(&leaf)
+                    {
+                        continue;
+                    }
+                    if knob_is_read(&source, &knob) {
+                        continue;
+                    }
+                    violations.push(format!(
+                        "{} [{}] targets engine '{}' but declares '{}', which no \
+                         source file of that engine ever reads - it parses and is \
+                         then silently discarded, so every run of this config \
+                         measures the engine default (see issue #216)",
+                        file_name, name, engine, knob
+                    ));
+                }
+            }
+        }
+
+        assert!(checked_entries > 0, "guard checked no config entries");
+        assert!(
+            violations.is_empty(),
+            "shipped configs declare {} knob(s) their engine never reads:\n  - {}",
+            violations.len(),
+            violations.join("\n  - ")
+        );
+    }
+
+    /// The guard must actually fire. Without this, a bug in `contains_token` or
+    /// `knob_is_read` would turn the test above into a permanent green light —
+    /// the same silence that let issue #216 survive.
+    #[test]
+    fn guard_detects_a_knob_the_engine_does_not_read() {
+        // Exercised against synthetic sources, not a real engine file: a guard
+        // whose self-test depends on a 2-letter token being absent from a
+        // 1800-line file would break the first time someone names a local `ef`.
+        let reads_nothing = "fn search() { let num_candidates = 10; }";
+        assert!(
+            !knob_is_read(reads_nothing, "search_params.search_params.ef"),
+            "a source that never mentions `ef` must not satisfy the ef knob — \
+             this is the exact shape of issue #216"
+        );
+        assert!(knob_is_read(
+            "let ef = params.ef.unwrap_or(64);",
+            "search_params.search_params.ef"
+        ));
+
+        // A short leaf under a distinctive typed parent is proven by the parent.
+        assert!(
+            !knob_is_read(reads_nothing, "collection_params.hnsw_config.M"),
+            "no hnsw_config in source means M cannot reach the server"
+        );
+        assert!(knob_is_read(
+            "cp.hnsw_config.as_ref()",
+            "collection_params.hnsw_config.M"
+        ));
+
+        // Whole-token matching: `ef` must not be satisfied by `ef_construction`.
+        assert!(
+            !contains_token("ef_construction", "ef"),
+            "token match must respect word boundaries"
+        );
+        assert!(contains_token("let ef = 1;", "ef"));
+        assert!(!contains_token("prefix_m_suffix", "m"));
+
+        // Finally, tie it to the real engine: the knobs wired for issue #216
+        // must be visible in the MongoDB read path.
+        let mongodb = engine_source("mongodb").expect("mongodb source");
+        assert!(
+            knob_is_read(&mongodb, "collection_params.hnsw_config.M"),
+            "hnsw_config must reach the MongoDB index definition"
+        );
+        assert!(
+            knob_is_read(&mongodb, "collection_params.hnsw_config.EF_CONSTRUCTION"),
+            "EF_CONSTRUCTION must reach the MongoDB index definition"
+        );
+        assert!(
+            contains_token(&mongodb, "hnswOptions"),
+            "MongoDB spells the HNSW build knobs `hnswOptions`, not m/efConstruction"
+        );
+    }
+}

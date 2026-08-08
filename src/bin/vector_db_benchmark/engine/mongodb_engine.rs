@@ -29,6 +29,11 @@ struct MongoConfig {
     parallel: usize,
     num_candidates_factor: i64,
     skip_vector_index: bool,
+    /// `collection_params.hnsw_config.M` -> `hnswOptions.maxEdges`.
+    hnsw_m: Option<i64>,
+    /// `collection_params.hnsw_config.EF_CONSTRUCTION` ->
+    /// `hnswOptions.numEdgeCandidates`.
+    hnsw_ef_construction: Option<i64>,
 }
 
 pub struct MongoDBEngine {
@@ -84,6 +89,17 @@ impl MongoDBEngine {
             .and_then(|v| v.as_i64())
             .unwrap_or(10);
 
+        // HNSW graph-construction knobs come from the TYPED
+        // collection_params.hnsw_config field (serde captures "M"/"m" and
+        // "EF_CONSTRUCTION"/"ef_construct"/"ef_construction" there via aliases,
+        // so they never land in the flattened `extra` map).
+        let typed_hnsw = engine_config
+            .collection_params
+            .as_ref()
+            .and_then(|cp| cp.hnsw_config.as_ref());
+        let hnsw_m = typed_hnsw.and_then(|h| h.m);
+        let hnsw_ef_construction = typed_hnsw.and_then(|h| h.ef_construction);
+
         let uri = build_uri(host, port);
 
         let client = Client::with_uri_str(&uri)
@@ -99,6 +115,8 @@ impl MongoDBEngine {
                 parallel,
                 num_candidates_factor,
                 skip_vector_index: engine_config.skip_vector_index,
+                hnsw_m,
+                hnsw_ef_construction,
             },
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             uri,
@@ -400,12 +418,24 @@ impl MongoDBEngine {
         };
 
         // Build vector search index definition
-        let mut fields = vec![doc! {
+        let mut vector_field = doc! {
             "type": "vector",
             "path": "vector",
             "numDimensions": vector_size as i32,
             "similarity": similarity,
-        }];
+        };
+
+        // Forward the HNSW graph-construction knobs. Atlas spells them
+        // `hnswOptions.{maxEdges,numEdgeCandidates}` — NOT `m`/`efConstruction`,
+        // which the server rejects outright as unrecognized fields. See
+        // `build_hnsw_options` for the config mapping.
+        if let Some(hnsw_options) =
+            build_hnsw_options(self.config.hnsw_m, self.config.hnsw_ef_construction)
+        {
+            vector_field.insert("hnswOptions", hnsw_options);
+        }
+
+        let mut fields = vec![vector_field];
 
         // Add filter fields from dataset schema
         if let Some(schema) = &dataset.config.schema {
@@ -690,6 +720,39 @@ impl MongoDBEngine {
         }
         Ok(())
     }
+}
+
+/// Translate the benchmark's engine-neutral `collection_params.hnsw_config`
+/// into the `hnswOptions` sub-document MongoDB Vector Search accepts inside a
+/// `vectorSearch` index field.
+///
+/// Name mapping (verified live against `mongodb/mongodb-atlas-local:8.0.17`):
+///
+/// | benchmark key     | MongoDB key                    | server-enforced bounds |
+/// |-------------------|--------------------------------|------------------------|
+/// | `M`               | `hnswOptions.maxEdges`         | `[16..64]`             |
+/// | `EF_CONSTRUCTION` | `hnswOptions.numEdgeCandidates`| `[100..3200]`          |
+///
+/// Values are forwarded verbatim — deliberately NOT clamped. The server
+/// validates them and fails index creation loudly with
+/// `"...hnswOptions.maxEdges" must be within bounds [16..64]`; clamping here
+/// would silently benchmark a different index than the config asked for, which
+/// is the exact failure mode this function was added to end (issue #216).
+///
+/// Returns `None` when neither knob is configured, so the index definition
+/// stays byte-identical to the pre-existing default-HNSW body.
+fn build_hnsw_options(m: Option<i64>, ef_construction: Option<i64>) -> Option<Document> {
+    if m.is_none() && ef_construction.is_none() {
+        return None;
+    }
+    let mut opts = Document::new();
+    if let Some(m) = m {
+        opts.insert("maxEdges", m as i32);
+    }
+    if let Some(ef_construction) = ef_construction {
+        opts.insert("numEdgeCandidates", ef_construction as i32);
+    }
+    Some(opts)
 }
 
 fn build_uri(host: &str, port: u16) -> String {
@@ -1705,6 +1768,46 @@ impl Engine for MongoDBEngine {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Issue #216: `hnsw_config` must be translated into the names MongoDB
+    /// accepts, not the HNSW-generic `m`/`efConstruction` (which the server
+    /// rejects: `unrecognized fields ["m", "efConstruction"]`).
+    #[test]
+    fn build_hnsw_options_uses_mongodb_field_names() {
+        let opts = build_hnsw_options(Some(32), Some(200)).expect("options built");
+        assert_eq!(opts.get_i32("maxEdges").unwrap(), 32);
+        assert_eq!(opts.get_i32("numEdgeCandidates").unwrap(), 200);
+        assert!(
+            !opts.contains_key("m") && !opts.contains_key("efConstruction"),
+            "MongoDB rejects m/efConstruction outright: {:?}",
+            opts
+        );
+    }
+
+    /// Each knob is independently optional, and an unconfigured `hnsw_config`
+    /// must leave the index body exactly as it was before this feature.
+    #[test]
+    fn build_hnsw_options_omits_unset_knobs() {
+        assert!(build_hnsw_options(None, None).is_none());
+
+        let only_m = build_hnsw_options(Some(64), None).unwrap();
+        assert_eq!(only_m.get_i32("maxEdges").unwrap(), 64);
+        assert!(!only_m.contains_key("numEdgeCandidates"));
+
+        let only_efc = build_hnsw_options(None, Some(512)).unwrap();
+        assert_eq!(only_efc.get_i32("numEdgeCandidates").unwrap(), 512);
+        assert!(!only_efc.contains_key("maxEdges"));
+    }
+
+    /// Out-of-range values are forwarded unchanged so the server can reject
+    /// them. Clamping would silently benchmark an index the config never asked
+    /// for — the failure mode of issue #216.
+    #[test]
+    fn build_hnsw_options_does_not_clamp_out_of_range_values() {
+        let opts = build_hnsw_options(Some(9999), Some(1)).unwrap();
+        assert_eq!(opts.get_i32("maxEdges").unwrap(), 9999);
+        assert_eq!(opts.get_i32("numEdgeCandidates").unwrap(), 1);
+    }
 
     // Load-bearing: the hoisted (out-of-timed-window) pipeline builder must
     // produce a pipeline byte-identical to the one the previous inline build
