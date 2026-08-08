@@ -128,6 +128,20 @@ pub fn export_chart(args: &Args) -> Result<(), String> {
 /// Extract (precision, qps) points from a summary's `precision_summary` map,
 /// falling back to `search_results` if that's absent.
 fn parse_points(json: &Value) -> Vec<Point> {
+    // A summary without `metrics_schema_version` predates the #217 rename — or was
+    // written by upstream qdrant/vector-db-benchmark, whose `precision_summary`
+    // keys and `mean_precisions` values are recall@top rather than our
+    // precision-at-returned. The two shapes are indistinguishable, so the X axis
+    // cannot be honestly labelled for such a file; say so instead of charting it
+    // silently under our label.
+    if json.get("metrics_schema_version").is_none() {
+        eprintln!(
+            "WARNING: summary has no `metrics_schema_version` — its precision values are either \
+             ours from before the #217 rename (precision = hits / results returned) or upstream's \
+             (recall@top = hits / top). They are plotted on the same axis; re-run the benchmark to \
+             get an unambiguous summary."
+        );
+    }
     if let Some(map) = json.get("precision_summary").and_then(|v| v.as_object()) {
         let mut pts: Vec<Point> = map
             .iter()
@@ -343,6 +357,7 @@ mod tests {
     #[test]
     fn parse_points_falls_back_to_search_results() {
         let json = serde_json::json!({
+            "metrics_schema_version": 2,
             "search_results": [
                 {"mean_precision_at_returned": 0.8, "rps": 100.0},
                 {"mean_precision_at_returned": 0.95, "rps": 60.0}

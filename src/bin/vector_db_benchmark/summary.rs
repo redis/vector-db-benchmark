@@ -20,6 +20,10 @@ pub struct SearchEntry {
     pub ef: String,
     pub parallel: i64,
     pub results: SearchResults,
+    /// Calibration outcome for this config, when it was calibrated. Carried into
+    /// the summary so a run whose target was never reached is visible in the
+    /// artifact a human reads, not only in a stderr line that scrolled away.
+    pub calibration: Option<serde_json::Value>,
 }
 
 /// Precision analysis result for a single precision bucket.
@@ -516,6 +520,7 @@ pub fn save_summary(
                 "oversubscribed": e.results.oversubscribed,
                 "available_cores": e.results.available_cores,
                 "client_cpu_cores_used": e.results.client_cpu_cores_used,
+                "calibration": e.calibration,
             })
         })
         .collect();
@@ -544,12 +549,49 @@ pub fn save_summary(
         })
         .collect();
 
+    // Configs whose calibration never reached its target. A sweep with a target
+    // the dataset makes unreachable exits 0 and the stderr warning has long
+    // scrolled away by then, so the artifact itself has to carry it (#217).
+    let uncalibrated: Vec<serde_json::Value> = entries
+        .iter()
+        .filter_map(|e| {
+            let cal = e.calibration.as_ref()?;
+            if cal.get("reached_target").and_then(|v| v.as_bool()) == Some(false) {
+                Some(json!({
+                    "search_id": e.search_id,
+                    "param": cal.get("param"),
+                    "value": cal.get("value"),
+                    "target": cal.get("target"),
+                    "achieved": cal.get("achieved"),
+                    "note": cal.get("note"),
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let mut summary = json!({
         "engine": engine_name,
         "dataset": dataset_name,
+        // Which definitions the quality fields in this file use (#217). Version 2
+        // renamed our `mean_precisions` — the key upstream qdrant/vector-db-benchmark
+        // uses for recall@top — to `mean_precision_at_returned`. A summary WITHOUT
+        // this marker is either one of ours from before the rename (its
+        // `mean_precisions` / `precision_summary` keys are precision-at-returned) or
+        // an upstream file (they are recall@top); the two cannot be told apart, so
+        // they must not be charted on one axis.
+        "metrics_schema_version": 2,
+        "metrics_definitions": {
+            "mean_precision_at_returned": "hits / |deduped results kept (<= top)|",
+            "mean_recall": "hits / |valid, deduped ground-truth ids in expected[:top]|",
+            "precision_summary": "keyed by mean_precision_at_returned buckets",
+            "upstream_qdrant_mean_precisions": "len(ids & expected[:top]) / top — never emitted under that key here",
+        },
         "search_results": search_results,
         "precision_summary": precision_summary,
         "concurrency_curve": concurrency_curve,
+        "uncalibrated_configs": uncalibrated,
     });
 
     if let Some(upload) = upload_json {
@@ -652,6 +694,60 @@ fn create_ascii_scatter_plot(engine_name: &str, dataset_name: &str, buckets: &[P
 mod tests {
     use super::*;
 
+    /// The summary is what `--chart` and external dashboards read, so the #217
+    /// definitions have to travel with it too: no upstream key name, an explicit
+    /// schema version, and any calibration that never reached its target.
+    #[test]
+    fn summary_carries_schema_version_and_unreached_calibrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut calibrated = prec_entry(0.24, 100.0, false);
+        calibrated.search_id = 3;
+        calibrated.calibration = Some(json!({
+            "param": "ef", "value": 1000, "target": 0.95, "achieved": 0.24,
+            "reached_target": false, "ground_truth_ceiling": 0.2334,
+            "note": "target precision 0.9500 is above the ceiling this dataset allows",
+        }));
+        let plain = prec_entry(0.90, 500.0, false);
+
+        save_summary(
+            "redis-test",
+            "h-and-m",
+            &[calibrated, plain],
+            None,
+            dir.path(),
+        )
+        .unwrap();
+        let raw = fs::read_to_string(dir.path().join("redis-test-h-and-m-summary.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(v["metrics_schema_version"], 2);
+        assert!(!raw.contains("\"mean_precisions\""), "{}", raw);
+        assert!(v["search_results"][0]["mean_precision_at_returned"].is_number());
+
+        let un = v["uncalibrated_configs"].as_array().unwrap();
+        assert_eq!(un.len(), 1, "only the unreached target is listed");
+        assert_eq!(un[0]["search_id"], 3);
+        assert_eq!(un[0]["target"], 0.95);
+    }
+
+    #[test]
+    fn summary_without_calibration_lists_no_uncalibrated_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        save_summary(
+            "redis-test",
+            "glove",
+            &[prec_entry(0.99, 100.0, false)],
+            None,
+            dir.path(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("redis-test-glove-summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(v["uncalibrated_configs"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn test_format_precision_key_low() {
         assert_eq!(format_precision_key(0.50), "0.50");
@@ -685,6 +781,7 @@ mod tests {
                 saturation_reason: sat_reason.to_string(),
                 ..Default::default()
             },
+            calibration: None,
         }
     }
 
@@ -776,6 +873,7 @@ mod tests {
                     p95_time: 0.02,
                     ..Default::default()
                 },
+                calibration: None,
             },
             SearchEntry {
                 search_id: 1,
@@ -788,6 +886,7 @@ mod tests {
                     p95_time: 0.025,
                     ..Default::default()
                 },
+                calibration: None,
             },
         ];
         let buckets = analyze_precision_performance(&entries);
@@ -809,6 +908,7 @@ mod tests {
                 client_saturated: saturated,
                 ..Default::default()
             },
+            calibration: None,
         }
     }
 

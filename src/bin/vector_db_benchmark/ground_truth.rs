@@ -132,7 +132,9 @@ impl GroundTruthStats {
     /// the ceiling, so this is reported as a warning rather than treated as a
     /// hard failure.
     pub fn unreachable_target_note(&self, target: f64) -> Option<String> {
-        if !target.is_finite() || target <= self.recall_at_top_ceiling + 1e-9 {
+        // NaN compares false against everything, so it is excluded explicitly;
+        // +inf is a legitimately unreachable target and must still be flagged.
+        if target.is_nan() || target <= self.recall_at_top_ceiling + 1e-9 {
             return None;
         }
         Some(format!(
@@ -158,8 +160,17 @@ impl GroundTruthStats {
     }
 
     /// Whether our `mean_recall` is numerically the same quantity as upstream's
-    /// `mean_precisions` for this dataset/`top` — true exactly when every row is
-    /// at least `top` wide, so both denominators equal `top`.
+    /// `mean_precisions` for this dataset/`top`: true when every row is at least
+    /// `top` wide, so both denominators equal `top`.
+    ///
+    /// This assumes the two normal shapes — sentinel padding only ever trails the
+    /// real ids, and the engine returns no more than `top` results. Two
+    /// pathological shapes can still separate the numbers even at full width: a
+    /// sentinel *interleaved* among real ids (upstream slices the raw row at
+    /// `top` and keeps the sentinel, we filter first and reach one id further),
+    /// and an engine returning MORE than `top` results (we truncate at `top`,
+    /// upstream intersects everything it got). Neither occurs in the shipped
+    /// datasets or engines.
     pub fn recall_matches_upstream(&self) -> bool {
         self.queries_below_top == 0
     }
@@ -256,9 +267,13 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_target_is_not_reported_unreachable() {
+    fn nan_target_is_not_reported_unreachable_but_infinity_is() {
         let p = GroundTruthProfile::from_rows(rows(2, 10));
         let s = p.stats(10).unwrap();
         assert!(s.unreachable_target_note(f64::NAN).is_none());
+        assert!(
+            s.unreachable_target_note(f64::INFINITY).is_some(),
+            "+inf is unreachable even against a ceiling of 1.0"
+        );
     }
 }

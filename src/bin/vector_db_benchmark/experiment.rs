@@ -500,23 +500,29 @@ fn run_single_experiment(
     // (a) whether our recall is the same quantity upstream calls `mean_precisions`
     // — reported in every result file — and (b) whether a calibration target is
     // reachable at all on this dataset (#217). Best-effort: a dataset whose query
-    // file cannot be profiled simply omits the block. Filter-only runs have no
-    // ground truth to speak of.
-    let ground_truth: Option<crate::ground_truth::GroundTruthProfile> = if args.skip_vector_index {
-        None
-    } else {
-        match crate::ground_truth::GroundTruthProfile::load(dataset) {
-            Ok(gt) => Some(gt),
-            Err(e) => {
-                eprintln!(
+    // file cannot be profiled simply omits the block.
+    //
+    // Skipped when nothing will consume it. `--skip-search` writes no search
+    // results and runs no calibration, and filter-only runs have no ground truth
+    // to speak of — reading the query file anyway costs a full parse of every
+    // query vector just to drop it (~22 s warm / ~137 s cold per config on the
+    // compound h-and-m dataset, paid once per config in a sweep).
+    let ground_truth: Option<crate::ground_truth::GroundTruthProfile> =
+        if args.skip_vector_index || args.skip_search {
+            None
+        } else {
+            match crate::ground_truth::GroundTruthProfile::load(dataset) {
+                Ok(gt) => Some(gt),
+                Err(e) => {
+                    eprintln!(
                     "\tNote: could not profile ground-truth widths ({}); result files will omit \
                      metrics_schema.ground_truth",
                     e
                 );
-                None
+                    None
+                }
             }
-        }
-    };
+        };
     // Configs that lost queries, collected so --fail-on-dropped-queries can fail
     // the run *after* every result file is written rather than instead of it.
     let mut dropped_query_failures: Vec<String> = Vec::new();
@@ -925,6 +931,7 @@ fn run_single_experiment(
                             ef: effective_ef.clone(),
                             parallel,
                             results,
+                            calibration: calibration_json.clone(),
                         });
                     }
                     None => {
@@ -987,6 +994,45 @@ fn run_single_experiment(
             dropped_query_failures.len(),
             dropped_query_failures.join("; ")
         ));
+    }
+
+    // Repeat any unreached calibration target at the END of the run. The warning
+    // the sweep printed up front is ~10 iterations of progress output away by now,
+    // and a sweep that "calibrated" against an unreachable target otherwise exits 0
+    // with nothing on screen to say the `ef` it settled on is meaningless (#217).
+    let uncalibrated: Vec<&SearchEntry> = search_entries
+        .iter()
+        .filter(|e| {
+            e.calibration
+                .as_ref()
+                .and_then(|c| c.get("reached_target"))
+                .and_then(|v| v.as_bool())
+                == Some(false)
+        })
+        .collect();
+    if !uncalibrated.is_empty() {
+        eprintln!(
+            "\n⚠ WARNING: {} search config(s) did NOT reach their calibration target; the swept \
+             parameter for those points is the closest value found, not a calibrated one. See \
+             `uncalibrated_configs` in the summary JSON.",
+            uncalibrated.len()
+        );
+        for e in &uncalibrated {
+            if let Some(cal) = &e.calibration {
+                eprintln!(
+                    "\t  search #{}: {}={} → {:.4} (target {:.4})",
+                    e.search_id,
+                    cal.get("param").and_then(|v| v.as_str()).unwrap_or("?"),
+                    cal.get("value").and_then(|v| v.as_i64()).unwrap_or(-1),
+                    cal.get("achieved")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(f64::NAN),
+                    cal.get("target")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(f64::NAN),
+                );
+            }
+        }
     }
 
     // Display precision summary and save summary JSON
@@ -1276,6 +1322,10 @@ fn metrics_schema(gt: Option<&crate::ground_truth::GroundTruthStats>) -> serde_j
              row has at least `top` valid ids (see `ground_truth` below), and it equals our \
              `mean_precision_at_returned` only when the engine returns a full page of `top` \
              results.",
+        // Names the field in THIS file that IS upstream's `mean_precisions`
+        // number, or null when no field is. Not "similar to": when this says
+        // `mean_recall`, our mean_recall and upstream's mean_precisions are the
+        // same quantity computed the same way, and may be overlaid directly.
         "comparable_to_upstream_mean_precisions": comparable,
     });
     if let Some(stats) = gt {
