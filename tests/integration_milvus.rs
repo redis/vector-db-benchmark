@@ -165,7 +165,10 @@ fn read_back_indexes(collection: &str) -> std::collections::HashMap<String, Inde
 /// The scalar `indexType` the engine must create for a dataset schema type —
 /// the test's INDEPENDENT copy of `milvus_field_kind`'s decision, so a silent
 /// change to the engine's mapping fails here rather than passing by circularity.
-/// `None` = the type is not materialised as a column (only `geo`, issue #223).
+/// `None` = "not part of the every-field-is-indexed sweep": either the type is
+/// not materialised as a column at all, or it is a column that must stay
+/// UNINDEXED (`geo` — asserted separately by
+/// `assert_geo_column_present_and_unindexed`).
 fn expected_index_type(field_name: &str, schema_type: &str) -> Option<&'static str> {
     // `geo` is a native `Geometry` column since #223, but deliberately UNINDEXED:
     // Milvus' only Geometry index (RTREE) prunes with a box smaller than the cap
@@ -297,12 +300,16 @@ fn assert_all_schema_fields_indexed(collection: &str, schema: &serde_json::Value
 /// The geo counterpart of [`assert_all_schema_fields_indexed`]: the `Geometry`
 /// column must EXIST and must have NO scalar index (issue #223).
 ///
-/// Both halves matter. "No index" alone is also what you get when the column was
-/// never created — which is precisely what master did with a `geo` schema type —
-/// so the column is confirmed present via `collections/describe` first. Then the
-/// absence of the index is asserted, so re-adding the `RTREE` (which silently
-/// drops in-cap documents) fails here rather than only showing up as a recall
-/// dip on the edge fixture.
+/// Both halves matter, though not equally. "No index" alone is also what you get
+/// when the column was never created, so the column is confirmed present via
+/// `collections/describe` first — but master's actual regression (no geo column
+/// at all) never reaches this function: the run dies at INSERT with `has pass
+/// more field without dynamic schema` and the test fails earlier, at `milvus geo
+/// run failed`. The describe check is therefore defence-in-depth for a
+/// dynamic-schema variant, not the live guard for that regression. The
+/// index-absence assertion below IS the live guard: it fails the moment an RTREE
+/// exists, which no recall assertion here reliably does (see
+/// `test_binary_milvus_geo_edges`).
 fn assert_geo_column_present_and_unindexed(collection: &str, field: &str) {
     let client = http_client();
     let resp = client
@@ -1059,13 +1066,15 @@ fn test_binary_milvus_match_any_labels() {
 /// Geo-radius end-to-end (issue #223).
 ///
 /// Before this, `geo` hit `milvus_field_kind`'s `_ => return None`, so no column
-/// was materialised at all, `build_milvus_filter` returned `None` for the geo
-/// leaf, and the query ran with NO `filter` while being scored against
-/// geo-filtered ground truth. Since #251 the same input is a hard error, so the
-/// shipped `random-geo-radius-*-angular-filters` were unrunnable on Milvus.
+/// was materialised at all — and because upload still emitted the key against a
+/// collection with `enableDynamicField: false`, the run died at INSERT
+/// (`has pass more field without dynamic schema`) rather than searching
+/// unfiltered. Either way the shipped `random-geo-radius-*-angular-filters` were
+/// unrunnable on Milvus.
 ///
-/// Now the point is a `Geometry` column holding OGC WKT `POINT(lon lat)` with an
-/// `RTREE` index, filtered by `ST_DWITHIN(field, 'POINT(lon lat)', metres)` —
+/// Now the point is a `Geometry` column holding OGC WKT `POINT(lon lat)`,
+/// deliberately UNINDEXED (see `milvus_field_kind`), filtered by
+/// `ST_DWITHIN(field, 'POINT(lon lat)', metres)` —
 /// which for a POINT column against a POINT query is an exact great-circle
 /// haversine test in the server (v2.6.19 `common/Geometry.h::dwithin`, R =
 /// 6 371 000 m, the same radius the fixture's ground truth uses).
@@ -1143,20 +1152,25 @@ fn test_binary_milvus_geo() {
 /// (0, 179.9) r = 200 km returned **4 of 8** with the index (every document
 /// across +180 was pruned) and 8 of 8 without.
 ///
-/// WHICH ASSERTION ACTUALLY CATCHES IT — measured, not assumed. Re-adding the
-/// RTREE and re-running this test was tried, and **recall stayed 1.000**: with
-/// 400 documents and random vectors the ~6 pruned documents are rarely among a
-/// query's top-10 nearest, so a defect that costs 6.4 % of the ground truth at
-/// 1M scale is invisible in this fixture's recall. What fires is
-/// [`assert_geo_column_present_and_unindexed`], which fails the moment the index
-/// exists — verified by re-adding it (`'location' must stay UNINDEXED`). The
-/// fixture's own value is the per-query recall FLOOR on the two hardest shapes
-/// (a coarser regression, e.g. dropping the antimeridian half entirely, does
-/// move it) plus the checked-in geometry itself.
+/// WHICH ASSERTION ACTUALLY CATCHES IT — measured, not assumed. On this exact
+/// fixture the prune is severe: identical rows in two collections differing only
+/// by the index, queried with the engine's own emitted filter, give
+/// **76 of 150** in-cap documents for q0 and **112 of 150** for q1. Several of
+/// each query's ground-truth top-10 sit in the pruned set, so recall would
+/// collapse well under the 0.9 floor.
 ///
-/// So: the behavioural guard here is the index assertion, and the recall
-/// assertion is a backstop. Stated plainly because the corner fixture's own
-/// comment used to overclaim in the same way.
+/// Yet re-adding the RTREE and re-running this test still scored **1.000**, and
+/// the reason is INDEX CREATION ORDER, not scale and not the query path:
+/// creating it in `collections/create`'s `indexParams` (before insert) prunes on
+/// BOTH `entities/query` and `entities/search`; creating it via `indexes/create`
+/// after insert + flush — which is what this engine does — does not prune at all
+/// at 400 rows. That is an artifact of ordering at this size, not a guarantee,
+/// so the column stays unindexed rather than relying on it.
+///
+/// The assertion that fires today is therefore
+/// [`assert_geo_column_present_and_unindexed`] (verified by re-adding the index:
+/// `'location' must stay UNINDEXED`), with the per-query recall floor as the
+/// backstop that would catch the prune under any ordering that does apply it.
 #[test]
 fn test_binary_milvus_geo_edges() {
     wait_for_milvus();

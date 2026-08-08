@@ -836,8 +836,8 @@ const GT_EARTH_RADIUS_M: f64 = 6_371_000.0;
 /// Great-circle distance in metres (haversine, R=[`GT_EARTH_RADIUS_M`]). Used to
 /// brute-force geo-radius ground truth. The margin baked into
 /// [`write_geo_project`] keeps every doc clearly inside or outside the radius
-/// despite tiny differences vs each engine's own earth model — measured, its
-/// tightest is **16.6 m** (an earlier comment said ~55 m).
+/// despite tiny differences vs each engine's own earth model; the figure lives
+/// with the layout that sets it, in `write_geo_project`.
 fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const R: f64 = GT_EARTH_RADIUS_M;
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
@@ -868,8 +868,9 @@ pub fn write_geo_project(
 ) -> FilterProject {
     let (lat0, lon0) = (40.0_f64, -74.0_f64);
     let loc = |id: usize| (lat0 + id as f64 * 0.001, lon0);
-    // ~111 m per 0.001 deg latitude; 22 km ≈ the nearest 198 docs, and the
-    // radius falls ~55 m between doc 197 (inside) and doc 198 (outside).
+    // ~111 m per 0.001 deg latitude; 22 km ≈ the nearest 198 docs. Measured, the
+    // radius falls between doc 197 (94.6 m INSIDE) and doc 198 (16.6 m OUTSIDE),
+    // so the tightest margin is 16.6 m — an earlier comment said "~55 m" here.
     let radius = 22_000.0_f64;
     let (q_lat, q_lon) = loc(0);
     write_filter_project(
@@ -912,9 +913,21 @@ pub fn write_geo_project(
 // below the 0.9 floor every filter test in this repo asserts.
 //
 // WHAT IT IS BLIND TO, stated so nobody over-reads it. The guard band is
-// [0.7065, 1.1013] * radius, so ANY radius within [-29.4 %, +10.1 %] selects the
-// identical 100 documents — a wrong radius is a provably equivalent mutant here
-// (measured: x1.101 -> 100 docs, x1.11 -> 104, x1.15 -> 128, x1.40 -> 400).
+// [0.706544, 1.101281) * radius, so a radius anywhere in [-29.35 %, +10.13 %)
+// selects the identical 100 documents — a wrong radius in that band is a
+// provably equivalent mutant here (measured: x1.101 -> 100 docs, x1.11 -> 104,
+// x1.15 -> 128, x1.40 -> 400). The lower bound is tight and must not be rounded
+// outward: at x0.7065 the fixture already selects 98 and at x0.706 it selects
+// 96, so "-29.4 %" would overstate the band.
+//
+// Two more blind spots, both undisclosed until review. (a) A lat/lon SWAP
+// applied to both the storage and the query side selects the identical 100
+// documents — self-consistent, so no recall fixture can see it; the axis order
+// is pinned instead by unit tests on each engine's emitted string AND on
+// milvus' stored WKT (`geo_wkt_point`), and partially by the edge fixture, where
+// a swapped 179.9 is not a valid latitude. (b) All 10 queries share ONE centre
+// and ONE radius, so a hard-coded centre passes here; `write_geo_edge_project`
+// is the fixture that varies the centre.
 // So is `>` vs `>=` (nothing sits within 10 % of the boundary), and so is an
 // equirectangular approximation (~1e-5 relative error at 20 km, deep inside the
 // band). Those are caught by the exact-string unit pins on each engine's emitted
@@ -1082,9 +1095,13 @@ pub fn write_and_filter_project(
 //
 // Milvus has exactly that bug when a `Geometry` column carries an `RTREE`:
 // `create_bounding_box_for_dwithin` divides by `111320.0` m/degree where the
-// truth is 111 194.93, so the prune box is ~0.11 % short in every direction, the
-// longitude half-width underestimates further at high latitude, and it does not
-// wrap the antimeridian at all. Anything inside the cap but outside that box is
+// truth is 111 194.93 (0.112 % high), and it does not wrap the antimeridian at
+// all. The two axes are NOT affected equally, which is why only some bearings
+// prune: modelling the box as lat +- d/111320 and lon +- d/(111320 cos phi), at
+// centre (81, 10) with r = 200 km the in-cap cutoff is x0.998876 on bearings
+// 0/180 (so N/S documents past that are dropped) but x1.0121 on 90/270 (so E/W
+// documents are NOT). At (0, 179.9) the bearing-90 cutoff is exactly x0.5 —
+// every document across +180 is dropped. Anything inside the cap but outside that box is
 // discarded before the exact `ST_DWITHIN` refine ever runs. On the shipped
 // dataset that silently caps recall at ~0.935.
 //
@@ -1093,7 +1110,7 @@ pub fn write_and_filter_project(
 //   * query 0 — centre (81 N, 10 E), the high-latitude case, with in-cap
 //     documents on all four cardinal bearings at 0.9990-0.9997 * radius: inside
 //     the cap, outside a box 0.11 % short;
-//   * query 1 — centre (0 N, 179.9 E), with in-cap documents 30-199 km east and
+//   * query 1 — centre (0 N, 179.9 E), with in-cap documents 30-150 km east and
 //     west, so half of them sit ACROSS the antimeridian at negative longitudes,
 //     which an unwrapped box drops outright.
 //
@@ -1108,13 +1125,31 @@ pub fn write_and_filter_project(
 //
 // Without the index both cases return the full truth.
 //
-// NOTE ON WHAT THIS FIXTURE'S RECALL CAN SEE. Re-adding the RTREE and running
-// the fixture through the harness was tried: recall stayed **1.000**. With 400
-// documents and random vectors the handful of pruned documents are rarely in a
-// query's top-10, so the defect is invisible to recall at this scale even though
-// it costs 6.4 % of the ground truth at 1M. The assertion that actually fires is
-// the index-presence one in `tests/integration_milvus.rs`; this fixture supplies
-// the geometry and a per-query recall floor, not the catch.
+// HOW SEVERE, AND WHY THE HARNESS DOES NOT SEE IT. Measured on this exact
+// 400-document layout, two collections with identical rows differing only by the
+// RTREE, using the engine's own emitted `ST_DWITHIN` filter:
+//
+//   q0 (81 N)        truth 150 -> RTREE returns  76  (49 % of the in-cap set gone)
+//   q1 (antimeridian) truth 150 -> RTREE returns 112  (25 % gone)
+//
+// So the fixture IS a strong discriminator — those are not a handful of
+// documents, and several of each query's ground-truth top-10 are inside the
+// pruned set. It simply never gets the chance, and the reason is INDEX CREATION
+// ORDER, not scale and not the query path:
+//
+//   index in `collections/create`'s `indexParams` (before insert) -> pruned
+//     (q0 76/150, q1 112/150), on BOTH `entities/query` and `entities/search`;
+//   index via `indexes/create` AFTER insert + flush             -> not pruned
+//     (150/150 on both queries, both paths).
+//
+// This engine creates scalar indexes after insert, which is why re-adding the
+// RTREE and running the integration test still scored 1.000. That is an artifact
+// of ordering at this size, not a guarantee — which is exactly why the column is
+// left unindexed rather than relying on it. Two earlier explanations were wrong
+// and are recorded here so they are not re-derived: "the ~6 pruned documents
+// rarely reach the top-10" (the pruned set is 74 and 38 documents, not ~6) and
+// "the vector-search path ignores the prune" (it honours it — see the ordering
+// result above).
 //
 // CALIBRATION WARNING. The query-0 band is only 0.1 % wide, which is NARROWER
 // than the spread between engines' earth radii (pgvector's `earthdistance` uses
@@ -1222,10 +1257,14 @@ pub fn write_geo_edge_project(
             across_antimeridian += 1;
         }
     }
+    // Counts in-cap documents past 0.99888 * radius on ANY bearing. Only the
+    // ~74 on bearings 0/180 are actually outside Milvus' prune box (see the
+    // per-axis cutoffs in the header); this is the superset, so the message says
+    // what it computes rather than what it implies.
     assert!(
         near_boundary >= 20,
-        "fixture must hold documents inside the cap but outside a 0.11 %-short \
-         prune box, got {near_boundary}"
+        "fixture must hold in-cap documents past 0.99888 * radius (the latitude \
+         cutoff of a 0.112 %-high m/degree divisor), got {near_boundary}"
     );
     assert!(
         across_antimeridian >= 20,

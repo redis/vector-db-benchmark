@@ -147,7 +147,7 @@ fn milvus_field_kind(field_name: &str, schema_type: &str) -> Option<MilvusFieldK
         // radius `engine::geo::EARTH_RADIUS_M` uses. Added in Milvus 2.6.4; the
         // pinned test image is v2.6.19.
         //
-        // DELIBERATELY UNINDEXED, which is the one exception to the #218
+        // DELIBERATELY UNINDEXED, the one exception to the #218
         // column-implies-index rule. `RTREE` is the only index type Milvus
         // offers for a Geometry column, and it is not merely a *coarse* filter —
         // it prunes with a box that is SMALLER than the cap it is supposed to
@@ -189,6 +189,26 @@ fn milvus_field_kind(field_name: &str, schema_type: &str) -> Option<MilvusFieldK
         data_type,
         index_type,
     })
+}
+
+/// One stored point as OGC WKT for a `Geometry` column (issue #223).
+///
+/// WKT is `POINT(x y)`, i.e. **longitude first**. The value this replaced was
+/// `"{lat},{lon}"` — the wrong format AND the wrong axis order — and it had no
+/// column to land in, because the `geo` schema type materialised nothing.
+///
+/// Extracted from the insert loop purely so it can be pinned: a lat/lon swap
+/// applied to BOTH the storage and the query side is self-consistent and selects
+/// the identical documents, so no recall fixture can see it. The query side is
+/// pinned by `geo_emits_st_dwithin_with_lon_first_and_metres`; this is the other
+/// half. (The edge fixture is a partial backstop — a swapped 179.9 is not a
+/// valid latitude — but a pin is cheaper and exact.)
+fn geo_wkt_point(lon: f64, lat: f64) -> String {
+    format!(
+        "POINT({} {})",
+        geo::plain_decimal(lon),
+        geo::plain_decimal(lat)
+    )
 }
 
 /// Every `(column, scalar index type)` pair that must exist for this dataset —
@@ -1028,13 +1048,8 @@ fn insert_batch(
                                 .collect(),
                         )
                     }
-                    // A `Geometry` column takes OGC WKT, and WKT is `POINT(x y)`
-                    // with x = LONGITUDE, y = LATITUDE. The previous
-                    // `"{lat},{lon}"` string was both the wrong format and the
-                    // wrong axis order, and had no column to land in — the geo
-                    // schema type materialised nothing (issue #223).
                     MetadataValue::Geo { lon, lat } => {
-                        serde_json::Value::String(format!("POINT({lon} {lat})"))
+                        serde_json::Value::String(geo_wkt_point(*lon, *lat))
                     }
                 };
                 row_obj.insert(k.clone(), val);
@@ -1400,9 +1415,9 @@ fn build_milvus_filter(
         // only clause, the query ran with NO filter against geo-filtered ground
         // truth.
         //
-        // WKT is `POINT(x y)` = `POINT(lon lat)`. `{:?}` renders each `f64` in
-        // its shortest round-tripping form, so the centre the server parses is
-        // bit-identical to the dataset's.
+        // WKT is `POINT(x y)` = `POINT(lon lat)`. Literals go through
+        // `geo::plain_decimal`, the shortest FIXED-POINT form that round-trips,
+        // so the centre the server parses is bit-identical to the dataset's.
         //
         // A missing or non-finite component is a DROP (→ the #219 hard error),
         // never a default radius.
@@ -1415,9 +1430,9 @@ fn build_milvus_filter(
             if !lon.is_finite() || !lat.is_finite() || !radius.is_finite() || radius < 0.0 {
                 return None;
             }
-            // Plain decimals only: `{:?}` switches to exponent form below 1e-4
-            // and a WKT literal like `POINT(-52.5 -1.9e-5)` is not portable
-            // across WKT parsers. See `geo::plain_decimal`.
+            // `{:?}` would switch to exponent form below 1e-4, and a WKT
+            // literal like `POINT(-52.5 -1.9e-5)` is not portable across WKT
+            // parsers. See `geo::plain_decimal`.
             Some(format!(
                 "ST_DWITHIN({field_name}, 'POINT({} {})', {})",
                 geo::plain_decimal(lon),
@@ -1943,6 +1958,29 @@ mod tests {
         );
     }
 
+    /// The INSERT side of the axis order. A lat/lon swap applied to both halves
+    /// is self-consistent — it selects the identical documents — so this cannot
+    /// be caught by any recall fixture; it needs a pin.
+    #[test]
+    fn stored_wkt_is_point_lon_lat_not_lat_lon() {
+        // Deliberately asymmetric and outside latitude range if swapped.
+        assert_eq!(geo_wkt_point(179.9, 40.5), "POINT(179.9 40.5)");
+        assert_eq!(geo_wkt_point(-74.0, 40.0), "POINT(-74.0 40.0)");
+        // Storage and query must agree on the order, which is the only thing
+        // that makes the pair meaningful.
+        let stored = geo_wkt_point(10.0, 20.0);
+        let queried =
+            build_milvus_filter("loc", "geo", &json!({"lat":20.0,"lon":10.0,"radius":500}))
+                .unwrap();
+        assert!(
+            queried.contains(&stored),
+            "stored {stored} vs query {queried}"
+        );
+        // And no exponent form on the insert side either (see geo::plain_decimal).
+        let tiny = geo_wkt_point(-52.545, -0.000019426574824796435);
+        assert!(!tiny.contains('e') && !tiny.contains('E'), "{tiny}");
+    }
+
     /// An incomplete criteria object is a DROP (→ the #219 hard error), not a
     /// default radius: Qdrant/Elasticsearch/Weaviate substitute 1000 m, which
     /// would invent a filter nobody asked for.
@@ -2045,11 +2083,15 @@ mod tests {
 
         for (field, ty) in schema.as_object().unwrap() {
             let kind = milvus_field_kind(field, ty.as_str().unwrap());
-            // The invariant is now "a column is indexed unless its mapping says
-            // it must not be", which is a stronger statement than the original
-            // "a column is indexed": the exception has to be spelled out in
-            // `milvus_field_kind` with its reason, and there is exactly one
-            // (geo — an RTREE there loses true hits, #223).
+            // The invariant moved from `has_column <=> indexed` to
+            // `wants_index <=> indexed`. That is INCOMPARABLE to the old rule,
+            // not stronger: `wants_index -> has_column` strictly, so neither
+            // implies the other, and the state `(column: Some, index: None)`
+            // that was previously unrepresentable is now accepted here. What
+            // stops that becoming a hole is not this assertion but
+            // `only_geo_is_a_deliberately_unindexed_column` below, which pins
+            // the exception SET to exactly {geo} — a newly added type that
+            // forgot its index would otherwise pass silently.
             let wants_index = kind.and_then(|k| k.index_type).is_some();
             assert_eq!(
                 wants_index,
@@ -2067,6 +2109,39 @@ mod tests {
         // it must be absent from the plan; an unknown type gets neither.
         assert!(!indexed.contains("loc"));
         assert!(!indexed.contains("weird"));
+    }
+
+    /// The exception set is asserted, not just documented.
+    ///
+    /// `index_type: Option` made `(column: Some, index_type: None)` a
+    /// representable state, so "the exception has to be spelled out with its
+    /// reason" became a comment convention rather than a check: a new schema
+    /// type that forgot its index would be accepted by
+    /// `every_materialised_column_is_also_indexed` without comment. This pins
+    /// the set to exactly {geo} over every type the engine claims to support, so
+    /// adding a second unindexed column is a deliberate edit here.
+    #[test]
+    fn only_geo_is_a_deliberately_unindexed_column() {
+        // Every schema type this engine maps, plus the multi-valued spelling.
+        let types = [
+            "int", "float", "keyword", "text", "uuid", "bool", "datetime", "geo",
+        ];
+        let unindexed: Vec<&str> = types
+            .iter()
+            .filter(|ty| milvus_field_kind("f", ty).is_some_and(|k| k.index_type.is_none()))
+            .copied()
+            .collect();
+        assert_eq!(
+            unindexed,
+            ["geo"],
+            "exactly one materialised column may be deliberately unindexed (#223); \
+             adding another needs its own reason and a live measurement"
+        );
+        // `labels` (Array of VarChar) must not sneak in as a second one.
+        assert!(milvus_field_kind("labels", "keyword")
+            .unwrap()
+            .index_type
+            .is_some());
     }
 
     /// The per-type index choice, verified live against milvusdb/milvus:v2.6.19

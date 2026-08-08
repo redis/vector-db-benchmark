@@ -329,10 +329,15 @@ fn engines() -> Vec<(&'static str, EngineResolver)> {
                 Ok(super::redis::parse_conditions(v).map(|f| render_redisearch(&f)))
             })
         }),
-        // Dragonfly reuses redis.rs's RediSearch builder verbatim.
+        // Dragonfly reuses redis.rs's RediSearch builder for everything EXCEPT
+        // geo, which it refuses because `configure()` never declares a GEO
+        // field. It must be called through `dragonfly::parse_conditions`, not
+        // `redis::parse_conditions`: this column used to call the latter, so the
+        // matrix scored dragonfly FILTERED on all three geo shapes for a field
+        // the engine does not create.
         ("dragonfly", |c, _| {
             through("Dragonfly", c, |v| {
-                Ok(super::redis::parse_conditions(v).map(|f| render_redisearch(&f)))
+                Ok(super::dragonfly::parse_conditions(v).map(|f| render_redisearch(&f)))
             })
         }),
         ("valkey", |c, _| {
@@ -460,8 +465,16 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
     // VectorSets by comparing the stored unit vector against a cosine threshold
     // (`engine::geo`), Milvus with the native `ST_DWITHIN` on a `Geometry`
     // column, MongoDB with `geoWithin`/`circle` inside a `$search` stage. Redis,
-    // Valkey, Dragonfly, Elasticsearch, OpenSearch, Weaviate, pgvector and
-    // Qdrant already did.
+    // Valkey, Elasticsearch, OpenSearch, Weaviate, pgvector and Qdrant already
+    // did.
+    //
+    // Dragonfly is NEW here and is a correction, not a regression. It shares
+    // RediSearch's builder, so this column used to render a geo filter for it —
+    // three asserted-green cells for a field `dragonfly::configure()`
+    // deliberately never declares (its geo-query parser rejects the `$param`
+    // placeholders the shared builder emits). `dragonfly::parse_conditions` now
+    // refuses geo, so the cells are REJECTED and the engine hard-errors on a geo
+    // dataset instead of sending a clause that cannot match.
     //
     // Chroma and Turbopuffer remain, and the entries below are the evidence
     // rather than a TODO. Both filter DSLs are a CLOSED enum of
@@ -478,6 +491,14 @@ const KNOWN_GAPS: &[(&str, &str, &str)] = &[
     // form the other two use needs cross-field arithmetic neither has. A
     // bounding box would admit up to √2·r away and is a widening, i.e. exactly
     // the silently-wrong recall #219 exists to stop.
+    (
+        "dragonfly",
+        "and_geo",
+        "#223 — configure() declares no GEO field: Dragonfly Search's geo-query parser rejects \
+         the `$param` placeholders the shared RediSearch builder emits",
+    ),
+    ("dragonfly", "and_geo_x2", "#223"),
+    ("dragonfly", "or_geo_x2", "#223"),
     (
         "turbopuffer",
         "and_geo",
@@ -620,7 +641,7 @@ fn every_shipped_condition_shape_is_expressible_or_a_tracked_gap() {
     );
     assert_eq!(
         (filtered, rejected),
-        (238, 17),
+        (235, 20),
         "the expressible/refused split changed — say why in the PR body"
     );
 }
@@ -707,7 +728,7 @@ fn every_known_gap_maps_to_a_live_cell() {
     let engine_names: Vec<&str> = engines().iter().map(|(n, _)| *n).collect();
     assert_eq!(
         KNOWN_GAPS.len(),
-        17,
+        20,
         "KNOWN_GAPS size changed — was that deliberate?"
     );
     for (engine, shape, why) in KNOWN_GAPS {

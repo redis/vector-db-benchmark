@@ -53,11 +53,24 @@
 //!
 //! `cos(r/R)` is evaluated in `f64`. Near `r = 0` it sits within one ulp of 1.0,
 //! so the absolute error in the *implied* radius grows as the radius shrinks.
-//! Measured by crossover search — binary-searching the distance at which each
-//! rendered `f64` predicate actually flips — the worst case over the shipped
-//! radii (**1 193 m to 1 991 786 m**, mean 990 613 m) is **7 µm**, at the 1 193 m
-//! end; at the mean it is ~1e-8 m. At a hand-written `r = 1 m` it is 4.2 mm.
-//! Every one of those is 8-10 orders of magnitude below the margin any fixture
+//!
+//! The shipped radii, over the WHOLE `random_geo_1m` `tests.jsonl` (10 000
+//! queries, 16 666 geo leaves): **min 1 031 m, max 1 999 939 m, mean 996 075 m**.
+//! (An earlier revision of this comment quoted 1 193 / 1 991 786 / 990 613 —
+//! those are the min/max/mean of the first **500** queries only, a sample
+//! presented as the population.)
+//!
+//! Error measured by crossover search: binary-search the distance at which the
+//! REAL predicate flips — `dot(u_doc, u_centre) >= cos(r/R)` on `f64` unit
+//! vectors, including the dot product's own rounding, not the ideal `cos` — over
+//! six centres (equator, mid-latitude, 81 N, 89 N, the antimeridian) x five
+//! bearings. Worst case **3.6 µm at r = 1 031 m**, 4.1 µm at 1 193 m, 0.30 µm at
+//! the mean, 0.01 µm at the max. An independent measurement with different
+//! sampling put the small-radius end at ~8 µm; take **under 10 µm** as the
+//! bound, since the exact figure depends on which centres you sample. At a
+//! hand-written `r = 1 m` it is 5.6 mm.
+//!
+//! Every one of those is 7-10 orders of magnitude below the margin any fixture
 //! here keeps around the boundary, and the dominant error is not this but the
 //! choice of earth radius.
 //!
@@ -69,7 +82,7 @@
 //! One place the encoding is **not** literally exact: at `r = 0`, a document
 //! exactly at the query point gives `dot(u, u) = 0.999999999999999 9` for many
 //! `u`, just under the threshold of 1.0, so it is excluded. Unreachable on
-//! shipped data (minimum radius 1 193 m) and only reachable from a hand-written
+//! shipped data (minimum radius 1 031 m) and only reachable from a hand-written
 //! `r = 0` config, where "within zero metres" is a degenerate question anyway.
 
 /// Mean earth radius, metres.
@@ -90,9 +103,16 @@
 /// only direction that matters**: a smaller `R` makes `cos(r/R)` smaller, so the
 /// cap is a strict *superset* of the ground truth's and no ground-truth
 /// neighbour can ever be excluded by the difference. It only admits a few extra
-/// documents, which cost nothing but a marginally larger candidate set —
-/// measured at 24 extra admitted documents across 500 shipped queries
-/// (0.048/query) against ~13 810 matching documents per query.
+/// documents — measured at 24 extra admitted across 500 shipped queries
+/// (0.048/query) against a mean of **14 594.2** matching documents per query.
+/// Not literally free: a superset CAN displace a true neighbour out of top-k.
+/// The magnitude here is ~1e-4 of recall, so the conclusion holds, but "costs
+/// nothing" (an earlier wording) was wrong.
+///
+/// Independently reproduced on the real `random_geo_1m`, counting ground-truth
+/// neighbours a strict `<` cap would EXCLUDE: R = 6 371 000 excludes **0** of
+/// 11 119; R = 6 372 797.56 (RediSearch) excludes 8; R = 6 378 137 (WGS-84)
+/// excludes 27.
 ///
 /// The reference engines disagree here anyway, by up to ~0.1 % (RediSearch's
 /// geohash library uses 6 372 797.56 m — 0.028 % stricter than the ground
@@ -456,7 +476,10 @@ mod tests {
     /// queries have a centre component in that range.
     #[test]
     fn no_rendered_literal_ever_uses_exponent_notation() {
-        // Includes the two real shipped centres, and a sweep down to subnormal.
+        // The two real shipped centres, plus a sweep down to 1e-300 and the
+        // smallest NORMAL f64. It does not reach the smallest subnormal
+        // (~4.94e-324); that 340 places would cover it too is an argument (324
+        // decimal places suffice) rather than something tested here.
         let mut values: Vec<f64> = vec![
             -1.9426574824796435e-5,
             -9.390384479741515e-5,

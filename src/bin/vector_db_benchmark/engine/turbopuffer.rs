@@ -880,9 +880,13 @@ mod filter_tests {
         let cond = json!({"and": [{"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 10.0}}}]});
         // geo yields no clause; the only clause dropping leaves an empty And → None.
         assert!(parse_turbopuffer_filter(&cond).is_none());
-        // ...and a SIBLING leaf dies with it, because the geo arm `return`s out
-        // of the whole entry. Harmless only because the result is refused
-        // outright rather than run: both spellings are an error at `resolve_all`.
+        // ...and a SIBLING leaf in another entry does NOT die with it on its
+        // own. `parse_single_condition`'s `"geo" => return None` exits only that
+        // ENTRY, and the `and` loop then SKIPS the `None` — so without the
+        // guard above this renders a keyword-only filter that looks real and
+        // constrains LESS than the ground truth does (verified by deleting the
+        // guard: `Some(["And", [["color", "Eq", "red"]]])`). The `None` below
+        // comes from `conditions_mention_geo`, not from the geo arm.
         let mixed = json!({"and": [
             {"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 10.0}}},
             {"color": {"match": {"value": "red"}}}
