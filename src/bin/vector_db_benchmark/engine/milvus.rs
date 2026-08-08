@@ -56,25 +56,52 @@ struct MilvusFieldKind {
 /// string and array field"; STL_SORT "only on numeric, varchar or timestamptz";
 /// Trie "only supported on varchar field".)
 ///
-/// * **INVERTED for VarChar / Int64 / Double / Array** — it is the only type
-///   accepted on all four, it serves BOTH predicate shapes this benchmark emits
+/// The choice per column is not "whatever is permitted" — it is what MEASURED
+/// fastest on this version, and it happens to coincide exactly with what Milvus
+/// picks for itself:
+///
+/// * **INVERTED for VarChar / Int64 / Double / Array** — the only type accepted
+///   on all four, and it serves BOTH predicate shapes this benchmark emits
 ///   (point: `==`, `in [...]`, `array_contains*`, `TEXT_MATCH`; and range:
-///   `<`/`>=` over `int`, `float` and the Int64-epoch `datetime` column), and
-///   it makes no cardinality assumption. That last point matters: our keyword
-///   fields span 2 distinct values (`random-100-match-kw-small-vocab-filters`)
-///   to tens of thousands (`prod_name` in `h-and-m-2048-angular-filters`).
-///   INVERTED is also precisely what Milvus's own AUTOINDEX selects for
-///   VARCHAR/INT*/FLOAT/DOUBLE, so we are not hand-tuning the engine past its
-///   own default — we are giving it the default it should always have had.
-/// * **BITMAP for Bool** — a boolean column has exactly 2 distinct values, the
-///   canonical BITMAP case, and it is under BITMAP's documented ~500-cardinality
-///   ceiling for every dataset by construction. STL_SORT is rejected on Bool.
+///   `<`/`>=` over `int`, `float` and the Int64-epoch `datetime` column).
+///   BITMAP is the only real alternative on VarChar, and it does NOT beat
+///   INVERTED even where it should be strongest: on a 10-distinct-value keyword
+///   column (`random-100-match-kw-small-vocab-filters`) the measured BITMAP /
+///   INVERTED ratio is ~0.95–1.03, i.e. a coin flip. So INVERTED leaves nothing
+///   on the table, while avoiding BITMAP's degradation on the high-cardinality
+///   end (`prod_name` in `h-and-m-2048-angular-filters` has tens of thousands of
+///   distinct values).
+/// * **BITMAP for Bool** — this arm is NECESSARY, not merely permitted.
+///   Measured on a Bool column, INVERTED is worth nothing at all: INVERTED /
+///   no-index = 0.987–1.017, indistinguishable from having no index. BITMAP
+///   delivers a 20–24% improvement. Simplifying to "INVERTED everywhere" would
+///   therefore have left `synthetic-filter-32`'s `flag` filter with no benefit
+///   whatsoever. STL_SORT is rejected on Bool by the server.
+/// * **This mapping is what Milvus's own AUTOINDEX resolves to**, measured by
+///   comparing an AUTOINDEX column against explicitly-typed ones: on VarChar
+///   `auto / INVERTED = 0.937` (AUTOINDEX behaves as INVERTED); on Bool
+///   `auto / BITMAP = 1.009` while `auto / INVERTED = 0.774` (AUTOINDEX behaves
+///   as BITMAP, definitively not INVERTED). We are therefore not hand-tuning
+///   Milvus past its own defaults — we give each column exactly the index Milvus
+///   would choose for itself, which is the fairest possible setting for a
+///   competitor in a vendor benchmark.
 /// * **Not STL_SORT** for the numerics: it is a sorted-array structure aimed at
 ///   ranges only, and it cannot cover the Array/Bool columns, so it would mean
 ///   two structures where INVERTED covers both shapes — and it is not what
 ///   AUTOINDEX picks.
 /// * **Not Trie**: VARCHAR-only and prefix-only. This benchmark never emits a
 ///   prefix predicate (`like "abc%"`), so Trie would not serve `==` / `in`.
+/// * **`text` columns get an INVERTED index on top of `enable_match`.** A
+///   `text` field is already created with `enable_analyzer` + `enable_match`
+///   (see `create_collection`), which builds Milvus's tokenised match index for
+///   `TEXT_MATCH`. The explicit INVERTED index here is therefore a SECOND
+///   structure on the same column. It is kept deliberately: `text` columns are
+///   also filtered with plain `==` / `in [...]` (nothing stops a dataset from
+///   doing so), which the match index does not serve, and skipping it would
+///   reintroduce exactly the "column with no scalar index" hole for one field
+///   type. The cost is extra index build time and memory on `text` columns
+///   only — `h-and-m-2048-angular-filters`'s `detail_desc` is the sole shipped
+///   instance.
 /// * **Not a bare `create_index` with no `indexType`** (upstream's approach,
 ///   i.e. AUTOINDEX): the REST `indexes/describe` reply then reports
 ///   `indexType: ""`, which makes the read-back assertion in
@@ -138,17 +165,77 @@ fn scalar_index_plan(dataset: &Dataset) -> Vec<(String, &'static str)> {
 }
 
 /// True when a failed `indexes/create` response means "this field already has an
-/// index", which is not an error for us — mirrors upstream tolerating pymilvus
-/// error code 1 ("index already exist"). v2.6.19 returns code 0 for an identical
-/// re-create, and 1100 with one of these messages when an index of a DIFFERENT
-/// type/name already covers the field. Either way the column IS indexed, so the
-/// property we care about holds. Anything else must surface as a hard error
-/// rather than silently leaving a column unindexed.
+/// index" — mirrors upstream tolerating pymilvus error code 1 ("index already
+/// exist"). v2.6.19 returns code 0 for a byte-identical re-create, and 1100 with
+/// one of these messages when an index already covers the field.
+///
+/// This says only "an index exists", NOT "the RIGHT index exists": the same 1100
+/// reply comes back when the existing index is of a DIFFERENT type. Callers must
+/// therefore read the existing index's type back and confirm it before treating
+/// this as success (see `create_scalar_indexes`) — otherwise a stale wrong-type
+/// index would be silently accepted, which is the same class of silent-wrong as
+/// #218 itself. Unreachable today because `configure()` drops the collection
+/// first, but a future `--skip-upload` path would hit it.
 fn is_already_indexed_error(message: &str) -> bool {
     let m = message.to_lowercase();
     m.contains("already exist")
         || m.contains("at most one distinct index is allowed per field")
         || m.contains("creating multiple indexes on same field is not supported")
+}
+
+/// One index's build progress, as reported by `indexes/describe`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexProgress {
+    field_name: String,
+    index_type: String,
+    state: String,
+    indexed_rows: i64,
+    pending_rows: i64,
+    total_rows: i64,
+}
+
+impl IndexProgress {
+    /// An index is only actually USABLE when it is built AND covers every row.
+    ///
+    /// `state == "Finished"` alone is worthless: before the collection is
+    /// flushed, every index on v2.6.19 reports `Finished` with
+    /// `indexedRows = totalRows = 0` — "finished indexing nothing" — and stays
+    /// that way indefinitely. Queries then fall back to brute force over the
+    /// growing segments regardless of the index. `indexedRows == totalRows`
+    /// with `totalRows > 0` is the condition that actually distinguishes a
+    /// usable index from that trap, and from a still-building one
+    /// (`indexedRows < totalRows`).
+    ///
+    /// `pendingRows` is deliberately NOT part of the test. Measured on v2.6.19:
+    /// once a 1M-row collection is fully indexed it reports
+    /// `Finished, indexedRows = totalRows = 1000000, pendingRows = 847872` —
+    /// the pending counter tracks segments queued for RE-indexing by background
+    /// compaction, which runs indefinitely and does not mean the data is
+    /// unindexed. Requiring `pendingRows == 0` therefore hangs until the
+    /// timeout on exactly the large uploads that matter most.
+    fn is_built(&self, expect_rows: bool) -> bool {
+        self.state == "Finished"
+            && self.indexed_rows == self.total_rows
+            && (!expect_rows || self.total_rows > 0)
+    }
+}
+
+fn parse_index_progress(row: &serde_json::Value) -> IndexProgress {
+    let s = |k: &str| {
+        row.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let n = |k: &str| row.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    IndexProgress {
+        field_name: s("fieldName"),
+        index_type: s("indexType"),
+        state: s("indexState"),
+        indexed_rows: n("indexedRows"),
+        pending_rows: n("pendingRows"),
+        total_rows: n("totalRows"),
+    }
 }
 
 pub struct MilvusEngine {
@@ -488,11 +575,37 @@ impl MilvusEngine {
                     .and_then(|m| m.as_str())
                     .unwrap_or("unknown error");
                 if is_already_indexed_error(msg) {
-                    println!(
-                        "  scalar index on '{}' already exists, skipping",
-                        field_name
-                    );
-                    continue;
+                    // "An index exists" is NOT "the RIGHT index exists" — the
+                    // same reply comes back for an index of a different type.
+                    // Confirm the existing one from the server before accepting,
+                    // or a stale wrong-type index passes silently (#218's class).
+                    let existing = self
+                        .describe_indexes(client)?
+                        .into_iter()
+                        .find(|p| p.field_name == *field_name);
+                    match existing {
+                        Some(p) if p.index_type == *index_type => {
+                            println!(
+                                "  scalar index on '{}' already exists ({}), skipping",
+                                field_name, p.index_type
+                            );
+                            continue;
+                        }
+                        Some(p) => {
+                            return Err(format!(
+                                "Field '{}' already carries a {} index but this dataset needs \
+                                 {}; drop the collection and re-upload",
+                                field_name, p.index_type, index_type
+                            ));
+                        }
+                        None => {
+                            return Err(format!(
+                                "Milvus reported an existing index on '{}' ({}) but none is \
+                                 present in the index catalogue",
+                                field_name, msg
+                            ));
+                        }
+                    }
                 }
                 return Err(format!(
                     "Failed to create scalar index on {}: {}",
@@ -509,6 +622,157 @@ impl MilvusEngine {
             created.join(", ")
         );
         Ok(())
+    }
+
+    /// Seal the growing segments so an index can actually cover the data.
+    ///
+    /// A Milvus index only ever covers SEALED segments. Freshly inserted rows
+    /// live in growing segments, which are brute-force scanned no matter what
+    /// indexes exist. Without this call every index — the HNSW vector index
+    /// included — reports `state: "Finished"` with `indexedRows: 0,
+    /// totalRows: 0` and stays that way indefinitely, so the whole corpus is
+    /// scanned and creating the scalar indexes at all is pointless.
+    ///
+    /// Verified on v2.6.19 with this engine's exact ingest order (100k rows,
+    /// insert -> create indexes -> load): at the moment `load` reports
+    /// `LoadStateLoaded`, and still 60s later, both `vector` and the scalar
+    /// column read back as `Finished, indexedRows=0, totalRows=0`; immediately
+    /// after an explicit flush they read `indexedRows=100000,
+    /// totalRows=100000`. Upstream does the same thing — `upload.py` calls
+    /// `collection.flush()` on the line directly above its `create_index` loop.
+    fn flush_collection(&self, client: &reqwest::blocking::Client) -> Result<(), String> {
+        let body = serde_json::json!({ "collectionName": self.collection_name });
+        let url = format!("{}/v2/vectordb/collections/flush", self.base_url);
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .map_err(|e| format!("Failed to flush collection: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Failed to flush collection: {} {}",
+                resp.status(),
+                resp.text().unwrap_or_default()
+            ));
+        }
+        let resp_body: serde_json::Value = resp.json().unwrap_or_default();
+        let code = resp_body.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        if code != 0 {
+            let msg = resp_body
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Failed to flush collection: {}", msg));
+        }
+        Ok(())
+    }
+
+    /// Every index on the collection, with its build progress.
+    fn describe_indexes(
+        &self,
+        client: &reqwest::blocking::Client,
+    ) -> Result<Vec<IndexProgress>, String> {
+        let list_url = format!("{}/v2/vectordb/indexes/list", self.base_url);
+        let resp = client
+            .post(&list_url)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "collectionName": self.collection_name }))
+            .send()
+            .map_err(|e| format!("Failed to list indexes: {}", e))?;
+        let body: serde_json::Value = resp.json().unwrap_or_default();
+        let names: Vec<String> = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let describe_url = format!("{}/v2/vectordb/indexes/describe", self.base_url);
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let resp = client
+                .post(&describe_url)
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "collectionName": self.collection_name,
+                    "indexName": name,
+                }))
+                .send()
+                .map_err(|e| format!("Failed to describe index {}: {}", name, e))?;
+            let body: serde_json::Value = resp.json().unwrap_or_default();
+            if let Some(rows) = body.get("data").and_then(|d| d.as_array()) {
+                out.extend(rows.iter().map(parse_index_progress));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Block until every index covers every row, so the search phase measures an
+    /// INDEXED collection.
+    ///
+    /// `load_collection` is not sufficient: it returns `LoadStateLoaded` while
+    /// indexes cover nothing (see `flush_collection`). Upstream waits the same
+    /// way — `wait_for_index_building_complete` on every index before `load()`.
+    /// Timing out is a hard error: silently searching a half-indexed collection
+    /// is exactly the failure mode this PR exists to remove.
+    fn wait_for_indexes_built(
+        &self,
+        client: &reqwest::blocking::Client,
+        uploaded_rows: usize,
+    ) -> Result<(), String> {
+        let expect_rows = uploaded_rows > 0;
+        let timeout_secs: u64 = std::env::var("MILVUS_INDEX_BUILD_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let mut backoff = std::time::Duration::from_millis(500);
+        let max_backoff = std::time::Duration::from_secs(10);
+
+        loop {
+            let progress = self.describe_indexes(client)?;
+            if !progress.is_empty() && progress.iter().all(|p| p.is_built(expect_rows)) {
+                let summary: Vec<String> = progress
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}({}, {} rows)",
+                            p.field_name, p.index_type, p.indexed_rows
+                        )
+                    })
+                    .collect();
+                println!("All indexes built: {}", summary.join(", "));
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                let summary: Vec<String> = progress
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}({}, state={}, indexed={}/{}, pending={})",
+                            p.field_name,
+                            p.index_type,
+                            p.state,
+                            p.indexed_rows,
+                            p.total_rows,
+                            p.pending_rows
+                        )
+                    })
+                    .collect();
+                return Err(format!(
+                    "Timed out after {}s waiting for indexes to cover all rows: {}",
+                    timeout_secs,
+                    summary.join(", ")
+                ));
+            }
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(max_backoff);
+        }
     }
 
     fn load_collection(&self, client: &reqwest::blocking::Client) -> Result<(), String> {
@@ -1134,17 +1398,28 @@ impl Engine for MilvusEngine {
             vectors.len() as f64 / upload_time
         );
 
-        // Create index after upload, then load the collection into memory. Both
-        // are part of the ingest cost and are included in total_time for
-        // cross-engine comparability (mirrors mongodb; matches v0's post_upload()
-        // timing).
+        // Flush -> create indexes -> wait for them to cover every row -> load.
+        // This whole block is part of the ingest cost and is included in
+        // total_time for cross-engine comparability (mirrors mongodb; matches
+        // v0's post_upload() timing), and it mirrors upstream's post_upload
+        // order exactly (flush, create_index, wait_for_index_building_complete,
+        // load). Every step is load-bearing: without the flush the indexes cover
+        // zero rows, and without the wait the search phase starts against a
+        // collection Milvus reports as "loaded" while it is still brute-forcing.
         let client = self.create_client()?;
+        let index_start = Instant::now();
+
+        println!("Flushing collection (seal growing segments so indexes cover them)...");
+        self.flush_collection(&client)?;
+
         println!(
             "Creating {} index (M={}, efConstruction={}, metric={})...",
             self.index_type, self.index_m, self.index_ef_construction, self.metric_type
         );
-        let index_start = Instant::now();
         self.create_index(&client, dataset)?;
+
+        println!("Waiting for all indexes to cover every row...");
+        self.wait_for_indexes_built(&client, vectors.len())?;
 
         // Load collection into memory
         self.load_collection(&client)?;
@@ -1713,6 +1988,53 @@ mod tests {
     #[test]
     fn scalar_index_plan_empty_for_unfiltered_dataset() {
         assert!(scalar_index_plan(&dataset_with_schema(json!({}))).is_empty());
+    }
+
+    /// The zero-row trap that made the #218 fix inert until the flush landed:
+    /// before a collection is flushed, EVERY index (the HNSW one included)
+    /// reports `Finished` with `indexedRows = totalRows = 0` and stays that way
+    /// indefinitely, while queries brute-force the growing segments. Verified
+    /// live on v2.6.19. So "built" must mean "covers every row", not "state is
+    /// Finished".
+    #[test]
+    fn index_is_built_requires_row_coverage_not_just_finished() {
+        let p = |state: &str, indexed: i64, pending: i64, total: i64| IndexProgress {
+            field_name: "a".into(),
+            index_type: "INVERTED".into(),
+            state: state.into(),
+            indexed_rows: indexed,
+            pending_rows: pending,
+            total_rows: total,
+        };
+        // The exact reply a pre-flush collection gives: Finished over nothing.
+        assert!(!p("Finished", 0, 0, 0).is_built(true));
+        // Still building.
+        assert!(!p("InProgress", 0, 100, 100).is_built(true));
+        // Built but only partially covering.
+        assert!(!p("Finished", 60, 40, 100).is_built(true));
+        // Genuinely usable.
+        assert!(p("Finished", 100, 0, 100).is_built(true));
+        // Fully indexed WHILE background compaction re-queues segments: the
+        // verbatim v2.6.19 reply for a settled 1M-row collection. Must count as
+        // built, or every large upload hangs until the timeout.
+        assert!(p("Finished", 1_000_000, 847_872, 1_000_000).is_built(true));
+        // An empty upload legitimately has no rows to cover, so the row
+        // requirement is waived rather than deadlocking the wait loop.
+        assert!(p("Finished", 0, 0, 0).is_built(false));
+    }
+
+    #[test]
+    fn parse_index_progress_reads_row_counts() {
+        let row = json!({
+            "fieldName": "color", "indexType": "INVERTED", "indexState": "Finished",
+            "indexedRows": 1000, "pendingRows": 0, "totalRows": 1000,
+        });
+        let p = parse_index_progress(&row);
+        assert_eq!(p.field_name, "color");
+        assert_eq!(p.index_type, "INVERTED");
+        assert_eq!(p.indexed_rows, 1000);
+        assert_eq!(p.total_rows, 1000);
+        assert!(p.is_built(true));
     }
 
     /// Only a genuine "the field is already indexed" reply is tolerated. Both

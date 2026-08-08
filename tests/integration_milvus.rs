@@ -70,15 +70,31 @@ fn drop_collection(name: &str) {
         .send();
 }
 
-/// Read the collection's indexes back FROM THE SERVER and return
-/// `fieldName -> (indexType, indexState)`.
+/// What the server reports for one index: its type, build state, and — crucially
+/// — how many rows it actually covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexInfo {
+    index_type: String,
+    state: String,
+    indexed_rows: i64,
+    pending_rows: i64,
+    total_rows: i64,
+}
+
+/// Read the collection's indexes back FROM THE SERVER, keyed by field name.
 ///
 /// `indexes/list` returns index NAMES only, so each one is then described to
-/// recover which field it covers and what type it is. Reading it back from the
-/// server (rather than trusting the create call's 200) is the whole point: the
-/// create path already returned success while creating nothing but the vector
-/// index (issue #218).
-fn read_back_indexes(collection: &str) -> std::collections::HashMap<String, (String, String)> {
+/// recover which field it covers, its type, and its row coverage. Reading this
+/// back from the server (rather than trusting the create call's 200) is the
+/// whole point: the create path already returned success while creating nothing
+/// but the vector index (issue #218).
+///
+/// `indexedRows`/`totalRows` are load-bearing, not decoration. Before the
+/// collection is flushed every index reports `state: "Finished"` with
+/// `indexedRows = totalRows = 0` — "finished indexing nothing" — and queries
+/// brute-force the growing segments regardless. An assertion that only checked
+/// `state` would pass on a collection where no index covers a single row.
+fn read_back_indexes(collection: &str) -> std::collections::HashMap<String, IndexInfo> {
     let client = http_client();
     let resp = client
         .post(format!("{}/v2/vectordb/indexes/list", milvus_base_url()))
@@ -117,22 +133,23 @@ fn read_back_indexes(collection: &str) -> std::collections::HashMap<String, (Str
             .cloned()
             .unwrap_or_default()
         {
-            let field = row
-                .get("fieldName")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let itype = row
-                .get("indexType")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let state = row
-                .get("indexState")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            out.insert(field, (itype, state));
+            let s = |k: &str| {
+                row.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let n = |k: &str| row.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+            out.insert(
+                s("fieldName"),
+                IndexInfo {
+                    index_type: s("indexType"),
+                    state: s("indexState"),
+                    indexed_rows: n("indexedRows"),
+                    pending_rows: n("pendingRows"),
+                    total_rows: n("totalRows"),
+                },
+            );
         }
     }
     out
@@ -156,17 +173,56 @@ fn expected_index_type(field_name: &str, schema_type: &str) -> Option<&'static s
     }
 }
 
+/// Assert one index is genuinely usable: built, nothing pending, and covering
+/// EVERY row of the collection.
+///
+/// `state == "Finished"` on its own proves nothing — before the collection is
+/// flushed, every index reports `Finished` with `indexedRows = totalRows = 0`,
+/// so a state-only assertion passes while the server brute-forces the entire
+/// corpus. That is the exact hole this check closes.
+fn assert_index_covers_all_rows(collection: &str, field: &str, info: &IndexInfo) {
+    assert_eq!(
+        info.state, "Finished",
+        "index on '{}' in '{}' is not built (state={})",
+        field, collection, info.state
+    );
+    // NB: `pendingRows` is intentionally not asserted. On v2.6.19 a fully
+    // indexed collection still reports a large `pendingRows` while background
+    // compaction re-queues segments (measured: indexed = total = 1000000 with
+    // pendingRows = 847872). Coverage, not the pending counter, is what says
+    // the index is usable.
+    assert!(
+        info.total_rows > 0,
+        "index on '{}' in '{}' covers ZERO rows (totalRows=0) — the collection was not \
+         flushed, so every query brute-forces the growing segments and the index is inert",
+        field,
+        collection
+    );
+    assert_eq!(
+        info.indexed_rows, info.total_rows,
+        "index on '{}' in '{}' covers only {}/{} rows",
+        field, collection, info.indexed_rows, info.total_rows
+    );
+}
+
 /// **Issue #218 guard.** Assert that EVERY field of the dataset schema has a
-/// scalar index on the server, of the expected type and in a built state — plus
-/// the `vector` ANN index.
+/// scalar index on the server, of the expected type, built, and covering every
+/// row — plus the `vector` ANN index.
 ///
 /// This cannot be replaced by a recall assertion: an unindexed scalar column
 /// returns exactly the same rows as an indexed one, so recall is identical and
 /// only latency differs. That is precisely why a Milvus collection ran for this
 /// long with no scalar index at all. The property must be read back from the
 /// server's own index catalogue.
+///
+/// Row coverage is asserted too, not just existence and state: an index that
+/// exists but covers zero rows is exactly as useless as no index, and Milvus
+/// reports that state as `Finished` (see `assert_index_covers_all_rows`).
 fn assert_all_schema_fields_indexed(collection: &str, schema: &serde_json::Value) {
+    // Read the catalogue and drop the collection BEFORE asserting, so a failing
+    // assertion cannot leak the collection into the shared test server.
     let found = read_back_indexes(collection);
+    drop_collection(collection);
     println!("milvus index read-back for '{}': {:?}", collection, found);
 
     let vector = found.get("vector").unwrap_or_else(|| {
@@ -176,10 +232,12 @@ fn assert_all_schema_fields_indexed(collection: &str, schema: &serde_json::Value
         )
     });
     assert_eq!(
-        vector.0, "HNSW",
+        vector.index_type, "HNSW",
         "vector index type unexpected in '{}': {:?}",
         collection, found
     );
+    // The ANN index is subject to the same zero-row trap as the scalar ones.
+    assert_index_covers_all_rows(collection, "vector", vector);
 
     let mut expected_fields = std::collections::BTreeSet::new();
     for (field, ty) in schema.as_object().expect("schema must be an object") {
@@ -188,7 +246,7 @@ fn assert_all_schema_fields_indexed(collection: &str, schema: &serde_json::Value
             continue;
         };
         expected_fields.insert(field.clone());
-        let (itype, state) = found.get(field).unwrap_or_else(|| {
+        let info = found.get(field).unwrap_or_else(|| {
             panic!(
                 "schema field '{}' ({}) has NO index in collection '{}' — a filter on it is a \
                  brute-force scalar scan (issue #218). Indexes present: {:?}",
@@ -196,15 +254,11 @@ fn assert_all_schema_fields_indexed(collection: &str, schema: &serde_json::Value
             )
         });
         assert_eq!(
-            itype, expected,
+            info.index_type, expected,
             "schema field '{}' ({}) is indexed as {} in '{}', expected {}",
-            field, schema_type, itype, collection, expected
+            field, schema_type, info.index_type, collection, expected
         );
-        assert_eq!(
-            state, "Finished",
-            "index on '{}' in '{}' is not built (state={})",
-            field, collection, state
-        );
+        assert_index_covers_all_rows(collection, field, info);
     }
     assert!(
         !expected_fields.is_empty(),
@@ -649,7 +703,6 @@ fn test_binary_milvus_bool() {
         "milvus bool run failed"
     );
     assert_all_schema_fields_indexed("bench_bool", &serde_json::json!({"flag": "bool"}));
-    drop_collection("bench_bool");
     let recall = common::read_recall(&proj.root, "milvus-bool");
     println!("milvus bool recall={:.3}", recall);
     assert!(recall >= 0.9, "milvus bool recall {:.3} < 0.9", recall);
@@ -686,7 +739,6 @@ fn test_binary_milvus_uuid() {
         "milvus uuid run failed"
     );
     assert_all_schema_fields_indexed("bench_uuid", &serde_json::json!({"uid": "uuid"}));
-    drop_collection("bench_uuid");
     let recall = common::read_recall(&proj.root, "milvus-uuid");
     println!("milvus uuid recall={:.3}", recall);
     assert!(recall >= 0.9, "milvus uuid recall {:.3} < 0.9", recall);
@@ -728,7 +780,6 @@ fn test_binary_milvus_and_filter() {
         "bench_and",
         &serde_json::json!({"color": "keyword", "size": "int"}),
     );
-    drop_collection("bench_and");
     let recall = common::read_recall(&proj.root, "milvus-and");
     println!("milvus and-filter recall={:.3}", recall);
     assert!(
@@ -801,7 +852,6 @@ fn test_binary_milvus_datetime() {
         "milvus datetime run failed"
     );
     assert_all_schema_fields_indexed("bench_dt", &serde_json::json!({"ts": "datetime"}));
-    drop_collection("bench_dt");
     let recall = common::read_recall(&proj.root, "milvus-dt");
     println!("milvus datetime recall={:.3}", recall);
     assert!(recall >= 0.9, "milvus datetime recall {:.3} < 0.9", recall);
@@ -838,7 +888,6 @@ fn test_binary_milvus_fulltext() {
         "milvus fulltext run failed"
     );
     assert_all_schema_fields_indexed("bench_ft", &serde_json::json!({"body": "text"}));
-    drop_collection("bench_ft");
     let recall = common::read_recall(&proj.root, "milvus-ft");
     println!("milvus fulltext recall={:.3}", recall);
     assert!(recall >= 0.9, "milvus fulltext recall {:.3} < 0.9", recall);
@@ -932,7 +981,6 @@ fn test_binary_milvus_match_any_labels() {
         "bench_matchany_labels",
         &serde_json::json!({"labels": "keyword"}),
     );
-    drop_collection("bench_matchany_labels");
     let recall = common::read_recall(&proj.root, "milvus-mal");
     println!("milvus match_any labels recall={:.3}", recall);
     assert!(
