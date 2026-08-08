@@ -128,144 +128,196 @@ pub fn is_secret(name: &str) -> bool {
     SECRET_MARKERS.iter().any(|m| upper.contains(m))
 }
 
-/// Strip `user:password@` from a URL-shaped value.
-///
-/// A connection string routinely carries a credential inline under a key that
-/// is not credential-named (`REDIS_URI`, `--host`, a config file's `endpoint`).
-/// Blanking the userinfo keeps the host/port — provenance worth having —
-/// without publishing the secret.
-///
-/// Two passes, because a redactor must fail safe:
-///
-/// 1. RFC 3986: the authority ends at the first `/`, `?` or `#`; an `@` inside
-///    it delimits userinfo.
-/// 2. If that finds nothing but an `@` appears later, the value is not a
-///    well-formed URL — and computing the authority boundary *first* is exactly
-///    how `redis://admin:hunt/er2@10.0.0.5:6379/0` used to be returned
-///    untouched, password and all. When the text before the last `@` contains a
-///    `:` it looks like `user:password`, so it is redacted anyway. A path that
-///    merely contains an `@` (`http://h/p@th`) has no colon and is left alone.
-fn strip_userinfo(value: &str) -> String {
-    // Scheme-less authority: `--host 'default:pw@127.0.0.1'` is exactly how the
-    // Redis-wire engines take a password, and `mongodb_engine` short-circuits on
-    // a `mongodb`-prefixed host where `user:pass@` is the convention. No `://`
-    // is required for the value to be a credential.
-    let (scheme, rest) = match value.find("://") {
-        Some(sep) => value.split_at(sep + 3),
-        None => ("", value),
-    };
+/// Placeholder for a component that was not positively recognised.
+const DROPPED: &str = "<dropped>";
+/// Placeholder for userinfo removed from an authority.
+const REDACTED_USERINFO: &str = "<redacted:userinfo>";
 
-    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(auth_end);
-    if let Some(at) = authority.rfind('@') {
-        return format!("{scheme}{REDACTED}@{}{tail}", &authority[at + 1..]);
-    }
+/// Parameter names whose VALUES are safe to publish verbatim.
+///
+/// An ALLOW-list, not a block-list, and that inversion is the whole point.
+/// Three review rounds each closed the demonstrated leak and left the class
+/// open, because a block-list over connection strings is a block-list over an
+/// unbounded input language: percent-encoded (`%70assword=`), Cyrillic
+/// homoglyph (`pаssword=`), `AccountKey=`, `bearer=`, and every nested or
+/// quote-desynced form slipped past markers that had just been widened. Under
+/// an allow-list all of those are simply not recognised, so their values are
+/// dropped without anyone having to have predicted them.
+///
+/// Matched case-insensitively. Deliberately excludes anything whose value can
+/// itself contain pairs — `options` above all (`options='-c password=X'` is a
+/// live libpq shape).
+const SAFE_PARAM_KEYS: &[&str] = &[
+    // libpq
+    "host",
+    "hostaddr",
+    "port",
+    "dbname",
+    "user",
+    "sslmode",
+    "connect_timeout",
+    "application_name",
+    "target_session_attrs",
+    // mongo
+    "w",
+    "retrywrites",
+    "readpreference",
+    "replicaset",
+    "authsource",
+    "tls",
+    "ssl",
+    "maxpoolsize",
+    "minpoolsize",
+    "sockettimeoutms",
+    "connecttimeoutms",
+    "directconnection",
+    "appname",
+    // redis
+    "db",
+    "protocol",
+    "timeout",
+    // odbc / jdbc
+    "server",
+    "database",
+    "uid",
+    "encrypt",
+    "driver",
+    "trustservercertificate",
+];
 
-    // Malformed-but-dangerous fallback.
-    match rest.rfind('@') {
-        Some(at) if rest[..at].contains(':') => {
-            format!("{scheme}{REDACTED}@{}", &rest[at + 1..])
-        }
-        _ => value.to_string(),
+fn is_safe_param(key: &str) -> bool {
+    let k = key.trim().to_ascii_lowercase();
+    SAFE_PARAM_KEYS.contains(&k.as_str())
+}
+
+/// A value simple enough that it cannot hide a nested pair: no quotes, no
+/// whitespace, no `=`, `&`, `;`, `@` or `?`, and short.
+///
+/// Belt to the allow-list's braces. Without it an allow-listed key whose value
+/// happened to contain `password=…` would republish it.
+fn is_simple_param_value(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 64
+        && v.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | ':' | '/' | '%')
+        })
+}
+
+/// A parameter NAME safe to echo back when its value is dropped. Bounded and
+/// ASCII so a tokeniser desync cannot smuggle secret text into a key position.
+fn sanitise_param_name(k: &str) -> String {
+    let k = k.trim();
+    let ok = !k.is_empty()
+        && k.len() <= 40
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        format!("{k}={DROPPED}")
+    } else {
+        DROPPED.to_string()
     }
 }
 
-/// Blank the value of any `key=value` credential embedded in an opaque string.
+/// True when a string is shaped like a connection string / URI / `key=value`
+/// blob, and therefore must never be published verbatim.
+fn is_connection_like(value: &str) -> bool {
+    // A bare `;` is NOT a signal: it is ordinary punctuation, and treating it as
+    // one reconstructed our own explanatory prose ("…did not parse; the default
+    // was used instead") into rubble. Every real blob has `=` as well
+    // (`Server=h;Pwd=x;`), so requiring one of these three loses nothing.
+    value.contains("://") || value.contains('@') || value.contains('=')
+}
+
+/// Keys whose values are prose WE author, never user or server input, and which
+/// must therefore be reproduced intact rather than reconstructed.
+const PROSE_KEYS: &[&str] = &["reason", "covers"];
+
+/// Rebuild a connection-like string from positively recognised components,
+/// dropping everything else.
 ///
-/// Name-based redaction cannot see these: the secret sits inside the value of a
-/// key that is not itself credential-named. Three families, all live shapes:
+/// This inverts the default. The old design published the string and tried to
+/// find secrets in it; every added rule created a new tokeniser-desync state,
+/// and a single unbalanced quote disabled the redactor for the remainder of the
+/// string. Here nothing reaches the artifact unless it was recognised, so a
+/// desync loses benign detail instead of publishing a credential.
 ///
-/// * libpq DSNs — `host=db user=bench password=hunter2 sslmode=require`
-/// * URL query strings — `mongodb://h/db?w=majority&password=hunter2`
-/// * ODBC/JDBC — `Server=h;Database=d;Uid=u;Pwd=hunter2;`
-///
-/// The query-string family is why this is not a whitespace splitter. It used to
-/// be, so it read the key of `mongodb://h/db?w=majority&password=X` as
-/// `mongodb://h/db?w` — not credential-named — and copied the password through.
-/// `?authSource=admin&password=X` *looked* fixed only because the first key
-/// contains `AUTH` and blanked the whole tail; any benign leading option
-/// (`w=`, `retryWrites=`, `ssl=`, `db=`) restored the leak.
-///
-/// Separators are whitespace, `&`, `;` and `?`. Spaces are permitted around the
-/// `=` (PostgreSQL documents them as optional). Values may be quoted with `'`
-/// or `"`, honouring both backslash escapes and SQL's doubled-quote escape.
-/// Non-secret pairs are reproduced byte for byte, spacing and quoting included.
-fn strip_dsn_secrets(value: &str) -> String {
-    if !value.contains('=') {
+/// Kept: scheme, host, port, path, and allow-listed query/DSN parameters whose
+/// values are simple. Dropped: userinfo, and every unrecognised parameter —
+/// its NAME is echoed (sanitised) so `password=<dropped>` still tells a reader
+/// that an inline credential was present.
+fn redact_connection_like(value: &str) -> String {
+    if !is_connection_like(value) {
         return value.to_string();
     }
-    let c: Vec<char> = value.chars().collect();
-    let is_sep = |ch: char| ch.is_whitespace() || ch == '&' || ch == ';' || ch == '?';
-    let take = |from: usize, to: usize| -> String { c[from..to].iter().collect() };
 
-    let mut out = String::with_capacity(value.len());
-    let mut i = 0usize;
-    while i < c.len() {
-        if is_sep(c[i]) {
-            out.push(c[i]);
-            i += 1;
-            continue;
-        }
-        // Key: up to `=` or a separator.
-        let key_start = i;
-        while i < c.len() && c[i] != '=' && !is_sep(c[i]) {
-            i += 1;
-        }
-        let key = take(key_start, i);
+    let (scheme, rest) = match value.find("://") {
+        Some(i) => (&value[..i + 3], &value[i + 3..]),
+        None => ("", value),
+    };
 
-        // Permit spaces between the key and the `=`.
-        let mut probe = i;
-        while probe < c.len() && (c[probe] == ' ' || c[probe] == '\t') {
-            probe += 1;
-        }
-        if probe >= c.len() || c[probe] != '=' {
-            out.push_str(&key);
-            continue; // not a pair; the separator loop handles what follows
-        }
-        probe += 1; // consume '='
-                    // …and after it.
-        while probe < c.len() && (c[probe] == ' ' || c[probe] == '\t') {
-            probe += 1;
-        }
-        // Everything from the key through the `=` and its padding, verbatim.
-        let prefix = take(key_start, probe);
-        i = probe;
+    // A bare `k=v` blob has no authority: `=` or `;` shows up before any `/?#`.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority_candidate = &rest[..authority_end];
+    let looks_like_authority = scheme.is_empty()
+        && (authority_candidate.contains('=') || authority_candidate.contains(';'));
 
-        // Value: a quoted run, or a bare run up to the next separator.
-        let val_start = i;
-        if i < c.len() && (c[i] == '\'' || c[i] == '"') {
-            let quote = c[i];
-            i += 1;
-            while i < c.len() {
-                if c[i] == '\\' && i + 1 < c.len() {
-                    i += 2;
-                    continue;
-                }
-                if c[i] == quote {
-                    // SQL doubles a quote to escape it: 'ab''cd' is one value.
-                    if i + 1 < c.len() && c[i + 1] == quote {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
+    let mut out = String::new();
+    let params_text: &str = if looks_like_authority {
+        // Whole string is a parameter blob.
+        rest
+    } else {
+        out.push_str(scheme);
+        let (authority, tail) = rest.split_at(authority_end);
+        // Userinfo: everything before the LAST `@`, unconditionally dropped.
+        let host_part = match authority.rfind('@') {
+            Some(at) => {
+                out.push_str(REDACTED_USERINFO);
+                out.push('@');
+                &authority[at + 1..]
             }
-        } else {
-            while i < c.len() && !is_sep(c[i]) {
-                i += 1;
+            None => authority,
+        };
+        // Host[:port], only if it is a plausible host token.
+        let host_ok = !host_part.is_empty()
+            && host_part.len() <= 255
+            && host_part.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']' | '%' | '_')
+            });
+        out.push_str(if host_ok { host_part } else { DROPPED });
+
+        let (path, query) = match tail.find('?') {
+            Some(i) => (&tail[..i], &tail[i + 1..]),
+            None => (tail, ""),
+        };
+        // Path: no pairs, no whitespace, no quotes.
+        let path_ok = path.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '%' | '~' | ':')
+        });
+        out.push_str(if path_ok { path } else { DROPPED });
+        query
+    };
+
+    if params_text.is_empty() {
+        return out;
+    }
+
+    let kept: Vec<String> = params_text
+        .split(|c: char| c == '&' || c == ';' || c.is_whitespace())
+        .filter(|seg| !seg.trim().is_empty())
+        .map(|seg| match seg.split_once('=') {
+            Some((k, v)) if is_safe_param(k) && is_simple_param_value(v) => {
+                format!("{}={}", k.trim(), v)
             }
+            Some((k, _)) => sanitise_param_name(k),
+            None => DROPPED.to_string(),
+        })
+        .collect();
+
+    if !kept.is_empty() {
+        if !looks_like_authority {
+            out.push('?');
         }
-        let raw = take(val_start, i);
-        let bare = raw.trim_matches(['\'', '"']);
-        if is_secret(key.trim()) && !bare.trim().is_empty() {
-            out.push_str(&prefix);
-            out.push_str(REDACTED);
-        } else {
-            out.push_str(&prefix);
-            out.push_str(&raw);
-        }
+        out.push_str(&kept.join("&"));
     }
     out
 }
@@ -283,6 +335,10 @@ const ENTRY_KEY_EXEMPT: &[&str] = &["key", "reason"];
 /// caught just like a bare string, and so is every leaf of a raw configuration
 /// file block copied in wholesale.
 fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
+    scrub_value_inner(value, secret_ancestor, false)
+}
+
+fn scrub_value_inner(value: &Value, secret_ancestor: bool, prose: bool) -> Value {
     match value {
         // `null` under a secret key means "read and unset" — a fact, not a leak.
         Value::Null => Value::Null,
@@ -307,7 +363,11 @@ fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
                             .is_some_and(is_secret);
                     (
                         k.clone(),
-                        scrub_value(v, secret_ancestor || is_secret(k) || seeded),
+                        scrub_value_inner(
+                            v,
+                            secret_ancestor || is_secret(k) || seeded,
+                            PROSE_KEYS.contains(&k.as_str()),
+                        ),
                     )
                 })
                 .collect(),
@@ -315,7 +375,7 @@ fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|v| scrub_value(v, secret_ancestor))
+                .map(|v| scrub_value_inner(v, secret_ancestor, prose))
                 .collect(),
         ),
         Value::String(s) if secret_ancestor && s == REDACTED_DEFAULT => {
@@ -323,11 +383,13 @@ fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
         }
         // NOTE: this changes a JSON *type* — `session_pool_size: 8` becomes the
         // string `"<redacted:set>"`. A scan of all 31 shipped configs and all
-        // 104 recorded knob names found zero false positives today, so this is
+        // 97 recorder-routed knob names found zero false positives today (the
+        // figure was quoted as 104 without being re-derived), so this is
         // a future-drift risk rather than a live defect; the direction of the
         // bias (over-redact) is deliberate. Tracked with the marker widening.
         _ if secret_ancestor => Value::from(REDACTED),
-        Value::String(s) => Value::from(strip_dsn_secrets(&strip_userinfo(s))),
+        Value::String(s) if prose => Value::from(s.clone()),
+        Value::String(s) => Value::from(redact_connection_like(s)),
         other => other.clone(),
     }
 }
@@ -887,6 +949,76 @@ pub fn snapshot() -> Value {
     recorder().snapshot()
 }
 
+/// Every connection-string shape reported across four review rounds, plus the
+/// tokeniser-desync probes that showed a block-list could not be finished.
+///
+/// Shared so the unit test and the on-disk artifact test cover exactly the same
+/// set: the on-disk one is the check that would have caught the seven shapes
+/// that survived when the assertion lived in memory.
+#[cfg(test)]
+pub const CONNECTION_SHAPE_CORPUS: &[(&str, &str)] = &[
+    ("userinfo", "default:CANARY@127.0.0.1"),
+    ("userinfo-url", "redis://admin:CANARY@10.0.0.5:6379/0"),
+    (
+        "userinfo-slash-pw",
+        "redis://admin:hunt/CANARY@10.0.0.5:6379/0",
+    ),
+    (
+        "userinfo-question-pw",
+        "redis://admin:hu?CANARY@10.0.0.5:6379/0",
+    ),
+    ("mongodb-srv", "mongodb+srv://u:CANARY@cluster.example.net"),
+    ("query-string", "mongodb://h/db?w=majority&password=CANARY"),
+    (
+        "query-retrywrites",
+        "mongodb://h/db?retryWrites=true&password=CANARY",
+    ),
+    ("query-redis", "redis://h:6379/0?db=1&password=CANARY"),
+    (
+        "query-schemeless",
+        "h.example:27017/?ssl=true&password=CANARY",
+    ),
+    (
+        "query-authsource-first",
+        "mongodb://h/db?authSource=admin&password=CANARY",
+    ),
+    ("percent-encoded-key", "mongodb://h/db?%70assword=CANARY"),
+    ("homoglyph-key", "p\u{430}ssword=CANARY"),
+    ("bearer", "bearer=CANARY"),
+    (
+        "azure-accountkey",
+        "DefaultEndpointsProtocol=https;AccountKey=CANARY;",
+    ),
+    ("azure-sas", "SharedAccessSignature=CANARY"),
+    ("aws-sig", "https://h/x?X-Amz-Signature=CANARY"),
+    ("odbc", "Server=h;Database=d;Uid=u;Pwd=CANARY;"),
+    ("odbc-password", "Server=h;Password=CANARY;Encrypt=yes"),
+    ("odbc-in-quotes", "cs=\"Server=h;Pwd=CANARY;\""),
+    ("jdbc", "jdbc:postgresql://h:5432/db?user=u&password=CANARY"),
+    (
+        "libpq",
+        "host=db user=bench password=CANARY sslmode=require",
+    ),
+    (
+        "libpq-quoted",
+        "host=db password='CANARY with spaces' sslmode=require",
+    ),
+    ("libpq-spaces-eq", "password = CANARY host=db"),
+    ("libpq-space-before", "password =CANARY"),
+    ("libpq-space-after", "password= CANARY"),
+    ("libpq-empty-then-pair", "password= host=example.internal"),
+    ("sql-doubled-quote", "password='ab''CANARY'"),
+    ("pwd", "pwd=CANARY"),
+    ("amp", "user=u&password=CANARY&ssl=true"),
+    // Tokeniser-desync probes: a quoted run under a NON-secret key.
+    ("desync-unbalanced", "note='hello password=CANARY"),
+    ("desync-balanced", "note='x password=CANARY' host=h"),
+    ("desync-escaped-quote", "note='x\\' password=CANARY"),
+    ("desync-nested-odbc", "cs=\"Server=h;Pwd=CANARY;\""),
+    ("desync-options", "options='-c password=CANARY'"),
+    ("desync-double-quote", "note=\"a password=CANARY\""),
+];
+
 /// Serialises the tests that mutate the process environment and drive the
 /// process-wide recorder. `cargo test` runs a binary's tests on many threads,
 /// and both of those are global.
@@ -920,6 +1052,10 @@ mod recorder_coverage_guard {
     /// and therefore are not compiled at all. Exempted rather than deleted here
     /// to keep this change to provenance; removing the dead constructor and the
     /// two dead directories is tracked separately.
+    /// Whole files exempt from guard 1. Only the recorder itself: `src/config.rs`
+    /// used to be here, and is now covered by the per-call `EXEMPT_CALLS` rows
+    /// below instead — the prose above them still described the old whole-file
+    /// waiver after the change.
     const EXEMPT: &[&str] = &["src/bin/vector_db_benchmark/effective_config.rs"];
 
     /// Individual reads that are allowed to stay raw, as (file, snippet, why).
@@ -1132,10 +1268,11 @@ mod recorder_coverage_guard {
     /// over: a `#[cfg(test)]` item with no brace of its own (a `const`) sent it
     /// hunting for the next `{` — the following function's body — deleting the
     /// production code in between; and its stated invariant ("string literals
-    /// here contain none") is false in at least five files (`start_gate.rs`,
-    /// `npy_reader.rs`, bin `config.rs`, `redis.rs`, `valkey.rs` all contain
-    /// `'{'` or `"{{"` literals), so the count desynchronised, the loop broke,
-    /// and whole test modules were scanned as production.
+    /// here contain none") is false — `engine/redis.rs` and `engine/valkey.rs`
+    /// carry `"{{"` literals and bin `config.rs` / `npy_reader.rs` carry `'{'`
+    /// — so the count desynchronised, the loop broke, and whole test modules
+    /// were scanned as production. (`start_gate.rs` was named in an earlier
+    /// revision of this comment and has none; the claim was not re-checked.)
     ///
     /// rustfmt guarantees a module's closing `}` sits at the module's own
     /// indentation, which is a far cheaper invariant than balanced braces and
@@ -1143,7 +1280,12 @@ mod recorder_coverage_guard {
     fn strip_test_modules(src: &str) -> String {
         // Comments first: a doc comment *mentioning* `#[cfg(test)] const` is
         // prose, not an item, and matching it truncated the scan.
-        let src = strip_line_comments(src);
+        // Line comments FIRST. A `///` doc comment mentioning a glob
+        // (`experiments/configurations/*.json`) contains `/*`, and stripping
+        // block comments first treated that as a real opener and ran to the end
+        // of the file — blanking 2300 lines of config.rs, `project_root`'s
+        // `env::current_dir()` among them. The exemption assertion caught it.
+        let src = strip_block_comments(&strip_line_comments(src));
         let lines: Vec<&str> = src.lines().collect();
         let mut out: Vec<&str> = Vec::with_capacity(lines.len());
         let mut i = 0usize;
@@ -1191,6 +1333,67 @@ mod recorder_coverage_guard {
             i += 1;
         }
         out.join("\n")
+    }
+
+    /// `strip_test_modules` has never had a test. Six over-strip bugs have been
+    /// found in it by hand across four review passes — a `#[cfg(test)] const`,
+    /// a bodiless `mod X;`, a `//`-commented closer, a block-commented fake
+    /// module, a block comment after a bodiless mod, and `//` inside a string
+    /// literal. Each silently removed production code from ALL FOUR
+    /// source-scanning guards.
+    ///
+    /// Direction matters: under-stripping shows up as a false positive somebody
+    /// must look at; over-stripping is invisible. Every case below therefore
+    /// asserts the production marker SURVIVES.
+    #[test]
+    fn strip_test_modules_never_removes_production_code() {
+        const CASES: &[(&str, &str)] = &[
+            (
+                "cfg-test-const-then-fn",
+                "#[cfg(test)]\nconst X: &[&str] = &[\"a\"];\nfn prod() { PRODUCTION }\n",
+            ),
+            (
+                "bodiless-mod-declaration",
+                "#[cfg(test)]\nmod filter_guard;\nfn prod() { PRODUCTION }\n",
+            ),
+            (
+                "bodiless-mod-then-block-comment",
+                "#[cfg(test)]\nmod filter_guard; /* note */\nfn prod() { PRODUCTION }\n",
+            ),
+            (
+                "commented-closer",
+                "#[cfg(test)]\nmod tests {\n    fn t() {}\n} // end of the tests\nfn prod() { PRODUCTION }\n",
+            ),
+            (
+                "block-commented-fake-module",
+                "/* #[cfg(test)]\nmod fake {\n} */\nfn prod() { PRODUCTION }\n",
+            ),
+            (
+                "glob-in-doc-comment",
+                "/// globs experiments/configurations/*.json\nfn prod() { PRODUCTION }\n",
+            ),
+            (
+                "slashes-inside-string-literal",
+                "fn u() { let _ = \"redis://h:6379/\"; }\nfn prod() { PRODUCTION }\n",
+            ),
+            (
+                "unterminated-module-fails-safe",
+                "#[cfg(test)]\nmod tests {\n    fn t() {}\nfn prod() { PRODUCTION }\n",
+            ),
+        ];
+        for (label, src) in CASES {
+            let out = strip_test_modules(src);
+            assert!(
+                out.contains("PRODUCTION"),
+                "[{label}] production code was stripped from the scan:\n{out}"
+            );
+        }
+
+        // …and the thing it IS for still works: a real test module goes away.
+        let real = "#[cfg(test)]\nmod tests {\n    fn t() { SECRET_TEST_ONLY }\n}\nfn prod() { PRODUCTION }\n";
+        let out = strip_test_modules(real);
+        assert!(!out.contains("SECRET_TEST_ONLY"), "{out}");
+        assert!(out.contains("PRODUCTION"), "{out}");
     }
 
     /// GUARD 1 — nothing outside the recorder reads the environment.
@@ -1249,13 +1452,81 @@ mod recorder_coverage_guard {
     /// source scan. `// TODO(#212): re-enable begin_experiment(…)` passed the
     /// unstripped version while every artifact shipped `declared: null`.
     fn strip_line_comments(src: &str) -> String {
+        // String-literal aware. A naive `find("//")` truncates 93 lines under
+        // `src/` at a `//` INSIDE a literal — `format!("redis://{}…")` in
+        // config.rs:35 among them — silently blinding all four source-scanning
+        // guards for the rest of those lines.
         src.lines()
-            .map(|l| match l.find("//") {
-                Some(i) => &l[..i],
-                None => l,
+            .map(|line| {
+                let b: Vec<char> = line.chars().collect();
+                let (mut i, mut in_str, mut esc) = (0usize, false, false);
+                while i < b.len() {
+                    let c = b[i];
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if c == '\\' {
+                            esc = true;
+                        } else if c == '"' {
+                            in_str = false;
+                        }
+                    } else if c == '"' {
+                        in_str = true;
+                    } else if c == '/' && i + 1 < b.len() && b[i + 1] == '/' {
+                        return b[..i].iter().collect::<String>();
+                    }
+                    i += 1;
+                }
+                line.to_string()
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Remove `/* … */` block comments before scanning.
+    ///
+    /// A commented-out `#[cfg(test)] mod fake {` inside a block comment made the
+    /// scanner strip from there to the next column-0 `}`, and a block comment
+    /// AFTER a bodiless `mod X;` defeated the `;` check. Both are over-strips:
+    /// production code silently leaves the scan.
+    fn strip_block_comments(src: &str) -> String {
+        let b: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let (mut i, mut depth, mut in_str, mut esc) = (0usize, 0usize, false, false);
+        while i < b.len() {
+            if depth == 0 && !in_str && b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            if depth > 0 {
+                if b[i] == '*' && i + 1 < b.len() && b[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                    continue;
+                }
+                // Keep newlines so line-oriented stripping still lines up.
+                if b[i] == '\n' {
+                    out.push('\n');
+                }
+                i += 1;
+                continue;
+            }
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if b[i] == '\\' {
+                    esc = true;
+                } else if b[i] == '"' {
+                    in_str = false;
+                }
+            } else if b[i] == '"' {
+                in_str = true;
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out
     }
 
     /// GUARD 3 — a cheap backstop; the real protection is the type.
@@ -1355,8 +1626,8 @@ mod recorder_coverage_guard {
             let mut rest = production.as_str();
             while let Some(i) = rest.find("env_var(") {
                 rest = &rest[i + "env_var(".len()..];
-                // Literal `"NAME"` argument; the two dynamic-name sites build
-                // their name with `format!` and are covered by their base var.
+                // Literal `"NAME"` argument only. The single non-literal site
+                // is pinned separately below; see NON_LITERAL_ENV_VAR_SITES.
                 if let Some(stripped) = rest.strip_prefix('"') {
                     if let Some(end) = stripped.find('"') {
                         actual.push(stripped[..end].to_string());
@@ -1400,11 +1671,25 @@ mod recorder_coverage_guard {
             }
         }
         dynamic.sort();
-        dynamic.dedup();
-        let documented: Vec<String> = NON_LITERAL_ENV_VAR_SITES
+        // NOT deduped: the comment claimed this pinned the COUNT and it deduped
+        // file paths, so a SECOND dynamic site in the same file collapsed to one
+        // entry and passed — the "documented as asserted, actually a skip-list"
+        // failure again.
+        let mut documented: Vec<String> = NON_LITERAL_ENV_VAR_SITES
             .iter()
             .map(|(f, _, _)| f.to_string())
             .collect();
+        documented.sort();
+        // The named function must exist, too: a row may not outlive its site.
+        for (file, function, _why) in NON_LITERAL_ENV_VAR_SITES {
+            let found = rust_sources()
+                .iter()
+                .any(|(p, src)| p == file && src.contains(&format!("fn {function}")));
+            assert!(
+                found,
+                "NON_LITERAL_ENV_VAR_SITES names {file}::{function}, which no longer exists"
+            );
+        }
         assert_eq!(
             dynamic, documented,
             "the set of `env_var` sites taking a NON-LITERAL name changed. Such a \
@@ -1611,26 +1896,6 @@ mod tests {
     }
 
     #[test]
-    fn connection_string_userinfo_is_stripped_but_host_kept() {
-        let mut r = Recorder::new();
-        r.observe_env("REDIS_URI", Some("redis://admin:hunter2@10.0.0.5:6379/0"));
-        r.observe_env("QDRANT_URL", Some("http://qdrant.internal:6334"));
-        let s = r.snapshot();
-        let uri = s["env"]["REDIS_URI"].as_str().unwrap();
-        assert!(!uri.contains("hunter2"), "password leaked: {uri}");
-        assert!(uri.contains("10.0.0.5:6379"), "host lost: {uri}");
-        // A URL with no userinfo is untouched.
-        assert_eq!(s["env"]["QDRANT_URL"], "http://qdrant.internal:6334");
-    }
-
-    #[test]
-    fn strip_userinfo_leaves_non_urls_alone() {
-        assert_eq!(strip_userinfo("localhost:6379"), "localhost:6379");
-        assert_eq!(strip_userinfo(""), "");
-        assert_eq!(strip_userinfo("http://h/p@th"), "http://h/p@th");
-    }
-
-    #[test]
     fn override_keeps_both_sides() {
         let mut r = Recorder::new();
         r.note_override(
@@ -1769,151 +2034,58 @@ mod tests {
         assert_no_cleartext_secrets(&doc, false, "engine_params");
     }
 
-    /// Name-based redaction cannot see a secret INSIDE the value of a
-    /// non-credential key. libpq DSNs are the live shape.
-    #[test]
-    fn dsn_embedded_password_is_blanked() {
-        let mut r = Recorder::new();
-        r.record_effective(
-            "PGVECTOR_DSN",
-            json!("host=db user=bench password=DSN-CANARY sslmode=require"),
-        );
-        let out = r.snapshot()["effective"]["PGVECTOR_DSN"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(!out.contains("DSN-CANARY"), "{out}");
-        // The parts that are provenance survive.
-        assert!(out.contains("host=db"), "{out}");
-        assert!(out.contains("sslmode=require"), "{out}");
-    }
-
-    /// A quoted libpq value may contain spaces. Splitting on whitespace first —
-    /// which is what this function did when it was added — redacted up to the
-    /// first space and published the rest of the password verbatim.
-    #[test]
-    fn dsn_quoted_password_containing_spaces_is_fully_blanked() {
-        for dsn in [
-            "host=db password='LEAKONE LEAKTWO LEAKTHREE' sslmode=require",
-            "host=db password=\"LEAKONE LEAKTWO LEAKTHREE\" sslmode=require",
-            "password='LEAKONE LEAKTWO LEAKTHREE'",
-            "host=db password='LEAKONE LEAKTWO LEAKTHREE'",
-        ] {
-            let out = strip_dsn_secrets(dsn);
-            for canary in ["LEAKONE", "LEAKTWO", "LEAKTHREE"] {
-                assert!(!out.contains(canary), "{dsn} -> {out}");
-            }
-        }
-        // The shapes that already worked must keep working.
-        let out = strip_dsn_secrets("host=db  PASSWORD=bare\tapi_key=k sslmode=require");
-        assert!(!out.contains("bare") && !out.contains("=k"), "{out}");
-        assert!(out.contains("host=db"), "{out}");
-        assert!(out.contains("sslmode=require"), "{out}");
-        // A non-secret key keeps its quoted value intact.
-        assert_eq!(
-            strip_dsn_secrets("options='-c statement_timeout=5s'"),
-            "options='-c statement_timeout=5s'"
-        );
-    }
-
-    /// **B1 regression.** A password in a URL QUERY STRING, which is the other
-    /// way `--host` carries one.
+    /// The full corpus of connection-string shapes reported across four review
+    /// rounds, plus the tokeniser-desync probes that showed the block-list
+    /// approach could not be finished.
     ///
-    /// `strip_userinfo` declines (no `@`) and the old whitespace splitter read
-    /// the key as `mongodb://h.example/db?w` — not credential-named — so the
-    /// password was copied through into `invocation.host` in all three file
-    /// kinds.
-    ///
-    /// The `authSource` cases are load-bearing: they passed BEFORE the fix, by
-    /// accident, because the first key contains `AUTH` and that blanked the
-    /// whole tail. Every case below therefore also appears with a benign
-    /// leading option, so the accidental masking cannot make a regression look
-    /// green.
+    /// Under the allow-list design none of these needed to be predicted: the
+    /// parameter names are simply not recognised, so their values never reach
+    /// the artifact.
     #[test]
-    fn query_string_password_is_blanked_whatever_precedes_it() {
-        for value in [
-            "mongodb://h.example/db?w=majority&password=CANARYQ",
-            "mongodb://h.example/db?retryWrites=true&password=CANARYQ",
-            "redis://h:6379/0?db=1&password=CANARYQ",
-            "h.example:27017/?ssl=true&password=CANARYQ",
-            "mongodb://h.example/db?authSource=admin&password=CANARYQ",
-            "mongodb+srv://h/db?w=1&authToken=CANARYQ&ssl=true",
-            "jdbc:postgresql://h:5432/db?user=u&password=CANARYQ",
-            "user=u&password=CANARYQ&ssl=true",
-            "Server=h;Database=d;Uid=u;Pwd=CANARYQ;",
-            "Server=h;Password=CANARYQ;Encrypt=yes",
-        ] {
-            let out = strip_dsn_secrets(value);
-            assert!(!out.contains("CANARYQ"), "{value} -> {out}");
-        }
-
-        // Through the real snapshot path, on the flag the leak was found on.
-        let mut r = Recorder::new();
-        r.set_invocation(json!({
-            "host": "mongodb://h.example/db?w=majority&password=CANARYLIVE"
-        }));
-        let s = r.snapshot();
-        assert!(
-            !serde_json::to_string(&s).unwrap().contains("CANARYLIVE"),
-            "{}",
-            s["invocation"]["host"]
-        );
-        // Host, path and the benign option survive.
-        let host = s["invocation"]["host"].as_str().unwrap();
-        assert!(host.contains("h.example/db"), "{host}");
-        assert!(host.contains("w=majority"), "{host}");
-    }
-
-    /// The nine shapes a 44-case corpus scan found still leaking after the
-    /// first DSN fix. `spaces-around-eq` matters most: PostgreSQL documents
-    /// spaces around `=` as optional, and libpq is the family this function
-    /// exists for.
-    #[test]
-    fn structured_secret_shapes_that_previously_leaked() {
-        for (label, value) in [
-            ("spaces-around-eq", "password = CANARYX host=db"),
-            ("space-before-eq", "password =CANARYX"),
-            ("space-after-eq", "password= CANARYX"),
-            ("sql-doubled-quote", "password='ab''CANARYX'"),
-            ("pwd", "pwd=CANARYX"),
-            ("pwd-upper", "PWD=CANARYX"),
-            (
-                "jdbc",
-                "jdbc:postgresql://h:5432/db?user=u&password=CANARYX",
-            ),
-            ("amp-separated", "user=u&password=CANARYX&ssl=true"),
-            ("semicolon-odbc", "Server=h;Database=d;Uid=u;Pwd=CANARYX;"),
-            (
-                "semicolon-odbc-pass",
-                "Server=h;Password=CANARYX;Encrypt=yes",
-            ),
-        ] {
-            let out = strip_dsn_secrets(value);
-            assert!(!out.contains("CANARYX"), "[{label}] {value} -> {out}");
+    fn no_connection_string_shape_publishes_its_credential() {
+        for (label, value) in CONNECTION_SHAPE_CORPUS {
+            let out = redact_connection_like(value);
+            assert!(!out.contains("CANARY"), "[{label}] {value} -> {out}");
         }
     }
 
-    /// Non-secret pairs must come through byte for byte — spacing, quoting and
-    /// separators included. Over-redaction here destroys provenance.
+    /// The provenance the reconstruction is supposed to keep. Losing all of it
+    /// would be a safe redactor and a useless one.
     #[test]
-    fn non_secret_pairs_are_reproduced_verbatim() {
-        for value in [
-            "options='-c statement_timeout=5s'",
-            "host=db sslmode=require connect_timeout=10",
-            "mongodb://h.example/db?w=majority&retryWrites=true",
-            "Server=h;Database=d;Encrypt=yes",
-            "http://h/a=b",
-            "host = db",
-            "no_pairs_here",
+    fn reconstruction_keeps_the_parts_that_identify_the_server() {
+        let cases = [
+            (
+                "mongodb://h.example/db?w=majority&password=X",
+                "mongodb://h.example/db?w=majority&password=<dropped>",
+            ),
+            (
+                "redis://admin:pw@10.0.0.5:6379/0",
+                "redis://<redacted:userinfo>@10.0.0.5:6379/0",
+            ),
+            ("default:pw@127.0.0.1", "<redacted:userinfo>@127.0.0.1"),
+            ("host=db sslmode=require", "host=db&sslmode=require"),
+            ("mongodb://[::1]:27017/db", "mongodb://[::1]:27017/db"),
+        ];
+        for (input, expect) in cases {
+            assert_eq!(redact_connection_like(input), expect, "input: {input}");
+        }
+        // A value with none of the connection-string markers is the identity —
+        // which is the overwhelming majority of what gets recorded.
+        for plain in [
+            "localhost",
+            "127.0.0.1",
+            "idx:redis-docker-test",
+            "bench",
+            "redis-docker-test:",
+            "FLOAT32",
+            "hnsw",
+            "us-central1",
+            "/home/u/experiments/configurations",
+            "int8_hnsw",
             "",
         ] {
-            assert_eq!(strip_dsn_secrets(value), value, "mangled: {value}");
+            assert_eq!(redact_connection_like(plain), plain, "mangled: {plain}");
         }
-        // Mixed: the secret goes, everything around it stays.
-        assert_eq!(
-            strip_dsn_secrets("host=db password='a b c' sslmode=require"),
-            format!("host=db password={REDACTED} sslmode=require")
-        );
     }
 
     /// An override ON a credential knob must still record the knob's NAME and
@@ -1965,26 +2137,6 @@ mod tests {
         assert_eq!(headers[1]["key"], "Content-Type");
         assert_eq!(headers[1]["value"], "application/json");
         assert!(!serde_json::to_string(&s).unwrap().contains("HEADER-CANARY"));
-    }
-
-    /// `strip_userinfo` computed the authority boundary BEFORE looking for `@`,
-    /// so an unencoded `/` in a password returned the URL untouched.
-    #[test]
-    fn userinfo_is_stripped_even_when_the_password_breaks_url_syntax() {
-        for (input, must_not_contain) in [
-            ("redis://admin:hunt/er2@10.0.0.5:6379/0", "hunt/er2"),
-            ("redis://admin:hu?nt@10.0.0.5:6379/0", "hu?nt"),
-            ("redis://admin:h#nt@10.0.0.5:6379/0", "h#nt"),
-            ("default:plainpw@127.0.0.1", "plainpw"),
-            ("mongodb+srv://u:mongopw@cluster.example.net", "mongopw"),
-        ] {
-            let out = strip_userinfo(input);
-            assert!(!out.contains(must_not_contain), "{input} -> {out}");
-        }
-        // A path containing `@` but no `user:pass` shape is left alone.
-        assert_eq!(strip_userinfo("http://h/p@th"), "http://h/p@th");
-        assert_eq!(strip_userinfo("localhost:6379"), "localhost:6379");
-        assert_eq!(strip_userinfo("127.0.0.1"), "127.0.0.1");
     }
 
     /// The marker list missed whole families. `"AUTH_TOKEN".contains("_AUTH")`
@@ -2043,8 +2195,10 @@ mod tests {
     ///
     /// The previous guard was `a_sweep_does_not_inherit_the_previous_configs_knobs`,
     /// which relied on residue other tests happened to leave in the global
-    /// recorder: measured at 7 red / 4 green over 11 default-threaded runs and
-    /// **3/3 GREEN run alone**. `begin_clears_every_accumulating_field` could
+    /// recorder: 2 red / 9 green over 11 default-threaded runs, 3/3 GREEN under
+    /// `--test-threads=1`, and 3/3 RED only when run alone.
+    /// (An earlier revision of this comment said "7 red / 4 green" for the same
+    /// 11 runs — two figures for one measurement, neither re-derived.) `begin_clears_every_accumulating_field` could
     /// never catch it at all, because it exercises `Recorder::begin`, which the
     /// mutation does not touch. This one seeds every accumulating field
     /// explicitly, so deleting `reset()` from `begin_experiment` fails it

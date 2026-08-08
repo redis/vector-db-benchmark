@@ -2615,6 +2615,23 @@ mod tests {
             // which made this inventory weaker than `KNOWN_UNRECORDED`.
             // `NON_BOOL_INVOCATION_KEYS` are the deliberately hand-maintained
             // non-boolean entries.
+            // REQUIRED, not merely permitted. Listing them in
+            // NON_BOOL_INVOCATION_KEYS made them look guarded while deleting
+            // either from `invocation_provenance` stayed green — the same
+            // unguarded-claim shape as the original defect.
+            for required in [
+                "host",
+                "repetitions",
+                "warmup_seconds",
+                "configurations_dir",
+                "results_dir",
+            ] {
+                assert!(
+                    recorded.contains_key(required),
+                    "`invocation.{required}` is documented as recorded and is not"
+                );
+            }
+
             const NON_BOOL_INVOCATION_KEYS: &[&str] = &[
                 "host",
                 "engines_file",
@@ -2778,34 +2795,64 @@ mod tests {
             assert_eq!(d["results"], other["results"]);
         }
 
-        /// B1, at the layer that writes the file.
+        /// Every connection-string shape, asserted against the BYTES ON DISK.
         ///
-        /// `save_search_results` is `serde_json::to_string_pretty` over exactly
-        /// this document, so asserting on the serialized bytes here is
-        /// asserting on what lands in `results/`. Driving it end-to-end through
-        /// the binary is not possible for this shape — every client rejects
-        /// `?password=` as an unknown option before a file is written — which is
-        /// precisely why the redactor must not rely on the driver refusing it.
+        /// The previous version of this test asserted on the serialized document
+        /// in memory, justified by a comment claiming "every client rejects
+        /// `?password=` as an unknown option before a file is written". That was
+        /// false — `REDIS_URI=redis://127.0.0.1:6411/?password=X` completes with
+        /// rc=0 and writes three files — and building the test on that premise
+        /// is precisely what let seven further shapes survive a round. So this
+        /// writes real files through the real serializer and greps them.
         #[test]
-        fn a_query_string_password_never_reaches_the_written_document() {
+        fn no_shape_reaches_the_files_on_disk() {
             let _l = crate::effective_config::test_lock();
-            for host in [
-                "mongodb://h.example/db?w=majority&password=CANARYDOC",
-                "mongodb://h.example/db?retryWrites=true&password=CANARYDOC",
-                "redis://h:6379/0?db=1&password=CANARYDOC",
-                "h.example:27017/?ssl=true&password=CANARYDOC",
-                "default:CANARYDOC@127.0.0.1",
-            ] {
+            let dir = tempfile::tempdir().unwrap();
+
+            for (label, host) in crate::effective_config::CONNECTION_SHAPE_CORPUS {
                 crate::effective_config::reset();
                 crate::effective_config::set_invocation(serde_json::json!({"host": host}));
-                let written =
-                    serde_json::to_string_pretty(&doc(&crate::effective_config::snapshot()))
-                        .unwrap();
-                assert!(
-                    !written.contains("CANARYDOC"),
-                    "{host} would be written to results/ as:\n{written}"
-                );
+                let snap = crate::effective_config::snapshot();
+
+                // Both artifact kinds, through the same serializer the save
+                // functions use.
+                let search = serde_json::to_string_pretty(&doc(&snap)).unwrap();
+                let upload = serde_json::to_string_pretty(&super::super::build_upload_result_json(
+                    "e",
+                    "d",
+                    &crate::engine::UploadStats::default(),
+                    None,
+                    &snap,
+                ))
+                .unwrap();
+
+                for (kind, bytes) in [("search", &search), ("upload", &upload)] {
+                    let path = dir.path().join(format!("{kind}.json"));
+                    std::fs::write(&path, bytes).unwrap();
+                    let on_disk = std::fs::read_to_string(&path).unwrap();
+                    assert!(
+                        !on_disk.contains("CANARY"),
+                        "[{label}] {kind} file on disk contains the credential:\n{on_disk}"
+                    );
+                }
             }
+
+            // And the summary, which writes its own file for real.
+            crate::effective_config::reset();
+            crate::effective_config::set_invocation(serde_json::json!({
+                "host": "mongodb://h/db?w=majority&password=CANARY"
+            }));
+            crate::summary::save_summary(
+                "e",
+                "d",
+                &[],
+                None,
+                dir.path(),
+                &crate::effective_config::snapshot(),
+            )
+            .unwrap();
+            let summary = std::fs::read_to_string(dir.path().join("e-d-summary.json")).unwrap();
+            assert!(!summary.contains("CANARY"), "{summary}");
         }
 
         /// The block is present, and shaped, on every search result.
