@@ -365,9 +365,22 @@ fn engines() -> Vec<(&'static str, EngineResolver)> {
                 Ok(super::milvus::parse_milvus_conditions(v))
             })
         }),
-        ("mongodb", |c, _| {
+        // MongoDB picks its query stage — and therefore its filter GRAMMAR —
+        // from the dataset schema: a geo-carrying dataset uses `$search` +
+        // the `vectorSearch` operator (the only MongoDB vector path with a geo
+        // pre-filter), everything else uses `$vectorSearch`. The resolver
+        // reproduces exactly that rule, so this column tests what production
+        // sends rather than a third code path.
+        ("mongodb", |c, schema| {
+            let declared = serde_json::json!(schema);
+            let dialect_is_search = super::mongodb_engine::schema_declares_geo(Some(&declared));
             through("MongoDB", c, |v| {
-                Ok(super::mongodb_engine::parse_mongo_conditions(v).map(|d| format!("{d:?}")))
+                if dialect_is_search {
+                    super::mongodb_engine::parse_mongo_search_conditions(v)
+                        .map(|d| d.map(|d| format!("{d:?}")))
+                } else {
+                    Ok(super::mongodb_engine::parse_mongo_conditions(v).map(|d| format!("{d:?}")))
+                }
             })
         }),
         ("pgvector", |c, _| {
@@ -439,48 +452,46 @@ fn through(
 /// every entry must name an engine and a shape that actually exist — all three
 /// are asserted, so an exemption cannot outlive the thing it exempts.
 const KNOWN_GAPS: &[(&str, &str, &str)] = &[
-    // ── #223: geo dropped by 5 engines on the 2 shipped geo-FILTER datasets ──
+    // ── #223: geo ───────────────────────────────────────────────────────────
     // (four datasets are geo-*named*; the two `-no-filters` twins are
     // `"conditions": null` throughout and stay green).
-    // Before this PR each of these returned `None` and the query ran with NO
-    // filter at all, scored against geo-filtered ground truth. The guard does
-    // not fix the gap; it stops the wrong number. Redis, Valkey, Dragonfly,
-    // Elasticsearch, OpenSearch, Weaviate, pgvector and Qdrant express geo.
-    (
-        "vectorsets",
-        "and_geo",
-        "#223 — was silently dropped, now refused",
-    ),
-    ("vectorsets", "and_geo_x2", "#223"),
-    ("vectorsets", "or_geo_x2", "#223"),
-    (
-        "milvus",
-        "and_geo",
-        "#223 — was silently dropped, now refused",
-    ),
-    ("milvus", "and_geo_x2", "#223"),
-    ("milvus", "or_geo_x2", "#223"),
+    //
+    // VectorSets, Milvus and MongoDB used to sit here and now express geo:
+    // VectorSets by comparing the stored unit vector against a cosine threshold
+    // (`engine::geo`), Milvus with the native `ST_DWITHIN` on a `Geometry`
+    // column, MongoDB with `geoWithin`/`circle` inside a `$search` stage. Redis,
+    // Valkey, Dragonfly, Elasticsearch, OpenSearch, Weaviate, pgvector and
+    // Qdrant already did.
+    //
+    // Chroma and Turbopuffer remain, and the entries below are the evidence
+    // rather than a TODO. Both filter DSLs are a CLOSED enum of
+    // `field OP literal` comparisons — Chroma:
+    // `$eq $ne $gt $gte $lt $lte $in $nin $and $or`; Turbopuffer:
+    // `Eq NotEq In NotIn Lt Lte Gt Gte Any* Contains* Glob* Regex
+    // ContainsAllTokens ContainsAnyToken ContainsTokenSequence Fuzzy And Or Not`
+    // — with no geo primitive, no attribute-vs-attribute comparison, and no
+    // arithmetic anywhere in the filter grammar (Turbopuffer's arithmetic lives
+    // in `rank_by`, which its docs state "never affect[s] matching"). That
+    // closes every exact encoding: a spherical cap is not an axis-aligned box in
+    // any query-INDEPENDENT coordinate system, so no conjunction of range
+    // comparisons can carve it out, and the linear `x*qx + y*qy + z*qz >= c`
+    // form the other two use needs cross-field arithmetic neither has. A
+    // bounding box would admit up to √2·r away and is a widening, i.e. exactly
+    // the silently-wrong recall #219 exists to stop.
     (
         "turbopuffer",
         "and_geo",
-        "#223 — was silently dropped, now refused",
+        "#223 — no geo operator and no arithmetic in the filter grammar",
     ),
     ("turbopuffer", "and_geo_x2", "#223"),
     ("turbopuffer", "or_geo_x2", "#223"),
     (
         "chroma",
         "and_geo",
-        "#223 — was silently dropped, now refused",
+        "#223 — `where` is a closed enum of field-OP-literal comparisons",
     ),
     ("chroma", "and_geo_x2", "#223"),
     ("chroma", "or_geo_x2", "#223"),
-    (
-        "mongodb",
-        "and_geo",
-        "#223 — was silently dropped, now refused",
-    ),
-    ("mongodb", "and_geo_x2", "#223"),
-    ("mongodb", "or_geo_x2", "#223"),
     // Already an explicit `Err` on master — behaviour unchanged by this PR.
     (
         "kividb",
@@ -609,7 +620,7 @@ fn every_shipped_condition_shape_is_expressible_or_a_tracked_gap() {
     );
     assert_eq!(
         (filtered, rejected),
-        (229, 26),
+        (238, 17),
         "the expressible/refused split changed — say why in the PR body"
     );
 }
@@ -624,7 +635,7 @@ fn every_known_gap_maps_to_a_live_cell() {
     let engine_names: Vec<&str> = engines().iter().map(|(n, _)| *n).collect();
     assert_eq!(
         KNOWN_GAPS.len(),
-        26,
+        17,
         "KNOWN_GAPS size changed — was that deliberate?"
     );
     for (engine, shape, why) in KNOWN_GAPS {

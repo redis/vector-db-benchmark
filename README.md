@@ -35,7 +35,7 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 \*\*\*\* **Vertex AI note:** Uses **Vertex AI Vector Search** (Google Cloud) — a STREAM_UPDATE tree-AH index streamed with `upsertDatapoints`, queried with `findNeighbors`. Cloud-only (no local server), like Turbopuffer. **Metadata filters** are supported: on upload, string/`labels` fields become categorical `restricts` and int/float fields become `numericRestricts` on each datapoint; on query, `match`/`range` conditions translate to Vertex query restrictions over REST **and** both gRPC transports. Vertex restrictions AND across fields and OR within a field's `allowList`, so an `and` of per-field conditions maps directly — but a filter Vertex cannot express (cross-field `or`, nested boolean, a numeric `match_any` IN-list, or geo) is a **hard error** rather than a silently partial filter. **Mixed workload** (`--update-search-ratio`) is supported: each worker interleaves S `findNeighbors` searches with U single-datapoint `upsertDatapoints` updates, reporting search recall/latency alongside update RPS/latency. Required: `VERTEX_PROJECT`; auth is `VERTEX_ACCESS_TOKEN` if set, else `gcloud auth print-access-token`. Optional: `VERTEX_REGION` (default `us-central1`), `VERTEX_MACHINE_TYPE` (default `e2-standard-16`), `VERTEX_DEPLOY_TIMEOUT_SECS` (default `3600`), and index-tuning knobs `VERTEX_APPROX_NEIGHBORS` / `VERTEX_LEAF_EMBEDDING_COUNT` / `VERTEX_LEAF_SEARCH_PERCENT`. **Deploying an index takes tens of minutes**; to skip the create+deploy step, point at an already-deployed index with `VERTEX_INDEX`, `VERTEX_INDEX_ENDPOINT`, and `VERTEX_DEPLOYED_INDEX_ID` (in that case the tool leaves those resources in place on cleanup). Query-time recall/latency is tuned per search config via `search_params.fraction_leaf_nodes_to_search_override` (0..1) and `num_candidates` (→ `approximateNeighborCount`). A config's `num_candidates` is honored (clamped to `top`, which Vertex requires as the floor); when it's **unset** the query runs at the index's own configured `approximateNeighborsCount` sent **explicitly** — never Vertex's silent `0` "use index default" sentinel — and the effective knobs are **logged per config** (`Vertex effective search knobs: approximateNeighborCount=… (config|index-default), …`) so a sweep point is honestly labeled rather than silently measured at the default (fairness gate, #200). Upload streams `upsertDatapoints` concurrently (`upload_params.parallel`); each `upsertDatapoints` request is bounded by payload size, so **very wide datasets may need a smaller `batch_size`** than the default 1000 to stay under the request limit. **Batch ingest (experimental, #187):** setting `VERTEX_GCS_STAGING_BUCKET` switches the index to `BATCH_UPDATE` and, on upload, stages every datapoint to a JSONL object under `gs://<bucket>/vdbb-batch/<display-name>/` and triggers a single index rebuild via `contentsDeltaUri` — avoiding the per-project streaming write quota on large corpora (`VERTEX_BATCH_THRESHOLD`, default `100000`, is the recommended cross-over size). This path was **live-validated** (1000×8d ingested to `vectorsCount=1000` in ~1 min on a fresh `BATCH_UPDATE` index); it ships behind the opt-in env var, so leave the bucket unset for the default streaming ingest.
 
 <a id="chroma-note"></a>
-\*\*\*\*\* **Chroma note:** Uses **Chroma** (OSS) via its **v2 REST API** — a collection of records (`ids` + `embeddings` + scalar `metadatas`) queried with `query` + a `where` document. **Metadata filters** map directly onto the canonical model: `match` → `$eq`, `match_any` → `$in`, `range` → `$gte`/`$gt`/`$lte`/`$lt`, and **AND / OR / nested boolean** to Chroma's native `$and` / `$or` (which nest arbitrarily). Supported datatypes: **keyword, int, float, bool, uuid, datetime** (stored as epoch-seconds int, like Milvus, so numeric range operators apply). **Full-text** (`{match:{text}}`) is supported via `where_document` `$contains` — the `text`-typed field's value is uploaded as each record's Chroma `document`. **NOT supported** by Chroma's metadata engine: **geo-radius** and multi-valued **`labels` arrays** (Chroma metadata values are scalar only). Since #219 these are a hard **error**, not a silent drop — see the note below. Runs over HTTP/REST via Docker; set the host port with `CHROMA_PORT` (default `8000`, test compose maps `8003`), and optionally `CHROMA_COLLECTION` / `CHROMA_TENANT` / `CHROMA_DATABASE`. Distance space (`l2`/`cosine`/`ip`) is set per collection from the dataset metric.
+\*\*\*\*\* **Chroma note:** Uses **Chroma** (OSS) via its **v2 REST API** — a collection of records (`ids` + `embeddings` + scalar `metadatas`) queried with `query` + a `where` document. **Metadata filters** map directly onto the canonical model: `match` → `$eq`, `match_any` → `$in`, `range` → `$gte`/`$gt`/`$lte`/`$lt`, and **AND / OR / nested boolean** to Chroma's native `$and` / `$or` (which nest arbitrarily). Supported datatypes: **keyword, int, float, bool, uuid, datetime** (stored as epoch-seconds int, like Milvus, so numeric range operators apply). **Full-text** (`{match:{text}}`) is supported via `where_document` `$contains` — the `text`-typed field's value is uploaded as each record's Chroma `document`. **NOT supported** by Chroma's metadata engine: **geo-radius** and multi-valued **`labels` arrays** (Chroma metadata values are scalar only). Geo is a *permanent* gap, not a to-do: Chroma's `where` is a closed enum of `field OP literal` comparisons with no geospatial operator, no attribute-vs-attribute comparison and no arithmetic, and a spherical cap is not an axis-aligned box in any query-independent coordinate system — so there is no exact encoding, and an inexact bounding box would under-constrain the query while looking filtered (#223). Since #219 these are a hard **error**, not a silent drop — and a condition tree containing a geo leaf is refused *whole*, so a `geo AND keyword` query cannot quietly run as keyword-only. See the note below. Runs over HTTP/REST via Docker; set the host port with `CHROMA_PORT` (default `8000`, test compose maps `8003`), and optionally `CHROMA_COLLECTION` / `CHROMA_TENANT` / `CHROMA_DATABASE`. Distance space (`l2`/`cosine`/`ip`) is set per collection from the dataset metric.
 
 <a id="unexpressible-filter-note"></a>
 ### Filters an engine cannot express are a hard error (#219)
@@ -51,20 +51,20 @@ Which shipped dataset/engine pairs this stops today:
 
 | dataset | engines that now abort | why |
 |---|---|---|
-| `random-geo-radius-100-angular-filters`, `random-geo-radius-2048-angular-filters` | vectorsets, milvus, turbopuffer, chroma, mongodb | no geo in the builder (#223). These previously ran and published a plausible recall that was really the *unfiltered* one. |
+| `random-geo-radius-100-angular-filters`, `random-geo-radius-2048-angular-filters` | turbopuffer, chroma | neither filter DSL has a geo operator, an attribute-vs-attribute comparison, or any arithmetic, so an exact radius has no representation at all (#223). A bounding box is a *widening*, not a substitute. |
 | the same two | kividb, vertex | already aborted before #219 |
 | `arxiv-titles-384-angular-filters` | kividb | multi-valued `labels` (see the KiviDB note) |
 
 Two operational consequences worth knowing:
 
 * **The check runs in `search()`, after `configure()` and `upload()`.** On the
-  geo datasets, milvus/mongodb/chroma/turbopuffer/vectorsets will ingest the
-  whole corpus and *then* abort. KiviDB is the exception — it rejects in
+  geo datasets, chroma/turbopuffer will ingest the whole corpus and *then*
+  abort. KiviDB is the exception — it rejects in
   `configure()`, before any ingest. Moving the check earlier for the other five
   needs the dataset's conditions at configure time and is tracked separately;
   until then, budget the ingest time or exclude those datasets up front.
 * **With the default `--exit-on-error true`, one refusal ends the sweep.** A
-  `--engines '*' --datasets 'random-geo*'` run aborts at the first of the five.
+  `--engines '*' --datasets 'random-geo*'` run aborts at the first refusal.
   Pass `--exit-on-error false` to let the rest of the matrix finish; each
   failure then prints `Experiment failed: [config=… dataset=…] …` so the
   refusal can be traced back to its sweep point.
@@ -509,7 +509,12 @@ Across the filtering engines, metadata `conditions` support the datatypes
 **nested/grouped** trees (e.g. `(A∧B)∨(C∧D)`); plus **multi-tenancy** (per-tenant
 scoped filters). Not every engine supports every feature natively — see each
 engine's note above for its exceptions (e.g. Dragonfly is KNN-only; Chroma has no
-geo/full-text/array metadata; Vertex errors on cross-field `or`/nested/geo). Each
+geo or array metadata; Turbopuffer has no geo; Vertex errors on cross-field
+`or`/nested/geo). **geo-radius** is now expressed by every engine except those
+three and KiviDB: Qdrant/Redis/Valkey/Elasticsearch/OpenSearch/Weaviate/pgvector
+natively, Milvus via a `Geometry` column and `ST_DWITHIN`, MongoDB via
+`geoWithin` inside a `$search` pre-filter, and VectorSets via an exact
+unit-vector dot product in its `FILTER` expression (#223). Each
 `(engine × feature)` combination is covered by an end-to-end `tests/integration_*`
 recall test that scores against filtered brute-force ground truth, so an engine
 that silently drops or mis-applies a filter fails its test.

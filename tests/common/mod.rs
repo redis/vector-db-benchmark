@@ -874,6 +874,146 @@ pub fn write_geo_project(
     )
 }
 
+// ── Bounding-box-discriminating geo fixture (issue #223) ────────────────────
+//
+// [`write_geo_project`] puts every document on ONE meridian, so a lat/lon
+// BOUNDING BOX and a great-circle CIRCLE of the same radius select the identical
+// set: it proves a geo filter was applied, but it cannot tell a correct radius
+// from a box that merely contains it. Every "cheap" geo implementation (a
+// bounding box, an equirectangular approximation) passes it.
+//
+// This fixture is built to fail those. 400 documents sit in the lat/lon box of
+// half-width `radius` around the query point:
+//
+//   * 100 within 0.71 · radius of the centre — INSIDE both the circle and the box;
+//   * 300 in the four corner regions, each at least 1.10 · radius away —
+//     OUTSIDE the circle, INSIDE the box.
+//
+// Ground truth is the top-10 over the 100 in-circle documents only (25 %
+// selectivity). An engine applying the true radius scores ~1.0; an engine
+// applying the bounding box, or no filter at all, searches all 400 and lands
+// roughly a quarter of the correct neighbours — around 0.25, far below the 0.9
+// floor every filter test in this repo asserts.
+//
+// `tests/integration_redis.rs` runs it against RediSearch's native
+// `@f:[lon lat r m]` as a control, so a failure here is the engine, not the
+// fixture.
+
+/// Fraction of `radius` at which the four corner clusters sit, per axis. Each
+/// component is ≤ 0.98 (inside the box) and the pair is ≥ √1.21 = 1.10 · radius
+/// from the centre (outside the circle), so no document is near the boundary.
+const GEO_CORNER_MIN: f64 = 0.78;
+const GEO_CORNER_MAX: f64 = 0.98;
+
+/// L2 variant of the bounding-box-discriminating geo fixture.
+pub fn write_geo_corner_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_geo_corner_project_metric(dataset_name, engine_configs_json, dim, GtMetric::L2)
+}
+
+/// Cosine variant, for engines that rank by cosine intrinsically (VectorSets).
+pub fn write_geo_corner_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_geo_corner_project_metric(dataset_name, engine_configs_json, dim, GtMetric::Cosine)
+}
+
+/// Degrees of latitude / longitude per metre at `lat`, used only to PLACE the
+/// documents. Every in/out decision is made with [`haversine_m`], so this local
+/// flat approximation cannot make the ground truth wrong — only the layout
+/// slightly uneven, which the wide margins absorb.
+fn geo_corner_offsets(lat: f64, radius_m: f64) -> (f64, f64) {
+    const M_PER_DEG_LAT: f64 = 111_320.0;
+    (
+        radius_m / M_PER_DEG_LAT,
+        radius_m / (M_PER_DEG_LAT * lat.to_radians().cos()),
+    )
+}
+
+fn write_geo_corner_project_metric(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    metric: GtMetric,
+) -> FilterProject {
+    let (q_lat, q_lon) = (40.0_f64, -74.0_f64);
+    let radius = 20_000.0_f64;
+    let (d_lat, d_lon) = geo_corner_offsets(q_lat, radius);
+
+    // (lat, lon) for document `id`. 0..99 inside the circle, 100..399 in the
+    // four corners of the box.
+    let loc = move |id: usize| -> (f64, f64) {
+        if id < 100 {
+            // 10x10 grid over [-0.5, 0.5]^2 of the box half-widths: at most
+            // 0.707 · radius from the centre.
+            let (u, v) = (-0.5 + (id % 10) as f64 / 9.0, -0.5 + (id / 10) as f64 / 9.0);
+            (q_lat + v * d_lat, q_lon + u * d_lon)
+        } else {
+            let k = id - 100;
+            let span = GEO_CORNER_MAX - GEO_CORNER_MIN;
+            let (u, v) = (
+                GEO_CORNER_MIN + span * (k % 15) as f64 / 14.0,
+                GEO_CORNER_MIN + span * ((k / 15) % 5) as f64 / 4.0,
+            );
+            let (su, sv) = ((k / 75) % 2, (k / 150) % 2);
+            let u = if su == 0 { u } else { -u };
+            let v = if sv == 0 { v } else { -v };
+            (q_lat + v * d_lat, q_lon + u * d_lon)
+        }
+    };
+
+    let proj = write_filter_project(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        metric,
+        serde_json::json!({ "location": "geo" }),
+        move |id| {
+            let (lat, lon) = loc(id);
+            serde_json::json!({ "location": { "lon": lon, "lat": lat } })
+        },
+        serde_json::json!({ "and": [ { "location": { "geo": {
+            "lat": q_lat, "lon": q_lon, "radius": radius } } } ] }),
+        move |id| {
+            let (lat, lon) = loc(id);
+            haversine_m(lat, lon, q_lat, q_lon) <= radius
+        },
+    );
+
+    // The fixture's whole value is in these three properties, so assert them
+    // here rather than trusting the arithmetic above: an off-by-one in the
+    // layout would silently turn this back into a test a bounding box passes.
+    let mut inside = 0usize;
+    let mut in_box_outside_circle = 0usize;
+    for id in 0..N_DOCS {
+        let (lat, lon) = loc(id);
+        let d = haversine_m(lat, lon, q_lat, q_lon);
+        let in_box =
+            (lat - q_lat).abs() <= d_lat * 1.000_001 && (lon - q_lon).abs() <= d_lon * 1.000_001;
+        assert!(in_box, "doc {id} escaped the bounding box — it would be filtered out by BOTH a box and a circle, weakening the fixture");
+        // No document within 5 % of the boundary, so no engine's earth model
+        // can move one across it.
+        assert!(
+            d <= radius * 0.95 || d >= radius * 1.05,
+            "doc {id} sits {d} m out, too close to the {radius} m boundary"
+        );
+        if d <= radius {
+            inside += 1;
+        } else {
+            in_box_outside_circle += 1;
+        }
+    }
+    assert_eq!(inside, 100, "in-circle count");
+    assert_eq!(in_box_outside_circle, 300, "box-minus-circle count");
+    assert_eq!(proj.matching_docs, inside);
+    proj
+}
+
 /// Multi-condition AND filter: a keyword match AND a numeric range in one query
 /// (`color == "red" AND size >= 50`). Every other fixture puts a SINGLE condition
 /// under `and`; this exercises that engines correctly COMPOSE (intersect) two
@@ -1372,6 +1512,51 @@ pub fn run_binary(
         );
     }
     out.status.success()
+}
+
+/// A finished `vector-db-benchmark` run: its exit status plus stdout+stderr.
+pub struct BinaryRun {
+    pub ok: bool,
+    pub combined: String,
+}
+
+/// Like [`run_binary`], but hands back the output instead of only a bool.
+///
+/// For the tests that assert an engine REFUSES a dataset (issue #223: Chroma and
+/// Turbopuffer cannot express a geo radius). "The run failed" on its own is a
+/// weak assertion — a crash, a typo in the config or an unreachable server all
+/// satisfy it — so those tests need the message to check WHICH failure it was.
+pub fn run_binary_capture(
+    root: &Path,
+    engine: &str,
+    dataset: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+) -> BinaryRun {
+    let mut cmd = std::process::Command::new(binary_path());
+    cmd.args([
+        "--engines",
+        engine,
+        "--datasets",
+        dataset,
+        "--host",
+        host,
+        "--skip-if-exists",
+        "false",
+    ])
+    .current_dir(root);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run vector-db-benchmark");
+    BinaryRun {
+        ok: out.status.success(),
+        combined: format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
 }
 
 /// Read `results.mean_recall` from the engine's search result JSON.

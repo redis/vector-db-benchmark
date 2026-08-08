@@ -11,6 +11,7 @@ mod dragonfly;
 mod elasticsearch;
 #[cfg(test)]
 mod filter_guard;
+mod geo;
 pub mod index_naming;
 mod kividb;
 mod milvus;

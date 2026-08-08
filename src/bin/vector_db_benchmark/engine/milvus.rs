@@ -110,11 +110,10 @@ struct MilvusFieldKind {
 ///   `tests/integration_milvus.rs` unable to prove WHICH index exists. Naming
 ///   the type keeps the choice auditable from the server's own reply.
 ///
-/// `geo` deliberately returns `None`: `milvus.rs` does not materialise a geo
-/// column and drops geo predicates (issue #223, out of scope here). Routing
-/// both the column pass and the index pass through this one function is what
-/// guarantees we never index a column that does not exist, or leave one that
-/// does unindexed.
+/// `geo` is a native `Geometry` column with an `RTREE` index (Milvus >= 2.6.4,
+/// issue #223). Routing both the column pass and the index pass through this one
+/// function is what guarantees we never index a column that does not exist, or
+/// leave one that does unindexed.
 fn milvus_field_kind(field_name: &str, schema_type: &str) -> Option<MilvusFieldKind> {
     // A multi-valued keyword field (`labels`) is an Array of VarChar (#88).
     if (schema_type == "keyword" || schema_type == "text")
@@ -137,6 +136,15 @@ fn milvus_field_kind(field_name: &str, schema_type: &str) -> Option<MilvusFieldK
         // (upload + the range filter both convert via datetime_to_epoch_secs)
         // and take the same INVERTED range index as `int`.
         "datetime" => ("Int64", "INVERTED"),
+        // Native geospatial column (issue #223). `Geometry` stores OGC WKT and
+        // is queried with `ST_DWITHIN(field, 'POINT(lon lat)', metres)`, which
+        // for a POINT column against a POINT query is an exact great-circle
+        // haversine test on R = 6 371 000 m in the server's own C++
+        // (`internal/core/src/common/Geometry.h`) — the same earth radius
+        // `engine::geo::EARTH_RADIUS_M` and the fixtures' ground truth use.
+        // Added in Milvus 2.6.4; the pinned test image is v2.6.19. RTREE is the
+        // only index type for a Geometry column.
+        "geo" => ("Geometry", "RTREE"),
         _ => return None,
     };
     Some(MilvusFieldKind {
@@ -976,9 +984,13 @@ fn insert_batch(
                                 .collect(),
                         )
                     }
+                    // A `Geometry` column takes OGC WKT, and WKT is `POINT(x y)`
+                    // with x = LONGITUDE, y = LATITUDE. The previous
+                    // `"{lat},{lon}"` string was both the wrong format and the
+                    // wrong axis order, and had no column to land in — the geo
+                    // schema type materialised nothing (issue #223).
                     MetadataValue::Geo { lon, lat } => {
-                        // Milvus doesn't support geo natively; store as string
-                        serde_json::Value::String(format!("{},{}", lat, lon))
+                        serde_json::Value::String(format!("POINT({lon} {lat})"))
                     }
                 };
                 row_obj.insert(k.clone(), val);
@@ -1335,9 +1347,33 @@ fn build_milvus_filter(
                 Some(format!("({})", clauses.join(" && ")))
             }
         }
+        // Geo-radius (issue #223). `ST_DWITHIN(field, 'POINT(lon lat)', metres)`
+        // is Milvus' native geodesic radius predicate: for a POINT column against
+        // a POINT query the server evaluates a haversine great-circle distance on
+        // R = 6 371 000 m and compares `<= radius` (v2.6.19
+        // `internal/core/src/common/Geometry.h::dwithin`). Available since 2.6.4;
+        // before this arm existed the clause was dropped and, when it was the
+        // only clause, the query ran with NO filter against geo-filtered ground
+        // truth.
+        //
+        // WKT is `POINT(x y)` = `POINT(lon lat)`. `{:?}` renders each `f64` in
+        // its shortest round-tripping form, so the centre the server parses is
+        // bit-identical to the dataset's.
+        //
+        // A missing or non-finite component is a DROP (→ the #219 hard error),
+        // never a default radius.
         "geo" => {
-            // Milvus doesn't support geo natively
-            None
+            let (lon, lat, radius) = (
+                criteria.get("lon").and_then(|v| v.as_f64())?,
+                criteria.get("lat").and_then(|v| v.as_f64())?,
+                criteria.get("radius").and_then(|v| v.as_f64())?,
+            );
+            if !lon.is_finite() || !lat.is_finite() || !radius.is_finite() || radius < 0.0 {
+                return None;
+            }
+            Some(format!(
+                "ST_DWITHIN({field_name}, 'POINT({lon:?} {lat:?})', {radius:?})"
+            ))
         }
         _ => None,
     }
@@ -1837,14 +1873,49 @@ mod tests {
         assert!(range_expr(json!({"gte":serde_json::Value::Null})).is_none());
     }
 
-    // ── Geo filter (unsupported → None) ────────────────────────────────────
+    // ── Geo filter (native ST_DWITHIN, issue #223) ─────────────────────────
 
+    /// The exact string that goes on the wire. WKT is `POINT(x y)` — LONGITUDE
+    /// first — so an axis swap here is a silently displaced query centre, and
+    /// the fixture in `tests/integration_milvus.rs` is what proves the server
+    /// agrees.
     #[test]
-    fn geo_is_unsupported_returns_none() {
-        // Milvus has no native geo filter; the builder must return None so a
-        // future accidental change is caught.
-        assert!(
-            build_milvus_filter("loc", "geo", &json!({"lat":20.0,"lon":10.0,"radius":5})).is_none()
+    fn geo_emits_st_dwithin_with_lon_first_and_metres() {
+        assert_eq!(
+            build_milvus_filter("loc", "geo", &json!({"lat":20.0,"lon":10.0,"radius":500})),
+            Some("ST_DWITHIN(loc, 'POINT(10.0 20.0)', 500.0)".to_string())
+        );
+    }
+
+    /// An incomplete criteria object is a DROP (→ the #219 hard error), not a
+    /// default radius: Qdrant/Elasticsearch/Weaviate substitute 1000 m, which
+    /// would invent a filter nobody asked for.
+    #[test]
+    fn geo_missing_component_is_none() {
+        for bad in [
+            json!({"lat":20.0,"lon":10.0}),
+            json!({"lon":10.0,"radius":500}),
+            json!({"lat":20.0,"radius":500}),
+            json!({"lat":20.0,"lon":10.0,"radius":-1}),
+        ] {
+            assert!(build_milvus_filter("loc", "geo", &bad).is_none(), "{bad}");
+        }
+    }
+
+    /// Two geo leaves must both survive the `&&`/`||` joins — the partial-drop
+    /// class `filter_guard::no_shipped_multi_leaf_filter_loses_a_leaf` covers
+    /// generically, pinned here as an exact string.
+    #[test]
+    fn two_geo_leaves_both_reach_the_expression() {
+        let expr = parse_milvus_conditions(&json!({"and":[
+            {"a":{"geo":{"lon":116.0,"lat":-52.0,"radius":326341.0}}},
+            {"b":{"geo":{"lon":12.0,"lat":40.0,"radius":100000.0}}}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            expr,
+            "(ST_DWITHIN(a, 'POINT(116.0 -52.0)', 326341.0) && \
+             ST_DWITHIN(b, 'POINT(12.0 40.0)', 100000.0))"
         );
     }
 
@@ -1929,9 +2000,9 @@ mod tests {
                 indexed.contains(field.as_str())
             );
         }
-        // `geo` is not materialised at all (issue #223), so it must be in
-        // neither set — not indexed, and not silently indexed either.
-        assert!(!indexed.contains("loc"));
+        // `geo` IS materialised now (issue #223) and must therefore also be
+        // indexed; an unknown type still gets neither.
+        assert!(indexed.contains("loc"));
         assert!(!indexed.contains("weird"));
     }
 
@@ -1959,8 +2030,12 @@ mod tests {
         assert_eq!(expect("labels", "keyword").index_type, "INVERTED");
         // A scalar keyword named anything else stays a VarChar.
         assert_eq!(expect("color", "keyword").data_type, "VarChar");
-        // Not materialised → no column, no index.
-        assert!(milvus_field_kind("loc", "geo").is_none());
+        // Native geospatial column: OGC WKT in a `Geometry` field, RTREE index
+        // (the only index type Milvus offers for it) — issue #223.
+        assert_eq!(expect("loc", "geo").data_type, "Geometry");
+        assert_eq!(expect("loc", "geo").index_type, "RTREE");
+        // An unknown type is still not materialised.
+        assert!(milvus_field_kind("loc", "nope").is_none());
     }
 
     /// `id`/`vector` are excluded (PK is implicitly indexed, `vector` gets the

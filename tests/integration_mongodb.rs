@@ -1750,3 +1750,91 @@ fn test_binary_mongodb_out_of_range_hnsw_config_fails_loudly() {
     drop_test_collection();
     let _ = fs::remove_dir_all(&project);
 }
+
+/// Geo-radius end-to-end (issue #223).
+///
+/// Before this, `build_mongo_filter_entry`'s `_ => {}` dropped the geo leaf, so
+/// `$vectorSearch` ran with NO `filter` while recall was scored against
+/// geo-filtered ground truth; since #251 the same input is a hard error, so the
+/// shipped `random-geo-radius-*-angular-filters` were unrunnable on MongoDB.
+///
+/// The fix is a different STAGE, not a different operator. `$vectorSearch`'s
+/// `filter` is MQL restricted to ten comparison operators and rejects
+/// `$geoWithin` outright (verified live: `"filter.loc" at least one of [$gt,
+/// $gte, $lt, $lte, $eq, $ne, $in, $nin, $exists, $not] must be present`), and a
+/// `vectorSearch`-type index has no geo field type. MongoDB's geo-capable vector
+/// pre-filter is the `vectorSearch` OPERATOR inside a `$search` stage over a
+/// `search`-type index, whose `filter` takes `geoWithin` with a `circle`. The
+/// engine switches to that path for — and only for — a dataset whose schema
+/// declares a `geo` field, so no other MongoDB number moves.
+///
+/// The fixture is the bounding-box-discriminating one: a box (or no filter at
+/// all) scores ~0.25 against its ground truth, so ≥ 0.9 can only come from a
+/// real radius. It is a PRE-filter, not a `$match` after the stage — a
+/// post-filter would shrink the k results and could not reach 0.9 here.
+#[test]
+fn test_binary_mongodb_geo() {
+    wait_for_mongodb();
+    drop_test_collection();
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "mongo-geo", "engine": "mongodb",
+        "connection_params": {}, "collection_params": {},
+        "search_params": [{"parallel": 1, "num_candidates": 400}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_geo_corner_project(
+        "mongo-geo-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    assert!(proj.matching_docs >= proj.top);
+
+    let port = std::env::var("MONGODB_PORT").unwrap_or_else(|_| MONGODB_PORT.to_string());
+    // `--keep-data` so the index survives the run and can be read back below;
+    // the test drops the collection itself at the end.
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "mongo-geo",
+            "mongo-geo-test",
+            MONGODB_HOST,
+            &[
+                ("MONGODB_PORT", port.as_str()),
+                ("MONGODB_DB", TEST_DB),
+                ("MONGODB_COLLECTION", TEST_COLLECTION),
+                ("MONGODB_INDEX_NAME", TEST_INDEX),
+            ],
+            &["--keep-data"],
+        ),
+        "mongodb geo run failed"
+    );
+
+    // The index the engine actually built must be the `search`-type one — a
+    // `vectorSearch`-type index here would mean the geo filter never had a
+    // chance, and only the recall assertion below would (eventually) notice.
+    let client = mongodb_client();
+    let indexes: Vec<mongodb::bson::Document> = client
+        .database(TEST_DB)
+        .collection::<mongodb::bson::Document>(TEST_COLLECTION)
+        .aggregate(vec![doc! { "$listSearchIndexes": {} }])
+        .run()
+        .expect("listSearchIndexes")
+        .filter_map(Result::ok)
+        .collect();
+    let ours = indexes
+        .iter()
+        .find(|i| i.get_str("name").unwrap_or("") == TEST_INDEX)
+        .unwrap_or_else(|| panic!("no index named {TEST_INDEX}: {indexes:?}"));
+    assert_eq!(
+        ours.get_str("type").unwrap_or(""),
+        "search",
+        "a geo dataset must build the search-type index: {ours:?}"
+    );
+
+    let recall = common::read_recall(&proj.root, "mongo-geo");
+    println!("mongodb geo recall={recall:.3}");
+    assert!(recall >= 0.9, "mongodb geo recall {recall:.3} < 0.9");
+    drop_test_collection();
+}

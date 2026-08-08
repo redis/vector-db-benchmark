@@ -384,3 +384,47 @@ fn test_binary_vectorsets_mixed_benchmark() {
     );
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// Geo-radius end-to-end (issue #223).
+///
+/// Before this, `geo` hit `build_clause`'s `_ => None`: with the geo leaf the
+/// ONLY leaf, VSIM ran with no `FILTER` argument at all and its recall was
+/// scored against geo-filtered ground truth. Since #251 the same input is a hard
+/// error, so the shipped `random-geo-radius-*-angular-filters` were unrunnable.
+///
+/// VSIM `FILTER` has no geo type and no function calls, but it does have `*`,
+/// `+` and `>=` over several top-level attributes at once — enough for an EXACT
+/// great-circle test once the point is stored as its unit vector on the sphere
+/// (`engine::geo`). The fixture is the bounding-box-discriminating one: 300 of
+/// 400 documents sit in the corners of the query's lat/lon box but outside its
+/// circle, so a box (or no filter) scores ~0.25 and only the true radius scores
+/// ~1.0. Cosine ground truth, because VSIM ranks by cosine intrinsically.
+#[test]
+fn test_binary_vectorsets_geo() {
+    wait_for_vectorsets();
+
+    let name = "vectorsets-geo";
+    let proj = common::write_geo_corner_cosine_project("vs-geo", &vectorsets_config(name), 8);
+    assert!(
+        proj.matching_docs >= proj.top,
+        "fixture must have >= top matching docs (got {})",
+        proj.matching_docs
+    );
+
+    let port = test_port().to_string();
+    assert!(
+        common::run_binary(
+            &proj.root,
+            name,
+            "vs-geo",
+            TEST_HOST,
+            &[("REDIS_PORT", port.as_str())],
+        ),
+        "vectorsets geo run failed"
+    );
+
+    let recall = common::read_recall(&proj.root, name);
+    println!("vectorsets geo recall={recall:.3}");
+    assert!(recall >= 0.9, "vectorsets geo recall {recall:.3} < 0.9");
+    std::fs::remove_dir_all(&proj.root).ok();
+}

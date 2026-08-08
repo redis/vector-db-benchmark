@@ -28,6 +28,13 @@ fn milvus_base_url() -> String {
     format!("http://{}:{}", MILVUS_HOST, port)
 }
 
+/// The port Milvus is listening on, as a string for the child process's env.
+/// Honours `MILVUS_PORT` exactly as [`milvus_base_url`] does, so a test suite
+/// pointed at a non-default server drives the binary there too.
+fn milvus_port_str() -> String {
+    std::env::var("MILVUS_PORT").unwrap_or_else(|_| MILVUS_PORT.to_string())
+}
+
 fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -160,8 +167,10 @@ fn read_back_indexes(collection: &str) -> std::collections::HashMap<String, Inde
 /// change to the engine's mapping fails here rather than passing by circularity.
 /// `None` = the type is not materialised as a column (only `geo`, issue #223).
 fn expected_index_type(field_name: &str, schema_type: &str) -> Option<&'static str> {
+    // `geo` is a native `Geometry` column since #223; RTREE is the only index
+    // type Milvus offers for it.
     if schema_type == "geo" {
-        return None;
+        return Some("RTREE");
     }
     if field_name == "labels" && (schema_type == "keyword" || schema_type == "text") {
         return Some("INVERTED"); // Array(VarChar)
@@ -988,4 +997,59 @@ fn test_binary_milvus_match_any_labels() {
         "milvus multi-valued labels match_any recall {:.3} < 0.9",
         recall
     );
+}
+
+/// Geo-radius end-to-end (issue #223).
+///
+/// Before this, `geo` hit `milvus_field_kind`'s `_ => return None`, so no column
+/// was materialised at all, `build_milvus_filter` returned `None` for the geo
+/// leaf, and the query ran with NO `filter` while being scored against
+/// geo-filtered ground truth. Since #251 the same input is a hard error, so the
+/// shipped `random-geo-radius-*-angular-filters` were unrunnable on Milvus.
+///
+/// Now the point is a `Geometry` column holding OGC WKT `POINT(lon lat)` with an
+/// `RTREE` index, filtered by `ST_DWITHIN(field, 'POINT(lon lat)', metres)` —
+/// which for a POINT column against a POINT query is an exact great-circle
+/// haversine test in the server (v2.6.19 `common/Geometry.h::dwithin`, R =
+/// 6 371 000 m, the same radius the fixture's ground truth uses).
+///
+/// The fixture is the bounding-box-discriminating one, which matters twice here:
+/// `ST_DWITHIN`'s RTREE probe is a lat/lon bounding box that the exact predicate
+/// then refines, so this asserts the refinement actually happens (a box-only
+/// answer scores ~0.25) AND that the coarse box does not lose true hits.
+#[test]
+fn test_binary_milvus_geo() {
+    wait_for_milvus();
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "milvus-geo", "engine": "milvus",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100, "index_params": {"M": 16, "efConstruction": 200}}
+    }]);
+    let proj = common::write_geo_corner_project(
+        "geo-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    assert!(proj.matching_docs >= proj.top);
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "milvus-geo",
+            "geo-test",
+            "127.0.0.1",
+            &[
+                ("MILVUS_PORT", &milvus_port_str()),
+                ("MILVUS_COLLECTION_NAME", "bench_geo")
+            ],
+            &["--keep-data"],
+        ),
+        "milvus geo run failed"
+    );
+    // The Geometry column must carry a real RTREE index over every row, not be
+    // quietly left unindexed (#218's invariant, now covering geo).
+    assert_all_schema_fields_indexed("bench_geo", &serde_json::json!({"location": "geo"}));
+    let recall = common::read_recall(&proj.root, "milvus-geo");
+    println!("milvus geo recall={:.3}", recall);
+    assert!(recall >= 0.9, "milvus geo recall {:.3} < 0.9", recall);
 }
