@@ -440,16 +440,6 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
     })
 }
 
-/// `Args` booleans deliberately absent from [`invocation_provenance`], with the
-/// reason. Asserted to still exist, so a renamed or deleted flag fails here
-/// rather than leaving a stale excuse behind.
-#[cfg(test)]
-pub(crate) const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[(
-    "verbose",
-    "console output only: changes what is printed, never what is measured or \
-     which experiments run",
-)];
-
 /// Parse "U:S" ratio string into UpdateSearchRatio.
 fn parse_update_search_ratio(s: &str) -> Result<UpdateSearchRatio, String> {
     let parts: Vec<&str> = s.split(':').collect();
@@ -2186,7 +2176,25 @@ mod tests {
             );
         }
 
-        /// Every `Args` boolean that changes what is measured must be recorded.
+        /// `Args` booleans deliberately absent from [`super::super::invocation_provenance`],
+        /// with the reason. Asserted to still exist, so a renamed or deleted flag
+        /// fails rather than leaving a stale excuse behind.
+        ///
+        /// Lives inside this test module rather than beside the function: a bare
+        /// `#[cfg(test)] const` at item level has no brace, and the guard's
+        /// `strip_test_modules` used to brace-count from the next `{` it found —
+        /// silently deleting the production code in between.
+        const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[(
+            "verbose",
+            "console output only: changes what is printed, never what is measured \
+         or which experiments run",
+        )];
+
+        /// Every `Args` BOOLEAN that changes what is measured must be recorded.
+        ///
+        /// Booleans only: the scan reads `pub <name>: bool,`, so a new
+        /// non-boolean measuring flag is invisible to it. `repetitions` and
+        /// `warmup_seconds` are recorded by hand for that reason (#274).
         ///
         /// `invocation` was the one hand-maintained inventory in this PR while
         /// every other (`KNOWN_UNREAD`, `KNOWN_UNRECORDED`) is bidirectionally
@@ -2219,10 +2227,7 @@ mod tests {
             let recorded =
                 super::super::invocation_provenance(&crate::cli::Args::parse_from(["vdbb"]));
             let recorded = recorded.as_object().unwrap();
-            let excused: Vec<&str> = super::super::INVOCATION_EXCLUDED_FLAGS
-                .iter()
-                .map(|(f, _)| *f)
-                .collect();
+            let excused: Vec<&str> = INVOCATION_EXCLUDED_FLAGS.iter().map(|(f, _)| *f).collect();
 
             let missing: Vec<&String> = declared
                 .iter()

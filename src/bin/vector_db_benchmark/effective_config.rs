@@ -176,17 +176,73 @@ fn strip_dsn_secrets(value: &str) -> String {
     if !value.contains('=') {
         return value.to_string();
     }
-    value
-        .split_inclusive(char::is_whitespace)
-        .map(|tok| match tok.split_once('=') {
-            Some((k, v)) if is_secret(k.trim()) && !v.trim().is_empty() => {
-                let trailing = &tok[tok.trim_end().len()..];
-                format!("{k}={REDACTED}{trailing}")
+    // Quote-aware, because libpq values may contain spaces when quoted:
+    // `password='a b c'`. Splitting on whitespace first — which is what this
+    // function did when it was written — redacted only up to the first space
+    // and published the rest of the password verbatim.
+    let bytes: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Copy leading separators.
+        if bytes[i].is_whitespace() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        // Read a key up to `=` (or to whitespace, if this token has none).
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != '=' && !bytes[i].is_whitespace() {
+            i += 1;
+        }
+        let key: String = bytes[key_start..i].iter().collect();
+        if i >= bytes.len() || bytes[i] != '=' {
+            out.push_str(&key);
+            continue;
+        }
+        i += 1; // consume '='
+
+        // Read the value: a quoted run (honouring backslash escapes) or a bare
+        // run up to the next whitespace.
+        let val_start = i;
+        if i < bytes.len() && (bytes[i] == '\'' || bytes[i] == '"') {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == '\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
             }
-            _ => tok.to_string(),
-        })
-        .collect()
+        } else {
+            while i < bytes.len() && !bytes[i].is_whitespace() {
+                i += 1;
+            }
+        }
+        let raw: String = bytes[val_start..i].iter().collect();
+        let bare = raw.trim_matches(['\'', '"']);
+        if is_secret(key.trim()) && !bare.trim().is_empty() {
+            out.push_str(&key);
+            out.push('=');
+            out.push_str(REDACTED);
+        } else {
+            out.push_str(&key);
+            out.push('=');
+            out.push_str(&raw);
+        }
+    }
+    out
 }
+
+/// Fields that a sibling `key` must NOT make secret: they carry the knob's name
+/// and the human explanation, not its value. Redacting them turns an
+/// `overridden` entry into four identical placeholders that record nothing.
+const ENTRY_KEY_EXEMPT: &[&str] = &["key", "reason"];
 
 /// Scrub one JSON value for publication.
 ///
@@ -205,13 +261,22 @@ fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
                     // An `overridden` entry names its knob in a sibling `key`
                     // field rather than in its own JSON key, so `declared` /
                     // `effective` there would otherwise look benign.
-                    let entry_key = map
-                        .get("key")
-                        .and_then(Value::as_str)
-                        .is_some_and(is_secret);
+                    //
+                    // `key` and `reason` are exempt from that seeding: they hold
+                    // the knob's NAME and a prose explanation, never its value.
+                    // Without the exemption an override on a credential knob
+                    // rendered as four `<redacted:set>`s and recorded nothing at
+                    // all — the entry destroying the very thing it exists to
+                    // produce. Same for any `{"key":…, "value":…}` pair, which
+                    // lost the name alongside the secret.
+                    let seeded = !ENTRY_KEY_EXEMPT.contains(&k.as_str())
+                        && map
+                            .get("key")
+                            .and_then(Value::as_str)
+                            .is_some_and(is_secret);
                     (
                         k.clone(),
-                        scrub_value(v, secret_ancestor || is_secret(k) || entry_key),
+                        scrub_value(v, secret_ancestor || is_secret(k) || seeded),
                     )
                 })
                 .collect(),
@@ -225,6 +290,11 @@ fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
         Value::String(s) if secret_ancestor && s == REDACTED_DEFAULT => {
             Value::from(REDACTED_DEFAULT)
         }
+        // NOTE: this changes a JSON *type* — `session_pool_size: 8` becomes the
+        // string `"<redacted:set>"`. A scan of all 31 shipped configs and all
+        // 104 recorded knob names found zero false positives today, so this is
+        // a future-drift risk rather than a live defect; the direction of the
+        // bias (over-redact) is deliberate. Tracked with the marker widening.
         _ if secret_ancestor => Value::from(REDACTED),
         Value::String(s) => Value::from(strip_dsn_secrets(&strip_userinfo(s))),
         other => other.clone(),
@@ -249,9 +319,14 @@ fn assert_no_cleartext_secrets(value: &Value, secret_ancestor: bool, path: &str)
                 .and_then(Value::as_str)
                 .is_some_and(is_secret);
             for (k, v) in map {
+                // Must mirror `scrub_value`'s exemption exactly, or the two
+                // disagree and the assertion panics on a correctly-scrubbed
+                // document (it did: it REQUIRED `overridden[0].key` to be
+                // blanked, so the two had to be fixed together).
+                let seeded = entry_key && !ENTRY_KEY_EXEMPT.contains(&k.as_str());
                 assert_no_cleartext_secrets(
                     v,
-                    secret_ancestor || is_secret(k) || entry_key,
+                    secret_ancestor || is_secret(k) || seeded,
                     &format!("{path}.{k}"),
                 );
             }
@@ -498,6 +573,12 @@ pub fn begin_experiment(
 ///   per (config, dataset) -> moved on the first iteration, does not compile.
 ///
 /// None of those three is expressible now. That is what the guard could not do.
+///
+/// It proves a recording BEGAN, not that it began for THIS (config, dataset)
+/// pair: handing `run_single_experiment` a token minted for a different
+/// experiment compiles and passes. Making it prove identity would mean carrying
+/// the config name in the token and checking it at the far end; the ordering
+/// half of that is covered by guard 3 instead.
 #[must_use = "run_single_experiment consumes this; dropping it means the \
               experiment ran without its provenance being started"]
 pub struct Recording(());
@@ -1006,40 +1087,53 @@ mod recorder_coverage_guard {
     }
 
     /// Drop `#[cfg(test)]` modules so a test helper mutating the environment is
-    /// not mistaken for a production read. Brace-counts from the module's
-    /// opening `{`, which is sufficient for this codebase's formatting (rustfmt
-    /// keeps braces balanced and string literals here contain none).
+    /// not mistaken for a production read.
+    ///
+    /// Indentation-based, NOT brace-counting. Brace counting was wrong twice
+    /// over: a `#[cfg(test)]` item with no brace of its own (a `const`) sent it
+    /// hunting for the next `{` — the following function's body — deleting the
+    /// production code in between; and its stated invariant ("string literals
+    /// here contain none") is false in at least five files (`start_gate.rs`,
+    /// `npy_reader.rs`, bin `config.rs`, `redis.rs`, `valkey.rs` all contain
+    /// `'{'` or `"{{"` literals), so the count desynchronised, the loop broke,
+    /// and whole test modules were scanned as production.
+    ///
+    /// rustfmt guarantees a module's closing `}` sits at the module's own
+    /// indentation, which is a far cheaper invariant than balanced braces and
+    /// does not care what is inside string literals.
     fn strip_test_modules(src: &str) -> String {
-        let mut out = String::with_capacity(src.len());
-        let mut rest = src;
-        while let Some(idx) = rest.find("#[cfg(test)]") {
-            out.push_str(&rest[..idx]);
-            let after = &rest[idx..];
-            let Some(open) = after.find('{') else {
-                break;
-            };
-            let mut depth = 0usize;
-            let mut end = None;
-            for (i, c) in after[open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = Some(open + i + 1);
-                            break;
-                        }
-                    }
-                    _ => {}
+        // Comments first: a doc comment *mentioning* `#[cfg(test)] const` is
+        // prose, not an item, and matching it truncated the scan.
+        let src = strip_line_comments(src);
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+        let mut i = 0usize;
+        while i < lines.len() {
+            let trimmed = lines[i].trim_start();
+            if trimmed.starts_with("#[cfg(test)]") {
+                let indent = lines[i].len() - trimmed.len();
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].trim().is_empty() {
+                    j += 1;
                 }
+                let head = lines.get(j).map(|l| l.trim_start()).unwrap_or("");
+                if head.starts_with("mod ") || head.starts_with("pub mod ") {
+                    let closer = format!("{}}}", " ".repeat(indent));
+                    let mut k = j + 1;
+                    while k < lines.len() && lines[k] != closer {
+                        k += 1;
+                    }
+                    i = k + 1;
+                    continue;
+                }
+                // Any other `#[cfg(test)]` item stays in the scanned text. A
+                // false positive there is visible and fixable; a deletion is
+                // neither.
             }
-            match end {
-                Some(e) => rest = &after[e..],
-                None => break,
-            }
+            out.push(lines[i]);
+            i += 1;
         }
-        out.push_str(rest);
-        out
+        out.join("\n")
     }
 
     /// GUARD 1 — nothing outside the recorder reads the environment.
@@ -1135,6 +1229,32 @@ mod recorder_coverage_guard {
             begin < create,
             "the recording must begin BEFORE the engine is built — engines resolve most of \
              their environment knobs in `new()`, so a later reset would erase them"
+        );
+    }
+
+    /// GUARD 1b — the scoped exemptions are real.
+    ///
+    /// `EXEMPT_CALLS` was documented as "asserted to still be present so a
+    /// removed one cannot leave a stale excuse" and was not: it was only a
+    /// skip-list, so unlike `KNOWN_UNRECORDED` it could rot silently. Now it
+    /// matches its own docstring.
+    #[test]
+    fn every_scoped_exemption_still_names_a_real_call_site() {
+        let sources = rust_sources();
+        let mut stale = Vec::new();
+        for (file, snippet, _why) in EXEMPT_CALLS {
+            let found = sources
+                .iter()
+                .any(|(path, src)| path == file && src.contains(snippet));
+            if !found {
+                stale.push(format!("{file}: {snippet}"));
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "EXEMPT_CALLS excuses reads that no longer exist — delete their rows \
+             so the list cannot become a stale excuse:\n  {}",
+            stale.join("\n  ")
         );
     }
 
@@ -1585,6 +1705,85 @@ mod tests {
         assert!(out.contains("sslmode=require"), "{out}");
     }
 
+    /// A quoted libpq value may contain spaces. Splitting on whitespace first —
+    /// which is what this function did when it was added — redacted up to the
+    /// first space and published the rest of the password verbatim.
+    #[test]
+    fn dsn_quoted_password_containing_spaces_is_fully_blanked() {
+        for dsn in [
+            "host=db password='LEAKONE LEAKTWO LEAKTHREE' sslmode=require",
+            "host=db password=\"LEAKONE LEAKTWO LEAKTHREE\" sslmode=require",
+            "password='LEAKONE LEAKTWO LEAKTHREE'",
+            "host=db password='LEAKONE LEAKTWO LEAKTHREE'",
+        ] {
+            let out = strip_dsn_secrets(dsn);
+            for canary in ["LEAKONE", "LEAKTWO", "LEAKTHREE"] {
+                assert!(!out.contains(canary), "{dsn} -> {out}");
+            }
+        }
+        // The shapes that already worked must keep working.
+        let out = strip_dsn_secrets("host=db  PASSWORD=bare\tapi_key=k sslmode=require");
+        assert!(!out.contains("bare") && !out.contains("=k"), "{out}");
+        assert!(out.contains("host=db"), "{out}");
+        assert!(out.contains("sslmode=require"), "{out}");
+        // A non-secret key keeps its quoted value intact.
+        assert_eq!(
+            strip_dsn_secrets("options='-c statement_timeout=5s'"),
+            "options='-c statement_timeout=5s'"
+        );
+    }
+
+    /// An override ON a credential knob must still record the knob's NAME and
+    /// the REASON — the entry exists to say what was overridden and why.
+    ///
+    /// Seeding secret-ness from the sibling `key` field blanked all four fields,
+    /// so the entry recorded nothing at all. The assertion had the same bug and
+    /// REQUIRED the blank, so the two had to be fixed together.
+    #[test]
+    fn an_override_on_a_credential_knob_keeps_its_name_and_reason() {
+        let mut r = Recorder::new();
+        r.note_override(
+            "REDIS_AUTH",
+            json!("OLD-CANARY"),
+            json!("NEW-CANARY"),
+            "rotated between phases",
+        );
+        let s = r.snapshot();
+        let o = &s["overridden"][0];
+        assert_eq!(o["key"], "REDIS_AUTH", "the knob name was destroyed");
+        assert_eq!(
+            o["reason"], "rotated between phases",
+            "the explanation was destroyed"
+        );
+        // …while the values themselves are gone.
+        assert_eq!(o["declared"], REDACTED);
+        assert_eq!(o["effective"], REDACTED);
+        let dumped = serde_json::to_string(&s).unwrap();
+        assert!(!dumped.contains("OLD-CANARY") && !dumped.contains("NEW-CANARY"));
+    }
+
+    /// The same shape more generally: a `{"key":…, "value":…}` pair must keep
+    /// its name. A header list rendered every credential entry as two identical
+    /// placeholders, losing which header it was.
+    #[test]
+    fn a_key_value_pair_keeps_its_name_when_the_value_is_secret() {
+        let mut r = Recorder::new();
+        r.record_effective(
+            "request_headers",
+            json!([
+                {"key": "Authorization", "value": "Bearer HEADER-CANARY"},
+                {"key": "Content-Type", "value": "application/json"},
+            ]),
+        );
+        let s = r.snapshot();
+        let headers = &s["effective"]["request_headers"];
+        assert_eq!(headers[0]["key"], "Authorization", "header name destroyed");
+        assert_eq!(headers[0]["value"], REDACTED);
+        assert_eq!(headers[1]["key"], "Content-Type");
+        assert_eq!(headers[1]["value"], "application/json");
+        assert!(!serde_json::to_string(&s).unwrap().contains("HEADER-CANARY"));
+    }
+
     /// `strip_userinfo` computed the authority boundary BEFORE looking for `@`,
     /// so an unencoded `/` in a password returned the URL untouched.
     #[test]
@@ -1654,6 +1853,63 @@ mod tests {
         let mut r = Recorder::new();
         r.observe_env("REDIS_USER", Some("benchrunner"));
         assert_eq!(r.snapshot()["env"]["REDIS_USER"], "benchrunner");
+    }
+
+    /// Drives `begin_experiment` — the function the mutation actually edits —
+    /// and seeds the state it must clear ITSELF.
+    ///
+    /// The previous guard was `a_sweep_does_not_inherit_the_previous_configs_knobs`,
+    /// which relied on residue other tests happened to leave in the global
+    /// recorder: measured at 7 red / 4 green over 11 default-threaded runs and
+    /// **3/3 GREEN run alone**. `begin_clears_every_accumulating_field` could
+    /// never catch it at all, because it exercises `Recorder::begin`, which the
+    /// mutation does not touch. This one seeds every accumulating field
+    /// explicitly, so deleting `reset()` from `begin_experiment` fails it
+    /// deterministically, alone or in a suite.
+    #[test]
+    fn begin_experiment_clears_the_previous_experiments_accumulation() {
+        let _l = test_lock();
+        let raw = json!({"name": "cfg-b", "engine": "redis"});
+        let mut cfg: crate::config::EngineConfig = serde_json::from_value(raw.clone()).unwrap();
+        cfg.raw = Some(raw);
+
+        // Stand in for configuration A: seed all four accumulating fields here,
+        // rather than hoping another test left them behind.
+        reset();
+        let _g = EnvGuard::set("VDBB_TEST_BLEED", Some("11"));
+        assert_eq!(env_parsed::<u16>("VDBB_TEST_BLEED", 0), 11);
+        record_effective("config_a_only", json!("leftover"));
+        note_override("config_a_knob", json!(1), json!(2), "config A");
+        note_ignored("config_a_ignored");
+        let before = snapshot();
+        assert_eq!(before["env"]["VDBB_TEST_BLEED"], "11");
+        assert_eq!(before["effective"]["config_a_only"], "leftover");
+
+        // Configuration B starts.
+        let _recording = begin_experiment(&cfg, json!({"host": "b"}));
+
+        let s = snapshot();
+        assert!(
+            s["env"].as_object().unwrap().is_empty(),
+            "config A's env observations survived into config B: {}",
+            s["env"]
+        );
+        assert!(
+            s["effective"].as_object().unwrap().is_empty(),
+            "config A's resolved knobs survived into config B: {}",
+            s["effective"]
+        );
+        assert!(
+            s["overridden"].as_array().unwrap().is_empty(),
+            "config A's overrides survived into config B"
+        );
+        assert_eq!(
+            s["ignored_declared_keys"]["keys"],
+            json!([]),
+            "config A's ignored keys survived into config B"
+        );
+        // …and config B's own declaration is in place.
+        assert_eq!(s["invocation"]["host"], "b");
     }
 
     /// `begin` clears the four ACCUMULATING fields. Pure — no process globals,
