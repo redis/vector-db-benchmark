@@ -1838,3 +1838,184 @@ fn test_binary_mongodb_geo() {
     assert!(recall >= 0.9, "mongodb geo recall {recall:.3} < 0.9");
     drop_test_collection();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #238 — `--skip-upload` must reuse the corpus, not destroy it
+// ---------------------------------------------------------------------------
+
+/// Count documents in the benchmark collection, server-side.
+fn count_test_docs() -> u64 {
+    mongodb_client()
+        .database(TEST_DB)
+        .collection::<Document>(TEST_COLLECTION)
+        .count_documents(doc! {})
+        .run()
+        .expect("countDocuments")
+}
+
+/// MongoDB's destruction path is a third shape: `collection.drop()`, which is
+/// unbounded — unlike Redis/Valkey, whose `DD`/UNLINK are scoped to this config's
+/// namespace, it removes the entire benchmark collection.
+///
+/// RED on the pre-fix branch: `countDocuments` 400 -> 0 while the run printed
+/// QPS lines and exited 0.
+#[test]
+fn test_binary_mongodb_skip_upload_skip_vector_index_preserves_corpus() {
+    wait_for_mongodb();
+    drop_test_collection();
+
+    let port: u16 = std::env::var("MONGODB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MONGODB_PORT);
+    let port_s = port.to_string();
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238mg", "engine": "mongodb",
+        "search_params": [{"parallel": 1, "num_candidates": 20}],
+        "upload_params": {"parallel": 1}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg238mg-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let envs: [(&str, &str); 4] = [
+        ("MONGODB_PORT", port_s.as_str()),
+        ("MONGODB_DB", TEST_DB),
+        ("MONGODB_COLLECTION", TEST_COLLECTION),
+        ("MONGODB_INDEX_NAME", TEST_INDEX),
+    ];
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238mg",
+            "cfg238mg-test",
+            MONGODB_HOST,
+            &envs,
+            &["--skip-vector-index", "--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload with --skip-vector-index) failed"
+    );
+    let before = count_test_docs();
+    assert_eq!(before, common::N_DOCS as u64, "phase 1 corpus");
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238mg",
+            "cfg238mg-test",
+            MONGODB_HOST,
+            &envs,
+            &["--skip-upload", "--skip-vector-index", "--keep-data"],
+        ),
+        "phase 2 (--skip-upload --skip-vector-index) failed"
+    );
+
+    let after = count_test_docs();
+    assert_eq!(
+        after, before,
+        "--skip-upload --skip-vector-index dropped the collection it was told to \
+         reuse ({before} -> {after} docs) — issue #238"
+    );
+
+    drop_test_collection();
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// MongoDB's `corpus_row_count()` must be a live `countDocuments`, proven by
+/// deleting documents behind the tool's back and watching the number follow.
+#[test]
+fn test_binary_mongodb_skip_upload_short_corpus_is_fatal() {
+    wait_for_mongodb();
+    drop_test_collection();
+
+    let port: u16 = std::env::var("MONGODB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MONGODB_PORT);
+    let port_s = port.to_string();
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238mgshort", "engine": "mongodb",
+        "search_params": [{"parallel": 1, "num_candidates": 20}],
+        "upload_params": {"parallel": 1}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg238mgshort-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let envs: [(&str, &str); 4] = [
+        ("MONGODB_PORT", port_s.as_str()),
+        ("MONGODB_DB", TEST_DB),
+        ("MONGODB_COLLECTION", TEST_COLLECTION),
+        ("MONGODB_INDEX_NAME", TEST_INDEX),
+    ];
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238mgshort",
+            "cfg238mgshort-test",
+            MONGODB_HOST,
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+    assert_eq!(count_test_docs(), common::N_DOCS as u64, "phase 1 corpus");
+
+    let half = (common::N_DOCS / 2) as i64;
+    mongodb_client()
+        .database(TEST_DB)
+        .collection::<Document>(TEST_COLLECTION)
+        .delete_many(doc! { "_id": { "$lt": half } })
+        .run()
+        .expect("delete_many");
+    assert_eq!(
+        count_test_docs(),
+        half as u64,
+        "half the corpus should remain"
+    );
+
+    let out = Command::new(binary_path())
+        .args([
+            "--engines",
+            "cfg238mgshort",
+            "--datasets",
+            "cfg238mgshort-test",
+            "--host",
+            MONGODB_HOST,
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ])
+        .env("MONGODB_PORT", &port_s)
+        .env("MONGODB_DB", TEST_DB)
+        .env("MONGODB_COLLECTION", TEST_COLLECTION)
+        .env("MONGODB_INDEX_NAME", TEST_INDEX)
+        .current_dir(&proj.root)
+        .output()
+        .expect("run vector-db-benchmark");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a half-deleted MongoDB collection must be a hard error.\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!("holds {half} of the {} rows", common::N_DOCS)),
+        "the count must track the deletion, proving it is a live countDocuments.\n{combined}"
+    );
+
+    drop_test_collection();
+    fs::remove_dir_all(&proj.root).ok();
+}

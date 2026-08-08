@@ -1143,3 +1143,187 @@ fn test_kividb_skip_upload_without_prior_upload_errors() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #238 — KiviDB's server-side corpus count
+// ---------------------------------------------------------------------------
+
+/// KiviDB's `FT.INFO` has NO `num_docs` field — it reports `hnsw_live_count`.
+/// Reading only `num_docs` made `corpus_row_count()` answer `Ok(None)`, silently
+/// downgrading the `--skip-upload` guard to "this engine cannot count" while the
+/// docs claimed KiviDB was covered. This asserts the field is actually there, so
+/// a future image that renames it fails loudly instead of degrading.
+#[test]
+fn test_kividb_ft_info_exposes_a_live_count_field() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let _: () = redis::cmd("FT.CREATE")
+        .arg("idx:cfg238kvprobe")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg(1)
+        .arg("cfg238kvprobe:")
+        .arg("SCHEMA")
+        .arg("vector")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg(6)
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg(4)
+        .arg("DISTANCE_METRIC")
+        .arg("COSINE")
+        .query(&mut conn)
+        .expect("FT.CREATE");
+
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("idx:cfg238kvprobe")
+        .query(&mut conn)
+        .expect("FT.INFO");
+    let keys = ft_info_field_names(&info);
+    assert!(
+        keys.iter().any(|k| k == "hnsw_live_count") || keys.iter().any(|k| k == "num_docs"),
+        "FT.INFO exposes no count field this tool can read — the #238 reuse guard \
+         would silently degrade to 'cannot count'. Fields seen: {keys:?}"
+    );
+
+    flush_db(&mut conn);
+}
+
+/// Field names of an `FT.INFO` reply (RESP2 array or RESP3 map).
+fn ft_info_field_names(v: &redis::Value) -> Vec<String> {
+    fn as_str(v: &redis::Value) -> String {
+        match v {
+            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
+            redis::Value::SimpleString(s) => s.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+    match v {
+        redis::Value::Map(m) => m.iter().map(|(k, _)| as_str(k)).collect(),
+        redis::Value::Array(items) => items.chunks_exact(2).map(|c| as_str(&c[0])).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// End-to-end: KiviDB reports a real server-side count, and a corpus that is
+/// gone is fatal rather than waved through (#238 item B).
+///
+/// RED before the `hnsw_live_count` fix: `ft_info_num_docs` looked only for
+/// `num_docs`, which KiviDB's `FT.INFO` does not have, so `corpus_row_count()`
+/// returned `Ok(None)`, the run printed
+/// "Reuse check — SKIPPED (... cannot report a server-side row count)",
+/// benchmarked whatever was there and exited 0.
+///
+/// The amputation here is `FT.DROPINDEX`, not a key deletion. KiviDB's HNSW
+/// graph is independent of the hashes: UNLINKing 45 of 100 documents leaves
+/// `hnsw_live_count` at 100 AND leaves recall at 1.0000 (measured), because the
+/// vectors are still in the graph. So the count is right and there is nothing to
+/// catch — dropping the index is what actually removes the searchable corpus.
+#[test]
+fn test_binary_kividb_skip_upload_missing_corpus_is_fatal() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238kv", "engine": "kividb",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_cosine_project(
+        "cfg238kv-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = test_port().to_string();
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238kv",
+            "cfg238kv-test",
+            "localhost",
+            &[("KIVIDB_PORT", port.as_str())],
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+
+    // The count must be a real read of the populated index, not a note.
+    let out_ok = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            "cfg238kv",
+            "--datasets",
+            "cfg238kv-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ])
+        .env("KIVIDB_PORT", &port)
+        .current_dir(&proj.root)
+        .output()
+        .expect("run vector-db-benchmark");
+    let ok_combined = String::from_utf8_lossy(&out_ok.stdout).to_string();
+    assert!(
+        !ok_combined.contains("cannot report a server-side row count"),
+        "KiviDB must report a count (hnsw_live_count), not degrade to a note.\n{ok_combined}"
+    );
+    assert!(
+        ok_combined.contains(&format!(
+            "server holds {} of {} expected rows",
+            common::N_DOCS,
+            common::N_DOCS
+        )),
+        "the reuse check must report the real corpus size.\n{ok_combined}"
+    );
+
+    // Now remove the searchable corpus behind the tool's back.
+    let _: () = redis::cmd("FT.DROPINDEX")
+        .arg("idx:cfg238kv")
+        .query(&mut conn)
+        .expect("FT.DROPINDEX");
+
+    let out = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            "cfg238kv",
+            "--datasets",
+            "cfg238kv-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ])
+        .env("KIVIDB_PORT", &port)
+        .current_dir(&proj.root)
+        .output()
+        .expect("run vector-db-benchmark");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a dropped KiviDB index must be a hard error.\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!("holds 0 of the {} rows", common::N_DOCS)),
+        "the count must track the drop, proving it is a live read.\n{combined}"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

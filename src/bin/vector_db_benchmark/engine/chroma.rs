@@ -133,6 +133,41 @@ impl ChromaEngine {
         Ok(())
     }
 
+    /// Look the collection's id up by name.
+    ///
+    /// `collection_id` is the one piece of engine state that is NOT a function of
+    /// the dataset — it comes back from the create-collection response — so the
+    /// `--skip-upload` path, which never calls configure() (#238), would otherwise
+    /// query `.../collections//query` and fail every request after a green reuse
+    /// check. Resolving by name recovers it without touching the corpus.
+    fn resolve_collection_id(&mut self, client: &reqwest::blocking::Client) -> Result<(), String> {
+        if !self.collection_id.is_empty() {
+            return Ok(());
+        }
+        let url = format!("{}/collections/{}", self.api_base, self.collection_name);
+        let resp = client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("resolve collection id request failed: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "collection '{}' not found on the server (status {}) — --skip-upload needs a \
+                 collection created by a previous run with --keep-data",
+                self.collection_name,
+                resp.status()
+            ));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .map_err(|e| format!("resolve collection id response parse: {}", e))?;
+        self.collection_id = v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .ok_or("resolve collection id: no id in response")?
+            .to_string();
+        Ok(())
+    }
+
     /// Create the collection and remember its id.
     fn create_collection(&mut self, client: &reqwest::blocking::Client) -> Result<(), String> {
         let url = format!("{}/collections", self.api_base);
@@ -644,6 +679,14 @@ impl Engine for ChromaEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // On the --skip-upload path configure() never runs (#238), so the
+        // collection id — the only piece of state here that is not derivable from
+        // the dataset — has to be recovered from the server by name.
+        {
+            let client = self.create_client()?;
+            self.resolve_collection_id(&client)?;
+        }
+
         let parallel = params.parallel.unwrap_or(1) as usize;
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 

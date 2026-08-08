@@ -39,9 +39,26 @@ pub struct Args {
     #[arg(long, default_value = "localhost")]
     pub host: String,
 
-    /// Skip upload phase
+    /// Skip upload phase.
+    ///
+    /// Means "the server already holds the corpus I want": the configure phase
+    /// is NOT run (it is destructive on almost every engine — see #238) and the
+    /// runner instead verifies, against the live server, that the corpus is
+    /// present and complete before measuring anything.
     #[arg(long, default_value = "false")]
     pub skip_upload: bool,
+
+    /// Downgrade the `--skip-upload` reuse precondition from a hard error to a
+    /// warning (issue #238).
+    ///
+    /// By default a `--skip-upload` run aborts when the engine holds fewer rows
+    /// than the dataset declares — including zero, i.e. a missing index — because
+    /// recall is scored against ground truth for the FULL corpus and a short
+    /// corpus therefore publishes a wrong number under a config name that claims
+    /// otherwise. Set this to measure a deliberately partial corpus, or when the
+    /// server-side count cannot be read at all (restrictive ACLs).
+    #[arg(long, default_value = "false")]
+    pub allow_partial_corpus: bool,
 
     /// Skip search phase
     #[arg(long, default_value = "false")]

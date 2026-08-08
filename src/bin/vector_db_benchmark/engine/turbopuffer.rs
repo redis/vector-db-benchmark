@@ -509,6 +509,16 @@ impl Engine for TurbopufferEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // Re-derive the distance metric here as well as in configure(): on the
+        // `--skip-upload` path configure() never runs (#238) and this field would
+        // keep its `new()` default of "cosine_distance" — which does not fail, it
+        // just measures an l2 or dot dataset under the WRONG metric and writes a
+        // plausible file. Pure function of the dataset, so recomputing is
+        // idempotent.
+        self.distance_metric =
+            to_turbopuffer_metric(dataset.config.distance.as_deref().unwrap_or("cosine"))
+                .to_string();
+
         // Clamp to >=1: `parallel` is Option<i64> from config, so 0 would spawn
         // no workers (AtomicUsize never drained → spurious "no searches" error)
         // and a negative value would wrap to usize::MAX via `as usize` and spawn
