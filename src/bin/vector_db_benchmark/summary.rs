@@ -59,13 +59,13 @@ fn analyze_precision_performance(entries: &[SearchEntry]) -> Vec<PrecisionBucket
     let mut buckets: BTreeMap<String, PrecisionBucket> = BTreeMap::new();
 
     for entry in entries {
-        let key = format_precision_key(entry.results.mean_precision);
+        let key = format_precision_key(entry.results.mean_precision_at_returned);
 
         let candidate = PrecisionBucket {
             qps: entry.results.rps,
             p50_ms: entry.results.p50_time * 1000.0,
             p95_ms: entry.results.p95_time * 1000.0,
-            precision: entry.results.mean_precision,
+            precision: entry.results.mean_precision_at_returned,
             recall: entry.results.mean_recall,
             mrr: entry.results.mean_mrr,
             ndcg: entry.results.mean_ndcg,
@@ -139,7 +139,7 @@ fn concurrency_curves(entries: &[SearchEntry]) -> Vec<ConcurrencyCurve> {
     let mut groups: BTreeMap<String, BTreeMap<i64, ConcurrencyPoint>> = BTreeMap::new();
     for e in entries {
         // Filter-only runs have no precision/recall curve to speak of; skip them.
-        if e.results.mean_precision < 0.0 {
+        if e.results.mean_precision_at_returned < 0.0 {
             continue;
         }
         let point = ConcurrencyPoint {
@@ -321,8 +321,10 @@ pub fn display_results_summary(engine_name: &str, dataset_name: &str, entries: &
 
     print_saturation_warnings(entries);
 
-    // Filter-only mode: precision is not applicable (mean_precision == -1.0)
-    let filter_only = entries.iter().all(|e| e.results.mean_precision < 0.0);
+    // Filter-only mode: precision is not applicable (mean_precision_at_returned == -1.0)
+    let filter_only = entries
+        .iter()
+        .all(|e| e.results.mean_precision_at_returned < 0.0);
 
     if filter_only {
         println!("{}", "-".repeat(40));
@@ -431,7 +433,7 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
             "{:<14} {:<8.4} {:<8.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3} {:<10} {:<12}",
             key,
             best.results.mean_recall,
-            best.results.mean_precision,
+            best.results.mean_precision_at_returned,
             best.results.mean_mrr,
             best.results.mean_ndcg,
             best.results.rps,
@@ -495,7 +497,11 @@ pub fn save_summary(
                 "search_id": e.search_id,
                 "ef": e.ef,
                 "parallel": e.parallel,
-                "mean_precisions": e.results.mean_precision,
+                // Not `mean_precisions`: upstream qdrant/vector-db-benchmark
+                // publishes recall@top under that key, and this is precision with
+                // "results returned" as its denominator (#217). See
+                // `metrics_schema` in the per-search result files for the formulas.
+                "mean_precision_at_returned": e.results.mean_precision_at_returned,
                 "mean_recall": e.results.mean_recall,
                 "recall_p10": e.results.recall_p10,
                 "mean_mrr": e.results.mean_mrr,
@@ -764,7 +770,7 @@ mod tests {
                 ef: "64".to_string(),
                 parallel: 100,
                 results: SearchResults {
-                    mean_precision: 0.90,
+                    mean_precision_at_returned: 0.90,
                     rps: 5000.0,
                     p50_time: 0.01,
                     p95_time: 0.02,
@@ -776,7 +782,7 @@ mod tests {
                 ef: "128".to_string(),
                 parallel: 100,
                 results: SearchResults {
-                    mean_precision: 0.91,
+                    mean_precision_at_returned: 0.91,
                     rps: 4000.0,
                     p50_time: 0.012,
                     p95_time: 0.025,
@@ -798,7 +804,7 @@ mod tests {
             ef: "64".to_string(),
             parallel: 1,
             results: SearchResults {
-                mean_precision: precision,
+                mean_precision_at_returned: precision,
                 rps,
                 client_saturated: saturated,
                 ..Default::default()
@@ -973,12 +979,12 @@ mod tests {
 
     #[test]
     fn concurrency_curve_excludes_filter_only_runs() {
-        // Filter-only runs carry mean_precision == -1.0 (sentinel) and have no
+        // Filter-only runs carry mean_precision_at_returned == -1.0 (sentinel) and have no
         // recall/precision curve — they must not appear in the saturation curve.
         let mut a = entry("64", 1, 100.0, 0.01, "");
         let mut b = entry("64", 2, 200.0, 0.01, "");
-        a.results.mean_precision = -1.0;
-        b.results.mean_precision = -1.0;
+        a.results.mean_precision_at_returned = -1.0;
+        b.results.mean_precision_at_returned = -1.0;
         assert!(concurrency_curves(&[a, b]).is_empty());
     }
 }

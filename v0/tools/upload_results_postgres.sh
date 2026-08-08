@@ -52,7 +52,12 @@ if [[ -z "$ROOT_API_RESPONSE_FILE" ]]; then
 fi
 
 RPS=$(jq -r '.results.rps' "$SEARCH_RESULTS_FILE")
-MEAN_PRECISIONS=$(jq -r '.results.mean_precisions' "$SEARCH_RESULTS_FILE")
+# Python v0 stores recall@top (len(ids & expected[:top]) / top) under
+# `mean_precisions`. Rust result files (schema version 2, #217) do not use that
+# key at all: `mean_recall` is the same quantity, while
+# `mean_precision_at_returned` is a different one (denominator = results
+# returned) and must NOT be loaded into this column.
+MEAN_PRECISIONS=$(jq -r '.results.mean_precisions // .results.mean_recall' "$SEARCH_RESULTS_FILE")
 P95_TIME=$(jq -r '.results.p95_time' "$SEARCH_RESULTS_FILE")
 P99_TIME=$(jq -r '.results.p99_time' "$SEARCH_RESULTS_FILE")
 

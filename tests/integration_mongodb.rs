@@ -641,7 +641,7 @@ fn create_test_project(
     root
 }
 
-/// Parse a search result JSON and return mean_precisions
+/// Parse a search result JSON and return mean_precision_at_returned
 fn read_search_precision(results_dir: &PathBuf, engine_name: &str) -> f64 {
     let pattern = format!("{}-*-search-*.json", engine_name);
     let mut found = Vec::new();
@@ -660,9 +660,9 @@ fn read_search_precision(results_dir: &PathBuf, engine_name: &str) -> f64 {
 
     let content = fs::read_to_string(&found[0]).unwrap();
     let result: serde_json::Value = serde_json::from_str(&content).unwrap();
-    result["results"]["mean_precisions"]
+    result["results"]["mean_precision_at_returned"]
         .as_f64()
-        .expect("mean_precisions not found in result JSON")
+        .expect("mean_precision_at_returned not found in result JSON")
 }
 
 /// Brute-force L2 nearest neighbors for building ground truth.
@@ -1047,7 +1047,7 @@ fn test_binary_mongodb_mixed_parallel() {
 
     let r = common::read_results_obj(&proj.root, "mongo-mx");
     let recall = r["mean_recall"].as_f64().unwrap();
-    let precision = r["mean_precisions"].as_f64().unwrap();
+    let precision = r["mean_precision_at_returned"].as_f64().unwrap();
     let update_count = r["update_count"].as_u64().unwrap();
     let update_rps = r["update_rps"].as_f64().unwrap();
     let p50 = r["p50_time"].as_f64().unwrap();
@@ -1072,7 +1072,7 @@ fn test_binary_mongodb_mixed_parallel() {
 /// End-to-end FILTER-ONLY harness (`--skip-vector-index`) at `parallel: 4` with
 /// `--queries 1000`: MongoDB has no `check_commandstats` backstop, so this is the
 /// primary guard that failed `$vectorSearch`/`find` calls are counted (not folded
-/// into RPS/percentiles). Asserts the filter-only sentinel (`mean_precisions ==
+/// into RPS/percentiles). Asserts the filter-only sentinel (`mean_precision_at_returned ==
 /// -1`), full query accounting (requested == succeeded, failed == 0) on a healthy
 /// run, positive RPS, and monotone linear percentiles, with the per-worker sample
 /// buffers merged across threads.
@@ -1114,7 +1114,7 @@ fn test_binary_mongodb_filter_only() {
     );
 
     let r = common::read_results_obj(&proj.root, "mongodb-no-vector");
-    let mp = r["mean_precisions"].as_f64().unwrap();
+    let mp = r["mean_precision_at_returned"].as_f64().unwrap();
     let rps = r["rps"].as_f64().unwrap();
     let p50 = r["p50_time"].as_f64().unwrap();
     let p95 = r["p95_time"].as_f64().unwrap();
@@ -1123,7 +1123,7 @@ fn test_binary_mongodb_filter_only() {
     let succeeded = r["succeeded_queries"].as_u64().unwrap();
     let failed = r["failed_queries"].as_u64().unwrap();
     println!(
-        "mongodb filter-only: mean_precisions={mp} rps={rps:.1} p50={p50} p95={p95} p99={p99} \
+        "mongodb filter-only: mean_precision_at_returned={mp} rps={rps:.1} p50={p50} p95={p95} p99={p99} \
          requested={requested} succeeded={succeeded} failed={failed}"
     );
     assert_eq!(mp, -1.0, "filter-only sentinel lost");

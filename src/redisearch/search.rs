@@ -335,6 +335,12 @@ impl RustRedisSearcher {
             let dict = PyDict::new_bound(py);
             dict.set_item("total_time", total_time)?;
             dict.set_item("mean_time", mean_time)?;
+            // NOTE (#217): this legacy PyO3 accelerator (not part of the Rust
+            // binary and not compiled today) fills Python v0's `mean_precisions`
+            // key with OUR precision (hits / results returned), while pure-Python
+            // v0 fills it with recall@top (hits / top). If this path is ever
+            // revived, feed it `mean_recall` — or rename the key — before any of
+            // its output is compared with upstream numbers.
             dict.set_item("mean_precisions", mean_precision)?;
             dict.set_item("mean_recall", mean_recall)?;
             dict.set_item("mean_mrr", mean_mrr)?;
@@ -542,6 +548,7 @@ fn search_one_rust(
         crate::metrics::QueryMetrics {
             recall: 1.0,
             precision: 1.0,
+            recall_at_top: 1.0,
             mrr: 1.0,
             ndcg: 1.0,
         }

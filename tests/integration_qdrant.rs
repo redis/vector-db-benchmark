@@ -530,7 +530,7 @@ fn read_precision(root: &std::path::Path, engine: &str) -> f64 {
         })
         .unwrap_or_else(|| panic!("no search result for {}", engine));
     let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-    v["results"]["mean_precisions"].as_f64().unwrap()
+    v["results"]["mean_precision_at_returned"].as_f64().unwrap()
 }
 
 /// End-to-end via the real engine: a plain search (covers the query_points

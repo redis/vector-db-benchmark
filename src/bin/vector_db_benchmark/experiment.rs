@@ -490,7 +490,33 @@ fn run_single_experiment(
     // Search-result files are written after the whole search phase so the
     // AFTER server-metadata snapshot (taken once all reps complete) can be
     // embedded alongside the BEFORE snapshot in every file.
-    let mut pending_saves: Vec<(usize, SearchParams, crate::engine::SearchResults)> = Vec::new();
+    let mut pending_saves: Vec<(
+        usize,
+        SearchParams,
+        crate::engine::SearchResults,
+        Option<serde_json::Value>,
+    )> = Vec::new();
+    // Ground-truth width profile, read once for the whole experiment. It decides
+    // (a) whether our recall is the same quantity upstream calls `mean_precisions`
+    // — reported in every result file — and (b) whether a calibration target is
+    // reachable at all on this dataset (#217). Best-effort: a dataset whose query
+    // file cannot be profiled simply omits the block. Filter-only runs have no
+    // ground truth to speak of.
+    let ground_truth: Option<crate::ground_truth::GroundTruthProfile> = if args.skip_vector_index {
+        None
+    } else {
+        match crate::ground_truth::GroundTruthProfile::load(dataset) {
+            Ok(gt) => Some(gt),
+            Err(e) => {
+                eprintln!(
+                    "\tNote: could not profile ground-truth widths ({}); result files will omit \
+                     metrics_schema.ground_truth",
+                    e
+                );
+                None
+            }
+        }
+    };
     // Configs that lost queries, collected so --fail-on-dropped-queries can fail
     // the run *after* every result file is written rather than instead of it.
     let mut dropped_query_failures: Vec<String> = Vec::new();
@@ -592,6 +618,7 @@ fn run_single_experiment(
                 let parallel = search_params.parallel.unwrap_or(1);
 
                 // Calibration is skipped for filter-only mode (no vector search to tune)
+                let mut calibration_json: Option<serde_json::Value> = None;
                 let calibrated_params = if skip_vector_index {
                     None
                 } else if let (Some(cal_param), Some(cal_precision)) = (
@@ -599,7 +626,7 @@ fn run_single_experiment(
                     search_params.calibration_precision,
                 ) {
                     println!(
-                        "\tCalibrating {}: target precision={:.4}, parallel={}",
+                        "\tCalibrating {}: target mean_precision_at_returned={:.4}, parallel={}",
                         cal_param, cal_precision, parallel
                     );
                     match calibrate(
@@ -609,12 +636,23 @@ fn run_single_experiment(
                         cal_param,
                         cal_precision,
                         args.queries,
+                        ground_truth.as_ref(),
                     ) {
-                        Ok((value, precision)) => {
+                        Ok(outcome) => {
+                            let value = outcome.value;
                             println!(
-                                "\tCalibrated {}={} → precision={:.4}",
-                                cal_param, value, precision
+                                "\tCalibrated {}={} → precision_at_returned={:.4} (target {:.4}{})",
+                                cal_param,
+                                value,
+                                outcome.achieved,
+                                outcome.target,
+                                if outcome.reached_target {
+                                    " reached"
+                                } else {
+                                    " NOT reached"
+                                },
                             );
+                            calibration_json = Some(outcome.to_json());
                             // Create a new SearchParams with calibrated value
                             let mut calibrated = search_params.clone();
                             let inner =
@@ -816,8 +854,8 @@ fn run_single_experiment(
                             println!("\t→ QPS: {:.1} (filter-only, no precision)", results.rps);
                         } else {
                             println!(
-                                "\t→ QPS: {:.1}, Recall: {:.4}, Precision: {:.4}, MRR: {:.4}, NDCG: {:.4}{}",
-                                results.rps, results.mean_recall, results.mean_precision, results.mean_mrr, results.mean_ndcg,
+                                "\t→ QPS: {:.1}, Recall: {:.4}, Precision@returned: {:.4}, MRR: {:.4}, NDCG: {:.4}{}",
+                                results.rps, results.mean_recall, results.mean_precision_at_returned, results.mean_mrr, results.mean_ndcg,
                                 if repetitions > 1 { " (best of reps)" } else { "" }
                             );
                         }
@@ -875,7 +913,12 @@ fn run_single_experiment(
                             );
                         }
                         // Defer the file write until the AFTER snapshot exists.
-                        pending_saves.push((*search_id, effective_params.clone(), results.clone()));
+                        pending_saves.push((
+                            *search_id,
+                            effective_params.clone(),
+                            results.clone(),
+                            calibration_json.clone(),
+                        ));
 
                         search_entries.push(SearchEntry {
                             search_id: *search_id,
@@ -915,7 +958,7 @@ fn run_single_experiment(
     // before and after snapshots. For non-Redis engines both are None and the
     // `server_metadata` key is omitted from the result JSON.
     let server_metadata_after = engine.server_metadata();
-    for (search_id, params, results) in &pending_saves {
+    for (search_id, params, results, calibration) in &pending_saves {
         save_search_results(
             engine.name(),
             &dataset.config.name,
@@ -926,6 +969,8 @@ fn run_single_experiment(
             server_metadata_after.as_ref(),
             args.dump_raw_latencies,
             number_of_shards,
+            ground_truth.as_ref(),
+            calibration.as_ref(),
         )?;
     }
 
@@ -980,11 +1025,52 @@ fn run_single_experiment(
     Ok(())
 }
 
+/// Outcome of a calibration sweep, including whether it actually got there.
+struct CalibrationOutcome {
+    param: String,
+    value: i64,
+    target: f64,
+    /// `mean_precision_at_returned` achieved at `value`.
+    achieved: f64,
+    reached_target: bool,
+    /// Ceiling implied by the dataset's ground-truth widths at this `top`, when
+    /// the ground truth could be profiled.
+    ceiling: Option<f64>,
+    /// Why the target was not reached, when it was not.
+    note: Option<String>,
+}
+
+impl CalibrationOutcome {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "param": self.param,
+            "value": self.value,
+            "metric": "mean_precision_at_returned",
+            "target": self.target,
+            "achieved": self.achieved,
+            "reached_target": self.reached_target,
+            "ground_truth_ceiling": self.ceiling,
+            "note": self.note,
+        })
+    }
+}
+
 /// Binary search calibration matching Python v0.
 ///
-/// Searches for the value of `calibration_param` (e.g., "ef") that achieves
-/// the target precision. Uses binary search between `min_value` (from `top` in
-/// search params, default 10) and `max_value` (1000).
+/// Searches for the value of `calibration_param` (e.g., "ef") that achieves the
+/// target `mean_precision_at_returned`. Uses binary search between `min_value`
+/// (from `top` in search params, default 10) and `max_value` (1000).
+///
+/// # The target can be unreachable by construction (#217)
+///
+/// The metric being chased has "results returned" as its denominator, so on a
+/// dataset whose ground-truth rows are narrower than `top` it is capped well
+/// below 1.0 — with `top: 100` (as shipped in `cohere-calibration.json` and
+/// `dbpedia-calibration.json`) and a 3-neighbour ground-truth row, no `ef`
+/// reaches 0.95. The sweep used to converge on `ef = 1000` and report it as a
+/// success. It now bounds the target against the ground-truth ceiling before
+/// spending a single search, and reports `reached_target` either way — both on
+/// stderr and in the result file's `params.calibration` block.
 fn calibrate(
     engine: &mut dyn Engine,
     dataset: &Dataset,
@@ -992,12 +1078,30 @@ fn calibrate(
     calibration_param: &str,
     target_precision: f64,
     num_queries: i64,
-) -> Result<(i64, f64), String> {
+    ground_truth: Option<&crate::ground_truth::GroundTruthProfile>,
+) -> Result<CalibrationOutcome, String> {
     // "EF" (upstream's redis spelling) is the same typed field as "ef"; without
     // this the loop would sweep extra["EF"], which no engine reads.
     let calibration_param = SearchParams::canonical_knob_name(calibration_param);
     let min_value = search_params.top.unwrap_or(10);
     let max_value: i64 = 1000;
+
+    // Bound the target against what the dataset's ground truth allows, before
+    // burning ~10 full search runs chasing a number that cannot exist.
+    let gt_stats = ground_truth.and_then(|gt| {
+        let top = search_params
+            .top
+            .and_then(|t| usize::try_from(t).ok())
+            .or_else(|| gt.first_row_len())?;
+        gt.stats(top)
+    });
+    let ceiling = gt_stats.as_ref().map(|s| s.recall_at_top_ceiling);
+    let unreachable_note = gt_stats
+        .as_ref()
+        .and_then(|s| s.unreachable_target_note(target_precision));
+    if let Some(note) = &unreachable_note {
+        eprintln!("\t⚠ WARNING: calibration target is unreachable — {}", note);
+    }
 
     let mut lower_bound = min_value;
     let mut upper_bound = max_value;
@@ -1024,15 +1128,24 @@ fn calibrate(
         }
 
         let results = engine.search(dataset, &test_params, num_queries)?;
-        let current_precision = results.mean_precision;
+        let current_precision = results.mean_precision_at_returned;
 
         println!(
-            "\t  calibration: {}={} → precision={:.4}",
+            "\t  calibration: {}={} → precision_at_returned={:.4}",
             calibration_param, current, current_precision
         );
 
         if (current_precision - target_precision).abs() < 1e-9 {
-            return Ok((current, current_precision));
+            return Ok(finish_calibration(
+                calibration_param,
+                current,
+                current_precision,
+                target_precision,
+                ceiling,
+                unreachable_note,
+                min_value,
+                max_value,
+            ));
         } else if current_precision > target_precision {
             upper_bound = current;
             upper_visited = true;
@@ -1047,19 +1160,137 @@ fn calibrate(
         if (lower_visited && next_value == lower_bound)
             || (upper_visited && next_value == upper_bound)
         {
-            if (previous_precision - target_precision).abs()
+            let (value, achieved) = if (previous_precision - target_precision).abs()
                 < (current_precision - target_precision).abs()
             {
-                return Ok((previous, previous_precision));
+                (previous, previous_precision)
             } else {
-                return Ok((current, current_precision));
-            }
+                (current, current_precision)
+            };
+            return Ok(finish_calibration(
+                calibration_param,
+                value,
+                achieved,
+                target_precision,
+                ceiling,
+                unreachable_note,
+                min_value,
+                max_value,
+            ));
         }
 
         previous = current;
         previous_precision = current_precision;
         current = next_value;
     }
+}
+
+/// Build the calibration outcome and say plainly whether the target was met.
+///
+/// Before #217 the sweep returned the closest value it found with no signal at
+/// all, so a target the dataset makes unreachable came out looking like a
+/// successful calibration at the maximum swept value.
+#[allow(clippy::too_many_arguments)]
+fn finish_calibration(
+    param: &str,
+    value: i64,
+    achieved: f64,
+    target: f64,
+    ceiling: Option<f64>,
+    unreachable_note: Option<String>,
+    min_value: i64,
+    max_value: i64,
+) -> CalibrationOutcome {
+    let reached_target = achieved + 1e-9 >= target;
+    let note = if reached_target {
+        None
+    } else if let Some(n) = unreachable_note {
+        Some(n)
+    } else {
+        Some(format!(
+            "the sweep of `{}` over [{}, {}] topped out at mean_precision_at_returned={:.4}, \
+             below the target {:.4}{}. The reported value is the closest point found, not a \
+             value that meets the target.",
+            param,
+            min_value,
+            max_value,
+            achieved,
+            target,
+            if value >= max_value {
+                format!(
+                    ", with `{}` pinned at the maximum swept value ({})",
+                    param, max_value
+                )
+            } else {
+                String::new()
+            },
+        ))
+    };
+    if let Some(n) = &note {
+        eprintln!(
+            "\t⚠ WARNING: calibration did NOT reach its target ({}={} → {:.4} < {:.4}) — {}",
+            param, value, achieved, target, n
+        );
+    }
+    CalibrationOutcome {
+        param: param.to_string(),
+        value,
+        target,
+        achieved,
+        reached_target,
+        ceiling,
+        note,
+    }
+}
+
+/// Retrieval-quality key definitions, emitted into every result file.
+///
+/// This block exists because the same key name meant two different things in the
+/// two benchmarks (#217). Upstream `qdrant/vector-db-benchmark`
+/// (`engine/base_client/search.py`) computes
+/// `len(ids.intersection(query.expected_result[:top])) / top` — recall@top — and
+/// publishes it as `mean_precisions`. We published *precision* (denominator =
+/// results returned) under that identical key, so overlaying the two tools'
+/// result files silently plotted precision against recall. We no longer emit a
+/// `mean_precisions` key at all; the definitions travel with the data instead of
+/// living only in a commit message.
+fn metrics_schema(gt: Option<&crate::ground_truth::GroundTruthStats>) -> serde_json::Value {
+    let comparable = gt
+        .filter(|s| s.recall_matches_upstream())
+        .map(|_| "mean_recall");
+    let mut schema = json!({
+        "version": 2,
+        "mean_precision_at_returned":
+            "hits / |deduped results kept (<= top)|, where hits = |results ∩ valid, deduped \
+             ground-truth ids in expected[:top]|. Renamed from `mean_precisions` in schema \
+             version 2 (#217): that key name is taken by a DIFFERENT formula upstream. \
+             -1.0 is the filter-only sentinel (no vector search was run).",
+        "mean_recall":
+            "hits / |valid, deduped ground-truth ids in expected[:top]|. The denominator is the \
+             ground truth that actually exists, so a query with 3 true neighbours can reach 1.0.",
+        "recall_p10": "10th percentile of the per-query recall defined above.",
+        "upstream_qdrant_mean_precisions":
+            "len(ids & expected[:top]) / top — recall@top. This is what upstream \
+             qdrant/vector-db-benchmark emits under the key `mean_precisions`. We deliberately \
+             do NOT emit that key name. It equals our `mean_recall` only when every ground-truth \
+             row has at least `top` valid ids (see `ground_truth` below), and it equals our \
+             `mean_precision_at_returned` only when the engine returns a full page of `top` \
+             results.",
+        "comparable_to_upstream_mean_precisions": comparable,
+    });
+    if let Some(stats) = gt {
+        schema["ground_truth"] = stats.to_json();
+        if comparable.is_none() {
+            schema["comparability_note"] = json!(format!(
+                "{} of {} queries have fewer than top={} valid ground-truth neighbours, so no \
+                 field in this file is directly comparable to upstream's `mean_precisions`; \
+                 upstream's value is capped at {:.4} on this dataset while our `mean_recall` \
+                 can still reach 1.0.",
+                stats.queries_below_top, stats.queries, stats.top, stats.recall_at_top_ceiling
+            ));
+        }
+    }
+    schema
 }
 
 /// Save search results to JSON file (matches Python v0 format)
@@ -1074,6 +1305,8 @@ fn save_search_results(
     server_metadata_after: Option<&serde_json::Value>,
     dump_raw_latencies: bool,
     number_of_shards: Option<&serde_json::Value>,
+    ground_truth: Option<&crate::ground_truth::GroundTruthProfile>,
+    calibration: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let pid = std::process::id();
@@ -1087,6 +1320,45 @@ fn save_search_results(
         engine_name, dataset_name, search_id, mixed_tag, pid, timestamp
     );
 
+    let result = build_search_result_json(
+        engine_name,
+        dataset_name,
+        search_params,
+        results,
+        server_metadata_before,
+        server_metadata_after,
+        dump_raw_latencies,
+        number_of_shards,
+        ground_truth,
+        calibration,
+    );
+
+    let path = results_dir().join(&filename);
+    fs::write(&path, serde_json::to_string_pretty(&result).unwrap())
+        .map_err(|e| format!("Failed to save results: {}", e))?;
+
+    println!("\tResults saved to: {:?}", path);
+    Ok(())
+}
+
+/// Build the search-result JSON document.
+///
+/// Split out of `save_search_results` so the emitted key set — in particular the
+/// absence of `mean_precisions` and the presence of `metrics_schema` (#217) — is
+/// unit-testable without writing a file.
+#[allow(clippy::too_many_arguments)]
+fn build_search_result_json(
+    engine_name: &str,
+    dataset_name: &str,
+    search_params: &crate::config::SearchParams,
+    results: &crate::engine::SearchResults,
+    server_metadata_before: Option<&serde_json::Value>,
+    server_metadata_after: Option<&serde_json::Value>,
+    dump_raw_latencies: bool,
+    number_of_shards: Option<&serde_json::Value>,
+    ground_truth: Option<&crate::ground_truth::GroundTruthProfile>,
+    calibration: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let mut result = json!({
         "params": {
             "dataset": dataset_name,
@@ -1129,7 +1401,13 @@ fn save_search_results(
             "end_to_end_p50_time": results.end_to_end_p50_time,
             "end_to_end_p95_time": results.end_to_end_p95_time,
             "end_to_end_p99_time": results.end_to_end_p99_time,
-            "mean_precisions": results.mean_precision,
+            // Retrieval quality. THREE denominators are in play and only two of
+            // them are ours; see the `metrics_schema` block below (and
+            // src/metrics.rs) for the formulas. `mean_precisions` — upstream's
+            // key for recall@top — is intentionally absent: we used to emit our
+            // precision under that name, which made cross-tool overlays compare
+            // precision against recall (#217).
+            "mean_precision_at_returned": results.mean_precision_at_returned,
             "mean_recall": results.mean_recall,
             "recall_p10": results.recall_p10,
             "mean_mrr": results.mean_mrr,
@@ -1146,12 +1424,27 @@ fn save_search_results(
             // p50/p95/p99_time seconds fields above are unchanged for back-compat.
             // Raw arrays are additionally dumped only under --dump-raw-latencies.
             "latency_hdr": crate::latency_digest::latency_hdr(&results.latencies),
-            "precision_dist": crate::latency_digest::quality_dist(&results.precisions),
+            "precision_at_returned_dist":
+                crate::latency_digest::quality_dist(&results.precisions_at_returned),
             "recall_dist": crate::latency_digest::quality_dist(&results.recalls),
             "mrr_dist": crate::latency_digest::quality_dist(&results.mrrs),
             "ndcg_dist": crate::latency_digest::quality_dist(&results.ndcgs),
         }
     });
+
+    // Metric definitions travel with the numbers (#217). The ground-truth width
+    // profile is evaluated at the `top` this run actually used, so a reader can
+    // see whether `mean_recall` is the same quantity upstream calls
+    // `mean_precisions` for this dataset — or by how much they cannot be.
+    let gt_stats = ground_truth.and_then(|gt| gt.stats(results.top));
+    result["metrics_schema"] = metrics_schema(gt_stats.as_ref());
+
+    // How the swept parameter was chosen, and — crucially — whether the target
+    // was actually reached. A calibration that converged on the maximum value
+    // without reaching its target is not a calibration.
+    if let Some(cal) = calibration {
+        result["params"]["calibration"] = cal.clone();
+    }
 
     // Shard count the index was built with. Recall and QPS both move with it, so
     // a published search result carries it instead of leaving it to be inferred
@@ -1165,7 +1458,12 @@ fn save_search_results(
     // exactly as before. Off by default so large runs stay ~1000x smaller.
     if dump_raw_latencies {
         let results_obj = result["results"].as_object_mut().unwrap();
-        results_obj.insert("precisions".to_string(), json!(results.precisions));
+        // `precisions` is another upstream key name carrying upstream's per-query
+        // recall@top values, so our array ships under an unambiguous name too.
+        results_obj.insert(
+            "precisions_at_returned".to_string(),
+            json!(results.precisions_at_returned),
+        );
         results_obj.insert("recalls".to_string(), json!(results.recalls));
         results_obj.insert("mrrs".to_string(), json!(results.mrrs));
         results_obj.insert("ndcgs".to_string(), json!(results.ndcgs));
@@ -1220,12 +1518,7 @@ fn save_search_results(
         }
     }
 
-    let path = results_dir().join(&filename);
-    fs::write(&path, serde_json::to_string_pretty(&result).unwrap())
-        .map_err(|e| format!("Failed to save results: {}", e))?;
-
-    println!("\tResults saved to: {:?}", path);
-    Ok(())
+    result
 }
 
 /// Save upload results to JSON file
@@ -1355,5 +1648,215 @@ mod tests {
         // searches == 0 would divide-by-zero later, so it is rejected up front.
         let err = parse_update_search_ratio("1:0").unwrap_err();
         assert_eq!(err, "Search count must be > 0");
+    }
+
+    mod metrics_keys {
+        use super::super::{finish_calibration, metrics_schema};
+        use crate::ground_truth::GroundTruthProfile;
+
+        fn rows(n: usize, width: usize) -> Vec<Vec<i64>> {
+            (0..n)
+                .map(|q| ((q * 1000) as i64..(q * 1000 + width) as i64).collect())
+                .collect()
+        }
+
+        /// The whole point of #217: we must never emit a key named
+        /// `mean_precisions`, because upstream publishes recall@top under it.
+        #[test]
+        fn schema_never_reuses_the_upstream_key_name() {
+            let schema = metrics_schema(None);
+            let obj = schema.as_object().unwrap();
+            assert!(
+                !obj.contains_key("mean_precisions"),
+                "`mean_precisions` must not be an emitted key: {:?}",
+                obj.keys().collect::<Vec<_>>()
+            );
+            assert!(obj.contains_key("mean_precision_at_returned"));
+            assert!(obj.contains_key("upstream_qdrant_mean_precisions"));
+            assert_eq!(schema["version"], 2);
+        }
+
+        /// Full-width ground truth: our `mean_recall` IS upstream's
+        /// `mean_precisions`, and the file says so.
+        #[test]
+        fn full_width_ground_truth_declares_mean_recall_comparable() {
+            let gt = GroundTruthProfile::from_rows(rows(100, 100));
+            let stats = gt.stats(100).unwrap();
+            let schema = metrics_schema(Some(&stats));
+            assert_eq!(
+                schema["comparable_to_upstream_mean_precisions"],
+                "mean_recall"
+            );
+            assert!(schema.get("comparability_note").is_none());
+            assert_eq!(
+                schema["ground_truth"]["queries_with_fewer_than_top_neighbours"],
+                0
+            );
+            assert_eq!(schema["ground_truth"]["recall_at_top_ceiling"], 1.0);
+        }
+
+        /// Short ground-truth rows: nothing in the file is comparable to
+        /// upstream's `mean_precisions`, and the file says that too rather than
+        /// inviting the overlay.
+        #[test]
+        fn short_ground_truth_declares_nothing_comparable() {
+            let mut r = rows(9, 100);
+            r.push(vec![42]); // one query with a single true neighbour
+            let gt = GroundTruthProfile::from_rows(r);
+            let stats = gt.stats(100).unwrap();
+            let schema = metrics_schema(Some(&stats));
+            assert!(schema["comparable_to_upstream_mean_precisions"].is_null());
+            let note = schema["comparability_note"].as_str().unwrap();
+            assert!(note.contains("1 of 10"), "{}", note);
+            assert!(note.contains("0.9010"), "{}", note);
+        }
+
+        #[test]
+        fn calibration_that_reaches_its_target_is_reported_clean() {
+            let out = finish_calibration("ef", 128, 0.9612, 0.95, Some(1.0), None, 10, 1000);
+            assert!(out.reached_target);
+            assert!(out.note.is_none());
+            let j = out.to_json();
+            assert_eq!(j["metric"], "mean_precision_at_returned");
+            assert_eq!(j["reached_target"], true);
+            assert_eq!(j["value"], 128);
+        }
+
+        /// The #217 calibrator failure mode: ground truth narrower than `top`
+        /// caps precision, the sweep pins the knob at its maximum, and the run
+        /// used to print that as a successful calibration.
+        #[test]
+        fn unreachable_target_is_reported_not_silently_accepted() {
+            let gt = GroundTruthProfile::from_rows(vec![vec![1, 2, 3]; 8]);
+            let stats = gt.stats(100).unwrap();
+            let note = stats.unreachable_target_note(0.95);
+            assert!(note.is_some(), "0.95 vs a 0.03 ceiling must be flagged");
+            let out = finish_calibration(
+                "ef",
+                1000,
+                0.03,
+                0.95,
+                Some(stats.recall_at_top_ceiling),
+                note,
+                100,
+                1000,
+            );
+            assert!(!out.reached_target);
+            let j = out.to_json();
+            assert_eq!(j["reached_target"], false);
+            assert!((j["ground_truth_ceiling"].as_f64().unwrap() - 0.03).abs() < 1e-9);
+            let note = j["note"].as_str().unwrap();
+            assert!(note.contains("ceiling"), "{}", note);
+        }
+
+        /// End-to-end over the document actually written to `results/`: the
+        /// colliding key names must be gone, the unambiguous ones present, and the
+        /// definitions must ship with the numbers.
+        #[test]
+        fn emitted_document_has_no_colliding_key_names() {
+            use super::super::build_search_result_json;
+            use crate::config::SearchParams;
+            use crate::engine::SearchResults;
+
+            let params: SearchParams =
+                serde_json::from_value(serde_json::json!({"parallel": 1, "top": 10})).unwrap();
+            let results = SearchResults {
+                top: 10,
+                mean_precision_at_returned: 1.0,
+                mean_recall: 0.5,
+                precisions_at_returned: vec![1.0, 1.0],
+                recalls: vec![0.5, 0.5],
+                mrrs: vec![1.0, 1.0],
+                ndcgs: vec![1.0, 1.0],
+                latencies: vec![0.001, 0.002],
+                ..Default::default()
+            };
+            let gt = GroundTruthProfile::from_rows(rows(2, 10));
+            let doc = build_search_result_json(
+                "redis-test",
+                "glove-25-angular",
+                &params,
+                &results,
+                None,
+                None,
+                true, // --dump-raw-latencies: exercises the raw-array key too
+                None,
+                Some(&gt),
+                None,
+            );
+
+            let res = doc["results"].as_object().unwrap();
+            // The 5-of-10 case from #217: our precision is 1.0 while upstream
+            // would publish 0.5 under `mean_precisions`. Neither the aggregate nor
+            // the per-query array may reuse an upstream key name.
+            assert!(
+                !res.contains_key("mean_precisions"),
+                "emitted `mean_precisions`: {:?}",
+                res.keys().collect::<Vec<_>>()
+            );
+            assert!(!res.contains_key("precisions"));
+            assert!(!res.contains_key("precision_dist"));
+            assert_eq!(res["mean_precision_at_returned"], 1.0);
+            assert_eq!(res["mean_recall"], 0.5);
+            assert_eq!(res["precisions_at_returned"], serde_json::json!([1.0, 1.0]));
+            assert!(res.contains_key("precision_at_returned_dist"));
+
+            // Definitions travel with the data, not just with the commit message.
+            let schema = doc["metrics_schema"].as_object().unwrap();
+            assert_eq!(schema["version"], 2);
+            assert_eq!(doc["metrics_schema"]["ground_truth"]["top"], 10);
+            assert_eq!(
+                doc["metrics_schema"]["comparable_to_upstream_mean_precisions"],
+                "mean_recall"
+            );
+        }
+
+        /// A calibrated run records how the knob was chosen, including a target it
+        /// failed to reach.
+        #[test]
+        fn emitted_document_carries_the_calibration_outcome() {
+            use super::super::{build_search_result_json, finish_calibration};
+            use crate::config::SearchParams;
+            use crate::engine::SearchResults;
+
+            let outcome = finish_calibration("ef", 1000, 0.24, 0.95, Some(0.25), None, 100, 1000);
+            let doc = build_search_result_json(
+                "redis-test",
+                "h-and-m-2048-angular",
+                &serde_json::from_value::<SearchParams>(
+                    serde_json::json!({"parallel": 1, "top": 100}),
+                )
+                .unwrap(),
+                &SearchResults {
+                    top: 100,
+                    ..Default::default()
+                },
+                None,
+                None,
+                false,
+                None,
+                None,
+                Some(&outcome.to_json()),
+            );
+            let cal = &doc["params"]["calibration"];
+            assert_eq!(cal["reached_target"], false);
+            assert_eq!(cal["metric"], "mean_precision_at_returned");
+            assert_eq!(cal["value"], 1000);
+            assert!(cal["note"].as_str().unwrap().contains("topped out"));
+        }
+
+        /// Target below the ceiling but still not reached by the sweep (a genuinely
+        /// weak engine): still reported, with the saturated-knob detail.
+        #[test]
+        fn target_missed_without_a_ceiling_explanation_still_warns() {
+            let out = finish_calibration("ef", 1000, 0.80, 0.95, Some(1.0), None, 10, 1000);
+            assert!(!out.reached_target);
+            let note = out.note.unwrap();
+            assert!(
+                note.contains("pinned at the maximum swept value"),
+                "{}",
+                note
+            );
+        }
     }
 }

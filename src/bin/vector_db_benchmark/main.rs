@@ -9,6 +9,7 @@ mod dataset;
 mod download;
 mod engine;
 mod experiment;
+mod ground_truth;
 mod latency_digest;
 mod metrics;
 mod plot;
