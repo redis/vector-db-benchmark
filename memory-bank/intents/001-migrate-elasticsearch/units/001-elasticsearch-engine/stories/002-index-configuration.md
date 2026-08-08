@@ -30,6 +30,10 @@ implemented: true
 ## Technical Notes
 
 - Index settings: `number_of_shards: 1, number_of_replicas: 0, refresh_interval: "10s"`
+  - SUPERSEDED by #240: `refresh_interval` is now `-1` (no periodic refresh during
+    ingest), matching `opensearch.rs` and upstream's
+    `v0/engine/clients/elasticsearch/configure.py`. `upload()` issues an explicit
+    `_refresh` before the search phase. Do not restore `"10s"`.
 - Vector field: `type: "dense_vector", dims: vector_size, index: true`
 - Source excludes vector field: `_source.excludes: ["vector"]`
 - Clean (delete) should catch NotFoundError silently
