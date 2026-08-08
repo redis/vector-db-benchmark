@@ -24,8 +24,14 @@ def _size_from_corpus_path(path):
     size = None
     for token in re.split(r'[_\-.]', segments[-1]):
         match = re.fullmatch(r'(\d+)([kKmMgGbB])', token)
-        if match:
-            size = int(match.group(1)) * _MAGNITUDE[match.group(2).lower()]
+        if not match:
+            continue
+        candidate = int(match.group(1)) * _MAGNITUDE[match.group(2).lower()]
+        # Ignore absurd magnitudes rather than letting one erase a valid earlier
+        # token, so this stays byte-for-byte equivalent to the Rust twin in
+        # config.rs (which declines anything that overflows i64).
+        if candidate <= 2 ** 63 - 1:
+            size = candidate
     return size
 
 

@@ -2858,6 +2858,85 @@ mod tests {
         assert_eq!(ds.corpus_completeness_target().unwrap(), None);
     }
 
+    /// The dangerous sibling of the above: the dataset DIRECTORY exists but the
+    /// corpus file inside it does not. `extract_tgz` creates the directory and
+    /// unpacks in place, and `vectors.npy` is the LAST member of `arxiv.tar.gz`
+    /// — so an interrupted download leaves exactly this state, as does deleting
+    /// a big `vectors.npy` to reclaim disk while `tests.jsonl` stays behind and
+    /// queries keep working. "A directory is here" must never stand in for "the
+    /// corpus is complete": that reopens #224 from the corpus side.
+    #[test]
+    fn present_directory_with_missing_corpus_file_yields_no_target() {
+        let dir = tempfile::tempdir().unwrap();
+        // Everything an interrupted extract leaves behind EXCEPT vectors.npy.
+        std::fs::write(dir.path().join("tests.jsonl"), "{\"query\": [1.0]}\n").unwrap();
+        std::fs::write(dir.path().join("payloads.jsonl"), "{}\n").unwrap();
+
+        let ds = Dataset::new(DatasetConfig {
+            name: "half-extracted".to_string(),
+            dataset_type: Some("tar".to_string()),
+            path: serde_json::Value::String(dir.path().to_str().unwrap().to_string()),
+            distance: Some("l2".to_string()),
+            vector_size: Some(3),
+            vector_count: Some(10),
+            link: None,
+            schema: None,
+            description: None,
+        });
+        assert_eq!(
+            ds.measured_vector_count().unwrap(),
+            None,
+            "no vectors.npy => nothing measurable"
+        );
+        assert_eq!(
+            ds.corpus_completeness_target().unwrap(),
+            None,
+            "a measurable layout with its corpus file missing must not fall back \
+             to the declared count"
+        );
+
+        // Same shape for the jsonl layout (directory present, vectors.jsonl gone).
+        let jsonl_dir = tempfile::tempdir().unwrap();
+        std::fs::write(jsonl_dir.path().join("queries.jsonl"), "[1.0]\n").unwrap();
+        let mut cfg = ds.config.clone();
+        cfg.dataset_type = Some("jsonl".to_string());
+        cfg.path = serde_json::Value::String(jsonl_dir.path().to_str().unwrap().to_string());
+        assert_eq!(
+            Dataset::new(cfg).corpus_completeness_target().unwrap(),
+            None
+        );
+    }
+
+    /// The narrow, deliberate exception: layouts with no cheap row count may use
+    /// the declared count — but only once their corpus files are actually there.
+    #[test]
+    fn unmeasurable_layouts_fall_back_only_when_their_files_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let sparse = Dataset::new(DatasetConfig {
+            name: "sparse-unit".to_string(),
+            dataset_type: Some("sparse".to_string()),
+            path: serde_json::Value::String(dir.path().to_str().unwrap().to_string()),
+            distance: Some("dot".to_string()),
+            vector_size: Some(3),
+            vector_count: Some(500),
+            link: None,
+            schema: None,
+            description: None,
+        });
+        assert_eq!(
+            sparse.corpus_completeness_target().unwrap(),
+            None,
+            "empty directory is not a corpus"
+        );
+
+        std::fs::write(dir.path().join("data.csr"), b"").unwrap();
+        assert_eq!(
+            sparse.corpus_completeness_target().unwrap(),
+            Some(500),
+            "CSR has no cheap row count, so the declared count is all we have"
+        );
+    }
+
     #[test]
     fn transient_conn_errors_are_retryable() {
         // Real redis-rs / OS socket-drop signatures → retry (#160).

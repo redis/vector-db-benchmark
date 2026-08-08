@@ -378,24 +378,38 @@ mod tests {
     /// path segment carries an unambiguous magnitude token — `random_keywords_1m`
     /// => 1_000_000, `..._100k` => 100_000, `...-1G-...` => 1_000_000_000. The
     /// LAST such token wins. `None` when the name says nothing about size.
+    ///
+    /// Every rejection is a `continue`, never a `?`: an unparseable token must
+    /// skip that token, NOT abandon the whole path. A `?` here silently excused
+    /// any path with a doubled or trailing separator (`random_keywords__1m`,
+    /// `random_keywords_1m_`) from the check entirely — a guard that turns
+    /// itself off. Token splitting is char-based for the same reason: a byte
+    /// index into a multi-byte char panicked instead of declining.
     fn path_implied_corpus_size(path: &serde_json::Value) -> Option<i64> {
         let leaf = path.as_str()?.split('/').rfind(|s| !s.is_empty())?;
         let mut implied = None;
         for tok in leaf.split(['_', '-', '.']) {
-            let (digits, suffix) = tok.split_at(tok.len().checked_sub(1)?);
+            let mut chars = tok.chars();
+            let Some(suffix) = chars.next_back() else {
+                continue; // empty token (doubled/trailing separator)
+            };
+            let digits = chars.as_str();
             if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 continue;
             }
-            let scale: i64 = match suffix.to_ascii_lowercase().as_str() {
-                "k" => 1_000,
-                "m" => 1_000_000,
-                "g" | "b" => 1_000_000_000,
+            let scale: i64 = match suffix.to_ascii_lowercase() {
+                'k' => 1_000,
+                'm' => 1_000_000,
+                'g' | 'b' => 1_000_000_000,
                 _ => continue,
             };
-            implied = digits
+            if let Some(size) = digits
                 .parse::<i64>()
                 .ok()
-                .and_then(|n| n.checked_mul(scale));
+                .and_then(|n| n.checked_mul(scale))
+            {
+                implied = Some(size);
+            }
         }
         implied
     }
@@ -411,24 +425,37 @@ mod tests {
     /// disk: whenever a corpus path names its own size, the declared count must
     /// agree. (A dataset that is deliberately a subset of a named corpus should
     /// be given a path that reflects its real size.)
+    ///
+    /// Every mismatch is collected and reported in ONE assertion. Asserting
+    /// inside the loop would report the first offender only, so a fix-rerun
+    /// cycle is needed to discover its twin — and #224's two entries were
+    /// exactly such a pair.
     #[test]
     fn declared_vector_count_agrees_with_the_size_its_path_advertises() {
         let configs = read_dataset_configs().expect("datasets.json must parse");
         let mut checked = 0;
+        let mut mismatches = Vec::new();
         for (name, cfg) in &configs {
             let Some(implied) = path_implied_corpus_size(&cfg.path) else {
                 continue;
             };
             checked += 1;
-            assert_eq!(
-                cfg.vector_count,
-                Some(implied),
-                "dataset '{name}' declares vector_count {:?} but its corpus path '{}' \
-                 advertises {implied} points (#224)",
-                cfg.vector_count,
-                cfg.path.as_str().unwrap_or_default(),
-            );
+            if cfg.vector_count != Some(implied) {
+                mismatches.push(format!(
+                    "  dataset '{name}' declares vector_count {:?} but its corpus path '{}' \
+                     advertises {implied} points",
+                    cfg.vector_count,
+                    cfg.path.as_str().unwrap_or_default(),
+                ));
+            }
         }
+        mismatches.sort();
+        assert!(
+            mismatches.is_empty(),
+            "{} dataset(s) declare a vector_count their corpus path contradicts (#224):\n{}",
+            mismatches.len(),
+            mismatches.join("\n"),
+        );
         assert!(
             checked >= 30,
             "expected the size-in-path check to cover the bulk of datasets.json, covered {checked}"
@@ -461,6 +488,43 @@ mod tests {
         );
         assert_eq!(path_implied_corpus_size(&s("random-100/")), None);
         assert_eq!(path_implied_corpus_size(&json!({"data": []})), None);
+    }
+
+    /// A guard that can be switched off by an odd separator is not a guard. An
+    /// unparseable token must skip that TOKEN, not abandon the whole path —
+    /// otherwise `random_keywords__1m` / `random_keywords_1m_` (doubled and
+    /// trailing separator) drop out of
+    /// `declared_vector_count_agrees_with_the_size_its_path_advertises`
+    /// entirely and a deliberately wrong `vector_count` sails through CI.
+    #[test]
+    fn odd_separators_and_unicode_do_not_switch_the_check_off() {
+        let s = |v: &str| serde_json::Value::String(v.to_string());
+        for leaf in [
+            "random-100-match-kw-small-vocab/random_keywords__1m",
+            "random-100-match-kw-small-vocab/random_keywords_1m_",
+            "random-100-match-kw-small-vocab/random__keywords_1m__vocab__10",
+            "random-100-match-kw-small-vocab/-random_keywords_1m.",
+        ] {
+            assert_eq!(
+                path_implied_corpus_size(&s(leaf)),
+                Some(1_000_000),
+                "empty tokens must be skipped, not abort the scan: {leaf}"
+            );
+        }
+        // Multi-byte characters must decline cleanly, never panic on a byte
+        // index that is not a char boundary.
+        assert_eq!(
+            path_implied_corpus_size(&s("random/random_keywords_1m_café")),
+            Some(1_000_000)
+        );
+        assert_eq!(path_implied_corpus_size(&s("random/café")), None);
+        assert_eq!(path_implied_corpus_size(&s("random/日本語")), None);
+        // A magnitude token that would overflow i64 must not erase an earlier
+        // valid one.
+        assert_eq!(
+            path_implied_corpus_size(&s("random/corpus_1m_99999999999999999999g")),
+            Some(1_000_000)
+        );
     }
 
     #[test]

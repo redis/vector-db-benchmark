@@ -127,7 +127,11 @@ impl Dataset {
                 _ => return Ok(None),
             },
             // "sparse" (CSR) and "h5-multi" (many part files) have no cheap
-            // row count; they also declare no vector_count today.
+            // row count. They declare no vector_count in the shipped
+            // datasets.json today, but sibling branches add sparse datasets
+            // that DO (msmarco-sparse-*) — those are covered only by the
+            // path-size CI check in config.rs, not by measurement. Giving CSR
+            // a cheap row count (its header carries nnz/rows) would close that.
             _ => return Ok(None),
         };
 
@@ -224,11 +228,20 @@ impl Dataset {
     ///
     /// Prefers the MEASURED corpus size over the declared `vector_count`, so a
     /// wrong number in `datasets.json` can no longer authorise an early skip
-    /// (#224). Falls back to the declared count only for a corpus that is on
-    /// disk but has no cheap row count (`h5-multi` parts), and returns
-    /// `Ok(None)` otherwise — which callers must read as "cannot confirm
-    /// completeness, do NOT skip". In particular a corpus that isn't downloaded
-    /// yet is never confirmable, so a stale keyspace can't be waved through.
+    /// (#224). It falls back to the declared count ONLY for the layouts that
+    /// genuinely have no cheap row count (`sparse`, `h5-multi`) and whose corpus
+    /// files are all present; everything else must be measured or is reported as
+    /// `Ok(None)` — which callers must read as "cannot confirm completeness, do
+    /// NOT skip".
+    ///
+    /// The fallback is keyed on `dataset_type`, never on "some directory
+    /// exists". A measurable layout whose corpus file is missing — a `tar`
+    /// dataset whose directory was created by an interrupted `extract_tgz`
+    /// (`vectors.npy` is the LAST member of `arxiv.tar.gz`, so this is the
+    /// normal shape of a truncated download), or one whose big `vectors.npy`
+    /// was deleted to reclaim disk while `tests.jsonl` stayed behind so queries
+    /// still work — must NOT be waved through on the declared number. That is
+    /// #224 all over again, just reached from the corpus side.
     pub fn corpus_completeness_target(&self) -> Result<Option<u64>, String> {
         let declared = self
             .config
@@ -242,33 +255,41 @@ impl Dataset {
         if measured.is_some() {
             return Ok(measured);
         }
-        if self.corpus_is_local() {
+        if self.unmeasurable_corpus_is_present() {
             Ok(declared)
         } else {
             Ok(None)
         }
     }
 
-    /// Whether the corpus files are on disk (no download attempted). Handles the
-    /// dict-style `h5-multi` layout, whose corpus is a set of part files: all of
-    /// them must be present for the corpus to count as local.
-    fn corpus_is_local(&self) -> bool {
-        if self.local_path().is_some() {
-            return true;
+    /// Whether this is one of the layouts with no cheap row count AND all of its
+    /// corpus files are on disk (no download attempted).
+    ///
+    /// Measurable layouts always answer `false`: they have a row count, so they
+    /// must be measured rather than trusted. Only `sparse` (CSR) and `h5-multi`
+    /// (many part files) may fall back to the declared count, and only when the
+    /// files they need actually exist.
+    fn unmeasurable_corpus_is_present(&self) -> bool {
+        match self.config.dataset_type.as_deref().unwrap_or("") {
+            "sparse" => self
+                .local_path()
+                .is_some_and(|p| p.join("data.csr").exists()),
+            "h5-multi" => self
+                .config
+                .path
+                .as_object()
+                .and_then(|o| o.get("data"))
+                .and_then(|d| d.as_array())
+                .is_some_and(|parts| {
+                    !parts.is_empty()
+                        && parts.iter().all(|p| {
+                            p.get("path")
+                                .and_then(|p| p.as_str())
+                                .is_some_and(|s| datasets_dir().join(s).exists())
+                        })
+                }),
+            _ => false,
         }
-        self.config
-            .path
-            .as_object()
-            .and_then(|o| o.get("data"))
-            .and_then(|d| d.as_array())
-            .is_some_and(|parts| {
-                !parts.is_empty()
-                    && parts.iter().all(|p| {
-                        p.get("path")
-                            .and_then(|p| p.as_str())
-                            .is_some_and(|s| datasets_dir().join(s).exists())
-                    })
-            })
     }
 
     /// Read all vectors and metadata from the dataset
