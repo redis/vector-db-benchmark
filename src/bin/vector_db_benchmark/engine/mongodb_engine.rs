@@ -14,6 +14,7 @@ use mongodb::sync::Client;
 
 use rand::{seq::SliceRandom, SeedableRng};
 
+use super::geo;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{CorpusCount, Engine, SearchResults, UpdateSearchRatio, UploadStats};
@@ -432,25 +433,65 @@ impl MongoDBEngine {
             vector_field.insert("hnswOptions", hnsw_options);
         }
 
-        let mut fields = vec![vector_field];
-
-        // Add filter fields from dataset schema
-        if let Some(schema) = &dataset.config.schema {
-            if let Some(schema_obj) = schema.as_object() {
-                for (field_name, _field_type) in schema_obj {
-                    fields.push(doc! {
-                        "type": "filter",
-                        "path": field_name,
-                    });
+        // A dataset that declares a `geo` field needs the `search`-type index:
+        // the `vectorSearch`-type index has no geo field type at all, and
+        // `$vectorSearch`'s `filter` has no geo operator (issue #223). See the
+        // `parse_mongo_search_conditions` section header.
+        let index_def = if schema_declares_geo(dataset.config.schema.as_ref()) {
+            let mut mapped = doc! {
+                "vector": {
+                    "type": "vector",
+                    "numDimensions": vector_size as i32,
+                    "similarity": similarity,
+                },
+            };
+            // Same HNSW knobs, same spelling — `hnswOptions` is honoured by the
+            // `search`-type index too (verified live: `maxEdges`/
+            // `numEdgeCandidates` come back in `latestDefinition`).
+            if let Some(hnsw_options) =
+                build_hnsw_options(self.config.hnsw_m, self.config.hnsw_ef_construction)?
+            {
+                if let Ok(v) = mapped.get_document_mut("vector") {
+                    v.insert("hnswOptions", hnsw_options);
                 }
             }
-        }
+            if let Some(schema_obj) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) {
+                for (field_name, field_type) in schema_obj {
+                    let ty = field_type.as_str().ok_or_else(|| {
+                        format!("MongoDB: schema type for `{field_name}` is not a string")
+                    })?;
+                    mapped.insert(
+                        field_name.clone(),
+                        search_index_field_mapping(field_name, ty)?,
+                    );
+                }
+            }
+            doc! {
+                "name": &self.index_name,
+                "type": "search",
+                "definition": { "mappings": { "dynamic": false, "fields": mapped } },
+            }
+        } else {
+            let mut fields = vec![vector_field];
 
-        let index_def = doc! {
-            "name": &self.index_name,
-            "type": "vectorSearch",
-            "definition": {
-                "fields": fields,
+            // Add filter fields from dataset schema
+            if let Some(schema) = &dataset.config.schema {
+                if let Some(schema_obj) = schema.as_object() {
+                    for (field_name, _field_type) in schema_obj {
+                        fields.push(doc! {
+                            "type": "filter",
+                            "path": field_name,
+                        });
+                    }
+                }
+            }
+
+            doc! {
+                "name": &self.index_name,
+                "type": "vectorSearch",
+                "definition": {
+                    "fields": fields,
+                }
             }
         };
 
@@ -534,6 +575,7 @@ impl MongoDBEngine {
         &self,
         expected_count: usize,
         probe_vector: &[f32],
+        dialect: SearchDialect,
     ) -> Result<(), String> {
         // Upper bound on how many docs we require the probe to surface. Atlas
         // caps both `limit` and `numCandidates` at 10_000, and for large corpora
@@ -603,6 +645,7 @@ impl MongoDBEngine {
                     probe_top,
                     probe_candidates,
                     None,
+                    dialect,
                 ) {
                     Ok(results) if results.len() >= want => {
                         println!(
@@ -938,12 +981,19 @@ fn filter_only_find(
 /// (pgvector/qdrant/redis) and the ES/OS/Milvus/Weaviate boundary from #113.
 ///
 /// The returned pipeline is identical to what the previous inline build produced.
+///
+/// `dialect` selects the stage: [`SearchDialect::VectorSearchStage`] is the
+/// long-standing `$vectorSearch` path; [`SearchDialect::SearchStage`] is the
+/// `$search` + `vectorSearch`-operator path used only for geo-carrying datasets
+/// (issue #223). The vector arguments are identical in both — only the stage
+/// name, the nesting and the score meta differ.
 fn build_search_pipeline(
     index_name: &str,
     query_vector: &[f32],
     top: usize,
     num_candidates: i64,
     filter: Option<&Document>,
+    dialect: SearchDialect,
 ) -> Vec<Document> {
     let bson_vec: Vec<mongodb::bson::Bson> = query_vector
         .iter()
@@ -951,7 +1001,6 @@ fn build_search_pipeline(
         .collect();
 
     let mut vs_stage = doc! {
-        "index": index_name,
         "path": "vector",
         "queryVector": bson_vec,
         "numCandidates": num_candidates,
@@ -962,15 +1011,63 @@ fn build_search_pipeline(
         vs_stage.insert("filter", f.clone());
     }
 
-    vec![
-        doc! { "$vectorSearch": vs_stage },
-        doc! {
-            "$project": {
-                "_id": 1,
-                "score": { "$meta": "vectorSearchScore" },
-            }
-        },
-    ]
+    match dialect {
+        SearchDialect::VectorSearchStage => {
+            let mut stage = doc! { "index": index_name };
+            stage.extend(vs_stage);
+            vec![
+                doc! { "$vectorSearch": stage },
+                doc! {
+                    "$project": {
+                        "_id": 1,
+                        "score": { "$meta": "vectorSearchScore" },
+                    }
+                },
+            ]
+        }
+        SearchDialect::SearchStage => vec![
+            doc! { "$search": { "index": index_name, "vectorSearch": vs_stage } },
+            doc! {
+                "$project": {
+                    "_id": 1,
+                    "score": { "$meta": "searchScore" },
+                }
+            },
+        ],
+    }
+}
+
+/// Which vector-query stage a run uses. Decided once, from the dataset schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchDialect {
+    /// `$vectorSearch` + a `vectorSearch`-type index. Every non-geo dataset.
+    VectorSearchStage,
+    /// `$search` + the `vectorSearch` operator + a `search`-type index. The only
+    /// MongoDB path with a geo pre-filter (issue #223).
+    SearchStage,
+}
+
+impl SearchDialect {
+    fn for_dataset(dataset: &Dataset) -> Self {
+        if schema_declares_geo(dataset.config.schema.as_ref()) {
+            SearchDialect::SearchStage
+        } else {
+            SearchDialect::VectorSearchStage
+        }
+    }
+
+    /// Build one query's filter in the grammar this dialect's stage accepts.
+    ///
+    /// The two `filter` grammars are NOT interchangeable — MQL on
+    /// `$vectorSearch`, a MongoDB Search operator tree on `$search` — so the
+    /// pairing lives here rather than at the call sites. `Ok(None)` still means
+    /// "produced nothing", which `try_resolve_all` turns into the #219 error.
+    fn parse(self, conditions: &serde_json::Value) -> Result<Option<Document>, String> {
+        match self {
+            SearchDialect::VectorSearchStage => Ok(parse_mongo_conditions(conditions)),
+            SearchDialect::SearchStage => parse_mongo_search_conditions(conditions),
+        }
+    }
 }
 
 /// Send a precomputed aggregation pipeline and return the DECODED documents.
@@ -1026,8 +1123,16 @@ fn vector_search(
     top: usize,
     num_candidates: i64,
     filter: Option<&Document>,
+    dialect: SearchDialect,
 ) -> Result<Vec<(i64, f64)>, String> {
-    let pipeline = build_search_pipeline(index_name, query_vector, top, num_candidates, filter);
+    let pipeline = build_search_pipeline(
+        index_name,
+        query_vector,
+        top,
+        num_candidates,
+        filter,
+        dialect,
+    );
     let docs = send_search(coll, &pipeline)?;
     Ok(extract_search_hits(&docs))
 }
@@ -1140,6 +1245,50 @@ fn build_mongo_filter_entry(entry: &serde_json::Value) -> Option<Document> {
                         clauses.insert(field_name.clone(), range_doc);
                     }
                 }
+                // Geo-radius, in the MQL dialect (issue #223). `$geoWithin` +
+                // `$centerSphere` is an exact spherical-cap test against the
+                // GeoJSON Point that `metadata_value_to_bson` already stores, and
+                // it needs no `2dsphere` index.
+                //
+                // `$centerSphere`'s radius is in RADIANS: dividing the dataset's
+                // metres by `geo::EARTH_RADIUS_M` makes MongoDB's cap the same set
+                // the fixtures' haversine ground truth uses, rather than the
+                // 6378.1 km the MongoDB docs suggest (a 0.11 % difference in the
+                // boundary).
+                //
+                // NOTE this arm is reachable only on the `find()` (filter-only)
+                // path. `$vectorSearch`'s `filter` accepts a closed list of 10
+                // operators — `$eq $ne $gt $gte $lt $lte $in $nin $exists $not` —
+                // and rejects `$geoWithin` outright (verified live against
+                // `mongodb/mongodb-atlas-local:8.0.17`:
+                // `"filter.loc" at least one of [...] must be present`). The
+                // vector path therefore uses [`parse_mongo_search_conditions`].
+                "geo" => {
+                    let center = (
+                        criteria.get("lon").and_then(|v| v.as_f64()),
+                        criteria.get("lat").and_then(|v| v.as_f64()),
+                        criteria.get("radius").and_then(|v| v.as_f64()),
+                    );
+                    // A missing/invalid component is a DROP, which
+                    // `query_filter::resolve` turns into a hard error — never a
+                    // default radius nobody asked for (see `geo::query_terms`).
+                    let (Some(lon), Some(lat), Some(radius)) = center else {
+                        return None;
+                    };
+                    if !lon.is_finite()
+                        || !lat.is_finite()
+                        || !(radius.is_finite() && radius >= 0.0)
+                    {
+                        return None;
+                    }
+                    clauses.insert(
+                        field_name.clone(),
+                        doc! { "$geoWithin": { "$centerSphere": [
+                            [lon, lat],
+                            radius / geo::EARTH_RADIUS_M,
+                        ] } },
+                    );
+                }
                 _ => {}
             }
         }
@@ -1149,6 +1298,207 @@ fn build_mongo_filter_entry(entry: &serde_json::Value) -> Option<Document> {
         None
     } else {
         Some(clauses)
+    }
+}
+
+// ── MongoDB Search operator dialect (the only geo-capable vector path) ───────
+//
+// `$vectorSearch`'s `filter` is MQL restricted to ten comparison operators, so
+// there is NO geo predicate on that stage — see the note in
+// `build_mongo_filter_entry`. MongoDB's geo-capable pre-filter for a vector
+// query is the `vectorSearch` OPERATOR inside a `$search` stage, whose `filter`
+// takes a MongoDB Search operator tree and therefore `geoWithin`. It needs a
+// different index (`type: "search"` with a `vector`-typed field and a
+// `geo`-typed field) and reports `$meta: "searchScore"`.
+//
+// This engine switches to that path for — and only for — a dataset whose schema
+// declares a `geo` field ([`schema_declares_geo`]). Everything else keeps the
+// `$vectorSearch` stage and the `vectorSearch`-type index it has always used, so
+// no existing MongoDB number moves.
+//
+// Verified live on `mongodb/mongodb-atlas-local:8.0.17`: `geoWithin` + `circle`
+// selected exactly the in-radius documents, and `equals`/`in`/`range`/`compound`
+// behave as the MQL forms do.
+
+/// Whether a dataset's declared schema contains a `geo` field.
+pub(crate) fn schema_declares_geo(schema: Option<&serde_json::Value>) -> bool {
+    schema
+        .and_then(|s| s.as_object())
+        .is_some_and(|o| o.values().any(|t| t.as_str() == Some("geo")))
+}
+
+/// The `mappings.fields` entry for one schema field in a `search`-type index.
+///
+/// `Err` rather than a silent omission for an unknown type: an unmapped field in
+/// a `dynamic: false` index is invisible to every filter that names it, which is
+/// the silent-unfiltered failure this whole area exists to stop.
+fn search_index_field_mapping(field: &str, schema_type: &str) -> Result<Document, String> {
+    Ok(match schema_type {
+        "geo" => doc! { "type": "geo" },
+        // `token` is the exact-value (non-analyzed) string type — the keyword
+        // semantics `equals`/`in` need. `text` fields are also indexed as tokens
+        // here because this path only has to serve the filters the harness emits.
+        "keyword" | "uuid" | "text" => doc! { "type": "token" },
+        "int" | "float" => doc! { "type": "number" },
+        // Bools are STORED as the strings "true"/"false" (see `json_to_bson`), so
+        // the exact-value token type is what matches them.
+        "bool" => doc! { "type": "token" },
+        // `datetime` is deliberately absent. `metadata_value_to_bson` stores it
+        // as the raw ISO STRING (only `int`/`float` are parsed back to numbers),
+        // so neither `number` nor `date` would match it, and a lexicographic
+        // `token` range is not something this PR verified against a live server.
+        // No shipped dataset carries geo and datetime together, so this arm is
+        // unreachable today; it errors rather than guessing.
+        other => {
+            return Err(format!(
+                "MongoDB: dataset schema field `{field}` has type `{other}`, which this engine \
+                 cannot map into a `search`-type index. Add a mapping rather than leaving the \
+                 field unindexed — an unmapped field in a `dynamic: false` index silently matches \
+                 nothing (issue #223)."
+            ))
+        }
+    })
+}
+
+/// Parse filter conditions into a MongoDB **Search** operator document, for the
+/// `$search` + `vectorSearch` path.
+///
+/// `Err` — never a silent drop — for a condition this dialect cannot express.
+pub(crate) fn parse_mongo_search_conditions(
+    conditions: &serde_json::Value,
+) -> Result<Option<Document>, String> {
+    let Some(obj) = conditions.as_object() else {
+        return Ok(None);
+    };
+    if obj.is_empty() {
+        return Ok(None);
+    }
+    build_search_group(obj)
+}
+
+/// One `{and:[…], or:[…]}` group → a `compound` operator. `and` entries become
+/// `filter` (non-scoring conjunction), `or` entries become `should` with
+/// `minimumShouldMatch: 1`.
+fn build_search_group(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<Document>, String> {
+    let mut and_clauses: Vec<mongodb::bson::Bson> = Vec::new();
+
+    if let Some(entries) = obj.get("and").and_then(|v| v.as_array()) {
+        for entry in entries {
+            if let Some(c) = build_search_entry(entry)? {
+                and_clauses.push(mongodb::bson::Bson::Document(c));
+            }
+        }
+    }
+
+    if let Some(entries) = obj.get("or").and_then(|v| v.as_array()) {
+        let mut should: Vec<mongodb::bson::Bson> = Vec::new();
+        for entry in entries {
+            if let Some(c) = build_search_entry(entry)? {
+                should.push(mongodb::bson::Bson::Document(c));
+            }
+        }
+        if !should.is_empty() {
+            and_clauses.push(mongodb::bson::Bson::Document(doc! {
+                "compound": { "should": should, "minimumShouldMatch": 1 }
+            }));
+        }
+    }
+
+    match and_clauses.len() {
+        0 => Ok(None),
+        // A single clause needs no wrapper — and must not get one, or the
+        // multi-leaf render comparison in `filter_guard` cannot tell a
+        // one-leaf group from a two-leaf group that lost a leaf.
+        1 => Ok(match and_clauses.into_iter().next() {
+            Some(mongodb::bson::Bson::Document(d)) => Some(d),
+            _ => None,
+        }),
+        _ => Ok(Some(doc! { "compound": { "filter": and_clauses } })),
+    }
+}
+
+fn build_search_entry(entry: &serde_json::Value) -> Result<Option<Document>, String> {
+    let Some(entry_obj) = entry.as_object() else {
+        return Ok(None);
+    };
+    if entry_obj.contains_key("and") || entry_obj.contains_key("or") {
+        return build_search_group(entry_obj);
+    }
+
+    let mut clauses: Vec<mongodb::bson::Bson> = Vec::new();
+    for (field, spec) in entry_obj {
+        let Some(spec_obj) = spec.as_object() else {
+            return Ok(None);
+        };
+        for (op, criteria) in spec_obj {
+            let clause = match op.as_str() {
+                "geo" => {
+                    let (Some(lon), Some(lat), Some(radius)) = (
+                        criteria.get("lon").and_then(|v| v.as_f64()),
+                        criteria.get("lat").and_then(|v| v.as_f64()),
+                        criteria.get("radius").and_then(|v| v.as_f64()),
+                    ) else {
+                        return Ok(None);
+                    };
+                    if !lon.is_finite()
+                        || !lat.is_finite()
+                        || !(radius.is_finite() && radius >= 0.0)
+                    {
+                        return Ok(None);
+                    }
+                    // `circle.radius` is in METRES, the same unit the dataset
+                    // uses, so it goes through unscaled.
+                    doc! { "geoWithin": {
+                        "path": field.clone(),
+                        "circle": {
+                            "center": { "type": "Point", "coordinates": [lon, lat] },
+                            "radius": radius,
+                        },
+                    } }
+                }
+                "match" => {
+                    if let Some(any) = criteria.get("any").and_then(|v| v.as_array()) {
+                        let arr: Vec<mongodb::bson::Bson> = any.iter().map(json_to_bson).collect();
+                        doc! { "in": { "path": field.clone(), "value": arr } }
+                    } else if let Some(value) = criteria.get("value") {
+                        doc! { "equals": { "path": field.clone(), "value": json_to_bson(value) } }
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                "range" => {
+                    let mut r = doc! { "path": field.clone() };
+                    for (key, op) in [("gt", "gt"), ("gte", "gte"), ("lt", "lt"), ("lte", "lte")] {
+                        if let Some(v) = criteria.get(key).filter(|v| !v.is_null()) {
+                            r.insert(op, json_to_bson(v));
+                        }
+                    }
+                    if r.len() == 1 {
+                        return Ok(None);
+                    }
+                    doc! { "range": r }
+                }
+                other => {
+                    return Err(format!(
+                        "MongoDB: the `$search` pre-filter dialect (used for geo-carrying \
+                         datasets) has no mapping for condition type `{other}` on field \
+                         `{field}`. Refusing rather than dropping the clause (issue #223)."
+                    ))
+                }
+            };
+            clauses.push(mongodb::bson::Bson::Document(clause));
+        }
+    }
+
+    match clauses.len() {
+        0 => Ok(None),
+        1 => Ok(match clauses.into_iter().next() {
+            Some(mongodb::bson::Bson::Document(d)) => Some(d),
+            _ => None,
+        }),
+        _ => Ok(Some(doc! { "compound": { "filter": clauses } })),
     }
 }
 
@@ -1307,7 +1657,11 @@ impl Engine for MongoDBEngine {
             // Use the first vector as a probe query to verify actual search readiness
             let probe_vector = vectors.first().ok_or("No vectors uploaded")?;
             let index_start = Instant::now();
-            self.wait_for_index_catchup(vectors.len(), probe_vector)?;
+            self.wait_for_index_catchup(
+                vectors.len(),
+                probe_vector,
+                SearchDialect::for_dataset(dataset),
+            )?;
             let index_time = index_start.elapsed().as_secs_f64();
 
             total_time = read_time + upload_time + index_time;
@@ -1373,8 +1727,12 @@ impl Engine for MongoDBEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
+        // Which stage this run uses, and therefore which filter grammar. Decided
+        // from the dataset schema alone, so it matches the index `configure()`
+        // built (issue #223).
+        let dialect = SearchDialect::for_dataset(dataset);
         let parsed_filters: Vec<QueryFilter<Document>> =
-            conditions.resolve_all("MongoDB", parse_mongo_conditions)?;
+            conditions.try_resolve_all("MongoDB", |c| dialect.parse(c))?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {
@@ -1409,6 +1767,7 @@ impl Engine for MongoDBEngine {
                     tops[idx],
                     (tops[idx] as i64) * num_candidates_factor,
                     parsed_filters[idx].as_ref(),
+                    dialect,
                 )
             })
             .collect();
@@ -1593,8 +1952,12 @@ impl Engine for MongoDBEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
+        // Which stage this run uses, and therefore which filter grammar. Decided
+        // from the dataset schema alone, so it matches the index `configure()`
+        // built (issue #223).
+        let dialect = SearchDialect::for_dataset(dataset);
         let parsed_filters: Vec<QueryFilter<Document>> =
-            conditions.resolve_all("MongoDB", parse_mongo_conditions)?;
+            conditions.try_resolve_all("MongoDB", |c| dialect.parse(c))?;
 
         // Read vectors for updates
         let normalize = dataset.needs_normalization();
@@ -1637,6 +2000,7 @@ impl Engine for MongoDBEngine {
                     tops[idx],
                     (tops[idx] as i64) * num_candidates_factor,
                     parsed_filters[idx].as_ref(),
+                    dialect,
                 )
             })
             .collect();
@@ -1926,7 +2290,14 @@ mod tests {
             } },
         ];
 
-        let got = build_search_pipeline("vidx", &query, top, num_candidates, Some(&filter));
+        let got = build_search_pipeline(
+            "vidx",
+            &query,
+            top,
+            num_candidates,
+            Some(&filter),
+            SearchDialect::VectorSearchStage,
+        );
         assert_eq!(got, expected, "filtered pipeline must be byte-identical");
 
         // Unfiltered variant: no `filter` key at all (not an empty/null filter).
@@ -1943,7 +2314,14 @@ mod tests {
                 "score": { "$meta": "vectorSearchScore" },
             } },
         ];
-        let got_nf = build_search_pipeline("vidx", &query, top, num_candidates, None);
+        let got_nf = build_search_pipeline(
+            "vidx",
+            &query,
+            top,
+            num_candidates,
+            None,
+            SearchDialect::VectorSearchStage,
+        );
         assert_eq!(got_nf, expected_nf, "unfiltered pipeline must omit filter");
     }
 
@@ -2037,6 +2415,247 @@ mod tests {
             .get_array("$in")
             .unwrap()
             .is_empty());
+    }
+
+    // ── Geo (issue #223) ───────────────────────────────────────────────────
+
+    /// The `find()` (filter-only) path keeps MQL, where `$geoWithin` +
+    /// `$centerSphere` IS available and needs no `2dsphere` index. The radius is
+    /// in RADIANS, so it is divided by the same mean earth radius the fixtures'
+    /// haversine ground truth uses — not the 6378.1 km the MongoDB docs suggest.
+    #[test]
+    fn mql_geo_becomes_center_sphere_in_radians() {
+        let doc_ = parse_mongo_conditions(
+            &json!({"and":[{"loc":{"geo":{"lat":20.0,"lon":10.0,"radius":6_371_000.0}}}]}),
+        )
+        .unwrap();
+        let within = doc_
+            .get_document("loc")
+            .unwrap()
+            .get_document("$geoWithin")
+            .unwrap()
+            .get_array("$centerSphere")
+            .unwrap();
+        assert_eq!(
+            within[0],
+            mongodb::bson::Bson::Array(vec![
+                mongodb::bson::Bson::Double(10.0),
+                mongodb::bson::Bson::Double(20.0),
+            ]),
+            "lon first, matching the stored GeoJSON coordinates"
+        );
+        // radius == R  =>  exactly one radian.
+        assert_eq!(within[1], mongodb::bson::Bson::Double(1.0));
+    }
+
+    #[test]
+    fn mql_geo_missing_component_is_a_drop() {
+        for bad in [
+            json!({"lat":20.0,"lon":10.0}),
+            json!({"lon":10.0,"radius":500}),
+            json!({"lat":20.0,"radius":500}),
+            json!({"lat":20.0,"lon":10.0,"radius":-5}),
+        ] {
+            assert!(
+                parse_mongo_conditions(&json!({"and":[{"loc":{"geo": bad}}]})).is_none(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `$vectorSearch`'s `filter` is MQL restricted to ten comparison operators
+    /// and REJECTS `$geoWithin` outright (verified live against
+    /// `mongodb/mongodb-atlas-local:8.0.17`). The dialect switch is what keeps
+    /// the MQL geo form off that stage.
+    #[test]
+    fn a_geo_schema_selects_the_search_stage_dialect() {
+        assert!(schema_declares_geo(Some(&json!({"a":"geo","b":"geo"}))));
+        assert!(schema_declares_geo(Some(
+            &json!({"kw":"keyword","a":"geo"})
+        )));
+        assert!(!schema_declares_geo(Some(&json!({"kw":"keyword"}))));
+        assert!(!schema_declares_geo(None));
+    }
+
+    #[test]
+    fn search_dialect_geo_emits_geo_within_circle_in_metres() {
+        let d = parse_mongo_search_conditions(
+            &json!({"and":[{"loc":{"geo":{"lat":20.0,"lon":10.0,"radius":500.0}}}]}),
+        )
+        .unwrap()
+        .unwrap();
+        let circle = d
+            .get_document("geoWithin")
+            .unwrap()
+            .get_document("circle")
+            .unwrap();
+        assert_eq!(
+            circle
+                .get_document("center")
+                .unwrap()
+                .get_array("coordinates")
+                .unwrap(),
+            &vec![
+                mongodb::bson::Bson::Double(10.0),
+                mongodb::bson::Bson::Double(20.0)
+            ]
+        );
+        // `circle.radius` is metres — the dataset's own unit, unscaled.
+        assert_eq!(circle.get_f64("radius").unwrap(), 500.0);
+        assert_eq!(
+            d.get_document("geoWithin")
+                .unwrap()
+                .get_str("path")
+                .unwrap(),
+            "loc"
+        );
+    }
+
+    #[test]
+    fn search_dialect_ands_with_compound_filter_and_ors_with_should() {
+        let and = parse_mongo_search_conditions(&json!({"and":[
+            {"a":{"geo":{"lat":1.0,"lon":2.0,"radius":10.0}}},
+            {"b":{"geo":{"lat":3.0,"lon":4.0,"radius":20.0}}}
+        ]}))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            and.get_document("compound")
+                .unwrap()
+                .get_array("filter")
+                .unwrap()
+                .len(),
+            2
+        );
+        let or = parse_mongo_search_conditions(&json!({"or":[
+            {"a":{"geo":{"lat":1.0,"lon":2.0,"radius":10.0}}},
+            {"a":{"geo":{"lat":3.0,"lon":4.0,"radius":20.0}}}
+        ]}))
+        .unwrap()
+        .unwrap();
+        let compound = or.get_document("compound").unwrap();
+        assert_eq!(compound.get_array("should").unwrap().len(), 2);
+        assert_eq!(compound.get_i32("minimumShouldMatch").unwrap(), 1);
+    }
+
+    /// The non-geo leaves of the search dialect, so a mixed geo dataset does not
+    /// silently lose them. Verified live on the pinned Atlas image.
+    #[test]
+    fn search_dialect_maps_match_and_range() {
+        let eq = parse_mongo_search_conditions(&json!({"and":[{"kw":{"match":{"value":"red"}}}]}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            eq.get_document("equals").unwrap().get_str("value").unwrap(),
+            "red"
+        );
+        let any = parse_mongo_search_conditions(
+            &json!({"and":[{"kw":{"match":{"any":["red","blue"]}}}]}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            any.get_document("in")
+                .unwrap()
+                .get_array("value")
+                .unwrap()
+                .len(),
+            2
+        );
+        let rng = parse_mongo_search_conditions(&json!({"and":[{"n":{"range":{"gte":1,"lt":9}}}]}))
+            .unwrap()
+            .unwrap();
+        let r = rng.get_document("range").unwrap();
+        assert_eq!(r.get_i64("gte").unwrap(), 1);
+        assert_eq!(r.get_i64("lt").unwrap(), 9);
+    }
+
+    /// An operator the search dialect has no mapping for must be an ERROR, not a
+    /// dropped clause — the whole point of #219/#223.
+    #[test]
+    fn search_dialect_refuses_an_unmappable_condition_type() {
+        let err = parse_mongo_search_conditions(&json!({"and":[{"b":{"nonsense":{"x":1}}}]}))
+            .unwrap_err();
+        assert!(err.contains("nonsense"), "{err}");
+        assert!(err.contains("#223"), "{err}");
+    }
+
+    /// A `dynamic: false` index leaves an unmapped field invisible to every
+    /// filter that names it, so an unknown schema type must fail loudly at index
+    /// creation rather than produce a quietly unfiltered run.
+    #[test]
+    fn search_index_mapping_covers_the_known_types_and_refuses_the_rest() {
+        assert_eq!(
+            search_index_field_mapping("loc", "geo")
+                .unwrap()
+                .get_str("type")
+                .unwrap(),
+            "geo"
+        );
+        for ty in ["keyword", "uuid", "text", "bool"] {
+            assert_eq!(
+                search_index_field_mapping("f", ty)
+                    .unwrap()
+                    .get_str("type")
+                    .unwrap(),
+                "token",
+                "{ty}"
+            );
+        }
+        for ty in ["int", "float"] {
+            assert_eq!(
+                search_index_field_mapping("f", ty)
+                    .unwrap()
+                    .get_str("type")
+                    .unwrap(),
+                "number",
+                "{ty}"
+            );
+        }
+        // datetime is stored as an ISO STRING here, so neither `number` nor
+        // `date` would match it; refused rather than guessed.
+        assert!(search_index_field_mapping("ts", "datetime").is_err());
+        assert!(search_index_field_mapping("x", "not-a-type").is_err());
+    }
+
+    /// The `$search` pipeline: different stage, different nesting, different
+    /// score meta — and the same vector arguments.
+    #[test]
+    fn search_stage_pipeline_wraps_the_vector_args_and_reads_search_score() {
+        let filter = doc! { "geoWithin": { "path": "loc" } };
+        let p = build_search_pipeline(
+            "idx",
+            &[1.0, 0.0],
+            7,
+            70,
+            Some(&filter),
+            SearchDialect::SearchStage,
+        );
+        let inner = p[0]
+            .get_document("$search")
+            .unwrap()
+            .get_document("vectorSearch")
+            .unwrap();
+        assert_eq!(inner.get_str("path").unwrap(), "vector");
+        assert_eq!(inner.get_i64("limit").unwrap(), 7);
+        assert_eq!(inner.get_i64("numCandidates").unwrap(), 70);
+        assert_eq!(inner.get_document("filter").unwrap(), &filter);
+        assert_eq!(
+            p[0].get_document("$search")
+                .unwrap()
+                .get_str("index")
+                .unwrap(),
+            "idx"
+        );
+        assert_eq!(
+            p[1].get_document("$project")
+                .unwrap()
+                .get_document("score")
+                .unwrap()
+                .get_str("$meta")
+                .unwrap(),
+            "searchScore"
+        );
     }
 
     #[test]

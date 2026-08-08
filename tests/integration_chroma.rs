@@ -158,3 +158,63 @@ fn test_binary_chroma_nested_filter() {
 fn test_binary_chroma_selectivity() {
     run_filter_recall_test("chroma-sel", "sel-test", common::write_selectivity_project);
 }
+
+/// Chroma REFUSES a geo dataset, loudly, and that is the intended end state
+/// (issue #223) — not a step on the way to supporting it.
+///
+/// Chroma's `where` DSL is a closed enum of `field OP literal` comparisons
+/// (`$eq $ne $gt $gte $lt $lte $in $nin $and $or`) over scalar metadata, with no
+/// geospatial operator, no attribute-vs-attribute comparison and no arithmetic.
+/// A spherical cap is not an axis-aligned box in any query-independent
+/// coordinate system, so no conjunction of ranges expresses it, and the linear
+/// `x*qx + y*qy + z*qz >= cos(r/R)` form VectorSets uses needs cross-field
+/// arithmetic Chroma does not have. A bounding box would admit points up to
+/// √2·r away — a filter that LOOKS applied and under-constrains, which is what
+/// #219 exists to stop.
+///
+/// So the assertion is on the failure, and on the failure being the right one:
+/// a nonzero exit with the #219 message, never a completed run with a plausible
+/// recall. Asserting "the run fails" alone would pass for a crash or a typo, so
+/// the sibling filter tests above (which must still succeed) are what prove the
+/// refusal is specific to geo.
+#[test]
+fn test_binary_chroma_geo_is_refused_loudly() {
+    wait_for_chroma();
+    let dim = 8;
+    let name = "chroma-geo";
+    let configs = serde_json::json!([{
+        "name": name, "engine": "chroma",
+        "search_params": [{"parallel": 1}],
+        "upload_params": {"parallel": 1, "batch_size": 200}
+    }]);
+    let proj = common::write_geo_corner_project(
+        "chroma-geo-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = chroma_port().to_string();
+    let out = common::run_binary_capture(
+        &proj.root,
+        name,
+        "chroma-geo-test",
+        CHROMA_HOST,
+        &[("CHROMA_PORT", port.as_str()), ("CHROMA_COLLECTION", name)],
+    );
+    assert!(
+        !out.ok,
+        "chroma must REFUSE a geo dataset, not report a recall for a filter it \
+         never applied:\n{}",
+        out.combined
+    );
+    assert!(
+        out.combined.contains("UNFILTERED") && out.combined.contains("#219"),
+        "the refusal must be the #219 dropped-filter error, not some other \
+         failure:\n{}",
+        out.combined
+    );
+    assert!(
+        out.combined.contains("Chroma cannot express the filter"),
+        "the error must name the engine:\n{}",
+        out.combined
+    );
+}

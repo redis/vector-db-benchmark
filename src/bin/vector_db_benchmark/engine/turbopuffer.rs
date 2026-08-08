@@ -14,6 +14,7 @@ use std::time::Instant;
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use turbopuffer_client::Client;
 
+use super::geo;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
@@ -206,6 +207,15 @@ pub(crate) fn parse_turbopuffer_filter(
     conditions: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let obj = conditions.as_object()?;
+    // Neither this engine's filter DSL nor its metadata model can express a
+    // geo radius (issue #223 — see the geo test below for the evidence), and a
+    // per-LEAF refusal is not enough: this builder keeps the leaves it
+    // understands, so `and(geo, keyword)` would emit only the keyword clause and
+    // run a real-looking filter that constrains less than the ground truth does.
+    // Refuse the whole tree, which `resolve_all` turns into a hard error.
+    if geo::conditions_mention_geo(conditions) {
+        return None;
+    }
 
     // Handle "and" / "or" top-level keys
     for (key, value) in obj {
@@ -852,11 +862,35 @@ mod filter_tests {
         );
     }
 
+    /// Geo is refused, and that is the FINAL answer for Turbopuffer, not a TODO
+    /// (issue #223). Its filter grammar is a closed set of `[attr, Op, literal]`
+    /// triples — `Eq NotEq In NotIn Lt Lte Gt Gte Any* Contains* Glob* Regex
+    /// ContainsAllTokens ContainsAnyToken ContainsTokenSequence Fuzzy And Or
+    /// Not` — with no geo operator, no attribute on the right-hand side and no
+    /// arithmetic; its attribute type list (string/int/uint/float/uuid/datetime/
+    /// bool and their array forms) has no geo or struct type either. Turbopuffer
+    /// DOES have arithmetic, but only in `rank_by`, which its documentation
+    /// states never affects matching — so it cannot exclude a document. That
+    /// leaves no exact encoding (see the Chroma note for why a bounding box is
+    /// not an acceptable substitute), and `None` → a hard error at `resolve_all`
+    /// is the honest answer.
     #[test]
-    fn geo_is_unsupported_none() {
+    fn geo_is_refused_because_the_filter_grammar_has_no_geo_and_no_arithmetic() {
         let cond = json!({"and": [{"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 10.0}}}]});
         // geo yields no clause; the only clause dropping leaves an empty And → None.
         assert!(parse_turbopuffer_filter(&cond).is_none());
+        // ...and a SIBLING leaf in another entry does NOT die with it on its
+        // own. `parse_single_condition`'s `"geo" => return None` exits only that
+        // ENTRY, and the `and` loop then SKIPS the `None` — so without the
+        // guard above this renders a keyword-only filter that looks real and
+        // constrains LESS than the ground truth does (verified by deleting the
+        // guard: `Some(["And", [["color", "Eq", "red"]]])`). The `None` below
+        // comes from `conditions_mention_geo`, not from the geo arm.
+        let mixed = json!({"and": [
+            {"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 10.0}}},
+            {"color": {"match": {"value": "red"}}}
+        ]});
+        assert!(parse_turbopuffer_filter(&mixed).is_none());
     }
 
     #[test]

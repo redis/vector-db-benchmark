@@ -19,6 +19,7 @@ use std::time::Instant;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
+use super::geo;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
@@ -410,6 +411,15 @@ pub(crate) fn build_chroma_where(conditions: &serde_json::Value) -> Option<serde
     if obj.is_empty() {
         return None;
     }
+    // Neither this engine's filter DSL nor its metadata model can express a
+    // geo radius (issue #223 — see the geo test below for the evidence), and a
+    // per-LEAF refusal is not enough: this builder keeps the leaves it
+    // understands, so `and(geo, keyword)` would emit only the keyword clause and
+    // run a real-looking filter that constrains less than the ground truth does.
+    // Refuse the whole tree, which `resolve_all` turns into a hard error.
+    if geo::conditions_mention_geo(conditions) {
+        return None;
+    }
     let mut clauses = Vec::new();
 
     if let Some(and_items) = obj.get("and").and_then(|v| v.as_array()) {
@@ -529,6 +539,15 @@ pub(crate) fn build_chroma_where_document(
     conditions: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let obj = conditions.as_object()?;
+    // Neither this engine's filter DSL nor its metadata model can express a
+    // geo radius (issue #223 — see the geo test below for the evidence), and a
+    // per-LEAF refusal is not enough: this builder keeps the leaves it
+    // understands, so `and(geo, keyword)` would emit only the keyword clause and
+    // run a real-looking filter that constrains less than the ground truth does.
+    // Refuse the whole tree, which `resolve_all` turns into a hard error.
+    if geo::conditions_mention_geo(conditions) {
+        return None;
+    }
     let mut clauses = Vec::new();
     if let Some(items) = obj.get("and").and_then(|v| v.as_array()) {
         let ops: Vec<serde_json::Value> = items.iter().filter_map(where_document_entry).collect();
@@ -917,12 +936,72 @@ mod tests {
         );
     }
 
+    /// Geo is refused, and that is the FINAL answer for Chroma, not a TODO
+    /// (issue #223). Chroma's `where` DSL is a closed enum of `field OP literal`
+    /// comparisons — `$eq $ne $gt $gte $lt $lte $in $nin $and $or` — with no
+    /// geospatial operator, no attribute-vs-attribute comparison and no
+    /// arithmetic, and its metadata values are scalars only. That rules out
+    /// every EXACT encoding: a spherical cap is not an axis-aligned box in any
+    /// query-independent coordinate system, so no conjunction of ranges can
+    /// carve it out, and the `x*qx + y*qy + z*qz >= cos(r/R)` form VectorSets
+    /// uses needs cross-field arithmetic Chroma does not have. A bounding box
+    /// would admit points up to √2·r away — a widening, i.e. exactly the
+    /// silently-wrong recall issue #219 exists to stop — so `None` (→ a hard
+    /// error at `resolve_all`) is the honest answer.
+    ///
+    /// A text match is separately NOT a metadata `where` leaf: it is routed to
+    /// `where_document` (see the next test).
     #[test]
-    fn geo_is_dropped_and_text_leaves_the_metadata_where() {
-        // geo is unsupported; a text match is NOT a metadata `where` leaf (it is
-        // routed to `where_document` instead — see next test).
+    fn geo_is_refused_and_text_leaves_the_metadata_where() {
         assert!(build_chroma_leaf("loc", "geo", &json!({"lat":1,"lon":2,"radius":5})).is_none());
         assert!(build_chroma_leaf("body", "match", &json!({"text":"quick"})).is_none());
+    }
+
+    /// The refusal must cover the WHOLE tree, not just the geo leaf.
+    ///
+    /// Without the `conditions_mention_geo` guard at the top of both builders,
+    /// `and(geo, keyword)` renders `{"color":{"$eq":"red"}}` — a filter that
+    /// looks real, satisfies the #219 guard, and constrains LESS than the ground
+    /// truth does. That is the partial-drop escape `query_filter.rs` documents,
+    /// and it is exactly the silent under-filtering this PR exists to remove.
+    ///
+    /// The integration test cannot see this: its fixture is geo-ONLY, so the
+    /// leaf builder refuses on its own and the guard could be deleted with every
+    /// test still green. This is the only thing holding it.
+    #[test]
+    fn a_geo_leaf_refuses_the_whole_tree_not_just_itself() {
+        let mixed = json!({"and": [
+            {"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 5.0}}},
+            {"color": {"match": {"value": "red"}}}
+        ]});
+        // The sibling alone IS expressible — so `None` below is the guard, not
+        // an inability to render the keyword leaf.
+        assert!(
+            build_chroma_where(&json!({"and": [{"color": {"match": {"value": "red"}}}]})).is_some()
+        );
+        assert_eq!(build_chroma_where(&mixed), None);
+        assert_eq!(build_chroma_where_document(&mixed), None);
+
+        // Same for a geo leaf mixed with a FULL-TEXT sibling, which lives in the
+        // other builder: `where_document` has its own copy of the guard.
+        let mixed_text = json!({"and": [
+            {"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 5.0}}},
+            {"body": {"match": {"text": "quick"}}}
+        ]});
+        assert!(build_chroma_where_document(
+            &json!({"and": [{"body": {"match": {"text": "quick"}}}]})
+        )
+        .is_some());
+        assert_eq!(build_chroma_where(&mixed_text), None);
+        assert_eq!(build_chroma_where_document(&mixed_text), None);
+
+        // And a nested tree, where the geo leaf is two levels down.
+        let nested = json!({"or": [
+            {"and": [{"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 5.0}}}]},
+            {"and": [{"color": {"match": {"value": "red"}}}]}
+        ]});
+        assert_eq!(build_chroma_where(&nested), None);
+        assert_eq!(build_chroma_where_document(&nested), None);
     }
 
     #[test]
