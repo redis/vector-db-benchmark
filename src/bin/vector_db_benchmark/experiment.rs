@@ -215,8 +215,8 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     // Collision guard (#151-4): among the selected configs, no two configs of the
-    // same destructive Redis-wire engine (redis/valkey/dragonfly/kividb) may derive
-    // the same index namespace, or a sweep would silently overwrite one config's graph
+    // same destructive Redis-wire engine (redis/valkey/dragonfly/kividb/vectorsets)
+    // may derive the same index namespace, or a sweep would silently overwrite one config's graph
     // and keyspace with another's (the exact bug this fix closes). Also fires when
     // an `*_INDEX_NAME_EXACT` pin is set with >1 config for that engine (every
     // config then resolves to the same verbatim base). In --skip-vector-index mode
@@ -232,6 +232,10 @@ pub fn run(args: &Args) -> Result<(), String> {
                 "valkey" => "VALKEY_INDEX_NAME",
                 "dragonfly" => "DRAGONFLY_INDEX_NAME",
                 "kividb" => "KIVIDB_INDEX_NAME",
+                // #236: VectorSets' "index" is the single Redis key holding the
+                // vector set, derived by the same helper, so it collides the same
+                // way and belongs in the same guard.
+                "vectorsets" => "VECTORSETS_INDEX_NAME",
                 _ => continue,
             };
             let idx = derive_index_name(base_env, "idx", &config.name);
@@ -727,7 +731,7 @@ fn run_single_experiment(
     // `--keep-data` defaults to FALSE — so the plainest form of the flag
     // (`--skip-upload` alone) used to reuse a corpus, benchmark it, and then
     // delete it. Measured: qdrant 400 points -> collection MISSING, vectorsets
-    // `VCARD idx` 400 -> 0, redis `DBSIZE` 400 -> 0, all exit 0. A run that did
+    // `VCARD idx:<config>` 400 -> 0, redis `DBSIZE` 400 -> 0, all exit 0. A run that did
     // not create the corpus must not tear it down, whatever `--keep-data` says.
     let keep_data =
         args.skip_upload || (args.keep_data && (is_last_config || !args.reset_between_configs));
@@ -790,7 +794,7 @@ fn run_single_experiment(
         // do not create, drop, recreate or otherwise modify it. `configure()` is
         // destructive on 14 of the 15 engines (FT.DROPINDEX ... DD, SCAN+UNLINK,
         // collection.drop(), DROP TABLE, DELETE /collections/<n>, indices.delete,
-        // DEL idx — only Vertex is not), so it must NOT run here under any flag
+        // DEL <key> — only Vertex is not), so it must NOT run here under any flag
         // combination.
         //
         // This used to have an `else if args.skip_vector_index` arm that called

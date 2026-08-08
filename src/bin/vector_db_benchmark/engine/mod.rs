@@ -495,11 +495,13 @@ pub trait Engine {
     ///   reuse went unverified and proceeds; an unimplemented probe must not make
     ///   the engine unusable.
     ///
-    /// Scope, and its limits. Only the four Redis-wire engines address a
-    /// per-config object (each config owns `idx:<config>` and a `<config>:`
-    /// keyspace, #151-4). MongoDB (`bench.vectors`), pgvector (`items`),
-    /// Elasticsearch/OpenSearch (`bench`), Qdrant (`benchmark`), Milvus and
-    /// VectorSets (`idx`, #236) each have exactly ONE such object per server,
+    /// Scope, and its limits. Only the five Redis-wire engines address a
+    /// per-config object: redis/valkey/dragonfly/kividb each own `idx:<config>`
+    /// plus a `<config>:` keyspace (#151-4), and VectorSets owns the single key
+    /// `idx:<config>` (#236 — a vector set is one key, so that key is the whole
+    /// object). MongoDB (`bench.vectors`), pgvector (`items`),
+    /// Elasticsearch/OpenSearch (`bench`), Qdrant (`benchmark`) and Milvus each
+    /// have exactly ONE such object per server,
     /// shared by every config and every dataset. On those, a full-size corpus
     /// uploaded by a SIBLING config — or by a different dataset entirely —
     /// certifies as this config's. The count therefore proves the corpus is the

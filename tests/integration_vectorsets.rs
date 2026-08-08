@@ -16,7 +16,14 @@
 //! grammar needs 8.8+). Start with:
 //!   docker run -d --rm -p 6398:6379 redis:8.8.0
 //! Run with:
-//!   VECTORSETS_PORT=6398 cargo test --test integration_vectorsets -- --test-threads=1
+//!   VECTORSETS_PORT=6398 cargo test --test integration_vectorsets
+//!
+//! The suite is parallel-safe since #236: each config's corpus lives in its own
+//! `idx:<config-name>` vector set, so tests no longer share one `idx` key that
+//! each `configure()` deleted out from under its neighbours. (Before that fix the
+//! `--test-threads=1` flag was mandatory, not merely advisable — without it most
+//! of these tests failed at recall 0.000.) Every test below therefore MUST use a
+//! distinct engine-config name; that name is the isolation boundary.
 
 use std::time::{Duration, Instant};
 
@@ -427,4 +434,656 @@ fn test_binary_vectorsets_geo() {
     println!("vectorsets geo recall={recall:.3}");
     assert!(recall >= 0.9, "vectorsets geo recall {recall:.3} < 0.9");
     std::fs::remove_dir_all(&proj.root).ok();
+}
+
+// ── #236: per-config key namespacing ─────────────────────────────────────────
+
+/// Open a connection to the live server used by these tests.
+fn conn() -> redis::Connection {
+    let url = format!("redis://{}:{}/", TEST_HOST, test_port());
+    redis::Client::open(url.as_str())
+        .expect("redis client")
+        .get_connection()
+        .expect("redis connection")
+}
+
+/// `VCARD <key>` — element count of a vector set, `0` when the key is absent.
+/// This is the load-bearing read-back: it is answered by the SERVER about the
+/// SERVER's state, so it cannot be satisfied by a plausible-looking recall.
+fn vcard(conn: &mut redis::Connection, key: &str) -> i64 {
+    redis::cmd("VCARD").arg(key).query::<i64>(conn).unwrap_or(0)
+}
+
+/// `VDIM <key>` — dimensionality of the vectors stored in a vector set, `0` when
+/// the key is absent. Two configs uploaded at different dims therefore have
+/// distinguishable *contents*, not merely distinguishable counts.
+fn vdim(conn: &mut redis::Connection, key: &str) -> i64 {
+    redis::cmd("VDIM").arg(key).query::<i64>(conn).unwrap_or(0)
+}
+
+/// `vector_count` as written into the fixture's `datasets/datasets.json`, i.e.
+/// exactly how many vectors a completed upload must leave on the server.
+fn expected_count(root: &std::path::Path) -> i64 {
+    let raw = std::fs::read_to_string(root.join("datasets/datasets.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v[0]["vector_count"].as_i64().expect("vector_count")
+}
+
+/// Issue #236 — two VectorSets configs sharing one server must own two DISJOINT
+/// vector sets.
+///
+/// Before this fix every config addressed the literal key `idx`, and
+/// `configure()` opened with `DEL idx`. So starting config B did not merely
+/// interleave with config A — it **deleted A's entire corpus**, then rebuilt the
+/// same key with its own. That is the #151-4 hazard the Redis family was fixed
+/// for, applied to a single key instead of an index + keyspace.
+///
+/// The assertions are deliberately all server-side (`VCARD`/`VDIM`/`EXISTS`),
+/// never recall. Two same-shaped corpora produce a perfectly plausible recall
+/// whichever one actually answered the query, which is precisely why this bug
+/// survived a suite full of recall assertions — see the repo's silent-wrong
+/// bug class. The two configs upload at DIFFERENT dimensionalities (8 and 16),
+/// so a surviving key can be attributed to its owner by content and not only by
+/// count.
+///
+/// RED on master: after run B, `VCARD idx:vectorsets-iso-a` is 0 — A's corpus is
+/// gone and only the shared `idx` exists.
+#[test]
+fn test_vectorsets_two_configs_do_not_clobber_each_other() {
+    wait_for_vectorsets();
+
+    let name_a = "vectorsets-iso-a";
+    let name_b = "vectorsets-iso-b";
+    // Must match `index_naming::derive_index_name("VECTORSETS_INDEX_NAME", "idx", …)`.
+    // Spelled out literally rather than imported: the point of the test is to pin
+    // the on-the-wire key, so it must fail if the derivation changes shape.
+    let key_a = format!("idx:{name_a}");
+    let key_b = format!("idx:{name_b}");
+    const LEGACY_KEY: &str = "idx";
+
+    let proj_a = common::write_match_any_cosine_project("vs-iso-a", &vectorsets_config(name_a), 8);
+    let proj_b = common::write_match_any_cosine_project("vs-iso-b", &vectorsets_config(name_b), 16);
+    let n_a = expected_count(&proj_a.root);
+    let n_b = expected_count(&proj_b.root);
+
+    let mut c = conn();
+    // Clean slate for exactly the three keys this test reasons about (never
+    // FLUSHALL — the suite shares one server with the other VectorSets tests).
+    for k in [key_a.as_str(), key_b.as_str(), LEGACY_KEY] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+
+    let port = test_port().to_string();
+    let env = [("REDIS_PORT", port.as_str())];
+
+    // ── Run config A, keeping its data resident ──
+    assert!(
+        common::run_binary_extra(
+            &proj_a.root,
+            name_a,
+            "vs-iso-a",
+            TEST_HOST,
+            &env,
+            &["--keep-data"]
+        ),
+        "config A run failed"
+    );
+    // Snapshot rather than assert here: every assertion is deferred to the end so
+    // that a regression prints the WHOLE before/after picture (including what
+    // landed in the legacy shared key) instead of aborting at the first symptom.
+    let card_a_after_a = vcard(&mut c, &key_a);
+    println!(
+        "#236 read-back after config A: VCARD {key_a}={card_a_after_a} (VDIM {}) | \
+         legacy VCARD {LEGACY_KEY}={} (VDIM {})",
+        vdim(&mut c, &key_a),
+        vcard(&mut c, LEGACY_KEY),
+        vdim(&mut c, LEGACY_KEY),
+    );
+
+    // ── Run config B against the SAME server ──
+    assert!(
+        common::run_binary_extra(
+            &proj_b.root,
+            name_b,
+            "vs-iso-b",
+            TEST_HOST,
+            &env,
+            &["--keep-data"]
+        ),
+        "config B run failed"
+    );
+
+    // Both corpora coexist, each with its own count …
+    let card_a = vcard(&mut c, &key_a);
+    let card_b = vcard(&mut c, &key_b);
+    println!(
+        "#236 read-back after config B: VCARD {key_a}={card_a} (VDIM {}), \
+         VCARD {key_b}={card_b} (VDIM {}) | legacy VCARD {LEGACY_KEY}={} (VDIM {})",
+        vdim(&mut c, &key_a),
+        vdim(&mut c, &key_b),
+        vcard(&mut c, LEGACY_KEY),
+        vdim(&mut c, LEGACY_KEY),
+    );
+    assert_eq!(
+        card_a_after_a, n_a,
+        "config A must upload into its own key '{key_a}' (#236)"
+    );
+    assert_eq!(
+        card_a, n_a,
+        "config B clobbered config A's corpus (#236): VCARD {key_a} = {card_a}, expected {n_a}"
+    );
+    assert_eq!(
+        card_b, n_b,
+        "config B did not land in its own key (#236): VCARD {key_b} = {card_b}, expected {n_b}"
+    );
+
+    // … and neither key holds the other's vectors: the dims are the ones each
+    // config uploaded, so no key was rebuilt from the other's corpus.
+    assert_eq!(
+        vdim(&mut c, &key_a),
+        8,
+        "'{key_a}' does not hold A's 8-d vectors"
+    );
+    assert_eq!(
+        vdim(&mut c, &key_b),
+        16,
+        "'{key_b}' does not hold B's 16-d vectors"
+    );
+
+    // And nothing was written to the old shared key at all.
+    let legacy_exists: i64 = redis::cmd("EXISTS")
+        .arg(LEGACY_KEY)
+        .query(&mut c)
+        .unwrap_or(0);
+    assert_eq!(
+        legacy_exists, 0,
+        "the hardcoded shared key '{LEGACY_KEY}' must no longer be written (#236)"
+    );
+
+    // Teardown: this test opted into --keep-data, so it owns the cleanup.
+    for k in [key_a.as_str(), key_b.as_str(), LEGACY_KEY] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+    std::fs::remove_dir_all(&proj_a.root).ok();
+    std::fs::remove_dir_all(&proj_b.root).ok();
+}
+
+/// Issue #236, part 2 — VectorSets must PARTICIPATE in the #151-4 startup
+/// collision guard, not just derive a good default.
+///
+/// The derivation alone leaves one way back into the shared-key world: the
+/// `VECTORSETS_INDEX_NAME_EXACT` pin drops the per-config suffix, so N configs
+/// resolve to one verbatim key again. The Redis-family engines have that case
+/// rejected at startup; before this fix `experiment::run`'s guard did not know
+/// the string `"vectorsets"` at all, so the pin silently re-armed the bug.
+///
+/// Asserted on the ERROR TEXT, not merely a non-zero exit: without a live
+/// server (or with any other misconfiguration) the run would fail anyway, and a
+/// bare exit-code assertion would pass against a removed guard.
+#[test]
+fn test_vectorsets_exact_pin_with_two_configs_is_rejected_at_startup() {
+    let configs = serde_json::json!([
+        {
+            "name": "vectorsets-guard-a",
+            "engine": "vectorsets",
+            "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        },
+        {
+            "name": "vectorsets-guard-b",
+            "engine": "vectorsets",
+            "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        },
+    ]);
+    let proj = common::write_match_any_cosine_project(
+        "vs-guard",
+        &serde_json::to_string(&configs).unwrap(),
+        8,
+    );
+
+    let out = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            "vectorsets-guard-*",
+            "--datasets",
+            "vs-guard",
+            "--host",
+            TEST_HOST,
+            "--skip-if-exists",
+            "false",
+        ])
+        .current_dir(&proj.root)
+        .env("REDIS_PORT", test_port().to_string())
+        .env("VECTORSETS_INDEX_NAME", "shared-vset")
+        .env("VECTORSETS_INDEX_NAME_EXACT", "1")
+        .output()
+        .expect("run vector-db-benchmark");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "exact-pinned sweep of 2 vectorsets configs must be rejected, not run: {combined}"
+    );
+    assert!(
+        combined.contains("derive the same index namespace"),
+        "the failure must be the #151-4 collision guard, not an incidental error: {combined}"
+    );
+    assert!(
+        combined.contains("VECTORSETS_INDEX_NAME_EXACT is set"),
+        "the guard must name the exact-pin as the cause so the fix is obvious: {combined}"
+    );
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// Issue #236 × #271 — the migration case the fix creates, and the guard that
+/// makes it loud.
+///
+/// A corpus written by a pre-#236 binary sits under the bare key `idx`. A
+/// current binary addresses `idx:<config>`, so `--skip-upload` finds nothing —
+/// and `VSIM` against a MISSING key returns an **empty array with no error**, so
+/// no amount of downstream inspection can tell "no data" from "no matches". Left
+/// unguarded this publishes a `mean_recall: 0.0` result file and exits 0: the
+/// repo's silent-wrong-result class, in the exact scenario this PR's migration
+/// note describes.
+///
+/// It is guarded, and by the mechanism that already exists rather than a second
+/// one: `--skip-upload` runs `check_corpus_reuse_precondition`, which calls
+/// `Engine::corpus_row_count` (#271 — `VCARD <key>` for VectorSets) and hard-errors
+/// when the server holds fewer rows than the dataset declares.
+///
+/// Where the teeth actually are, stated precisely because an earlier version of
+/// this comment got it wrong. The legacy key is seeded with exactly the expected
+/// row count, which *looks* like the load-bearing part — as if a probe hardcoded
+/// to `idx` would read 400 of 400 and wave the run through. It would not: this
+/// test runs over a PRIVATE base (`BASE` below, not the literal `idx`, for the
+/// isolation reason given there), so a hardcoded probe reads an empty `idx`, gets
+/// 0 of 400, and hard-errors — passing the negative half for the wrong reason.
+///
+/// The half that actually fails against a wrong-key probe is the **positive
+/// control** at the end: `--skip-upload` against the corpus this config really
+/// uploaded must SUCCEED, and a probe reading `idx` sees 0 there and rejects it.
+/// Verified by counterfactual — with `corpus_row_count` patched back to
+/// `.arg("idx")`, this test fails at the positive control, not at any assertion
+/// above it. (`test_vectorsets_corpus_row_count_tracks_the_live_key` fails too,
+/// and its `holds 200 of the 400 rows` assertion IS a direct wrong-key detector.)
+///
+/// The seeding still earns its place: it makes the scenario the realistic one (a
+/// legacy corpus present, not merely absent) and proves the run is rejected even
+/// when a full-size corpus is sitting right there on the server.
+#[test]
+fn test_vectorsets_skip_upload_hard_errors_on_a_pre_236_corpus() {
+    wait_for_vectorsets();
+
+    let name = "vectorsets-migrate";
+    // The migration is "un-suffixed base key" → "<base>:<config>". Reproduced here
+    // over a PRIVATE base rather than the real `idx`, for two reasons: the shape is
+    // identical (that is exactly what `VECTORSETS_INDEX_NAME_EXACT` writes), and the
+    // literal `idx` is global state that
+    // `test_vectorsets_two_configs_do_not_clobber_each_other` asserts is never
+    // written — two tests mutating it would race at default test threads, which is
+    // the very property #236 restored.
+    const BASE: &str = "idx236mig";
+    let key = format!("{BASE}:{name}");
+    const LEGACY_KEY: &str = BASE;
+
+    let proj = common::write_match_any_cosine_project("vs-migrate", &vectorsets_config(name), 8);
+    let n = expected_count(&proj.root);
+
+    let mut c = conn();
+    for k in [key.as_str(), LEGACY_KEY] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+
+    // Seed the pre-#236 corpus: `n` vectors under the bare shared key, i.e. the
+    // exact count a probe on the WRONG key would happily accept.
+    for id in 0..n {
+        let mut cmd = redis::cmd("VADD");
+        cmd.arg(LEGACY_KEY).arg("VALUES").arg(8);
+        for d in 0..8 {
+            cmd.arg((id as f64 * 0.001 + d as f64).to_string());
+        }
+        cmd.arg(id.to_string());
+        cmd.query::<i64>(&mut c).expect("seed legacy corpus");
+    }
+    assert_eq!(
+        vcard(&mut c, LEGACY_KEY),
+        n,
+        "legacy corpus must be seeded to exactly the expected row count"
+    );
+    assert_eq!(
+        vcard(&mut c, &key),
+        0,
+        "the per-config key must start empty"
+    );
+
+    let out = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            name,
+            "--datasets",
+            "vs-migrate",
+            "--host",
+            TEST_HOST,
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+        ])
+        .current_dir(&proj.root)
+        .env("REDIS_PORT", test_port().to_string())
+        .env("VECTORSETS_INDEX_NAME", BASE)
+        .output()
+        .expect("run vector-db-benchmark");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a pre-#236 corpus must FAIL, not publish recall 0.0: {combined}"
+    );
+    assert!(
+        combined.contains("the corpus you asked to reuse is empty or missing"),
+        "the failure must be the corpus-reuse guard reading THIS config's key, \
+         not an incidental error: {combined}"
+    );
+    // The whole point is that no number gets published.
+    let results = std::fs::read_dir(proj.root.join("results"))
+        .map(|d| d.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    assert_eq!(results, 0, "a rejected run must publish no result file");
+
+    // ── Positive control: the same flags against a corpus this config actually
+    // uploaded must succeed. Without this the assertions above would also pass
+    // against a guard that rejects unconditionally.
+    let _ = redis::cmd("DEL").arg(LEGACY_KEY).query::<i64>(&mut c);
+    let port = test_port().to_string();
+    let env = [
+        ("REDIS_PORT", port.as_str()),
+        ("VECTORSETS_INDEX_NAME", BASE),
+    ];
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "vs-migrate",
+            TEST_HOST,
+            &env,
+            &["--keep-data"]
+        ),
+        "upload run failed"
+    );
+    assert_eq!(vcard(&mut c, &key), n, "upload must land in '{key}'");
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "vs-migrate",
+            TEST_HOST,
+            &env,
+            &["--skip-upload", "--keep-data"]
+        ),
+        "--skip-upload against this config's OWN corpus must succeed"
+    );
+
+    for k in [key.as_str(), LEGACY_KEY] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// Issue #238/#271 family test, the VectorSets member that #271 did not ship:
+/// `corpus_row_count()` must be a LIVE read of THIS config's key, not a constant
+/// and not the old shared `idx`. Amputate the corpus behind the tool's back and
+/// the reported number has to follow.
+///
+/// kividb / mongodb / qdrant / valkey each got this test in #271; VectorSets did
+/// not, which is exactly why CI could not see that its probe was hardcoded to
+/// `idx` while #236 moved every other site to `idx:<config>`.
+#[test]
+fn test_vectorsets_corpus_row_count_tracks_the_live_key() {
+    wait_for_vectorsets();
+
+    let name = "vectorsets-rowcount";
+    let key = format!("idx:{name}");
+    let proj = common::write_match_any_cosine_project("vs-rowcount", &vectorsets_config(name), 8);
+    let n = expected_count(&proj.root);
+
+    let mut c = conn();
+    let _ = redis::cmd("DEL").arg(&key).query::<i64>(&mut c);
+
+    let port = test_port().to_string();
+    let env = [("REDIS_PORT", port.as_str())];
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "vs-rowcount",
+            TEST_HOST,
+            &env,
+            &["--keep-data", "--skip-search"]
+        ),
+        "phase 1 (upload) failed"
+    );
+    assert_eq!(vcard(&mut c, &key), n, "upload must land in '{key}'");
+
+    // Amputate half the corpus with VREM, straight on the server.
+    let half = n / 2;
+    for id in 0..half {
+        let removed: i64 = redis::cmd("VREM")
+            .arg(&key)
+            .arg(id.to_string())
+            .query(&mut c)
+            .expect("VREM");
+        assert_eq!(removed, 1, "VREM must actually remove element {id}");
+    }
+    assert_eq!(vcard(&mut c, &key), n - half);
+
+    let out = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            name,
+            "--datasets",
+            "vs-rowcount",
+            "--host",
+            TEST_HOST,
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ])
+        .current_dir(&proj.root)
+        .env("REDIS_PORT", &port)
+        .output()
+        .expect("run vector-db-benchmark");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !out.status.success(),
+        "--skip-upload against a half-deleted vectorsets corpus must be a hard error.\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!("holds {} of the {n} rows", n - half)),
+        "the count must track the amputation, proving it is a live read of '{key}' \
+         and not a constant or the old shared 'idx'.\n{combined}"
+    );
+
+    let _ = redis::cmd("DEL").arg(&key).query::<i64>(&mut c);
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// Per-config memory attribution (#236 follow-on).
+///
+/// `get_memory_usage` reports server-wide `INFO memory:used_memory`. That number
+/// was *correct* as a per-config figure before this PR — the hardcoded key plus a
+/// destructive `DEL` in `configure()` guaranteed exactly one resident corpus. Now
+/// that configs coexist it is the SUM over all of them, so every config after the
+/// first over-reports (2× here, N× on an N-config sweep — and the coexistence
+/// test above is precisely that scenario).
+///
+/// `VINFO` carries no memory field, but the corpus is a single key, so
+/// `MEMORY USAGE <key>` attributes it exactly. This asserts the per-config figure
+/// does NOT grow when a sibling config lands on the same server, while the global
+/// `used_memory` does — i.e. that the two numbers now mean different things and
+/// the per-config one is the honest one.
+#[test]
+fn test_vectorsets_index_memory_is_per_config_not_server_wide() {
+    wait_for_vectorsets();
+
+    let name_a = "vectorsets-mem-a";
+    let name_b = "vectorsets-mem-b";
+    let key_a = format!("idx:{name_a}");
+    let key_b = format!("idx:{name_b}");
+
+    let proj_a = common::write_match_any_cosine_project("vs-mem-a", &vectorsets_config(name_a), 8);
+    let proj_b = common::write_match_any_cosine_project("vs-mem-b", &vectorsets_config(name_b), 8);
+    let n_b = expected_count(&proj_b.root);
+
+    let mut c = conn();
+    for k in [key_a.as_str(), key_b.as_str()] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+
+    let port = test_port().to_string();
+    let env = [("REDIS_PORT", port.as_str())];
+
+    assert!(
+        common::run_binary_extra(
+            &proj_a.root,
+            name_a,
+            "vs-mem-a",
+            TEST_HOST,
+            &env,
+            &["--keep-data", "--skip-search"]
+        ),
+        "config A upload failed"
+    );
+    let (a_alone_index, a_alone_used) = read_upload_memory(&proj_a.root, name_a);
+
+    assert!(
+        common::run_binary_extra(
+            &proj_b.root,
+            name_b,
+            "vs-mem-b",
+            TEST_HOST,
+            &env,
+            &["--keep-data", "--skip-search"]
+        ),
+        "config B upload failed"
+    );
+    let (b_with_a_index, b_with_a_used) = read_upload_memory(&proj_b.root, name_b);
+
+    println!(
+        "#236 memory attribution: A alone index={a_alone_index} used_memory={a_alone_used} | \
+         B with A resident index={b_with_a_index} used_memory={b_with_a_used} | \
+         MEMORY USAGE {key_a}={} {key_b}={}",
+        memory_usage(&mut c, &key_a),
+        memory_usage(&mut c, &key_b),
+    );
+
+    // The per-config figure is attributable: B's own corpus is the same shape as
+    // A's, so B's index memory must stay in A's ballpark even though the SERVER
+    // now holds both. A 1.5× ceiling is far below the 2× a summed figure gives.
+    assert!(
+        b_with_a_index > 0 && a_alone_index > 0,
+        "per-config index_memory_bytes must be reported for both configs \
+         (A={a_alone_index}, B={b_with_a_index})"
+    );
+    assert!(
+        (b_with_a_index as f64) < 1.5 * a_alone_index as f64,
+        "index_memory_bytes must be THIS config's corpus, not the server sum: \
+         A alone={a_alone_index}, B with A resident={b_with_a_index}"
+    );
+    // …and it tracks the actual key, within the slack of the engine's own
+    // bookkeeping between the upload snapshot and this read-back.
+    let live_b = memory_usage(&mut c, &key_b);
+    assert!(
+        live_b > 0 && (b_with_a_index as f64) >= 0.5 * live_b as f64,
+        "index_memory_bytes ({b_with_a_index}) must track MEMORY USAGE {key_b} ({live_b})"
+    );
+    // …and it SCALES with the corpus rather than reporting a constant. Every
+    // assertion above is satisfied by a fixed per-key overhead figure, which is
+    // the plausible way `MEMORY USAGE` could be meaningless here (a module type
+    // with no `mem_usage` callback reports bare key overhead). Compare against a
+    // one-element vector set of the same dimensionality on the same server: 400
+    // elements must cost an order of magnitude more than 1.
+    let tiny_key = "idx:vs-mem-tiny";
+    let _ = redis::cmd("DEL").arg(tiny_key).query::<i64>(&mut c);
+    let mut seed = redis::cmd("VADD");
+    seed.arg(tiny_key).arg("VALUES").arg(8);
+    for d in 0..8 {
+        seed.arg(d.to_string());
+    }
+    seed.arg("solo");
+    seed.query::<i64>(&mut c)
+        .expect("seed 1-element vector set");
+    let tiny = memory_usage(&mut c, tiny_key);
+    let _ = redis::cmd("DEL").arg(tiny_key).query::<i64>(&mut c);
+    assert!(
+        tiny > 0 && b_with_a_index > 10 * tiny,
+        "index_memory_bytes must scale with the corpus, not report a constant: \
+         {n_b} elements = {b_with_a_index} B vs 1 element = {tiny} B"
+    );
+    // And the two numbers demonstrably mean different things: the server-wide
+    // figure accounts for far more than this config's corpus, which is exactly
+    // why it cannot serve as the per-config one. Asserted as a floor rather than
+    // as growth between the two runs — `used_memory` is global state that any
+    // concurrently-running test moves in either direction, and a flaky assertion
+    // about the number we are de-emphasising would be its own kind of wrong. The
+    // inequality only gets safer as other corpora land.
+    assert!(
+        b_with_a_used > 2 * b_with_a_index,
+        "server-wide used_memory ({b_with_a_used}) should dwarf this config's own \
+         corpus ({b_with_a_index}); if they are the same number, the per-config \
+         figure is just the server total again"
+    );
+    let _ = a_alone_used; // reported above; not asserted (see note)
+
+    for k in [key_a.as_str(), key_b.as_str()] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+    std::fs::remove_dir_all(&proj_a.root).ok();
+    std::fs::remove_dir_all(&proj_b.root).ok();
+}
+
+/// `MEMORY USAGE <key>`, or 0 when the key is absent.
+fn memory_usage(conn: &mut redis::Connection, key: &str) -> i64 {
+    redis::cmd("MEMORY")
+        .arg("USAGE")
+        .arg(key)
+        .query::<Option<i64>>(conn)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// `(index_memory_bytes, used_memory)` from an engine's upload result JSON.
+fn read_upload_memory(root: &std::path::Path, engine: &str) -> (i64, i64) {
+    let pattern = format!("{engine}-*-upload-*.json");
+    let dir = root.join("results");
+    let path = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            glob::Pattern::new(&pattern)
+                .unwrap()
+                .matches(&p.file_name().unwrap().to_string_lossy())
+        })
+        .unwrap_or_else(|| panic!("no upload result for {engine}"));
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mem = &v["results"]["memory_usage"];
+    (
+        mem["index_memory_bytes"].as_i64().unwrap_or(-1),
+        mem["used_memory"].as_i64().unwrap_or(-1),
+    )
 }
