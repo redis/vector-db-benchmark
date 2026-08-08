@@ -19,6 +19,20 @@ use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
+/// Shard count this engine creates its index with. Not configurable: it is
+/// pinned so an ES run is reproducible across cluster versions and deployments,
+/// whatever their per-index default happens to be.
+///
+/// It is a named constant rather than a literal because it is a *cross-engine*
+/// invariant, not a local choice: the shipped `opensearch-single-node.json` pins
+/// the same value so the published ES-vs-OS head-to-head compares two indexes
+/// with the same shard count (#211), and
+/// `opensearch::tests::shipped_opensearch_configs_pin_their_shard_count`
+/// asserts that equality against this constant. Changing this number therefore
+/// fails that test until the OpenSearch config is moved with it, instead of
+/// silently desynchronising the pairing.
+pub(crate) const ES_NUMBER_OF_SHARDS: i64 = 1;
+
 /// Elasticsearch engine configuration parsed from JSON
 #[derive(Clone)]
 struct ElasticsearchConfig {
@@ -194,7 +208,7 @@ impl ElasticsearchEngine {
         let body = serde_json::json!({
             "settings": {
                 "index": {
-                    "number_of_shards": 1,
+                    "number_of_shards": ES_NUMBER_OF_SHARDS,
                     "number_of_replicas": 0,
                     "refresh_interval": "10s",
                 }

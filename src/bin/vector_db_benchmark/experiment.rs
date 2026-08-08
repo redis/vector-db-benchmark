@@ -332,8 +332,18 @@ pub fn run(args: &Args) -> Result<(), String> {
             // Create engine
             let mut engine = create_engine(&engine_config, &args.host)?;
 
+            // Shard count this run will be measured at, recorded in the result
+            // files so it does not have to be inferred from the config name (#211).
+            let number_of_shards = crate::engine::resolved_number_of_shards(&engine_config)?;
+
             // Run experiment phases
-            if let Err(e) = run_single_experiment(&mut *engine, &dataset, args, is_last_config) {
+            if let Err(e) = run_single_experiment(
+                &mut *engine,
+                &dataset,
+                args,
+                is_last_config,
+                number_of_shards.as_ref(),
+            ) {
                 eprintln!("Experiment failed: {}", e);
                 if args.exit_on_error {
                     pb.finish_and_clear();
@@ -375,6 +385,7 @@ fn run_single_experiment(
     dataset: &Dataset,
     args: &Args,
     is_last_config: bool,
+    number_of_shards: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     // With --reset-between-configs, `--keep-data` only skips cleanup for the LAST
     // config in a sweep; earlier configs tear down so their (identical) corpus
@@ -414,7 +425,12 @@ fn run_single_experiment(
         upload_stats.memory_usage = engine.get_memory_usage();
 
         // Save upload results
-        save_upload_results(engine.name(), &dataset.config.name, &upload_stats)?;
+        save_upload_results(
+            engine.name(),
+            &dataset.config.name,
+            &upload_stats,
+            number_of_shards,
+        )?;
     } else if args.skip_vector_index {
         // --skip-upload + --skip-vector-index: data already uploaded, but we need
         // a schema-only index (previous run's index was dropped by delete()).
@@ -890,6 +906,7 @@ fn run_single_experiment(
             server_metadata_before.as_ref(),
             server_metadata_after.as_ref(),
             args.dump_raw_latencies,
+            number_of_shards,
         )?;
     }
 
@@ -1034,6 +1051,7 @@ fn save_search_results(
     server_metadata_before: Option<&serde_json::Value>,
     server_metadata_after: Option<&serde_json::Value>,
     dump_raw_latencies: bool,
+    number_of_shards: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let pid = std::process::id();
@@ -1113,6 +1131,14 @@ fn save_search_results(
         }
     });
 
+    // Shard count the index was built with. Recall and QPS both move with it, so
+    // a published search result carries it instead of leaving it to be inferred
+    // from the `experiment` (config) name (#211). Emitted only for the engines
+    // where it means something; the full engine-params block is #212.
+    if let Some(shards) = number_of_shards {
+        result["params"]["number_of_shards"] = shards.clone();
+    }
+
     // Opt-in full-fidelity archival: additionally emit the raw per-query arrays
     // exactly as before. Off by default so large runs stay ~1000x smaller.
     if dump_raw_latencies {
@@ -1185,6 +1211,7 @@ fn save_upload_results(
     engine_name: &str,
     dataset_name: &str,
     stats: &crate::engine::UploadStats,
+    number_of_shards: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let filename = format!(
@@ -1192,7 +1219,7 @@ fn save_upload_results(
         engine_name, dataset_name, stats.upload_count, timestamp
     );
 
-    let result = json!({
+    let mut result = json!({
         "params": {
             "experiment": engine_name,
             "dataset": dataset_name,
@@ -1206,6 +1233,13 @@ fn save_upload_results(
             "memory_usage": stats.memory_usage,
         }
     });
+    // Shard count is the one collection param that changes indexing throughput
+    // outright, so it is recorded rather than left to be inferred from the config
+    // name (#211). Emitted only for the engines where it means something; the
+    // full engine-params block is #212.
+    if let Some(shards) = number_of_shards {
+        result["params"]["number_of_shards"] = shards.clone();
+    }
 
     let path = results_dir().join(&filename);
     fs::write(&path, serde_json::to_string_pretty(&result).unwrap())

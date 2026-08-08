@@ -1,6 +1,6 @@
 [
   {
-    "name": "opensearch-managed-default",
+    "name": "opensearch-5-shard-default",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
@@ -13,7 +13,7 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-managed-m-16-ef-128",
+    "name": "opensearch-5-shard-m-16-ef-128",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
@@ -26,7 +26,7 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-managed-m-32-ef-128",
+    "name": "opensearch-5-shard-m-32-ef-128",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
@@ -39,7 +39,7 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-managed-m-32-ef-256",
+    "name": "opensearch-5-shard-m-32-ef-256",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
@@ -52,7 +52,7 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-managed-m-32-ef-512",
+    "name": "opensearch-5-shard-m-32-ef-512",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
@@ -65,7 +65,7 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-managed-m-64-ef-256",
+    "name": "opensearch-5-shard-m-64-ef-256",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
@@ -78,7 +78,7 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-managed-m-64-ef-512",
+    "name": "opensearch-5-shard-m-64-ef-512",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000

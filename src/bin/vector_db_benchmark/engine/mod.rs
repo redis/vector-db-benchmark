@@ -471,6 +471,49 @@ pub fn build_redis_url(host: &str) -> String {
     format!("redis://{}{}:{}/", auth_part, host, port)
 }
 
+/// Shard count the run will actually be measured at, for the results JSON (#211).
+///
+/// Shard count materially changes vector indexing speed and precision, but the
+/// only trace of it in a result file used to be the config *name* — an auditor
+/// could infer it at best, and a renamed or hand-edited config left no trace at
+/// all. This resolves it the same way the engine does, so the number lands in
+/// `params` next to `parallel`/`batch_size`:
+///
+/// - `opensearch` reads it from `collection_params.number_of_shards` and is the
+///   only engine where it is configurable. Always reported — including the
+///   `"cluster-default"` sentinel when nothing pinned it, since "nobody chose
+///   this" is exactly what a reader of a published result needs to see.
+/// - `elasticsearch` pins [`elasticsearch::ES_NUMBER_OF_SHARDS`] in code and
+///   ignores the config, so the constant is reported.
+/// - every other engine returns `None` and the key is omitted rather than
+///   invented.
+///
+/// This is deliberately one key, not the full engine-params block: capturing
+/// `collection_params` verbatim plus the env-derived knobs (`m`,
+/// `ef_construction`, retry budgets, `*_UPLOAD_PARALLEL`, …) for all 15 engines
+/// is tracked separately in #212.
+pub fn resolved_number_of_shards(
+    engine_config: &EngineConfig,
+) -> Result<Option<serde_json::Value>, String> {
+    match engine_config.engine.as_deref() {
+        Some("opensearch") => {
+            let raw = engine_config
+                .collection_params
+                .as_ref()
+                .and_then(|c| c.extra.as_ref())
+                .and_then(|e| e.get("number_of_shards"));
+            Ok(Some(match opensearch::parse_number_of_shards(raw)? {
+                Some(n) => serde_json::Value::from(n),
+                None => serde_json::Value::from("cluster-default"),
+            }))
+        }
+        Some("elasticsearch") => Ok(Some(serde_json::Value::from(
+            elasticsearch::ES_NUMBER_OF_SHARDS,
+        ))),
+        _ => Ok(None),
+    }
+}
+
 /// Create an engine based on config
 pub fn create_engine(engine_config: &EngineConfig, host: &str) -> Result<Box<dyn Engine>, String> {
     let engine_type = engine_config.engine.as_deref().unwrap_or("unknown");

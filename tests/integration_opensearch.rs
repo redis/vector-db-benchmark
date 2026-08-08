@@ -1036,3 +1036,137 @@ fn test_binary_opensearch_fulltext() {
         recall
     );
 }
+
+/// Shard count reaches the server, end to end (#211).
+///
+/// Every link in the chain is unit-covered on its own — the shipped configs are
+/// asserted to pin the key, `parse_number_of_shards` is asserted to accept and
+/// reject, `build_index_settings` is asserted to emit it — but nothing proved
+/// the value actually survives the trip. `collection_params` is a
+/// `#[serde(flatten)]` catch-all: an undeclared or wrongly-placed key parses
+/// cleanly and is dropped in silence, and the index that results looks entirely
+/// healthy. The server's own `_settings` is the only evidence, and only a live
+/// run produces it, so the read-back lives here rather than in a PR comment that
+/// expires.
+///
+/// Uses **3** deliberately: no cluster defaults to it (open-source OpenSearch
+/// defaults to 1, legacy Amazon domains to 5), so a dropped setting cannot pass
+/// by coincidence the way asserting 1 against a 1-defaulting cluster would.
+/// Also asserts the value is echoed into the results JSON, which is what makes a
+/// published run auditable after the index is gone.
+#[test]
+fn test_binary_opensearch_number_of_shards_reaches_the_server() {
+    wait_for_opensearch();
+
+    const SHARDS: i64 = 3;
+    const INDEX: &str = "bench_shards";
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "os-shards", "engine": "opensearch",
+        "collection_params": {
+            "number_of_shards": SHARDS,
+            "method": { "parameters": { "m": 16, "ef_construction": 100 } }
+        },
+        "search_params": [{"parallel": 1, "num_candidates": 400}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_bool_project(
+        "shards-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+
+    let client = os_client();
+    let index_url = format!("{}/{}", os_base_url(), INDEX);
+    // Start from a clean slate: an index left by a previous run keeps its
+    // original shard count (it is fixed at creation), which would make this test
+    // report the old value.
+    let _ = client.delete(&index_url).send();
+
+    // --keep-data so the index outlives the run and its settings can be read.
+    let ok = common::run_binary_extra(
+        &proj.root,
+        "os-shards",
+        "shards-test",
+        // Explicit http:// scheme: the OpenSearch engine defaults to https for a
+        // bare host, but the CI container runs plaintext http.
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", "9202"), ("OPENSEARCH_INDEX", INDEX)],
+        &["--keep-data"],
+    );
+    assert!(ok, "opensearch number_of_shards run failed");
+
+    let settings: serde_json::Value = client
+        .get(format!("{}/_settings", index_url))
+        .send()
+        .expect("read index settings")
+        .json()
+        .expect("settings response is JSON");
+    // OpenSearch stringifies index settings.
+    let stored = settings[INDEX]["settings"]["index"]["number_of_shards"]
+        .as_str()
+        .map(|s| s.to_string());
+    // Count the primaries that actually materialized, not just the setting.
+    let cat: serde_json::Value = client
+        .get(format!(
+            "{}/_cat/shards/{}?format=json&h=prirep,state",
+            os_base_url(),
+            INDEX
+        ))
+        .send()
+        .expect("read _cat/shards")
+        .json()
+        .expect("_cat/shards response is JSON");
+    let primaries = cat
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| r["prirep"].as_str() == Some("p"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    // Clean up before asserting so a failure does not leak the index into the
+    // next test's cluster.
+    let _ = client.delete(&index_url).send();
+
+    assert_eq!(
+        stored.as_deref(),
+        Some(SHARDS.to_string().as_str()),
+        "index {INDEX} must be created with number_of_shards={SHARDS}; got {stored:?}. \
+         collection_params is a serde(flatten) catch-all, so a dropped key leaves a \
+         perfectly healthy index at the cluster default"
+    );
+    assert_eq!(
+        primaries, SHARDS as usize,
+        "expected {SHARDS} primary shards to materialize, saw {primaries}"
+    );
+
+    // The run must also be self-describing: an auditor reading a published
+    // result file should not have to infer the shard count from the config name.
+    let params = read_params_obj(&proj.root, "os-shards");
+    assert_eq!(
+        params["number_of_shards"],
+        serde_json::json!(SHARDS),
+        "search results must record params.number_of_shards; got {params}"
+    );
+}
+
+/// Read the `params` object from an engine's search result JSON.
+fn read_params_obj(root: &std::path::Path, engine: &str) -> serde_json::Value {
+    let pattern = format!("{}-*-search-*.json", engine);
+    let dir = root.join("results");
+    let path = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            glob::Pattern::new(&pattern)
+                .unwrap()
+                .matches(&p.file_name().unwrap().to_string_lossy())
+        })
+        .unwrap_or_else(|| panic!("no search result for {}", engine));
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    v["params"].clone()
+}
