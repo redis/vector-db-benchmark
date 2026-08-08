@@ -804,7 +804,7 @@ mod tests {
 ///
 /// What it reliably catches:
 /// * a knob no source file of the target engine mentions at all (the #216 shape);
-/// * a knob inside a [`CLOSED_CONTAINERS`] struct that the struct does not
+/// * a knob inside a [`TYPED_CONTAINERS`] struct that the struct does not
 ///   declare, on every engine — a real schema check, not a heuristic;
 /// * a misspelled top-level key, which serde drops with everything under it;
 /// * a mention that exists only in a comment or a `#[cfg(test)]` item.
@@ -817,7 +817,7 @@ mod tests {
 ///   it was declared in, so declaring an `upload_params` knob under
 ///   `collection_params` passes whenever the token appears anywhere.
 /// * **short common leaves.** Token matching cannot distinguish a knob named
-///   `ef` from an unrelated local `ef`. [`CLOSED_CONTAINERS`] covers the known
+///   `ef` from an unrelated local `ef`. [`TYPED_CONTAINERS`] covers the known
 ///   typed structs; elsewhere this remains a hole.
 ///
 /// Only a read-back assertion against a live server — see
@@ -876,12 +876,15 @@ mod shipped_config_knob_guard {
         "calibration_param",
         "calibration_precision",
         // The inner `search_params` object itself is a container, not a knob.
+        // `config` is #215's alias for that same container (upstream's spelling).
         "search_params",
+        "config",
     ];
 
-    /// Containers deserialized into a CLOSED Rust struct — no `#[serde(flatten)]`
-    /// catch-all — so any key outside the listed set is dropped on the floor by
-    /// serde no matter which engine is targeted.
+    /// Containers deserialized into a TYPED Rust struct, with the fields that
+    /// struct actually declares. A key outside the set is not a typed knob: it
+    /// either lands in an untyped `#[serde(flatten)] extra` map or is dropped
+    /// outright, and in neither case does an engine read it as a knob.
     ///
     /// This is a schema check, and it is the only thing that reliably stops the
     /// issue #216 bug from being laundered by relocation: moving `ef` to
@@ -889,10 +892,28 @@ mod shipped_config_knob_guard {
     /// whose source happens to contain a bare `ef` (qdrant, redis and pgvector
     /// all do), but it cannot defeat this.
     ///
+    /// Keep in sync with the structs. [`HnswConfig`] gained `on_disk`,
+    /// `payload_m`, `inline_storage`, `full_scan_threshold` and
+    /// `max_indexing_threads` in #215; it also gained an `extra` catch-all, so an
+    /// unlisted key there is *captured* rather than dropped — but only Qdrant
+    /// calls `unsupported_keys()` on it, so for every other engine it is still
+    /// silently inert.
+    ///
     /// Leaves are compared after [`canonical`], so `M`/`EF_CONSTRUCTION` and
     /// their serde aliases all normalize into the sets below.
-    const CLOSED_CONTAINERS: &[(&str, &[&str])] = &[
-        ("collection_params.hnsw_config", &["m", "ef_construction"]),
+    const TYPED_CONTAINERS: &[(&str, &[&str])] = &[
+        (
+            "collection_params.hnsw_config",
+            &[
+                "m",
+                "ef_construction",
+                "on_disk",
+                "payload_m",
+                "inline_storage",
+                "full_scan_threshold",
+                "max_indexing_threads",
+            ],
+        ),
         ("collection_params.index_options", &["m", "ef_construction"]),
     ];
 
@@ -919,23 +940,20 @@ mod shipped_config_knob_guard {
         (
             "elasticsearch",
             "connection_params.request_timeout",
-            "engine takes its timeout from ELASTIC_TIMEOUT (default 300) and never \
-             consults the config; the shipped value 10000 has no effect. Units are \
-             ambiguous (s vs ms), so honouring it blindly could be worse than \
-             ignoring it — needs its own issue, not a drive-by fix in #216.",
+            "issue #245: engine takes its timeout from ELASTIC_TIMEOUT (default 300) \
+             and never consults the config; the shipped value 10000 has no effect. \
+             Units are ambiguous (s vs ms) and the two readings move behaviour in \
+             opposite directions, so the fix needs a deliberate decision.",
         ),
         (
             "opensearch",
             "connection_params.request_timeout",
-            "same as elasticsearch: OPENSEARCH_TIMEOUT only.",
+            "issue #245: same as elasticsearch, OPENSEARCH_TIMEOUT only.",
         ),
-        (
-            "qdrant",
-            "collection_params.hnsw_config.on_disk",
-            "issue #215: qdrant.rs reads vectors_config.on_disk, and HnswConfig has \
-             no on_disk field, so this key is dropped by serde. Being fixed in its \
-             own PR; this entry must be deleted when that lands.",
-        ),
+        // `qdrant collection_params.hnsw_config.on_disk` used to live here for
+        // issue #215. #215 landed, HnswConfig gained the field and qdrant.rs
+        // reads it, so the entry is gone — removed because the guard demanded it,
+        // not because anyone remembered to look.
         (
             "redis",
             "collection_params.hnsw_config.DISTANCE_METRIC",
@@ -965,6 +983,8 @@ mod shipped_config_knob_guard {
         match leaf {
             "M" => "m",
             "EF_CONSTRUCTION" | "ef_construct" => "ef_construction",
+            // #215 made `EF` an alias of the typed `ef` field.
+            "EF" => "ef",
             other => other,
         }
     }
@@ -1210,6 +1230,13 @@ mod shipped_config_knob_guard {
                 // for it. Check the roots against EngineConfig's real fields.
                 if let Some(obj) = entry.as_object() {
                     for key in obj.keys() {
+                        // `_`-prefixed keys are a deliberate JSON documentation
+                        // idiom (e.g. qdrant-tenant-on-disk.json's `_comment`
+                        // naming the only dataset the config is valid for), not
+                        // a typo. serde ignores them by design.
+                        if key.starts_with('_') {
+                            continue;
+                        }
                         if !ENGINE_CONFIG_ROOT_KEYS.contains(&key.as_str()) {
                             violations.push(format!(
                                 "{} [{}] has unknown top-level key '{}' - EngineConfig \
@@ -1242,48 +1269,66 @@ mod shipped_config_knob_guard {
                     {
                         continue;
                     }
-                    // Documented pre-existing debt, checked first so the reason
-                    // is what a reader sees rather than a generic violation.
-                    if KNOWN_UNREAD
-                        .iter()
-                        .any(|(eng, path, _)| *eng == engine && *path == knob)
-                    {
-                        used_exemptions.insert((engine.to_string(), knob.clone()));
-                        continue;
-                    }
-                    // Schema check: a key inside a closed struct that the struct
-                    // does not declare is dropped by serde on EVERY engine.
-                    if let Some((container, allowed)) = CLOSED_CONTAINERS
-                        .iter()
-                        .find(|(c, _)| knob.starts_with(&format!("{}.", c)))
-                    {
-                        let rel = &knob[container.len() + 1..];
-                        if !rel.contains('.') && !allowed.contains(&canonical(rel)) {
-                            violations.push(format!(
-                                "{} [{}] declares '{}', but '{}' is a closed struct \
-                                 accepting only {:?} - serde drops '{}' on every \
-                                 engine, so it can never take effect (see issue #216)",
-                                file_name, name, knob, container, allowed, rel
-                            ));
-                            continue;
-                        }
-                    }
                     // Leaves inside a wholesale-forwarded container.
                     if PASSTHROUGH_CONTAINERS.iter().any(|(eng, container)| {
                         *eng == engine && knob.starts_with(&format!("{}.", container))
                     }) {
                         continue;
                     }
-                    if knob_is_read(&source, &knob) {
-                        continue;
+
+                    // Decide the violation FIRST, and only then consult the
+                    // exemption list. Checking the exemption first would let an
+                    // entry stay "used" long after the underlying bug was fixed
+                    // — which is exactly what happened when #215 landed and made
+                    // `hnsw_config.on_disk` a real, read knob.
+                    let schema_violation = TYPED_CONTAINERS
+                        .iter()
+                        .find(|(c, _)| knob.starts_with(&format!("{}.", c)))
+                        .and_then(|(container, allowed)| {
+                            let rel = &knob[container.len() + 1..];
+                            if !rel.contains('.') && !allowed.contains(&canonical(rel)) {
+                                Some(format!(
+                                    "{} [{}] declares '{}', but '{}' declares no such \
+                                     field (only {:?}) - it lands in the untyped \
+                                     catch-all that no engine reads as a knob, so it \
+                                     can never take effect (see issue #216)",
+                                    file_name, name, knob, container, allowed
+                                ))
+                            } else {
+                                None
+                            }
+                        });
+
+                    let reason = schema_violation.or_else(|| {
+                        if knob_is_read(&source, &knob) {
+                            None
+                        } else {
+                            Some(format!(
+                                "{} [{}] targets engine '{}' but declares '{}', which \
+                                 no source file of that engine ever reads - it parses \
+                                 and is then silently discarded, so every run of this \
+                                 config measures the engine default (see issue #216)",
+                                file_name, name, engine, knob
+                            ))
+                        }
+                    });
+
+                    let exempt = KNOWN_UNREAD
+                        .iter()
+                        .any(|(eng, path, _)| *eng == engine && *path == knob);
+
+                    match (reason, exempt) {
+                        (Some(_), true) => {
+                            used_exemptions.insert((engine.to_string(), knob.clone()));
+                        }
+                        (Some(reason), false) => violations.push(reason),
+                        (None, true) => violations.push(format!(
+                            "{} [{}] {}/{} is listed in KNOWN_UNREAD but is no longer a \
+                             violation - the engine reads it now, so delete the entry",
+                            file_name, name, engine, knob
+                        )),
+                        (None, false) => {}
                     }
-                    violations.push(format!(
-                        "{} [{}] targets engine '{}' but declares '{}', which no \
-                         source file of that engine ever reads - it parses and is \
-                         then silently discarded, so every run of this config \
-                         measures the engine default (see issue #216)",
-                        file_name, name, engine, knob
-                    ));
                 }
             }
         }
