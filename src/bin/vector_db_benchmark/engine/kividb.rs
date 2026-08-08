@@ -72,7 +72,7 @@ use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{Engine, SearchResults, UploadStats};
 use crate::metrics::compute_metrics;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, doc_key_to_id, doc_key_to_id_opt};
-use vector_db_benchmark::readers::metadata::MetadataItem;
+use vector_db_benchmark::readers::metadata::{is_multivalued_keyword_field, MetadataItem};
 
 /// KiviDB engine configuration.
 #[derive(Clone)]
@@ -267,6 +267,10 @@ impl KividbEngine {
                     "text" => {
                         cmd.arg(field_name).arg("TEXT");
                     }
+                    // `"geo"` never reaches here: `validate_dataset_support`
+                    // rejects the dataset in `configure()` before this runs, so
+                    // no geo field is ever silently left undeclared. Anything
+                    // else is a schema type this repo does not filter on.
                     _ => {}
                 }
             }
@@ -284,7 +288,6 @@ impl KividbEngine {
         vectors: &[Vec<f32>],
         metadata: &[Option<MetadataItem>],
         datetime_fields: &std::collections::HashSet<String>,
-        indexed_tag_fields: &std::collections::HashSet<String>,
     ) -> Result<(), String> {
         let mut conn = self.get_connection()?;
         let pb = self.create_progress_bar(ids.len());
@@ -297,7 +300,6 @@ impl KividbEngine {
                 &vectors[batch_start..batch_end],
                 &metadata[batch_start..batch_end],
                 datetime_fields,
-                indexed_tag_fields,
                 &self.config.key_prefix,
             )?;
             pb.inc((batch_end - batch_start) as u64);
@@ -313,7 +315,6 @@ impl KividbEngine {
         vectors: &[Vec<f32>],
         metadata: &[Option<MetadataItem>],
         datetime_fields: &std::collections::HashSet<String>,
-        indexed_tag_fields: &std::collections::HashSet<String>,
     ) -> Result<(), String> {
         let pb = self.create_progress_bar(ids.len());
         let batches: Vec<(usize, usize)> = (0..ids.len())
@@ -357,7 +358,6 @@ impl KividbEngine {
                             &vectors[batch_start..batch_end],
                             &metadata[batch_start..batch_end],
                             datetime_fields,
-                            indexed_tag_fields,
                             &key_prefix,
                         ) {
                             *error.lock().unwrap() = Some(e);
@@ -512,32 +512,54 @@ impl KividbEngine {
 /// server and is why KiviDB needs its own emitter. Every item was reproduced by
 /// hand with `FT.SEARCH` against a seeded index before being encoded here.
 ///
-/// 1. **`$param` placeholders are NOT substituted inside a hybrid query's
-///    prefilter.** This is the root cause of issue #205. In
-///    `<prefilter>=>[KNN $K @vector $vec_param ...]` KiviDB substitutes the KNN
-///    params (`$vec_param`, `$K`, `$EF`) but leaves the prefilter's `$name`
-///    placeholders as literal text. A TAG or TEXT clause then matches ZERO
+/// 1. **`$param` placeholders are NOT substituted in a filter expression, in
+///    ANY query form.** This is the root cause of issue #205. The failure is
+///    NOT hybrid-specific: a plain `FT.SEARCH idx "(@color:{$a})" PARAMS 2 a
+///    red` returns 0 documents exactly as the hybrid
+///    `<prefilter>=>[KNN $K @vector $vec_param ...]` does, and `@n:[$lo +inf]`
+///    returns the whole corpus in both forms. (In the hybrid form KiviDB *does*
+///    substitute the KNN params `$vec_param`, `$K`, `$EF` — only the filter
+///    expression is left as literal text, which is what made this look
+///    prefilter-specific at first.) A TAG or TEXT clause therefore matches ZERO
 ///    documents (`@kw:{$p}` looks for the literal tag `$p`) and a NUMERIC clause
-///    silently degrades to match-ALL. That is exactly the observed
-///    `and`/`or`/`uuid`/`bool`/`nested`/`fulltext` recall ≈ 0.0 and `datetime`
-///    recall ≈ 0.5. So this builder inlines every value as a LITERAL and binds
-///    no filter params at all.
+///    silently degrades to match-ALL. That accounts for the `uuid` / `bool` /
+///    `fulltext` / `and` / `nested` recall ≈ 0.0 and the `datetime` recall ≈ 0.5
+///    measured on `master`. Note it does NOT by itself account for the `or` and
+///    `match_any` rows (≈ 0.46): those are dominated by divergences 4 and 9
+///    below — a spaced intra-brace TAG-OR reads as match-all, and a redundantly
+///    wrapped OR arm degrades the same way — which is why fixing this one alone
+///    would not have fixed them. So this builder inlines every value as a
+///    LITERAL and binds no filter params at all.
 /// 2. **No escaping.** KiviDB TAG values are matched raw. RediSearch-style
 ///    backslash escaping matches nothing (`@uid:{3f2a\-9c}` → 0 docs, while
 ///    `@uid:{3f2a-9c}` → the document). Spaces, `-`, `$`, `{`, `}`, `:`, `;`,
 ///    `.`, `/`, quotes and backslashes all round-trip verbatim, even inside a
 ///    compound clause.
-/// 3. **Two characters are inexpressible in a TAG value** — see
-///    [`check_tag_value`]. `|` is always read as the TAG-OR separator
-///    (under-match) and `@` degrades the whole query to match-all
-///    (over-match). Both are hard errors here rather than a silent wrong recall.
-/// 4. **TAG-OR must not be spaced.** `@f:{a | b}` matches EVERY document (a
-///    parser divergence), while `@f:{a|b}` is correct. This builder sidesteps
-///    the ambiguity entirely by emitting separate clauses, `(@f:{a} | @f:{b})`.
+/// 3. **Four characters are inexpressible in a TAG value** — see
+///    [`tag_value_offender`], which carries the measurement. `|` is always read
+///    as the TAG-OR separator (under-match), `@` degrades the whole query to
+///    match-all (over-match), and `(`/`)` are parsed as grouping the moment the
+///    clause sits inside a group (`@t:{zz(zz} @u:{blue}` → 0;
+///    `(@t:{zz)zz})` → the whole corpus), which every non-trivial filter does.
+///    All four are hard errors here rather than a silent wrong recall.
+/// 4. **`|` spacing is inverted between the two positions it appears in.**
+///    INSIDE braces it must NOT be spaced: `@f:{a | b}` matches EVERY document
+///    (a parser divergence) while `@f:{a|b}` is correct. BETWEEN clauses it
+///    MUST be spaced: `@t:{a} | @t:{c}` is correct while the unspaced
+///    `@t:{a}|@t:{c}` returns 0. This builder sidesteps the intra-brace form
+///    entirely by emitting separate clauses, and [`Node::render`] always joins
+///    disjuncts with `" | "`.
 /// 5. **Exclusive numeric bounds `(x` are not parsed** — `@f:[-inf (5]`
-///    degrades to match-all. KiviDB NUMERIC is `f64` (verified: 16777217 and
-///    1609459201 are both distinguishable from their neighbours), so `gt`/`lt`
-///    are emulated exactly with `f64::next_up`/`next_down`.
+///    degrades to match-all, so `gt`/`lt` are emulated exactly with
+///    `f64::next_up`/`next_down`. That emulation is only sound if KiviDB
+///    compares NUMERIC values as `f64`, which was established by two probes
+///    that an integer representation could not pass:
+///    `@val:[9007199254740993 9007199254740993]` returns **2** — 2^53+1
+///    collides with 2^53, which no `i64` comparison would do — and
+///    `@val:[1.5 1.5]` returns **1**, so non-integers are stored and compared
+///    rather than truncated. (An earlier note cited 16777217 and 1609459201;
+///    those only rule out `f32`, since both are equally distinguishable under
+///    `i64`, and `next_up`/`next_down` is exact only for `f64`.)
 /// 6. **Negation is broken.** A leading `-@f:{v}` is ignored (matches all) and a
 ///    `-` clause next to a positive one annihilates the result. This builder
 ///    never emits `-`; a never-match degenerates to a sentinel value instead.
@@ -581,6 +603,11 @@ mod kividb_filter {
     /// ALL documents). A plain lookup for a value no corpus contains was
     /// verified to return 0 documents for both TAG and TEXT.
     const NEVER_MATCH: &str = "__kividb_never_match__";
+
+    /// The prefilter that selects the whole corpus, i.e. an unfiltered kNN.
+    /// Returned explicitly by [`parse_conditions`] for conditions that carry no
+    /// clause, so callers never have to interpret an `Option`.
+    pub const MATCH_ALL: &str = "*";
 
     /// Largest magnitude an integer bound may have and still be converted to
     /// `f64` losslessly (needed only for the exclusive-bound emulation).
@@ -689,18 +716,30 @@ mod kividb_filter {
 
     /// Parse `meta_conditions` JSON into a KiviDB prefilter string.
     ///
-    /// `Ok(None)` means "no conditions" (the caller uses the `*` match-all
-    /// prefilter). `Err` means the conditions cannot be expressed FAITHFULLY on
-    /// KiviDB — the caller must abort the run rather than report a recall
-    /// computed against a filter that was never applied.
-    pub fn parse_conditions(conditions: &Value) -> Result<Option<String>, String> {
+    /// Returns the prefilter to splice into the hybrid query. `Err` means the
+    /// conditions cannot be expressed FAITHFULLY on KiviDB — the caller must
+    /// abort the run rather than report a recall computed against a filter that
+    /// was never applied.
+    ///
+    /// Deliberately `Result<String, _>` and NOT `Result<Option<String>, _>`
+    /// (issue #219): the `Option` would keep alive the ambiguity between "there
+    /// was no filter" and "there was a filter and it parsed to nothing", which
+    /// is exactly the class of bug this module exists to remove. `vertex.rs`'s
+    /// `parse_vertex_filter` is the same shape — the no-conditions case is split
+    /// structurally instead, here by returning the explicit [`MATCH_ALL`]
+    /// prefilter (the caller does the same for an absent condition). "Parsed to
+    /// nothing" is unreachable by construction: every leaf path either emits a
+    /// clause or errors.
+    pub fn parse_conditions(conditions: &Value) -> Result<String, String> {
         let Some(obj) = conditions.as_object() else {
-            return Ok(None);
+            return Ok(MATCH_ALL.to_string());
         };
         if obj.is_empty() {
-            return Ok(None);
+            return Ok(MATCH_ALL.to_string());
         }
-        Ok(build_group(obj)?.map(|node| node.render()))
+        Ok(build_group(obj)?
+            .map(|node| node.render())
+            .unwrap_or_else(|| MATCH_ALL.to_string()))
     }
 
     /// Build one boolean group (`{and:[...], or:[...]}`). Recursive with
@@ -734,11 +773,21 @@ mod kividb_filter {
     /// Build the children of one `and`/`or` array. An entry carrying an
     /// `and`/`or` key is a nested group (recursed); anything else is a
     /// `{field: {op: criteria}}` leaf.
+    ///
+    /// A malformed entry is an ERROR, not a skip. redis.rs `continue`s past
+    /// these, which is the same silent-drop this module exists to eliminate:
+    /// skipping one entry of an `and` array widens the prefilter and publishes a
+    /// recall for a filter that was only partly applied. No shipped dataset
+    /// produces either shape, so this changes no current run.
     fn build_subfilters(entries: &[Value]) -> Result<Vec<Node>, String> {
         let mut children = Vec::new();
         for entry in entries {
             let Some(entry_obj) = entry.as_object() else {
-                continue;
+                return Err(format!(
+                    "KiviDB filter: filter entry must be an object, got {entry}. Refusing to skip \
+                     it — dropping one conjunct would widen the prefilter and report a recall for \
+                     a filter that was never fully applied."
+                ));
             };
             if entry_obj.contains_key("and") || entry_obj.contains_key("or") {
                 if let Some(group) = build_group(entry_obj)? {
@@ -748,7 +797,10 @@ mod kividb_filter {
             }
             for (field_name, field_filters) in entry_obj {
                 let Some(filter_obj) = field_filters.as_object() else {
-                    continue;
+                    return Err(format!(
+                        "KiviDB filter: filter for `{field_name}` must be an object, got \
+                         {field_filters}. Refusing to skip it — see above."
+                    ));
                 };
                 for (condition_type, criteria) in filter_obj {
                     children.push(build_filter(field_name, condition_type, criteria)?);
@@ -895,7 +947,9 @@ mod kividb_filter {
     /// Divergence 5: KiviDB does not parse RediSearch's `(` exclusive-bound
     /// marker — `@f:[-inf (5]` degrades to match-all — so an exclusive bound is
     /// emulated by nudging the inclusive bound to the adjacent `f64`. KiviDB
-    /// NUMERIC comparisons are `f64`, so this is exact, not an approximation.
+    /// NUMERIC comparisons are `f64` (proved by the 2^53+1 collision and the
+    /// `1.5` probe in divergence 5 above), so this is exact, not an
+    /// approximation.
     fn build_range(field: &str, criteria: &Value) -> Result<Node, String> {
         // (key, is_upper_bound, is_exclusive) in a fixed order so the emitted
         // string is deterministic.
@@ -915,7 +969,9 @@ mod kividb_filter {
             let rendered = if exclusive {
                 // `< x` becomes `<= prev(x)`; `> x` becomes `>= next(x)`.
                 let as_f64 = match bound {
-                    Bound::Int(i) if i.abs() > MAX_EXACT_INT_F64 => {
+                    // `unsigned_abs`, not `abs`: `i64::MIN.abs()` panics in a
+                    // debug build (and is UB-adjacent in release).
+                    Bound::Int(i) if i.unsigned_abs() > MAX_EXACT_INT_F64 as u64 => {
                         return Err(format!(
                             "KiviDB filter: exclusive `{key}` bound {i} on `{field}` exceeds \
                              2^53 and cannot be nudged to the adjacent f64 exactly. KiviDB does \
@@ -999,26 +1055,82 @@ mod kividb_filter {
         Ok(Node::Leaf(format!("@{field}:{{{value}}}")))
     }
 
-    /// Reject the two characters KiviDB cannot represent inside a TAG value.
+    /// The first character in `value` that a KiviDB TAG value cannot represent,
+    /// if any.
     ///
     /// Measured on v1.0.2 by storing `zz<c>zz` and querying it back for 32
-    /// candidate characters: every one round-trips EXCEPT
-    /// * `|` — always parsed as the TAG-OR separator, so the clause silently
-    ///   UNDER-matches (0 documents), and
+    /// candidate characters. FOUR fail to round-trip, and the probe has to be
+    /// run in every clause POSITION this builder emits, not just as a lone bare
+    /// clause — the first version of this check tested bare clauses only and
+    /// consequently missed the parens:
+    /// * `|` — always parsed as the TAG-OR separator, so a clause carrying it
+    ///   silently UNDER-matches (0 documents);
     /// * `@` — starts a new field reference, degrading the whole query to
-    ///   match-all, so the clause silently OVER-matches (every document).
+    ///   match-all, so the clause silently OVER-matches (every document);
+    /// * `(` and `)` — correct ONLY in a lone bare clause. Measured on a
+    ///   200-doc index (35 matching documents):
+    ///
+    ///   | value        | bare clause | inside a group |
+    ///   | ------------ | ----------- | -------------- |
+    ///   | `@t:{zz(zz}` | 1 (correct) | 0 (UNDER-match) |
+    ///   | `@t:{zz)zz}` | 1 (correct) | 35 (MATCH-ALL) |
+    ///
+    ///   Every non-trivial rendering puts a TAG clause inside a group — a sole
+    ///   `match_any`, a two-clause AND, a `match_any` AND'd with a leaf, any
+    ///   nested boolean — so a parenthesised TAG value is silently wrong almost
+    ///   everywhere. `build_text` already rejects `)` for the same reason.
     ///
     /// There is no escaping mechanism to fall back on: a backslash escape (the
-    /// RediSearch answer) matches nothing on KiviDB. Both cases would publish a
-    /// wrong recall, so this is a hard error.
+    /// RediSearch answer) matches nothing on KiviDB.
+    ///
+    /// # Why this is checked on the QUERY side only
+    ///
+    /// The obvious worry is the corpus: if a stored value carrying one of these
+    /// characters were mis-indexed, no query-side check could see it. Measured
+    /// on v1.0.2, it is not — the whole failure lives in the query parser and a
+    /// stored occurrence is INERT:
+    ///
+    /// * A stored `a|b` is **not** split on the separator. With documents
+    ///   `a|b`, `a` and `b` in one TAG field, `@t:{a}` returns exactly 1 (the
+    ///   `a` document), not 2. TAG values really are atomic on storage, so the
+    ///   feared over-match — a stored `a|b` answering an unrelated `@t:{a}` —
+    ///   does not happen. The same holds for a stored `@` (`@t:{c}` returns 1
+    ///   with `c` and `c@d` both indexed).
+    /// * Two identical corpora, one seeded with `Bag (Small)` / `x|y` / `p@q`
+    ///   and one entirely clean, return IDENTICAL counts for every clause shape
+    ///   this builder emits (bare leaf, ` | ` disjunction, parenthesised
+    ///   disjunct AND'd with a leaf, two parenthesised disjuncts).
+    ///
+    /// So a corpus value carrying one of these is simply unaddressable — the
+    /// only query that could match it is one this function rejects — and it
+    /// never perturbs any other query's result. Adding an upload-side check
+    /// would therefore buy no correctness and would hard-fail a dataset that
+    /// benchmarks correctly today. Scanned over the shipped h-and-m corpus and
+    /// its shipped queries (13 TAG-typed schema fields):
+    ///
+    /// | | `(` | `)` | `@` | `|` |
+    /// | --- | --- | --- | --- | --- |
+    /// | corpus field-values (105,100 docs) | 3,900 | 3,878 | 0 | 0 |
+    /// | distinct query filter values (586) | 0 | 0 | 0 | 0 |
+    ///
+    /// An upload-side check would abort h-and-m outright; the query-side check
+    /// it actually needs fires on nothing shipped.
+    pub fn tag_value_offender(value: &str) -> Option<char> {
+        value.chars().find(|c| matches!(c, '|' | '@' | '(' | ')'))
+    }
+
+    /// Reject a QUERY-side TAG value KiviDB cannot represent. See
+    /// [`tag_value_offender`] for the measurement and for the corpus-side twin.
     fn check_tag_value(field: &str, value: &str) -> Result<(), String> {
-        if let Some(c) = value.chars().find(|c| matches!(c, '|' | '@')) {
+        if let Some(c) = tag_value_offender(value) {
             return Err(format!(
                 "KiviDB filter: TAG value {value:?} for field `{field}` contains {c:?}, which \
                  KiviDB's FT.SEARCH cannot express — `|` is always read as the TAG-OR separator \
-                 (silent under-match) and `@` degrades the whole query to match-all (silent \
-                 over-match), and backslash escaping matches nothing. Refusing to emit a filter \
-                 that would report a wrong recall."
+                 (silent under-match), `@` degrades the whole query to match-all (silent \
+                 over-match), and `(`/`)` are parsed as grouping the moment the clause sits \
+                 inside a group, which every non-trivial filter does (`(` under-matches, `)` \
+                 degrades to match-all). Backslash escaping matches nothing on KiviDB. Refusing \
+                 to emit a filter that would report a wrong recall."
             ));
         }
         Ok(())
@@ -1043,7 +1155,7 @@ mod kividb_filter {
         use serde_json::json;
 
         fn q(v: Value) -> String {
-            parse_conditions(&v).unwrap().unwrap()
+            parse_conditions(&v).unwrap()
         }
 
         fn err(v: Value) -> String {
@@ -1051,10 +1163,38 @@ mod kividb_filter {
         }
 
         #[test]
-        fn no_conditions_yields_no_prefilter() {
-            assert_eq!(parse_conditions(&json!({})).unwrap(), None);
-            assert_eq!(parse_conditions(&json!(null)).unwrap(), None);
-            assert_eq!(parse_conditions(&json!({"and": []})).unwrap(), None);
+        fn no_conditions_yields_the_explicit_match_all_prefilter() {
+            // Not `Ok(None)` — see `parse_conditions`' doc comment on issue #219.
+            // The absence of a filter is expressed as the `*` prefilter, which is
+            // exactly what it means on the wire, so no caller can confuse it with
+            // a filter that silently parsed away.
+            assert_eq!(parse_conditions(&json!({})).unwrap(), MATCH_ALL);
+            assert_eq!(parse_conditions(&json!(null)).unwrap(), MATCH_ALL);
+            assert_eq!(parse_conditions(&json!({"and": []})).unwrap(), MATCH_ALL);
+        }
+
+        #[test]
+        fn the_tag_offender_set_is_exactly_pipe_at_and_the_two_parens() {
+            // Pins the shared predicate both the query side and the corpus side
+            // consult, so the two can never drift apart (the corpus side would
+            // otherwise store a value the query side would have rejected).
+            for (v, expected) in [
+                ("a|b", Some('|')),
+                ("a@b", Some('@')),
+                ("a(b", Some('(')),
+                ("a)b", Some(')')),
+                ("plain-value_1.2:3/4", None),
+            ] {
+                assert_eq!(tag_value_offender(v), expected, "{v}");
+            }
+            // Everything else was verified live to round-trip raw.
+            for c in "-_.:/\\+*?~^$#%&[]{}<>=!,;'\"` ".chars() {
+                assert_eq!(
+                    tag_value_offender(&format!("zz{c}zz")),
+                    None,
+                    "{c:?} must round-trip through a KiviDB TAG value"
+                );
+            }
         }
 
         #[test]
@@ -1201,6 +1341,33 @@ mod kividb_filter {
         }
 
         #[test]
+        fn malformed_entries_are_errors_never_silently_skipped() {
+            // redis.rs `continue`s past both of these. Skipping one conjunct of
+            // an `and` widens the prefilter, which is the silent drop this
+            // module exists to eliminate.
+            let e = err(json!({"and": [{"c": {"match": {"value": "red"}}}, "not-an-object"]}));
+            assert!(e.contains("must be an object"), "{e}");
+            let e = err(json!({"and": [{"c": "not-an-object"}]}));
+            assert!(e.contains("must be an object"), "{e}");
+        }
+
+        #[test]
+        fn extreme_integer_bounds_do_not_panic() {
+            // `i64::MIN.abs()` panics in a debug build, so the 2^53 guard uses
+            // `unsigned_abs`. Both extremes must surface as the inexpressible
+            // -bound error, not as an abort.
+            for v in [i64::MIN, i64::MAX] {
+                let e = err(json!({"and": [{"n": {"range": {"gt": v}}}]}));
+                assert!(e.contains("2^53"), "{v}: {e}");
+            }
+            // An in-range bound still works.
+            assert_eq!(
+                q(json!({"and": [{"n": {"range": {"gt": 5}}}]})),
+                "@n:[5.000000000000001 +inf]"
+            );
+        }
+
+        #[test]
         fn fulltext_single_term_is_emitted_bare() {
             assert_eq!(
                 q(json!({"and": [{"body": {"match": {"text": "quick"}}}]})),
@@ -1221,15 +1388,26 @@ mod kividb_filter {
         }
 
         #[test]
-        fn tag_values_with_pipe_or_at_are_hard_errors() {
-            // `|` under-matches, `@` over-matches — both silently, so neither
-            // may be emitted.
-            let e = err(json!({"and": [{"c": {"match": {"value": "a|b"}}}]}));
-            assert!(e.contains("'|'"), "{e}");
-            let e = err(json!({"and": [{"c": {"match": {"value": "a@b"}}}]}));
-            assert!(e.contains("'@'"), "{e}");
+        fn tag_values_with_pipe_at_or_parens_are_hard_errors() {
+            // `|` under-matches, `@` over-matches, and `(`/`)` are read as
+            // grouping the moment the clause sits inside a group (which every
+            // non-trivial rendering does) — all silently, so none may be
+            // emitted. The parens were missed by the first probe because it
+            // only tested a LONE BARE clause, the one position where they work.
+            for (v, needle) in [
+                ("a|b", "'|'"),
+                ("a@b", "'@'"),
+                ("a(b", "'('"),
+                ("a)b", "')'"),
+                ("Bag (Small)", "'('"),
+            ] {
+                let e = err(json!({"and": [{"c": {"match": {"value": v}}}]}));
+                assert!(e.contains(needle), "{v}: {e}");
+            }
             let e = err(json!({"and": [{"c": {"match": {"any": ["ok", "a|b"]}}}]}));
             assert!(e.contains("'|'"), "{e}");
+            let e = err(json!({"and": [{"c": {"match": {"any": ["ok", "a)b"]}}}]}));
+            assert!(e.contains("')'"), "{e}");
         }
 
         #[test]
@@ -1406,7 +1584,6 @@ fn upload_batch_internal(
     vectors: &[Vec<f32>],
     metadata: &[Option<MetadataItem>],
     datetime_fields: &std::collections::HashSet<String>,
-    indexed_tag_fields: &std::collections::HashSet<String>,
     key_prefix: &str,
 ) -> Result<(), String> {
     use vector_db_benchmark::readers::metadata::MetadataValue;
@@ -1435,6 +1612,11 @@ fn upload_batch_internal(
                         } else {
                             s.clone()
                         };
+                        // Stored verbatim, with NO corpus-side counterpart to
+                        // `kividb_filter::check_tag_value`. That asymmetry is
+                        // deliberate and measured — see `tag_value_offender`:
+                        // the `|`/`@`/`(`/`)` failure lives entirely in the
+                        // QUERY parser, and a stored occurrence is inert.
                         hset_cmd.arg(k.as_str()).arg(stored);
                     }
                     MetadataValue::Int(n) => {
@@ -1444,36 +1626,16 @@ fn upload_batch_internal(
                         hset_cmd.arg(k.as_str()).arg(f.to_string());
                     }
                     MetadataValue::Labels(labels) => {
-                        // A KiviDB TAG value is ATOMIC: it is never split on any
-                        // separator (`FT.CREATE` rejects the `SEPARATOR`
-                        // modifier outright, and `@f:{b}` was verified NOT to
-                        // match a stored `a;b;c`). So a multi-valued array
-                        // indexed as a TAG can only ever be matched as the whole
-                        // joined string — every `match_any` over it would return
-                        // zero documents and be reported as recall 0.0.
+                        // A DECLARED multi-valued field never reaches this
+                        // point: `validate_dataset_support` rejects the dataset
+                        // in `configure()`, before the payload is even read,
+                        // because a KiviDB TAG value is atomic and could only
+                        // match the whole joined string.
                         //
-                        // Following vertex.rs (which hard-errors on filters it
-                        // cannot express) rather than chroma.rs/milvus.rs (which
-                        // silently drop geo), this is a hard error — but only
-                        // when the field is actually DECLARED in the dataset
-                        // schema, i.e. only when we would otherwise be building
-                        // a filterable index that quietly cannot answer the
-                        // query. An undeclared labels field was never filterable
-                        // on any engine, so it is still stored (joined) and a
-                        // pure-KNN run over such a dataset keeps working.
-                        if labels.len() > 1 && indexed_tag_fields.contains(k) {
-                            return Err(format!(
-                                "KiviDB cannot index the multi-valued field `{k}` \
-                                 ({} values on doc id {}): KiviDB TAG values are atomic — they are \
-                                 never split on a separator — so `match_any` over `{k}` would \
-                                 match nothing and report recall 0.0 as if the corpus had no hit. \
-                                 Refusing to upload a silently unfilterable index. Drop `{k}` from \
-                                 the dataset schema to run KiviDB on this dataset without \
-                                 filtering it.",
-                                labels.len(),
-                                ids[i]
-                            ));
-                        }
+                        // An UNDECLARED labels field was never filterable on any
+                        // engine, so it is still stored joined — the HSET
+                        // succeeds and a pure-KNN run over such a dataset keeps
+                        // working, exactly as before.
                         hset_cmd.arg(k.as_str()).arg(labels.join(";"));
                     }
                     MetadataValue::Geo { lon, lat } => {
@@ -1489,6 +1651,73 @@ fn upload_batch_internal(
     }
 
     pipe.query::<()>(conn).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Reject — BEFORE anything is created, read or uploaded — the dataset schema
+/// shapes KiviDB cannot index faithfully.
+///
+/// Both rejections are decidable from `dataset.config.schema` alone, so they
+/// belong here and not deeper in the run. Doing them late is not merely slower,
+/// it is actively harmful:
+///
+/// * A geo condition can only be seen in `search()`, i.e. AFTER the whole corpus
+///   is uploaded (1M vectors for `random-geo-radius-100-angular-filters`) AND
+///   after `experiment.rs` has already written the upload result file. That
+///   orphan file then satisfies `--skip-if-exists`, so a later `--skip-upload`
+///   re-run skips the pair silently instead of reporting it. `engine.delete()`
+///   is also never reached on the error path, leaving the keyspace populated.
+/// * A multi-valued `labels` array can only be seen mid-`upload()`, i.e. after
+///   parsing a 3.6 GB payload file for `arxiv-titles-384-angular-filters`.
+///
+/// Failing in `configure()` makes both aborts instant and leaves nothing behind.
+///
+/// Exactly three shipped datasets are affected: the two
+/// `random-geo-radius-*-angular-filters` (geo) and
+/// `arxiv-titles-384-angular-filters` (multi-valued `labels`).
+fn validate_dataset_support(dataset: &Dataset) -> Result<(), String> {
+    let Some(schema) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) else {
+        return Ok(());
+    };
+    let dataset_name = &dataset.config.name;
+    for (field_name, field_type) in schema {
+        match field_type.as_str().unwrap_or("") {
+            "geo" => {
+                return Err(format!(
+                    "KiviDB cannot benchmark dataset `{dataset_name}`: its schema declares geo \
+                     field `{field_name}`, and KiviDB's index schema has no GEO field type at all \
+                     (its `FieldType` has no `Geo` variant, unlike Dragonfly, which has the type \
+                     but rejects this tool's `$param` geo bounds at the query parser). The field \
+                     can never be indexed, so a geo condition matches zero documents and the run \
+                     would publish recall 0.0 for a filter that was never applied. Per-run \
+                     remedies: drop this dataset from `--datasets` (the geo datasets are \
+                     `random-geo-radius-100-angular-filters` and \
+                     `random-geo-radius-2048-angular-filters`), or keep the sweep going past it \
+                     with `--exit-on-error false`. Do NOT edit the field out of \
+                     `datasets/datasets.json` — that file is shared, and qdrant, milvus, weaviate, \
+                     pgvector and elasticsearch all filter this field natively."
+                ));
+            }
+            // Only `keyword` reaches `create_index`'s TAG arm, which is where the
+            // atomic-TAG limitation below bites.
+            "keyword" if is_multivalued_keyword_field(field_name) => {
+                return Err(format!(
+                    "KiviDB cannot benchmark dataset `{dataset_name}`: its schema declares the \
+                     multi-valued keyword field `{field_name}`, and a KiviDB TAG value is ATOMIC \
+                     — `FT.CREATE` rejects the `SEPARATOR` modifier outright and `@{field_name}:\
+                     {{b}}` does not match a stored `a;b;c`. A `match_any` over `{field_name}` \
+                     could therefore only ever match the whole joined string, i.e. zero documents, \
+                     and the run would publish recall 0.0 for a filter that was never applied. \
+                     Per-run remedies: drop this dataset from `--datasets` and use its unfiltered \
+                     twin `arxiv-titles-384-angular-no-filters` for a pure-KNN KiviDB number, or \
+                     keep the sweep going past it with `--exit-on-error false`. Do NOT edit the \
+                     field out of `datasets/datasets.json` — that file is shared, and qdrant, \
+                     milvus, weaviate, pgvector and elasticsearch all filter this field natively."
+                ));
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
@@ -1755,6 +1984,12 @@ impl Engine for KividbEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // FIRST, before a connection is opened or an index dropped/created: a
+        // dataset whose schema KiviDB cannot index faithfully aborts here rather
+        // than after the corpus has been uploaded (geo) or parsed (labels). See
+        // `validate_dataset_support`.
+        validate_dataset_support(dataset)?;
+
         let mut conn = self.get_connection()?;
 
         println!(
@@ -1790,23 +2025,6 @@ impl Engine for KividbEngine {
                     .collect()
             })
             .unwrap_or_default();
-        // Schema fields declared as TAG by `create_index`. Only these can hit
-        // the atomic-TAG limitation on a multi-valued `labels` array — see the
-        // `MetadataValue::Labels` arm in `upload_batch_internal`.
-        let indexed_tag_fields: std::collections::HashSet<String> = dataset
-            .config
-            .schema
-            .as_ref()
-            .and_then(|s| s.as_object())
-            .map(|o| {
-                o.iter()
-                    .filter(|(_, t)| {
-                        matches!(t.as_str(), Some("keyword") | Some("uuid") | Some("bool"))
-                    })
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
         let read_time = read_start.elapsed().as_secs_f64();
 
         println!(
@@ -1824,21 +2042,9 @@ impl Engine for KividbEngine {
         let upload_start = Instant::now();
 
         if self.config.parallel <= 1 {
-            self.upload_sequential(
-                &ids,
-                &vectors,
-                &metadata,
-                &datetime_fields,
-                &indexed_tag_fields,
-            )?;
+            self.upload_sequential(&ids, &vectors, &metadata, &datetime_fields)?;
         } else {
-            self.upload_parallel(
-                &ids,
-                &vectors,
-                &metadata,
-                &datetime_fields,
-                &indexed_tag_fields,
-            )?;
+            self.upload_parallel(&ids, &vectors, &metadata, &datetime_fields)?;
         }
 
         let upload_time = upload_start.elapsed().as_secs_f64();
@@ -1887,6 +2093,10 @@ impl Engine for KividbEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // Repeated for the `--skip-upload` path, which reaches `search()`
+        // without ever calling `configure()`. Schema-only, so it costs nothing.
+        validate_dataset_support(dataset)?;
+
         // Index-existence guard: on the --skip-upload path a missing or
         // mismatched index would otherwise write a silent recall-0.0 result file.
         {
@@ -1914,11 +2124,14 @@ impl Engine for KividbEngine {
         // substitute `$param` placeholders inside a hybrid query's prefilter.
         // A condition KiviDB cannot express faithfully aborts the run here — a
         // dropped clause would publish a recall for a filter never applied.
-        let parsed_filters: Vec<Option<String>> = conditions
+        //
+        // The absent-condition case is split out HERE rather than folded into an
+        // `Option` return (issue #219) — see `kividb_filter::parse_conditions`.
+        let prefilters: Vec<String> = conditions
             .iter()
             .map(|c| match c.as_ref() {
                 Some(v) => kividb_filter::parse_conditions(v),
-                None => Ok(None),
+                None => Ok(kividb_filter::MATCH_ALL.to_string()),
             })
             .collect::<Result<Vec<_>, String>>()?;
 
@@ -1935,12 +2148,9 @@ impl Engine for KividbEngine {
         let encoded_queries: Vec<Vec<u8>> =
             queries.iter().map(|q| encode_query_vector(q)).collect();
         let algorithm = self.config.algorithm.clone();
-        let query_strs: Vec<String> = parsed_filters
+        let query_strs: Vec<String> = prefilters
             .iter()
-            .map(|f| {
-                let prefilter = f.as_deref().unwrap_or("*");
-                build_knn_query_str(&algorithm, prefilter)
-            })
+            .map(|prefilter| build_knn_query_str(&algorithm, prefilter))
             .collect();
         let index_name = self.config.index_name.clone();
 

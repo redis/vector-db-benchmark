@@ -11,7 +11,8 @@
 //! selectivity ladder) against filtered ground truth — see the `#205` block
 //! below. The two constructs KiviDB genuinely cannot express (geo, and
 //! multi-valued `labels`) are asserted to FAIL the run rather than report a
-//! recall.
+//! recall — and to fail in `configure()`, leaving neither a result file nor a
+//! populated keyspace behind.
 
 use std::fs;
 use std::path::PathBuf;
@@ -479,8 +480,34 @@ fn test_binary_kividb_selectivity_ladder() {
 // prefilter and publishes a recall for a filter that was never applied. These
 // two tests assert the run FAILS rather than producing a result file.
 
+/// Assert the aborted run left NO result file behind.
+///
+/// This is the point of rejecting in `configure()` rather than later. A geo
+/// dataset rejected in `search()` would abort only AFTER `experiment.rs` had
+/// already written the upload result file — an orphan that then satisfies
+/// `--skip-if-exists`, so a later `--skip-upload` re-run skips the pair silently
+/// instead of reporting it.
+fn assert_no_results_written(root: &std::path::Path) {
+    let dir = root.join("results");
+    let stragglers: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        stragglers.is_empty(),
+        "a rejected dataset must leave no result file behind (found {stragglers:?}) — an orphan \
+         upload file would make a later --skip-upload re-run silently skip the pair"
+    );
+}
+
 /// GEO: KiviDB's index schema has no GEO field type, so the field is never
-/// indexed and a geo clause would match nothing. The run must abort.
+/// indexed and a geo clause would match nothing. The run must abort — and abort
+/// in `configure()`, i.e. before the corpus is uploaded, since the whole
+/// rejection is decidable from the dataset schema.
 #[test]
 fn test_binary_kividb_geo_is_rejected_not_silently_dropped() {
     wait_for_kividb();
@@ -509,12 +536,21 @@ fn test_binary_kividb_geo_is_rejected_not_silently_dropped() {
         ),
         "kividb must REJECT a geo filter, not run it and report a recall"
     );
+    assert_no_results_written(&proj.root);
+    // Rejected in configure(), so nothing was ever written to the keyspace.
+    assert_eq!(
+        redis::cmd("DBSIZE").query::<i64>(&mut conn).unwrap_or(-1),
+        0,
+        "a geo dataset must be rejected BEFORE the corpus is uploaded"
+    );
 }
 
 /// Multi-valued `labels`: a KiviDB TAG value is atomic (never split on any
 /// separator), so a `match_any` over a labels array can only ever match the
-/// whole joined string — i.e. nothing. Upload must abort rather than build an
-/// index that silently answers every such query with zero documents.
+/// whole joined string — i.e. nothing. The run must abort rather than build an
+/// index that silently answers every such query with zero documents — and abort
+/// in `configure()`, before the payload file is parsed at all (3.6 GB for the
+/// shipped `arxiv-titles-384-angular-filters`).
 #[test]
 fn test_binary_kividb_multivalued_labels_is_rejected_not_silently_mis_encoded() {
     wait_for_kividb();
@@ -543,6 +579,12 @@ fn test_binary_kividb_multivalued_labels_is_rejected_not_silently_mis_encoded() 
             &[("KIVIDB_PORT", test_port().to_string().as_str())],
         ),
         "kividb must REJECT a multi-valued labels field, not index it as an atomic TAG"
+    );
+    assert_no_results_written(&proj.root);
+    assert_eq!(
+        redis::cmd("DBSIZE").query::<i64>(&mut conn).unwrap_or(-1),
+        0,
+        "a multi-valued labels dataset must be rejected BEFORE the corpus is uploaded"
     );
 }
 
