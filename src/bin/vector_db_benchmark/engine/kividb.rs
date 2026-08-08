@@ -592,7 +592,7 @@ impl KividbEngine {
 /// recall against brute-force filtered ground truth over 2000 docs is 1.000 for
 /// keyword / range / AND / OR / nested filters all the way down to 2%
 /// selectivity, so the filtered numbers this engine reports are meaningful.
-mod kividb_filter {
+pub(crate) mod kividb_filter {
     use serde_json::{Map, Value};
     use vector_db_benchmark::parsers::datetime_to_epoch_secs;
 
@@ -2127,13 +2127,10 @@ impl Engine for KividbEngine {
         //
         // The absent-condition case is split out HERE rather than folded into an
         // `Option` return (issue #219) — see `kividb_filter::parse_conditions`.
-        let prefilters: Vec<String> = conditions
-            .iter()
-            .map(|c| match c.as_ref() {
-                Some(v) => kividb_filter::parse_conditions(v),
-                None => Ok(kividb_filter::MATCH_ALL.to_string()),
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let prefilters: Vec<String> = conditions.resolve_all_total(
+            || kividb_filter::MATCH_ALL.to_string(),
+            kividb_filter::parse_conditions,
+        )?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {

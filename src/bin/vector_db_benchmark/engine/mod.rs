@@ -9,6 +9,8 @@
 mod chroma;
 mod dragonfly;
 mod elasticsearch;
+#[cfg(test)]
+mod filter_guard;
 pub mod index_naming;
 mod kividb;
 mod milvus;

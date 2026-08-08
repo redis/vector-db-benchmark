@@ -14,6 +14,7 @@ mod latency_digest;
 mod metrics;
 mod plot;
 mod proc_cpu;
+mod query_filter;
 mod summary;
 
 use clap::Parser;

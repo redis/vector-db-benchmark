@@ -35,6 +35,7 @@ use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
+use crate::query_filter::QueryFilter;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, doc_key_to_id, doc_key_to_id_opt};
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 
@@ -504,15 +505,13 @@ impl ValkeyEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (_queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<ParsedFilter>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+            conditions.resolve_all("Valkey", parse_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
 
         let runnable_indices: Vec<usize> = (0..parsed_filters.len())
-            .filter(|&i| parsed_filters[i].is_some())
+            .filter(|&i| parsed_filters[i].is_filtered())
             .collect();
 
         if runnable_indices.is_empty() {
@@ -864,7 +863,7 @@ fn parse_used_memory(info: &str) -> i64 {
 // filters still use parameterised PARAMS.
 
 #[derive(Debug, Clone)]
-enum FilterParamValue {
+pub(crate) enum FilterParamValue {
     Int(i64),
     Float(f64),
 }
@@ -883,7 +882,7 @@ fn map_distance_metric(distance: &str) -> &'static str {
     }
 }
 
-fn parse_conditions(conditions: &serde_json::Value) -> Option<ParsedFilter> {
+pub(crate) fn parse_conditions(conditions: &serde_json::Value) -> Option<ParsedFilter> {
     let obj = conditions.as_object()?;
     if obj.is_empty() {
         return None;
@@ -1779,10 +1778,8 @@ impl Engine for ValkeyEngine {
             return Err("dataset contains no search queries".to_string());
         }
 
-        let parsed_filters: Vec<Option<ParsedFilter>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+            conditions.resolve_all("Valkey", parse_conditions)?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {
@@ -2058,10 +2055,8 @@ impl Engine for ValkeyEngine {
         println!("\tReading queries from {}...", query_path.display());
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<Option<ParsedFilter>> = conditions
-            .iter()
-            .map(|c| c.as_ref().and_then(parse_conditions))
-            .collect();
+        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+            conditions.resolve_all("Valkey", parse_conditions)?;
 
         // Read vectors for updates
         let normalize = dataset.needs_normalization();

@@ -43,6 +43,7 @@ use crate::engine::{
     attach_open_loop_metrics, closed_loop_duration, zero_search_results, Engine, OpenLoopPlan,
     SearchResults, UpdateSearchRatio, UploadStats,
 };
+use crate::query_filter::QueryFilter;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
@@ -223,7 +224,7 @@ fn metadata_to_filter(meta: &MetadataItem, schema: &HashMap<String, String>) -> 
 /// express is a hard error (per the engine's "no silent partial filter" policy):
 /// cross-field `or`, nested boolean, numeric `match_any` (an IN-list can't be a
 /// single numeric restriction), and geo.
-fn parse_vertex_filter(
+pub(crate) fn parse_vertex_filter(
     conditions: &serde_json::Value,
     schema: &HashMap<String, String>,
 ) -> Result<VertexFilter, String> {
@@ -1768,14 +1769,13 @@ impl Engine for VertexEngine {
         // partial filter (which would inflate recall against filtered ground
         // truth).
         let schema = schema_type_map(dataset);
-        let parsed_filters: Vec<Option<VertexFilter>> = conditions
-            .iter()
-            .map(|c| {
-                c.as_ref()
-                    .map(|v| parse_vertex_filter(v, &schema))
-                    .transpose()
-            })
-            .collect::<Result<_, _>>()?;
+        let parsed_filters: Vec<QueryFilter<VertexFilter>> =
+            conditions.try_resolve_all("Vertex AI", |v| {
+                let filter = parse_vertex_filter(v, &schema)?;
+                // A declared filter that lowers to zero restrictions would be
+                // sent as an unrestricted query — the #219 drop, one level down.
+                Ok((!filter.is_empty()).then_some(filter))
+            })?;
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let open_loop = OpenLoopPlan::from_params(params)?;
@@ -2158,14 +2158,13 @@ impl Engine for VertexEngine {
         if queries.is_empty() {
             return Err("dataset contains no search queries".to_string());
         }
-        let parsed_filters: Vec<Option<VertexFilter>> = conditions
-            .iter()
-            .map(|c| {
-                c.as_ref()
-                    .map(|v| parse_vertex_filter(v, &schema))
-                    .transpose()
-            })
-            .collect::<Result<_, _>>()?;
+        let parsed_filters: Vec<QueryFilter<VertexFilter>> =
+            conditions.try_resolve_all("Vertex AI", |v| {
+                let filter = parse_vertex_filter(v, &schema)?;
+                // A declared filter that lowers to zero restrictions would be
+                // sent as an unrestricted query — the #219 drop, one level down.
+                Ok((!filter.is_empty()).then_some(filter))
+            })?;
 
         // Vectors + metadata for the update half (deterministic shuffled order,
         // so re-upserts hit the same datapoints run-to-run).
