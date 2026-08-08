@@ -3292,11 +3292,14 @@ fn test_binary_redis_skip_upload_without_keep_data_preserves_corpus() {
 /// succeed and record `verified`), then the guard with the server corpus INTACT
 /// (proving it fires on unverifiability itself, not on missing data), then with
 /// the server corpus EMPTY (the published-recall-0.0 case from the issue), then
-/// the `--allow-partial-corpus` waiver.
+/// the `--allow-partial-corpus` waiver, then the second `None` path: a corpus
+/// file whose header cannot be READ. That last phase is the one that covers the
+/// swallowed-`Err` half of #290 — `reuse_expected_rows` already returned `Err`
+/// for it on master; it was the caller that turned that into "cannot verify".
 ///
-/// RED on unfixed master `cff7e3a`: both guarded runs exit 0 and write a search
-/// result file; the empty-corpus one publishes `mean_recall` 0.0 with
-/// `corpus_reuse.status` `"unverified"`.
+/// RED on unfixed master `cff7e3a`: every guarded run here exits 0 and writes a
+/// search result file; the empty-corpus one publishes `mean_recall` 0.0 with
+/// `corpus_reuse.status` `"unverified"` and `failed_queries` 0.
 #[test]
 fn test_binary_redis_skip_upload_unverifiable_corpus_is_fatal() {
     wait_for_redis();
@@ -3481,8 +3484,8 @@ fn test_binary_redis_skip_upload_unverifiable_corpus_is_fatal() {
         "the reuse check must never modify the corpus, waived or not"
     );
 
-    // Illustrative only, and deliberately last: this is the number the default
-    // path used to publish with exit 0. It is not the detector.
+    // Illustrative only: this is the number the default path used to publish
+    // with exit 0. It is NOT the detector — see the doc comment.
     assert_eq!(
         common::read_recall(&proj.root, "cfg290unver"),
         0.0,
@@ -3492,6 +3495,30 @@ fn test_binary_redis_skip_upload_unverifiable_corpus_is_fatal() {
         common::read_results_obj(&proj.root, "cfg290unver")["failed_queries"],
         0,
         "and it scores it with no failed queries, which is why nothing else catches it"
+    );
+
+    // (d) The OTHER #290 path, and the widest one: the corpus file IS present
+    // but its header cannot be read. `reuse_expected_rows` already returned Err
+    // here before this fix — it was the CALL SITE that degraded that Err to
+    // `None`, leaving the guard inert for the run. So this phase, not the unit
+    // tests, is what covers the swallowed-Err half of the issue.
+    delete_search_result_files(&results_dir);
+    fs::write(&vectors_npy, b"not an npy file at all").expect("write junk vectors.npy");
+    let junk = run(&[]);
+    let junk_out = combined(&junk);
+    assert!(
+        !junk.status.success(),
+        "a failed corpus measurement must abort the run, not be swallowed into \
+         'cannot verify' (issue #290).\n{junk_out}"
+    );
+    assert!(
+        junk_out.contains("measuring the corpus on disk failed"),
+        "the error must say the measurement FAILED, not that the layout has no \
+         count — they are different conditions.\n{junk_out}"
+    );
+    assert!(
+        !wrote_search_result(),
+        "the rejected run must not publish a result file after a failed measurement"
     );
 
     flush_db(&mut conn);

@@ -2553,10 +2553,16 @@ mod reuse_precondition_tests {
         );
     }
 
-    // The other #290 path: `measured_vector_count()` returning Err. Before, the
-    // call site swallowed it to None and the guard went inert for that run.
+    // The other #290 path: `measured_vector_count()` returning Err.
+    //
+    // Scope, stated so it is not overclaimed: this function ALREADY returned Err
+    // here before the fix — the swallow was in `check_corpus_reuse_precondition`,
+    // which turned that Err into `None`. So all this test pins is that the two
+    // failure conditions now read differently to the operator. The end-to-end
+    // coverage for the swallow itself is phase (d) of
+    // `test_binary_redis_skip_upload_unverifiable_corpus_is_fatal`.
     #[test]
-    fn a_failed_measurement_propagates_instead_of_being_swallowed() {
+    fn a_failed_measurement_reads_as_a_failure_not_as_a_missing_count() {
         let dir = tempfile::tempdir().unwrap();
         // A vectors.npy that exists but is not a valid npy file: the header read
         // fails, which is the transient-read-failure shape of this bug.
