@@ -107,3 +107,17 @@ path = "fuzz_targets/npy_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "gt_reader"
+path = "fuzz_targets/gt_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gt_roundtrip"
+path = "fuzz_targets/gt_roundtrip.rs"
+test = false
+doc = false
+bench = false

@@ -88,6 +88,53 @@ fn brute_force_neighbors_l2(query: &[f32], vectors: &[Vec<f32>], top: usize) -> 
     dists.iter().take(top).map(|(id, _)| *id).collect()
 }
 
+/// Like `common::run_binary`, but hands back the combined stdout+stderr so a
+/// test asserting a FAILURE can pin *why* it failed. `!run_binary(...)` on its
+/// own is satisfied by a downed container or a broken fixture just as happily as
+/// by the rejection under test, and `run_binary` prints its diagnostics only on
+/// the success path — so a regression there would be silent.
+fn run_binary_capture(root: &std::path::Path, engine: &str, dataset: &str) -> (bool, String) {
+    let mut cmd = std::process::Command::new(common::binary_path());
+    cmd.args([
+        "--engines",
+        engine,
+        "--datasets",
+        dataset,
+        "--host",
+        "localhost",
+        "--skip-if-exists",
+        "false",
+    ])
+    .current_dir(root)
+    .env("QDRANT_GRPC_PORT", QDRANT_GRPC_PORT.to_string())
+    .env("QDRANT_REST_PORT", QDRANT_REST_PORT.to_string());
+    let out = cmd.output().expect("run vector-db-benchmark");
+    let combined = format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), combined)
+}
+
+/// A rejected filter must leave NO benchmark number behind — that is the whole
+/// point of failing rather than degrading into an unfiltered run.
+fn assert_no_search_result(root: &std::path::Path, engine: &str) {
+    let dir = root.join("results");
+    let found: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(&format!("{}-", engine)) && n.contains("-search-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        found.is_empty(),
+        "a rejected filter must not publish a recall number, but found {found:?}"
+    );
+}
+
 fn create_grpc_client() -> (tokio::runtime::Runtime, qdrant_client::Qdrant) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     // `from_url(...).build()` is synchronous and returns a Result, not a future.
@@ -692,6 +739,349 @@ fn test_binary_qdrant_match_any() {
     assert!(recall >= 0.9, "qdrant match_any recall {:.3} < 0.9", recall);
 }
 
+/// #222, server-side premise: an EMPTY `Filter` is MATCH-ALL, not "no matches"
+/// and not an error. This is why `parse_qdrant_conditions` must return `None`
+/// rather than `Some(Filter{must:[],should:[]})` when every leaf of an `and`
+/// group drops — sending that filter runs the query completely unconstrained
+/// while the code believes it filtered. Live-asserted so the premise cannot
+/// silently change under a Qdrant upgrade.
+#[test]
+fn test_qdrant_empty_filter_is_match_all() {
+    wait_for_qdrant();
+    delete_collection();
+
+    let (rt, client) = create_grpc_client();
+    use qdrant_client::qdrant::{
+        vectors_config::Config, Condition, CreateCollectionBuilder, Distance, FieldType, Filter,
+        PointStruct, SearchPointsBuilder, VectorParamsBuilder, VectorsConfig,
+    };
+
+    rt.block_on(
+        client.create_collection(CreateCollectionBuilder::new(COLLECTION).vectors_config(
+            VectorsConfig {
+                config: Some(Config::Params(
+                    VectorParamsBuilder::new(4, Distance::Euclid).build(),
+                )),
+            },
+        )),
+    )
+    .unwrap();
+    rt.block_on(client.create_field_index(
+        qdrant_client::qdrant::CreateFieldIndexCollectionBuilder::new(
+            COLLECTION,
+            "category",
+            FieldType::Keyword,
+        ),
+    ))
+    .unwrap();
+
+    let (ids, vectors) = generate_test_vectors(20, 4);
+    let points: Vec<PointStruct> = ids
+        .iter()
+        .zip(vectors.iter())
+        .map(|(id, vec)| {
+            let mut payload = qdrant_client::Payload::new();
+            payload.insert("category", if *id % 2 == 0 { "A" } else { "B" });
+            PointStruct::new(*id as u64, vec.clone(), payload)
+        })
+        .collect();
+    rt.block_on(client.upsert_points(
+        qdrant_client::qdrant::UpsertPointsBuilder::new(COLLECTION, points).wait(true),
+    ))
+    .unwrap();
+
+    let hits = |filter: Option<Filter>| -> usize {
+        let mut b = SearchPointsBuilder::new(COLLECTION, vectors[0].clone(), 100);
+        if let Some(f) = filter {
+            b = b.filter(f);
+        }
+        rt.block_on(client.search_points(b)).unwrap().result.len()
+    };
+
+    let unfiltered = hits(None);
+    let empty_filter = hits(Some(Filter::default()));
+    let real_filter = hits(Some(Filter {
+        must: vec![Condition::matches("category", "A".to_string())],
+        ..Default::default()
+    }));
+
+    assert_eq!(unfiltered, 20, "fixture should hold 20 points");
+    assert_eq!(
+        empty_filter, unfiltered,
+        "an empty Filter must be understood as MATCH-ALL ({} vs {}) — the whole \
+         point of the #222 guard",
+        empty_filter, unfiltered
+    );
+    assert_eq!(real_filter, 10, "a real filter must actually constrain");
+
+    delete_collection();
+}
+
+/// #222 defect 2, server-side premise + UTC correctness of the datetime arm.
+///
+/// Two things the unit tests cannot establish, both live:
+///
+/// 1. **An all-`None` `DatetimeRange` is MATCH-ALL over gRPC.** The decision to
+///    hard-error on an unparseable datetime bound rests entirely on this: if a
+///    vacuous range were an error or matched nothing, dropping the bound would
+///    be harmless. It is not — the request goes out looking filtered and
+///    returns the whole collection.
+/// 2. **A client-converted `Timestamp` selects exactly what the server selects
+///    for the equivalent datetime string.** `parse_rfc3339_timestamp` maps the
+///    RFC-3339, naive, date-only and epoch-seconds spellings onto the SAME
+///    `prost_types::Timestamp` (pinned by the unit tests), and `DatetimeRange`'s
+///    bounds are `Timestamp`, not strings — so this asserts the whole family
+///    lands on the same documents as Qdrant's own string parsing, i.e. the
+///    fallback is not a type substitution onto some other index.
+#[test]
+fn test_qdrant_datetime_range_is_utc_correct_and_vacuous_range_is_match_all() {
+    wait_for_qdrant();
+    delete_collection();
+
+    let (rt, client) = create_grpc_client();
+    use qdrant_client::qdrant::{
+        vectors_config::Config, Condition, CreateCollectionBuilder, DatetimeRange, Distance,
+        FieldType, Filter, PointStruct, SearchPointsBuilder, Timestamp, VectorParamsBuilder,
+        VectorsConfig,
+    };
+
+    rt.block_on(
+        client.create_collection(CreateCollectionBuilder::new(COLLECTION).vectors_config(
+            VectorsConfig {
+                config: Some(Config::Params(
+                    VectorParamsBuilder::new(4, Distance::Euclid).build(),
+                )),
+            },
+        )),
+    )
+    .unwrap();
+    rt.block_on(client.create_field_index(
+        qdrant_client::qdrant::CreateFieldIndexCollectionBuilder::new(
+            COLLECTION,
+            "ts",
+            FieldType::Datetime,
+        ),
+    ))
+    .unwrap();
+
+    // 8 points, one per day: id N carries ts = 2023-01-0N T00:00:00Z.
+    let (ids, vectors) = generate_test_vectors(8, 4);
+    let points: Vec<PointStruct> = ids
+        .iter()
+        .zip(vectors.iter())
+        .map(|(id, vec)| {
+            let mut payload = qdrant_client::Payload::new();
+            payload.insert("ts", format!("2023-01-{:02}T00:00:00Z", id + 1));
+            PointStruct::new(*id as u64, vec.clone(), payload)
+        })
+        .collect();
+    rt.block_on(client.upsert_points(
+        qdrant_client::qdrant::UpsertPointsBuilder::new(COLLECTION, points).wait(true),
+    ))
+    .unwrap();
+
+    let hit_ids = |filter: Option<Filter>| -> Vec<u64> {
+        let mut b = SearchPointsBuilder::new(COLLECTION, vectors[0].clone(), 100);
+        if let Some(f) = filter {
+            b = b.filter(f);
+        }
+        let mut out: Vec<u64> = rt
+            .block_on(client.search_points(b))
+            .unwrap()
+            .result
+            .iter()
+            .filter_map(|p| match p.id.as_ref()?.point_id_options.as_ref()? {
+                qdrant_client::qdrant::point_id::PointIdOptions::Num(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    };
+
+    // (1) A DatetimeRange with every bound None is MATCH-ALL — byte-identical to
+    //     an empty filter and to sending no filter at all.
+    let vacuous = hit_ids(Some(Filter {
+        must: vec![Condition::datetime_range("ts", DatetimeRange::default())],
+        ..Default::default()
+    }));
+    let unfiltered = hit_ids(None);
+    assert_eq!(unfiltered.len(), 8, "fixture should hold 8 points");
+    assert_eq!(
+        vacuous, unfiltered,
+        "an all-None DatetimeRange must be MATCH-ALL — this is why an unparseable \
+         bound has to fail the run instead of being dropped"
+    );
+
+    // (2) 2023-01-05T00:00:00Z as a client-side Timestamp — the value
+    //     `parse_rfc3339_timestamp` produces for the RFC-3339, naive
+    //     ("2023-01-05 00:00:00"), date-only ("2023-01-05") and epoch-seconds
+    //     ("1672876800") spellings alike.
+    const JAN5_2023_UTC: i64 = 1_672_876_800;
+    let via_timestamp = hit_ids(Some(Filter {
+        must: vec![Condition::datetime_range(
+            "ts",
+            DatetimeRange {
+                gte: Some(Timestamp {
+                    seconds: JAN5_2023_UTC,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            },
+        )],
+        ..Default::default()
+    }));
+    assert_eq!(
+        via_timestamp,
+        vec![4, 5, 6, 7],
+        "gte 2023-01-05T00:00:00Z must select exactly the 2023-01-05..08 points \
+         (UTC, no off-by-one-day and no timezone drift)"
+    );
+
+    // …and the server's OWN parsing of the equivalent string picks the same set,
+    // so the client-side conversion is not a substitution onto another index.
+    let resp: serde_json::Value = rest_client()
+        .post(format!(
+            "{}/collections/{}/points/scroll",
+            rest_url(),
+            COLLECTION
+        ))
+        .json(&serde_json::json!({
+            "limit": 100,
+            "filter": {"must": [{"key": "ts", "range": {"gte": "2023-01-05T00:00:00Z"}}]}
+        }))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let mut via_string: Vec<u64> = resp["result"]["points"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexpected scroll response: {resp}"))
+        .iter()
+        .map(|p| p["id"].as_u64().unwrap())
+        .collect();
+    via_string.sort_unstable();
+    assert_eq!(
+        via_string, via_timestamp,
+        "server-parsed datetime string and client-converted Timestamp must select \
+         the same documents"
+    );
+
+    delete_collection();
+}
+
+/// #222 defect 3, end-to-end: a float `match.any` used to have its members
+/// deleted by `filter_map(as_str)`, leaving an EMPTY `MatchAny` — which Qdrant
+/// happily evaluates to zero hits, so the run reported **recall 0 as a
+/// benchmark result**. It must now fail the run instead. Built by rewriting the
+/// conditions of the standard match_any fixture, so everything else about the
+/// project is a known-good configuration.
+#[test]
+fn test_binary_qdrant_float_match_any_fails_instead_of_reporting_zero_recall() {
+    wait_for_qdrant();
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "qdrant-ma-float", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1, "search_params": {"hnsw_ef": 128}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "match-any-float-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+
+    // Rewrite every query's condition to a FLOAT match_any (unrepresentable in
+    // Qdrant's Match, which has keyword/integer variants only).
+    let tests_path = proj
+        .root
+        .join("datasets")
+        .join("match-any-float-test")
+        .join("tests.jsonl");
+    let rewritten: Vec<String> = std::fs::read_to_string(&tests_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["conditions"] =
+                serde_json::json!({"and": [{"size": {"match": {"any": [1.5, 2.5]}}}]});
+            v.to_string()
+        })
+        .collect();
+    std::fs::write(&tests_path, rewritten.join("\n")).unwrap();
+
+    let (ok, output) = run_binary_capture(&proj.root, "qdrant-ma-float", "match-any-float-test");
+    assert!(
+        !ok,
+        "a float match_any must FAIL the run, not report a recall number"
+    );
+    // `!ok` alone would also pass if the container were down or the fixture were
+    // broken, so pin WHY it failed and that no number reached disk.
+    assert!(
+        output.contains("size"),
+        "the failure must name the offending field, not fail for some unrelated \
+         reason; got:\n{output}"
+    );
+    assert_no_search_result(&proj.root, "qdrant-ma-float");
+}
+
+/// #222 defect 1, end-to-end — the one the original fix did NOT close.
+///
+/// Measured on the first revision of this branch, with every leaf rewritten to
+/// drop: `run_succeeded = true, reported_mean_recall = Some(0.46)`. Returning
+/// `None` for a filter that evaporated is indistinguishable from "this query has
+/// no filter", so the run went out unconstrained and published 0.46 as a Qdrant
+/// recall against FILTERED ground truth. Only failing the run separates the two.
+#[test]
+fn test_binary_qdrant_unbuildable_filter_fails_instead_of_publishing_a_recall() {
+    wait_for_qdrant();
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "qdrant-drop", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1, "search_params": {"hnsw_ef": 128}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "drop-filter-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+
+    let tests_path = proj
+        .root
+        .join("datasets")
+        .join("drop-filter-test")
+        .join("tests.jsonl");
+    let rewritten: Vec<String> = std::fs::read_to_string(&tests_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            // Every leaf un-buildable: pre-fix an EMPTY Filter (match-all), then
+            // `None` (also match-all). The ground truth stays filtered either way.
+            v["conditions"] = serde_json::json!({"and": [{"size": {"nosuchop": {"value": 1}}}]});
+            v.to_string()
+        })
+        .collect();
+    std::fs::write(&tests_path, rewritten.join("\n")).unwrap();
+
+    let (ok, output) = run_binary_capture(&proj.root, "qdrant-drop", "drop-filter-test");
+    assert!(
+        !ok,
+        "a filter that builds no condition must FAIL the run — running it \
+         unfiltered against filtered ground truth publishes a plausible wrong number"
+    );
+    assert!(
+        output.contains("nosuchop"),
+        "the failure must name the offending operator; got:\n{output}"
+    );
+    assert_no_search_result(&proj.root, "qdrant-drop");
+}
+
 /// Geo-radius filter end-to-end (previously untested for qdrant). `geo` -> a Geo
 /// payload index + `Condition::geo_radius`; recall vs haversine ground truth.
 #[test]
@@ -1281,5 +1671,307 @@ fn test_generate_dataset_binary_sparse_end_to_end() {
     assert!(
         precision >= 0.9,
         "generated sparse precision {precision:.3} < 0.9"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Collection-parameter passthrough (upstream parity): the on-disk / tenant
+// knobs used by upstream's on-disk experiments must reach the SERVER, not just
+// parse.
+//
+// These are exactly the knobs that fail silently: a dropped
+// `hnsw_config.on_disk` still produces a working collection with plausible
+// recall — it just benchmarks an in-memory graph while the config, the result
+// file and the run name all say "on disk". Behavioural teeth (as used for
+// quantization) cannot separate those two, so this test READS THE COLLECTION
+// CONFIG BACK from a live Qdrant instead.
+//
+// To make read-back possible the CLI is run with `--keep-data` (which skips the
+// usual teardown) into its own collection name.
+// ---------------------------------------------------------------------------
+
+/// Like `run_qdrant_binary`, but keeps the collection after the run and points
+/// the engine at `collection` so the caller can inspect the result.
+fn run_qdrant_binary_keep_collection(
+    root: &std::path::Path,
+    engine: &str,
+    dataset: &str,
+    collection: &str,
+) -> bool {
+    let out = std::process::Command::new(binary_path())
+        .args([
+            "--engines",
+            engine,
+            "--datasets",
+            dataset,
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--keep-data",
+        ])
+        .env("QDRANT_GRPC_PORT", QDRANT_GRPC_PORT.to_string())
+        .env("QDRANT_REST_PORT", QDRANT_REST_PORT.to_string())
+        .env("QDRANT_COLLECTION_NAME", collection)
+        .current_dir(root)
+        .output()
+        .expect("run vector-db-benchmark");
+    if !out.status.success() {
+        eprintln!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    out.status.success()
+}
+
+#[test]
+fn test_binary_qdrant_on_disk_and_tenant_collection_params() {
+    wait_for_qdrant();
+
+    let collection = "bench_on_disk_params";
+    let engine = "qdrant-on-disk-params";
+    let dataset = "tenant-on-disk";
+
+    // `search_params` is spelled `config` here on purpose: that is upstream's
+    // spelling, so this proves a config written that way runs end-to-end and
+    // still returns correct results. (It does NOT prove `hnsw_ef` reached the
+    // server — that only affects search quality/latency; the recall floor below
+    // is what would catch a search broken by this collection layout.)
+    let configs = serde_json::json!([{
+        "name": engine,
+        "engine": "qdrant",
+        "connection_params": {"timeout": 120},
+        "collection_params": {
+            "timeout": 120,
+            "vectors_config": { "on_disk": true, "datatype": "float16" },
+            // m: 0 + payload_m: build graphs per tenant value only — the
+            // multi-tenancy layout upstream benchmarks.
+            "hnsw_config": { "m": 0, "ef_construct": 64, "on_disk": true, "payload_m": 16,
+                             "inline_storage": true },
+            // DELIBERATELY `false`. Qdrant v1.18.2 DEFAULTS on_disk_payload to
+            // true (verified live), so asserting `true` here would pass even with
+            // the forwarding deleted — a vacuous assertion. Only a real
+            // forwarding path can produce `false`.
+            "on_disk_payload": false,
+            "payload_index_params": { "tenant": { "is_tenant": true, "on_disk": true } }
+        },
+        // with_payload exercises the search knob added alongside these collection
+        // params; recall must stay correct with payloads coming back.
+        "search_params": [{ "parallel": 1, "config": { "hnsw_ef": 64, "with_payload": true } }],
+        "upload_params": {"parallel": 1, "batch_size": 128}
+    }]);
+    let proj = common::write_tenant_project(dataset, &serde_json::to_string(&configs).unwrap(), 16);
+
+    let ok = run_qdrant_binary_keep_collection(&proj.root, engine, dataset, collection);
+
+    // Read the collection config back BEFORE asserting, so the collection is
+    // always cleaned up even when an assertion fails below.
+    let (rt, client) = create_grpc_client();
+    let info = if ok {
+        rt.block_on(client.collection_info(collection)).ok()
+    } else {
+        None
+    };
+    let _ = rt.block_on(client.delete_collection(collection));
+
+    assert!(ok, "{engine} run failed");
+    let info = info.expect("collection_info").result.expect("info result");
+
+    let config = info.config.expect("collection config");
+    let params = config.params.expect("collection params");
+    assert!(
+        !params.on_disk_payload,
+        "on_disk_payload: false was not applied — the collection sits on Qdrant's \
+         own default (true), so the configured value never reached the server"
+    );
+
+    let hnsw = config.hnsw_config.expect("hnsw config");
+    assert_eq!(hnsw.m, Some(0), "hnsw_config.m: 0 did not reach the server");
+    assert_eq!(hnsw.ef_construct, Some(64));
+    assert_eq!(
+        hnsw.inline_storage,
+        Some(true),
+        "hnsw_config.inline_storage did not reach the server"
+    );
+    assert_eq!(
+        hnsw.on_disk,
+        Some(true),
+        "hnsw_config.on_disk did not reach the server — the run would have \
+         benchmarked an IN-MEMORY graph while claiming to be on disk"
+    );
+    assert_eq!(
+        hnsw.payload_m,
+        Some(16),
+        "hnsw_config.payload_m did not reach the server"
+    );
+
+    // vectors_config: on_disk + float16 storage.
+    let vectors = params.vectors_config.expect("vectors config").config;
+    match vectors {
+        Some(qdrant_client::qdrant::vectors_config::Config::Params(vp)) => {
+            assert_eq!(vp.on_disk, Some(true), "vectors_config.on_disk not applied");
+            assert_eq!(
+                vp.datatype,
+                Some(qdrant_client::qdrant::Datatype::Float16 as i32),
+                "vectors_config.datatype float16 not applied — storage would be \
+                 full float32"
+            );
+        }
+        other => panic!("expected single dense vector params, got {other:?}"),
+    }
+
+    // payload_index_params: the keyword index on `tenant` must be a TENANT index
+    // kept on disk.
+    let schema = info
+        .payload_schema
+        .get("tenant")
+        .expect("tenant payload index should exist");
+    match schema.params.as_ref().and_then(|p| p.index_params.as_ref()) {
+        Some(qdrant_client::qdrant::payload_index_params::IndexParams::KeywordIndexParams(k)) => {
+            assert_eq!(
+                k.is_tenant,
+                Some(true),
+                "payload_index_params.is_tenant not applied — the index would not \
+                 be tenant-grouped"
+            );
+            assert_eq!(k.on_disk, Some(true), "payload index on_disk not applied");
+        }
+        other => panic!("expected keyword index params on `tenant`, got {other:?}"),
+    }
+
+    // The layout above is the one most likely to break SEARCH rather than
+    // creation: `m: 0` means there is no global HNSW graph, so results can only
+    // come back via the per-tenant payload graphs, and float16 storage is lossy.
+    // Asserting the config alone would pass at recall 0. Ground truth here is
+    // tenant-local and exact (write_tenant_project), so this also catches a
+    // dropped tenant filter.
+    let recall = common::read_recall(&proj.root, engine);
+    println!("qdrant tenant/on-disk recall={recall:.3}");
+    assert!(
+        recall > 0.9,
+        "recall {recall:.3} <= 0.9 — the on-disk/tenant collection built, but search \
+         over it is broken (m:0 + payload_m graphs, float16 storage, or the tenant \
+         filter)"
+    );
+}
+
+/// REGRESSION: an OMITTED `vectors_config.on_disk` must NOT be sent as an
+/// explicit `false`.
+///
+/// Behavioural assertions cannot tell an mmap'd vector storage from an in-memory
+/// one — which is precisely why this survived — so this reads the collection
+/// config BACK from a live Qdrant and asserts the field is absent.
+///
+/// Why absence matters (verified on qdrant v1.18.2 at `memmap_threshold: 1` by
+/// inspecting the segment layout): omitting `on_disk` lets the optimizer mmap
+/// the vector storage (`vector_storage/matrix.dat`), while an explicit `false`
+/// OVERRIDES the threshold and pins the vectors in RAM
+/// (`vector_storage/vectors/chunk_0.mmap`). Sending `unwrap_or(false)` therefore
+/// silently disabled mmap for `qdrant-on-disk-default` and for all six
+/// `qdrant-mmap-*` configurations, whose names, configs and results all claimed
+/// on-disk storage.
+#[test]
+fn test_binary_qdrant_omitted_vectors_on_disk_stays_omitted() {
+    wait_for_qdrant();
+
+    let collection = "bench_omitted_on_disk";
+    let engine = "qdrant-omitted-on-disk";
+    let dataset = "omitted-on-disk";
+
+    // NOTE: no `vectors_config` at all — mmap is meant to be driven purely by
+    // optimizers_config.memmap_threshold, exactly like the qdrant-mmap-* configs.
+    let configs = serde_json::json!([{
+        "name": engine,
+        "engine": "qdrant",
+        "connection_params": {"timeout": 120},
+        "collection_params": {
+            "optimizers_config": { "memmap_threshold": 10000 },
+            "hnsw_config": { "m": 16, "ef_construct": 64 }
+        },
+        "search_params": [{ "parallel": 1, "config": { "hnsw_ef": 64 } }],
+        "upload_params": {"parallel": 1, "batch_size": 128}
+    }]);
+    let proj = common::write_tenant_project(dataset, &serde_json::to_string(&configs).unwrap(), 16);
+
+    let ok = run_qdrant_binary_keep_collection(&proj.root, engine, dataset, collection);
+
+    let (rt, client) = create_grpc_client();
+    let info = if ok {
+        rt.block_on(client.collection_info(collection)).ok()
+    } else {
+        None
+    };
+    let _ = rt.block_on(client.delete_collection(collection));
+
+    assert!(ok, "{engine} run failed");
+    let info = info.expect("collection_info").result.expect("info result");
+    let config = info.config.expect("collection config");
+    let params = config.params.expect("collection params");
+
+    match params.vectors_config.expect("vectors config").config {
+        Some(qdrant_client::qdrant::vectors_config::Config::Params(vp)) => {
+            assert_eq!(
+                vp.on_disk, None,
+                "an omitted vectors_config.on_disk was sent as an explicit value \
+                 ({:?}); an explicit `false` overrides memmap_threshold and pins \
+                 the vectors in RAM",
+                vp.on_disk
+            );
+        }
+        other => panic!("expected single dense vector params, got {other:?}"),
+    }
+
+    // The threshold itself must still have arrived, otherwise this test would
+    // pass vacuously on a collection that was never mmap-eligible to begin with.
+    let opt = config.optimizer_config.expect("optimizer config");
+    assert_eq!(opt.memmap_threshold, Some(10000));
+}
+
+/// End-to-end run over BINARY `results.gt` ground truth — the layout the public
+/// `msmarco-sparse-*` datasets ship, and the only branch of `read_sparse_queries`
+/// that no other test exercises (every other fixture writes `neighbours.jsonl`).
+///
+/// What this pins that a reader unit test cannot: the ids inside `results.gt`
+/// must be 0-based row indices lining up with the ids the uploader assigns from
+/// `data.csr` row order. If they were 1-based, or MS MARCO document ids, recall
+/// on a published `msmarco-sparse-1M` run would collapse to ~0 and every other
+/// test in this repo would still be green.
+#[test]
+fn test_binary_qdrant_sparse_binary_ground_truth_end_to_end() {
+    wait_for_qdrant();
+
+    let configs = serde_json::json!([{
+        "name": "qdrant-sparse-gt", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1}], "upload_params": {"parallel": 1, "batch_size": 50}
+    }]);
+    let proj =
+        common::write_sparse_project_gt("sparse-gt", &serde_json::to_string(&configs).unwrap());
+
+    // The fixture must carry ONLY the binary layout, otherwise this silently
+    // falls back to the jsonl branch and pins nothing.
+    let ds_dir = proj.root.join("datasets").join(&proj.dataset_name);
+    assert!(ds_dir.join("results.gt").exists(), "results.gt not written");
+    assert!(
+        !ds_dir.join("neighbours.jsonl").exists(),
+        "neighbours.jsonl would take precedence and hide the results.gt path"
+    );
+
+    assert!(
+        run_qdrant_binary(&proj.root, "qdrant-sparse-gt", "sparse-gt"),
+        "sparse results.gt run failed"
+    );
+    let precision = read_precision(&proj.root, "qdrant-sparse-gt");
+    println!(
+        "qdrant sparse (results.gt) precision={:.3} (top={})",
+        precision, proj.top
+    );
+    assert!(
+        precision >= 0.9,
+        "sparse results.gt precision {:.3} < 0.9 — the binary ground-truth ids do \
+         not line up with the point ids the uploader assigns",
+        precision
     );
 }

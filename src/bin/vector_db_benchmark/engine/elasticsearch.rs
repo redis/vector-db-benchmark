@@ -21,6 +21,20 @@ use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
+/// Shard count this engine creates its index with. Not configurable: it is
+/// pinned so an ES run is reproducible across cluster versions and deployments,
+/// whatever their per-index default happens to be.
+///
+/// It is a named constant rather than a literal because it is a *cross-engine*
+/// invariant, not a local choice: the shipped `opensearch-single-node.json` pins
+/// the same value so the published ES-vs-OS head-to-head compares two indexes
+/// with the same shard count (#211), and
+/// `opensearch::tests::shipped_opensearch_configs_pin_their_shard_count`
+/// asserts that equality against this constant. Changing this number therefore
+/// fails that test until the OpenSearch config is moved with it, instead of
+/// silently desynchronising the pairing.
+pub(crate) const ES_NUMBER_OF_SHARDS: i64 = 1;
+
 /// Elasticsearch engine configuration parsed from JSON
 #[derive(Clone)]
 struct ElasticsearchConfig {
@@ -426,19 +440,28 @@ impl ElasticsearchEngine {
 ///
 /// `refresh_interval: -1` disables periodic refresh for the duration of the
 /// benchmark. The whole dataset is indexed in one bulk phase, so a background
-/// refresh every N seconds only buys visibility nobody reads — while charging
-/// the ingest for segment creation the run never needs. Upstream qdrant's
+/// refresh every N seconds only buys visibility nobody reads. Upstream qdrant's
 /// reference tool does the same for Elasticsearch
 /// (`engine/clients/elasticsearch/configure.py`: *"no refresh is required
 /// because we index all the data at once"*), and `opensearch.rs` already did.
-/// Leaving ES at the old `10s` made our ES upload throughput pessimistic
-/// against both.
+///
+/// The reason is **comparability, not throughput** (#240). Measured live, `-1`
+/// does ~5x fewer refreshes and cuts ~2.5x fewer segments during ingest, but it
+/// does NOT reliably make the upload phase faster: on an HNSW field, frequent
+/// refreshes cut many *small* segments, and k small graphs over n/k docs each
+/// cost `n·log(n/k)` — cheaper per document than the few large graphs `-1`
+/// builds. The setting moves HNSW construction between the ingest and merge
+/// phases more than it removes it. What the old `10s` actually broke was the
+/// ES-vs-OS head-to-head: the two engines ingested under different index
+/// configurations, exactly like the shard-count mismatch `ES_NUMBER_OF_SHARDS`
+/// above fixes (#211/#235). Do not "restore" `10s` chasing an upload number.
 ///
 /// Because nothing refreshes on a timer any more, `upload()` MUST issue an
 /// explicit `_refresh` before the search phase (see `ElasticsearchEngine::refresh`).
 fn build_index_settings() -> serde_json::Value {
     serde_json::json!({
-        "number_of_shards": 1,
+        // Cross-engine invariant, not a local choice — see the constant's docs.
+        "number_of_shards": ES_NUMBER_OF_SHARDS,
         "number_of_replicas": 0,
         "refresh_interval": -1,
     })
@@ -957,7 +980,15 @@ impl Engine for ElasticsearchEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let num_candidates = params.num_candidates.unwrap_or(100);
+        // Upstream nests this under `config`; accept the nested spelling too so an
+        // upstream configuration does not silently fall back to 100. Nested is
+        // checked FIRST, matching SearchParams::knob's documented precedence —
+        // reading the typed flat field first would invert it for this one knob.
+        let num_candidates = params
+            .knob("num_candidates")
+            .and_then(|v| v.as_i64())
+            .or(params.num_candidates)
+            .unwrap_or(100);
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
@@ -1163,23 +1194,34 @@ impl Engine for ElasticsearchEngine {
 mod tests {
     use super::*;
 
-    /// Periodic refresh must stay disabled during ingest. `10s` here charged the
-    /// ES upload for segment refreshes that OpenSearch (`refresh_interval: -1`)
-    /// and upstream qdrant's reference client both skip, making our ES upload
-    /// throughput pessimistic — a competitor made to look worse than it is.
-    /// Regression guard for #240.
+    /// Periodic refresh must stay disabled during ingest. `10s` here made ES
+    /// ingest under a different index configuration than OpenSearch
+    /// (`refresh_interval: -1`) and than upstream qdrant's reference client, so
+    /// the published ES-vs-OS head-to-head was not apples-to-apples. Note this
+    /// is a *comparability* guard, not a throughput one — the measurement in
+    /// #240 found no reliable upload speedup from `-1` (see
+    /// `build_index_settings`), so a future "this makes upload slower, revert
+    /// it" is not a reason to restore `10s`. Regression guard for #240.
     #[test]
     fn index_settings_disable_periodic_refresh() {
         let settings = build_index_settings();
         assert_eq!(settings["refresh_interval"], serde_json::json!(-1));
     }
 
-    /// The other half of the apples-to-apples ES-vs-OS pairing (#235): a single
-    /// shard and no replicas, matching `opensearch.rs`.
+    /// The other half of the apples-to-apples ES-vs-OS pairing (#235): the shard
+    /// count actually sent must be the cross-engine constant, not a re-inlined
+    /// literal. Asserted against `ES_NUMBER_OF_SHARDS` rather than `1` on
+    /// purpose — hoisting the settings into `build_index_settings` is exactly
+    /// the kind of edit that could quietly drop the constant and desynchronise
+    /// the pairing that `opensearch::tests::shipped_opensearch_configs_pin_their_shard_count`
+    /// keys off.
     #[test]
     fn index_settings_pin_single_shard_no_replicas() {
         let settings = build_index_settings();
-        assert_eq!(settings["number_of_shards"], serde_json::json!(1));
+        assert_eq!(
+            settings["number_of_shards"],
+            serde_json::json!(ES_NUMBER_OF_SHARDS)
+        );
         assert_eq!(settings["number_of_replicas"], serde_json::json!(0));
     }
 

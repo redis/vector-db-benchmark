@@ -1,24 +1,11 @@
 [
   {
-    "name": "opensearch-default",
+    "name": "opensearch-5-shard-default",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
     },
-    "collection_params": { "number_of_shards": 1, "method": { "parameters": { "m": 16, "ef_construction": 100 } } },
-"search_params": [
-      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
-      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
-    ],
-    "upload_params": { "parallel": 16 }
-  },
-  {
-    "name": "opensearch-m-16-ef-128",
-    "engine": "opensearch",
-    "connection_params": {
-      "request_timeout": 10000
-    },
-    "collection_params": { "number_of_shards": 1, "method": { "parameters": { "m": 16, "ef_construction": 128 } } },
+    "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 16, "ef_construction": 100 } } },
     "search_params": [
       { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
       { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
@@ -26,12 +13,12 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-m-32-ef-128",
+    "name": "opensearch-5-shard-m-16-ef-128",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
     },
-    "collection_params": { "number_of_shards": 1, "method": { "parameters": { "m": 32, "ef_construction": 128 } } },
+    "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 16, "ef_construction": 128 } } },
     "search_params": [
       { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
       { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
@@ -39,12 +26,12 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-m-32-ef-256",
+    "name": "opensearch-5-shard-m-32-ef-128",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
     },
-    "collection_params": { "number_of_shards": 1, "method": { "parameters": { "m": 32, "ef_construction": 256 } } },
+    "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 32, "ef_construction": 128 } } },
     "search_params": [
       { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
       { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
@@ -52,12 +39,12 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-m-32-ef-512",
+    "name": "opensearch-5-shard-m-32-ef-256",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
     },
-    "collection_params": { "number_of_shards": 1, "method": { "parameters": { "m": 32, "ef_construction": 512 } } },
+    "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 32, "ef_construction": 256 } } },
     "search_params": [
       { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
       { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
@@ -65,12 +52,12 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-m-64-ef-256",
+    "name": "opensearch-5-shard-m-32-ef-512",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
     },
-    "collection_params": { "number_of_shards": 1, "method": { "parameters": { "m": 64, "ef_construction": 256 } } },
+    "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 32, "ef_construction": 512 } } },
     "search_params": [
       { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
       { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
@@ -78,12 +65,25 @@
     "upload_params": { "parallel": 16 }
   },
   {
-    "name": "opensearch-m-64-ef-512",
+    "name": "opensearch-5-shard-m-64-ef-256",
     "engine": "opensearch",
     "connection_params": {
       "request_timeout": 10000
     },
-    "collection_params": { "number_of_shards": 1, "method": { "parameters": { "m": 64, "ef_construction": 512 } } },
+    "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 64, "ef_construction": 256 } } },
+    "search_params": [
+      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
+      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
+    ],
+    "upload_params": { "parallel": 16 }
+  },
+  {
+    "name": "opensearch-5-shard-m-64-ef-512",
+    "engine": "opensearch",
+    "connection_params": {
+      "request_timeout": 10000
+    },
+    "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 64, "ef_construction": 512 } } },
     "search_params": [
       { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
       { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }

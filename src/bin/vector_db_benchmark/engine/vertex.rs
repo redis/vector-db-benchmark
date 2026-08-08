@@ -943,12 +943,19 @@ impl VertexEngine {
     /// `(approximate_neighbor_count, fraction_leaf_override)` for `request()`.
     fn resolve_search_knobs(&self, params: &SearchParams, top: usize) -> (i64, Option<f64>) {
         let (count, count_src) =
-            resolve_approx_neighbor_count(params.num_candidates, self.approx_neighbors, top);
+            // Nested (upstream `config: {...}`) placement as well as the flat
+            // typed field — see SearchParams::knob.
+            resolve_approx_neighbor_count(
+                params
+                    .knob("num_candidates")
+                    .and_then(|v| v.as_i64())
+                    .or(params.num_candidates),
+                self.approx_neighbors,
+                top,
+            );
+        // Nested or flat placement — see SearchParams::knob.
         let fraction_leaf_override: Option<f64> = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.extra.as_ref())
-            .and_then(|e| e.get("fraction_leaf_nodes_to_search_override"))
+            .knob("fraction_leaf_nodes_to_search_override")
             .and_then(|v| v.as_f64());
         match fraction_leaf_override {
             Some(f) => println!(

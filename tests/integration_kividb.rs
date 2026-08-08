@@ -5,11 +5,14 @@
 //! Run with:   KIVIDB_PORT=6386 cargo test --test integration_kividb -- --test-threads=1
 //!
 //! Scope: vector KNN (whole-corpus COSINE ground truth, so recall reflects index
-//! quality alone), plus HNSW/FLAT algorithm selection, EF_RUNTIME behavior, and
-//! per-config keyspace coexistence / --skip-upload. Metadata FILTER tests are
-//! intentionally excluded — live testing showed KiviDB's FT.* filter surface
-//! diverges from RediSearch in ways the shared filter builder does not yet
-//! handle (see the note above the FLAT test and the tracking issue).
+//! quality alone), plus HNSW/FLAT algorithm selection, EF_RUNTIME behavior,
+//! per-config keyspace coexistence / --skip-upload, AND metadata filtering
+//! (bool / uuid / datetime / full-text / match_any / AND / OR / nested /
+//! selectivity ladder) against filtered ground truth — see the `#205` block
+//! below. The two constructs KiviDB genuinely cannot express (geo, and
+//! multi-valued `labels`) are asserted to FAIL the run rather than report a
+//! recall — and to fail in `configure()`, leaving neither a result file nor a
+//! populated keyspace behind.
 
 use std::fs;
 use std::path::PathBuf;
@@ -256,21 +259,334 @@ fn test_kividb_knn_recall_parallel() {
     );
 }
 
-// NOTE: metadata-FILTER integration tests are intentionally NOT included here.
-// Live testing against a real KiviDB server surfaced that KiviDB's FT.* filter
-// surface diverges from RediSearch/Dragonfly in ways the shared redis.rs filter
-// builder does not yet accommodate:
-//   * FT.CREATE rejects the `SEPARATOR` TAG modifier (fixed in this change: the
-//     kividb engine now declares a bare TAG), and KiviDB TAG values are atomic —
-//     never split — so multi-valued `labels` arrays are not individually
-//     filterable (like geo).
-//   * KiviDB TAG queries want UNescaped values, whereas the shared builder emits
-//     RediSearch-style backslash escaping (e.g. `@uid:{3f2a\-9c}`), so filters
-//     over values with special characters miss and recall collapses.
-// Making metadata filtering correct on KiviDB therefore needs a KiviDB-specific
-// query/escaping path (tracked as a follow-up issue). Until then these tests
-// cover the validated KNN surface only; geo is unsupported regardless (KiviDB's
-// schema has no Geo field type).
+// ---------------------------------------------------------------------------
+// Metadata-filter tests (issue #205)
+// ---------------------------------------------------------------------------
+//
+// These were previously omitted because the engine reused redis.rs's RediSearch
+// filter builder, which binds filter values as FT.SEARCH `PARAMS`. KiviDB does
+// NOT substitute `$param` placeholders inside a hybrid query's prefilter, so
+// every one of these fixtures scored recall ~0.0 (TAG/TEXT clauses matched
+// nothing) or ~0.5 (NUMERIC clauses silently degraded to match-all). The engine
+// now inlines literals via its own `kividb_filter` builder; see that module for
+// the full measured divergence list.
+//
+// Each fixture's ground truth is brute-forced over ONLY the documents that
+// satisfy the filter, so a dropped or mis-built filter searches the wrong doc
+// set and recall collapses — these assertions cannot be satisfied by a filter
+// that was silently ignored.
+
+/// Run one metadata-filter fixture end-to-end and assert recall >= 0.9 vs the
+/// filtered ground truth.
+fn run_kividb_filter_test(
+    name: &str,
+    dataset: &str,
+    build: impl Fn(&str, &str, usize) -> common::FilterProject,
+) {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": name, "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = build(dataset, &serde_json::to_string(&configs).unwrap(), dim);
+    assert!(
+        proj.matching_docs >= proj.top,
+        "fixture must have >= top matching docs (got {})",
+        proj.matching_docs
+    );
+    let port = test_port().to_string();
+    assert!(
+        common::run_binary(
+            &proj.root,
+            name,
+            dataset,
+            TEST_HOST,
+            &[("KIVIDB_PORT", port.as_str())],
+        ),
+        "kividb {} run failed",
+        name
+    );
+    let recall = common::read_recall(&proj.root, name);
+    println!("kividb {} recall={:.3}", name, recall);
+    assert!(recall >= 0.9, "kividb {} recall {:.3} < 0.9", name, recall);
+}
+
+/// Bool equality — `bool` is indexed as a TAG holding the literal "true"/"false".
+#[test]
+fn test_binary_kividb_bool() {
+    run_kividb_filter_test(
+        "kividb-bool",
+        "kividb-bool-test",
+        common::write_bool_project,
+    );
+}
+
+/// UUID exact match (TAG). The regression that motivated #205: the value's
+/// hyphens must reach KiviDB UNescaped and as a literal, not as a `$param`.
+#[test]
+fn test_binary_kividb_uuid() {
+    run_kividb_filter_test(
+        "kividb-uuid",
+        "kividb-uuid-test",
+        common::write_uuid_project,
+    );
+}
+
+/// Datetime range (stored as NUMERIC epoch seconds, queried with an ISO range).
+/// This fixture's `lt` bound is EXCLUSIVE — KiviDB does not parse RediSearch's
+/// `(` exclusive marker (the clause degrades to match-all), so this also covers
+/// the `f64::next_down` emulation.
+#[test]
+fn test_binary_kividb_datetime() {
+    run_kividb_filter_test(
+        "kividb-dt",
+        "kividb-dt-test",
+        common::write_datetime_project,
+    );
+}
+
+/// Full-text: a `text` field indexed as TEXT, single-term `@body:(quick)`.
+#[test]
+fn test_binary_kividb_fulltext() {
+    run_kividb_filter_test(
+        "kividb-text",
+        "kividb-text-test",
+        common::write_fulltext_project,
+    );
+}
+
+/// Multi-condition AND (keyword AND numeric range).
+#[test]
+fn test_binary_kividb_and_filter() {
+    run_kividb_filter_test(
+        "kividb-and",
+        "kividb-and-test",
+        common::write_and_filter_project,
+    );
+}
+
+/// Multi-condition OR (union).
+#[test]
+fn test_binary_kividb_or_filter() {
+    run_kividb_filter_test(
+        "kividb-or",
+        "kividb-or-test",
+        common::write_or_filter_project,
+    );
+}
+
+/// Nested boolean groups: `(red AND size>=50) OR (blue AND size<10)`.
+#[test]
+fn test_binary_kividb_nested_filter() {
+    run_kividb_filter_test(
+        "kividb-nested",
+        "kividb-nested-test",
+        common::write_nested_filter_project,
+    );
+}
+
+/// `match_any` (IN-list) over a SCALAR keyword field. KiviDB reads a spaced
+/// intra-brace OR (`@color:{red | blue}`) as match-ALL, so the engine emits
+/// separate OR'd clauses instead; a regression back to the shared builder's form
+/// would silently disable the filter and collapse recall here.
+#[test]
+fn test_binary_kividb_match_any() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "kividb-match-any", "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = common::write_match_any_project(
+        "kividb-match-any-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    assert!(proj.matching_docs >= proj.top);
+    let port = test_port().to_string();
+    assert!(
+        common::run_binary(
+            &proj.root,
+            "kividb-match-any",
+            "kividb-match-any-test",
+            TEST_HOST,
+            &[("KIVIDB_PORT", port.as_str())],
+        ),
+        "kividb match_any run failed"
+    );
+    let recall = common::read_recall(&proj.root, "kividb-match-any");
+    println!("kividb match_any recall={:.3}", recall);
+    assert!(recall >= 0.9, "kividb match_any recall {:.3} < 0.9", recall);
+}
+
+/// Range-filter correctness across a selectivity ladder (~3% → ~99% matching).
+/// Every rung is an EXCLUSIVE `rank < K` bound, so this sweeps the exclusive
+/// bound emulation across the whole selectivity range and also confirms KiviDB
+/// genuinely PRE-filters: a post-filtering engine collapses at the restrictive
+/// end even though the query is syntactically fine.
+#[test]
+fn test_binary_kividb_selectivity_ladder() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "kividb-sel", "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = common::write_selectivity_project(
+        "kividb-sel-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = test_port().to_string();
+    assert!(
+        common::run_binary(
+            &proj.root,
+            "kividb-sel",
+            "kividb-sel-test",
+            TEST_HOST,
+            &[("KIVIDB_PORT", port.as_str())],
+        ),
+        "kividb selectivity run failed"
+    );
+    let recall = common::read_recall(&proj.root, "kividb-sel");
+    println!("kividb selectivity-ladder recall={:.3}", recall);
+    assert!(
+        recall >= 0.9,
+        "kividb selectivity-ladder recall {:.3} < 0.9",
+        recall
+    );
+}
+
+// ── Genuine KiviDB limitations: these MUST fail loudly, not score a recall ──
+//
+// The repo rule (see vertex.rs) is that a filter an engine cannot express is a
+// hard error, never a silent drop — a dropped clause leaves a weaker or empty
+// prefilter and publishes a recall for a filter that was never applied. These
+// two tests assert the run FAILS rather than producing a result file.
+
+/// Assert the aborted run left NO result file behind.
+///
+/// This is the point of rejecting in `configure()` rather than later. A geo
+/// dataset rejected in `search()` would abort only AFTER `experiment.rs` had
+/// already written the upload result file — an orphan that then satisfies
+/// `--skip-if-exists`, so a later `--skip-upload` re-run skips the pair silently
+/// instead of reporting it.
+fn assert_no_results_written(root: &std::path::Path) {
+    let dir = root.join("results");
+    let stragglers: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        stragglers.is_empty(),
+        "a rejected dataset must leave no result file behind (found {stragglers:?}) — an orphan \
+         upload file would make a later --skip-upload re-run silently skip the pair"
+    );
+}
+
+/// GEO: KiviDB's index schema has no GEO field type, so the field is never
+/// indexed and a geo clause would match nothing. The run must abort — and abort
+/// in `configure()`, i.e. before the corpus is uploaded, since the whole
+/// rejection is decidable from the dataset schema.
+#[test]
+fn test_binary_kividb_geo_is_rejected_not_silently_dropped() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "kividb-geo", "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = common::write_geo_project(
+        "kividb-geo-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    assert!(
+        !common::run_binary(
+            &proj.root,
+            "kividb-geo",
+            "kividb-geo-test",
+            TEST_HOST,
+            &[("KIVIDB_PORT", test_port().to_string().as_str())],
+        ),
+        "kividb must REJECT a geo filter, not run it and report a recall"
+    );
+    assert_no_results_written(&proj.root);
+    // Rejected in configure(), so nothing was ever written to the keyspace.
+    assert_eq!(
+        redis::cmd("DBSIZE").query::<i64>(&mut conn).unwrap_or(-1),
+        0,
+        "a geo dataset must be rejected BEFORE the corpus is uploaded"
+    );
+}
+
+/// Multi-valued `labels`: a KiviDB TAG value is atomic (never split on any
+/// separator), so a `match_any` over a labels array can only ever match the
+/// whole joined string — i.e. nothing. The run must abort rather than build an
+/// index that silently answers every such query with zero documents — and abort
+/// in `configure()`, before the payload file is parsed at all (3.6 GB for the
+/// shipped `arxiv-titles-384-angular-filters`).
+#[test]
+fn test_binary_kividb_multivalued_labels_is_rejected_not_silently_mis_encoded() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "kividb-labels", "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = common::write_match_any_labels_project(
+        "kividb-labels-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+        common::GtMetric::L2,
+    );
+    assert!(
+        !common::run_binary(
+            &proj.root,
+            "kividb-labels",
+            "kividb-labels-test",
+            TEST_HOST,
+            &[("KIVIDB_PORT", test_port().to_string().as_str())],
+        ),
+        "kividb must REJECT a multi-valued labels field, not index it as an atomic TAG"
+    );
+    assert_no_results_written(&proj.root);
+    assert_eq!(
+        redis::cmd("DBSIZE").query::<i64>(&mut conn).unwrap_or(-1),
+        0,
+        "a multi-valued labels dataset must be rejected BEFORE the corpus is uploaded"
+    );
+}
 
 /// A `"algorithm":"flat"` config must run end-to-end: EF_RUNTIME is HNSW-only,
 /// so the engine must NOT emit it (or bind the EF param) for a FLAT index — else
