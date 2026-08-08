@@ -1398,7 +1398,7 @@
     "path": "msmarco-sparse/100K",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-100K.tar.gz",
     "vector_count": 100000,
-    "description": "MS MARCO learned-sparse (SPLADE-style) embeddings — the public sparse benchmark used upstream. Ships data.csr + queries.csr + binary results.gt ground truth; no vector_size: the readers and engines derive it from the CSR files (whose header does declare ncol=30109). Scored by dot product (MIPS) — verified numerically against results.gt — so distance is dot, NOT cosine. Qdrant is the only engine with a sparse path."
+    "description": "MS MARCO learned-sparse (SPLADE-style) embeddings — the public sparse benchmark used upstream. Ships data.csr + queries.csr + binary results.gt ground truth; no vector_size, because nothing needs it: Qdrant's sparse collection takes no dimension, and every other engine refuses type=sparse outright. (The CSR header does declare ncol=30109; the readers do not surface it.) Scored by dot product (MIPS), not cosine — checked by hand against the scores in results.gt. Qdrant is the only engine with a sparse path."
   },
   {
     "name": "msmarco-sparse-1M",

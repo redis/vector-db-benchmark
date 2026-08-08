@@ -331,10 +331,15 @@ impl WeaviateEngine {
         // only the flat map meant an upstream-style `config: {...}` returned Ok
         // WITHOUT patching the class, so every ef in the sweep silently ran at
         // the build-time ef while the results file listed one row per ef.
+        // Also accept the plain `search_params.ef` spelling that the other eight
+        // ef-bearing engines use. Without it, `{"search_params": {"ef": 128}}`
+        // hit the early return below and the whole sweep silently ran at the
+        // BUILD-time ef while emitting one results row per ef.
         let ef = params
             .knob("vectorIndexConfig")
             .and_then(|v| v.get("ef"))
-            .and_then(|v| v.as_i64());
+            .and_then(|v| v.as_i64())
+            .or_else(|| params.search_params.as_ref().and_then(|sp| sp.ef));
 
         let Some(ef_val) = ef else {
             return Ok(());

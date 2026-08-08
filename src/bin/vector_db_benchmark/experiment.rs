@@ -382,6 +382,21 @@ fn run_single_experiment(
     // `--keep-data` keeps every config's data (the default coexistence behaviour,
     // needed for --skip-upload reuse). A single-config run is always the last.
     let keep_data = args.keep_data && (is_last_config || !args.reset_between_configs);
+
+    // Skip an incompatible (engine, dataset) pair BEFORE `get_path()`, which would
+    // otherwise download the archive — hundreds of MB for the msmarco-sparse sets
+    // — build an index at the fallback dimension, and only then fail inside the
+    // reader. Mirrors upstream's IncompatibilityError skip.
+    if (dataset.is_sparse() || dataset.is_hybrid()) && !engine.supports_sparse() {
+        println!(
+            "Skipping {} - {}: the dataset is {} and this engine has no sparse path",
+            engine.name(),
+            dataset.config.name,
+            dataset.config.dataset_type.as_deref().unwrap_or("sparse")
+        );
+        return Ok(());
+    }
+
     // Check if we should skip
     if args.skip_if_exists {
         let glob_pattern = format!("{}-{}-upload-*.json", engine.name(), dataset.config.name);

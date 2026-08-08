@@ -50,9 +50,9 @@ jobs:
           - target: npy_roundtrip
             dict: npy
           - target: gt_reader
-            dict: csr
+            dict: gt
           - target: gt_roundtrip
-            dict: csr
+            dict: gt
     steps:
       - uses: actions/checkout@v4
 

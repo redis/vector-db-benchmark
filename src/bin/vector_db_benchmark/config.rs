@@ -48,7 +48,13 @@ pub struct HnswConfig {
     /// Catch-all so an unrecognised key inside `hnsw_config` can be REPORTED
     /// rather than silently discarded. Serde ignores undeclared fields by
     /// default, which is how `on_disk` used to vanish here — the very bug this
-    /// branch fixes. Engines that consume hnsw_config warn on leftovers.
+    /// branch fixes.
+    ///
+    /// Only the Qdrant engine calls `unsupported_keys()` today. The other five
+    /// consumers (redis, valkey, pgvector, dragonfly, kividb) read just
+    /// `m`/`ef_construction`, and at least one shipped config deliberately parks
+    /// an inert key here (`redis-single-node.json`'s `DISTANCE_METRIC`, which
+    /// redis derives from the dataset), so warning for them would be noise.
     #[serde(flatten)]
     pub extra: Option<HashMap<String, serde_json::Value>>,
 }
@@ -141,9 +147,20 @@ impl SearchParams {
     /// would find a flat `ef` while ignoring the nested one that configures the
     /// run — hence the debug assertion below).
     pub fn knob(&self, key: &str) -> Option<&serde_json::Value> {
-        debug_assert_ne!(
-            key, "ef",
-            "`ef` is a typed field; read search_params.ef instead of knob(\"ef\")"
+        debug_assert!(
+            !matches!(
+                key,
+                "ef" | "EF"
+                    | "parallel"
+                    | "top"
+                    | "target_qps"
+                    | "duration_seconds"
+                    | "max_lateness_ms"
+                    | "calibration_param"
+                    | "calibration_precision"
+            ),
+            "{key:?} is a typed field; knob() cannot see it — read the field directly \
+             (num_candidates is exempt: its call sites combine both, see the doc above)"
         );
         self.search_params
             .as_ref()

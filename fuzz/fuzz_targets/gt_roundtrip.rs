@@ -44,17 +44,15 @@ fuzz_target!(|data: &[u8]| {
         None => return,
     };
 
-    // An id that does not fit the int32 on-disk field must be refused, not
-    // written lossily — that is the asymmetry this target exists to pin.
+    // The writer refuses anything the format cannot represent faithfully: an id
+    // outside i32 (which `as i32` would truncate into a DIFFERENT id) and the
+    // `n > 0, d == 0` shape (an 8-byte file the reader rejects). Those are the
+    // asymmetries this target exists to pin, so a refusal is a pass, and
+    // everything the writer DOES accept must read back byte-for-byte.
     if write_gt_neighbours(path, &rows).is_err() {
         return;
     }
 
     let read = read_gt_neighbours(path).expect("valid results.gt written by us must read back");
-    // A zero-width row set writes n rows of 0 ids, which the reader reports as
-    // "no queries" (and rejects outright when n > 0) — so only compare when
-    // there is something to compare.
-    if rows.first().is_some_and(|r| !r.is_empty()) {
-        assert_eq!(read, rows, "results.gt round-trip mismatch");
-    }
+    assert_eq!(read, rows, "results.gt round-trip mismatch");
 });

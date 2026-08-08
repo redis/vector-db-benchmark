@@ -20,7 +20,7 @@ use qdrant_client::qdrant::{
     OptimizersConfigDiff, PointStruct, PrefetchQueryBuilder, ProductQuantization,
     QuantizationSearchParams, QuantizationType, Query, QueryPointsBuilder, ScalarQuantization,
     SearchParams as QdrantSearchParams, SparseIndexConfigBuilder, SparseVectorParamsBuilder,
-    SparseVectorsConfigBuilder, TextIndexParams, Timestamp, UuidIndexParams, Vector, VectorInput,
+    SparseVectorsConfigBuilder, Timestamp, UuidIndexParams, Vector, VectorInput,
     VectorParamsBuilder, VectorsConfig, VectorsConfigBuilder,
 };
 use qdrant_client::{Payload, Qdrant};
@@ -35,6 +35,11 @@ const DEFAULT_COLLECTION: &str = "benchmark";
 pub struct QdrantEngine {
     name: String,
     collection_name: String,
+    /// Config knobs this run could NOT honour, accumulated during `configure`.
+    /// Surfaced through `server_metadata()` so they land in the saved result JSON:
+    /// a stderr line alone leaves the artifact indistinguishable from a run where
+    /// the knob DID apply, and the artifact is what someone reads months later.
+    ignored_config: Vec<String>,
     #[allow(dead_code)]
     timeout: u64,
     batch_size: usize,
@@ -144,6 +149,7 @@ impl QdrantEngine {
         Ok(Self {
             name: engine_config.name.clone(),
             collection_name,
+            ignored_config: Vec::new(),
             timeout,
             batch_size,
             parallel,
@@ -180,7 +186,7 @@ impl QdrantEngine {
         Ok(())
     }
 
-    fn create_collection(&self, dataset: &Dataset) -> Result<(), String> {
+    fn create_collection(&mut self, dataset: &Dataset) -> Result<(), String> {
         if dataset.is_hybrid() {
             return self.create_hybrid_collection(dataset);
         }
@@ -248,6 +254,30 @@ impl QdrantEngine {
             params = params.datatype(parse_datatype(dt)?);
         }
         Ok(params)
+    }
+
+    /// Build the named "sparse" vector params, mapping `vectors_config`'s
+    /// `on_disk` / `datatype` onto the SPARSE inverted index (which has its own
+    /// equivalents). Shared by the sparse-only and hybrid create paths — the
+    /// hybrid path previously built a bare default here, so an "all-on-disk"
+    /// hybrid run put the dense half on disk and silently left the sparse half in
+    /// RAM at full precision.
+    fn sparse_vector_params(&self) -> Result<SparseVectorParamsBuilder, String> {
+        let vectors_config = self.collection_params_extra.get("vectors_config");
+        let mut index = SparseIndexConfigBuilder::default();
+        if let Some(on_disk) = vectors_config
+            .and_then(|v| v.get("on_disk"))
+            .and_then(|v| v.as_bool())
+        {
+            index = index.on_disk(on_disk);
+        }
+        if let Some(dt) = vectors_config
+            .and_then(|v| v.get("datatype"))
+            .and_then(|v| v.as_str())
+        {
+            index = index.datatype(parse_datatype(dt)?);
+        }
+        Ok(SparseVectorParamsBuilder::default().index(index.build()))
     }
 
     /// Build the Qdrant `HnswConfigDiff` from the typed
@@ -323,6 +353,31 @@ impl QdrantEngine {
                      wait, so index-build time stays comparable across engines"
                 );
             }
+            // Report anything else rather than dropping it: this allow-list is
+            // narrower than Qdrant's optimizer config (indexing_threshold,
+            // flush_interval_sec, ...), so an unread knob here looks honoured.
+            if let Some(obj) = opt.as_object() {
+                let unknown: Vec<&str> = obj
+                    .keys()
+                    .map(|k| k.as_str())
+                    .filter(|k| {
+                        !matches!(
+                            *k,
+                            "default_segment_number"
+                                | "max_segment_size"
+                                | "memmap_threshold"
+                                | "max_optimization_threads"
+                        )
+                    })
+                    .collect();
+                if !unknown.is_empty() {
+                    eprintln!(
+                        "Warning: unsupported collection_params.optimizers_config keys ignored: {} \
+                         (supported: default_segment_number, max_segment_size, memmap_threshold)",
+                        unknown.join(", ")
+                    );
+                }
+            }
             create_builder = create_builder.optimizers_config(diff);
         }
 
@@ -393,39 +448,16 @@ impl QdrantEngine {
     /// not all declare, and rejecting those would make the upstream file
     /// unrunnable verbatim, which is the opposite of this branch's goal. The
     /// warning is what stops the run from quietly passing as tenant-optimised.
-    fn create_payload_indexes(&self, dataset: &Dataset) -> Result<(), String> {
+    fn create_payload_indexes(&mut self, dataset: &Dataset) -> Result<(), String> {
         let schema = dataset.config.schema.as_ref().and_then(|s| s.as_object());
         let index_params = self
             .collection_params_extra
             .get("payload_index_params")
             .and_then(|v| v.as_object());
 
-        if let Some(params) = index_params {
-            for (field, spec) in params {
-                let declared = schema.and_then(|s| s.get(field)).and_then(|v| v.as_str());
-                match declared {
-                    None => eprintln!(
-                        "Warning: collection_params.payload_index_params names {:?}, which is NOT \
-                         in the schema of dataset {} — no index is created for it, so {:?} has no \
-                         effect on this run",
-                        field, dataset.config.name, spec
-                    ),
-                    // `on_disk` works on every index type; `is_tenant` only on
-                    // keyword/uuid (and bool, which we index as a keyword).
-                    Some(ft)
-                        if spec.get("is_tenant").is_some()
-                            && !matches!(ft, "keyword" | "uuid" | "bool") =>
-                    {
-                        eprintln!(
-                            "Warning: payload_index_params.{}.is_tenant is ignored — a Qdrant {} \
-                             index has no is_tenant (only keyword, uuid and bool do); its on_disk \
-                             setting, if any, IS applied",
-                            field, ft
-                        )
-                    }
-                    Some(_) => {}
-                }
-            }
+        for warning in payload_index_warnings(schema, index_params, &dataset.config.name) {
+            eprintln!("Warning: {}", warning);
+            self.ignored_config.push(warning);
         }
 
         let Some(schema_obj) = schema else {
@@ -459,16 +491,20 @@ impl QdrantEngine {
                 builder = builder.field_index_params(params);
             }
 
-            if let Err(e) = self.rt.block_on(self.client.create_field_index(builder)) {
-                // Not fatal (the index may already exist from a previous run), but
-                // never silent: a missing payload index turns every filtered query
-                // into a full scan, which reads as an engine result rather than a
-                // setup failure.
-                eprintln!(
-                    "Warning: failed to create payload index on {:?} ({}): {}",
-                    field_name, ft, e
-                );
-            }
+            // FATAL, deliberately: `configure` always deletes and recreates the
+            // collection first, so "index already exists" is unreachable here and
+            // every error means the index is genuinely missing. Qdrant still
+            // filters correctly without one, so recall looks healthy while
+            // latency/QPS are garbage — the hardest kind of wrong number to spot.
+            self.rt
+                .block_on(self.client.create_field_index(builder))
+                .map_err(|e| {
+                    format!(
+                        "failed to create the {} payload index on {:?}: {} (a missing payload \
+                         index silently turns every filtered query into a full scan)",
+                        ft, field_name, e
+                    )
+                })?;
         }
         Ok(())
     }
@@ -485,53 +521,34 @@ impl QdrantEngine {
     /// Qdrant. They are NOT silently ignored: each warns, so a config asking for
     /// something the sparse index cannot do says so instead of producing a
     /// mislabelled result.
-    fn create_sparse_collection(&self, dataset: &Dataset) -> Result<(), String> {
-        let vectors_config = self.collection_params_extra.get("vectors_config");
-        let mut index = SparseIndexConfigBuilder::default();
-        if let Some(on_disk) = vectors_config
-            .and_then(|v| v.get("on_disk"))
-            .and_then(|v| v.as_bool())
-        {
-            index = index.on_disk(on_disk);
-        }
-        if let Some(dt) = vectors_config
-            .and_then(|v| v.get("datatype"))
-            .and_then(|v| v.as_str())
-        {
-            index = index.datatype(parse_datatype(dt)?);
-        }
-
-        let mut sparse_params = SparseVectorParamsBuilder::default();
-        sparse_params = sparse_params.index(index.build());
+    fn create_sparse_collection(&mut self, dataset: &Dataset) -> Result<(), String> {
         let mut sparse_cfg = SparseVectorsConfigBuilder::default();
-        sparse_cfg.add_named_vector_params("sparse", sparse_params);
+        sparse_cfg.add_named_vector_params("sparse", self.sparse_vector_params()?);
 
         let mut create_builder =
             CreateCollectionBuilder::new(&self.collection_name).sparse_vectors_config(sparse_cfg);
         create_builder = self.apply_optimizers_and_payload_storage(create_builder);
 
-        if self.hnsw.is_some() {
-            eprintln!(
-                "Warning: collection_params.hnsw_config is ignored for the SPARSE dataset {} \
-                 (Qdrant's sparse index has no HNSW graph)",
-                dataset.config.name
-            );
-        }
-        if self
-            .collection_params_extra
-            .get("quantization_config")
-            .is_some()
-        {
-            eprintln!(
-                "Warning: collection_params.quantization_config is ignored for the SPARSE dataset \
-                 {} (Qdrant quantization applies to dense vectors only) — this run is NOT quantized",
-                dataset.config.name
-            );
+        for warning in sparse_ignored_warnings(
+            self.hnsw.is_some(),
+            self.collection_params_extra
+                .get("quantization_config")
+                .is_some(),
+            &dataset.config.name,
+        ) {
+            eprintln!("Warning: {}", warning);
+            self.ignored_config.push(warning);
         }
 
         self.rt
             .block_on(self.client.create_collection(create_builder))
             .map_err(|e| format!("Failed to create sparse collection: {}", e))?;
+
+        // Same optimizer regime as the dense and hybrid paths (0 threads during
+        // ingest, Auto once green), so sparse index-build time is measured the
+        // same way — and so the max_optimization_threads warning is true here too.
+        self.disable_indexing_optimizers();
+
         self.create_payload_indexes(dataset)?;
         Ok(())
     }
@@ -541,7 +558,7 @@ impl QdrantEngine {
     /// a sparse-vector prefetch server-side (RRF). The dense vector carries the
     /// dataset's distance metric (and HNSW config, if configured); the sparse
     /// vector uses Qdrant's default sparse index.
-    fn create_hybrid_collection(&self, dataset: &Dataset) -> Result<(), String> {
+    fn create_hybrid_collection(&mut self, dataset: &Dataset) -> Result<(), String> {
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
         let qdrant_distance = map_qdrant_distance(distance)?;
@@ -556,9 +573,11 @@ impl QdrantEngine {
         let mut dense_cfg = VectorsConfigBuilder::default();
         dense_cfg.add_named_vector_params("dense", dense_params);
 
-        // Named sparse vector "sparse" (mirrors create_sparse_collection).
+        // Named sparse vector "sparse" — shares sparse_vector_params() with the
+        // sparse-only path, so vectors_config's on_disk/datatype reaches BOTH
+        // halves of a hybrid collection.
         let mut sparse_cfg = SparseVectorsConfigBuilder::default();
-        sparse_cfg.add_named_vector_params("sparse", SparseVectorParamsBuilder::default());
+        sparse_cfg.add_named_vector_params("sparse", self.sparse_vector_params()?);
 
         let mut create_builder = CreateCollectionBuilder::new(&self.collection_name)
             .vectors_config(dense_cfg)
@@ -1017,6 +1036,82 @@ fn parse_compression_ratio(s: &str) -> Result<CompressionRatio, String> {
     }
 }
 
+/// Every `payload_index_params` entry that cannot take effect, as a list of
+/// warning strings.
+///
+/// Pure so it is testable: `create_payload_indexes` has no error return left
+/// (an unusable key warns, and a failed index creation warns), so a test that
+/// only asserted `is_ok()` would pass even if this logic were deleted — and
+/// deleting it restores the "run quietly passes as tenant-optimised" failure
+/// this branch exists to remove.
+fn payload_index_warnings(
+    schema: Option<&serde_json::Map<String, serde_json::Value>>,
+    index_params: Option<&serde_json::Map<String, serde_json::Value>>,
+    dataset_name: &str,
+) -> Vec<String> {
+    let Some(params) = index_params else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (field, spec) in params {
+        match schema.and_then(|s| s.get(field)).and_then(|v| v.as_str()) {
+            None => out.push(format!(
+                "collection_params.payload_index_params names {:?}, which is NOT in the schema of \
+                 dataset {} — no index is created for it, so {} has no effect on this run",
+                field, dataset_name, spec
+            )),
+            // `text` cannot carry either parameter here — see
+            // build_payload_index_params for why (required tokenizer field).
+            Some("text") => out.push(format!(
+                "payload_index_params.{} is ignored — a Qdrant text index needs an explicit \
+                 tokenizer, so this harness sends no index params for text fields",
+                field
+            )),
+            // `on_disk` works on every other index type; `is_tenant` only on
+            // keyword/uuid (and bool, which we index as a keyword).
+            Some(ft)
+                if spec.get("is_tenant").is_some()
+                    && !matches!(ft, "keyword" | "uuid" | "bool") =>
+            {
+                out.push(format!(
+                    "payload_index_params.{}.is_tenant is ignored — a Qdrant {} index has no \
+                     is_tenant (only keyword and uuid do; this harness also accepts it for bool, \
+                     which it indexes AS a keyword); its on_disk setting, if any, IS applied",
+                    field, ft
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    out
+}
+
+/// The collection params a SPARSE collection cannot honour, as warning strings.
+/// Pure for the same reason as `payload_index_warnings`: these warnings are the
+/// only signal that a run named `*-bq` is not actually quantized.
+fn sparse_ignored_warnings(
+    hnsw_configured: bool,
+    quantization_configured: bool,
+    dataset_name: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if hnsw_configured {
+        out.push(format!(
+            "collection_params.hnsw_config is ignored for the SPARSE dataset {} (Qdrant's sparse \
+             index has no HNSW graph)",
+            dataset_name
+        ));
+    }
+    if quantization_configured {
+        out.push(format!(
+            "collection_params.quantization_config is ignored for the SPARSE dataset {} (Qdrant \
+             quantization applies to dense vectors only) — this run is NOT quantized",
+            dataset_name
+        ));
+    }
+    out
+}
+
 /// Map a `vectors_config.datatype` string onto Qdrant's `Datatype`.
 ///
 /// `"default"` maps to `Datatype::Default` (let Qdrant choose), NOT to
@@ -1071,7 +1166,16 @@ fn build_payload_index_params(
             on_disk,
             ..Default::default()
         }),
-        // is_tenant does not exist on these; on_disk does, so forward it.
+        // `text` is deliberately absent: TextIndexParams.tokenizer is the one
+        // REQUIRED (non-optional) proto field across the index-params messages,
+        // so emitting the message to carry on_disk would pin the tokenizer to
+        // Unknown(0) — either rejected by the server (leaving NO text index, so
+        // every full-text filter degrades silently) or a tokenizer the config
+        // never asked for. The caller warns instead.
+        "text" => return None,
+        // is_tenant does not exist on the rest, so there is nothing to send
+        // unless on_disk was actually asked for.
+        _ if on_disk.is_none() => return None,
         "int" => IndexParams::IntegerIndexParams(IntegerIndexParams {
             on_disk,
             ..Default::default()
@@ -1081,10 +1185,6 @@ fn build_payload_index_params(
             ..Default::default()
         }),
         "geo" => IndexParams::GeoIndexParams(GeoIndexParams {
-            on_disk,
-            ..Default::default()
-        }),
-        "text" => IndexParams::TextIndexParams(TextIndexParams {
             on_disk,
             ..Default::default()
         }),
@@ -1121,6 +1221,18 @@ fn build_quantization(q: &serde_json::Value) -> Result<Option<Quantization>, Str
             compression: compression.into(),
             always_ram: p.get("always_ram").and_then(|v| v.as_bool()),
         })))
+    } else if q.get("binary").is_none() {
+        // Neither scalar, product nor binary: report it. Returning Ok(None) here
+        // silently un-quantizes a run whose config name says otherwise — the same
+        // silent-drop class this branch exists to remove.
+        if let Some(obj) = q.as_object() {
+            eprintln!(
+                "Warning: unrecognised collection_params.quantization_config key(s) {} — this run \
+                 is NOT quantized (expected one of: scalar, product, binary)",
+                obj.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        Ok(None)
     } else {
         Ok(q.get("binary").map(|b| {
             Quantization::Binary(BinaryQuantization {
@@ -1266,6 +1378,22 @@ impl Engine for QdrantEngine {
         &self.name
     }
 
+    /// Qdrant is the only engine with a sparse / hybrid path.
+    fn supports_sparse(&self) -> bool {
+        true
+    }
+
+    /// Report the config knobs this run could not honour, so they land in the
+    /// saved result JSON. Without this the artifact is identical to a run where
+    /// the knob DID apply — and the artifact, not a scrolled-past stderr line, is
+    /// what gets read later.
+    fn server_metadata(&mut self) -> Option<serde_json::Value> {
+        if self.ignored_config.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!({ "ignored_collection_params": self.ignored_config }))
+    }
+
     fn search_params(&self) -> &[SearchParams] {
         &self.search_params
     }
@@ -1349,8 +1477,9 @@ impl Engine for QdrantEngine {
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
 
-        // EVERY search knob below resolves through `knob()` (nested under
-        // `search_params`/`config`, or flat), so an entry cannot be half-applied.
+        // Every search knob in THIS engine resolves through `knob()` (nested
+        // under `search_params`/`config`, or flat), so an entry cannot be
+        // half-applied. (Other engines vary; see SearchParams::knob.)
         // The asymmetry this replaces was worse than a plain drop: with only
         // `with_payload` accepting the flat spelling, `{"with_payload": true,
         // "hnsw_ef": 128}` returned payloads while silently searching at DEFAULT
@@ -1546,21 +1675,39 @@ impl Engine for QdrantEngine {
                                 ))
                                 .limit(pf_limit)
                                 .build();
-                            QueryPointsBuilder::new(collection_name.clone())
+                            let mut qb = QueryPointsBuilder::new(collection_name.clone())
                                 .query(Query::new_fusion(Fusion::Rrf))
                                 .prefetch(vec![dense_pf, sparse_pf])
                                 .limit(top as u64)
-                                .with_payload(with_payload)
+                                .with_payload(with_payload);
+                            // indexed_only is collection-level, not vector-kind
+                            // specific, so it must reach the fused query too —
+                            // otherwise it is honoured for dense runs and
+                            // silently dropped for hybrid ones.
+                            if indexed_only {
+                                qb = qb.params(QdrantSearchParams {
+                                    indexed_only: Some(true),
+                                    ..Default::default()
+                                });
+                            }
+                            qb
                         } else if is_sparse {
                             let sv = &sparse_queries[idx];
-                            QueryPointsBuilder::new(collection_name.clone())
+                            let mut qb = QueryPointsBuilder::new(collection_name.clone())
                                 .query(VectorInput::new_sparse(
                                     sv.indices.clone(),
                                     sv.values.clone(),
                                 ))
                                 .using("sparse")
                                 .limit(top as u64)
-                                .with_payload(with_payload)
+                                .with_payload(with_payload);
+                            if indexed_only {
+                                qb = qb.params(QdrantSearchParams {
+                                    indexed_only: Some(true),
+                                    ..Default::default()
+                                });
+                            }
+                            qb
                         } else {
                             let mut qb = QueryPointsBuilder::new(collection_name.clone())
                                 .query(queries[idx].clone())
@@ -1839,8 +1986,7 @@ mod tests {
         build_payload_index_params, build_qdrant_filter, parse_compression_ratio,
         parse_qdrant_metrics, parse_rfc3339_timestamp, IndexParams, QdrantEngine,
     };
-    use crate::config::{DatasetConfig, EngineConfig};
-    use crate::dataset::Dataset;
+    use crate::config::EngineConfig;
     use qdrant_client::qdrant::{condition::ConditionOneOf, CompressionRatio, FieldCondition};
     use serde_json::json;
 
@@ -1861,20 +2007,6 @@ mod tests {
         }))
         .expect("engine config should parse");
         QdrantEngine::new(&cfg, "localhost").expect("client construction is lazy")
-    }
-
-    fn dataset_with_schema(schema: serde_json::Value) -> Dataset {
-        Dataset::new(DatasetConfig {
-            name: "qdrant-unit-ds".to_string(),
-            dataset_type: Some("tar".to_string()),
-            path: json!("/nonexistent"),
-            distance: Some("cosine".to_string()),
-            vector_size: Some(4),
-            vector_count: None,
-            link: None,
-            schema: Some(schema),
-            description: None,
-        })
     }
 
     // ── collection_params.hnsw_config: the on-disk knobs ───────────────────
@@ -1997,20 +2129,27 @@ mod tests {
     #[test]
     fn payload_index_params_forward_on_disk_for_every_indexable_type() {
         let on_disk_only = json!({"on_disk": true});
-        for ft in ["int", "float", "geo", "text", "datetime"] {
+        for ft in ["int", "float", "geo", "datetime"] {
             let params = build_payload_index_params(ft, Some(&on_disk_only))
                 .unwrap_or_else(|| panic!("{ft} index must forward on_disk"));
             let forwarded = match params {
                 IndexParams::IntegerIndexParams(p) => p.on_disk,
                 IndexParams::FloatIndexParams(p) => p.on_disk,
                 IndexParams::GeoIndexParams(p) => p.on_disk,
-                IndexParams::TextIndexParams(p) => p.on_disk,
                 IndexParams::DatetimeIndexParams(p) => p.on_disk,
                 other => panic!("unexpected params for {ft}: {other:?}"),
             };
             assert_eq!(forwarded, Some(true), "{ft} dropped on_disk");
         }
         assert!(build_payload_index_params("nonsense", Some(&on_disk_only)).is_none());
+        // `text` is excluded on purpose: TextIndexParams.tokenizer is a REQUIRED
+        // proto field, so emitting the message to carry on_disk would pin the
+        // tokenizer to Unknown — either rejected (leaving no text index at all)
+        // or silently not the tokenizer the config asked for. The caller warns.
+        assert!(
+            build_payload_index_params("text", Some(&on_disk_only)).is_none(),
+            "text must not be sent with a defaulted tokenizer"
+        );
     }
 
     /// `"default"` must map to Qdrant's `Datatype::Default` (let the server
@@ -2066,19 +2205,52 @@ mod tests {
     /// neither case is escalated to an error.)
     #[test]
     fn payload_index_params_naming_unknown_field_warns_but_does_not_fail() {
-        let e = engine_with_collection_params(json!({
-            "payload_index_params": { "tenant_id": { "is_tenant": true } }
-        }));
-        assert!(
-            e.create_payload_indexes(&dataset_with_schema(json!({"a": "keyword"})))
-                .is_ok(),
-            "an unusable payload_index_params key must warn, not abort the run"
-        );
+        use super::payload_index_warnings;
 
-        // A dataset with NO schema declares no fields to index at all.
-        let mut no_schema = dataset_with_schema(json!({}));
-        no_schema.config.schema = None;
-        assert!(e.create_payload_indexes(&no_schema).is_ok());
+        let schema = json!({"a": "keyword", "price": "int"});
+        let schema = schema.as_object().unwrap();
+
+        // A key absent from the schema gets no index at all, so the spec is inert.
+        let params = json!({"tenant_id": {"is_tenant": true}});
+        let warnings = payload_index_warnings(Some(schema), params.as_object(), "ds");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("tenant_id") && warnings[0].contains("NOT in the schema"));
+
+        // `is_tenant` on a type that cannot carry it (int) — its on_disk still applies.
+        let params = json!({"price": {"is_tenant": true, "on_disk": true}});
+        let warnings = payload_index_warnings(Some(schema), params.as_object(), "ds");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("price") && warnings[0].contains("is_tenant is ignored"));
+
+        // Usable specs are silent, and so is no config at all.
+        let params = json!({"a": {"is_tenant": true, "on_disk": true}, "price": {"on_disk": true}});
+        assert!(payload_index_warnings(Some(schema), params.as_object(), "ds").is_empty());
+        assert!(payload_index_warnings(Some(schema), None, "ds").is_empty());
+        // No schema means nothing can be satisfied.
+        let params = json!({"a": {"on_disk": true}});
+        assert_eq!(
+            payload_index_warnings(None, params.as_object(), "ds").len(),
+            1
+        );
+    }
+
+    /// A sparse collection cannot honour hnsw_config or quantization_config, and
+    /// the warning is the ONLY signal that a run named `*-bq` is not quantized —
+    /// so assert the strings, not merely that configure() returned Ok.
+    #[test]
+    fn sparse_collection_warns_about_knobs_it_cannot_honour() {
+        use super::sparse_ignored_warnings;
+
+        assert!(sparse_ignored_warnings(false, false, "ds").is_empty());
+
+        let both = sparse_ignored_warnings(true, true, "msmarco-sparse-1M");
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both[0].contains("hnsw_config") && both[0].contains("msmarco-sparse-1M"));
+        assert!(
+            both[1].contains("NOT quantized"),
+            "the quantization warning must say the run is not quantized: {}",
+            both[1]
+        );
     }
 
     #[test]

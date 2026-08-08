@@ -403,18 +403,14 @@ impl Engine for PgVectorEngine {
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
 
-        // Extract hnsw_ef from search params
+        // Extract hnsw_ef from search params: the typed `ef` field first, then
+        // `hnsw_ef` in either placement (nested under `search_params`/`config`,
+        // or flat) via knob().
         let hnsw_ef = params
             .search_params
             .as_ref()
-            .and_then(|sp| {
-                sp.ef.or_else(|| {
-                    sp.extra
-                        .as_ref()
-                        .and_then(|e| e.get("hnsw_ef"))
-                        .and_then(|v| v.as_i64())
-                })
-            })
+            .and_then(|sp| sp.ef)
+            .or_else(|| params.knob("hnsw_ef").and_then(|v| v.as_i64()))
             .unwrap_or(128);
 
         let query_path = dataset.get_path()?;

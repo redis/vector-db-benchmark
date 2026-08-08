@@ -265,6 +265,17 @@ pub fn write_gt_neighbours(path: &str, rows: &[Vec<i64>]) -> Result<(), String> 
     if rows.iter().any(|r| r.len() != d) {
         return Err("ground-truth rows must all have the same length".to_string());
     }
+    // Refuse to write a shape our own reader rejects. `n > 0, d == 0` produces an
+    // 8-byte file that satisfies the length check while carrying no ground truth,
+    // so `read_gt_neighbours` errors on it — a writer that can emit input its
+    // reader calls corrupt is the defect, not an accepted asymmetry.
+    if d == 0 && !rows.is_empty() {
+        return Err(format!(
+            "cannot write ground truth for {} queries with 0 neighbours each: the format \
+             cannot represent it (and read_gt_neighbours rejects it)",
+            rows.len()
+        ));
+    }
     if let Some(bad) = rows
         .iter()
         .flatten()
@@ -499,6 +510,42 @@ mod tests {
         b.extend_from_slice(&u32::MAX.to_le_bytes());
         let f = write_tmp(&b);
         assert!(read_gt_neighbours(f.path().to_str().unwrap()).is_err());
+    }
+
+    /// The on-disk id field is int32. An out-of-range id must be REFUSED, not
+    /// truncated by `as i32` into a different (often negative) id, which would
+    /// make write→read non-identity and bake wrong ground truth into a fixture.
+    #[test]
+    fn gt_writer_rejects_ids_outside_i32() {
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_range_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        for bad in [i64::from(i32::MAX) + 1, i64::from(i32::MIN) - 1, i64::MAX] {
+            let err = write_gt_neighbours(&path, &[vec![1i64, bad]]).unwrap_err();
+            assert!(err.contains("int32"), "id {bad}: {err}");
+        }
+        // In-range values, including the -1 padding sentinel, are fine.
+        assert!(write_gt_neighbours(&path, &[vec![-1i64, i64::from(i32::MAX)]]).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The writer must not emit a shape its own reader rejects: `n > 0, d == 0`
+    /// is an 8-byte file that passes the length check while carrying no ground
+    /// truth, so refusing it at the writer keeps the codec self-consistent.
+    #[test]
+    fn gt_writer_rejects_zero_width_rows() {
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_zerow_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let err = write_gt_neighbours(&path, &[vec![], vec![]]).unwrap_err();
+        assert!(err.contains("0 neighbours"), "got: {err}");
+        // No rows at all is legitimately empty and still writes.
+        assert!(write_gt_neighbours(&path, &[]).is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -953,11 +953,9 @@ impl VertexEngine {
                 self.approx_neighbors,
                 top,
             );
+        // Nested or flat placement — see SearchParams::knob.
         let fraction_leaf_override: Option<f64> = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.extra.as_ref())
-            .and_then(|e| e.get("fraction_leaf_nodes_to_search_override"))
+            .knob("fraction_leaf_nodes_to_search_override")
             .and_then(|v| v.as_f64());
         match fraction_leaf_override {
             Some(f) => println!(
