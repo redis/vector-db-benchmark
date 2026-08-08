@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use vector_db_benchmark::readers::{write_npy_vectors, write_sparse_matrix};
+use vector_db_benchmark::readers::{write_gt_neighbours, write_npy_vectors, write_sparse_matrix};
 use vector_db_benchmark::synthetic::{generate_hybrid, generate_sparse, HybridData, SparseData};
 
 /// Keyword values assigned round-robin to documents by `id % 4`.
@@ -754,6 +754,25 @@ pub fn write_datetime_project(
     engine_configs_json: &str,
     dim: usize,
 ) -> FilterProject {
+    write_datetime_project_metric(dataset_name, engine_configs_json, dim, GtMetric::L2)
+}
+
+/// Cosine-ground-truth variant of [`write_datetime_project`] for engines that
+/// rank by cosine similarity (VectorSets).
+pub fn write_datetime_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_datetime_project_metric(dataset_name, engine_configs_json, dim, GtMetric::Cosine)
+}
+
+fn write_datetime_project_metric(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    metric: GtMetric,
+) -> FilterProject {
     use chrono::{Duration, TimeZone, Utc};
     let base = Utc.timestamp_opt(1_609_459_200, 0).unwrap(); // 2021-01-01T00:00:00Z
     let iso_for = move |day: i64| (base + Duration::days(day)).to_rfc3339();
@@ -763,11 +782,48 @@ pub fn write_datetime_project(
         dataset_name,
         engine_configs_json,
         dim,
-        GtMetric::L2,
+        metric,
         serde_json::json!({ "ts": "datetime" }),
         move |id| serde_json::json!({ "ts": iso_for(id as i64) }),
         serde_json::json!({ "and": [ { "ts": { "range": { "gte": gte, "lt": lt } } } ] }),
         |id| (100..300).contains(&id),
+    )
+}
+
+/// Same ISO-8601 timestamps as [`write_datetime_project`], but the schema
+/// declares `ts` as **`keyword`**, not `datetime`, and the query carries a
+/// **one-sided** `lt` bound.
+///
+/// This is the fixture for the storage-vs-filter DISAGREEMENT (PR #230 review
+/// M2): an engine that decides "is this a datetime?" from the SCHEMA on the
+/// storage side but from the VALUE on the filter side stores an ISO string here
+/// while comparing against an epoch number. VectorSets coerces a non-numeric
+/// attribute to `0` in a numeric comparison, so `.ts < <epoch>` then matches
+/// EVERY document — the query runs effectively unfiltered, with exit code 0 and
+/// no warning. Only recall detects it (measured live on redis 8.8: 0.800
+/// schema-gated vs 1.000 once both halves agree).
+///
+/// The one-sided bound is deliberate: a two-sided range degrades to zero hits,
+/// which is far more likely to be noticed. This is the quiet direction.
+pub fn write_datetime_keyword_schema_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    use chrono::{Duration, TimeZone, Utc};
+    let base = Utc.timestamp_opt(1_609_459_200, 0).unwrap(); // 2021-01-01T00:00:00Z
+    let iso_for = move |day: i64| (base + Duration::days(day)).to_rfc3339();
+    let lt = iso_for(200);
+    write_filter_project(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        GtMetric::Cosine,
+        // NOT "datetime" — the whole point of the fixture.
+        serde_json::json!({ "ts": "keyword" }),
+        move |id| serde_json::json!({ "ts": iso_for(id as i64) }),
+        serde_json::json!({ "and": [ { "ts": { "range": { "lt": lt } } } ] }),
+        |id| id < 200,
     )
 }
 
@@ -894,11 +950,30 @@ pub fn write_nested_filter_project(
     engine_configs_json: &str,
     dim: usize,
 ) -> FilterProject {
+    write_nested_filter_project_metric(dataset_name, engine_configs_json, dim, GtMetric::L2)
+}
+
+/// Cosine-ground-truth variant of [`write_nested_filter_project`] for engines
+/// that rank by cosine similarity (VectorSets).
+pub fn write_nested_filter_cosine_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_nested_filter_project_metric(dataset_name, engine_configs_json, dim, GtMetric::Cosine)
+}
+
+fn write_nested_filter_project_metric(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    metric: GtMetric,
+) -> FilterProject {
     write_filter_project(
         dataset_name,
         engine_configs_json,
         dim,
-        GtMetric::L2,
+        metric,
         serde_json::json!({ "color": "keyword", "size": "int" }),
         move |id| {
             serde_json::json!({
@@ -1045,6 +1120,27 @@ pub struct SparseProject {
 /// dot-product (descending) ground truth. `engine_configs_json` is the verbatim
 /// `experiments/configurations/test.json`.
 pub fn write_sparse_project(dataset_name: &str, engine_configs_json: &str) -> SparseProject {
+    write_sparse_project_with_gt(dataset_name, engine_configs_json, false)
+}
+
+/// Same fixture, but the ground truth is written as the BINARY `results.gt`
+/// block the public `msmarco-sparse-*` datasets ship, with no `neighbours.jsonl`
+/// at all.
+///
+/// This is the only end-to-end exercise of the `results.gt` branch. Without it
+/// nothing proves the ids inside `results.gt` are 0-based row indices matching
+/// the ids the uploader assigns from `data.csr` row order — if they were 1-based
+/// (or document ids), recall on a published `msmarco-sparse-1M` run would be
+/// near zero and every other test in this repo would still be green.
+pub fn write_sparse_project_gt(dataset_name: &str, engine_configs_json: &str) -> SparseProject {
+    write_sparse_project_with_gt(dataset_name, engine_configs_json, true)
+}
+
+fn write_sparse_project_with_gt(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    binary_gt: bool,
+) -> SparseProject {
     const DIM: usize = 300;
     const NNZ: usize = 10;
     const N: usize = 150;
@@ -1070,7 +1166,11 @@ pub fn write_sparse_project(dataset_name: &str, engine_configs_json: &str) -> Sp
     fs::create_dir_all(root.join("results")).unwrap();
     write_sparse_matrix(ds_dir.join("data.csr").to_str().unwrap(), &data).unwrap();
     write_sparse_matrix(ds_dir.join("queries.csr").to_str().unwrap(), &queries).unwrap();
-    write_neighbours(&ds_dir, &neighbors);
+    if binary_gt {
+        write_gt_neighbours(ds_dir.join("results.gt").to_str().unwrap(), &neighbors).unwrap();
+    } else {
+        write_neighbours(&ds_dir, &neighbors);
+    }
 
     let datasets_json = serde_json::json!([{
         "name": dataset_name, "type": "sparse", "path": dataset_name,

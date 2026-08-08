@@ -178,6 +178,134 @@ pub fn write_sparse_matrix(path: &str, rows: &[SparseVector]) -> Result<(), Stri
     Ok(())
 }
 
+/// Read a binary k-NN ground-truth file (`results.gt`), the format shipped by
+/// the public `msmarco-sparse-*` datasets and produced by upstream's
+/// `knn_result_read`:
+///
+/// ```text
+/// [ n: u32 ][ d: u32 ]
+/// [ ids:    i32 × (n × d) ]
+/// [ scores: f32 × (n × d) ]
+/// ```
+///
+/// `n` is the query count and `d` the neighbours per query. Only the ids are
+/// returned — recall is computed from ids alone, and the scores block is
+/// engine-independent.
+///
+/// The file length MUST be exactly `8 + n*d*8`. A truncated or mis-declared file
+/// is rejected rather than read short: short ground truth silently DEFLATES
+/// measured recall, which is worse than a failed run.
+///
+/// `d == 0` alongside `n > 0` is rejected for the same reason. It would otherwise
+/// pass the length check (an 8-byte file can legitimately claim any `n` when
+/// `n*d == 0`) and yield ZERO rows for a non-empty query set — a silent empty
+/// ground truth, exactly what the length check exists to prevent.
+///
+/// Note the length check constrains only the PRODUCT `n*d`, so it cannot by
+/// itself detect a transposed header — (n=2, d=4) and (n=4, d=2) have identical
+/// byte lengths. `Dataset::read_sparse_queries` pins `n` against the real query
+/// count, which then pins `d` too; this reader alone is not sufficient.
+pub fn read_gt_neighbours(path: &str) -> Result<Vec<Vec<i64>>, String> {
+    let file = File::open(Path::new(path)).map_err(|e| format!("open {}: {}", path, e))?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut r = BufReader::new(file);
+
+    let mut header = [0u8; 8];
+    r.read_exact(&mut header)
+        .map_err(|e| format!("read {} header: {}", path, e))?;
+    let n = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let d = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+
+    // Zero neighbours per query for a non-empty query set is a mis-declared
+    // header, not an empty result — reject before the length check, which cannot
+    // distinguish it (n*d == 0 for ANY n).
+    if d == 0 && n > 0 {
+        return Err(format!(
+            "ground-truth {} declares {} queries but 0 neighbours each",
+            path, n
+        ));
+    }
+
+    let count = n
+        .checked_mul(d)
+        .ok_or_else(|| format!("ground-truth n*d overflow in {}", path))?;
+    // 4 bytes per id + 4 per score, plus the 8-byte header.
+    let expected = count
+        .checked_mul(8)
+        .and_then(|b| b.checked_add(8))
+        .ok_or_else(|| format!("ground-truth size overflow in {}", path))?;
+    if expected as u64 != file_len {
+        return Err(format!(
+            "ground-truth {} declares {} queries × {} neighbours ({} bytes) but the file is {} bytes",
+            path, n, d, expected, file_len
+        ));
+    }
+
+    // `read_u32_array` read_exact's a `count * 4` buffer, so it returns exactly
+    // `count` ids or errors — no short-read check needed here.
+    let ids = read_u32_array(&mut r, count, file_len, i32::from_le_bytes)?;
+    // `d > 0` is guaranteed above whenever there is anything to chunk, so this
+    // yields exactly `n` rows of `d` ids.
+    Ok(ids
+        .chunks(d.max(1))
+        .map(|c| c.iter().map(|&i| i as i64).collect())
+        .collect())
+}
+
+/// Write a `results.gt` ground-truth file (used by tests / fixtures). Every row
+/// must have the same neighbour count, as the format stores a single `d`.
+///
+/// Ids must fit in `i32` — the on-disk format is int32. An out-of-range id is
+/// REJECTED rather than truncated: `id as i32` would silently write a different
+/// (often negative) id, so `write` then `read` would not round-trip and a fixture
+/// would carry ground truth nobody wrote.
+pub fn write_gt_neighbours(path: &str, rows: &[Vec<i64>]) -> Result<(), String> {
+    use std::io::Write;
+    let d = rows.first().map(|r| r.len()).unwrap_or(0);
+    if rows.iter().any(|r| r.len() != d) {
+        return Err("ground-truth rows must all have the same length".to_string());
+    }
+    // Refuse to write a shape our own reader rejects. `n > 0, d == 0` produces an
+    // 8-byte file that satisfies the length check while carrying no ground truth,
+    // so `read_gt_neighbours` errors on it — a writer that can emit input its
+    // reader calls corrupt is the defect, not an accepted asymmetry.
+    if d == 0 && !rows.is_empty() {
+        return Err(format!(
+            "cannot write ground truth for {} queries with 0 neighbours each: the format \
+             cannot represent it (and read_gt_neighbours rejects it)",
+            rows.len()
+        ));
+    }
+    if let Some(bad) = rows
+        .iter()
+        .flatten()
+        .find(|&&id| i32::try_from(id).is_err())
+    {
+        return Err(format!(
+            "ground-truth id {} does not fit in the format's int32 id field",
+            bad
+        ));
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(d as u32).to_le_bytes());
+    for row in rows {
+        for &id in row {
+            buf.extend_from_slice(&(id as i32).to_le_bytes());
+        }
+    }
+    // Scores are not read back, but the block must exist for the length check.
+    for row in rows {
+        for _ in row {
+            buf.extend_from_slice(&0f32.to_le_bytes());
+        }
+    }
+    let mut f = File::create(Path::new(path)).map_err(|e| e.to_string())?;
+    f.write_all(&buf).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +420,184 @@ mod tests {
         b.extend_from_slice(&nnz.to_le_bytes()); // index_pointer[0] == nnz
         let f = write_tmp(&b);
         assert!(read_sparse_matrix(f.path().to_str().unwrap()).is_err());
+    }
+
+    // ---- results.gt (binary ground truth) ----
+
+    /// GOLDEN test: hand-written bytes, no writer involved.
+    ///
+    /// `round_trips_gt_neighbours` below CANNOT catch a wrong on-disk format —
+    /// `write_gt_neighbours` is a test-only encoder written against the same
+    /// assumptions as the decoder, so flipping BOTH to big-endian ids (or
+    /// swapping the ids and scores blocks) leaves the round-trip green. These
+    /// bytes pin the layout the real `msmacro-sparse-*.tar.gz` files use:
+    /// `[n: u32 LE][d: u32 LE][ids: i32 LE × n·d][scores: f32 × n·d]`, verified
+    /// byte-for-byte against the real 100K download (n=6980, d=10, file length
+    /// 558408 == 8 + 6980*10*8).
+    #[test]
+    fn gt_decodes_a_literal_little_endian_fixture() {
+        #[rustfmt::skip]
+        let bytes: &[u8] = &[
+            // header: n = 2, d = 3
+            0x02, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00,
+            // ids row 0: 1, 256, 65536  (each distinguishes LE from BE)
+            0x01, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x00,
+            // ids row 1: 0, 16777216, 2147483647 (i32::MAX)
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+            0xff, 0xff, 0xff, 0x7f,
+            // scores block: 6 f32. Never read, but it must FOLLOW the ids — if
+            // the two blocks were swapped these zero bytes would decode as ids.
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let f = write_tmp(bytes);
+        assert_eq!(
+            read_gt_neighbours(f.path().to_str().unwrap()).unwrap(),
+            vec![vec![1i64, 256, 65536], vec![0, 16_777_216, 2_147_483_647]],
+            "results.gt ids must be parsed as little-endian i32, ids block first"
+        );
+    }
+
+    #[test]
+    fn round_trips_gt_neighbours() {
+        let rows = vec![vec![7i64, 3, 11], vec![0, 1, 2]];
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_test_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        write_gt_neighbours(&path, &rows).unwrap();
+        let read = read_gt_neighbours(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read, rows);
+    }
+
+    #[test]
+    fn gt_empty_file_reads_as_no_queries() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u32.to_le_bytes()); // n = 0
+        b.extend_from_slice(&0u32.to_le_bytes()); // d = 0
+        let f = write_tmp(&b);
+        assert_eq!(
+            read_gt_neighbours(f.path().to_str().unwrap()).unwrap(),
+            Vec::<Vec<i64>>::new()
+        );
+    }
+
+    /// `n > 0, d = 0` is an 8-byte file that SATISFIES the length check (n*d == 0
+    /// for any n) and would otherwise return zero rows for a non-empty query set
+    /// — a silent empty ground truth, which is precisely what the length check is
+    /// there to prevent.
+    #[test]
+    fn gt_rejects_zero_neighbours_for_nonempty_query_set() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1000u32.to_le_bytes()); // n = 1000
+        b.extend_from_slice(&0u32.to_le_bytes()); // d = 0
+        let f = write_tmp(&b);
+        let err = read_gt_neighbours(f.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("0 neighbours"),
+            "expected a 0-neighbours rejection, got: {}",
+            err
+        );
+    }
+
+    /// The length check constrains only the product n*d, so a transposed header
+    /// is byte-identical and parses "successfully" here. Documenting that limit
+    /// in a test: the real defence is the query-count check in
+    /// `Dataset::read_sparse_queries`, not this reader.
+    #[test]
+    fn gt_cannot_detect_a_transposed_header_alone() {
+        let rows = vec![vec![0i64, 1, 2, 3], vec![4, 5, 6, 7]];
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_shape_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        write_gt_neighbours(&path, &rows).unwrap(); // (n=2, d=4)
+        let read = read_gt_neighbours(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // Same 8 ids could equally be 4 rows of 2; this reader takes the header's
+        // word for it.
+        assert_eq!(read, rows);
+        assert_eq!(read.len(), 2, "header shape is trusted at this layer");
+    }
+
+    /// A header promising more neighbours than the file holds must Err. Reading
+    /// it short would silently deflate recall for every engine.
+    #[test]
+    fn gt_rejects_truncated_file() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u32.to_le_bytes()); // n = 2
+        b.extend_from_slice(&10u32.to_le_bytes()); // d = 10 -> needs 8 + 160 bytes
+        b.extend_from_slice(&1i32.to_le_bytes()); // only one id present
+        let f = write_tmp(&b);
+        let err = read_gt_neighbours(f.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("but the file is"), "unexpected error: {}", err);
+    }
+
+    /// A header whose n*d overflows must Err, not wrap or OOM.
+    #[test]
+    fn gt_rejects_size_overflow() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        let f = write_tmp(&b);
+        assert!(read_gt_neighbours(f.path().to_str().unwrap()).is_err());
+    }
+
+    /// The on-disk id field is int32. An out-of-range id must be REFUSED, not
+    /// truncated by `as i32` into a different (often negative) id, which would
+    /// make write→read non-identity and bake wrong ground truth into a fixture.
+    #[test]
+    fn gt_writer_rejects_ids_outside_i32() {
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_range_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        for bad in [i64::from(i32::MAX) + 1, i64::from(i32::MIN) - 1, i64::MAX] {
+            let err = write_gt_neighbours(&path, &[vec![1i64, bad]]).unwrap_err();
+            assert!(err.contains("int32"), "id {bad}: {err}");
+        }
+        // In-range values, including the -1 padding sentinel, are fine.
+        assert!(write_gt_neighbours(&path, &[vec![-1i64, i64::from(i32::MAX)]]).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The writer must not emit a shape its own reader rejects: `n > 0, d == 0`
+    /// is an 8-byte file that passes the length check while carrying no ground
+    /// truth, so refusing it at the writer keeps the codec self-consistent.
+    #[test]
+    fn gt_writer_rejects_zero_width_rows() {
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_zerow_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let err = write_gt_neighbours(&path, &[vec![], vec![]]).unwrap_err();
+        assert!(err.contains("0 neighbours"), "got: {err}");
+        // No rows at all is legitimately empty and still writes.
+        assert!(write_gt_neighbours(&path, &[]).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gt_writer_rejects_ragged_rows() {
+        let path = std::env::temp_dir()
+            .join(format!("vdb_gt_ragged_{}.gt", std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(write_gt_neighbours(&path, &[vec![1i64, 2], vec![3]]).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

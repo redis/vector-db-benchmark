@@ -103,7 +103,9 @@ fn test_es_create_index_l2() {
             "index": {
                 "number_of_shards": 1,
                 "number_of_replicas": 0,
-                "refresh_interval": "10s"
+                // Mirrors the engine's production settings (#240): no periodic
+                // refresh during ingest, matching OpenSearch and upstream.
+                "refresh_interval": -1
             }
         },
         "mappings": {

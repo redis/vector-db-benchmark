@@ -2432,6 +2432,20 @@ fn test_binary_redis_shared_corpus_upload_once() {
         stdout
     );
 
+    // ...but it must still have WAITED for its own index to backfill. Its index
+    // is created over an already-populated keyspace, so RediSearch fills it
+    // asynchronously: FT.INFO reports ~1% indexed for a beat after FT.CREATE.
+    // A skipping config that returned without waiting searched a half-built
+    // index and reported low recall with no error — visible only as a flaky
+    // `rb` below, which is a silent wrong result on a real sweep. Asserting the
+    // wait ran is deterministic, unlike the recall threshold it protects.
+    assert!(
+        stdout.contains("Index time (backfill over the shared corpus)"),
+        "the config that skipped the re-upload must still wait for its index to \
+         backfill before searching; stdout:\n{}",
+        stdout
+    );
+
     // Both configs' indexes work over the shared corpus.
     let ra = common::read_recall(&proj.root, "redis-sc-a");
     let rb = common::read_recall(&proj.root, "redis-sc-b");

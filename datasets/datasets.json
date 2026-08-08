@@ -993,6 +993,16 @@
     "description": "Knowledge embeddings"
   },
   {
+    "name": "dbpedia-openai-100K-1536-angular",
+    "vector_size": 1536,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "dbpedia-openai-100K-1536-angular/dbpedia_openai_100K",
+    "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/dbpedia_openai_100K.tgz",
+    "vector_count": 100000,
+    "description": "Knowledge embeddings, 100K subset of the UPSTREAM dbpedia_openai_1M corpus (ann-filtered-benchmark bucket) — NOT a subset of the neighbouring dbpedia-openai-1M-* entries, which come from a different embedding model (text-embedding-3-large, redislabs bucket) even at the same 1536 dimensions, so numbers are not comparable across the two families. This is the dataset that upstream's continuous benchmark runs, so results here are directly comparable with published qdrant/vector-db-benchmark numbers; it is also small enough for a quick end-to-end run."
+  },
+  {
     "name": "dbpedia-openai-1M-1536-angular",
     "vector_size": 1536,
     "distance": "cosine",
@@ -1065,7 +1075,7 @@
       "garment_group_name": "keyword",
       "detail_desc": "text"
     },
-    "vector_count": 105542,
+    "vector_count": 105100,
     "description": "Fashion product embeddings"
   },
   {
@@ -1075,7 +1085,7 @@
     "type": "tar",
     "path": "h-and-m-2048-angular-no-filters/hnm_no_filters",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/hnm_no_filters.tgz",
-    "vector_count": 105542,
+    "vector_count": 105100,
     "description": "Fashion product embeddings"
   },
   {
@@ -1090,7 +1100,7 @@
       "labels": "keyword",
       "submitter": "keyword"
     },
-    "vector_count": 2205995,
+    "vector_count": 2138591,
     "description": "Academic paper embeddings"
   },
   {
@@ -1100,7 +1110,7 @@
     "type": "tar",
     "path": "arxiv-titles-384-angular/arxiv_no_filters",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/arxiv_no_filters.tar.gz",
-    "vector_count": 2205995,
+    "vector_count": 2138591,
     "description": "Academic paper embeddings"
   },
   {
@@ -1324,7 +1334,7 @@
       "a": "keyword",
       "b": "keyword"
     },
-    "vector_count": 100,
+    "vector_count": 1000000,
     "description": "Synthetic data"
   },
   {
@@ -1334,7 +1344,7 @@
     "type": "tar",
     "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/random_keywords_1m_vocab_10_no_filters.tgz",
     "path": "random-100-match-kw-small-vocab/random_keywords_1m_vocab_10_no_filters",
-    "vector_count": 100,
+    "vector_count": 1000000,
     "description": "Synthetic data"
   },
   {
@@ -1347,6 +1357,19 @@
       "tenant": "keyword"
     },
     "description": "Multi-tenancy: many tenants share ONE index; every query is scoped to a single tenant via an exact keyword match on the `tenant` field (schema tenant:keyword), with recall measured against the nearest neighbours WITHIN that tenant only. Analogous to upstream qdrant/vector-db-benchmark random-768-*-tenants. NOTE: locally-generated placeholder — no public download link yet (follow-up), so selecting this name without local files errors by design; the multi-tenancy engine path is exercised end-to-end by the tenancy integration tests (tests/common write_tenant_project + test_binary_{redis,valkey}_tenancy)."
+  },
+  {
+    "name": "random-768-100-tenants",
+    "vector_size": 768,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "random-768-100-tenants/random_keywords_1m_768_vocab_100",
+    "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/random_keywords_1m_768_vocab_100.tgz",
+    "schema": {
+      "a": "keyword"
+    },
+    "vector_count": 1000000,
+    "description": "Multi-tenancy at 100 tenants: 1M points share ONE index and every query is scoped to a single tenant by an exact keyword match on `a`, with recall measured within that tenant only. Unlike random-768-25-tenants (locally generated, no link) this one DOWNLOADS, so it is the reproducible multi-tenancy run. The tenant field is `a`, matching the upstream tarball. NOTE: it ships only 200 test queries (25 neighbours each, 2 queries per tenant), so tail percentiles are computed from 200 samples — far fewer than the 5k-10k of the other sets; raise --repetitions if you need a stable p99."
   },
   {
     "name": "cohere-768-1M",
@@ -1367,6 +1390,24 @@
     "link": "https://dbyiw3u3rf9yr.cloudfront.net/corpora/vectorsearch/cohere-wikipedia-22-12-en-embeddings/documents-10m.hdf5.bz2",
     "vector_count": 10000000,
     "description": "Wikipedia embeddings"
+  },
+  {
+    "name": "msmarco-sparse-100K",
+    "distance": "dot",
+    "type": "sparse",
+    "path": "msmarco-sparse/100K",
+    "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-100K.tar.gz",
+    "vector_count": 100000,
+    "description": "MS MARCO learned-sparse (SPLADE-style) embeddings — the public sparse benchmark used upstream. Ships data.csr + queries.csr + binary results.gt ground truth; no vector_size, because nothing needs it: Qdrant's sparse collection takes no dimension, and every other engine refuses type=sparse outright. (The CSR header does declare ncol=30109; the readers do not surface it.) Scored by dot product (MIPS), not cosine — checked by hand against the scores in results.gt. Qdrant is the only engine with a sparse path. DO NOT 'fix' the msmacro/msmarco transposition in the link: 'msmacro-sparse-100K.tar.gz' is the real object name in the bucket (msmacro -> HTTP 200, msmarco -> HTTP 404). Only the dataset NAME is spelled correctly."
+  },
+  {
+    "name": "msmarco-sparse-1M",
+    "distance": "dot",
+    "type": "sparse",
+    "path": "msmarco-sparse/1M",
+    "link": "https://storage.googleapis.com/ann-filtered-benchmark/datasets/msmacro-sparse-1M.tar.gz",
+    "vector_count": 1000000,
+    "description": "1M-point variant of msmarco-sparse-100K, sharing the identical 6980-query set. Same layout (data.csr + queries.csr + results.gt), dot/MIPS scoring. Qdrant is the only engine with a sparse path. Same 'msmacro' link spelling as the 100K entry — the real object name, not a typo to fix. Because both sizes ship the SAME 6980 queries, a results.gt from the wrong size passes every row-count check; the reader guards this by rejecting ground-truth ids >= vector_count."
   },
   {
     "name": "synthetic-sparse-300",

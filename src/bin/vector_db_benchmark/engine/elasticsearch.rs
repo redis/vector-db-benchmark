@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use elasticsearch::http::request::JsonBody;
 use elasticsearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
-use elasticsearch::indices::{IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts};
+use elasticsearch::indices::{
+    IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts, IndicesRefreshParts,
+};
 use elasticsearch::params::WaitForStatus;
 use elasticsearch::{BulkParts, Elasticsearch, SearchParts};
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
@@ -18,6 +20,20 @@ use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
 use vector_db_benchmark::readers::metadata::MetadataItem;
+
+/// Shard count this engine creates its index with. Not configurable: it is
+/// pinned so an ES run is reproducible across cluster versions and deployments,
+/// whatever their per-index default happens to be.
+///
+/// It is a named constant rather than a literal because it is a *cross-engine*
+/// invariant, not a local choice: the shipped `opensearch-single-node.json` pins
+/// the same value so the published ES-vs-OS head-to-head compares two indexes
+/// with the same shard count (#211), and
+/// `opensearch::tests::shipped_opensearch_configs_pin_their_shard_count`
+/// asserts that equality against this constant. Changing this number therefore
+/// fails that test until the OpenSearch config is moved with it, instead of
+/// silently desynchronising the pairing.
+pub(crate) const ES_NUMBER_OF_SHARDS: i64 = 1;
 
 /// Elasticsearch engine configuration parsed from JSON
 #[derive(Clone)]
@@ -193,11 +209,7 @@ impl ElasticsearchEngine {
 
         let body = serde_json::json!({
             "settings": {
-                "index": {
-                    "number_of_shards": 1,
-                    "number_of_replicas": 0,
-                    "refresh_interval": "10s",
-                }
+                "index": build_index_settings(),
             },
             "mappings": {
                 "_source": { "excludes": ["vector"] },
@@ -307,6 +319,52 @@ impl ElasticsearchEngine {
         Ok(())
     }
 
+    /// Make just-uploaded documents searchable.
+    ///
+    /// Required because `build_index_settings` sets `refresh_interval: -1`: with
+    /// no periodic refresh, documents sitting in the in-memory buffer are not
+    /// visible to search. An explicit `_refresh` is also *not* implied by the
+    /// force-merge that follows — force-merge rewrites segments, it does not
+    /// promise to reopen the searcher — and ES's "search idle" auto-refresh
+    /// escape hatch does not apply to an index with an explicit
+    /// `refresh_interval`. So this call is the thing that guarantees the search
+    /// phase sees the full corpus. Mirrors `opensearch.rs::refresh`.
+    ///
+    /// Retried on the same budget as force-merge: it runs after the whole
+    /// ingest, and failing it un-retried would discard a long upload.
+    fn refresh(&self) -> Result<(), String> {
+        println!("Refreshing index...");
+
+        let max_retries = 30;
+        let mut last_err = String::new();
+        for attempt in 0..=max_retries {
+            let result = self.rt.block_on(
+                self.client
+                    .indices()
+                    .refresh(IndicesRefreshParts::Index(&[&self.index_name]))
+                    .send(),
+            );
+
+            match result {
+                Ok(resp) if resp.status_code().is_success() => return Ok(()),
+                Ok(resp) => {
+                    last_err = format!("status {}", resp.status_code());
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+
+            if attempt < max_retries {
+                println!("Refresh retry {}/{}: {}", attempt, max_retries, last_err);
+            }
+        }
+        Err(format!(
+            "Refresh failed after {} retries: {}",
+            max_retries, last_err
+        ))
+    }
+
     fn force_merge(&self) -> Result<(), String> {
         println!("Forcing merge into 1 segment...");
 
@@ -376,6 +434,37 @@ impl ElasticsearchEngine {
         }
         Err("Elasticsearch cluster did not reach yellow status in time".to_string())
     }
+}
+
+/// Index-level settings applied at create time.
+///
+/// `refresh_interval: -1` disables periodic refresh for the duration of the
+/// benchmark. The whole dataset is indexed in one bulk phase, so a background
+/// refresh every N seconds only buys visibility nobody reads. Upstream qdrant's
+/// reference tool does the same for Elasticsearch
+/// (`engine/clients/elasticsearch/configure.py`: *"no refresh is required
+/// because we index all the data at once"*), and `opensearch.rs` already did.
+///
+/// The reason is **comparability, not throughput** (#240). Measured live, `-1`
+/// does ~5x fewer refreshes and cuts ~2.5x fewer segments during ingest, but it
+/// does NOT reliably make the upload phase faster: on an HNSW field, frequent
+/// refreshes cut many *small* segments, and k small graphs over n/k docs each
+/// cost `n·log(n/k)` — cheaper per document than the few large graphs `-1`
+/// builds. The setting moves HNSW construction between the ingest and merge
+/// phases more than it removes it. What the old `10s` actually broke was the
+/// ES-vs-OS head-to-head: the two engines ingested under different index
+/// configurations, exactly like the shard-count mismatch `ES_NUMBER_OF_SHARDS`
+/// above fixes (#211/#235). Do not "restore" `10s` chasing an upload number.
+///
+/// Because nothing refreshes on a timer any more, `upload()` MUST issue an
+/// explicit `_refresh` before the search phase (see `ElasticsearchEngine::refresh`).
+fn build_index_settings() -> serde_json::Value {
+    serde_json::json!({
+        // Cross-engine invariant, not a local choice — see the constant's docs.
+        "number_of_shards": ES_NUMBER_OF_SHARDS,
+        "number_of_replicas": 0,
+        "refresh_interval": -1,
+    })
 }
 
 /// Build the base URL with authentication from env vars.
@@ -857,10 +946,14 @@ impl Engine for ElasticsearchEngine {
             vectors.len() as f64 / upload_time
         );
 
-        // Force merge post-upload. Include the merge/index-settle time in
-        // total_time for cross-engine comparability (mirrors mongodb; matches
-        // v0's post_upload() timing).
+        // Explicit refresh (refresh_interval is disabled during upload) so the
+        // documents are searchable, then merge segments. Include this
+        // refresh+merge time in total_time for cross-engine comparability
+        // (mirrors opensearch/mongodb; matches v0's post_upload() timing) — the
+        // refresh work is not removed from the measurement, only moved out of
+        // the concurrent ingest and accounted for once.
         let index_start = Instant::now();
+        self.refresh()?;
         self.force_merge()?;
         let index_time = index_start.elapsed().as_secs_f64();
 
@@ -887,7 +980,15 @@ impl Engine for ElasticsearchEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let num_candidates = params.num_candidates.unwrap_or(100);
+        // Upstream nests this under `config`; accept the nested spelling too so an
+        // upstream configuration does not silently fall back to 100. Nested is
+        // checked FIRST, matching SearchParams::knob's documented precedence —
+        // reading the typed flat field first would invert it for this one knob.
+        let num_candidates = params
+            .knob("num_candidates")
+            .and_then(|v| v.as_i64())
+            .or(params.num_candidates)
+            .unwrap_or(100);
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
@@ -1092,6 +1193,37 @@ impl Engine for ElasticsearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Periodic refresh must stay disabled during ingest. `10s` here made ES
+    /// ingest under a different index configuration than OpenSearch
+    /// (`refresh_interval: -1`) and than upstream qdrant's reference client, so
+    /// the published ES-vs-OS head-to-head was not apples-to-apples. Note this
+    /// is a *comparability* guard, not a throughput one — the measurement in
+    /// #240 found no reliable upload speedup from `-1` (see
+    /// `build_index_settings`), so a future "this makes upload slower, revert
+    /// it" is not a reason to restore `10s`. Regression guard for #240.
+    #[test]
+    fn index_settings_disable_periodic_refresh() {
+        let settings = build_index_settings();
+        assert_eq!(settings["refresh_interval"], serde_json::json!(-1));
+    }
+
+    /// The other half of the apples-to-apples ES-vs-OS pairing (#235): the shard
+    /// count actually sent must be the cross-engine constant, not a re-inlined
+    /// literal. Asserted against `ES_NUMBER_OF_SHARDS` rather than `1` on
+    /// purpose — hoisting the settings into `build_index_settings` is exactly
+    /// the kind of edit that could quietly drop the constant and desynchronise
+    /// the pairing that `opensearch::tests::shipped_opensearch_configs_pin_their_shard_count`
+    /// keys off.
+    #[test]
+    fn index_settings_pin_single_shard_no_replicas() {
+        let settings = build_index_settings();
+        assert_eq!(
+            settings["number_of_shards"],
+            serde_json::json!(ES_NUMBER_OF_SHARDS)
+        );
+        assert_eq!(settings["number_of_replicas"], serde_json::json!(0));
+    }
 
     /// Load-bearing: the hoisted request body (pre-serialized to a RawValue) must
     /// be byte-identical to what the old inline `.body(value)` path put on the

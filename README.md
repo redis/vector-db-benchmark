@@ -14,7 +14,7 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 | **PgVector** | `postgres` 0.19 + `pgvector` 0.4 | PostgreSQL | L2, Cosine | Yes |
 | **Weaviate** | `tonic` 0.12 / `prost` 0.13 (gRPC) + `reqwest` (REST) | gRPC (search) + HTTP/REST (schema) [\*\*](#weaviate-protocol-note) | L2, Cosine, Dot | Yes |
 | **Milvus** | `reqwest` (REST API v2) | HTTP/REST | L2, Cosine, IP | Yes |
-| **MongoDB** (Atlas Search) | `mongodb` 3 (sync) | MongoDB protocol | Euclidean, Cosine, Dot | Yes |
+| **MongoDB** (Atlas Search) | `mongodb` 3 (sync) | MongoDB protocol | Euclidean, Cosine, Dot | Yes [\*\*\*\*\*\*\*\*](#mongodb-note) |
 | **Valkey** (Valkey Search) | `redis` 1.3 [\*](#valkey-client-note) | RESP protocol | L2, Cosine, IP | Yes |
 | **Turbopuffer** | `turbopuffer-client` 0.0.4 | HTTP/REST (cloud) | Cosine, Euclidean | Yes |
 | **Dragonfly** (Dragonfly Search) | `redis` 1.3 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*](#dragonfly-note) |
@@ -38,12 +38,60 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 \*\*\*\*\* **Chroma note:** Uses **Chroma** (OSS) via its **v2 REST API** — a collection of records (`ids` + `embeddings` + scalar `metadatas`) queried with `query` + a `where` document. **Metadata filters** map directly onto the canonical model: `match` → `$eq`, `match_any` → `$in`, `range` → `$gte`/`$gt`/`$lte`/`$lt`, and **AND / OR / nested boolean** to Chroma's native `$and` / `$or` (which nest arbitrarily). Supported datatypes: **keyword, int, float, bool, uuid, datetime** (stored as epoch-seconds int, like Milvus, so numeric range operators apply). **Full-text** (`{match:{text}}`) is supported via `where_document` `$contains` — the `text`-typed field's value is uploaded as each record's Chroma `document`. **NOT supported** by Chroma's metadata engine (those conditions are dropped, like Dragonfly's documented limits): **geo-radius** and multi-valued **`labels` arrays** (Chroma metadata values are scalar only). Runs over HTTP/REST via Docker; set the host port with `CHROMA_PORT` (default `8000`, test compose maps `8003`), and optionally `CHROMA_COLLECTION` / `CHROMA_TENANT` / `CHROMA_DATABASE`. Distance space (`l2`/`cosine`/`ip`) is set per collection from the dataset metric.
 
 <a id="kividb-note"></a>
-\*\*\*\*\*\* **KiviDB note:** [KiviDB](https://kividb.io) is a Redis-wire-compatible (RESP2) data store that implements a RediSearch-compatible `FT.*` subset (`FT.CREATE`/`FT.SEARCH`/`FT.INFO`/`FT.DROPINDEX`, `VECTOR` HNSW/FLAT, `*=>[KNN k @field $blob AS score]`). Supports **vector KNN + metadata filtering** exactly like Redis/Valkey/Dragonfly: TAG/NUMERIC/TEXT datatypes, `match`/`match_any`/`range`, and AND/OR/nested boolean. **GEO** is not supported — unlike Dragonfly (which has a GEO field type but rejects this tool's `$param` geo bounds at the query-parser level), KiviDB's schema has no GEO field type at all, so geo fields are never declared or filtered (like Chroma/Milvus). KiviDB's `FT.CREATE` supports only the **float32** vector type. One real protocol difference worth knowing: KiviDB's `FT.INFO` does not expose RediSearch's `num_docs`/`percent_indexed` — it reports HNSW graph state directly instead (`hnsw_live_count`, `hnsw_compaction_in_progress`), because it builds each vector's HNSW entry synchronously inside the `HSET` that stores it (no async backfill phase exists to report progress on); `wait_for_indexing` polls those fields instead and returns immediately as a result. RESP2 only (no RESP3 opt-in). Set the host port with `KIVIDB_PORT` (default `6379`).
+\*\*\*\*\*\* **KiviDB note:** [KiviDB](https://kividb.io) is a Redis-wire-compatible (RESP2) data store that implements a RediSearch-compatible `FT.*` subset (`FT.CREATE`/`FT.SEARCH`/`FT.INFO`/`FT.DROPINDEX`, `VECTOR` HNSW/FLAT, `*=>[KNN k @field $blob AS score]`). Supports **vector KNN + metadata filtering**: TAG/NUMERIC/TEXT datatypes, `match`/`match_any`/`range` (inclusive **and** exclusive bounds), and AND/OR/nested boolean, all verified live against filtered ground truth. KiviDB genuinely **pre-filters** (measured recall ~1.0 down to ~2% filter selectivity), so its filtered numbers are meaningful. KiviDB's `FT.CREATE` supports only the **float32** vector type.
+
+The filter path is **not** the shared RediSearch builder used by Redis/Valkey/Dragonfly — KiviDB's `FT.SEARCH` diverges from RediSearch in ways that would otherwise produce silently wrong recall (issue #205), so the engine has its own emitter (`kividb_filter` in `kividb.rs`, where every divergence is documented with the measurement behind it). The headline one: **KiviDB does not substitute `$param` placeholders in a filter expression, in any query form** — a plain `FT.SEARCH` fails identically to a hybrid one, so this is not a prefilter-specific quirk — and all filter values are therefore inlined as literals. It also does not accept RediSearch backslash escaping, RediSearch's `(` exclusive-range marker, or `-` negation, and it reads a spaced intra-brace TAG-OR (`@f:{a | b}`) as match-all.
+
+**Not supported on KiviDB**, and therefore a hard **error** rather than a silently dropped condition (following `vertex.rs`; a dropped clause would run kNN over the whole corpus and publish a recall for a filter that was never applied):
+- **GEO** — KiviDB's index schema has no GEO field type at all, so the field is never indexed (unlike Dragonfly, which has a GEO type but rejects this tool's `$param` geo bounds at the query-parser level).
+- **Multi-valued `labels` arrays** — a KiviDB TAG value is *atomic*, never split on a separator (`FT.CREATE` rejects the `SEPARATOR` modifier, and `@f:{b}` does not match a stored `a;b;c`), so `match_any` over a labels field could only ever match the whole joined string.
+- **Multi-term or non-alphanumeric full-text terms** — KiviDB's TEXT matcher handles a single alphanumeric term per `@field:(...)` clause and returns zero documents otherwise.
+- **TAG filter values containing `|`, `@`, `(` or `)`** — inexpressible with no escaping mechanism. `|` is always the TAG-OR separator (under-match), `@` degrades the whole query to match-all (over-match), and `(`/`)` are parsed as grouping as soon as the clause sits inside a group, which every non-trivial filter does (`@t:{zz(zz} @u:{blue}` returns 0; `(@t:{zz)zz})` returns the whole corpus). This is a **query-side** limit only: a *stored* value containing one of these is inert — measured, a stored `a|b` is not split, and a corpus seeded with such values returns identical counts to a clean one for every clause shape the builder emits — so uploads are never rejected for it. That matters in practice: h-and-m stores a paren in `prod_name` on 3,900 documents and benchmarks correctly, because none of the 586 distinct filter values in its shipped queries contains one.
+
+The first two are decidable from the dataset schema, so KiviDB rejects them in the **configure** phase — before the index is created and before the corpus is read — leaving no partial upload, no orphan result file and no populated keyspace behind.
+
+> **Which shipped datasets this excludes.** **3 of the 53** datasets in `datasets/datasets.json` cannot run on KiviDB at all and now abort instead of producing a result file: `random-geo-radius-100-angular-filters` and `random-geo-radius-2048-angular-filters` (geo), and `arxiv-titles-384-angular-filters` (multi-valued `labels` — the only shipped dataset that declares a `labels` field). Before this was fixed these three *did* run and published a recall near 0.0, which was visibly wrong; they now publish nothing at all, and no result file records the rejection, so `--plot` simply shows a gap for KiviDB on those datasets. If you are sweeping KiviDB across everything, either exclude the three from `--datasets` (`arxiv-titles-384-angular-no-filters` is the pure-KNN twin of the arxiv one) or pass `--exit-on-error false` so the rest of the sweep continues. Every other dataset — including all filtered ones — is unaffected.
+
+One real protocol difference worth knowing: KiviDB's `FT.INFO` does not expose RediSearch's `num_docs`/`percent_indexed` — it reports HNSW graph state directly instead (`hnsw_live_count`, `hnsw_compaction_in_progress`), because it builds each vector's HNSW entry synchronously inside the `HSET` that stores it (no async backfill phase exists to report progress on); `wait_for_indexing` polls those fields instead and returns immediately as a result. RESP2 only (no RESP3 opt-in). Set the host port with `KIVIDB_PORT` (default `6380` — KiviDB's own default listen port, **not** Redis's 6379).
+
+<a id="mongodb-note"></a>
+\*\*\*\*\*\*\*\* **MongoDB note — which knobs MongoDB actually honours:** MongoDB Vector Search exposes **build-time** HNSW tuning and **no query-time `ef`**.
+
+`collection_params.hnsw_config` is forwarded into the `vectorSearch` index as the `hnswOptions` sub-document — MongoDB's own spelling, since it rejects the HNSW-generic names outright (`unrecognized fields ["m", "efConstruction"]`):
+
+| benchmark key | MongoDB key | server-enforced bounds |
+|---|---|---|
+| `M` | `hnswOptions.maxEdges` | `[16..64]` |
+| `EF_CONSTRUCTION` | `hnswOptions.numEdgeCandidates` | `[100..3200]` |
+
+Values are forwarded **verbatim, never clamped**: an out-of-range value fails index creation loudly rather than silently benchmarking a different index. Note the server **elides default-valued options** when reporting a definition back, so `{maxEdges:16, numEdgeCandidates:100}` (the defaults) is indistinguishable from an untuned index.
+
+At query time, **`numCandidates` is the only recall/latency dial** — there is no `ef`/`efSearch`, and `$vectorSearch` *silently ignores* unknown stage fields, so a stray `search_params.ef` is a no-op rather than an error. The benchmark sends `numCandidates = top × search_params.num_candidates`, i.e. **`num_candidates` is a multiplier here**, unlike `elasticsearch.rs` and `vertex.rs` where the same key is an absolute count. `experiments/configurations/mongodb-single-node.json` therefore sweeps `M` × `EF_CONSTRUCTION` at build time and `num_candidates` at query time; it previously swept a `search_params.ef` that MongoDB never honoured (issue #216).
 
 <a id="opensearch-note"></a>
 \*\*\*\*\*\*\* **OpenSearch note:** Connection is set with `OPENSEARCH_PORT` (default `9200`), `OPENSEARCH_INDEX` (default `bench`), `OPENSEARCH_TIMEOUT` seconds (default `300`), and `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD`.
 
-**Shard count** is read from `collection_params.number_of_shards`. Leave it unset to inherit the cluster default — but note that default is **1 on open-source OpenSearch and historically 5 on Amazon OpenSearch Service**, and shard count materially changes vector indexing speed and precision, so a run that leaves it unset is not comparable across engine versions or deployments. `elasticsearch.rs` pins `number_of_shards: 1`, so pin it here too for an apples-to-apples ES-vs-OS comparison. The effective value is printed per config (`OpenSearch: HNSW { … }, number_of_shards: 5|cluster-default`), and a present-but-non-integer value is a hard error rather than a silent fallback to the default.
+**Shard count** is read from `collection_params.number_of_shards`. Leave it unset to inherit the cluster default — but note that default is **1 on open-source OpenSearch and historically 5 on Amazon OpenSearch Service**, and shard count materially changes vector indexing speed and precision, so a run that leaves it unset is not comparable across engine versions or deployments. The effective value is printed per config (`OpenSearch: HNSW { … }, number_of_shards: 5|cluster-default`), and a present-but-non-integer value is a hard error rather than a silent fallback to the default.
+
+Every OpenSearch config shipped **in this (Rust) tree** pins it explicitly, so no published run inherits a default (#211). The resolved value is also written into every result file as `params.number_of_shards` (`"cluster-default"` if a custom config left it unpinned), so a run can be audited without reverse-engineering its config name. The legacy `v0/` Python tree is *not* pinned and cannot be: `v0/engine/clients/opensearch/configure.py` hardcodes its index settings and ignores `number_of_shards` entirely, while `v0/engine/clients/elasticsearch/configure.py` pins 1 — so v0's own ES-vs-OS pairing still has the #211 asymmetry.
+
+| Config file | `number_of_shards` | Use for |
+|---|---|---|
+| `experiments/configurations/opensearch-single-node.json` | `1` | Open-source / single-node OpenSearch. Matches `elasticsearch.rs`, which pins `ES_NUMBER_OF_SHARDS = 1`, so this is the ES-vs-OS head-to-head pairing (see the caveat below). |
+| `experiments/configurations/opensearch-5-shard.json` | `5` | A 5-shard index — the per-index default Amazon OpenSearch Service inherited from Elasticsearch and still applies on legacy/ES-derived domains. Same HNSW sweep, config names prefixed `opensearch-5-shard-`. |
+
+The 5-shard file is named for what it *does*, not for a deployment: a modern Amazon OpenSearch Service domain defaults to **1** shard per index, not 5, so "managed" would have been a claim about someone else's default that is no longer reliably true. Run it on a managed domain if you want to reproduce a legacy default, and set `number_of_shards` to whatever your own domain actually reports if you want to model it.
+
+**Do not compare `opensearch-5-shard-*` numbers against Elasticsearch.** `elasticsearch.rs` always builds a 1-shard index, so a 5-shard OpenSearch result against an ES result differs in shard count as well as engine and is not a head-to-head. Pair ES only with `opensearch-single-node.json`. Even that pairing is not yet fully matched: ES still bulk-loads with `refresh_interval: "10s"` while OpenSearch uses `-1`, so ES pays refresh work during ingest that OpenSearch does not — tracked in #240.
+
+Pick one file per run — they are exact and survive future renames:
+
+```
+--engines-file experiments/configurations/opensearch-single-node.json
+--engines-file experiments/configurations/opensearch-5-shard.json
+```
+
+Avoid selecting by glob here: `--engines 'opensearch-m-*'` matches only 6 of the 7 sweep points — it silently drops the `opensearch-default` (m=16, ef_construction=100) baseline, whose name lacks the `opensearch-m-` prefix — and a bare `--engines 'opensearch-*'` matches both files, sweeping two different shard counts into one report.
 
 **Retries against a managed domain.** Amazon OpenSearch Service returns states an open-source single-node cluster never produces: HTTP 429 on bulk (its `knn.algo_param.index_thread_qty` defaults to 1, so HNSW graph building is single-threaded and cannot drain as fast as a parallel uploader pushes), 400 `snapshot_in_progress_exception` on delete (automated snapshots cannot be disabled), 503 `process_cluster_event_timeout_exception` on create, and 502/504 from the front door on force-merge. All four paths retry with jittered exponential backoff, tunable with:
 
@@ -234,6 +282,23 @@ memory is reported per-index via `FT.INFO` (issue #151-4).
   the sweep finishes. Unset (the default) keeps full per-config isolation — no
   behavior change.
 
+### VectorSets: datetime corpora written before #230 must be re-uploaded
+
+VSIM `FILTER` has no date type and its comparison operators are numeric, so since
+PR #230 a datetime metadata value is stored as an **epoch-seconds number** on
+`VADD … SETATTR`, and range/equality filters compare against epoch numbers. A
+corpus uploaded by any **pre-#230** binary holds ISO-8601 **strings** instead, and
+VSIM coerces a non-numeric attribute to `0` in a numeric comparison — so a
+`--skip-upload` search against such a corpus silently returns the wrong documents
+(a two-sided range matches nothing → recall 0; a one-sided `lt`/`lte` matches
+everything). **Re-upload before searching.**
+
+Unlike Redis/Valkey — where `--skip-upload` against a missing or mismatched index
+hard-errors (`redis_utils::ensure_index_exists`) — VectorSets has **no such
+guard**: it uses a single hardcoded key (`idx`), so there is not even a name
+change for the tool to detect. The stale corpus is found, the run succeeds, and
+only the recall number is wrong.
+
 ### Charts
 
 Render a QPS-vs-precision trade-off plot (SVG, no dependencies) from existing `*-summary.json` results — one colored series per engine, filtered by `--engines`/`--datasets`:
@@ -293,11 +358,11 @@ Omitting the flag preserves the standard search-only benchmark behavior.
 
 ## Multi-tenancy
 
-Multi-tenancy benchmarks model many tenants sharing **one** index: every search is scoped to a single tenant via an exact keyword-equality filter on a `tenant` field (`schema: { "tenant": "keyword" }`), and recall is measured against the nearest neighbours **within that tenant only**. This reuses the standard keyword-TAG filter path (no engine-specific code) and mirrors upstream qdrant/vector-db-benchmark's `random-768-*-tenants` scenario (registered here as `random-768-25-tenants`). The per-query filter looks like `{"and":[{"tenant":{"match":{"value":"tenant_7"}}}]}`. Because ground truth is tenant-local, recall is a strong isolation signal — a leaked cross-tenant document displaces a correct neighbour and lowers recall — and the tests assert **exact** per-query recall (`== 1.0` against an exact search, one query per tenant), so any single cross-tenant leak fails the check. Redis and Valkey are covered end-to-end (over both RESP2 and RESP3) by the `test_binary_{redis,valkey}_tenancy` integration tests. (Recall is necessary but not by itself sufficient to *prove* zero leakage; strict per-id membership checking is a possible future hardening.)
+Multi-tenancy benchmarks model many tenants sharing **one** index: every search is scoped to a single tenant via an exact keyword-equality filter on a tenant field (`schema: { "<field>": "keyword" }` — the field is named `a` in `random-768-100-tenants` and `tenant` in `random-768-25-tenants`), and recall is measured against the nearest neighbours **within that tenant only**. This reuses the standard keyword-TAG filter path (no engine-specific code) and mirrors upstream qdrant/vector-db-benchmark's `random-768-*-tenants` scenario. Two are registered: **`random-768-100-tenants`** (1M points over 100 tenants) downloads, and is the reproducible one to benchmark with — note its tenant field is named `a` (`schema: { "a": "keyword" }`), matching the published tarball; `random-768-25-tenants` is a locally-generated placeholder using a `tenant` field. The per-query filter looks like `{"and":[{"tenant":{"match":{"value":"tenant_7"}}}]}` for the 25-tenant fixture, and `{"and":[{"a":{"match":{"value":"WLRCI"}}}]}` for the downloadable 100-tenant set (whose tenant ids are random 5-character strings). Because ground truth is tenant-local, recall is a strong isolation signal — a leaked cross-tenant document displaces a correct neighbour and lowers recall — and the tests assert **exact** per-query recall (`== 1.0` against an exact search, one query per tenant), so any single cross-tenant leak fails the check. Redis and Valkey are covered end-to-end (over both RESP2 and RESP3) by the `test_binary_{redis,valkey}_tenancy` integration tests. (Recall is necessary but not by itself sufficient to *prove* zero leakage; strict per-id membership checking is a possible future hardening.)
 
 ## Datasets
 
-Most datasets are automatically downloaded on first use. The image includes `random-100` (228KB) for quick smoke tests. (Exception: `random-768-25-tenants` is a locally-generated placeholder with no public download link yet — see the Multi-tenancy section.)
+Most datasets are automatically downloaded on first use. The image includes `random-100` (228KB) for quick smoke tests. (Exception: `random-768-25-tenants` is a locally-generated placeholder with no public download link — use the downloadable `random-768-100-tenants` instead; see the Multi-tenancy section.)
 
 | Dataset                                                                                                     | Dimensions |  Train size | Test size | Neighbors | Distance  |
 | ----------------------------------------------------------------------------------------------------------- | ---------: |  ---------: | --------: | --------: | --------- |
@@ -319,7 +384,11 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | [GIST-960: Image descriptors](http://ann-benchmarks.com)                                                   |        960 |   1,000,000 |     1,000 |       100 | L2        |
 | **Text and Knowledge Embeddings**                                                                          |            |             |           |           |           |
 | [DBpedia OpenAI-1M: Knowledge embeddings](https://www.dbpedia.org/)                                       |      1,536 |   1,000,000 |    10,000 |       100 | Cosine    |
+| [DBpedia OpenAI-100K: Knowledge embeddings](https://www.dbpedia.org/)                                     |      1,536 |     100,000 |     5,000 |        10 | Cosine    |
 | [LAION Small CLIP: Small CLIP embeddings](https://laion.ai/blog/laion-400-open-dataset/)                   |        512 |     100,000 |     1,000 |       100 | Cosine    |
+| **Sparse Vectors** (learned/lexical sparse embeddings — Qdrant is the only engine with a sparse path)        |            |             |           |           |           |
+| [MS MARCO Sparse-100K: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                |   *sparse* |     100,000 |     6,980 |        10 | Dot       |
+| [MS MARCO Sparse-1M: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                  |   *sparse* |   1,000,000 |     6,980 |        10 | Dot       |
 | **Yandex Datasets**                                                                                        |            |             |           |           |           |
 | [Yandex T2I: Text-to-image embeddings](https://research.yandex.com/)                                      |        200 |   1,000,000 |   100,000 |       100 | Dot       |
 | **Random and Synthetic**                                                                                   |            |             |           |           |           |
@@ -348,12 +417,20 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | Random Geo Radius-2048: Large synthetic geo queries (no filters)                                           |      2,048 |     100,000 |     1,000 |       100 | Cosine    |
 | Random Match Keyword Small Vocab-256: Small vocabulary keyword matching (with filters)                     |        256 |   1,000,000 |    10,000 |       100 | Cosine    |
 | Random Match Keyword Small Vocab-256: Small vocabulary keyword matching (no filters)                       |        256 |   1,000,000 |    10,000 |       100 | Cosine    |
+| **Multi-Tenancy** (many tenants share one index; every query scoped to one tenant)                          |            |             |           |           |           |
+| Random-768-100-tenants: 100 tenants, per-tenant scoped queries (tenant field `a`)                          |        768 |   1,000,000 |       200 |        25 | Cosine    |
 
 ### Generating local datasets
 
 The sparse-vector, hybrid (dense+sparse fusion), and multi-datatype filter code
 paths ship with **locally-generated** synthetic datasets — small, deterministic
-(fixed-seed) fixtures with **no public download link**. Generate them once with:
+(fixed-seed) fixtures with **no public download link**. (For sparse vectors at
+realistic scale, prefer the downloadable `msmarco-sparse-100K` / `-1M` in the
+table above; the synthetic fixture exists to exercise the code path fast. Both
+work: a sparse dataset's ground truth is read from either `neighbours.jsonl` —
+one JSON array of ids per query line, what the generator writes — or the binary
+`results.gt` those downloads ship.)
+Generate them once with:
 
 ```bash
 cargo run --release --bin generate-dataset          # writes into ./datasets
