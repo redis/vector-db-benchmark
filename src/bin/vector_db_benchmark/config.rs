@@ -33,6 +33,41 @@ pub struct HnswConfig {
         alias = "ef_construction"
     )]
     pub ef_construction: Option<i64>,
+    /// Qdrant: keep the HNSW graph on disk (mmap) instead of in RAM.
+    pub on_disk: Option<bool>,
+    /// Qdrant: per-payload-value graph links. `m: 0` + `payload_m: k` builds
+    /// graphs only per tenant/payload value — the multi-tenancy layout.
+    pub payload_m: Option<i64>,
+    /// Qdrant: store vectors inline with the graph links (on-disk locality).
+    pub inline_storage: Option<bool>,
+    /// Qdrant: below this many points a filtered search full-scans instead of
+    /// traversing the graph. Decisive for filtered / multi-tenant benchmarks.
+    pub full_scan_threshold: Option<i64>,
+    /// Qdrant: threads used to build the graph.
+    pub max_indexing_threads: Option<i64>,
+    /// Catch-all so an unrecognised key inside `hnsw_config` can be REPORTED
+    /// rather than silently discarded. Serde ignores undeclared fields by
+    /// default, which is how `on_disk` used to vanish here — the very bug this
+    /// branch fixes.
+    ///
+    /// Only the Qdrant engine calls `unsupported_keys()` today. The other five
+    /// consumers (redis, valkey, pgvector, dragonfly, kividb) read just
+    /// `m`/`ef_construction`, and at least one shipped config deliberately parks
+    /// an inert key here (`redis-single-node.json`'s `DISTANCE_METRIC`, which
+    /// redis derives from the dataset), so warning for them would be noise.
+    #[serde(flatten)]
+    pub extra: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl HnswConfig {
+    /// Keys inside `hnsw_config` that no engine reads. Returned so the caller can
+    /// warn: a typo'd or unsupported knob must not pass for a configured one.
+    pub fn unsupported_keys(&self) -> Vec<&str> {
+        self.extra
+            .as_ref()
+            .map(|e| e.keys().map(|k| k.as_str()).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Elasticsearch index_options (lowercase keys)
@@ -56,6 +91,12 @@ pub struct CollectionParams {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SearchParams {
     pub parallel: Option<i64>,
+    /// Per-search engine knobs. Upstream (qdrant/vector-db-benchmark) spells this
+    /// key `config`; accept BOTH so an upstream configuration file can be used
+    /// verbatim. Without the alias, `"config": {...}` was absorbed by the
+    /// `extra` catch-all below and silently dropped — the run then used default
+    /// `ef`/`hnsw_ef` while reporting as if it had been tuned.
+    #[serde(alias = "config")]
     pub search_params: Option<InnerSearchParams>,
     pub top: Option<i64>,
     pub num_candidates: Option<i64>,
@@ -76,10 +117,71 @@ pub struct SearchParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InnerSearchParams {
+    /// HNSW search-time breadth. Upstream's redis configs spell it `EF`
+    /// (uppercase, matching the FT.SEARCH runtime attribute), so accept both.
+    #[serde(alias = "EF")]
     pub ef: Option<i64>,
     /// Catch-all for additional search params (e.g., SEARCH_WINDOW_SIZE, data_type)
     #[serde(flatten)]
     pub extra: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+impl SearchParams {
+    /// Resolve an UNTYPED engine-specific search knob by name, accepting it
+    /// either nested under `search_params` / `config` or flat at the entry's top
+    /// level. Nested wins, being the more specific placement.
+    ///
+    /// Upstream nests EVERY knob under `config` (`num_candidates`,
+    /// `knn.algo_param.ef_search`, `hnsw_ef`, …) while several of our own
+    /// configurations put them flat. Engines resolve through here so both shapes
+    /// work and neither is silently ignored.
+    ///
+    /// IMPORTANT — this searches only the two `extra` catch-alls, so it does NOT
+    /// see a key that serde captured into a TYPED field. That covers `ef` and
+    /// `EF` on the inner struct, and `parallel`, `top`, `num_candidates`,
+    /// `target_qps`, `duration_seconds`, `max_lateness_ms`, `calibration_param`
+    /// and `calibration_precision` on this one. For those, `knob()` sees only the
+    /// placement serde did NOT claim, so a caller must combine both — e.g.
+    /// Elasticsearch does `knob("num_candidates").or(params.num_candidates)`, and
+    /// engines read `search_params.ef` directly rather than `knob("ef")` (which
+    /// would find a flat `ef` while ignoring the nested one that configures the
+    /// run — hence the debug assertion below).
+    /// Canonicalise a search-knob NAME onto the field it actually sets.
+    ///
+    /// `calibration_param` names its knob by string. Every alias of the typed
+    /// `ef` field must collapse onto `"ef"`, otherwise the calibration loop
+    /// writes `search_params.extra["EF"]` — a key NO engine reads (they read
+    /// `search_params.ef`) — so the sweep tunes a knob that is never applied and
+    /// then reports the calibrated value as if it had been.
+    pub fn canonical_knob_name(name: &str) -> &str {
+        match name {
+            "ef" | "EF" => "ef",
+            other => other,
+        }
+    }
+
+    pub fn knob(&self, key: &str) -> Option<&serde_json::Value> {
+        debug_assert!(
+            !matches!(
+                key,
+                "ef" | "EF"
+                    | "parallel"
+                    | "top"
+                    | "target_qps"
+                    | "duration_seconds"
+                    | "max_lateness_ms"
+                    | "calibration_param"
+                    | "calibration_precision"
+            ),
+            "{key:?} is a typed field; knob() cannot see it — read the field directly \
+             (num_candidates is exempt: its call sites combine both, see the doc above)"
+        );
+        self.search_params
+            .as_ref()
+            .and_then(|sp| sp.extra.as_ref())
+            .and_then(|e| e.get(key))
+            .or_else(|| self.extra.as_ref().and_then(|e| e.get(key)))
+    }
 }
 
 /// Engine configuration from experiments/configurations/*.json
@@ -170,12 +272,33 @@ pub fn read_engine_configs(
         .map_err(|e| e.to_string())?
         .flatten()
     {
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(configs) = serde_json::from_str::<Vec<EngineConfig>>(&content) {
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Warning: skipping engine config {:?}: {}", path, e);
+                continue;
+            }
+        };
+        // NEVER swallow the parse error. serde rejects the WHOLE file on one bad
+        // entry, so a single typo deletes every engine defined in it and the run
+        // fails with a baffling "no engines match" — e.g. a typo anywhere in
+        // qdrant-on-disk.json removes all four of its configurations. The typed
+        // fields and aliases on this branch make that easy to trip:
+        //   hnsw_config: {"on_disk": "true"}          -> invalid type: string
+        //   {"search_params": {...}, "config": {...}} -> duplicate field
+        //   {"config": {"ef": 64, "EF": 512}}         -> duplicate field
+        //   {"config": 5}                             -> invalid type
+        match serde_json::from_str::<Vec<EngineConfig>>(&content) {
+            Ok(configs) => {
                 for config in configs {
                     all_configs.insert(config.name.clone(), config);
                 }
             }
+            Err(e) => eprintln!(
+                "Warning: engine config {:?} does not parse, so ALL of its entries were \
+                 skipped: {}",
+                path, e
+            ),
         }
     }
     Ok(all_configs)
@@ -552,6 +675,158 @@ mod tests {
 
         // Missing file → hard error (not a silent fall-through to the glob).
         assert!(read_engine_configs(Some("/no/such/file.json")).is_err());
+    }
+
+    // Upstream spells the per-search knob object `config`. Before the alias it
+    // landed in the flattened `extra` catch-all and was silently dropped, so a
+    // verbatim upstream file ran with default ef while REPORTING as tuned.
+    #[test]
+    fn upstream_config_key_is_accepted_as_search_params() {
+        let sp: SearchParams =
+            serde_json::from_value(json!({"parallel": 8, "config": {"hnsw_ef": 128}})).unwrap();
+        assert_eq!(sp.parallel, Some(8));
+        assert_eq!(
+            sp.knob("hnsw_ef").and_then(|v| v.as_u64()),
+            Some(128),
+            "`config` must populate search_params, not the extra catch-all"
+        );
+        // And it must NOT also linger in `extra` under the raw key.
+        assert!(sp.extra.is_none_or(|e| !e.contains_key("config")));
+    }
+
+    // Our own spelling keeps working, and uppercase `EF` (upstream's redis
+    // configs) resolves to the same typed field as lowercase `ef`.
+    #[test]
+    fn our_search_params_key_and_uppercase_ef_still_work() {
+        let ours: SearchParams =
+            serde_json::from_value(json!({"parallel": 1, "search_params": {"ef": 64}})).unwrap();
+        assert_eq!(
+            ours.search_params.as_ref().and_then(|sp| sp.ef),
+            Some(64),
+            "our historical `search_params` spelling must keep working"
+        );
+
+        let upstream_redis: SearchParams =
+            serde_json::from_value(json!({"parallel": 100, "config": {"EF": 512}})).unwrap();
+        assert_eq!(
+            upstream_redis.search_params.as_ref().and_then(|sp| sp.ef),
+            Some(512),
+            "upstream redis `EF` must map onto the typed ef field"
+        );
+    }
+
+    // Engines read knobs through SearchParams::knob, which accepts either
+    // placement. Nested is more specific and therefore wins.
+    #[test]
+    fn knob_resolves_nested_and_flat_with_nested_winning() {
+        let nested: SearchParams =
+            serde_json::from_value(json!({"config": {"num_candidates": 16}})).unwrap();
+        assert_eq!(
+            nested.knob("num_candidates").and_then(|v| v.as_i64()),
+            Some(16)
+        );
+
+        let flat: SearchParams =
+            serde_json::from_value(json!({"knn.algo_param.ef_search": 256})).unwrap();
+        assert_eq!(
+            flat.knob("knn.algo_param.ef_search")
+                .and_then(|v| v.as_i64()),
+            Some(256)
+        );
+
+        let both: SearchParams =
+            serde_json::from_value(json!({"num_candidates_x": 1, "config": {"k": 2}, "k": 3}))
+                .unwrap();
+        assert_eq!(both.knob("k").and_then(|v| v.as_i64()), Some(2));
+
+        let neither: SearchParams = serde_json::from_value(json!({"parallel": 1})).unwrap();
+        assert!(neither.knob("k").is_none());
+    }
+
+    /// `knob()` searches only the `extra` catch-alls, so it is BLIND to a key
+    /// serde captured into a typed field. Pinning that contract: a caller must
+    /// combine `knob()` with the typed field (as Elasticsearch does) — relying on
+    /// `knob()` alone for a declared name silently yields the default.
+    #[test]
+    fn knob_is_blind_to_typed_fields() {
+        // Flat `num_candidates` is a DECLARED field on SearchParams.
+        let flat: SearchParams =
+            serde_json::from_value(json!({"num_candidates": 16, "parallel": 1})).unwrap();
+        assert_eq!(flat.num_candidates, Some(16));
+        assert!(
+            flat.knob("num_candidates").is_none(),
+            "knob() must not be expected to see a typed field"
+        );
+
+        // Nested `ef` is declared on InnerSearchParams, so it lands there.
+        let nested_ef: SearchParams =
+            serde_json::from_value(json!({"config": {"ef": 64}})).unwrap();
+        assert_eq!(
+            nested_ef.search_params.as_ref().and_then(|sp| sp.ef),
+            Some(64)
+        );
+    }
+
+    // `search_params` and `config` are the SAME field under an alias, so an entry
+    // carrying both is a serde duplicate-field error rather than one silently
+    // winning. Pin it: if serde ever tolerated it, the losing half would vanish.
+    #[test]
+    fn both_search_params_and_config_is_a_duplicate_field_error() {
+        let err = serde_json::from_value::<SearchParams>(
+            json!({"search_params": {"ef": 64}, "config": {"ef": 128}}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
+
+        // Same one level down: `ef` and its `EF` alias in one object.
+        let err = serde_json::from_value::<SearchParams>(json!({"config": {"ef": 64, "EF": 512}}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
+    }
+
+    // `"config": null` parses fine and yields NO knobs — an untuned run that
+    // looks configured. Documented here so the behaviour is at least known.
+    #[test]
+    fn null_config_parses_to_no_search_params() {
+        let sp: SearchParams =
+            serde_json::from_value(json!({"parallel": 4, "config": null})).unwrap();
+        assert!(sp.search_params.is_none());
+    }
+
+    // Every shipped experiments/configurations/*.json MUST parse. Nothing else in
+    // the suite reads the real directory (integration tests all write their own
+    // temp config), so a typo — or a new typed field rejecting an existing value
+    // — would otherwise only surface at run time as "no engines match", with
+    // every entry in the offending file silently gone.
+    #[test]
+    fn every_shipped_engine_config_file_parses() {
+        let dir = project_root().join("experiments/configurations");
+        let pattern = dir.join("*.json");
+        let mut seen = 0usize;
+        for path in glob::glob(pattern.to_str().unwrap()).unwrap().flatten() {
+            let content = fs::read_to_string(&path).unwrap();
+            let parsed = serde_json::from_str::<Vec<EngineConfig>>(&content);
+            assert!(
+                parsed.is_ok(),
+                "{:?} does not parse — ALL of its engine entries would silently \
+                 disappear from every run: {}",
+                path,
+                parsed.unwrap_err()
+            );
+            seen += 1;
+        }
+        assert!(
+            seen > 10,
+            "expected the real config directory, found {seen} files"
+        );
     }
 
     #[test]

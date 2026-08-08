@@ -15,7 +15,9 @@ pub use hdf5_reader::{hdf5_train_row_count, read_hdf5_vectors};
 pub use jsonl_reader::{read_jsonl_queries, read_jsonl_vectors};
 pub use metadata::{parse_metadata_from_json, MetadataItem, MetadataValue};
 pub use npy_reader::{npy_row_count, read_npy_vectors, write_npy_vectors};
-pub use sparse_reader::{read_sparse_matrix, write_sparse_matrix, SparseVector};
+pub use sparse_reader::{
+    read_gt_neighbours, read_sparse_matrix, write_gt_neighbours, write_sparse_matrix, SparseVector,
+};
 
 #[cfg(test)]
 mod tests {

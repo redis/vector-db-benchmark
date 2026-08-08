@@ -967,16 +967,16 @@ impl Engine for MilvusEngine {
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
 
-        // Extract ef from search params
+        // Extract ef from search params. The typed `ef` field first, then the
+        // `params: { ef }` shape resolved through knob() so the nested
+        // (upstream) placement is honoured too, not just the flat one.
         let ef = params
             .search_params
             .as_ref()
             .and_then(|sp| sp.ef)
             .or_else(|| {
                 params
-                    .extra
-                    .as_ref()
-                    .and_then(|e| e.get("params"))
+                    .knob("params")
                     .and_then(|p| p.get("ef"))
                     .and_then(|v| v.as_i64())
             });

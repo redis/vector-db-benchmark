@@ -382,6 +382,21 @@ fn run_single_experiment(
     // `--keep-data` keeps every config's data (the default coexistence behaviour,
     // needed for --skip-upload reuse). A single-config run is always the last.
     let keep_data = args.keep_data && (is_last_config || !args.reset_between_configs);
+
+    // Skip an incompatible (engine, dataset) pair BEFORE `get_path()`, which would
+    // otherwise download the archive — hundreds of MB for the msmarco-sparse sets
+    // — build an index at the fallback dimension, and only then fail inside the
+    // reader. Mirrors upstream's IncompatibilityError skip.
+    if (dataset.is_sparse() || dataset.is_hybrid()) && !engine.supports_sparse() {
+        println!(
+            "Skipping {} - {}: the dataset is {} and this engine has no sparse path",
+            engine.name(),
+            dataset.config.name,
+            dataset.config.dataset_type.as_deref().unwrap_or("sparse")
+        );
+        return Ok(());
+    }
+
     // Check if we should skip
     if args.skip_if_exists {
         let glob_pattern = format!("{}-{}-upload-*.json", engine.name(), dataset.config.name);
@@ -593,11 +608,15 @@ fn run_single_experiment(
                                         ef: None,
                                         extra: None,
                                     });
-                            if cal_param == "ef" {
+                            // "EF" is the SAME field as "ef" (serde alias), so it
+                            // must land on the typed field rather than in an
+                            // `extra` map no engine reads.
+                            let cal_key = SearchParams::canonical_knob_name(cal_param);
+                            if cal_key == "ef" {
                                 inner.ef = Some(value);
                             } else {
                                 let extras = inner.extra.get_or_insert_with(Default::default);
-                                extras.insert(cal_param.clone(), serde_json::json!(value));
+                                extras.insert(cal_key.to_string(), serde_json::json!(value));
                             }
                             Some(calibrated)
                         }
@@ -957,6 +976,9 @@ fn calibrate(
     target_precision: f64,
     num_queries: i64,
 ) -> Result<(i64, f64), String> {
+    // "EF" (upstream's redis spelling) is the same typed field as "ef"; without
+    // this the loop would sweep extra["EF"], which no engine reads.
+    let calibration_param = SearchParams::canonical_knob_name(calibration_param);
     let min_value = search_params.top.unwrap_or(10);
     let max_value: i64 = 1000;
 
