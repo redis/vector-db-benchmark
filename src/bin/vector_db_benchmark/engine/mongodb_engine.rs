@@ -430,7 +430,7 @@ impl MongoDBEngine {
         // which the server rejects outright as unrecognized fields. See
         // `build_hnsw_options` for the config mapping.
         if let Some(hnsw_options) =
-            build_hnsw_options(self.config.hnsw_m, self.config.hnsw_ef_construction)
+            build_hnsw_options(self.config.hnsw_m, self.config.hnsw_ef_construction)?
         {
             vector_field.insert("hnswOptions", hnsw_options);
         }
@@ -739,20 +739,40 @@ impl MongoDBEngine {
 /// would silently benchmark a different index than the config asked for, which
 /// is the exact failure mode this function was added to end (issue #216).
 ///
-/// Returns `None` when neither knob is configured, so the index definition
+/// Returns `Ok(None)` when neither knob is configured, so the index definition
 /// stays byte-identical to the pre-existing default-HNSW body.
-fn build_hnsw_options(m: Option<i64>, ef_construction: Option<i64>) -> Option<Document> {
+///
+/// Out-of-`i32` values are an error rather than a silent `as i32` truncation:
+/// `M: 4294967328` would otherwise wrap to `maxEdges: 32` and build happily,
+/// which is the same "benchmarked something other than what the config said"
+/// failure this function exists to prevent.
+fn build_hnsw_options(
+    m: Option<i64>,
+    ef_construction: Option<i64>,
+) -> Result<Option<Document>, String> {
     if m.is_none() && ef_construction.is_none() {
-        return None;
+        return Ok(None);
     }
+    let to_i32 = |name: &str, v: i64| {
+        i32::try_from(v).map_err(|_| {
+            format!(
+                "collection_params.hnsw_config.{} = {} does not fit in an i32 and \
+                 cannot be sent to MongoDB",
+                name, v
+            )
+        })
+    };
     let mut opts = Document::new();
     if let Some(m) = m {
-        opts.insert("maxEdges", m as i32);
+        opts.insert("maxEdges", to_i32("M", m)?);
     }
     if let Some(ef_construction) = ef_construction {
-        opts.insert("numEdgeCandidates", ef_construction as i32);
+        opts.insert(
+            "numEdgeCandidates",
+            to_i32("EF_CONSTRUCTION", ef_construction)?,
+        );
     }
-    Some(opts)
+    Ok(Some(opts))
 }
 
 fn build_uri(host: &str, port: u16) -> String {
@@ -1774,7 +1794,9 @@ mod tests {
     /// rejects: `unrecognized fields ["m", "efConstruction"]`).
     #[test]
     fn build_hnsw_options_uses_mongodb_field_names() {
-        let opts = build_hnsw_options(Some(32), Some(200)).expect("options built");
+        let opts = build_hnsw_options(Some(32), Some(200))
+            .expect("no error")
+            .expect("options built");
         assert_eq!(opts.get_i32("maxEdges").unwrap(), 32);
         assert_eq!(opts.get_i32("numEdgeCandidates").unwrap(), 200);
         assert!(
@@ -1788,13 +1810,13 @@ mod tests {
     /// must leave the index body exactly as it was before this feature.
     #[test]
     fn build_hnsw_options_omits_unset_knobs() {
-        assert!(build_hnsw_options(None, None).is_none());
+        assert!(build_hnsw_options(None, None).unwrap().is_none());
 
-        let only_m = build_hnsw_options(Some(64), None).unwrap();
+        let only_m = build_hnsw_options(Some(64), None).unwrap().unwrap();
         assert_eq!(only_m.get_i32("maxEdges").unwrap(), 64);
         assert!(!only_m.contains_key("numEdgeCandidates"));
 
-        let only_efc = build_hnsw_options(None, Some(512)).unwrap();
+        let only_efc = build_hnsw_options(None, Some(512)).unwrap().unwrap();
         assert_eq!(only_efc.get_i32("numEdgeCandidates").unwrap(), 512);
         assert!(!only_efc.contains_key("maxEdges"));
     }
@@ -1804,9 +1826,25 @@ mod tests {
     /// for — the failure mode of issue #216.
     #[test]
     fn build_hnsw_options_does_not_clamp_out_of_range_values() {
-        let opts = build_hnsw_options(Some(9999), Some(1)).unwrap();
+        let opts = build_hnsw_options(Some(9999), Some(1)).unwrap().unwrap();
         assert_eq!(opts.get_i32("maxEdges").unwrap(), 9999);
         assert_eq!(opts.get_i32("numEdgeCandidates").unwrap(), 1);
+    }
+
+    /// "Forwarded verbatim" must not quietly become "forwarded truncated":
+    /// `as i32` would wrap 4294967328 to 32 and build a plausible-looking index.
+    #[test]
+    fn build_hnsw_options_rejects_values_that_do_not_fit_i32() {
+        let err = build_hnsw_options(Some(4_294_967_328), None).unwrap_err();
+        assert!(err.contains("does not fit in an i32"), "{}", err);
+        assert!(
+            err.contains('M'),
+            "error must name the offending knob: {}",
+            err
+        );
+
+        let err = build_hnsw_options(None, Some(i64::MAX)).unwrap_err();
+        assert!(err.contains("EF_CONSTRUCTION"), "{}", err);
     }
 
     // Load-bearing: the hoisted (out-of-timed-window) pipeline builder must

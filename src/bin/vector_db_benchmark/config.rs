@@ -520,11 +520,33 @@ mod tests {
 /// cannot catch this — serde applies it through `#[serde(flatten)]` too, which
 /// would break the `extra` passthrough every engine depends on.
 ///
-/// So instead of validating *parsing*, this guard validates *consumption*: for
-/// every entry in every shipped config, each declared knob must appear as a real
-/// token in the source of the engine that entry targets. It is a source-level
-/// check on purpose — it is the only thing that distinguishes "the engine reads
-/// this" from "serde accepted this and threw it away".
+/// So instead of validating *parsing*, this guard checks that each knob a
+/// shipped config declares at least *appears* in the production source of the
+/// engine that entry targets — comments and `#[cfg(test)]` items stripped first,
+/// so a stale doc comment or a test-only mention cannot vouch for a knob.
+///
+/// SCOPE — this is a useful net, not a durable defence. Read before trusting it.
+///
+/// What it reliably catches:
+/// * a knob no source file of the target engine mentions at all (the #216 shape);
+/// * a knob inside a [`CLOSED_CONTAINERS`] struct that the struct does not
+///   declare, on every engine — a real schema check, not a heuristic;
+/// * a misspelled top-level key, which serde drops with everything under it;
+/// * a mention that exists only in a comment or a `#[cfg(test)]` item.
+///
+/// What it does NOT catch, by construction:
+/// * **wrong use.** A knob that is read and then overridden, clamped or ignored
+///   downstream passes: its token is present. Issue #229's knobs are read and
+///   then forced to a constant, and this guard is green on all of them.
+/// * **positional mismatch.** It never checks that a knob is read from the block
+///   it was declared in, so declaring an `upload_params` knob under
+///   `collection_params` passes whenever the token appears anywhere.
+/// * **short common leaves.** Token matching cannot distinguish a knob named
+///   `ef` from an unrelated local `ef`. [`CLOSED_CONTAINERS`] covers the known
+///   typed structs; elsewhere this remains a hole.
+///
+/// Only a read-back assertion against a live server — see
+/// `tests/integration_mongodb.rs` — proves a value actually took effect.
 ///
 /// LOAD-BEARING: this walks the RAW JSON keys, never the typed structs and never
 /// [`CollectionParams::extra`]. Do not "simplify" it to inspect `extra` — the
@@ -582,6 +604,85 @@ mod shipped_config_knob_guard {
         "search_params",
     ];
 
+    /// Containers deserialized into a CLOSED Rust struct — no `#[serde(flatten)]`
+    /// catch-all — so any key outside the listed set is dropped on the floor by
+    /// serde no matter which engine is targeted.
+    ///
+    /// This is a schema check, and it is the only thing that reliably stops the
+    /// issue #216 bug from being laundered by relocation: moving `ef` to
+    /// `collection_params.hnsw_config.ef` defeats token matching on any engine
+    /// whose source happens to contain a bare `ef` (qdrant, redis and pgvector
+    /// all do), but it cannot defeat this.
+    ///
+    /// Leaves are compared after [`canonical`], so `M`/`EF_CONSTRUCTION` and
+    /// their serde aliases all normalize into the sets below.
+    const CLOSED_CONTAINERS: &[(&str, &[&str])] = &[
+        ("collection_params.hnsw_config", &["m", "ef_construction"]),
+        ("collection_params.index_options", &["m", "ef_construction"]),
+    ];
+
+    /// Containers an engine forwards to the server WHOLESALE, as an opaque
+    /// sub-object. Their leaves are honoured without ever being named in Rust,
+    /// so leaf-token matching cannot see them.
+    ///
+    /// e.g. `weaviate.rs` pulls `collection_params.vectorIndexConfig` out of
+    /// `extra` and merges every key of it into the class body, so
+    /// `efConstruction`/`maxConnections` do reach the server.
+    ///
+    /// The container itself must still be read — that is asserted below, so an
+    /// entry here cannot excuse a container the engine ignores entirely.
+    const PASSTHROUGH_CONTAINERS: &[(&str, &str)] =
+        &[("weaviate", "collection_params.vectorIndexConfig")];
+
+    /// Knobs shipped configs declare that their engine genuinely does NOT read.
+    /// Pre-existing debt this guard surfaced, listed rather than silently
+    /// excused — and asserted to still be unread, so a fix must delete its entry
+    /// instead of leaving a stale exemption behind.
+    ///
+    /// NOT a place to park new violations. Fix the engine or drop the key.
+    const KNOWN_UNREAD: &[(&str, &str, &str)] = &[
+        (
+            "elasticsearch",
+            "connection_params.request_timeout",
+            "engine takes its timeout from ELASTIC_TIMEOUT (default 300) and never \
+             consults the config; the shipped value 10000 has no effect. Units are \
+             ambiguous (s vs ms), so honouring it blindly could be worse than \
+             ignoring it — needs its own issue, not a drive-by fix in #216.",
+        ),
+        (
+            "opensearch",
+            "connection_params.request_timeout",
+            "same as elasticsearch: OPENSEARCH_TIMEOUT only.",
+        ),
+        (
+            "qdrant",
+            "collection_params.hnsw_config.on_disk",
+            "issue #215: qdrant.rs reads vectors_config.on_disk, and HnswConfig has \
+             no on_disk field, so this key is dropped by serde. Being fixed in its \
+             own PR; this entry must be deleted when that lands.",
+        ),
+        (
+            "redis",
+            "collection_params.hnsw_config.DISTANCE_METRIC",
+            "HnswConfig has no DISTANCE_METRIC field; the distance actually comes \
+             from the dataset. Harmless but decorative - the key should be dropped \
+             from the calibration configs in a follow-up.",
+        ),
+    ];
+
+    /// Every field [`EngineConfig`] declares. A root key outside this set is a
+    /// typo that serde silently discards along with everything under it.
+    const ENGINE_CONFIG_ROOT_KEYS: &[&str] = &[
+        "name",
+        "engine",
+        "algorithm",
+        "connection_params",
+        "collection_params",
+        "search_params",
+        "upload_params",
+        "skip_vector_index",
+    ];
+
     /// Resolve serde aliases to the field name the Rust source actually spells.
     /// A config may say `EF_CONSTRUCTION`, `ef_construct` or `ef_construction`;
     /// engines read `.ef_construction`.
@@ -626,6 +727,138 @@ mod shipped_config_knob_guard {
         }
     }
 
+    /// Remove `//`/`/* */` comments while preserving string literals.
+    ///
+    /// String contents must survive: engines read many knobs via
+    /// `params.get("batch_size")`, so the literal IS the read. Comments must
+    /// not: otherwise a refactor that deletes the forwarding code and leaves
+    /// `// forwards hnsw_config` behind still satisfies the guard.
+    fn strip_comments(src: &str) -> String {
+        let c: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let (mut i, mut block) = (0usize, 0usize);
+        while i < c.len() {
+            let (cur, next) = (c[i], c.get(i + 1).copied());
+            if block > 0 {
+                if cur == '/' && next == Some('*') {
+                    block += 1;
+                    i += 2;
+                } else if cur == '*' && next == Some('/') {
+                    block -= 1;
+                    i += 2;
+                } else {
+                    if cur == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            match cur {
+                '/' if next == Some('/') => {
+                    while i < c.len() && c[i] != '\n' {
+                        i += 1;
+                    }
+                }
+                '/' if next == Some('*') => {
+                    block = 1;
+                    i += 2;
+                }
+                '"' => {
+                    out.push(cur);
+                    i += 1;
+                    while i < c.len() {
+                        out.push(c[i]);
+                        if c[i] == '\\' {
+                            if let Some(&e) = c.get(i + 1) {
+                                out.push(e);
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        if c[i] == '"' {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // Distinguish a char literal ('x', '\n') from a lifetime ('a).
+                '\'' if c.get(i + 2) == Some(&'\'')
+                    || (next == Some('\\') && c.get(i + 3) == Some(&'\'')) =>
+                {
+                    let end = if next == Some('\\') { i + 4 } else { i + 3 };
+                    for &ch in c.iter().take(end.min(c.len())).skip(i) {
+                        out.push(ch);
+                    }
+                    i = end;
+                }
+                _ => {
+                    out.push(cur);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Drop every `#[cfg(test)]` item (both `mod tests { … }` and the
+    /// test-only helper `fn`s several engines define), so a knob that is only
+    /// ever mentioned inside tests does not count as a production read.
+    fn strip_test_items(src: &str) -> String {
+        const ATTR: &str = "#[cfg(test)]";
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(pos) = rest.find(ATTR) {
+            out.push_str(&rest[..pos]);
+            let after: Vec<char> = rest[pos + ATTR.len()..].chars().collect();
+            // Walk to the item's opening brace (a `mod`/`fn` body) or its
+            // terminating `;` (e.g. a `#[cfg(test)] use …;`), ignoring braces
+            // that live inside string literals such as `format!("{}")`.
+            let (mut i, mut depth, mut started, mut in_str) = (0usize, 0usize, false, false);
+            while i < after.len() {
+                let ch = after[i];
+                if in_str {
+                    if ch == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if ch == '"' {
+                        in_str = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                match ch {
+                    '"' => in_str = true,
+                    ';' if !started => {
+                        i += 1;
+                        break;
+                    }
+                    '{' => {
+                        depth += 1;
+                        started = true;
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if started && depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let consumed: usize = after.iter().take(i).map(|c| c.len_utf8()).sum();
+            rest = &rest[pos + ATTR.len() + consumed..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The engine's PRODUCTION read path: sources with comments and
+    /// `#[cfg(test)]` items removed.
     fn engine_source(engine: &str) -> Option<String> {
         let files = ENGINE_SOURCES
             .iter()
@@ -634,7 +867,8 @@ mod shipped_config_knob_guard {
         let dir = repo_root().join("src/bin/vector_db_benchmark/engine");
         let mut blob = String::new();
         for file in files {
-            blob.push_str(&std::fs::read_to_string(dir.join(file)).unwrap_or_default());
+            let raw = std::fs::read_to_string(dir.join(file)).unwrap_or_default();
+            blob.push_str(&strip_test_items(&strip_comments(&raw)));
             blob.push('\n');
         }
         Some(blob)
@@ -642,28 +876,15 @@ mod shipped_config_knob_guard {
 
     /// Is `knob_path` (dotted) satisfied by the engine's source?
     ///
-    /// A leaf of one or two characters (`m`, `ef`) is unsearchable on its own —
-    /// short identifiers occur everywhere in Rust. For those the *parent*
-    /// container token carries the signal: reading `hnsw_config` at all is what
-    /// proves `hnsw_config.M` reaches the server. A short knob whose parent is
-    /// itself a bare container (`search_params.search_params.ef`) still has to be
-    /// found verbatim, which is what catches issue #216.
+    /// The leaf token must ALWAYS be present verbatim. An earlier version let a
+    /// distinctive parent stand in for a short leaf (`hnsw_config` vouching for
+    /// `M`), which meant the issue #216 bug survived a one-level relocation:
+    /// moving `ef` to `collection_params.hnsw_config.ef` passed on engines that
+    /// merely mention `hnsw_config`. Parent proxying is gone; field access still
+    /// counts, since `h.m` contains the whole token `m`.
     fn knob_is_read(source: &str, knob_path: &str) -> bool {
-        let parts: Vec<&str> = knob_path.split('.').collect();
-        let leaf = canonical(parts[parts.len() - 1]);
-        if leaf.len() > 2 {
-            return contains_token(source, leaf);
-        }
-        if parts.len() < 2 {
-            return contains_token(source, leaf);
-        }
-        let parent = parts[parts.len() - 2];
-        // `search_params` is the generic container every engine mentions; it
-        // carries no evidence that this particular knob is honoured.
-        if parent == "search_params" {
-            return contains_token(source, leaf);
-        }
-        contains_token(source, parent)
+        let leaf = canonical(knob_path.rsplit('.').next().unwrap_or(knob_path));
+        contains_token(source, leaf)
     }
 
     /// Every knob declared by a shipped config must be read by its engine.
@@ -672,6 +893,7 @@ mod shipped_config_knob_guard {
         let dir = repo_root().join("experiments/configurations");
         let mut violations: Vec<String> = Vec::new();
         let mut checked_entries = 0usize;
+        let mut used_exemptions: BTreeSet<(String, String)> = BTreeSet::new();
 
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .expect("configurations dir")
@@ -708,12 +930,27 @@ mod shipped_config_knob_guard {
                 };
                 checked_entries += 1;
 
-                let mut knobs = BTreeSet::new();
-                if let Some(cp) = entry.get("collection_params") {
-                    collect_knobs(cp, "collection_params", &mut knobs);
+                // A misspelled root key (`collection_param`) would silently drop
+                // a whole block: serde ignores it and nothing downstream looks
+                // for it. Check the roots against EngineConfig's real fields.
+                if let Some(obj) = entry.as_object() {
+                    for key in obj.keys() {
+                        if !ENGINE_CONFIG_ROOT_KEYS.contains(&key.as_str()) {
+                            violations.push(format!(
+                                "{} [{}] has unknown top-level key '{}' - EngineConfig \
+                                 has no such field, so the whole block is silently \
+                                 ignored (a typo for one of {:?}?)",
+                                file_name, name, key, ENGINE_CONFIG_ROOT_KEYS
+                            ));
+                        }
+                    }
                 }
-                if let Some(up) = entry.get("upload_params") {
-                    collect_knobs(up, "upload_params", &mut knobs);
+
+                let mut knobs = BTreeSet::new();
+                for block in ["collection_params", "connection_params", "upload_params"] {
+                    if let Some(v) = entry.get(block) {
+                        collect_knobs(v, block, &mut knobs);
+                    }
                 }
                 if let Some(list) = entry.get("search_params").and_then(|v| v.as_array()) {
                     for sp in list {
@@ -730,6 +967,38 @@ mod shipped_config_knob_guard {
                     {
                         continue;
                     }
+                    // Documented pre-existing debt, checked first so the reason
+                    // is what a reader sees rather than a generic violation.
+                    if KNOWN_UNREAD
+                        .iter()
+                        .any(|(eng, path, _)| *eng == engine && *path == knob)
+                    {
+                        used_exemptions.insert((engine.to_string(), knob.clone()));
+                        continue;
+                    }
+                    // Schema check: a key inside a closed struct that the struct
+                    // does not declare is dropped by serde on EVERY engine.
+                    if let Some((container, allowed)) = CLOSED_CONTAINERS
+                        .iter()
+                        .find(|(c, _)| knob.starts_with(&format!("{}.", c)))
+                    {
+                        let rel = &knob[container.len() + 1..];
+                        if !rel.contains('.') && !allowed.contains(&canonical(rel)) {
+                            violations.push(format!(
+                                "{} [{}] declares '{}', but '{}' is a closed struct \
+                                 accepting only {:?} - serde drops '{}' on every \
+                                 engine, so it can never take effect (see issue #216)",
+                                file_name, name, knob, container, allowed, rel
+                            ));
+                            continue;
+                        }
+                    }
+                    // Leaves inside a wholesale-forwarded container.
+                    if PASSTHROUGH_CONTAINERS.iter().any(|(eng, container)| {
+                        *eng == engine && knob.starts_with(&format!("{}.", container))
+                    }) {
+                        continue;
+                    }
                     if knob_is_read(&source, &knob) {
                         continue;
                     }
@@ -742,6 +1011,35 @@ mod shipped_config_knob_guard {
                     ));
                 }
             }
+        }
+
+        // Anti-rot: a pass-through entry must name a container the engine really
+        // reads, otherwise it would excuse a block that is dropped entirely.
+        for (engine, container) in PASSTHROUGH_CONTAINERS {
+            let source = engine_source(engine).expect("passthrough engine exists");
+            let leaf = container.rsplit('.').next().unwrap();
+            assert!(
+                contains_token(&source, leaf),
+                "PASSTHROUGH_CONTAINERS claims {} forwards '{}', but its source never \
+                 mentions '{}' - the container is not read at all",
+                engine,
+                container,
+                leaf
+            );
+        }
+
+        // Anti-rot: every exemption must correspond to a violation that is still
+        // live. This catches BOTH ways an entry goes stale — the engine learning
+        // to read the knob, and the knob being dropped from the configs — so the
+        // list cannot quietly accumulate permission slips.
+        for (engine, path, _why) in KNOWN_UNREAD {
+            assert!(
+                used_exemptions.contains(&(engine.to_string(), path.to_string())),
+                "KNOWN_UNREAD lists {}/{}, but nothing in experiments/configurations \
+                 triggers it any more - the debt is paid, so delete the entry",
+                engine,
+                path
+            );
         }
 
         assert!(checked_entries > 0, "guard checked no config entries");
@@ -772,15 +1070,28 @@ mod shipped_config_knob_guard {
             "search_params.search_params.ef"
         ));
 
-        // A short leaf under a distinctive typed parent is proven by the parent.
         assert!(
             !knob_is_read(reads_nothing, "collection_params.hnsw_config.M"),
             "no hnsw_config in source means M cannot reach the server"
         );
+        // Field access is a read; the parent alone is NOT.
         assert!(knob_is_read(
-            "cp.hnsw_config.as_ref()",
+            "let m = cp.hnsw_config.as_ref().and_then(|h| h.m);",
             "collection_params.hnsw_config.M"
         ));
+        assert!(
+            !knob_is_read("cp.hnsw_config.as_ref()", "collection_params.hnsw_config.M"),
+            "mentioning hnsw_config must not vouch for the M leaf"
+        );
+        // The #216 bug must not survive being relocated one level: `ef` under
+        // hnsw_config is still unread unless the leaf itself appears.
+        assert!(
+            !knob_is_read(
+                "let h = cp.hnsw_config.as_ref();",
+                "collection_params.hnsw_config.ef"
+            ),
+            "relocating `ef` under a mentioned parent must not launder it"
+        );
 
         // Whole-token matching: `ef` must not be satisfied by `ef_construction`.
         assert!(
@@ -789,6 +1100,58 @@ mod shipped_config_knob_guard {
         );
         assert!(contains_token("let ef = 1;", "ef"));
         assert!(!contains_token("prefix_m_suffix", "m"));
+
+        // A knob mentioned ONLY in a comment must not count as read: the likely
+        // future regression is a refactor that deletes the forwarding code and
+        // leaves the explanatory comment behind.
+        let comment_only = "/// forwards hnsw_config to hnswOptions\n\
+                            // hnsw_config.M -> maxEdges\n\
+                            fn create_index() { let x = 1; }";
+        assert!(
+            !knob_is_read(
+                &strip_test_items(&strip_comments(comment_only)),
+                "collection_params.hnsw_config.M"
+            ),
+            "a comment must not vouch for a knob the code no longer forwards"
+        );
+
+        // Nor may a mention that exists only inside a #[cfg(test)] item.
+        let test_only = "fn create_index() { let x = 1; }\n\
+                         #[cfg(test)]\n\
+                         mod tests { fn t() { let s = \"hnsw_config\"; } }";
+        assert!(
+            !knob_is_read(
+                &strip_test_items(&strip_comments(test_only)),
+                "collection_params.hnsw_config.M"
+            ),
+            "a #[cfg(test)] mention must not vouch for a production read"
+        );
+
+        // Stripping must NOT eat string literals — many engines read knobs via
+        // `params.get("batch_size")`, so the literal is the read.
+        let via_literal = "let b = p.get(\"batch_size\"); // comment";
+        let stripped = strip_test_items(&strip_comments(via_literal));
+        assert!(contains_token(&stripped, "batch_size"));
+        assert!(!stripped.contains("comment"));
+
+        // Stripping must not swallow code after a `//` inside a string literal.
+        let url = "let u = \"mongodb://host\"; let batch_size = 1;";
+        let stripped_url = strip_test_items(&strip_comments(url));
+        assert!(
+            contains_token(&stripped_url, "batch_size"),
+            "a `//` inside a string must not start a comment: {:?}",
+            stripped_url
+        );
+
+        // An engine honouring EF_CONSTRUCTION while silently dropping M must
+        // not pass clean.
+        assert!(
+            !knob_is_read(
+                "let e = cp.hnsw_config.ef_construction;",
+                "collection_params.hnsw_config.M"
+            ),
+            "reading hnsw_config must not by itself vouch for M"
+        );
 
         // Finally, tie it to the real engine: the knobs wired for issue #216
         // must be visible in the MongoDB read path.

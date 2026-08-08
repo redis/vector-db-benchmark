@@ -1582,6 +1582,18 @@ fn run_and_read_back_definition(
 /// a negative control (a config with no `hnsw_config` must produce an index with
 /// NO `hnswOptions`). Without the control the assertion could pass against a
 /// server that always reports some default, proving nothing.
+///
+/// IMPORTANT — why the tuned values are 32/200 and not 16/100:
+/// **the server elides default-valued options from the definition it reports.**
+/// The defaults are `maxEdges=16`, `numEdgeCandidates=100`, so `{16, 100}` reads
+/// back with no `hnswOptions` at all, and `{16, 200}` reads back with only
+/// `numEdgeCandidates`. "Absent from the read-back" therefore means "not sent OR
+/// sent at the default" — the control distinguishes those two only because the
+/// positive case deliberately uses NON-DEFAULT values on both knobs.
+///
+/// Consequence for anyone reparameterising this test: dropping to `M: 16` makes
+/// the `maxEdges` assertion below fail against a perfectly correct engine. Keep
+/// both values off their defaults.
 #[test]
 fn test_binary_mongodb_hnsw_config_reaches_server() {
     wait_for_mongodb();
@@ -1620,6 +1632,7 @@ fn test_binary_mongodb_hnsw_config_reaches_server() {
         )
     });
 
+    // Present only because 32 is not the default (16); see the note above.
     let max_edges = opts
         .get_i32("maxEdges")
         .map(|v| v as i64)
