@@ -1083,36 +1083,6 @@ mod shipped_config_knob_guard {
     const PASSTHROUGH_CONTAINERS: &[(&str, &str)] =
         &[("weaviate", "collection_params.vectorIndexConfig")];
 
-    /// Leaf tokens that appear in an engine's source for a reason that has
-    /// nothing to do with the config knob of the same name.
-    ///
-    /// `knob_is_read` is a whole-token text search, which is the right trade for
-    /// a guard that must work across fifteen hand-written engines — but it cannot
-    /// tell a config read from an unrelated identifier that happens to share the
-    /// leaf name. When that happens the guard silently flips to the *opposite*
-    /// failure: it concludes the engine reads the knob, so the matching
-    /// `KNOWN_UNREAD` entry looks stale and the anti-rot check demands its
-    /// deletion — which would record real debt as paid.
-    ///
-    /// Entries here are asserted below to be real: the token must actually occur
-    /// in the engine's source, so a collision that goes away (the identifier is
-    /// renamed, the call removed) fails instead of lingering.
-    ///
-    /// NOT an escape hatch for a knob the engine really should read. It records
-    /// that a *name* collides, never that a knob may go unread — the knob must
-    /// still be listed in `KNOWN_UNREAD` to be excused at all.
-    const TOKEN_COLLISIONS: &[(&str, &str, &str)] = &[(
-        "opensearch",
-        "connection_params.request_timeout",
-        "#210/#246: opensearch.rs calls reqwest's `.request_timeout(..)` builder \
-         on the force-merge and cluster-health requests, and binds a local of the \
-         same name. All three are derived from OPENSEARCH_FORCE_MERGE_TIMEOUT / \
-         OPENSEARCH_TIMEOUT, never from connection_params, so issue #245's debt is \
-         untouched. Surfaced only when #246 merged with master: master added the \
-         KNOWN_UNREAD entry while the engine had no such token, #246 added the \
-         token while the branch had no such entry, and neither side fails alone.",
-    )];
-
     /// Knobs shipped configs declare that their engine genuinely does NOT read.
     /// Pre-existing debt this guard surfaced, listed rather than silently
     /// excused — and asserted to still be unread, so a fix must delete its entry
@@ -1379,9 +1349,64 @@ mod shipped_config_knob_guard {
     /// moving `ef` to `collection_params.hnsw_config.ef` passed on engines that
     /// merely mention `hnsw_config`. Parent proxying is gone; field access still
     /// counts, since `h.m` contains the whole token `m`.
+    ///
+    /// A bare method CALL — `.leaf(..)` — is not evidence. Those are almost
+    /// always a client-library builder setter that merely shares a name with the
+    /// knob: `opensearch.rs` calls reqwest's `.request_timeout(..)` on the
+    /// force-merge and cluster-health requests with a value derived from
+    /// OPENSEARCH_FORCE_MERGE_TIMEOUT, and never consults
+    /// `connection_params.request_timeout`. Counting that as a read would have
+    /// silently retired issue #245's KNOWN_UNREAD entry as paid-off debt.
+    ///
+    /// The asymmetry is deliberate. Discounting a real read costs a loud, easily
+    /// diagnosed failure ("no source file of that engine ever reads it") that a
+    /// human resolves in a minute. Accepting a fake read costs silence, which is
+    /// the failure mode this whole guard exists to prevent — so when the two are
+    /// in tension, err toward loud. An engine that genuinely reads a knob only
+    /// through a same-named getter can add a field access, or the knob can be
+    /// listed in `KNOWN_UNREAD` with the reason.
     fn knob_is_read(source: &str, knob_path: &str) -> bool {
         let leaf = canonical(knob_path.rsplit('.').next().unwrap_or(knob_path));
-        contains_token(source, leaf)
+        token_occurrences(source, leaf).any(|at| !is_method_call(source, at, leaf))
+    }
+
+    /// Byte offsets of every whole-token occurrence of `token` in `haystack`.
+    fn token_occurrences<'a>(
+        haystack: &'a str,
+        token: &'a str,
+    ) -> impl Iterator<Item = usize> + 'a {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let bytes = haystack.as_bytes();
+        let mut from = 0usize;
+        std::iter::from_fn(move || {
+            while let Some(pos) = haystack[from..].find(token) {
+                let start = from + pos;
+                let end = start + token.len();
+                from = start + 1;
+                let before_ok = start == 0 || !is_word(bytes[start - 1] as char);
+                let after_ok = end >= bytes.len() || !is_word(bytes[end] as char);
+                if before_ok && after_ok {
+                    return Some(start);
+                }
+            }
+            None
+        })
+    }
+
+    /// Whether the occurrence at `at` is a method call `.token(` rather than a
+    /// field access or a plain identifier.
+    ///
+    /// Deliberately does NOT skip whitespace before the dot: `foo\n    .bar(` is
+    /// a chained builder call and is treated as one, which is exactly the shape
+    /// a fluent client library produces.
+    fn is_method_call(source: &str, at: usize, token: &str) -> bool {
+        let dotted = source[..at].trim_end().ends_with('.');
+        let called = source[at + token.len()..]
+            .bytes()
+            .find(|b| !b.is_ascii_whitespace())
+            .map(|b| b == b'(')
+            .unwrap_or(false);
+        dotted && called
     }
 
     /// Every knob declared by a shipped config must be read by its engine.
@@ -1495,13 +1520,7 @@ mod shipped_config_knob_guard {
                         });
 
                     let reason = schema_violation.or_else(|| {
-                        // A token match only counts as a read when the token is
-                        // not a known namesake of something unrelated — see
-                        // TOKEN_COLLISIONS.
-                        let collides = TOKEN_COLLISIONS
-                            .iter()
-                            .any(|(eng, path, _)| *eng == engine && *path == knob);
-                        if knob_is_read(&source, &knob) && !collides {
+                        if knob_is_read(&source, &knob) {
                             None
                         } else {
                             Some(format!(
@@ -1546,33 +1565,6 @@ mod shipped_config_knob_guard {
                 engine,
                 container,
                 leaf
-            );
-        }
-
-        // Anti-rot: a declared collision must still be a real one. If the token
-        // no longer appears in the engine's source, the namesake is gone and the
-        // entry is now suppressing a genuine read-detection.
-        for (engine, path, _why) in TOKEN_COLLISIONS {
-            let source = engine_source(engine).expect("collision engine exists");
-            let leaf = canonical(path.rsplit('.').next().unwrap_or(path));
-            assert!(
-                contains_token(&source, leaf),
-                "TOKEN_COLLISIONS claims {}/{} collides with an unrelated use of \
-                 '{}', but the token no longer appears in the engine source - the \
-                 collision is gone, so delete the entry and let knob_is_read speak",
-                engine,
-                path,
-                leaf
-            );
-            assert!(
-                KNOWN_UNREAD
-                    .iter()
-                    .any(|(eng, p, _)| eng == engine && p == path),
-                "TOKEN_COLLISIONS lists {}/{} but KNOWN_UNREAD does not - a \
-                 collision entry only suppresses a false 'engine reads it' \
-                 signal; on its own it would silently excuse an unread knob",
-                engine,
-                path
             );
         }
 
@@ -1630,6 +1622,36 @@ mod shipped_config_knob_guard {
         assert!(
             !knob_is_read("cp.hnsw_config.as_ref()", "collection_params.hnsw_config.M"),
             "mentioning hnsw_config must not vouch for the M leaf"
+        );
+
+        // A builder setter is not a read. This is the shape that broke when #246
+        // met master: opensearch.rs gained reqwest `.request_timeout(..)` calls
+        // whose value comes from OPENSEARCH_FORCE_MERGE_TIMEOUT, and the guard
+        // concluded the engine now read `connection_params.request_timeout` —
+        // which would have retired issue #245's KNOWN_UNREAD entry as paid debt.
+        assert!(
+            !knob_is_read(
+                ".forcemerge(x)\n.max_num_segments(1)\n.request_timeout(merge_deadline)\n.send()",
+                "connection_params.request_timeout"
+            ),
+            "a chained `.request_timeout(..)` builder call is a transport setter, \
+             not evidence that the engine reads the config knob of that name"
+        );
+        // ...but any non-call mention still counts, so a real read is never lost.
+        assert!(
+            knob_is_read(
+                "let t = cp.request_timeout.unwrap_or(300);",
+                "connection_params.request_timeout"
+            ),
+            "field access must still count as a read"
+        );
+        assert!(
+            knob_is_read(
+                ".request_timeout(cfg.request_timeout)",
+                "connection_params.request_timeout"
+            ),
+            "forwarding the config value INTO the setter is a genuine read, and \
+             the argument occurrence is not itself a method call"
         );
         // THE relocation defence, tested directly rather than only via the
         // whole-corpus sweep. Token matching cannot stop `hnsw_config.ef`
