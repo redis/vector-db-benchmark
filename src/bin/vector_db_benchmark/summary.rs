@@ -756,8 +756,9 @@ mod tests {
 
     /// The summary is the file a dashboard reads instead of the 200 per-search
     /// files, so it has to answer "what was this run configured with?" on its
-    /// own (#212) — and the schema version has to move so a consumer can tell a
-    /// summary that can answer it from one that cannot.
+    /// own (#212). `metrics_schema_version` deliberately does NOT move: it
+    /// versions the metric definitions, which #212 did not touch. The marker for
+    /// this block is `engine_params.schema_version`.
     #[test]
     fn summary_carries_the_engine_params_block_at_top_level() {
         let dir = tempfile::tempdir().unwrap();
@@ -768,7 +769,11 @@ mod tests {
             "env": {"OPENSEARCH_BULK_MAX_RETRIES": null},
             "overridden": [{"key": "collection_params.number_of_shards",
                             "declared": 3, "effective": 1, "reason": "pinned in code"}],
-            "ignored_declared_keys": ["collection_params.hnsw_config.DISTANCE_METRIC"],
+            "ignored_declared_keys": {
+                "exhaustive": false,
+                "covers": "…",
+                "keys": ["collection_params.hnsw_config.DISTANCE_METRIC"],
+            },
         });
         save_summary(
             "es-tuned",
@@ -794,8 +799,12 @@ mod tests {
         assert_eq!(v["engine_params"]["overridden"][0]["declared"], 3);
         assert_eq!(v["engine_params"]["overridden"][0]["effective"], 1);
         assert_eq!(
-            v["engine_params"]["ignored_declared_keys"][0],
+            v["engine_params"]["ignored_declared_keys"]["keys"][0],
             "collection_params.hnsw_config.DISTANCE_METRIC"
+        );
+        assert_eq!(
+            v["engine_params"]["ignored_declared_keys"]["exhaustive"],
+            false
         );
     }
 

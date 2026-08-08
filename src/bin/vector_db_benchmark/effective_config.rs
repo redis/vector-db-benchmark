@@ -81,20 +81,42 @@ pub const ENGINE_PARAMS_SCHEMA_VERSION: u32 = 1;
 /// the value is not, and these files get published.
 const REDACTED: &str = "<redacted:set>";
 
-/// Substrings that make an environment variable's *value* a credential.
+/// Placeholder for a credential the run used but which came from a built-in
+/// DEFAULT, not from the environment.
 ///
-/// Matched case-insensitively against the variable name. Deliberately not
-/// `KEY` on its own — `REDIS_KEY_PREFIX` and `MILVUS_COLLECTION_NAME` are
-/// benign and their values are needed to tell two runs apart.
+/// `<redacted:set>` next to `env: null` in the same block asserted "set" for a
+/// variable the block had just said was unset — the self-contradiction class
+/// this module exists to remove.
+const REDACTED_DEFAULT: &str = "<redacted:default>";
+
+/// Substrings that make a KEY's value a credential.
+///
+/// Matched case-insensitively against the key, and against every *ancestor* key
+/// on the path to a value (see [`scrub_value`]), so these cover configuration
+/// file keys like `api_key` and `auth_token` as well as environment variable
+/// names. Bias is deliberately towards over-matching: a redacted knob costs
+/// provenance, a published one costs a rotation.
+///
+/// Deliberately not bare `KEY` — `REDIS_KEY_PREFIX` and `MILVUS_COLLECTION_NAME`
+/// are benign and their values are needed to tell two runs apart.
 const SECRET_MARKERS: &[&str] = &[
     "PASSWORD",
     "PASSWD",
+    // Bare `PASS` also catches `REDIS_PASS` and `pass`.
+    "PASS",
     "API_KEY",
     "APIKEY",
-    "ACCESS_TOKEN",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "SIGNING_KEY",
+    // Bare `TOKEN`/`AUTH` catch `ACCESS_TOKEN`, `AUTH_TOKEN`, `AUTHORIZATION`,
+    // `AWS_SESSION_TOKEN`, `REDIS_AUTH`. Note `"AUTH_TOKEN".contains("_AUTH")`
+    // is FALSE, which is how the leading-underscore forms missed them.
+    "TOKEN",
+    "AUTH",
     "SECRET",
-    "_AUTH",
     "CREDENTIAL",
+    "SESSION",
 ];
 
 /// True when `name`'s value must never reach an artifact.
@@ -105,31 +127,146 @@ pub fn is_secret(name: &str) -> bool {
 
 /// Strip `user:password@` from a URL-shaped value.
 ///
-/// `REDIS_URI`, `QDRANT_URL` and friends are not credential variables by name,
-/// but a connection string routinely carries one inline. Returning the URL with
-/// the userinfo blanked keeps the host/port — which is provenance worth having —
+/// A connection string routinely carries a credential inline under a key that
+/// is not credential-named (`REDIS_URI`, `--host`, a config file's `endpoint`).
+/// Blanking the userinfo keeps the host/port — provenance worth having —
 /// without publishing the secret.
+///
+/// Two passes, because a redactor must fail safe:
+///
+/// 1. RFC 3986: the authority ends at the first `/`, `?` or `#`; an `@` inside
+///    it delimits userinfo.
+/// 2. If that finds nothing but an `@` appears later, the value is not a
+///    well-formed URL — and computing the authority boundary *first* is exactly
+///    how `redis://admin:hunt/er2@10.0.0.5:6379/0` used to be returned
+///    untouched, password and all. When the text before the last `@` contains a
+///    `:` it looks like `user:password`, so it is redacted anyway. A path that
+///    merely contains an `@` (`http://h/p@th`) has no colon and is left alone.
 fn strip_userinfo(value: &str) -> String {
-    // Only touch things that look like `scheme://…`; a bare host has no userinfo.
-    let Some(sep) = value.find("://") else {
-        return value.to_string();
+    // Scheme-less authority: `--host 'default:pw@127.0.0.1'` is exactly how the
+    // Redis-wire engines take a password, and `mongodb_engine` short-circuits on
+    // a `mongodb`-prefixed host where `user:pass@` is the convention. No `://`
+    // is required for the value to be a credential.
+    let (scheme, rest) = match value.find("://") {
+        Some(sep) => value.split_at(sep + 3),
+        None => ("", value),
     };
-    let (scheme, rest) = value.split_at(sep + 3);
-    // The authority ends at the first '/', '?' or '#'.
+
     let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(auth_end);
-    match authority.rfind('@') {
-        Some(at) => format!("{scheme}{REDACTED}@{}{tail}", &authority[at + 1..]),
-        None => value.to_string(),
+    if let Some(at) = authority.rfind('@') {
+        return format!("{scheme}{REDACTED}@{}{tail}", &authority[at + 1..]);
+    }
+
+    // Malformed-but-dangerous fallback.
+    match rest.rfind('@') {
+        Some(at) if rest[..at].contains(':') => {
+            format!("{scheme}{REDACTED}@{}", &rest[at + 1..])
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Blank the value of a `key=value` credential inside an opaque connection
+/// string (libpq DSNs: `host=db user=bench password=hunter2 sslmode=require`).
+///
+/// Name-based redaction cannot see these — the secret is *inside* the value of
+/// a key that is not itself credential-named.
+fn strip_dsn_secrets(value: &str) -> String {
+    if !value.contains('=') {
+        return value.to_string();
+    }
+    value
+        .split_inclusive(char::is_whitespace)
+        .map(|tok| match tok.split_once('=') {
+            Some((k, v)) if is_secret(k.trim()) && !v.trim().is_empty() => {
+                let trailing = &tok[tok.trim_end().len()..];
+                format!("{k}={REDACTED}{trailing}")
+            }
+            _ => tok.to_string(),
+        })
+        .collect()
+}
+
+/// Scrub one JSON value for publication.
+///
+/// `secret_ancestor` is true when any key on the path to this value is
+/// credential-named, which is what makes the rule total: a secret nested inside
+/// an object (`record_effective("ELASTIC_PASSWORD", json!({"value": s}))`) is
+/// caught just like a bare string, and so is every leaf of a raw configuration
+/// file block copied in wholesale.
+fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
+    match value {
+        // `null` under a secret key means "read and unset" — a fact, not a leak.
+        Value::Null => Value::Null,
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    // An `overridden` entry names its knob in a sibling `key`
+                    // field rather than in its own JSON key, so `declared` /
+                    // `effective` there would otherwise look benign.
+                    let entry_key = map
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_secret);
+                    (
+                        k.clone(),
+                        scrub_value(v, secret_ancestor || is_secret(k) || entry_key),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| scrub_value(v, secret_ancestor))
+                .collect(),
+        ),
+        Value::String(s) if secret_ancestor && s == REDACTED_DEFAULT => {
+            Value::from(REDACTED_DEFAULT)
+        }
+        _ if secret_ancestor => Value::from(REDACTED),
+        Value::String(s) => Value::from(strip_dsn_secrets(&strip_userinfo(s))),
+        other => other.clone(),
     }
 }
 
 /// Redact a raw environment value for publication.
 fn redact(name: &str, raw: &str) -> Value {
-    if is_secret(name) {
-        Value::from(REDACTED)
-    } else {
-        Value::from(strip_userinfo(raw))
+    scrub_value(&Value::from(raw), is_secret(name))
+}
+
+/// Assert that no credential-named key anywhere in `value` carries anything but
+/// [`REDACTED`]. The mirror image of [`scrub_value`], deliberately written as a
+/// separate walk: if the two ever disagree the assertion is the one that fires,
+/// and it fires in release builds too (`assert!`, under no `cfg`).
+fn assert_no_cleartext_secrets(value: &Value, secret_ancestor: bool, path: &str) {
+    match value {
+        Value::Null => {}
+        Value::Object(map) => {
+            let entry_key = map
+                .get("key")
+                .and_then(Value::as_str)
+                .is_some_and(is_secret);
+            for (k, v) in map {
+                assert_no_cleartext_secrets(
+                    v,
+                    secret_ancestor || is_secret(k) || entry_key,
+                    &format!("{path}.{k}"),
+                );
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                assert_no_cleartext_secrets(v, secret_ancestor, &format!("{path}[{i}]"));
+            }
+        }
+        leaf => assert!(
+            !secret_ancestor || matches!(leaf.as_str(), Some(REDACTED) | Some(REDACTED_DEFAULT)),
+            "refusing to publish `{path}` in the clear: a credential-named key \
+             reached the artifact carrying {leaf}. Every value under such a key \
+             must go through `scrub_value`."
+        ),
     }
 }
 
@@ -215,24 +352,25 @@ impl Recorder {
     /// from every present and future caller; [`Recorder::snapshot`] then asserts
     /// it held.
     pub fn record_effective(&mut self, key: &str, value: Value) {
-        let value = match value.as_str() {
-            Some(text) => redact(key, text),
-            // A non-string (port, timeout, bool) cannot carry a credential.
-            None => value,
-        };
+        // `scrub_value`, not a string-only check: a credential nested inside an
+        // object under a secret-named key is still a credential.
+        self.effective
+            .insert(key.to_string(), scrub_value(&value, is_secret(key)));
+    }
+
+    /// Insert a value that is ALREADY a safe placeholder, bypassing the scrub
+    /// that would rewrite `<redacted:default>` into `<redacted:set>`.
+    fn record_effective_raw(&mut self, key: &str, value: Value) {
         self.effective.insert(key.to_string(), value);
     }
 
     /// Record that `declared` lost to `effective`, and why.
     pub fn note_override(&mut self, key: &str, declared: Value, effective: Value, reason: &str) {
-        let scrub = |v: Value| match v.as_str() {
-            Some(text) => redact(key, text),
-            None => v,
-        };
+        let secret = is_secret(key);
         let entry = json!({
             "key": key,
-            "declared": scrub(declared),
-            "effective": scrub(effective),
+            "declared": scrub_value(&declared, secret),
+            "effective": scrub_value(&effective, secret),
             "reason": reason,
         });
         if !self.overridden.contains(&entry) {
@@ -240,40 +378,49 @@ impl Recorder {
         }
     }
 
+    /// Clear every field, so the next experiment starts from nothing.
+    ///
+    /// `declared`, `invocation` and `phase` are overwritten each experiment and
+    /// self-heal; `env`, `effective`, `overridden` and `ignored` only ACCUMULATE
+    /// and are cleared here and nowhere else. That asymmetry is why dropping the
+    /// clear was caught by only one test, and flakily: it is the single point of
+    /// failure for four of the seven fields.
+    pub fn begin(&mut self) {
+        *self = Recorder::new();
+    }
+
     /// Record a declared configuration key that is known not to be read.
     pub fn note_ignored(&mut self, key: &str) {
         self.ignored.insert(key.to_string());
     }
 
-    /// Every string value this snapshot would publish, with the key it sits
-    /// under. The single place that enumerates the artifact's string leaves, so
-    /// the redaction invariant below cannot miss a map somebody adds later.
-    fn published_strings(&self) -> Vec<(&str, &str)> {
-        fn from_map(m: &BTreeMap<String, Value>) -> impl Iterator<Item = (&str, &str)> {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.as_str(), s)))
-        }
-        from_map(&self.env)
-            .chain(from_map(&self.effective))
-            .collect()
-    }
-
     /// The `engine_params` block for an artifact.
+    ///
+    /// Everything the block will publish is passed through [`scrub_value`] as
+    /// one tree, then re-walked to assert the invariant held.
+    ///
+    /// The previous version enumerated two flat maps (`env`, `effective`) while
+    /// `snapshot` emitted five value-bearing members. The three it never
+    /// inspected — `invocation`, `declared`, `overridden` — were exactly the
+    /// three this block added, and two of them leaked live: `--host
+    /// 'user:pw@127.0.0.1'` and a configuration file's `api_key` were published
+    /// verbatim, three keys from a `<redacted:set>`. Scrubbing the assembled
+    /// document instead of named maps is what makes "cannot miss a map somebody
+    /// adds later" true rather than aspirational.
     ///
     /// # Panics
     ///
     /// If a credential-named key would be published in the clear. These files
     /// get pasted into issues; aborting the run is the correct response to
-    /// discovering we are about to leak, and the invariant is checked here —
-    /// once, over every map — rather than trusted to each writer.
+    /// discovering we are about to leak.
     pub fn snapshot(&self) -> Value {
-        for (key, value) in self.published_strings() {
-            assert!(
-                !(is_secret(key) && value != REDACTED),
-                "refusing to publish `{key}` in the clear: every credential-named \
-                 key must go through `redact` (see Recorder::record_effective)"
-            );
-        }
+        let doc = self.assemble();
+        let scrubbed = scrub_value(&doc, false);
+        assert_no_cleartext_secrets(&scrubbed, false, "engine_params");
+        scrubbed
+    }
+
+    fn assemble(&self) -> Value {
         json!({
             "schema_version": ENGINE_PARAMS_SCHEMA_VERSION,
             "phase": self.phase,
@@ -310,7 +457,7 @@ fn recorder() -> MutexGuard<'static, Recorder> {
 /// Start a fresh recording. Prefer [`begin_experiment`], which cannot be
 /// half-called; this exists for tests that drive the recorder directly.
 pub fn reset() {
-    *recorder() = Recorder::new();
+    recorder().begin();
 }
 
 /// Begin recording one experiment: clear the previous configuration's state,
@@ -322,11 +469,38 @@ pub fn reset() {
 /// configurations silently inherited the earlier ones' knobs — the exact
 /// sweep-bleed this module's docs warn about. Resetting is now inseparable from
 /// declaring, so forgetting it is not expressible.
-pub fn begin_experiment(engine_config: &crate::config::EngineConfig, invocation: Value) {
+pub fn begin_experiment(
+    engine_config: &crate::config::EngineConfig,
+    invocation: Value,
+) -> Recording {
     reset();
     set_declared(engine_config);
     set_invocation(invocation);
+    Recording(())
 }
+
+/// Proof that a recording was started for the experiment about to run.
+///
+/// `run_single_experiment` **consumes** one of these. That is the whole point,
+/// and it is load-bearing: a source-scanning guard could be satisfied by a
+/// commented-out call, and was — `// TODO(#212): re-enable begin_experiment(…)`
+/// passed 776/776 while every artifact shipped `declared: null`. So did
+/// `if engine_idx == 0 { begin_experiment(…) }`, which is worse than the bug
+/// #212 fixed: the second config then publishes the FIRST config's `declared`
+/// block and `effective` knobs, so the artifact affirmatively asserts a
+/// configuration that never ran where master merely said nothing.
+///
+/// Because the token is neither `Copy` nor `Clone` and is taken by value:
+///
+/// * commenting the call out  -> the binding does not exist, does not compile;
+/// * calling it conditionally -> the binding is not in scope, does not compile;
+/// * hoisting it out of the loop so it runs once per *config* instead of once
+///   per (config, dataset) -> moved on the first iteration, does not compile.
+///
+/// None of those three is expressible now. That is what the guard could not do.
+#[must_use = "run_single_experiment consumes this; dropping it means the \
+              experiment ran without its provenance being started"]
+pub struct Recording(());
 
 /// Record how the tool was invoked.
 ///
@@ -490,10 +664,18 @@ pub fn env_or(name: &str, default: &str) -> String {
     let raw = std::env::var(name).ok();
     let mut rec = recorder();
     rec.observe_env(name, raw.as_deref());
+    let was_set = raw.is_some();
     let value = raw.unwrap_or_else(|| default.to_string());
     // Redaction is applied by `record_effective` itself; passing the plaintext
-    // is correct and is what every other caller does.
-    rec.record_effective(name, Value::from(value.clone()));
+    // is correct and is what every other caller does. The one thing it cannot
+    // know is whether the value came from the environment or from the built-in
+    // default, which is the difference between `<redacted:set>` and
+    // `<redacted:default>`.
+    if is_secret(name) && !was_set {
+        rec.record_effective_raw(name, Value::from(REDACTED_DEFAULT));
+    } else {
+        rec.record_effective(name, Value::from(value.clone()));
+    }
     value
 }
 
@@ -619,9 +801,50 @@ mod recorder_coverage_guard {
     /// and therefore are not compiled at all. Exempted rather than deleted here
     /// to keep this change to provenance; removing the dead constructor and the
     /// two dead directories is tracked separately.
-    const EXEMPT: &[&str] = &[
-        "src/bin/vector_db_benchmark/effective_config.rs",
-        "src/config.rs",
+    const EXEMPT: &[&str] = &["src/bin/vector_db_benchmark/effective_config.rs"];
+
+    /// Individual reads that are allowed to stay raw, as (file, snippet, why).
+    /// Scoped to the exact call rather than exempting a whole file, and asserted
+    /// to still be present so a removed one cannot leave a stale excuse.
+    const EXEMPT_CALLS: &[(&str, &str, &str)] = &[
+        (
+            "src/config.rs",
+            "env::var(\"REDIS_PORT\")",
+            "RedisConfig::from_env is a pub constructor whose only callers are \
+             src/redisearch/ and src/vectorsets/, neither of which lib.rs \
+             declares — dead code, tracked for deletion in #275",
+        ),
+        (
+            "src/config.rs",
+            "env::var(\"REDIS_AUTH\")",
+            "as REDIS_PORT above (#275)",
+        ),
+        (
+            "src/config.rs",
+            "env::var(\"REDIS_USER\")",
+            "as REDIS_PORT above (#275)",
+        ),
+        (
+            "src/config.rs",
+            "env::var(\"REDIS_CLUSTER\")",
+            "as REDIS_PORT above (#275); also documented in v0/DOCKER_README.md \
+             and read by nothing live",
+        ),
+        ("src/config.rs", "env::var(k)", "as REDIS_PORT above (#275)"),
+        (
+            "src/bin/vector_db_benchmark/config.rs",
+            "env::current_dir()",
+            "project_root() resolves the configurations directory from the cwd. \
+             The RESOLVED directory is recorded once per run in \
+             `invocation.configurations_dir`, which is the fact that matters — \
+             it decides which configs the sweep globs",
+        ),
+        (
+            "src/bin/vector_db_benchmark/download.rs",
+            "env::temp_dir()",
+            "staging directory for a dataset download; affects where bytes land \
+             on disk, not what is measured",
+        ),
     ];
 
     /// Directories on disk that no crate root declares, so nothing in them is
@@ -632,8 +855,18 @@ mod recorder_coverage_guard {
     /// shim, which records the raw text and nothing else.
     ///
     /// Asserted in BOTH directions, exactly like `config::KNOWN_UNREAD`: every
-    /// `env_var` site must be listed here, and every entry here must still be an
-    /// `env_var` site. Migrating one to `env_parsed`/`env_flag`/`env_opt`
+    /// LITERAL-named `env_var` site must be listed here, and every entry here
+    /// must still be an `env_var` site.
+    ///
+    /// Exactly one site takes a non-literal name — `opensearch::parse_env_secs`,
+    /// called with `OPENSEARCH_FORCE_MERGE_TIMEOUT` and
+    /// `..._FORCE_MERGE_BUDGET`. It is NOT listed, and does not need to be: it
+    /// records the resolved value with `record_effective`, so those two knobs
+    /// are tier 1, not tier 2. `NON_LITERAL_ENV_VAR_SITES` below pins that count
+    /// so a second dynamic site cannot appear unnoticed. (An earlier version of
+    /// this comment claimed two `format!`-built sites covered by a base
+    /// variable; there is one, it uses no `format!`, and it has no base
+    /// variable.) Migrating one to `env_parsed`/`env_flag`/`env_opt`
     /// therefore FORCES deleting its row, so the list cannot rot into a stale
     /// excuse — and adding a new weak read forces writing down why.
     ///
@@ -733,6 +966,15 @@ mod recorder_coverage_guard {
         ),
     ];
 
+    /// `env_var` call sites whose variable name is not a literal, as
+    /// (file, function, why it is not in `KNOWN_UNRECORDED`).
+    const NON_LITERAL_ENV_VAR_SITES: &[(&str, &str, &str)] = &[(
+        "src/bin/vector_db_benchmark/engine/opensearch.rs",
+        "parse_env_secs",
+        "records the parsed value with `record_effective`, so its two knobs are \
+         tier 1; the raw-text-only contract of KNOWN_UNRECORDED does not apply",
+    )];
+
     fn repo_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
     }
@@ -812,9 +1054,33 @@ mod recorder_coverage_guard {
                 continue;
             }
             let production = strip_test_modules(&src);
-            for probe in ["env::var(", "env::var_os(", "env::vars("] {
-                if production.contains(probe) {
+            for probe in [
+                "env::var(",
+                "env::var_os(",
+                "env::vars(",
+                "env::vars_os(",
+                "env::temp_dir(",
+                "env::current_dir(",
+            ] {
+                let mut from = 0usize;
+                while let Some(i) = production[from..].find(probe) {
+                    let at = from + i;
+                    from = at + probe.len();
+                    // A scoped exemption must match the exact call text.
+                    let tail = &production[at..(at + 64).min(production.len())];
+                    if EXEMPT_CALLS
+                        .iter()
+                        .any(|(f, snippet, _)| *f == path && tail.starts_with(snippet))
+                    {
+                        continue;
+                    }
                     offenders.push(format!("{path}: {probe}"));
+                }
+            }
+            // Aliasing defeats a textual probe outright.
+            for alias in ["use std::env::var", "use std::env::vars"] {
+                if production.contains(alias) {
+                    offenders.push(format!("{path}: {alias} (aliased import)"));
                 }
             }
         }
@@ -828,21 +1094,33 @@ mod recorder_coverage_guard {
         );
     }
 
-    /// GUARD 3 — the experiment loop actually begins a recording.
+    /// Remove `//` line comments so a commented-out call cannot satisfy a
+    /// source scan. `// TODO(#212): re-enable begin_experiment(…)` passed the
+    /// unstripped version while every artifact shipped `declared: null`.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// GUARD 3 — a cheap backstop; the real protection is the type.
     ///
-    /// A source scan, because `experiment::run` cannot be unit-tested: it builds
-    /// engines and talks to servers. Deleting its
-    /// `effective_config::begin_experiment(...)` line therefore leaves every
-    /// unit test green while every artifact loses its provenance — and a sweep
-    /// silently carries configuration A's knobs into configuration B's file.
-    /// Crude, but it fails on the one edit that would otherwise be invisible
-    /// until someone reads a published result.
+    /// `effective_config::Recording` is move-only and consumed by
+    /// `run_single_experiment`, so commenting the call out, calling it
+    /// conditionally, or hoisting it out of the per-experiment loop are all
+    /// compile errors (verified). This scan only adds the ORDERING check the
+    /// type cannot express: the recording must begin before the engine is built,
+    /// because engines resolve most of their environment knobs in `new()`.
     #[test]
     fn the_experiment_loop_begins_a_recording_before_building_the_engine() {
         let src =
             std::fs::read_to_string(repo_root().join("src/bin/vector_db_benchmark/experiment.rs"))
                 .expect("experiment.rs");
-        let production = strip_test_modules(&src);
+        let production = strip_line_comments(&strip_test_modules(&src));
         let begin = production
             .find("effective_config::begin_experiment(")
             .expect(
@@ -869,9 +1147,11 @@ mod recorder_coverage_guard {
                 continue;
             }
             let production = strip_test_modules(&src);
+            // Match a bare `env_var(` too: an `use crate::effective_config::env_var;`
+            // would otherwise hide a site from this guard entirely.
             let mut rest = production.as_str();
-            while let Some(i) = rest.find("effective_config::env_var(") {
-                rest = &rest[i + "effective_config::env_var(".len()..];
+            while let Some(i) = rest.find("env_var(") {
+                rest = &rest[i + "env_var(".len()..];
                 // Literal `"NAME"` argument; the two dynamic-name sites build
                 // their name with `format!` and are covered by their base var.
                 if let Some(stripped) = rest.strip_prefix('"') {
@@ -898,6 +1178,37 @@ mod recorder_coverage_guard {
              use a recording helper, or add a row saying why the raw text is the \
              whole story: {missing:?}"
         );
+        // A non-literal `env_var(some_var)` is invisible to the name matching
+        // above, so it would evade the bidirectional assertion entirely. Pin the
+        // count: a second dynamic site has to be justified in
+        // NON_LITERAL_ENV_VAR_SITES before it can appear.
+        let mut dynamic = Vec::new();
+        for (path, src) in rust_sources() {
+            if path.ends_with("effective_config.rs") {
+                continue;
+            }
+            let production = strip_test_modules(&src);
+            let mut rest = production.as_str();
+            while let Some(i) = rest.find("env_var(") {
+                rest = &rest[i + "env_var(".len()..];
+                if !rest.starts_with('"') && !rest.starts_with('&') {
+                    dynamic.push(path.clone());
+                }
+            }
+        }
+        dynamic.sort();
+        dynamic.dedup();
+        let documented: Vec<String> = NON_LITERAL_ENV_VAR_SITES
+            .iter()
+            .map(|(f, _, _)| f.to_string())
+            .collect();
+        assert_eq!(
+            dynamic, documented,
+            "the set of `env_var` sites taking a NON-LITERAL name changed. Such a \
+             site cannot be name-matched, so it must be justified in \
+             NON_LITERAL_ENV_VAR_SITES (or given a literal name)"
+        );
+
         let stale: Vec<_> = listed.iter().filter(|v| !actual.contains(v)).collect();
         assert!(
             stale.is_empty(),
@@ -1180,16 +1491,207 @@ mod tests {
         assert_eq!(r.snapshot()["effective"]["ELASTIC_PASSWORD"], REDACTED);
     }
 
-    /// The invariant is enforced by `snapshot`, not merely by the writers, so a
-    /// future map or a route that skips `record_effective` still cannot publish.
+    /// A route that bypasses `record_effective` entirely is repaired by
+    /// `snapshot`, not merely detected by it: the scrub runs over the assembled
+    /// document, so the write path is no longer trusted at all.
     #[test]
-    #[should_panic(expected = "refusing to publish")]
-    fn snapshot_refuses_to_publish_a_credential_in_the_clear() {
+    fn snapshot_scrubs_a_credential_that_bypassed_the_write_path() {
         let mut r = Recorder::new();
-        // Bypass `record_effective` the way a careless future edit would.
+        // Exactly what a careless future edit would do.
         r.effective
             .insert("MONGODB_PASSWORD".into(), json!("plaintext"));
-        r.snapshot();
+        assert_eq!(r.snapshot()["effective"]["MONGODB_PASSWORD"], REDACTED);
+    }
+
+    /// The two live leaks the review found, at the layer that produced them.
+    ///
+    /// `snapshot()` emitted five value-bearing members while the assertion
+    /// walked two flat maps. The three it never inspected — `invocation`,
+    /// `declared`, `overridden` — were exactly the three this block added.
+    #[test]
+    fn every_member_of_the_snapshot_is_scrubbed_not_just_env_and_effective() {
+        let mut r = Recorder::new();
+        // BLOCKER 1: `--host 'user:pw@node'`, scheme-less, run succeeds.
+        r.set_invocation(json!({"host": "default:HOST-CANARY@127.0.0.1"}));
+        // BLOCKER 2: the raw config file copied in wholesale.
+        r.set_declared(
+            Some(&json!({
+                "api_key": "DECLARED-CANARY-bbb",
+                "endpoint": "https://svc:DECLARED-CANARY-ccc@vendor.cloud/v1",
+                "nested": {"deep": {"auth_token": "DECLARED-CANARY-eee"}}
+            })),
+            Some(&json!({"parallel": 8, "auth_token": "DECLARED-CANARY-ddd"})),
+        );
+        // Latent: an override whose secret-ness is named in a SIBLING field.
+        r.note_override(
+            "REDIS_AUTH",
+            json!({"was": "OVERRIDE-CANARY-fff"}),
+            json!("OVERRIDE-CANARY-ggg"),
+            "rotated",
+        );
+
+        let dumped = serde_json::to_string(&r.snapshot()).unwrap();
+        for canary in [
+            "HOST-CANARY",
+            "DECLARED-CANARY-bbb",
+            "DECLARED-CANARY-ccc",
+            "DECLARED-CANARY-ddd",
+            "DECLARED-CANARY-eee",
+            "OVERRIDE-CANARY-fff",
+            "OVERRIDE-CANARY-ggg",
+        ] {
+            assert!(!dumped.contains(canary), "{canary} leaked: {dumped}");
+        }
+        // Provenance that is NOT a secret survives.
+        let s = r.snapshot();
+        assert!(s["invocation"]["host"]
+            .as_str()
+            .unwrap()
+            .contains("127.0.0.1"));
+        assert_eq!(s["declared"]["upload_params"]["parallel"], 8);
+        assert!(s["declared"]["collection_params"]["endpoint"]
+            .as_str()
+            .unwrap()
+            .contains("vendor.cloud"));
+    }
+
+    /// The assertion is a real backstop, not a restatement of the scrubber: it
+    /// walks the assembled document independently and fires in release builds.
+    #[test]
+    #[should_panic(expected = "refusing to publish `engine_params.declared")]
+    fn the_assertion_catches_a_secret_the_scrubber_would_have_missed() {
+        let mut doc = json!({"declared": {"api_key": "leaked"}});
+        // Simulate a future member that skipped `scrub_value`.
+        doc["declared"]["api_key"] = json!("leaked");
+        assert_no_cleartext_secrets(&doc, false, "engine_params");
+    }
+
+    /// Name-based redaction cannot see a secret INSIDE the value of a
+    /// non-credential key. libpq DSNs are the live shape.
+    #[test]
+    fn dsn_embedded_password_is_blanked() {
+        let mut r = Recorder::new();
+        r.record_effective(
+            "PGVECTOR_DSN",
+            json!("host=db user=bench password=DSN-CANARY sslmode=require"),
+        );
+        let out = r.snapshot()["effective"]["PGVECTOR_DSN"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!out.contains("DSN-CANARY"), "{out}");
+        // The parts that are provenance survive.
+        assert!(out.contains("host=db"), "{out}");
+        assert!(out.contains("sslmode=require"), "{out}");
+    }
+
+    /// `strip_userinfo` computed the authority boundary BEFORE looking for `@`,
+    /// so an unencoded `/` in a password returned the URL untouched.
+    #[test]
+    fn userinfo_is_stripped_even_when_the_password_breaks_url_syntax() {
+        for (input, must_not_contain) in [
+            ("redis://admin:hunt/er2@10.0.0.5:6379/0", "hunt/er2"),
+            ("redis://admin:hu?nt@10.0.0.5:6379/0", "hu?nt"),
+            ("redis://admin:h#nt@10.0.0.5:6379/0", "h#nt"),
+            ("default:plainpw@127.0.0.1", "plainpw"),
+            ("mongodb+srv://u:mongopw@cluster.example.net", "mongopw"),
+        ] {
+            let out = strip_userinfo(input);
+            assert!(!out.contains(must_not_contain), "{input} -> {out}");
+        }
+        // A path containing `@` but no `user:pass` shape is left alone.
+        assert_eq!(strip_userinfo("http://h/p@th"), "http://h/p@th");
+        assert_eq!(strip_userinfo("localhost:6379"), "localhost:6379");
+        assert_eq!(strip_userinfo("127.0.0.1"), "127.0.0.1");
+    }
+
+    /// The marker list missed whole families. `"AUTH_TOKEN".contains("_AUTH")`
+    /// is false, which is how `auth_token` slipped through.
+    #[test]
+    fn secret_markers_cover_the_families_that_slipped_through() {
+        for name in [
+            "auth_token",
+            "AUTH_TOKEN",
+            "AUTHORIZATION",
+            "AWS_SESSION_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "SERVICE_PRIVATE_KEY",
+            "REDIS_PASS",
+            "X_SIGNING_KEY",
+            "api_key",
+            "ELASTIC_PASSWORD",
+            "REDIS_AUTH",
+            "QDRANT_API_KEY",
+            "VERTEX_ACCESS_TOKEN",
+            "MONGODB_PASSWORD",
+            "OPENSEARCH_PASSWORD",
+            "PGVECTOR_PASSWORD",
+        ] {
+            assert!(is_secret(name), "{name} is not treated as a secret");
+        }
+        // Benign keys whose values are load-bearing provenance stay in the clear.
+        for name in [
+            "REDIS_KEY_PREFIX",
+            "MILVUS_COLLECTION_NAME",
+            "host",
+            "parallel",
+            "hnsw_config",
+            "number_of_shards",
+            "ELASTIC_INDEX",
+        ] {
+            assert!(!is_secret(name), "{name} was redacted unnecessarily");
+        }
+    }
+
+    /// Deliberate, pinned decision: usernames are recorded in the clear.
+    ///
+    /// A username is provenance (which role the run authenticated as) and is not
+    /// itself a credential. It is half of one, and PII in some deployments, so
+    /// the call is written down and pinned rather than left to the marker list's
+    /// shape. Flip this test to flip the policy.
+    #[test]
+    fn usernames_are_deliberately_recorded_in_the_clear() {
+        let mut r = Recorder::new();
+        r.observe_env("REDIS_USER", Some("benchrunner"));
+        assert_eq!(r.snapshot()["env"]["REDIS_USER"], "benchrunner");
+    }
+
+    /// `begin` clears the four ACCUMULATING fields. Pure — no process globals,
+    /// no environment, no scheduling. The global-state version of this passed
+    /// 9 runs in 11 and 3/3 under `--test-threads=1` with `reset()` deleted,
+    /// because residual state from a previously-scheduled test pre-seeded
+    /// `env` and `observe_env` is first-write-wins.
+    #[test]
+    fn begin_clears_every_accumulating_field() {
+        let mut r = Recorder::new();
+        r.observe_env("A", Some("1"));
+        r.record_effective("b", json!(2));
+        r.note_override("c", json!(3), json!(4), "why");
+        r.note_ignored("d");
+        r.set_declared(Some(&json!({"x": 1})), None);
+        r.set_invocation(json!({"host": "h"}));
+        r.set_phase("search");
+
+        r.begin();
+
+        let s = r.snapshot();
+        assert!(s["env"].as_object().unwrap().is_empty(), "env survived");
+        assert!(
+            s["effective"].as_object().unwrap().is_empty(),
+            "effective survived"
+        );
+        assert!(
+            s["overridden"].as_array().unwrap().is_empty(),
+            "overridden survived"
+        );
+        assert_eq!(
+            s["ignored_declared_keys"]["keys"],
+            json!([]),
+            "ignored survived"
+        );
+        assert!(s["declared"].is_null());
+        assert!(s["invocation"].is_null());
+        assert!(s["phase"].is_null());
     }
 
     /// Non-string values cannot carry a credential and must survive intact —
@@ -1277,6 +1779,16 @@ mod tests {
         reset();
         let port: u16 = env_parsed("VDBB_TEST_PORT", 6379);
         assert_eq!(port, 6380, "the old idiom fell back to the default here");
+        drop(_g);
+        // `str::trim` uses the Unicode White_Space property, so a NO-BREAK SPACE
+        // pasted out of documentation is accepted too. Documented AND pinned.
+        let _g2 = EnvGuard::set("VDBB_TEST_PORT", Some("\u{a0}6381"));
+        reset();
+        assert_eq!(env_parsed::<u16>("VDBB_TEST_PORT", 6379), 6381);
+        let _g = EnvGuard::set("VDBB_TEST_PORT", Some(" 6380 "));
+        reset();
+        let port: u16 = env_parsed("VDBB_TEST_PORT", 6379);
+        assert_eq!(port, 6380);
         let s = snapshot();
         assert_eq!(s["effective"]["VDBB_TEST_PORT"], 6380);
         // Nothing is hidden: the untrimmed text survives verbatim.

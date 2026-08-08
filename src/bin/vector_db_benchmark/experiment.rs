@@ -356,7 +356,13 @@ pub fn run(args: &Args) -> Result<(), String> {
             // built — engines resolve most of their environment knobs in `new()`,
             // and a sweep must not carry the previous configuration's knobs into
             // this one's artifacts (#212).
-            crate::effective_config::begin_experiment(&engine_config, invocation_provenance(args));
+            // Consumed by `run_single_experiment` below. See `Recording`: the
+            // move is what makes a commented-out, conditional or hoisted call a
+            // compile error instead of a silently empty artifact.
+            let recording = crate::effective_config::begin_experiment(
+                &engine_config,
+                invocation_provenance(args),
+            );
 
             // Create engine
             let mut engine = create_engine(&engine_config, &args.host)?;
@@ -375,6 +381,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                 args,
                 is_last_config,
                 number_of_shards.as_ref(),
+                recording,
             ) {
                 // Name the sweep point. Under `--exit-on-error false` this line
                 // is all the operator gets, and a bare engine-side message
@@ -407,18 +414,41 @@ pub fn run(args: &Args) -> Result<(), String> {
 /// config had built was distinguishable only by the absence of an upload file —
 /// which is exactly the evidence somebody holding a published summary does not
 /// have.
+/// `host` is scrubbed by `effective_config::snapshot` on the way out — it is the
+/// documented way to pass a Redis/Mongo password (`--host 'user:pw@node'`), and
+/// it used to be published verbatim.
+///
+/// The boolean set here is CI-asserted against `Args` by
+/// `every_measuring_flag_is_recorded_in_the_invocation`, so a new flag cannot be
+/// added without either recording it or excusing it in writing. Every other
+/// inventory in this module is bidirectional; this one was hand-maintained and
+/// had already drifted by five flags.
 pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
     json!({
         "host": args.host,
         "engines_file": args.engines_file,
-        "skip_upload": args.skip_upload,
-        "skip_search": args.skip_search,
+        "allow_partial_configs": args.allow_partial_configs,
+        "dump_raw_latencies": args.dump_raw_latencies,
+        "exit_on_error": args.exit_on_error,
+        "fail_on_dropped_queries": args.fail_on_dropped_queries,
         "keep_data": args.keep_data,
         "reset_between_configs": args.reset_between_configs,
         "skip_if_exists": args.skip_if_exists,
-        "allow_partial_configs": args.allow_partial_configs,
+        "skip_search": args.skip_search,
+        "skip_upload": args.skip_upload,
+        "skip_vector_index": args.skip_vector_index,
     })
 }
+
+/// `Args` booleans deliberately absent from [`invocation_provenance`], with the
+/// reason. Asserted to still exist, so a renamed or deleted flag fails here
+/// rather than leaving a stale excuse behind.
+#[cfg(test)]
+pub(crate) const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[(
+    "verbose",
+    "console output only: changes what is printed, never what is measured or \
+     which experiments run",
+)];
 
 /// Parse "U:S" ratio string into UpdateSearchRatio.
 fn parse_update_search_ratio(s: &str) -> Result<UpdateSearchRatio, String> {
@@ -448,6 +478,9 @@ fn run_single_experiment(
     args: &Args,
     is_last_config: bool,
     number_of_shards: Option<&serde_json::Value>,
+    // Consumed, never read: holding it proves `begin_experiment` ran for THIS
+    // (config, dataset) pair. See `effective_config::Recording`.
+    _recording: crate::effective_config::Recording,
 ) -> Result<(), String> {
     // With --reset-between-configs, `--keep-data` only skips cleanup for the LAST
     // config in a sweep; earlier configs tear down so their (identical) corpus
@@ -2132,6 +2165,64 @@ mod tests {
             );
         }
 
+        /// Every `Args` boolean that changes what is measured must be recorded.
+        ///
+        /// `invocation` was the one hand-maintained inventory in this PR while
+        /// every other (`KNOWN_UNREAD`, `KNOWN_UNRECORDED`) is bidirectionally
+        /// CI-asserted — and it had already drifted by five flags, including
+        /// `skip_vector_index`, which decides whether a vector index exists at
+        /// all. This is why the next flag would have drifted in silently too.
+        #[test]
+        fn every_measuring_flag_is_recorded_in_the_invocation() {
+            use clap::Parser;
+            let src = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/vector_db_benchmark/cli.rs"),
+            )
+            .expect("cli.rs");
+            let declared: Vec<String> = src
+                .lines()
+                .filter_map(|l| {
+                    let t = l.trim();
+                    t.strip_prefix("pub ")
+                        .and_then(|r| r.strip_suffix(": bool,"))
+                        .map(str::to_string)
+                })
+                .collect();
+            assert!(
+                declared.len() >= 10,
+                "the `pub <name>: bool,` scan found only {declared:?} — cli.rs \
+                 formatting changed and this guard is no longer reading it"
+            );
+
+            let recorded =
+                super::super::invocation_provenance(&crate::cli::Args::parse_from(["vdbb"]));
+            let recorded = recorded.as_object().unwrap();
+            let excused: Vec<&str> = super::super::INVOCATION_EXCLUDED_FLAGS
+                .iter()
+                .map(|(f, _)| *f)
+                .collect();
+
+            let missing: Vec<&String> = declared
+                .iter()
+                .filter(|f| !recorded.contains_key(*f) && !excused.contains(&f.as_str()))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "these Args flags change what a run does but reach no artifact: \
+                 {missing:?}. Record them in `invocation_provenance`, or excuse \
+                 them in INVOCATION_EXCLUDED_FLAGS with a reason."
+            );
+            let stale: Vec<&&str> = excused
+                .iter()
+                .filter(|f| !declared.contains(&f.to_string()))
+                .collect();
+            assert!(
+                stale.is_empty(),
+                "INVOCATION_EXCLUDED_FLAGS names flags that no longer exist: {stale:?}"
+            );
+        }
+
         /// Drives the SAME entry point `experiment::run` uses, so deleting the
         /// reset — or the whole call — fails here.
         ///
@@ -2144,7 +2235,7 @@ mod tests {
             let raw = serde_json::json!({"name": cfg_name, "engine": "redis"});
             let mut cfg: crate::config::EngineConfig = serde_json::from_value(raw.clone()).unwrap();
             cfg.raw = Some(raw);
-            crate::effective_config::begin_experiment(
+            let _recording = crate::effective_config::begin_experiment(
                 &cfg,
                 super::super::invocation_provenance(args),
             );
