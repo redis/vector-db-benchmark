@@ -442,6 +442,22 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
         "skip_search": args.skip_search,
         "skip_upload": args.skip_upload,
         "skip_vector_index": args.skip_vector_index,
+        // NON-BOOLEAN, so the guard below does NOT cover them: it enumerates
+        // `pub <name>: bool,` only. Both change what is measured — `repetitions`
+        // selects a best-of-N, `warmup_seconds` moves the measurement window —
+        // and both are recorded by hand for that reason. Widening the guard past
+        // booleans is #274.
+        "repetitions": args.repetitions,
+        "warmup_seconds": args.warmup_seconds,
+        // Which directory the sweep globbed its configurations from, and where
+        // the artifacts landed. `project_root()` resolves both from the process
+        // cwd via `env::current_dir()`, the one raw environment read guard 1
+        // waives — and this is the compensating record that waiver cites.
+        "configurations_dir": crate::config::project_root()
+            .join("experiments/configurations")
+            .display()
+            .to_string(),
+        "results_dir": results_dir().display().to_string(),
     })
 }
 
@@ -2593,6 +2609,31 @@ mod tests {
                 stale.is_empty(),
                 "INVOCATION_EXCLUDED_FLAGS names flags that no longer exist: {stale:?}"
             );
+
+            // Reverse leg. Without it a fabricated key — say a renamed flag
+            // leaving `skip_vector_index_LEGACY` behind — stayed green forever,
+            // which made this inventory weaker than `KNOWN_UNRECORDED`.
+            // `NON_BOOL_INVOCATION_KEYS` are the deliberately hand-maintained
+            // non-boolean entries.
+            const NON_BOOL_INVOCATION_KEYS: &[&str] = &[
+                "host",
+                "engines_file",
+                "repetitions",
+                "warmup_seconds",
+                "configurations_dir",
+                "results_dir",
+            ];
+            let fabricated: Vec<&String> = recorded
+                .keys()
+                .filter(|k| {
+                    !NON_BOOL_INVOCATION_KEYS.contains(&k.as_str()) && !declared.contains(k)
+                })
+                .collect();
+            assert!(
+                fabricated.is_empty(),
+                "`invocation` publishes keys that map to no `Args` field: \
+                 {fabricated:?}. A reader would take these for real flags."
+            );
         }
 
         /// Drives the SAME entry point `experiment::run` uses, so deleting the
@@ -2735,6 +2776,36 @@ mod tests {
             );
             assert_ne!(d, other);
             assert_eq!(d["results"], other["results"]);
+        }
+
+        /// B1, at the layer that writes the file.
+        ///
+        /// `save_search_results` is `serde_json::to_string_pretty` over exactly
+        /// this document, so asserting on the serialized bytes here is
+        /// asserting on what lands in `results/`. Driving it end-to-end through
+        /// the binary is not possible for this shape — every client rejects
+        /// `?password=` as an unknown option before a file is written — which is
+        /// precisely why the redactor must not rely on the driver refusing it.
+        #[test]
+        fn a_query_string_password_never_reaches_the_written_document() {
+            let _l = crate::effective_config::test_lock();
+            for host in [
+                "mongodb://h.example/db?w=majority&password=CANARYDOC",
+                "mongodb://h.example/db?retryWrites=true&password=CANARYDOC",
+                "redis://h:6379/0?db=1&password=CANARYDOC",
+                "h.example:27017/?ssl=true&password=CANARYDOC",
+                "default:CANARYDOC@127.0.0.1",
+            ] {
+                crate::effective_config::reset();
+                crate::effective_config::set_invocation(serde_json::json!({"host": host}));
+                let written =
+                    serde_json::to_string_pretty(&doc(&crate::effective_config::snapshot()))
+                        .unwrap();
+                assert!(
+                    !written.contains("CANARYDOC"),
+                    "{host} would be written to results/ as:\n{written}"
+                );
+            }
         }
 
         /// The block is present, and shaped, on every search result.

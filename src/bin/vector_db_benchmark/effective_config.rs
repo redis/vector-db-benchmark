@@ -104,6 +104,9 @@ const SECRET_MARKERS: &[&str] = &[
     "PASSWD",
     // Bare `PASS` also catches `REDIS_PASS` and `pass`.
     "PASS",
+    // ODBC/JDBC spell it `Pwd=`; `password`/`passwd`/`PGPASSWORD` all matched
+    // and this one did not.
+    "PWD",
     "API_KEY",
     "APIKEY",
     "ACCESS_KEY",
@@ -167,72 +170,100 @@ fn strip_userinfo(value: &str) -> String {
     }
 }
 
-/// Blank the value of a `key=value` credential inside an opaque connection
-/// string (libpq DSNs: `host=db user=bench password=hunter2 sslmode=require`).
+/// Blank the value of any `key=value` credential embedded in an opaque string.
 ///
-/// Name-based redaction cannot see these — the secret is *inside* the value of
-/// a key that is not itself credential-named.
+/// Name-based redaction cannot see these: the secret sits inside the value of a
+/// key that is not itself credential-named. Three families, all live shapes:
+///
+/// * libpq DSNs — `host=db user=bench password=hunter2 sslmode=require`
+/// * URL query strings — `mongodb://h/db?w=majority&password=hunter2`
+/// * ODBC/JDBC — `Server=h;Database=d;Uid=u;Pwd=hunter2;`
+///
+/// The query-string family is why this is not a whitespace splitter. It used to
+/// be, so it read the key of `mongodb://h/db?w=majority&password=X` as
+/// `mongodb://h/db?w` — not credential-named — and copied the password through.
+/// `?authSource=admin&password=X` *looked* fixed only because the first key
+/// contains `AUTH` and blanked the whole tail; any benign leading option
+/// (`w=`, `retryWrites=`, `ssl=`, `db=`) restored the leak.
+///
+/// Separators are whitespace, `&`, `;` and `?`. Spaces are permitted around the
+/// `=` (PostgreSQL documents them as optional). Values may be quoted with `'`
+/// or `"`, honouring both backslash escapes and SQL's doubled-quote escape.
+/// Non-secret pairs are reproduced byte for byte, spacing and quoting included.
 fn strip_dsn_secrets(value: &str) -> String {
     if !value.contains('=') {
         return value.to_string();
     }
-    // Quote-aware, because libpq values may contain spaces when quoted:
-    // `password='a b c'`. Splitting on whitespace first — which is what this
-    // function did when it was written — redacted only up to the first space
-    // and published the rest of the password verbatim.
-    let bytes: Vec<char> = value.chars().collect();
+    let c: Vec<char> = value.chars().collect();
+    let is_sep = |ch: char| ch.is_whitespace() || ch == '&' || ch == ';' || ch == '?';
+    let take = |from: usize, to: usize| -> String { c[from..to].iter().collect() };
+
     let mut out = String::with_capacity(value.len());
     let mut i = 0usize;
-    while i < bytes.len() {
-        // Copy leading separators.
-        if bytes[i].is_whitespace() {
-            out.push(bytes[i]);
+    while i < c.len() {
+        if is_sep(c[i]) {
+            out.push(c[i]);
             i += 1;
             continue;
         }
-        // Read a key up to `=` (or to whitespace, if this token has none).
+        // Key: up to `=` or a separator.
         let key_start = i;
-        while i < bytes.len() && bytes[i] != '=' && !bytes[i].is_whitespace() {
+        while i < c.len() && c[i] != '=' && !is_sep(c[i]) {
             i += 1;
         }
-        let key: String = bytes[key_start..i].iter().collect();
-        if i >= bytes.len() || bytes[i] != '=' {
-            out.push_str(&key);
-            continue;
-        }
-        i += 1; // consume '='
+        let key = take(key_start, i);
 
-        // Read the value: a quoted run (honouring backslash escapes) or a bare
-        // run up to the next whitespace.
+        // Permit spaces between the key and the `=`.
+        let mut probe = i;
+        while probe < c.len() && (c[probe] == ' ' || c[probe] == '\t') {
+            probe += 1;
+        }
+        if probe >= c.len() || c[probe] != '=' {
+            out.push_str(&key);
+            continue; // not a pair; the separator loop handles what follows
+        }
+        probe += 1; // consume '='
+                    // …and after it.
+        while probe < c.len() && (c[probe] == ' ' || c[probe] == '\t') {
+            probe += 1;
+        }
+        // Everything from the key through the `=` and its padding, verbatim.
+        let prefix = take(key_start, probe);
+        i = probe;
+
+        // Value: a quoted run, or a bare run up to the next separator.
         let val_start = i;
-        if i < bytes.len() && (bytes[i] == '\'' || bytes[i] == '"') {
-            let quote = bytes[i];
+        if i < c.len() && (c[i] == '\'' || c[i] == '"') {
+            let quote = c[i];
             i += 1;
-            while i < bytes.len() {
-                if bytes[i] == '\\' && i + 1 < bytes.len() {
+            while i < c.len() {
+                if c[i] == '\\' && i + 1 < c.len() {
                     i += 2;
                     continue;
                 }
-                if bytes[i] == quote {
+                if c[i] == quote {
+                    // SQL doubles a quote to escape it: 'ab''cd' is one value.
+                    if i + 1 < c.len() && c[i + 1] == quote {
+                        i += 2;
+                        continue;
+                    }
                     i += 1;
                     break;
                 }
                 i += 1;
             }
         } else {
-            while i < bytes.len() && !bytes[i].is_whitespace() {
+            while i < c.len() && !is_sep(c[i]) {
                 i += 1;
             }
         }
-        let raw: String = bytes[val_start..i].iter().collect();
+        let raw = take(val_start, i);
         let bare = raw.trim_matches(['\'', '"']);
         if is_secret(key.trim()) && !bare.trim().is_empty() {
-            out.push_str(&key);
-            out.push('=');
+            out.push_str(&prefix);
             out.push_str(REDACTED);
         } else {
-            out.push_str(&key);
-            out.push('=');
+            out.push_str(&prefix);
             out.push_str(&raw);
         }
     }
@@ -511,6 +542,8 @@ impl Recorder {
                 "exhaustive": false,
                 "covers": "hnsw_config keys serde could not type, plus the \
                            CI-asserted KNOWN_UNREAD inventory for this engine",
+                // Key NAMES only, never values — the one snapshot member the
+                // redaction assertion has nothing to check.
                 "keys": self.ignored.iter().collect::<Vec<_>>(),
             },
         })
@@ -541,9 +574,14 @@ pub fn reset() {
 /// **One entry point on purpose.** These three steps used to be three separate
 /// calls at the top of the experiment loop, and a mutation campaign showed that
 /// deleting the `reset()` line left the whole suite green while a sweep's later
-/// configurations silently inherited the earlier ones' knobs — the exact
-/// sweep-bleed this module's docs warn about. Resetting is now inseparable from
-/// declaring, so forgetting it is not expressible.
+/// configurations silently inherited the earlier ones' knobs.
+///
+/// To be precise about what this does and does not buy: deleting the `reset()`
+/// call BELOW still compiles. It is caught by a test
+/// (`begin_experiment_clears_the_previous_experiments_accumulation`), not by the
+/// type system. What the [`Recording`] token makes inexpressible is the three
+/// CALL-SITE mutations — commenting the call out, calling it conditionally, and
+/// hoisting it out of the per-experiment loop.
 pub fn begin_experiment(
     engine_config: &crate::config::EngineConfig,
     invocation: Value,
@@ -911,14 +949,15 @@ mod recorder_coverage_guard {
             "as REDIS_PORT above (#275); also documented in v0/DOCKER_README.md \
              and read by nothing live",
         ),
-        ("src/config.rs", "env::var(k)", "as REDIS_PORT above (#275)"),
         (
             "src/bin/vector_db_benchmark/config.rs",
             "env::current_dir()",
-            "project_root() resolves the configurations directory from the cwd. \
-             The RESOLVED directory is recorded once per run in \
-             `invocation.configurations_dir`, which is the fact that matters — \
-             it decides which configs the sweep globs",
+            "project_root() resolves the configurations and results directories \
+             from the cwd. Both RESOLVED paths are recorded per run in \
+             `invocation.configurations_dir` / `invocation.results_dir` — the \
+             facts that matter, since the first decides which configs the sweep \
+             globs. Asserted by \
+             `the_cited_compensating_record_for_current_dir_exists`",
         ),
         (
             "src/bin/vector_db_benchmark/download.rs",
@@ -1117,18 +1156,36 @@ mod recorder_coverage_guard {
                     j += 1;
                 }
                 let head = lines.get(j).map(|l| l.trim_start()).unwrap_or("");
-                if head.starts_with("mod ") || head.starts_with("pub mod ") {
+                let is_mod = head.starts_with("mod ") || head.starts_with("pub mod ");
+                // A BODILESS declaration (`#[cfg(test)] mod filter_guard;`) has
+                // no block to strip. Treating it as one sent the scan hunting
+                // for the next `}` at this indent and deleted the 48 production
+                // lines in between — the `#[cfg(test)] const` bug in a different
+                // item shape. `engine/mod.rs:12` is exactly this.
+                if is_mod && !head.trim_end().ends_with(';') {
                     let closer = format!("{}}}", " ".repeat(indent));
                     let mut k = j + 1;
-                    while k < lines.len() && lines[k] != closer {
+                    // `trim_end`: `strip_line_comments` turns
+                    // `} // end of the config tests` into `"} "`, which never
+                    // equalled the closer, so `k` ran to EOF and silently
+                    // disabled the guard for the rest of the file.
+                    while k < lines.len() && lines[k].trim_end() != closer {
                         k += 1;
+                    }
+                    if k >= lines.len() {
+                        // No closer found: emit the lines rather than deleting
+                        // to EOF. Over-scanning shows up as a false positive
+                        // somebody can see; under-scanning is invisible.
+                        out.push(lines[i]);
+                        i += 1;
+                        continue;
                     }
                     i = k + 1;
                     continue;
                 }
-                // Any other `#[cfg(test)]` item stays in the scanned text. A
-                // false positive there is visible and fixable; a deletion is
-                // neither.
+                // Any other `#[cfg(test)]` item — a `const`, a `use`, a
+                // bodiless `mod X;` — stays in the scanned text. A false
+                // positive there is visible and fixable; a deletion is neither.
             }
             out.push(lines[i]);
             i += 1;
@@ -1243,9 +1300,12 @@ mod recorder_coverage_guard {
         let sources = rust_sources();
         let mut stale = Vec::new();
         for (file, snippet, _why) in EXEMPT_CALLS {
+            // Stripped production text, not raw source: an exempted call that
+            // migrated into a `#[cfg(test)]` module would otherwise keep its
+            // excuse alive while excusing nothing.
             let found = sources
                 .iter()
-                .any(|(path, src)| path == file && src.contains(snippet));
+                .any(|(path, src)| path == file && strip_test_modules(src).contains(snippet));
             if !found {
                 stale.push(format!("{file}: {snippet}"));
             }
@@ -1256,6 +1316,29 @@ mod recorder_coverage_guard {
              so the list cannot become a stale excuse:\n  {}",
             stale.join("\n  ")
         );
+    }
+
+    /// A scoped exemption may cite a compensating record. If it does, that
+    /// record has to exist.
+    ///
+    /// `every_scoped_exemption_still_names_a_real_call_site` only checks that
+    /// the excused CALL is still there — so the `env::current_dir()` waiver
+    /// could name `invocation.configurations_dir`, a field that was never
+    /// built, and stay green. That is exactly the stale excuse these inventories
+    /// exist to prevent.
+    #[test]
+    fn the_cited_compensating_record_for_current_dir_exists() {
+        let src =
+            std::fs::read_to_string(repo_root().join("src/bin/vector_db_benchmark/experiment.rs"))
+                .expect("experiment.rs");
+        let production = strip_line_comments(&strip_test_modules(&src));
+        for field in ["configurations_dir", "results_dir"] {
+            assert!(
+                production.contains(&format!("\"{field}\"")),
+                "the `env::current_dir()` exemption cites `invocation.{field}`, \
+                 which `invocation_provenance` does not emit"
+            );
+        }
     }
 
     /// GUARD 2 — the weak tier's membership is written down, both ways.
@@ -1730,6 +1813,106 @@ mod tests {
         assert_eq!(
             strip_dsn_secrets("options='-c statement_timeout=5s'"),
             "options='-c statement_timeout=5s'"
+        );
+    }
+
+    /// **B1 regression.** A password in a URL QUERY STRING, which is the other
+    /// way `--host` carries one.
+    ///
+    /// `strip_userinfo` declines (no `@`) and the old whitespace splitter read
+    /// the key as `mongodb://h.example/db?w` — not credential-named — so the
+    /// password was copied through into `invocation.host` in all three file
+    /// kinds.
+    ///
+    /// The `authSource` cases are load-bearing: they passed BEFORE the fix, by
+    /// accident, because the first key contains `AUTH` and that blanked the
+    /// whole tail. Every case below therefore also appears with a benign
+    /// leading option, so the accidental masking cannot make a regression look
+    /// green.
+    #[test]
+    fn query_string_password_is_blanked_whatever_precedes_it() {
+        for value in [
+            "mongodb://h.example/db?w=majority&password=CANARYQ",
+            "mongodb://h.example/db?retryWrites=true&password=CANARYQ",
+            "redis://h:6379/0?db=1&password=CANARYQ",
+            "h.example:27017/?ssl=true&password=CANARYQ",
+            "mongodb://h.example/db?authSource=admin&password=CANARYQ",
+            "mongodb+srv://h/db?w=1&authToken=CANARYQ&ssl=true",
+            "jdbc:postgresql://h:5432/db?user=u&password=CANARYQ",
+            "user=u&password=CANARYQ&ssl=true",
+            "Server=h;Database=d;Uid=u;Pwd=CANARYQ;",
+            "Server=h;Password=CANARYQ;Encrypt=yes",
+        ] {
+            let out = strip_dsn_secrets(value);
+            assert!(!out.contains("CANARYQ"), "{value} -> {out}");
+        }
+
+        // Through the real snapshot path, on the flag the leak was found on.
+        let mut r = Recorder::new();
+        r.set_invocation(json!({
+            "host": "mongodb://h.example/db?w=majority&password=CANARYLIVE"
+        }));
+        let s = r.snapshot();
+        assert!(
+            !serde_json::to_string(&s).unwrap().contains("CANARYLIVE"),
+            "{}",
+            s["invocation"]["host"]
+        );
+        // Host, path and the benign option survive.
+        let host = s["invocation"]["host"].as_str().unwrap();
+        assert!(host.contains("h.example/db"), "{host}");
+        assert!(host.contains("w=majority"), "{host}");
+    }
+
+    /// The nine shapes a 44-case corpus scan found still leaking after the
+    /// first DSN fix. `spaces-around-eq` matters most: PostgreSQL documents
+    /// spaces around `=` as optional, and libpq is the family this function
+    /// exists for.
+    #[test]
+    fn structured_secret_shapes_that_previously_leaked() {
+        for (label, value) in [
+            ("spaces-around-eq", "password = CANARYX host=db"),
+            ("space-before-eq", "password =CANARYX"),
+            ("space-after-eq", "password= CANARYX"),
+            ("sql-doubled-quote", "password='ab''CANARYX'"),
+            ("pwd", "pwd=CANARYX"),
+            ("pwd-upper", "PWD=CANARYX"),
+            (
+                "jdbc",
+                "jdbc:postgresql://h:5432/db?user=u&password=CANARYX",
+            ),
+            ("amp-separated", "user=u&password=CANARYX&ssl=true"),
+            ("semicolon-odbc", "Server=h;Database=d;Uid=u;Pwd=CANARYX;"),
+            (
+                "semicolon-odbc-pass",
+                "Server=h;Password=CANARYX;Encrypt=yes",
+            ),
+        ] {
+            let out = strip_dsn_secrets(value);
+            assert!(!out.contains("CANARYX"), "[{label}] {value} -> {out}");
+        }
+    }
+
+    /// Non-secret pairs must come through byte for byte — spacing, quoting and
+    /// separators included. Over-redaction here destroys provenance.
+    #[test]
+    fn non_secret_pairs_are_reproduced_verbatim() {
+        for value in [
+            "options='-c statement_timeout=5s'",
+            "host=db sslmode=require connect_timeout=10",
+            "mongodb://h.example/db?w=majority&retryWrites=true",
+            "Server=h;Database=d;Encrypt=yes",
+            "http://h/a=b",
+            "host = db",
+            "no_pairs_here",
+            "",
+        ] {
+            assert_eq!(strip_dsn_secrets(value), value, "mangled: {value}");
+        }
+        // Mixed: the secret goes, everything around it stays.
+        assert_eq!(
+            strip_dsn_secrets("host=db password='a b c' sslmode=require"),
+            format!("host=db password={REDACTED} sslmode=require")
         );
     }
 
