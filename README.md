@@ -494,6 +494,20 @@ cargo run --release --bin vector-db-benchmark -- \
 
 Engine configurations live in [`experiments/configurations/`](./experiments/configurations/). Each JSON file defines one or more experiment configurations specifying the engine, index parameters, search parameters, and upload parallelism.
 
+Two rules are enforced at load time, and breaking either aborts the run rather than
+quietly changing what gets measured:
+
+- **`name` must be unique across every file in the directory**, not just within one
+  file. The name is what `--engines` selects and what the result JSON is keyed by, so
+  two definitions sharing a name would mean the reported number came from whichever
+  one happened to load last. A duplicate is an error naming both definitions (#239).
+  The same rule applies to dataset names in `datasets/datasets.json`.
+- **Every `*.json` in the directory must parse.** `serde` rejects a whole file on one
+  bad entry, so a single typo removes every configuration that file defines — and
+  under a wildcard `--engines` (the default is `*`) the sweep would just get smaller
+  and still exit 0. Pass `--allow-partial-configs` to run anyway; the run then records
+  the offending files under `skipped_config_files` in every summary JSON it writes.
+
 Example (`redis-docker-test.json`):
 
 ```json

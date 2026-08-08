@@ -12,8 +12,7 @@ use serde_json::json;
 
 use crate::cli::Args;
 use crate::config::{
-    matches_pattern, project_root, read_dataset_configs, read_engine_configs, InnerSearchParams,
-    SearchParams,
+    self, matches_pattern, project_root, read_dataset_configs, InnerSearchParams, SearchParams,
 };
 use crate::dataset::Dataset;
 use crate::engine::{create_engine, Engine, UpdateSearchRatio};
@@ -110,7 +109,31 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     let dataset_configs = read_dataset_configs()?;
-    let engine_configs = read_engine_configs(args.engines_file.as_deref())?;
+    // A configuration file that fails to load takes EVERY configuration it
+    // defines with it, and under a wildcard `--engines` that silently shrinks the
+    // sweep rather than failing — so refuse to start unless the user says
+    // otherwise, and if they do, carry the list into the artifacts (#239).
+    let (engine_configs, skipped_configs) = if args.allow_partial_configs {
+        let (configs, skipped) =
+            config::read_engine_configs_reporting_skips(args.engines_file.as_deref())?;
+        if !skipped.is_empty() {
+            eprintln!(
+                "Warning: --allow-partial-configs was passed, so the run continues with an \
+                 INCOMPLETE configuration set.\n{}",
+                config::describe_skipped_config_files(&skipped, false)
+            );
+        }
+        (configs, skipped)
+    } else {
+        // Strict: an unloadable file aborts here rather than shrinking the sweep.
+        (
+            config::read_engine_configs(args.engines_file.as_deref())?,
+            Vec::new(),
+        )
+    };
+    // Carried into every summary this run writes, so a truncated sweep says so
+    // in the artifact rather than only on a stderr line nobody keeps (#239).
+    config::record_skipped_config_files(skipped_configs);
 
     // Filter datasets by pattern
     let datasets: Vec<_> = dataset_configs
