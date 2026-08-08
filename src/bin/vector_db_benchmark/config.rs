@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Dataset configuration from datasets.json
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -243,35 +243,60 @@ pub fn read_dataset_configs() -> Result<HashMap<String, DatasetConfig>, String> 
     Ok(map)
 }
 
-/// Read all engine configurations from experiments/configurations/*.json
-/// Read engine configs. When `engines_file` is `Some`, ONLY that JSON file is
-/// read (the `--engines-file` flag); otherwise every
-/// `experiments/configurations/*.json` is globbed. A `--engines-file` that is
-/// missing or malformed is a hard error (the previous glob-only behavior
-/// silently ignored the flag, so `--engines-file x.json` failed with a
-/// confusing "no engines match" — see issue #151).
-pub fn read_engine_configs(
-    engines_file: Option<&str>,
-) -> Result<HashMap<String, EngineConfig>, String> {
-    let mut all_configs = HashMap::new();
-
-    if let Some(file) = engines_file {
-        let content = fs::read_to_string(file)
-            .map_err(|e| format!("failed to read --engines-file {}: {}", file, e))?;
-        let configs: Vec<EngineConfig> = serde_json::from_str(&content)
-            .map_err(|e| format!("invalid JSON in --engines-file {}: {}", file, e))?;
-        for config in configs {
-            all_configs.insert(config.name.clone(), config);
-        }
-        return Ok(all_configs);
+/// Insert one engine configuration, REJECTING a name that is already taken.
+///
+/// A configuration's `name` is the run's identity: it is what `--engines`
+/// selects, what the result JSON is keyed by, and what a chart legend or a
+/// commit message quotes. Two definitions sharing one name means the name no
+/// longer denotes a single set of parameters, and the previous `HashMap::insert`
+/// resolved that by last-write-wins over an *unordered* glob — so the run
+/// measured whichever file the filesystem happened to hand over last, and
+/// nothing in the output said which. See issue #239: `vectorsets-fp32-default`
+/// was a live collision.
+///
+/// This is the repo's recurring silent-wrong class, so it errors rather than
+/// warns: a shadowed configuration changes the reported number by definition.
+fn insert_engine_config(
+    all_configs: &mut HashMap<String, EngineConfig>,
+    origins: &mut HashMap<String, String>,
+    config: EngineConfig,
+    origin: &str,
+) -> Result<(), String> {
+    if let Some(first) = origins.get(&config.name) {
+        return Err(format!(
+            "duplicate engine configuration name {:?}:\n  first defined in: {}\n  redefined in:     {}\n\
+             A configuration name selects exactly one set of parameters, so a duplicate would \
+             silently resolve to whichever file loaded last (glob order is not stable across \
+             platforms). Rename one of the two entries, or delete the redundant definition.",
+            config.name, first, origin
+        ));
     }
+    origins.insert(config.name.clone(), origin.to_string());
+    all_configs.insert(config.name.clone(), config);
+    Ok(())
+}
 
-    let configs_dir = project_root().join("experiments/configurations");
-    let pattern = configs_dir.join("*.json");
-    for path in glob::glob(pattern.to_str().unwrap())
+/// Read every `*.json` engine configuration in `dir`, rejecting duplicate names.
+///
+/// Split out from [`read_engine_configs`] so the duplicate-name rejection can be
+/// tested against a fixture directory as well as against the shipped one.
+pub fn read_engine_configs_from_dir(dir: &Path) -> Result<HashMap<String, EngineConfig>, String> {
+    let mut all_configs = HashMap::new();
+    let mut origins: HashMap<String, String> = HashMap::new();
+
+    let pattern = dir.join("*.json");
+    let pattern = pattern
+        .to_str()
+        .ok_or_else(|| format!("engine configuration path is not valid UTF-8: {:?}", dir))?;
+    // Sorted, so a collision always names the same file as "first" regardless of
+    // the order the filesystem enumerates directory entries in.
+    let mut paths: Vec<PathBuf> = glob::glob(pattern)
         .map_err(|e| e.to_string())?
         .flatten()
-    {
+        .collect();
+    paths.sort();
+
+    for path in paths {
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -290,8 +315,9 @@ pub fn read_engine_configs(
         //   {"config": 5}                             -> invalid type
         match serde_json::from_str::<Vec<EngineConfig>>(&content) {
             Ok(configs) => {
+                let origin = path.display().to_string();
                 for config in configs {
-                    all_configs.insert(config.name.clone(), config);
+                    insert_engine_config(&mut all_configs, &mut origins, config, &origin)?;
                 }
             }
             Err(e) => eprintln!(
@@ -302,6 +328,35 @@ pub fn read_engine_configs(
         }
     }
     Ok(all_configs)
+}
+
+/// Read all engine configurations from experiments/configurations/*.json
+/// Read engine configs. When `engines_file` is `Some`, ONLY that JSON file is
+/// read (the `--engines-file` flag); otherwise every
+/// `experiments/configurations/*.json` is globbed. A `--engines-file` that is
+/// missing or malformed is a hard error (the previous glob-only behavior
+/// silently ignored the flag, so `--engines-file x.json` failed with a
+/// confusing "no engines match" — see issue #151).
+///
+/// A duplicated `name` — within one file or across two — is likewise a hard
+/// error naming both definitions (issue #239).
+pub fn read_engine_configs(
+    engines_file: Option<&str>,
+) -> Result<HashMap<String, EngineConfig>, String> {
+    if let Some(file) = engines_file {
+        let mut all_configs = HashMap::new();
+        let mut origins: HashMap<String, String> = HashMap::new();
+        let content = fs::read_to_string(file)
+            .map_err(|e| format!("failed to read --engines-file {}: {}", file, e))?;
+        let configs: Vec<EngineConfig> = serde_json::from_str(&content)
+            .map_err(|e| format!("invalid JSON in --engines-file {}: {}", file, e))?;
+        for config in configs {
+            insert_engine_config(&mut all_configs, &mut origins, config, file)?;
+        }
+        return Ok(all_configs);
+    }
+
+    read_engine_configs_from_dir(&project_root().join("experiments/configurations"))
 }
 
 /// Match a name against a pattern (supports * wildcard)
@@ -932,6 +987,133 @@ mod tests {
             "compact --describe engines"
         );
         assert!(describe_engines(true).is_ok(), "verbose --describe engines");
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #239 — duplicate configuration names must never resolve silently.
+    // ---------------------------------------------------------------------
+
+    /// The shipped configuration directory, located from the crate manifest
+    /// rather than the process CWD so these tests do not depend on where the
+    /// test binary was launched from.
+    fn shipped_configs_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("experiments/configurations")
+    }
+
+    fn write_config_file(dir: &Path, file: &str, names: &[&str]) -> PathBuf {
+        let entries: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| json!({"name": n, "engine": "redis"}))
+            .collect();
+        let path = dir.join(file);
+        fs::write(&path, serde_json::to_string(&entries).unwrap()).unwrap();
+        path
+    }
+
+    /// Two shipped files declaring one name is exactly the #239 shape:
+    /// `vectorsets-fp32-default` lived in both `vectorsets-NOQUANT.json` and
+    /// `vectorsets-rs-NOQUANT.json`, and last-write-wins over an unordered glob
+    /// picked the winner. RED against the old loader, which returned `Ok` with
+    /// one arbitrary survivor.
+    #[test]
+    fn duplicate_name_across_two_files_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "a-first.json", &["shared-name", "only-in-a"]);
+        write_config_file(dir.path(), "b-second.json", &["shared-name"]);
+
+        let err = read_engine_configs_from_dir(dir.path())
+            .expect_err("a duplicated configuration name must not load");
+
+        assert!(
+            err.contains("shared-name"),
+            "error must name the duplicated config: {err}"
+        );
+        // Both competing files must be named, or the user cannot act on it.
+        assert!(
+            err.contains("a-first.json"),
+            "error must name the first file: {err}"
+        );
+        assert!(
+            err.contains("b-second.json"),
+            "error must name the second file: {err}"
+        );
+    }
+
+    /// Same rule within a single file — `HashMap::insert` shadowed these too.
+    #[test]
+    fn duplicate_name_within_one_file_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "twins.json", &["twin", "twin"]);
+
+        let err = read_engine_configs_from_dir(dir.path())
+            .expect_err("a duplicated name inside one file must not load");
+        assert!(err.contains("twin"), "{err}");
+        assert!(err.contains("twins.json"), "{err}");
+    }
+
+    /// `--engines-file` takes the same path through `insert_engine_config`.
+    #[test]
+    fn duplicate_name_in_engines_file_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config_file(dir.path(), "explicit.json", &["dup", "dup"]);
+
+        let err = read_engine_configs(Some(path.to_str().unwrap()))
+            .expect_err("--engines-file must reject duplicates too");
+        assert!(err.contains("dup"), "{err}");
+    }
+
+    /// Distinct names still load, and every one is reachable.
+    #[test]
+    fn distinct_names_across_files_load_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "a.json", &["one", "two"]);
+        write_config_file(dir.path(), "b.json", &["three"]);
+
+        let configs = read_engine_configs_from_dir(dir.path()).expect("no collisions");
+        assert_eq!(configs.len(), 3);
+        for n in ["one", "two", "three"] {
+            assert!(configs.contains_key(n), "missing {n}");
+        }
+    }
+
+    /// Regress-guard for the shipped set itself: run the REAL loader over the
+    /// REAL `experiments/configurations/` directory. Any future PR that
+    /// reintroduces a duplicate name — the #239 root cause — fails here rather
+    /// than silently mis-measuring a run.
+    ///
+    /// Also asserts the directory is non-empty, so a broken path cannot make
+    /// this pass vacuously.
+    #[test]
+    fn shipped_engine_configs_have_no_duplicate_names() {
+        let dir = shipped_configs_dir();
+        assert!(dir.is_dir(), "shipped config dir not found at {dir:?}");
+
+        let configs = read_engine_configs_from_dir(&dir)
+            .expect("every shipped engine configuration name must be unique");
+
+        // Independently count the declared entries; the loader's map size can
+        // only equal it when no name was shadowed.
+        let mut declared = 0usize;
+        for path in glob::glob(dir.join("*.json").to_str().unwrap())
+            .unwrap()
+            .flatten()
+        {
+            let content = fs::read_to_string(&path).unwrap();
+            if let Ok(entries) = serde_json::from_str::<Vec<EngineConfig>>(&content) {
+                declared += entries.len();
+            }
+        }
+        assert!(
+            declared > 100,
+            "suspiciously few shipped configs: {declared}"
+        );
+        assert_eq!(
+            configs.len(),
+            declared,
+            "shipped configurations shadow each other: {} declared, {} distinct names",
+            declared,
+            configs.len()
+        );
     }
 }
 
