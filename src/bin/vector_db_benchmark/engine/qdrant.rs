@@ -27,7 +27,7 @@ use qdrant_client::{Payload, Qdrant};
 
 use crate::config::{EngineConfig, HnswConfig, SearchParams};
 use crate::dataset::Dataset;
-use crate::engine::{Engine, SearchResults, UploadStats};
+use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
@@ -1711,19 +1711,42 @@ fn build_qdrant_filter(
     }
 }
 
+/// Whether a Qdrant client error means "no such collection" rather than "the
+/// probe failed" (issue #238 — a probe failure must never be reported as a
+/// corpus size of zero).
+fn collection_missing(e: &qdrant_client::QdrantError) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("doesn't exist") || msg.contains("does not exist") || msg.contains("not found")
+}
+
 impl Engine for QdrantEngine {
     /// Server-side corpus size, for the `--skip-upload` reuse precondition
     /// (issue #238). `points_count` from the collection info — the same figure
     /// `GET /collections/<name>` reports. A missing collection answers 0.
-    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         match self
             .rt
             .block_on(self.client.collection_info(&self.collection_name))
         {
-            Ok(info) => Ok(Some(info.result.and_then(|r| r.points_count).unwrap_or(0))),
-            // "collection doesn't exist" is a normal error reply here, and for
-            // this check it means the same thing as an empty collection.
-            Err(_) => Ok(Some(0)),
+            // Pass the Option THROUGH: a reply with no `points_count` means
+            // "cannot tell", and `unwrap_or(0)` would turn that into "the corpus
+            // is gone" — the exact fabrication `ft_info_num_docs` is careful to
+            // avoid (see its `missing_field_is_none_not_zero` test). None here
+            // lands in `Unverifiable`, which says so out loud.
+            Ok(info) => Ok(info
+                .result
+                .and_then(|r| r.points_count)
+                .map(CorpusCount::exact)),
+            // "collection doesn't exist" is a normal error reply, and for this
+            // check it means the same thing as an empty collection. Anything else
+            // (unreachable node, refused gRPC port) says nothing about the corpus
+            // and must NOT be reported as a corpus of zero — that sends the user
+            // to re-upload data that is still there.
+            Err(e) if collection_missing(&e) => Ok(Some(CorpusCount::exact(0))),
+            Err(e) => Err(format!(
+                "collection_info('{}') failed: {}",
+                self.collection_name, e
+            )),
         }
     }
 

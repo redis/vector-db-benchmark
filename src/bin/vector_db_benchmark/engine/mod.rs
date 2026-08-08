@@ -397,6 +397,39 @@ pub fn zero_search_results(
     }
 }
 
+/// A corpus size read back off a live server (issue #238), and how much the
+/// runner may conclude from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorpusCount {
+    pub rows: u64,
+    /// True when `rows` is a planner/metadata **estimate** rather than a count of
+    /// rows. An estimate may only ever produce a warning, never a hard error:
+    /// aborting a run on a number that is allowed to be wrong trades one silent
+    /// failure for a noisy one.
+    pub approximate: bool,
+}
+
+impl CorpusCount {
+    /// A count the server actually performed.
+    pub fn exact(rows: u64) -> Self {
+        Self {
+            rows,
+            approximate: false,
+        }
+    }
+
+    /// An estimate — cheap, but never grounds to abort. Used where an exact count
+    /// would cost more than it is worth, or would perturb the measurement (see
+    /// pgvector: `count(*)` seq-scans the whole heap into the page cache
+    /// immediately before the search phase, turning a cold run warm).
+    pub fn estimated(rows: u64) -> Self {
+        Self {
+            rows,
+            approximate: true,
+        }
+    }
+}
+
 /// Engine trait - equivalent to Python BaseClient
 ///
 /// Each engine implementation provides:
@@ -449,21 +482,29 @@ pub trait Engine {
     ///
     /// This is the reuse precondition for `--skip-upload`: the flag asserts "the
     /// corpus is already loaded", and the runner has to be able to check that
-    /// assertion against reality rather than trust it. A missing index/collection
-    /// answers `Ok(Some(0))` — indistinguishable from an empty one for this
-    /// purpose, and both are equally fatal to the reported recall.
+    /// assertion against reality rather than trust it.
     ///
-    /// The count must cover exactly the keyspace/collection **this config**
-    /// searches (per-config prefix included), so a sibling config's corpus can
-    /// never be mistaken for this one's.
+    /// Contract:
+    /// - index/collection **missing** → `Ok(Some(CorpusCount::exact(0)))`. For
+    ///   this check "gone" and "empty" are the same fact.
+    /// - **probe failed** (unreachable server, `NOPERM`, missing privilege) →
+    ///   `Err`. It must NEVER be reported as a corpus of zero: that names the
+    ///   wrong problem and invites a re-upload over a corpus that was fine.
+    /// - engine has no implementation yet → `Ok(None)`. The runner then says the
+    ///   reuse went unverified and proceeds; an unimplemented probe must not make
+    ///   the engine unusable.
     ///
-    /// Default `Ok(None)`: "this engine cannot report one". The runner then says
-    /// so and proceeds — an unverifiable engine must not become an unusable one.
-    /// `Err` means the probe itself failed (unreachable server, refused command);
-    /// the runner treats that as fatal unless `--allow-partial-corpus` is set,
-    /// because an unverified reuse is exactly how a partial index gets published
-    /// as a full one.
-    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+    /// Scope, and its limits. Only the four Redis-wire engines address a
+    /// per-config object (each config owns `idx:<config>` and a `<config>:`
+    /// keyspace, #151-4). MongoDB (`bench.vectors`), pgvector (`items`),
+    /// Elasticsearch/OpenSearch (`bench`), Qdrant (`benchmark`), Milvus and
+    /// VectorSets (`idx`, #236) each have exactly ONE such object per server,
+    /// shared by every config and every dataset. On those, a full-size corpus
+    /// uploaded by a SIBLING config — or by a different dataset entirely —
+    /// certifies as this config's. The count therefore proves the corpus is the
+    /// right SIZE; it never proves it is the right corpus. Cardinality is not
+    /// identity.
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         Ok(None)
     }
 

@@ -21,11 +21,19 @@ mod common;
 // Helpers
 // ---------------------------------------------------------------------------
 
-const TEST_PORT: u16 = 6399;
+/// Redis port under test. Overridable so a session can run against its OWN
+/// container instead of the shared 6399 one — these tests call `flush_db()`, so
+/// two sessions sharing an instance clobber each other.
+fn test_port() -> u16 {
+    std::env::var("REDIS_TEST_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6399)
+}
 const TEST_HOST: &str = "127.0.0.1";
 
 fn get_test_connection() -> Connection {
-    let url = format!("redis://{}:{}/", TEST_HOST, TEST_PORT);
+    let url = format!("redis://{}:{}/", TEST_HOST, test_port());
     let client = redis::Client::open(url.as_str()).expect("Failed to create Redis client");
     client
         .get_connection()
@@ -35,7 +43,7 @@ fn get_test_connection() -> Connection {
 fn wait_for_redis() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let url = format!("redis://{}:{}/", TEST_HOST, TEST_PORT);
+        let url = format!("redis://{}:{}/", TEST_HOST, test_port());
         if let Ok(client) = redis::Client::open(url.as_str()) {
             if let Ok(mut conn) = client.get_connection() {
                 let pong: Result<String, _> = redis::cmd("PING").query(&mut conn);
@@ -45,7 +53,7 @@ fn wait_for_redis() {
             }
         }
         if Instant::now() > deadline {
-            panic!("Redis not available on port {} after 10s", TEST_PORT);
+            panic!("Redis not available on port {} after 10s", test_port());
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -1501,7 +1509,7 @@ fn test_binary_redis_end_to_end() {
             "--host",
             "localhost",
         ])
-        .env("REDIS_PORT", TEST_PORT.to_string())
+        .env("REDIS_PORT", test_port().to_string())
         .current_dir(&project_root)
         .output()
         .expect("Failed to run vector-db-benchmark");
@@ -1598,7 +1606,7 @@ fn test_binary_redis_svs_vamana() {
             "--host",
             "localhost",
         ])
-        .env("REDIS_PORT", TEST_PORT.to_string())
+        .env("REDIS_PORT", test_port().to_string())
         .current_dir(&project_root)
         .output()
         .expect("Failed to run vector-db-benchmark");
@@ -1683,7 +1691,7 @@ fn test_binary_redis_open_loop_fixed_qps() {
             "--repetitions",
             "1",
         ])
-        .env("REDIS_PORT", TEST_PORT.to_string())
+        .env("REDIS_PORT", test_port().to_string())
         .current_dir(&project_root)
         .output()
         .expect("Failed to run open-loop benchmark");
@@ -1786,7 +1794,7 @@ fn test_binary_vectorsets_end_to_end() {
             "--host",
             "localhost",
         ])
-        .env("REDIS_PORT", TEST_PORT.to_string())
+        .env("REDIS_PORT", test_port().to_string())
         .current_dir(&project_root)
         .output()
         .expect("Failed to run vector-db-benchmark");
@@ -1926,7 +1934,7 @@ fn test_binary_redis_mixed_benchmark() {
             "--repetitions",
             "1",
         ])
-        .env("REDIS_PORT", TEST_PORT.to_string())
+        .env("REDIS_PORT", test_port().to_string())
         .current_dir(&project_root)
         .output()
         .expect("Failed to run vector-db-benchmark");
@@ -2027,7 +2035,7 @@ fn test_binary_redis_filter_only() {
     );
     assert!(proj.matching_docs >= proj.top);
 
-    let port = TEST_PORT.to_string();
+    let port = test_port().to_string();
     assert!(
         common::run_binary_extra(
             &proj.root,
@@ -2090,7 +2098,7 @@ fn test_binary_redis_mixed_parallel() {
     );
     assert!(proj.matching_docs >= proj.top);
 
-    let port = TEST_PORT.to_string();
+    let port = test_port().to_string();
     assert!(
         common::run_binary_extra(
             &proj.root,
@@ -2158,7 +2166,7 @@ fn test_binary_redis_match_any() {
             "redis-ma",
             "match-any-test",
             "localhost",
-            &[("REDIS_PORT", &TEST_PORT.to_string())],
+            &[("REDIS_PORT", &test_port().to_string())],
         ),
         "redis match_any run failed"
     );
@@ -2190,7 +2198,7 @@ fn test_binary_redis_match_any_resp3() {
     );
     assert!(proj.matching_docs >= proj.top);
 
-    let resp3_uri = format!("redis://localhost:{}/?protocol=resp3", TEST_PORT);
+    let resp3_uri = format!("redis://localhost:{}/?protocol=resp3", test_port());
     assert!(
         common::run_binary(
             &proj.root,
@@ -2244,7 +2252,7 @@ fn run_filter_recall_test(
             name,
             dataset,
             "localhost",
-            &[("REDIS_PORT", &TEST_PORT.to_string())],
+            &[("REDIS_PORT", &test_port().to_string())],
         ),
         "redis {} run failed",
         name
@@ -2338,7 +2346,7 @@ fn test_binary_redis_keep_data_sweep_frees_prior_configs() {
             "redis-sweep*",
             "sweep-test",
             "localhost",
-            &[("REDIS_PORT", &TEST_PORT.to_string())],
+            &[("REDIS_PORT", &test_port().to_string())],
             &["--keep-data", "--reset-between-configs"],
         ),
         "redis keep-data sweep run failed"
@@ -2412,7 +2420,7 @@ fn test_binary_redis_shared_corpus_upload_once() {
             "--skip-if-exists",
             "false",
         ])
-        .env("REDIS_PORT", TEST_PORT.to_string())
+        .env("REDIS_PORT", test_port().to_string())
         .env("REDIS_KEY_PREFIX", "shared_sc:")
         .current_dir(&proj.root)
         .output()
@@ -2535,7 +2543,7 @@ fn test_binary_redis_tenancy() {
             "redis-tenancy",
             "tenancy-test",
             "localhost",
-            &[("REDIS_PORT", &TEST_PORT.to_string())],
+            &[("REDIS_PORT", &test_port().to_string())],
             &["--dump-raw-latencies"],
         ),
         "redis tenancy run failed"
@@ -2646,7 +2654,7 @@ fn test_binary_redis_coexistence_skip_upload() {
         dim,
     );
     let bin = binary_path();
-    let port = TEST_PORT.to_string();
+    let port = test_port().to_string();
     let results_dir = root.join("results");
 
     // Phase 1: upload + search BOTH configs, KEEPING data for the skip-upload phase.
@@ -2817,7 +2825,7 @@ fn test_binary_redis_skip_upload_without_prior_upload_errors() {
             "--skip-if-exists",
             "false",
         ])
-        .env("REDIS_PORT", TEST_PORT.to_string())
+        .env("REDIS_PORT", test_port().to_string())
         .current_dir(&root)
         .output()
         .expect("run skip-upload-no-index");
@@ -2885,7 +2893,7 @@ fn test_binary_redis_skip_upload_skip_vector_index_preserves_corpus() {
         &serde_json::to_string(&configs).unwrap(),
         dim,
     );
-    let port = TEST_PORT.to_string();
+    let port = test_port().to_string();
     let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
 
     // Phase 1: build the filter-only corpus the second phase is told to reuse.
@@ -2947,9 +2955,13 @@ fn test_binary_redis_skip_upload_skip_vector_index_preserves_corpus() {
 /// SHORT corpus must not quietly measure it.
 ///
 /// Deleting half the docs leaves an index that answers every query without
-/// error, so no behavioural assertion catches it — and recall does not either
-/// (the same experiment on Qdrant reported `mean_recall: 1.0` with half the
-/// collection gone). Only a server-side row count does.
+/// error, so no behavioural assertion catches it — and recall is not a reliable
+/// detector either. Whether a truncated corpus shows up in recall depends on
+/// WHICH rows went: on `random-100` (9 queries, one ground-truth neighbour each,
+/// ids 0-8) deleting the upper half of a Qdrant collection leaves
+/// `mean_recall: 1.0`, while deleting the lower half gives `0.0`. A metric that
+/// is a coin flip on the deletion pattern cannot be the guard; a server-side row
+/// count is not.
 ///
 /// RED on unfixed code: phase 2 exits 0 and writes a search result file.
 #[test]
@@ -2960,24 +2972,24 @@ fn test_binary_redis_skip_upload_short_corpus_is_fatal() {
 
     let dim = 8;
     let configs = serde_json::json!([{
-        "name": "redis-238-short", "engine": "redis",
+        "name": "cfg238short", "engine": "redis",
         "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
         "upload_params": {"parallel": 1, "batch_size": 100}
     }]);
     let proj = common::write_match_any_project(
-        "redis-238-short-test",
+        "cfg238short-test",
         &serde_json::to_string(&configs).unwrap(),
         dim,
     );
-    let port = TEST_PORT.to_string();
+    let port = test_port().to_string();
     let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
     let results_dir = proj.root.join("results");
 
     assert!(
         common::run_binary_extra(
             &proj.root,
-            "redis-238-short",
-            "redis-238-short-test",
+            "cfg238short",
+            "cfg238short-test",
             "localhost",
             &envs,
             &["--keep-data", "--skip-search"],
@@ -2985,7 +2997,7 @@ fn test_binary_redis_skip_upload_short_corpus_is_fatal() {
         "phase 1 (upload) failed"
     );
     assert_eq!(
-        ft_info_num_docs(&mut conn, "idx:redis-238-short"),
+        ft_info_num_docs(&mut conn, "idx:cfg238short"),
         common::N_DOCS as i64,
         "phase 1 must leave a complete corpus"
     );
@@ -2994,11 +3006,11 @@ fn test_binary_redis_skip_upload_short_corpus_is_fatal() {
     let half = common::N_DOCS / 2;
     for id in 0..half {
         let _: () = redis::cmd("UNLINK")
-            .arg(format!("redis-238-short:{id}"))
+            .arg(format!("cfg238short:{id}"))
             .query(&mut conn)
             .unwrap();
     }
-    let remaining = ft_info_num_docs(&mut conn, "idx:redis-238-short");
+    let remaining = ft_info_num_docs(&mut conn, "idx:cfg238short");
     assert_eq!(remaining, half as i64, "half the corpus should remain");
 
     delete_search_result_files(&results_dir);
@@ -3008,9 +3020,9 @@ fn test_binary_redis_skip_upload_short_corpus_is_fatal() {
         let mut cmd = Command::new(&bin);
         cmd.args([
             "--engines",
-            "redis-238-short",
+            "cfg238short",
             "--datasets",
-            "redis-238-short-test",
+            "cfg238short-test",
             "--host",
             "localhost",
             "--skip-if-exists",
@@ -3064,9 +3076,187 @@ fn test_binary_redis_skip_upload_short_corpus_is_fatal() {
         "the override must still warn"
     );
     assert_eq!(
-        ft_info_num_docs(&mut conn, "idx:redis-238-short"),
+        ft_info_num_docs(&mut conn, "idx:cfg238short"),
         half as i64,
         "the reuse check must never modify the corpus"
+    );
+
+    // The waived run must SAY it was waived. A verified run, an unverified run
+    // and a waived run over a half-deleted corpus produced structurally
+    // identical artifacts before #238, so the verdict travels in the file.
+    let reuse = common::read_params_obj(&proj.root, "cfg238short")["corpus_reuse"].clone();
+    assert_eq!(reuse["status"], "short", "recorded verdict: {reuse}");
+    assert_eq!(reuse["expected_rows"], common::N_DOCS as u64);
+    assert_eq!(reuse["actual_rows"], half as u64);
+    assert_eq!(reuse["waived_by_allow_partial_corpus"], true);
+    assert_eq!(reuse["actual_is_estimate"], false);
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// The SURPLUS arm of the guard, exercised end to end (issue #238).
+///
+/// The classifier unit test only proves the variant is returned; this proves the
+/// handler *warns and continues* rather than aborting — the arm that decides
+/// warn-vs-abort is the one that matters, and it had no runtime coverage.
+#[test]
+fn test_binary_redis_skip_upload_surplus_warns_and_continues() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238surplus", "engine": "redis",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg238surplus-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238surplus",
+            "cfg238surplus-test",
+            "localhost",
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+
+    // Five extra indexed docs under this config's prefix: a real superset corpus.
+    for id in 10_000..10_005 {
+        let _: () = redis::cmd("HSET")
+            .arg(format!("cfg238surplus:{id}"))
+            .arg("vector")
+            .arg(vec_to_bytes(&vec![0.0f32; dim]))
+            .query(&mut conn)
+            .unwrap();
+    }
+    let expected_surplus = common::N_DOCS as i64 + 5;
+    for _ in 0..50 {
+        if ft_info_num_docs(&mut conn, "idx:cfg238surplus") == expected_surplus {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg238surplus"),
+        expected_surplus,
+        "the extra docs must be indexed for this to be a surplus"
+    );
+
+    delete_search_result_files(&proj.root.join("results"));
+
+    let out = Command::new(binary_path())
+        .args([
+            "--engines",
+            "cfg238surplus",
+            "--datasets",
+            "cfg238surplus-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ])
+        .env("REDIS_PORT", &port)
+        .current_dir(&proj.root)
+        .output()
+        .expect("run vector-db-benchmark");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "a surplus corpus must WARN and continue, not abort.\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr.contains("WARNING: --skip-upload")
+            && stderr.contains(&format!("holds {expected_surplus} rows")),
+        "the surplus warning must name the count it found.\nstderr: {stderr}"
+    );
+    let reuse = common::read_params_obj(&proj.root, "cfg238surplus")["corpus_reuse"].clone();
+    assert_eq!(reuse["status"], "surplus", "recorded verdict: {reuse}");
+    assert_eq!(reuse["actual_rows"], expected_surplus as u64);
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// `--skip-upload` with NO `--keep-data` must not delete the corpus it reused
+/// (issue #238, second destructive path).
+///
+/// `--keep-data` defaults to false and `engine.delete()` runs at the end of every
+/// successful experiment, so the plainest form of the flag used to benchmark a
+/// corpus and then destroy it — exit 0, no warning. The other #238 regression
+/// tests all pass `--keep-data`, so none of them covered this.
+///
+/// RED before the fix: `DBSIZE` 400 -> 0.
+#[test]
+fn test_binary_redis_skip_upload_without_keep_data_preserves_corpus() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg238nokeep", "engine": "redis",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg238nokeep-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238nokeep",
+            "cfg238nokeep-test",
+            "localhost",
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+    let before = ft_info_num_docs(&mut conn, "idx:cfg238nokeep");
+    assert_eq!(before, common::N_DOCS as i64, "phase 1 corpus");
+
+    // Deliberately NO --keep-data.
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg238nokeep",
+            "cfg238nokeep-test",
+            "localhost",
+            &envs,
+            &["--skip-upload"],
+        ),
+        "phase 2 (--skip-upload, no --keep-data) failed"
+    );
+
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg238nokeep"),
+        before,
+        "--skip-upload without --keep-data deleted the corpus it reused — issue #238"
+    );
+    assert_eq!(
+        count_prefix(&mut conn, "cfg238nokeep:"),
+        common::N_DOCS as i64,
+        "--skip-upload without --keep-data unlinked the keyspace it reused — issue #238"
     );
 
     flush_db(&mut conn);

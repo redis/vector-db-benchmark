@@ -69,7 +69,7 @@ use super::redis_utils;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
-use crate::engine::{Engine, SearchResults, UploadStats};
+use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use crate::metrics::compute_metrics;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, doc_key_to_id, doc_key_to_id_opt};
 use vector_db_benchmark::readers::metadata::{is_multivalued_keyword_field, MetadataItem};
@@ -100,6 +100,16 @@ pub struct KividbEngine {
     config: KividbEngineConfig,
     search_params: Vec<SearchParams>,
     commandstats_baseline: Option<redis_utils::CommandStatsBaseline>,
+    /// Whether `commandstats_baseline` was established by this process.
+    ///
+    /// `None` is ambiguous on its own: it means BOTH "CONFIG RESETSTAT succeeded,
+    /// so the server counters start at zero" and "configure() never ran, so
+    /// nothing was reset". On the `--skip-upload` path (#238) configure() is
+    /// skipped, and `check_commandstats` would then compare this run's failure
+    /// count against zero while the counters still hold every failure since the
+    /// server started — failing a search in which nothing actually failed. This
+    /// flag disambiguates so `search()` can prime the baseline exactly once.
+    commandstats_primed: bool,
 }
 
 impl KividbEngine {
@@ -175,6 +185,7 @@ impl KividbEngine {
             },
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             commandstats_baseline: None,
+            commandstats_primed: false,
         })
     }
 
@@ -1982,13 +1993,32 @@ fn redis_value_to_json(val: &redis::Value) -> serde_json::Value {
 
 // ── Engine trait implementation ──────────────────────────────────────────
 
+/// Establish the commandstats baseline if configure() did not (issue #238).
+impl KividbEngine {
+    /// Idempotent and a no-op on the normal configure -> upload -> search path,
+    /// so the existing accounting is unchanged; it only rescues the
+    /// `--skip-upload` path, where nothing had reset the counters.
+    fn prime_commandstats_if_needed(&mut self) -> Result<(), String> {
+        if self.commandstats_primed {
+            return Ok(());
+        }
+        let mut conn = self.get_connection()?;
+        self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
+        self.commandstats_primed = true;
+        Ok(())
+    }
+}
+
 impl Engine for KividbEngine {
     /// Server-side corpus size for this config's index, for the `--skip-upload`
     /// reuse precondition (issue #238). `FT.INFO <index>` → `num_docs`; a missing
     /// index counts as 0 (the corpus to reuse is not there).
-    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         let mut conn = self.get_connection()?;
-        redis_utils::ft_index_num_docs(&mut conn, &self.config.index_name)
+        Ok(
+            redis_utils::ft_index_num_docs(&mut conn, &self.config.index_name)?
+                .map(CorpusCount::exact),
+        )
     }
 
     fn name(&self) -> &str {
@@ -2016,6 +2046,7 @@ impl Engine for KividbEngine {
         self.create_index(&mut conn, dataset)?;
         // Best-effort; see check_commandstats note in upload()/search() below.
         self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
+        self.commandstats_primed = true;
         Ok(())
     }
 
@@ -2109,6 +2140,14 @@ impl Engine for KividbEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // configure() normally resets the server's command counters and
+        // establishes the commandstats baseline; on the `--skip-upload` path it
+        // never runs (#238), so check_commandstats below would compare this run's
+        // failure count against zero while the counters still hold every failure
+        // since the server started — failing a run in which nothing failed.
+        // Idempotent no-op once primed; outside every timed window.
+        self.prime_commandstats_if_needed()?;
+
         // Repeated for the `--skip-upload` path, which reaches `search()`
         // without ever calling `configure()`. Schema-only, so it costs nothing.
         validate_dataset_support(dataset)?;

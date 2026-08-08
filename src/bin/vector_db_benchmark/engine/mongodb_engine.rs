@@ -16,7 +16,7 @@ use rand::{seq::SliceRandom, SeedableRng};
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
-use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
+use crate::engine::{CorpusCount, Engine, SearchResults, UpdateSearchRatio, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
@@ -1196,15 +1196,24 @@ impl Engine for MongoDBEngine {
     /// (issue #238). `countDocuments({})` on the benchmark collection — an exact
     /// count, not the metadata estimate, because the estimate can lag a drop and
     /// report a corpus that is no longer there. A missing collection answers 0.
-    fn corpus_row_count(&mut self) -> Result<Option<u64>, String> {
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         let coll = self
             .client
             .database(&self.db_name)
             .collection::<Document>(&self.collection_name);
-        match coll.count_documents(doc! {}).run() {
-            Ok(n) => Ok(Some(n)),
-            Err(_) => Ok(Some(0)),
-        }
+        // A missing collection is not an error in MongoDB — countDocuments
+        // answers 0 — so any Err here is a real probe failure (unreachable node,
+        // auth). Reporting that as a corpus of zero would send the user to
+        // re-upload a corpus that is still intact.
+        coll.count_documents(doc! {})
+            .run()
+            .map(|n| Some(CorpusCount::exact(n)))
+            .map_err(|e| {
+                format!(
+                    "countDocuments on {}.{} failed: {}",
+                    self.db_name, self.collection_name, e
+                )
+            })
     }
 
     fn name(&self) -> &str {
@@ -1327,9 +1336,17 @@ impl Engine for MongoDBEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        // `--skip-upload` never runs configure() (issue #238), so the schema type
-        // cache must be primed here too — without it a numeric filter would be
-        // built against string literals and quietly match nothing.
+        // Defensive, matching what Redis and Valkey already do at the top of
+        // their own `search()`: `--skip-upload` never runs configure() (#238),
+        // which is where this cache is otherwise primed. It is the identical
+        // call with the identical argument, so no divergence is possible.
+        //
+        // It is NOT load-bearing for a pure search on shipped data — the filter
+        // builders (`parse_mongo_conditions` -> `json_to_bson`) type literals off
+        // the JSON value itself and never consult the cache; the cache only feeds
+        // `metadata_value_to_bson`, which coerces `MetadataValue::String` on the
+        // WRITE path (upload, and the update half of `search_mixed`). Kept so the
+        // engine's state does not depend on which phases happened to run.
         self.load_schema_types(dataset);
         if self.config.skip_vector_index {
             return self.search_filter_only(dataset, params, num_queries);
