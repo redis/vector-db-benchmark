@@ -267,6 +267,56 @@ fn test_binary_vectorsets_nested_filter() {
     );
 }
 
+/// End-to-end DATETIME range filter whose schema declares `ts` as **`keyword`**,
+/// with a **one-sided** `lt` bound (PR #230 review M2).
+///
+/// This is the regression test for the storage/filter DISAGREEMENT, a second
+/// silent-wrong route into issue #220's failure class. The first fix for #220
+/// decided "is this field a datetime?" from `dataset.config.schema` on the
+/// STORAGE side but from the VALUE on the FILTER side. Whenever the schema does
+/// not say `datetime` the two disagree: upload writes the ISO string, the filter
+/// compares against an epoch number, and VSIM coerces the non-numeric attribute
+/// to `0` — so `.ts < <epoch>` matches EVERY document and the query is
+/// effectively UNFILTERED. Exit code 0, no error, no warning; recall is the only
+/// detector (measured live on redis:8.8.0: 0.800 schema-gated vs 1.000 once both
+/// halves derive the representation from the value alone).
+///
+/// The one-sided bound is the point. A two-sided range collapses to zero hits,
+/// which is loud; `lt`/`lte` alone silently returns the whole corpus.
+#[test]
+fn test_binary_vectorsets_datetime_keyword_schema() {
+    wait_for_vectorsets();
+
+    let name = "vectorsets-dt-kw";
+    let proj = common::write_datetime_keyword_schema_cosine_project(
+        "vs-dt-kw",
+        &vectorsets_config(name),
+        8,
+    );
+    assert!(proj.matching_docs >= proj.top);
+
+    let port = test_port().to_string();
+    assert!(
+        common::run_binary(
+            &proj.root,
+            name,
+            "vs-dt-kw",
+            TEST_HOST,
+            &[("REDIS_PORT", port.as_str())],
+        ),
+        "vectorsets keyword-schema datetime run failed"
+    );
+
+    let recall = common::read_recall(&proj.root, name);
+    println!("vectorsets keyword-schema datetime recall={:.3}", recall);
+    assert!(
+        recall >= 0.9,
+        "vectorsets keyword-schema datetime recall {:.3} < 0.9 \
+         (storage stored ISO strings while the filter compared epochs → `.ts < N` matched everything?)",
+        recall
+    );
+}
+
 /// End-to-end MIXED harness (`--update-search-ratio`) at `parallel: 4`: drives
 /// the VectorSets mixed path (VSIM search + VADD update) with a real multi-worker
 /// join-merge of the thread-local sample buffers. Cosine ground truth (VectorSets
