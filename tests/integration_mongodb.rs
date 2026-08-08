@@ -1440,3 +1440,313 @@ fn test_binary_mongodb_match_any_int() {
         recall
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #216: hnsw_config must actually reach the server
+// ---------------------------------------------------------------------------
+
+/// Read the vector index definition back from the server.
+///
+/// This is the only assertion that can prove a build-time knob took effect.
+/// Recall/latency assertions cannot: HNSW is accurate enough on a small corpus
+/// that a default index and a tuned index produce identical results, which is
+/// precisely why issue #216 (all 96 MongoDB sweep rows measuring one default
+/// index) survived undetected — "recall looks plausible throughout".
+fn read_back_index_definition() -> Document {
+    let client = mongodb_client();
+    let db = client.database(TEST_DB);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let result = db
+            .run_command(doc! { "listSearchIndexes": TEST_COLLECTION })
+            .run();
+        if let Ok(result) = result {
+            let batch = result
+                .get_document("cursor")
+                .ok()
+                .and_then(|c| c.get_array("firstBatch").ok())
+                .cloned()
+                .unwrap_or_default();
+            for idx in batch {
+                let Some(idx) = idx.as_document() else {
+                    continue;
+                };
+                if idx.get_str("name").ok() != Some(TEST_INDEX) {
+                    continue;
+                }
+                if let Ok(def) = idx.get_document("latestDefinition") {
+                    return def.clone();
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "index '{}' never appeared in listSearchIndexes on {}.{}",
+            TEST_INDEX,
+            TEST_DB,
+            TEST_COLLECTION
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Pull the `hnswOptions` sub-document out of the vector field of a definition.
+fn hnsw_options_of(definition: &Document) -> Option<Document> {
+    definition
+        .get_array("fields")
+        .ok()?
+        .iter()
+        .filter_map(|f| f.as_document())
+        .find(|f| f.get_str("type").ok() == Some("vector"))?
+        .get_document("hnswOptions")
+        .ok()
+        .cloned()
+}
+
+/// Run the binary once with the given `collection_params`, keeping the index
+/// alive (`--keep-data`) so the definition can be read back afterwards.
+fn run_and_read_back_definition(
+    engine_name: &str,
+    collection_params: serde_json::Value,
+    port: u16,
+) -> (Document, PathBuf) {
+    let engine_config = serde_json::json!([{
+        "name": engine_name,
+        "engine": "mongodb",
+        "connection_params": {},
+        "collection_params": collection_params,
+        "search_params": [{ "parallel": 1, "num_candidates": 20 }],
+        "upload_params": { "parallel": 1, "batch_size": 50 }
+    }]);
+
+    let dim = 8;
+    let (_, vectors) = generate_test_vectors(40, dim);
+    let queries: Vec<Vec<f32>> = vectors[..3].to_vec();
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors_l2(q, &vectors, 5))
+        .collect();
+
+    let project = create_test_project(
+        "test-hnswopts",
+        &serde_json::to_string_pretty(&engine_config).unwrap(),
+        &vectors,
+        &queries,
+        &neighbors,
+        "l2",
+        dim,
+    );
+
+    let bin = binary_path();
+    assert!(bin.exists(), "Binary not found at {:?}", bin);
+    let output = Command::new(&bin)
+        .args([
+            "--engines",
+            engine_name,
+            "--datasets",
+            "test-hnswopts",
+            "--host",
+            MONGODB_HOST,
+            "--skip-if-exists",
+            "false",
+            // Keep the index so it can be inspected after the run; the default
+            // cleanup drops it and takes the evidence with it.
+            "--keep-data",
+        ])
+        .env("MONGODB_PORT", port.to_string())
+        .env("MONGODB_DB", TEST_DB)
+        .env("MONGODB_COLLECTION", TEST_COLLECTION)
+        .env("MONGODB_INDEX_NAME", TEST_INDEX)
+        .current_dir(&project)
+        .output()
+        .expect("Failed to run vector-db-benchmark");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "run for {} failed.\nstdout: {}\nstderr: {}",
+        engine_name,
+        stdout,
+        stderr
+    );
+
+    (read_back_index_definition(), project)
+}
+
+/// Issue #216: `collection_params.hnsw_config` must reach the server as
+/// `hnswOptions.{maxEdges,numEdgeCandidates}`.
+///
+/// The test asserts on the definition MongoDB itself reports, and pairs it with
+/// a negative control (a config with no `hnsw_config` must produce an index with
+/// NO `hnswOptions`). Without the control the assertion could pass against a
+/// server that always reports some default, proving nothing.
+///
+/// IMPORTANT — why the tuned values are 32/200 and not 16/100:
+/// **the server elides default-valued options from the definition it reports.**
+/// The defaults are `maxEdges=16`, `numEdgeCandidates=100`, so `{16, 100}` reads
+/// back with no `hnswOptions` at all, and `{16, 200}` reads back with only
+/// `numEdgeCandidates`. "Absent from the read-back" therefore means "not sent OR
+/// sent at the default" — the control distinguishes those two only because the
+/// positive case deliberately uses NON-DEFAULT values on both knobs.
+///
+/// Consequence for anyone reparameterising this test: dropping to `M: 16` makes
+/// the `maxEdges` assertion below fail against a perfectly correct engine. Keep
+/// both values off their defaults.
+#[test]
+fn test_binary_mongodb_hnsw_config_reaches_server() {
+    wait_for_mongodb();
+
+    let port: u16 = std::env::var("MONGODB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MONGODB_PORT);
+
+    // ── Negative control: no hnsw_config → no hnswOptions on the server ──
+    drop_test_collection();
+    let (default_def, project_default) =
+        run_and_read_back_definition("test-mongodb-hnsw-default", serde_json::json!({}), port);
+    println!("default index definition: {:?}", default_def);
+    assert!(
+        hnsw_options_of(&default_def).is_none(),
+        "a config without hnsw_config must not send hnswOptions, but the server \
+         reports {:?} — the positive assertion below would then prove nothing",
+        default_def
+    );
+
+    // ── Positive: hnsw_config → hnswOptions, verified by read-back ──
+    drop_test_collection();
+    let (tuned_def, project_tuned) = run_and_read_back_definition(
+        "test-mongodb-hnsw-tuned",
+        serde_json::json!({ "hnsw_config": { "M": 32, "EF_CONSTRUCTION": 200 } }),
+        port,
+    );
+    println!("tuned index definition: {:?}", tuned_def);
+
+    let opts = hnsw_options_of(&tuned_def).unwrap_or_else(|| {
+        panic!(
+            "hnsw_config was declared but the server reports no hnswOptions: {:?} \
+             — the knob is being silently discarded (issue #216)",
+            tuned_def
+        )
+    });
+
+    // Present only because 32 is not the default (16); see the note above.
+    let max_edges = opts
+        .get_i32("maxEdges")
+        .map(|v| v as i64)
+        .or_else(|_| opts.get_i64("maxEdges"))
+        .expect("maxEdges missing from hnswOptions");
+    let num_edge_candidates = opts
+        .get_i32("numEdgeCandidates")
+        .map(|v| v as i64)
+        .or_else(|_| opts.get_i64("numEdgeCandidates"))
+        .expect("numEdgeCandidates missing from hnswOptions");
+
+    assert_eq!(
+        max_edges, 32,
+        "hnsw_config.M=32 must arrive as hnswOptions.maxEdges=32, server reports {:?}",
+        opts
+    );
+    assert_eq!(
+        num_edge_candidates, 200,
+        "hnsw_config.EF_CONSTRUCTION=200 must arrive as \
+         hnswOptions.numEdgeCandidates=200, server reports {:?}",
+        opts
+    );
+
+    drop_test_collection();
+    let _ = fs::remove_dir_all(&project_default);
+    let _ = fs::remove_dir_all(&project_tuned);
+}
+
+/// MongoDB enforces `hnswOptions` bounds server-side (`maxEdges` in `[16..64]`,
+/// `numEdgeCandidates` in `[100..3200]`). The engine forwards values verbatim
+/// rather than clamping them, so an out-of-range config must FAIL LOUDLY instead
+/// of quietly benchmarking a different index than the one requested.
+#[test]
+fn test_binary_mongodb_out_of_range_hnsw_config_fails_loudly() {
+    wait_for_mongodb();
+    drop_test_collection();
+
+    let port: u16 = std::env::var("MONGODB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MONGODB_PORT);
+
+    let engine_name = "test-mongodb-hnsw-oob";
+    // EF_CONSTRUCTION=64 was in the ORIGINAL shipped sweep and is below
+    // MongoDB's documented minimum of 100 — further proof those numbers were
+    // never sent anywhere.
+    let engine_config = serde_json::json!([{
+        "name": engine_name,
+        "engine": "mongodb",
+        "connection_params": {},
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 64 } },
+        "search_params": [{ "parallel": 1, "num_candidates": 20 }],
+        "upload_params": { "parallel": 1, "batch_size": 50 }
+    }]);
+
+    let dim = 8;
+    let (_, vectors) = generate_test_vectors(40, dim);
+    let queries: Vec<Vec<f32>> = vectors[..3].to_vec();
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors_l2(q, &vectors, 5))
+        .collect();
+
+    let project = create_test_project(
+        "test-hnsw-oob",
+        &serde_json::to_string_pretty(&engine_config).unwrap(),
+        &vectors,
+        &queries,
+        &neighbors,
+        "l2",
+        dim,
+    );
+
+    let (stdout, stderr, success) = {
+        let bin = binary_path();
+        let output = Command::new(&bin)
+            .args([
+                "--engines",
+                engine_name,
+                "--datasets",
+                "test-hnsw-oob",
+                "--host",
+                MONGODB_HOST,
+                "--skip-if-exists",
+                "false",
+            ])
+            .env("MONGODB_PORT", port.to_string())
+            .env("MONGODB_DB", TEST_DB)
+            .env("MONGODB_COLLECTION", TEST_COLLECTION)
+            .env("MONGODB_INDEX_NAME", TEST_INDEX)
+            .current_dir(&project)
+            .output()
+            .expect("Failed to run vector-db-benchmark");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.success(),
+        )
+    };
+
+    assert!(
+        !success,
+        "EF_CONSTRUCTION=64 is below MongoDB's minimum of 100; the run must fail \
+         rather than silently benchmark a default index.\nstdout: {}\nstderr: {}",
+        stdout, stderr
+    );
+    let combined = format!("{}{}", stdout, stderr);
+    assert!(
+        combined.contains("numEdgeCandidates"),
+        "failure must name the rejected knob so the cause is obvious.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    drop_test_collection();
+    let _ = fs::remove_dir_all(&project);
+}

@@ -14,7 +14,7 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 | **PgVector** | `postgres` 0.19 + `pgvector` 0.4 | PostgreSQL | L2, Cosine | Yes |
 | **Weaviate** | `tonic` 0.12 / `prost` 0.13 (gRPC) + `reqwest` (REST) | gRPC (search) + HTTP/REST (schema) [\*\*](#weaviate-protocol-note) | L2, Cosine, Dot | Yes |
 | **Milvus** | `reqwest` (REST API v2) | HTTP/REST | L2, Cosine, IP | Yes |
-| **MongoDB** (Atlas Search) | `mongodb` 3 (sync) | MongoDB protocol | Euclidean, Cosine, Dot | Yes |
+| **MongoDB** (Atlas Search) | `mongodb` 3 (sync) | MongoDB protocol | Euclidean, Cosine, Dot | Yes [\*\*\*\*\*\*\*\*](#mongodb-note) |
 | **Valkey** (Valkey Search) | `redis` 1.3 [\*](#valkey-client-note) | RESP protocol | L2, Cosine, IP | Yes |
 | **Turbopuffer** | `turbopuffer-client` 0.0.4 | HTTP/REST (cloud) | Cosine, Euclidean | Yes |
 | **Dragonfly** (Dragonfly Search) | `redis` 1.3 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*](#dragonfly-note) |
@@ -53,6 +53,20 @@ The first two are decidable from the dataset schema, so KiviDB rejects them in t
 > **Which shipped datasets this excludes.** **3 of the 53** datasets in `datasets/datasets.json` cannot run on KiviDB at all and now abort instead of producing a result file: `random-geo-radius-100-angular-filters` and `random-geo-radius-2048-angular-filters` (geo), and `arxiv-titles-384-angular-filters` (multi-valued `labels` — the only shipped dataset that declares a `labels` field). Before this was fixed these three *did* run and published a recall near 0.0, which was visibly wrong; they now publish nothing at all, and no result file records the rejection, so `--plot` simply shows a gap for KiviDB on those datasets. If you are sweeping KiviDB across everything, either exclude the three from `--datasets` (`arxiv-titles-384-angular-no-filters` is the pure-KNN twin of the arxiv one) or pass `--exit-on-error false` so the rest of the sweep continues. Every other dataset — including all filtered ones — is unaffected.
 
 One real protocol difference worth knowing: KiviDB's `FT.INFO` does not expose RediSearch's `num_docs`/`percent_indexed` — it reports HNSW graph state directly instead (`hnsw_live_count`, `hnsw_compaction_in_progress`), because it builds each vector's HNSW entry synchronously inside the `HSET` that stores it (no async backfill phase exists to report progress on); `wait_for_indexing` polls those fields instead and returns immediately as a result. RESP2 only (no RESP3 opt-in). Set the host port with `KIVIDB_PORT` (default `6380` — KiviDB's own default listen port, **not** Redis's 6379).
+
+<a id="mongodb-note"></a>
+\*\*\*\*\*\*\*\* **MongoDB note — which knobs MongoDB actually honours:** MongoDB Vector Search exposes **build-time** HNSW tuning and **no query-time `ef`**.
+
+`collection_params.hnsw_config` is forwarded into the `vectorSearch` index as the `hnswOptions` sub-document — MongoDB's own spelling, since it rejects the HNSW-generic names outright (`unrecognized fields ["m", "efConstruction"]`):
+
+| benchmark key | MongoDB key | server-enforced bounds |
+|---|---|---|
+| `M` | `hnswOptions.maxEdges` | `[16..64]` |
+| `EF_CONSTRUCTION` | `hnswOptions.numEdgeCandidates` | `[100..3200]` |
+
+Values are forwarded **verbatim, never clamped**: an out-of-range value fails index creation loudly rather than silently benchmarking a different index. Note the server **elides default-valued options** when reporting a definition back, so `{maxEdges:16, numEdgeCandidates:100}` (the defaults) is indistinguishable from an untuned index.
+
+At query time, **`numCandidates` is the only recall/latency dial** — there is no `ef`/`efSearch`, and `$vectorSearch` *silently ignores* unknown stage fields, so a stray `search_params.ef` is a no-op rather than an error. The benchmark sends `numCandidates = top × search_params.num_candidates`, i.e. **`num_candidates` is a multiplier here**, unlike `elasticsearch.rs` and `vertex.rs` where the same key is an absolute count. `experiments/configurations/mongodb-single-node.json` therefore sweeps `M` × `EF_CONSTRUCTION` at build time and `num_candidates` at query time; it previously swept a `search_params.ef` that MongoDB never honoured (issue #216).
 
 <a id="opensearch-note"></a>
 \*\*\*\*\*\*\* **OpenSearch note:** Connection is set with `OPENSEARCH_PORT` (default `9200`), `OPENSEARCH_INDEX` (default `bench`), `OPENSEARCH_TIMEOUT` seconds (default `300`), and `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD`.
