@@ -443,9 +443,16 @@ pub fn read_engine_configs_from_dir(
         // rejects the WHOLE file on one bad entry, so a single typo deletes every
         // configuration defined in it — and under the DEFAULT `--engines '*'`,
         // or any wildcard, the sweep simply gets smaller and still exits 0. On
-        // the shipped tree a typo in qdrant-single-node.json drops 15 of its 56
-        // configurations; one in opensearch-5-shard.json drops 7 of 14, turning
-        // a shard-count comparison single-sided. `summary.rs` then picks the best
+        // the shipped tree, even for engines whose configurations are SPLIT over
+        // several files, one file still owns at least half of that engine's
+        // sweep — so a single typo takes most of a curve with it, and
+        // `opensearch-5-shard.json` in particular is half the opensearch entries,
+        // which makes a shard-count comparison single-sided.
+        //
+        // Those shares are DERIVED from the tree, not restated here, by
+        // `one_unloadable_file_removes_a_large_share_of_an_engines_sweep` below.
+        // Do not hard-code a total in this comment: a stale count in a comment is
+        // the same defect class this guard exists for. `summary.rs` picks the best
         // QPS among the points that DID run and `plot.rs` charts them, so the
         // published peak and Pareto frontier are quietly truncated. Only an exact
         // single-name `--engines` selection turns this into "no engines match".
@@ -527,31 +534,54 @@ pub fn read_engine_configs(
 ) -> Result<HashMap<String, EngineConfig>, String> {
     let (configs, skipped) = read_engine_configs_reporting_skips(engines_file)?;
     if !skipped.is_empty() {
-        return Err(describe_skipped_config_files(&skipped, true));
+        return Err(describe_skipped_config_files(&skipped, SkipReport::Refusal));
     }
     Ok(configs)
 }
 
-/// The user-facing report for a partial configuration set.
-///
-/// `offer_opt_in` appends the `--allow-partial-configs` remedy — wanted on the
-/// refusal, unwanted on the notice printed when that flag was already passed.
-pub fn describe_skipped_config_files(skipped: &[SkippedConfigFile], offer_opt_in: bool) -> String {
-    let mut msg = format!(
-        "{} engine configuration file(s) could not be loaded, so EVERY configuration they \
-         define is missing from this run. Under a wildcard `--engines` (the default is `*`) \
-         that silently shrinks the sweep and still exits 0, which truncates the peak QPS and \
-         the Pareto frontier that get published:\n",
-        skipped.len()
-    );
+/// Who is reporting the unloadable files, and therefore what the message should
+/// say about them. The three cases want genuinely different text: only one of
+/// them is refusing, only one of them is about to measure something, and only
+/// one of them has no run at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReport {
+    /// A run refusing to start. Explains the consequence and offers the opt-in.
+    Refusal,
+    /// A run proceeding under `--allow-partial-configs`. Same consequence, but
+    /// must not tell the user to pass a flag they already passed.
+    PartialRun,
+    /// `--describe`, which is listing the directory rather than measuring
+    /// anything. No sweep, no published number, and `--allow-partial-configs`
+    /// would be a no-op here, so neither is mentioned.
+    Listing,
+}
+
+/// The user-facing report for configuration files that could not be loaded.
+pub fn describe_skipped_config_files(skipped: &[SkippedConfigFile], report: SkipReport) -> String {
+    let mut msg = match report {
+        SkipReport::Listing => format!(
+            "{} engine configuration file(s) could not be loaded, so every configuration they \
+             define is MISSING from the listing below:\n",
+            skipped.len()
+        ),
+        SkipReport::Refusal | SkipReport::PartialRun => format!(
+            "{} engine configuration file(s) could not be loaded, so EVERY configuration they \
+             define is missing from this run. Under a wildcard `--engines` (the default is `*`) \
+             that silently shrinks the sweep and still exits 0, which truncates the peak QPS and \
+             the Pareto frontier that get published:\n",
+            skipped.len()
+        ),
+    };
     for s in skipped {
         msg.push_str(&format!("  {}\n    {}\n", s.path, s.error));
     }
-    if offer_opt_in {
-        msg.push_str(
+    match report {
+        SkipReport::Refusal => msg.push_str(
             "Fix the file(s), or pass --allow-partial-configs to run anyway (the run then \
              records `skipped_config_files` in every summary JSON it writes).",
-        );
+        ),
+        SkipReport::Listing => msg.push_str("Fix the file(s) to see their configurations here."),
+        SkipReport::PartialRun => {}
     }
     msg
 }
@@ -737,7 +767,10 @@ pub fn describe_datasets(verbose: bool) -> Result<(), String> {
 pub fn describe_engines(verbose: bool) -> Result<(), String> {
     let (configs, skipped) = read_engine_configs_reporting_skips(None)?;
     if !skipped.is_empty() {
-        eprintln!("{}", describe_skipped_config_files(&skipped, true));
+        eprintln!(
+            "{}",
+            describe_skipped_config_files(&skipped, SkipReport::Listing)
+        );
     }
     println!("Available engines ({}):", configs.len());
     for (name, config) in configs.iter() {
@@ -1352,7 +1385,7 @@ mod tests {
 
         // The refusal a run without --allow-partial-configs prints: names the
         // file, the parse error, and the opt-in flag.
-        let refusal = describe_skipped_config_files(&skipped, true);
+        let refusal = describe_skipped_config_files(&skipped, SkipReport::Refusal);
         assert!(refusal.contains("broken.json"), "{refusal}");
         assert!(refusal.contains("invalid type"), "{refusal}");
         assert!(
@@ -1360,12 +1393,27 @@ mod tests {
             "the refusal must name its escape hatch: {refusal}"
         );
         // ...and the notice printed when the flag WAS passed does not re-offer it.
-        let notice = describe_skipped_config_files(&skipped, false);
+        let notice = describe_skipped_config_files(&skipped, SkipReport::PartialRun);
         assert!(notice.contains("broken.json"), "{notice}");
         assert!(
             !notice.contains("--allow-partial-configs"),
             "do not tell the user to pass a flag they already passed: {notice}"
         );
+        // ...and `--describe`, where there is no run at all, must not talk about
+        // a sweep or a published frontier, and must not offer an opt-in that
+        // would be a no-op there.
+        let listing = describe_skipped_config_files(&skipped, SkipReport::Listing);
+        assert!(listing.contains("broken.json"), "{listing}");
+        assert!(
+            !listing.contains("--allow-partial-configs"),
+            "the flag is a no-op for --describe: {listing}"
+        );
+        for run_only in ["this run", "sweep", "Pareto", "published"] {
+            assert!(
+                !listing.contains(run_only),
+                "--describe has no run to describe, yet the message says {run_only:?}: {listing}"
+            );
+        }
     }
 
     /// `--engines-file` was already strict about a malformed file; keep it that
@@ -1519,20 +1567,110 @@ mod tests {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("datasets/datasets.json");
         assert!(path.is_file(), "datasets.json not found at {path:?}");
 
-        let configs = read_dataset_configs_from_file(&path)
-            .expect("every shipped dataset name must be unique");
+        // Not `.expect("... must be unique")`: this loader also rejects a file
+        // that does not PARSE, and labelling that failure "must be unique" sends
+        // the reader hunting for a duplicate that does not exist. Engines avoid
+        // this by having `every_shipped_engine_config_file_parses` next door;
+        // `every_shipped_dataset_file_parses` below is the dataset twin.
+        let configs = match read_dataset_configs_from_file(&path) {
+            Ok(c) => c,
+            Err(e) => panic!("datasets.json failed to load: {e}"),
+        };
 
         let declared: usize =
             serde_json::from_str::<Vec<DatasetConfig>>(&fs::read_to_string(&path).unwrap())
                 .unwrap()
                 .len();
+        // LIVE: catches an emptied or truncated registry.
         assert!(declared > 10, "suspiciously few datasets: {declared}");
+        // NOT live for duplicates any more — the loader hard-errors above before
+        // this can be reached, and a name collision is the only way these two
+        // could diverge. Kept as a cheap belt-and-braces invariant, but do not
+        // mistake it for the coverage; the `match` above is what guards #239.
         assert_eq!(
             configs.len(),
             declared,
             "shipped datasets shadow each other: {} declared, {} distinct names",
             declared,
             configs.len()
+        );
+    }
+
+    /// Dataset twin of `every_shipped_engine_config_file_parses`: a typo in
+    /// `datasets.json` makes EVERY dataset vanish, and `read_dataset_configs`
+    /// reports it as a parse failure — which the uniqueness guard above must not
+    /// be left to mislabel.
+    #[test]
+    fn every_shipped_dataset_file_parses() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("datasets/datasets.json");
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed = serde_json::from_str::<Vec<DatasetConfig>>(&content);
+        assert!(
+            parsed.is_ok(),
+            "{:?} does not parse — EVERY dataset would disappear from every run: {}",
+            path,
+            parsed.unwrap_err()
+        );
+    }
+
+    /// Derives the claim the loader's comment makes: on the shipped tree, one
+    /// unloadable file removes a large share of some engine's configurations, so
+    /// a wildcard sweep that tolerated it would publish a materially truncated
+    /// curve.
+    ///
+    /// Computed from the tree rather than written down, so it cannot go stale
+    /// the way a hard-coded "15 of 56" did.
+    #[test]
+    fn one_unloadable_file_removes_a_large_share_of_an_engines_sweep() {
+        let dir = shipped_configs_dir();
+        // engine -> total entries, and (file, engine) -> entries in that file.
+        let mut per_engine: HashMap<String, usize> = HashMap::new();
+        let mut per_file: HashMap<(String, String), usize> = HashMap::new();
+        for path in glob::glob(dir.join("*.json").to_str().unwrap())
+            .unwrap()
+            .flatten()
+        {
+            let content = fs::read_to_string(&path).unwrap();
+            let entries: Vec<EngineConfig> = serde_json::from_str(&content).unwrap();
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            for c in entries {
+                let engine = c.engine.unwrap_or_default();
+                *per_engine.entry(engine.clone()).or_default() += 1;
+                *per_file.entry((file.clone(), engine)).or_default() += 1;
+            }
+        }
+
+        // Restrict to engines whose configurations are SPLIT across more than one
+        // file. Without that, the measurement is trivial: an engine defined in a
+        // single file always scores 100%, which would make the assertion
+        // tautological (verified — it passed at a 99% threshold before this
+        // filter was added).
+        let mut files_per_engine: HashMap<&str, usize> = HashMap::new();
+        for (_, engine) in per_file.keys() {
+            *files_per_engine.entry(engine.as_str()).or_default() += 1;
+        }
+
+        let (worst, share, count, total) = per_file
+            .iter()
+            .filter(|((_, engine), _)| files_per_engine[engine.as_str()] > 1)
+            .map(|((file, engine), n)| {
+                (
+                    format!("{file} ({engine})"),
+                    *n as f64 / per_engine[engine] as f64,
+                    *n,
+                    per_engine[engine],
+                )
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("at least one engine is split across several files");
+
+        assert!(
+            share >= 0.5,
+            "even among engines split across several files, one file should own at least half \
+             of that engine's configurations — worst-case here is {worst} at {count}/{total} \
+             ({:.0}%). If this ever drops, the loader comment about a single typo truncating a \
+             sweep needs revisiting.",
+            share * 100.0
         );
     }
 }

@@ -120,7 +120,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             eprintln!(
                 "Warning: --allow-partial-configs was passed, so the run continues with an \
                  INCOMPLETE configuration set.\n{}",
-                config::describe_skipped_config_files(&skipped, false)
+                config::describe_skipped_config_files(&skipped, config::SkipReport::PartialRun)
             );
         }
         (configs, skipped)
