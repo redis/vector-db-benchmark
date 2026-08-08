@@ -146,6 +146,20 @@ impl SearchParams {
     /// engines read `search_params.ef` directly rather than `knob("ef")` (which
     /// would find a flat `ef` while ignoring the nested one that configures the
     /// run — hence the debug assertion below).
+    /// Canonicalise a search-knob NAME onto the field it actually sets.
+    ///
+    /// `calibration_param` names its knob by string. Every alias of the typed
+    /// `ef` field must collapse onto `"ef"`, otherwise the calibration loop
+    /// writes `search_params.extra["EF"]` — a key NO engine reads (they read
+    /// `search_params.ef`) — so the sweep tunes a knob that is never applied and
+    /// then reports the calibrated value as if it had been.
+    pub fn canonical_knob_name(name: &str) -> &str {
+        match name {
+            "ef" | "EF" => "ef",
+            other => other,
+        }
+    }
+
     pub fn knob(&self, key: &str) -> Option<&serde_json::Value> {
         debug_assert!(
             !matches!(
@@ -258,12 +272,33 @@ pub fn read_engine_configs(
         .map_err(|e| e.to_string())?
         .flatten()
     {
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(configs) = serde_json::from_str::<Vec<EngineConfig>>(&content) {
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Warning: skipping engine config {:?}: {}", path, e);
+                continue;
+            }
+        };
+        // NEVER swallow the parse error. serde rejects the WHOLE file on one bad
+        // entry, so a single typo deletes every engine defined in it and the run
+        // fails with a baffling "no engines match" — e.g. a typo anywhere in
+        // qdrant-on-disk.json removes all four of its configurations. The typed
+        // fields and aliases on this branch make that easy to trip:
+        //   hnsw_config: {"on_disk": "true"}          -> invalid type: string
+        //   {"search_params": {...}, "config": {...}} -> duplicate field
+        //   {"config": {"ef": 64, "EF": 512}}         -> duplicate field
+        //   {"config": 5}                             -> invalid type
+        match serde_json::from_str::<Vec<EngineConfig>>(&content) {
+            Ok(configs) => {
                 for config in configs {
                     all_configs.insert(config.name.clone(), config);
                 }
             }
+            Err(e) => eprintln!(
+                "Warning: engine config {:?} does not parse, so ALL of its entries were \
+                 skipped: {}",
+                path, e
+            ),
         }
     }
     Ok(all_configs)
@@ -576,6 +611,68 @@ mod tests {
         assert_eq!(
             nested_ef.search_params.as_ref().and_then(|sp| sp.ef),
             Some(64)
+        );
+    }
+
+    // `search_params` and `config` are the SAME field under an alias, so an entry
+    // carrying both is a serde duplicate-field error rather than one silently
+    // winning. Pin it: if serde ever tolerated it, the losing half would vanish.
+    #[test]
+    fn both_search_params_and_config_is_a_duplicate_field_error() {
+        let err = serde_json::from_value::<SearchParams>(
+            json!({"search_params": {"ef": 64}, "config": {"ef": 128}}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
+
+        // Same one level down: `ef` and its `EF` alias in one object.
+        let err = serde_json::from_value::<SearchParams>(json!({"config": {"ef": 64, "EF": 512}}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("duplicate field"),
+            "expected a duplicate-field error, got: {err}"
+        );
+    }
+
+    // `"config": null` parses fine and yields NO knobs — an untuned run that
+    // looks configured. Documented here so the behaviour is at least known.
+    #[test]
+    fn null_config_parses_to_no_search_params() {
+        let sp: SearchParams =
+            serde_json::from_value(json!({"parallel": 4, "config": null})).unwrap();
+        assert!(sp.search_params.is_none());
+    }
+
+    // Every shipped experiments/configurations/*.json MUST parse. Nothing else in
+    // the suite reads the real directory (integration tests all write their own
+    // temp config), so a typo — or a new typed field rejecting an existing value
+    // — would otherwise only surface at run time as "no engines match", with
+    // every entry in the offending file silently gone.
+    #[test]
+    fn every_shipped_engine_config_file_parses() {
+        let dir = project_root().join("experiments/configurations");
+        let pattern = dir.join("*.json");
+        let mut seen = 0usize;
+        for path in glob::glob(pattern.to_str().unwrap()).unwrap().flatten() {
+            let content = fs::read_to_string(&path).unwrap();
+            let parsed = serde_json::from_str::<Vec<EngineConfig>>(&content);
+            assert!(
+                parsed.is_ok(),
+                "{:?} does not parse — ALL of its engine entries would silently \
+                 disappear from every run: {}",
+                path,
+                parsed.unwrap_err()
+            );
+            seen += 1;
+        }
+        assert!(
+            seen > 10,
+            "expected the real config directory, found {seen} files"
         );
     }
 

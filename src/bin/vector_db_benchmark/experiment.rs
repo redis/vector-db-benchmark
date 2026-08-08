@@ -605,11 +605,15 @@ fn run_single_experiment(
                                         ef: None,
                                         extra: None,
                                     });
-                            if cal_param == "ef" {
+                            // "EF" is the SAME field as "ef" (serde alias), so it
+                            // must land on the typed field rather than in an
+                            // `extra` map no engine reads.
+                            let cal_key = SearchParams::canonical_knob_name(cal_param);
+                            if cal_key == "ef" {
                                 inner.ef = Some(value);
                             } else {
                                 let extras = inner.extra.get_or_insert_with(Default::default);
-                                extras.insert(cal_param.clone(), serde_json::json!(value));
+                                extras.insert(cal_key.to_string(), serde_json::json!(value));
                             }
                             Some(calibrated)
                         }
@@ -944,6 +948,9 @@ fn calibrate(
     target_precision: f64,
     num_queries: i64,
 ) -> Result<(i64, f64), String> {
+    // "EF" (upstream's redis spelling) is the same typed field as "ef"; without
+    // this the loop would sweep extra["EF"], which no engine reads.
+    let calibration_param = SearchParams::canonical_knob_name(calibration_param);
     let min_value = search_params.top.unwrap_or(10);
     let max_value: i64 = 1000;
 
