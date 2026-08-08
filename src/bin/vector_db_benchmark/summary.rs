@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde_json::json;
 
@@ -466,6 +467,32 @@ fn ratio_sort_key(key: &str) -> f64 {
     0.0
 }
 
+/// Experiments this run REFUSED to measure, and why (issue #238).
+///
+/// A `--skip-upload` run that finds a short corpus aborts that experiment. With
+/// `--exit-on-error false` a five-config sweep can lose four of them, exit 0, and
+/// write one summary — which then charts as a clean sweep with nothing saying the
+/// other four never ran. Same reasoning as `skipped_config_files` (#239): the
+/// stderr message has scrolled away by the time anyone reads the artifact, so the
+/// artifact has to say it itself.
+static REJECTED_EXPERIMENTS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+
+/// Record an experiment that was refused before it could be measured.
+pub fn record_rejected_experiment(engine: &str, dataset: &str, reason: &str) {
+    REJECTED_EXPERIMENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(json!({ "engine": engine, "dataset": dataset, "reason": reason }));
+}
+
+/// Every experiment this run refused, for stamping into the summary artifact.
+pub fn rejected_experiments() -> Vec<serde_json::Value> {
+    REJECTED_EXPERIMENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Save summary JSON matching Python v0 format.
 pub fn save_summary(
     engine_name: &str,
@@ -615,6 +642,11 @@ pub fn save_summary(
         // above: the stderr warning has long scrolled away by the time anyone
         // reads the artifact, so a truncated sweep has to say so itself (#239).
         "skipped_config_files": crate::config::skipped_config_files(),
+        // Experiments this run REFUSED to measure — currently the --skip-upload
+        // reuse precondition (#238). Without it a sweep that lost most of its
+        // configs to a missing corpus produces a summary and a chart that look
+        // exactly like a complete one.
+        "rejected_experiments": rejected_experiments(),
     });
 
     if let Some(upload) = upload_json {

@@ -15,7 +15,7 @@ use crate::config::{
     self, matches_pattern, project_root, read_dataset_configs, InnerSearchParams, SearchParams,
 };
 use crate::dataset::Dataset;
-use crate::engine::{create_engine, Engine, UpdateSearchRatio};
+use crate::engine::{create_engine, CorpusCount, Engine, UpdateSearchRatio};
 use crate::summary::{self, SearchEntry};
 
 /// Results directory
@@ -428,6 +428,11 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
         "host": args.host,
         "engines_file": args.engines_file,
         "allow_partial_configs": args.allow_partial_configs,
+        // #271: suppresses the short-corpus refusal, so a run that measured a
+        // partial corpus — and therefore a wrong recall under a config name that
+        // claims otherwise — is exactly the run whose artifact must say so.
+        // Caught by the guard below on the very first merge after it landed.
+        "allow_partial_corpus": args.allow_partial_corpus,
         "dump_raw_latencies": args.dump_raw_latencies,
         "exit_on_error": args.exit_on_error,
         "fail_on_dropped_queries": args.fail_on_dropped_queries,
@@ -461,6 +466,304 @@ fn parse_update_search_ratio(s: &str) -> Result<UpdateSearchRatio, String> {
     Ok(UpdateSearchRatio { updates, searches })
 }
 
+/// Outcome of the `--skip-upload` reuse precondition check, split out so it can
+/// be unit-tested without a server (issue #238).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReusePrecondition {
+    /// Server-side count matches what the dataset declares.
+    Ok {
+        actual: u64,
+        expected: u64,
+        approximate: bool,
+    },
+    /// Nothing to check against: the dataset's corpus size cannot be determined,
+    /// or no server-side count is implemented for this engine. Proceed with a note.
+    Unverifiable(String),
+    /// The server holds MORE rows than the dataset declares. Warn and continue:
+    /// leftovers from a bigger corpus change the reported recall, but so does
+    /// refusing to run, and unlike a short corpus this is often deliberate
+    /// (a shared prefix, a superset upload).
+    Surplus {
+        actual: u64,
+        expected: u64,
+        approximate: bool,
+    },
+    /// The server holds FEWER rows than the dataset declares — including zero,
+    /// i.e. a missing index/collection. Fatal when the count is exact: every
+    /// reported recall/precision figure is computed against ground truth for the
+    /// FULL corpus, so a short corpus silently publishes the wrong number.
+    /// `approximate` counts only ever warn — aborting on a number that is allowed
+    /// to be wrong trades one silent failure for a noisy one.
+    Short {
+        actual: u64,
+        expected: u64,
+        approximate: bool,
+    },
+}
+
+impl ReusePrecondition {
+    /// Short machine-readable tag for the results JSON.
+    fn status(&self) -> &'static str {
+        match self {
+            ReusePrecondition::Ok { .. } => "verified",
+            ReusePrecondition::Unverifiable(_) => "unverified",
+            ReusePrecondition::Surplus { .. } => "surplus",
+            ReusePrecondition::Short { .. } => "short",
+        }
+    }
+}
+
+/// Classify a server-side corpus count against what the dataset declares.
+pub fn classify_reuse_precondition(
+    expected: Option<u64>,
+    actual: Option<CorpusCount>,
+    engine_name: &str,
+) -> ReusePrecondition {
+    let Some(expected) = expected else {
+        return ReusePrecondition::Unverifiable(
+            "the dataset's corpus size could not be determined".to_string(),
+        );
+    };
+    let Some(actual) = actual else {
+        // Deliberately phrased as a gap in this tool, not a limitation of the
+        // database: Chroma, Milvus and Weaviate all expose a count, we simply
+        // have not wired one up yet.
+        return ReusePrecondition::Unverifiable(format!(
+            "no server-side row count is implemented here for the engine behind config \
+             '{engine_name}' yet"
+        ));
+    };
+    let (a, e, approximate) = (actual.rows, expected, actual.approximate);
+    if a < e {
+        ReusePrecondition::Short {
+            actual: a,
+            expected: e,
+            approximate,
+        }
+    } else if a > e {
+        ReusePrecondition::Surplus {
+            actual: a,
+            expected: e,
+            approximate,
+        }
+    } else {
+        ReusePrecondition::Ok {
+            actual: a,
+            expected: e,
+            approximate,
+        }
+    }
+}
+
+/// How many rows the reused corpus should hold, for the `--skip-upload` check.
+///
+/// Cost: this runs once per experiment and only on the `--skip-upload` path. For
+/// npy/hdf5 corpora it is a header read. For the two `jsonl` datasets in
+/// `datasets.json` it is a full-file line count that the search path did not
+/// previously perform — cheap at their size, but not free, and worth knowing
+/// before pointing `jsonl` at a very large corpus.
+///
+/// MEASURES the corpus on disk in preference to trusting `vector_count` in
+/// `datasets.json`. `corpus_completeness_target()` is deliberately not used here:
+/// it turns a declared-vs-measured DISAGREEMENT into an `Err`, and on this path an
+/// `Err` degrades to "cannot verify" — so an under-declared `vector_count`
+/// switched the guard off entirely, waving through exactly the half-empty corpus
+/// it exists to catch (a `Recall: 0.0000` run, exit 0). The measurement is the
+/// fact; a conflicting declaration is a `datasets.json` bug worth warning about,
+/// not a reason to stop checking.
+fn reuse_expected_rows(dataset: &Dataset) -> Result<Option<u64>, String> {
+    if let Some(measured) = dataset.measured_vector_count()? {
+        if let Some(declared) = dataset
+            .config
+            .vector_count
+            .filter(|&n| n > 0)
+            .map(|n| n as u64)
+        {
+            if declared != measured {
+                eprintln!(
+                    "WARNING: dataset '{}' declares vector_count {} but its corpus on disk holds \
+                     {}. The --skip-upload reuse check uses the MEASURED {}; fix vector_count in \
+                     datasets/datasets.json.",
+                    dataset.config.name, declared, measured, measured
+                );
+            }
+        }
+        return Ok(Some(measured));
+    }
+    // Layouts with no cheap row count (sparse CSR, h5-multi) fall back to the
+    // declared count, but only when their files are actually present.
+    dataset.corpus_completeness_target()
+}
+
+/// Verify the promise `--skip-upload` makes: that the corpus it is told to reuse
+/// is actually there, and whole (issue #238).
+///
+/// The check reads state back off the live server (`FT.INFO`, `GET
+/// /collections/<n>`, `_count`, `countDocuments`, `reltuples`, `VCARD`) — "search
+/// returned no error" is not evidence. Neither, in general, is recall: whether a
+/// truncated corpus shows up in recall depends entirely on which rows went. On
+/// `random-100` (9 queries, one ground-truth neighbour each, ids 0-8) deleting
+/// the UPPER half of the collection leaves `mean_recall: 1.0` and deleting the
+/// LOWER half gives `mean_recall: 0.0`. A metric that is a coin flip on the
+/// deletion pattern cannot be the guard.
+///
+/// Repo policy on what is fatal: a short corpus changes the reported number, so
+/// an exact count that comes up short is a hard error; everything softer warns.
+///
+/// Returns the verdict so it can be stamped into every result file this
+/// experiment writes.
+fn check_corpus_reuse_precondition(
+    engine: &mut dyn Engine,
+    dataset: &Dataset,
+    args: &Args,
+) -> Result<Option<serde_json::Value>, String> {
+    // Nothing is measured, so nothing can be misreported.
+    if args.skip_search {
+        return Ok(None);
+    }
+
+    let expected = match reuse_expected_rows(dataset) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "\tNote: could not determine the dataset's corpus size ({e}); \
+                 --skip-upload reuse left unverified"
+            );
+            None
+        }
+    };
+
+    let actual = match engine.corpus_row_count() {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!(
+                "--skip-upload: could not read the server-side corpus size for config '{}' ({}). \
+                 This is a PROBE failure, not a verdict on the corpus — the data may well be \
+                 intact. The flag promises to reuse an already-loaded corpus and that promise is \
+                 now unverified. Fix the connection or the privilege, or pass \
+                 --allow-partial-corpus to run anyway.",
+                engine.name(),
+                e
+            );
+            if args.allow_partial_corpus {
+                eprintln!("WARNING: {msg}");
+                return Ok(Some(json!({
+                    "status": "probe_failed",
+                    "detail": e,
+                    "waived_by_allow_partial_corpus": true,
+                })));
+            }
+            return Err(msg);
+        }
+    };
+
+    let verdict = classify_reuse_precondition(expected, actual, engine.name());
+    let approx_note = |approximate: bool| if approximate { "≈" } else { "" };
+    let record = |waived: bool| {
+        json!({
+            "status": verdict.status(),
+            "expected_rows": expected,
+            "actual_rows": actual.map(|c| c.rows),
+            "actual_is_estimate": actual.map(|c| c.approximate).unwrap_or(false),
+            "waived_by_allow_partial_corpus": waived,
+        })
+    };
+
+    match &verdict {
+        ReusePrecondition::Ok {
+            actual,
+            expected,
+            approximate,
+        } => {
+            println!(
+                "Experiment stage: Reuse check — server holds {}{} of {} expected rows",
+                approx_note(*approximate),
+                actual,
+                expected
+            );
+            Ok(Some(record(false)))
+        }
+        ReusePrecondition::Unverifiable(why) => {
+            println!(
+                "Experiment stage: Reuse check — SKIPPED ({why}); \
+                 --skip-upload is running against an unverified corpus"
+            );
+            Ok(Some(record(false)))
+        }
+        ReusePrecondition::Surplus {
+            actual,
+            expected,
+            approximate,
+        } => {
+            eprintln!(
+                "WARNING: --skip-upload: config '{}' holds {}{} rows but dataset '{}' declares {} \
+                 — the extra rows are searchable and can displace true neighbours, so recall may \
+                 be understated.",
+                engine.name(),
+                approx_note(*approximate),
+                actual,
+                dataset.config.name,
+                expected
+            );
+            Ok(Some(record(false)))
+        }
+        ReusePrecondition::Short {
+            actual,
+            expected,
+            approximate,
+        } => {
+            let what = if *actual == 0 {
+                "is empty or missing"
+            } else {
+                "is incomplete"
+            };
+            let msg = format!(
+                "--skip-upload: the corpus you asked to reuse {what} — config '{}' holds {}{} of \
+                 the {} rows dataset '{}' declares. Recall/precision are scored against ground \
+                 truth for the FULL corpus, so continuing would publish a wrong number under a \
+                 config name that claims otherwise. Re-upload this config (drop --skip-upload, \
+                 add --keep-data). On a sweep, add --exit-on-error false so the configs whose \
+                 corpus IS intact still publish their (correct) numbers while this one is \
+                 skipped. --allow-partial-corpus measures the partial corpus deliberately — it \
+                 publishes exactly the number this check exists to suppress, so reach for it \
+                 last.",
+                engine.name(),
+                approx_note(*approximate),
+                actual,
+                expected,
+                dataset.config.name
+            );
+            // An ESTIMATE may not abort a run: pgvector's count is a planner
+            // figure, and a false hard error would be its own silent-wrong-result.
+            if *approximate {
+                eprintln!(
+                    "WARNING: {msg}\n\t(the count above is an ESTIMATE, so this is a warning, \
+                     not a rejection — verify it before quoting the run)"
+                );
+                return Ok(Some(record(false)));
+            }
+            if args.allow_partial_corpus {
+                eprintln!("WARNING: {msg}");
+                return Ok(Some(record(true)));
+            }
+            crate::summary::record_rejected_experiment(engine.name(), &dataset.config.name, &msg);
+            Err(msg)
+        }
+    }
+}
+
+/// Why a run is not tearing its corpus down, for the "Keep data" line.
+///
+/// `--skip-upload` gets its own wording because it is not a user preference but
+/// an invariant (#238): a run that did not upload the corpus never deletes it.
+fn keep_data_reason(args: &Args) -> &'static str {
+    if args.skip_upload {
+        "--skip-upload did not create this corpus, so it does not delete it"
+    } else {
+        "cleanup skipped"
+    }
+}
+
 /// Run a single experiment (configure, upload, search)
 fn run_single_experiment(
     engine: &mut dyn Engine,
@@ -477,7 +780,16 @@ fn run_single_experiment(
     // copy doesn't accumulate and OOM the server (#184). Without the flag,
     // `--keep-data` keeps every config's data (the default coexistence behaviour,
     // needed for --skip-upload reuse). A single-config run is always the last.
-    let keep_data = args.keep_data && (is_last_config || !args.reset_between_configs);
+    //
+    // `--skip-upload` overrides all of that (#238). `configure()` is not the only
+    // destructive call in an experiment: cleanup runs `engine.delete()`, and
+    // `--keep-data` defaults to FALSE — so the plainest form of the flag
+    // (`--skip-upload` alone) used to reuse a corpus, benchmark it, and then
+    // delete it. Measured: qdrant 400 points -> collection MISSING, vectorsets
+    // `VCARD idx` 400 -> 0, redis `DBSIZE` 400 -> 0, all exit 0. A run that did
+    // not create the corpus must not tear it down, whatever `--keep-data` says.
+    let keep_data =
+        args.skip_upload || (args.keep_data && (is_last_config || !args.reset_between_configs));
 
     // Skip an incompatible (engine, dataset) pair BEFORE `get_path()`, which would
     // otherwise download the archive — hundreds of MB for the msmarco-sparse sets
@@ -513,6 +825,7 @@ fn run_single_experiment(
     let server_metadata_before = engine.server_metadata();
 
     // Configure phase
+    let mut corpus_reuse: Option<serde_json::Value> = None;
     if !args.skip_upload {
         println!("Experiment stage: Configure");
         engine.configure(dataset)?;
@@ -531,11 +844,29 @@ fn run_single_experiment(
             &upload_stats,
             number_of_shards,
         )?;
-    } else if args.skip_vector_index {
-        // --skip-upload + --skip-vector-index: data already uploaded, but we need
-        // a schema-only index (previous run's index was dropped by delete()).
-        println!("Experiment stage: Configure (creating schema-only index for filter-only search)");
-        engine.configure(dataset)?;
+    } else {
+        // `--skip-upload` means: the server already holds the corpus I want —
+        // do not create, drop, recreate or otherwise modify it. `configure()` is
+        // destructive on 14 of the 15 engines (FT.DROPINDEX ... DD, SCAN+UNLINK,
+        // collection.drop(), DROP TABLE, DELETE /collections/<n>, indices.delete,
+        // DEL idx — only Vertex is not), so it must NOT run here under any flag
+        // combination.
+        //
+        // This used to have an `else if args.skip_vector_index` arm that called
+        // `configure()` "to create a schema-only index". It destroyed the corpus
+        // the flags had just promised to reuse and then measured the empty index
+        // without a word (issue #238) — verified live: Redis 400 -> 0 docs,
+        // Valkey 400 -> 0 keys, MongoDB 400 -> 0 documents, each still printing a
+        // QPS number and exiting 0. The arm is also unnecessary: the prior
+        // `--skip-vector-index --keep-data` upload runs under the SAME rewritten
+        // config name (`<engine>-no-vector`), so it left exactly the schema-only
+        // index this run needs.
+        //
+        // A related shape survives the fix and the guard below is what catches
+        // it: if phase 1 was a NORMAL upload, phase 2 does not destroy anything —
+        // it publishes a QPS number from an empty `<engine>-no-vector` index while
+        // the real corpus sits untouched under the original config name.
+        corpus_reuse = check_corpus_reuse_precondition(engine, dataset, args)?;
     }
 
     // Build ordered search phases: pure search first, then mixed ratios ascending
@@ -638,7 +969,7 @@ fn run_single_experiment(
                     dataset.config.name
                 );
                 if keep_data {
-                    println!("Experiment stage: Keep data (cleanup skipped)");
+                    println!("Experiment stage: Keep data ({})", keep_data_reason(args));
                 } else {
                     if args.keep_data {
                         println!(
@@ -1072,6 +1403,7 @@ fn run_single_experiment(
             number_of_shards,
             ground_truth.as_ref(),
             calibration.as_ref(),
+            corpus_reuse.as_ref(),
         )?;
     }
 
@@ -1164,7 +1496,7 @@ fn run_single_experiment(
     // multi-config sweep `--keep-data` keeps only the LAST config's data; earlier
     // configs tear down here so their corpus copy doesn't accumulate (#184).
     if keep_data {
-        println!("Experiment stage: Keep data (cleanup skipped)");
+        println!("Experiment stage: Keep data ({})", keep_data_reason(args));
     } else {
         if args.keep_data {
             println!(
@@ -1467,6 +1799,7 @@ fn save_search_results(
     number_of_shards: Option<&serde_json::Value>,
     ground_truth: Option<&crate::ground_truth::GroundTruthProfile>,
     calibration: Option<&serde_json::Value>,
+    corpus_reuse: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let pid = std::process::id();
@@ -1491,6 +1824,7 @@ fn save_search_results(
         number_of_shards,
         ground_truth,
         calibration,
+        corpus_reuse,
         // Snapshotted here rather than inside the builder so the builder stays a
         // pure function of its arguments and its tests do not race the
         // process-wide recorder.
@@ -1525,6 +1859,7 @@ fn build_search_result_json(
     number_of_shards: Option<&serde_json::Value>,
     ground_truth: Option<&crate::ground_truth::GroundTruthProfile>,
     calibration: Option<&serde_json::Value>,
+    corpus_reuse: Option<&serde_json::Value>,
     engine_params: &serde_json::Value,
 ) -> serde_json::Value {
     let mut result = json!({
@@ -1612,6 +1947,14 @@ fn build_search_result_json(
     // without reaching its target is not a calibration.
     if let Some(cal) = calibration {
         result["params"]["calibration"] = cal.clone();
+    }
+
+    // Whether this run's corpus was the one it claims to have measured (#238).
+    // A verified run, an unverified-note run and an --allow-partial-corpus run
+    // over a half-deleted corpus used to produce structurally identical
+    // artifacts; the verdict travels with the numbers so it cannot be lost.
+    if let Some(reuse) = corpus_reuse {
+        result["params"]["corpus_reuse"] = reuse.clone();
     }
 
     // Shard count the index was built with. Recall and QPS both move with it, so
@@ -1998,6 +2341,7 @@ mod tests {
                 None,
                 Some(&gt),
                 None,
+                None,
                 &serde_json::json!({}),
             );
 
@@ -2053,6 +2397,7 @@ mod tests {
                 None,
                 None,
                 Some(&outcome.to_json()),
+                None,
                 &serde_json::json!({}),
             );
             let cal = &doc["params"]["calibration"];
@@ -2099,6 +2444,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -2410,5 +2756,125 @@ mod tests {
             assert_eq!(d["params"]["parallel"], 8);
             assert_eq!(d["params"]["top"], 10);
         }
+    }
+}
+
+#[cfg(test)]
+mod reuse_precondition_tests {
+    use super::{classify_reuse_precondition, ReusePrecondition};
+    use crate::engine::CorpusCount;
+
+    // A corpus shorter than the dataset declares is the case that publishes a
+    // wrong recall under a config name claiming otherwise (issue #238).
+    #[test]
+    fn short_corpus_is_short() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(CorpusCount::exact(200)), "redis-x"),
+            ReusePrecondition::Short {
+                actual: 200,
+                expected: 400,
+                approximate: false
+            }
+        );
+    }
+
+    // A missing index/collection reports 0 rows. Same verdict as a truncated
+    // one: the corpus the flags promised to reuse is not there.
+    #[test]
+    fn missing_corpus_is_short_not_ok() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(CorpusCount::exact(0)), "redis-x"),
+            ReusePrecondition::Short {
+                actual: 0,
+                expected: 400,
+                approximate: false
+            }
+        );
+    }
+
+    #[test]
+    fn exact_match_is_ok() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(CorpusCount::exact(400)), "redis-x"),
+            ReusePrecondition::Ok {
+                actual: 400,
+                expected: 400,
+                approximate: false
+            }
+        );
+    }
+
+    // Extra rows affect the number too, but unlike a shortfall they are often
+    // deliberate (a shared prefix, a superset upload) — warn, do not abort.
+    #[test]
+    fn surplus_is_classified_as_surplus() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(CorpusCount::exact(401)), "redis-x"),
+            ReusePrecondition::Surplus {
+                actual: 401,
+                expected: 400,
+                approximate: false
+            }
+        );
+    }
+
+    // An ESTIMATE carries through to the verdict, which is what lets the handler
+    // downgrade a short estimate to a warning instead of aborting on a number
+    // that is allowed to be wrong.
+    #[test]
+    fn approximate_flag_survives_classification() {
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(CorpusCount::estimated(200)), "pg-x"),
+            ReusePrecondition::Short {
+                actual: 200,
+                expected: 400,
+                approximate: true
+            }
+        );
+        assert_eq!(
+            classify_reuse_precondition(Some(400), Some(CorpusCount::estimated(400)), "pg-x"),
+            ReusePrecondition::Ok {
+                actual: 400,
+                expected: 400,
+                approximate: true
+            }
+        );
+    }
+
+    // Nothing to compare against must never be silently reported as "Ok" — the
+    // runner has to say the reuse went unverified.
+    #[test]
+    fn unknown_expected_or_actual_is_unverifiable() {
+        assert!(matches!(
+            classify_reuse_precondition(None, Some(CorpusCount::exact(400)), "redis-x"),
+            ReusePrecondition::Unverifiable(_)
+        ));
+        let why = match classify_reuse_precondition(Some(400), None, "chroma-y") {
+            ReusePrecondition::Unverifiable(w) => w,
+            other => panic!("expected Unverifiable, got {other:?}"),
+        };
+        assert!(
+            why.contains("chroma-y"),
+            "the note must name the config it could not count: {why}"
+        );
+        // The wording must blame this tool, not the database: Chroma, Milvus and
+        // Weaviate all expose a count, we simply have not wired one up.
+        assert!(
+            why.contains("implemented"),
+            "the note must read as a gap in this tool, not a database limitation: {why}"
+        );
+    }
+
+    // Zero expected rows cannot make a zero-row server look short.
+    #[test]
+    fn zero_expected_never_fires() {
+        assert_eq!(
+            classify_reuse_precondition(Some(0), Some(CorpusCount::exact(0)), "redis-x"),
+            ReusePrecondition::Ok {
+                actual: 0,
+                expected: 0,
+                approximate: false
+            }
+        );
     }
 }

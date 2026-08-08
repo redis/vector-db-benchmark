@@ -275,7 +275,9 @@ Options:
     --host <HOST>              Redis/engine host [default: localhost]
     --parallels <N,N,...>      Filter by parallel thread counts
     --ef-runtime <N,N,...>     Filter by ef runtime values
-    --skip-upload              Skip the upload phase
+    --skip-upload              Reuse the corpus already on the server (no configure,
+                               no upload); verified against the live server first
+    --allow-partial-corpus     Downgrade that verification from a hard error to a warning
     --skip-search              Skip the search phase
     --skip-if-exists           Skip if results already exist
     --exit-on-error            Stop on first error
@@ -286,6 +288,92 @@ Options:
     --plot <OUTPUT.svg>        Render a QPS-vs-precision trade-off chart from results/
     -h, --help                 Print help
 ```
+
+### `--skip-upload`: reuse means reuse (issue #238)
+
+`--skip-upload` asserts *"the server already holds the corpus I want"*. Three
+rules follow, and all three are enforced:
+
+1. **The configure phase never runs.** `configure()` is destructive on **14 of the
+   15 engines** — `FT.DROPINDEX … DD` (Redis), `FT.DROPINDEX` + `SCAN`/`UNLINK`
+   (Valkey / Dragonfly / KiviDB), `collection.drop()` (MongoDB), `DROP TABLE`
+   (pgvector), `DELETE /collections/<n>` (Qdrant / Chroma / Weaviate / Milvus /
+   Turbopuffer), `indices.delete` (Elasticsearch / OpenSearch), `DEL idx`
+   (VectorSets). Only Vertex is non-destructive. Until #238 the
+   `--skip-upload --skip-vector-index` combination still called it: the flags that
+   mean *"do not upload, do not build an index, just use what is there"* deleted
+   the corpus and then benchmarked the empty index — printing a QPS number and
+   exiting 0.
+2. **The cleanup phase never runs either.** `--keep-data` defaults to **false**,
+   so `--skip-upload` on its own used to reuse a corpus, measure it, and then
+   `engine.delete()` it. A run that did not create the corpus does not delete it,
+   whatever `--keep-data` says.
+3. **The corpus is verified before anything is measured.** The runner reads the
+   row count back off the live server (`FT.INFO num_docs` / `hnsw_live_count`,
+   `GET /collections/<n>` → `points_count`, `_count`, `countDocuments`,
+   `reltuples`, `VCARD`) and compares it with the corpus **measured on disk**:
+   - **fewer rows than the dataset holds — including zero, i.e. a missing index —
+     is a hard error.** Recall/precision are scored against ground truth for the
+     FULL corpus, so a short corpus publishes a wrong number under a config name
+     that claims otherwise.
+   - more rows → warning (often deliberate: a shared prefix, a superset upload).
+   - an **estimate** that comes up short → warning only. pgvector's count is a
+     planner figure (see below); aborting a run on a number that is allowed to be
+     wrong just trades one silent failure for a noisy one.
+   - a **probe failure** (unreachable server, `NOPERM`, missing `SELECT`, a closed
+     ES index, a shard that did not answer) → a hard error that says *probe
+     failure*. It is never reported as "the corpus is empty": that names the wrong
+     problem and invites a re-upload over a corpus that was fine.
+   - no count implemented for the engine → a printed note that the reuse went
+     unverified. Implemented for Redis, Valkey, Dragonfly, KiviDB, VectorSets,
+     Qdrant, Elasticsearch, OpenSearch, pgvector and MongoDB. Chroma, Milvus and
+     Weaviate all expose a count we have simply not wired up yet; Turbopuffer and
+     Vertex are the only genuinely uncountable ones.
+
+   **On a sweep, the right remedy for a rejected config is `--exit-on-error false`**
+   (`--exit-on-error` defaults to true, so one stale config otherwise kills the
+   whole run and the *correct* measurements from the other configs are lost too).
+   `--allow-partial-corpus` downgrades the rejection to a warning and measures the
+   partial corpus — it publishes exactly the number the check exists to suppress,
+   so reach for it last, and only deliberately.
+
+The verdict is recorded in every result file it applies to, under
+`params.corpus_reuse` (`status`, `expected_rows`, `actual_rows`,
+`actual_is_estimate`, `waived_by_allow_partial_corpus`), and a rejected
+experiment is listed in the summary under `rejected_experiments` — otherwise a
+sweep that lost most of its configs produces a summary and a chart
+indistinguishable from a complete one.
+
+**What the check cannot do: cardinality is not identity.** Only the four
+Redis-wire engines address a per-config index and keyspace (#151-4). MongoDB,
+pgvector, Elasticsearch/OpenSearch, Qdrant, Milvus and VectorSets each have ONE
+corpus object per server, shared by every config *and every dataset* — so a
+full-size corpus uploaded by a sibling config, or by a different dataset, passes.
+The count proves the corpus is the right SIZE, never that it is the right corpus.
+
+**pgvector's count is an estimate on purpose.** The engine never `VACUUM`s and
+forces `STORAGE PLAIN`, so `SELECT count(*) FROM items` plans a Seq Scan over the
+whole heap *immediately before the search phase*, silently turning a cold-cache
+run warm and changing the published number. Measured on a cold 1M-row / 768-dim
+table built like this engine's (3906 MB, 500000 relpages):
+
+| | heap blocks touched | cache primed | cold wall clock |
+|---|---|---|---|
+| `SELECT count(*)` | 500,000 | 3906 MB | 1.58 s |
+| `ANALYZE items` | 30,001 | 234 MB | 0.84 s |
+
+The point is not the 16.7x ratio but that ANALYZE's sample is capped at
+`300 * default_statistics_target` = 30,000 rows **regardless of table size**, so
+its footprint is bounded while `count(*)` grows linearly — at 1536 dims (~7.8 GB)
+`count(*)` primes all of it and ANALYZE still touches ~30,000 blocks. Bounded is
+not free (~6% of this heap), so the perturbation is capped, not eliminated. The
+check uses `ANALYZE` + `reltuples` and can therefore only warn, never abort.
+
+Two-phase workflows are unchanged, and now provably non-destructive: upload with
+`--keep-data`, then re-run with `--skip-upload --skip-if-exists false`. A
+filter-only two-phase run must pass `--skip-vector-index` in **both** phases —
+the flag renames the config to `<engine>-no-vector`, so phase 1 writes exactly the
+schema-only index phase 2 reuses.
 
 ### Per-config index isolation (Redis / Valkey / Dragonfly / KiviDB)
 
@@ -332,11 +420,12 @@ VSIM coerces a non-numeric attribute to `0` in a numeric comparison — so a
 (a two-sided range matches nothing → recall 0; a one-sided `lt`/`lte` matches
 everything). **Re-upload before searching.**
 
-Unlike Redis/Valkey — where `--skip-upload` against a missing or mismatched index
-hard-errors (`redis_utils::ensure_index_exists`) — VectorSets has **no such
-guard**: it uses a single hardcoded key (`idx`), so there is not even a name
-change for the tool to detect. The stale corpus is found, the run succeeds, and
-only the recall number is wrong.
+`--skip-upload` does check that the corpus is **present and complete** on
+VectorSets too (`VCARD idx`, see above), but it cannot check that the corpus is
+*current*: a pre-#230 corpus is the right size and the wrong encoding. And because
+the engine uses a single hardcoded key (`idx`, issue #236), there is not even a
+name change for the tool to detect. A stale corpus of the right size is found, the
+run succeeds, and only the recall number is wrong.
 
 ### Charts
 

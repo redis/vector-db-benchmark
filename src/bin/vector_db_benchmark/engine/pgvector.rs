@@ -13,7 +13,7 @@ use postgres::types::ToSql;
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
-use crate::engine::{Engine, SearchResults, UploadStats};
+use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{
     is_multivalued_keyword_field, MetadataItem, MetadataValue,
@@ -225,6 +225,62 @@ impl PgVectorEngine {
 }
 
 impl Engine for PgVectorEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238), as an **estimate**.
+    ///
+    /// It is deliberately not `SELECT count(*) FROM items`. This engine never
+    /// VACUUMs and forces `STORAGE PLAIN`, so an exact count plans a Seq Scan
+    /// over the whole heap, pulling the entire corpus into shared buffers and the
+    /// OS page cache **immediately before the search phase** — silently turning a
+    /// cold-cache run warm and changing the published number, a worse failure
+    /// than the one this guard prevents.
+    ///
+    /// Measured on a cold 1M-row / 768-dim table built exactly like this engine's
+    /// (3906 MB, 500000 relpages, never VACUUMed, `STORAGE PLAIN`):
+    ///
+    /// ```text
+    ///                      heap blocks touched   cache primed   cold wall clock
+    ///   SELECT count(*)          500 000           3906 MB          1.58 s
+    ///   ANALYZE items             30 001            234 MB          0.84 s
+    /// ```
+    ///
+    /// `EXPLAIN (ANALYZE, BUFFERS)` confirms the plan: `Parallel Seq Scan on
+    /// items … Buffers: shared hit=96 read=499904`.
+    ///
+    /// The decisive property is not the 16.7x ratio but that ANALYZE's sample is
+    /// capped at `300 * default_statistics_target` = 30 000 rows **regardless of
+    /// table size**, so its footprint is BOUNDED while `count(*)` grows linearly:
+    /// at 1536 dims (~7.8 GB) `count(*)` primes the whole 7.8 GB and ANALYZE
+    /// still touches ~30 000 blocks. It is bounded, not free — ~234 MB, ~6% of
+    /// this heap — so the perturbation is capped rather than eliminated.
+    ///
+    /// Being approximate, the result can only ever warn — never abort a run.
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
+        let mut conn = self.connect()?;
+        // A missing table is "nothing to reuse", not a probe failure.
+        let exists: bool = conn
+            .query_one("SELECT to_regclass('public.items') IS NOT NULL", &[])
+            .map_err(|e| format!("probing for the items table failed: {e}"))?
+            .get(0);
+        if !exists {
+            return Ok(Some(CorpusCount::exact(0)));
+        }
+        conn.execute("ANALYZE items", &[])
+            .map_err(|e| format!("ANALYZE items failed: {e}"))?;
+        let reltuples: f32 = conn
+            .query_one(
+                "SELECT reltuples FROM pg_class WHERE oid = 'public.items'::regclass",
+                &[],
+            )
+            .map_err(|e| format!("reading reltuples for items failed: {e}"))?
+            .get(0);
+        // -1 is "never analyzed"; treat it as "cannot tell" rather than as zero.
+        if reltuples < 0.0 {
+            return Ok(None);
+        }
+        Ok(Some(CorpusCount::estimated(reltuples as u64)))
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -460,6 +516,18 @@ impl Engine for PgVectorEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // Re-derive the distance operator here as well as in configure(): on the
+        // `--skip-upload` path configure() never runs (#238), and `distance_op`
+        // would still be its `new()` default of "" — which splices into the query
+        // as `embedding  $1` and fails EVERY search with a bare SQL syntax error
+        // after a green reuse check. It is a pure function of the dataset, so
+        // recomputing is idempotent; it also restores the unsupported-metric hard
+        // error that the skip-upload path otherwise loses.
+        let (distance_op, hnsw_ops_class) =
+            map_pg_distance_ops(&dataset.distance().to_lowercase())?;
+        self.distance_op = distance_op.to_string();
+        self.hnsw_ops_class = hnsw_ops_class.to_string();
+
         let parallel = params.parallel.unwrap_or(1) as usize;
 
         // Extract hnsw_ef from search params: the typed `ef` field first, then

@@ -1441,6 +1441,12 @@ impl Engine for MilvusEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        // Re-derive the metric type here as well as in configure(): on the
+        // `--skip-upload` path configure() never runs (#238) and this field would
+        // still be the `new()` default of "" — an empty metric_type in the search
+        // body. Pure function of the dataset, so recomputing is idempotent.
+        self.metric_type = map_milvus_metric_type(&dataset.distance().to_lowercase())?.to_string();
+
         let parallel = params.parallel.unwrap_or(1) as usize;
 
         // Extract ef from search params. The typed `ef` field first, then the
