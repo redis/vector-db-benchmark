@@ -17,7 +17,7 @@ use turbopuffer_client::Client;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
-use crate::query_filter::QueryFilter;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
 /// One upload batch: ids, their vectors, and optional per-item metadata.

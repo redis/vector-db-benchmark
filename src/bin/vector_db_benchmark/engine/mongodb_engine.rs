@@ -17,7 +17,7 @@ use rand::{seq::SliceRandom, SeedableRng};
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
-use crate::query_filter::QueryFilter;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
 const DEFAULT_DB: &str = "bench";

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use crate::config::{datasets_dir, DatasetConfig};
 use crate::download;
-use crate::query_filter::QueryConditions;
+use vector_db_benchmark::query_filter::QueryConditions;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
     hdf5_train_row_count, npy_row_count, read_compound_data, read_compound_queries,
@@ -387,12 +387,16 @@ impl Dataset {
             "tar" => {
                 // Compound format: tests.jsonl includes conditions
                 let (queries, neighbors, conditions) = read_compound_queries(path_str, normalize)?;
-                Ok((queries, neighbors, QueryConditions::new(conditions)))
+                Ok((
+                    queries,
+                    neighbors,
+                    conditions.from_dataset(&self.config.name),
+                ))
             }
             "hdf5" | "h5" => {
                 // Explicit HDF5 type — trust it regardless of file extension
                 let (queries, neighbors) = self.read_hdf5_queries(path_str)?;
-                let conditions = QueryConditions::new(vec![None; queries.len()]);
+                let conditions = QueryConditions::unfiltered(queries.len());
                 Ok((queries, neighbors, conditions))
             }
             "jsonl" => {
@@ -407,13 +411,13 @@ impl Dataset {
                     dir.to_str().ok_or("Invalid dir path encoding")?,
                     normalize,
                 )?;
-                let conditions = QueryConditions::new(vec![None; queries.len()]);
+                let conditions = QueryConditions::unfiltered(queries.len());
                 Ok((queries, neighbors, conditions))
             }
             _ => {
                 if path_str.ends_with(".hdf5") || path_str.ends_with(".h5") {
                     let (queries, neighbors) = self.read_hdf5_queries(path_str)?;
-                    let conditions = QueryConditions::new(vec![None; queries.len()]);
+                    let conditions = QueryConditions::unfiltered(queries.len());
                     Ok((queries, neighbors, conditions))
                 } else if path.is_dir() {
                     let tests_path = path.join("tests.jsonl");
@@ -421,10 +425,14 @@ impl Dataset {
                     if tests_path.exists() {
                         let (queries, neighbors, conditions) =
                             read_compound_queries(path_str, normalize)?;
-                        Ok((queries, neighbors, QueryConditions::new(conditions)))
+                        Ok((
+                            queries,
+                            neighbors,
+                            conditions.from_dataset(&self.config.name),
+                        ))
                     } else if queries_path.exists() {
                         let (queries, neighbors) = read_jsonl_queries(path_str, normalize)?;
-                        let conditions = QueryConditions::new(vec![None; queries.len()]);
+                        let conditions = QueryConditions::unfiltered(queries.len());
                         Ok((queries, neighbors, conditions))
                     } else {
                         Err(format!("No query files found in directory: {}", path_str))

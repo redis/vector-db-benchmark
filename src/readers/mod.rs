@@ -459,7 +459,8 @@ mod tests {
         .unwrap();
 
         let (queries, neighbors, _conditions) =
-            read_compound_queries(dir.path().to_str().unwrap(), false).unwrap();
+            compound_reader::read_compound_queries_raw(dir.path().to_str().unwrap(), false)
+                .unwrap();
 
         assert_eq!(queries.len(), 2);
         assert_eq!(neighbors.len(), 2);
@@ -487,7 +488,11 @@ mod tests {
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0], vec![1.0f32, 0.0]);
         assert_eq!(neighbors[0], vec![5i64]);
-        assert!(conditions[0].is_some(), "conditions should be parsed");
+        assert_eq!(
+            conditions.declared_count(),
+            1,
+            "the row declares a filter, so it must survive the guarded reader"
+        );
     }
 
     #[test]
@@ -497,7 +502,8 @@ mod tests {
         let mut f = std::fs::File::create(dir.path().join("tests.jsonl")).unwrap();
         writeln!(f, r#"{{"query": [3.0, 4.0], "closest_ids": [0]}}"#).unwrap();
 
-        let (queries, _, _) = read_compound_queries(dir.path().to_str().unwrap(), true).unwrap();
+        let (queries, _, _) =
+            compound_reader::read_compound_queries_raw(dir.path().to_str().unwrap(), true).unwrap();
 
         let norm: f32 = queries[0].iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
@@ -512,7 +518,8 @@ mod tests {
         writeln!(f, r#"{{"query": [1.0, 2.0]}}"#).unwrap();
 
         let (queries, neighbors, _conditions) =
-            read_compound_queries(dir.path().to_str().unwrap(), false).unwrap();
+            compound_reader::read_compound_queries_raw(dir.path().to_str().unwrap(), false)
+                .unwrap();
 
         assert_eq!(queries.len(), 1);
         assert!(neighbors[0].is_empty());
@@ -528,7 +535,8 @@ mod tests {
         writeln!(f, r#"{{"query": [2.0], "closest_ids": [1]}}"#).unwrap();
 
         let (queries, neighbors, _conditions) =
-            read_compound_queries(dir.path().to_str().unwrap(), false).unwrap();
+            compound_reader::read_compound_queries_raw(dir.path().to_str().unwrap(), false)
+                .unwrap();
 
         assert_eq!(queries.len(), 2);
         assert_eq!(neighbors.len(), 2);
@@ -538,7 +546,8 @@ mod tests {
     fn test_compound_queries_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         // No tests.jsonl created
-        let result = read_compound_queries(dir.path().to_str().unwrap(), false);
+        let result =
+            compound_reader::read_compound_queries_raw(dir.path().to_str().unwrap(), false);
         assert!(result.is_err());
     }
 
@@ -640,7 +649,7 @@ mod tests {
         }
 
         let (queries, neighbors, _conditions) =
-            read_compound_queries(path.to_str().unwrap(), false).unwrap();
+            compound_reader::read_compound_queries_raw(path.to_str().unwrap(), false).unwrap();
 
         assert!(
             !queries.is_empty(),

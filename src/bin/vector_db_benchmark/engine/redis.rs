@@ -23,8 +23,8 @@ use crate::engine::{
     SearchResults, UpdateSearchRatio, UploadStats,
 };
 use crate::metrics::compute_metrics;
-use crate::query_filter::QueryFilter;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, parse_ft_search_response};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 
 /// Redis engine configuration

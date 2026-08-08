@@ -28,7 +28,7 @@ use qdrant_client::{Payload, Qdrant};
 use crate::config::{EngineConfig, HnswConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
-use crate::query_filter::QueryFilter;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
 const DEFAULT_COLLECTION: &str = "benchmark";
@@ -2986,8 +2986,8 @@ rest_responses_total{method=\"GET\"} 42
     fn parse_query_filter(
         conditions: Option<&serde_json::Value>,
     ) -> Result<Option<Filter>, String> {
-        crate::query_filter::resolve("Qdrant", 0, conditions, parse_qdrant_conditions)
-            .map(crate::query_filter::QueryFilter::into_inner)
+        vector_db_benchmark::query_filter::resolve("Qdrant", 0, conditions, parse_qdrant_conditions)
+            .map(vector_db_benchmark::query_filter::QueryFilter::into_inner)
     }
 
     #[test]

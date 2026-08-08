@@ -26,7 +26,7 @@ use super::weaviate_grpc::weaviate_v1::{
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
-use crate::query_filter::QueryFilter;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
 const DEFAULT_CLASS_NAME: &str = "Benchmark";

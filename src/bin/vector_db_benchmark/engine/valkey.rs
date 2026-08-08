@@ -35,8 +35,8 @@ use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
-use crate::query_filter::QueryFilter;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, doc_key_to_id, doc_key_to_id_opt};
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 
 /// Valkey engine configuration

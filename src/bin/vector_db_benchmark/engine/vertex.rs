@@ -43,9 +43,9 @@ use crate::engine::{
     attach_open_loop_metrics, closed_loop_duration, zero_search_results, Engine, OpenLoopPlan,
     SearchResults, UpdateSearchRatio, UploadStats,
 };
-use crate::query_filter::QueryFilter;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 
 const DEFAULT_REGION: &str = "us-central1";

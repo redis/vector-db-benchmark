@@ -14,8 +14,8 @@ use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
-use crate::query_filter::QueryFilter;
 use vector_db_benchmark::parsers::datetime_to_epoch_secs;
+use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{is_multivalued_keyword_field, MetadataItem};
 
 const DEFAULT_COLLECTION: &str = "Benchmark";

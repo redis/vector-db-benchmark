@@ -24,26 +24,45 @@
 //!
 //! # The fix
 //!
-//! [`QueryConditions`] is the only thing [`crate::dataset::Dataset::read_queries`]
-//! hands back, and it has **no accessor for the raw per-query JSON**. The only
-//! way to get from it to something you can attach to a request is one of the
-//! `resolve_*` methods here, and each of them makes the drop an `Err`. A new
-//! engine cannot reproduce the old shape by copying a neighbour, because the
-//! type it would need to copy from no longer exists.
+//! [`QueryConditions`] is the only thing `Dataset::read_queries` hands back, and
+//! it has **no accessor for the raw per-query JSON**. The only way to get from
+//! it to something you can attach to a request is one of the `resolve_*` methods
+//! here, and each makes "a declared filter produced nothing" an `Err`. Restoring
+//! the old expression at a call site does not compile: `Vec<Option<Value>>` is
+//! no longer what an engine receives, and [`QueryFilter`]'s inner `Option` is a
+//! private field with no public constructor, so an engine cannot mint
+//! "unfiltered" out of a parse that dropped something.
 //!
 //! The three states are kept apart at the type level, in the return type
 //! `Result<Vec<QueryFilter<T>>, String>`:
 //!
 //! | state | value |
 //! |---|---|
-//! | no filter declared | `Ok(..)`, entry is [`QueryFilter::unfiltered`] |
-//! | filter declared and expressible | `Ok(..)`, entry is [`QueryFilter::filtered`] |
+//! | no filter declared | `Ok(..)`, entry is unfiltered |
+//! | filter declared and expressible | `Ok(..)`, entry carries the filter |
 //! | filter declared and dropped | `Err(..)` — the run stops |
 //!
-//! [`QueryFilter`]'s inner `Option` is private and there is no public
-//! constructor, so an engine cannot mint "unfiltered" out of a parse that
-//! dropped something; only the `resolve_*` functions below can, and they only do
-//! it for genuinely absent conditions.
+//! # What this does NOT guarantee — read before trusting it
+//!
+//! The guarantee is **"no silent `None`"**, not "no silent drop". Two escapes
+//! are outside what the type system can see, and both are live in-tree:
+//!
+//! 1. **A builder that keeps the leaves it understands and skips the rest.**
+//!    12 of the 15 builders are written that way (`build_subfilters` in
+//!    `redis.rs`, `vectorsets.rs`, ...), so a two-leaf `and` that loses one leaf
+//!    still returns a real filter, passes every check here, and constrains less
+//!    than the ground truth does. Nine shipped datasets emit 3 333 two-leaf
+//!    `and` conditions each -- 29 997 queries -- so this is reachable, not
+//!    theoretical. Measured on the branch that introduced this module:
+//!    VectorSets scores 0.2250 on an `and(keyword, geo)` corpus where Redis,
+//!    which expresses both leaves, scores 1.0000. Closing it is the per-builder
+//!    `Option -> Result` refactor tracked in its own issue; this module only
+//!    removes the "everything vanished" case.
+//! 2. **A builder that returns a match-all `T`.** `resolve_all("X", |c|
+//!    Some(c.clone()))` type-checks and rebuilds the #219 expression in one line
+//!    -- shorter than the correct spelling. Nothing here can tell a match-all
+//!    filter from a real one; `engine/filter_guard.rs` checks the builders
+//!    themselves for that.
 //!
 //! # What counts as "no filter declared"
 //!
@@ -69,7 +88,9 @@ use serde_json::Value;
 /// no public constructor, so the only route to the "no filter" state is
 /// [`QueryConditions::resolve_all`] & friends, which reach it only for a
 /// genuinely absent conditions value. Downstream `if let Some(f) = qf.as_ref()`
-/// is therefore sound — the `None` arm can no longer be a dropped filter.
+/// is therefore sound — the `None` arm can no longer be a *vanished* filter. It
+/// can still be a filter the builder rendered as match-all; see the module docs
+/// on what this type does not guarantee.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryFilter<T>(Option<T>);
 
@@ -93,9 +114,9 @@ impl<T> QueryFilter<T> {
     /// Consume into the underlying option, with the same guarantee as
     /// [`Self::as_ref`].
     ///
-    /// Test-only: production code keeps the `QueryFilter` so the two states stay
-    /// distinguishable all the way to the request builder.
-    #[cfg(test)]
+    /// Prefer keeping the `QueryFilter` as far as the request builder; unwrap
+    /// only where the engine has an explicit value for "no filter" (KiviDB's
+    /// match-all prefilter).
     pub fn into_inner(self) -> Option<T> {
         self.0
     }
@@ -118,18 +139,66 @@ impl<T: std::ops::Deref> QueryFilter<T> {
 ///
 /// Opaque by design: there is no way to read the raw JSON out of it, only to
 /// resolve it through one of the guarded constructors below.
+///
+/// `#[must_use]`: silently dropping this value IS the bug in another spelling —
+/// an engine that destructures `read_queries()` and ignores the conditions runs
+/// every query unfiltered, and no other check would notice.
+#[must_use = "a dataset's filter conditions must be resolved, not discarded: ignoring them \
+              runs every query UNFILTERED against filtered ground truth (issue #219)"]
 #[derive(Debug, Clone, Default)]
 pub struct QueryConditions {
+    /// Dataset these came from, so a dropped filter can name it.
+    dataset: String,
     per_query: Vec<Option<Value>>,
 }
 
 impl QueryConditions {
     /// Wrap the raw per-query conditions read from a dataset file.
     ///
-    /// Crate-visible so only `dataset.rs` can build one; engines receive it and
-    /// must resolve it.
+    /// `pub(crate)` **of the library crate**: the only code that can turn raw
+    /// JSON into a `QueryConditions` is `readers/`. The binary crate — every
+    /// engine — cannot reach it, and no reader hands out the raw vector.
     pub(crate) fn new(per_query: Vec<Option<Value>>) -> Self {
-        Self { per_query }
+        Self {
+            dataset: String::new(),
+            per_query,
+        }
+    }
+
+    /// `n` queries that declare no filter — the HDF5/JSONL formats, which have
+    /// nowhere to put conditions.
+    ///
+    /// Public because the binary's `dataset.rs` builds these; unlike
+    /// [`Self::new`] it cannot express a filter, so it cannot launder one.
+    pub fn unfiltered(n: usize) -> Self {
+        Self {
+            dataset: String::new(),
+            per_query: vec![None; n],
+        }
+    }
+
+    /// Label these conditions with the dataset they came from, so a dropped
+    /// filter names the dataset as well as the engine and the query index.
+    pub fn from_dataset(mut self, dataset: &str) -> Self {
+        self.dataset = dataset.to_string();
+        self
+    }
+
+    /// How many queries declare a filter. Absent / `null` / `{}` do not count.
+    pub fn declared_count(&self) -> usize {
+        self.per_query
+            .iter()
+            .filter(|c| declared(c.as_ref()).is_some())
+            .count()
+    }
+
+    /// Number of queries.
+    pub fn len(&self) -> usize {
+        self.per_query.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.per_query.is_empty()
     }
 
     /// Resolve every query's conditions with a builder that returns `Option<T>`.
@@ -156,26 +225,7 @@ impl QueryConditions {
         self.per_query
             .iter()
             .enumerate()
-            .map(|(idx, cond)| resolve(engine, idx, cond.as_ref(), &parse))
-            .collect()
-    }
-
-    /// Resolve with a builder that has **no** "produced nothing" state at all —
-    /// it returns the filter or says why it cannot (`vertex.rs`, `kividb.rs`).
-    ///
-    /// `unfiltered` supplies the value used for queries that declared no filter
-    /// (an empty restriction set, a `*` prefilter, …).
-    pub fn resolve_all_total<T>(
-        &self,
-        unfiltered: impl Fn() -> T,
-        parse: impl Fn(&Value) -> Result<T, String>,
-    ) -> Result<Vec<T>, String> {
-        self.per_query
-            .iter()
-            .map(|cond| match declared(cond.as_ref()) {
-                Some(cond) => parse(cond),
-                None => Ok(unfiltered()),
-            })
+            .map(|(idx, cond)| resolve_in(engine, &self.dataset, idx, cond.as_ref(), &parse))
             .collect()
     }
 }
@@ -191,6 +241,17 @@ pub fn resolve<T>(
     conditions: Option<&Value>,
     parse: impl FnOnce(&Value) -> Result<Option<T>, String>,
 ) -> Result<QueryFilter<T>, String> {
+    resolve_in(engine, "", idx, conditions, parse)
+}
+
+/// [`resolve`] with the dataset name for the error message.
+pub fn resolve_in<T>(
+    engine: &str,
+    dataset: &str,
+    idx: usize,
+    conditions: Option<&Value>,
+    parse: impl FnOnce(&Value) -> Result<Option<T>, String>,
+) -> Result<QueryFilter<T>, String> {
     let Some(cond) = declared(conditions) else {
         return Ok(QueryFilter::unfiltered());
     };
@@ -198,6 +259,7 @@ pub fn resolve<T>(
         Some(filter) => Ok(QueryFilter::filtered(filter)),
         None => Err(dropped(
             engine,
+            dataset,
             idx,
             cond,
             "it produced no condition at all",
@@ -220,12 +282,18 @@ fn declared(cond: Option<&Value>) -> Option<&Value> {
 }
 
 /// The error every dropped filter reports, in one voice across engines.
-pub fn dropped(engine: &str, idx: usize, conditions: &Value, why: &str) -> String {
+pub fn dropped(engine: &str, dataset: &str, idx: usize, conditions: &Value, why: &str) -> String {
+    let on = if dataset.is_empty() {
+        String::new()
+    } else {
+        format!(" of dataset `{dataset}`")
+    };
     format!(
-        "{engine} cannot express the filter on query {idx}: {why}. Conditions: {conditions}. \
-         Running the query without it would search UNFILTERED while its ground truth is \
-         filtered, so the recall reported would be for a filter that was never applied \
-         (issue #219). Fix the engine's filter builder or drop this dataset from the run."
+        "{engine} cannot express the filter on query {idx}{on}: {why}. Conditions: \
+         {conditions}. Running the query without it would search UNFILTERED while its ground \
+         truth is filtered, so the recall reported would be for a filter that was never \
+         applied (issue #219). Fix the engine's filter builder, or drop this dataset from \
+         the run."
     )
 }
 
@@ -329,12 +397,81 @@ mod tests {
         assert!(err.contains("UNFILTERED"), "{err}");
     }
 
+    /// The shape KiviDB uses: a builder whose "produced nothing" state is a
+    /// match-all SENTINEL rather than `None`. There used to be a
+    /// `resolve_all_total` here that returned a bare `Vec<T>` and never compared
+    /// the builder's output against the unfiltered value, so `{"and": []}` was
+    /// laundered into a match-all prefilter and the run continued. The sentinel
+    /// must be mapped back to `None` at the call site, and then rejected.
     #[test]
-    fn resolve_all_total_uses_the_unfiltered_value_only_for_absent_conditions() {
-        let out = conds(vec![Some(Value::Null), Some(json!({"a":1}))])
-            .resolve_all_total(|| "*".to_string(), |c| Ok(c.to_string()))
+    fn a_match_all_sentinel_is_a_drop_not_an_unfiltered_query() {
+        let sentinel = "*";
+        // The real builder renders `*` where `toy` returns `None`; the caller
+        // must map that sentinel back to "produced nothing".
+        let render = |c: &Value| -> Result<Option<String>, String> {
+            let rendered = toy(c).unwrap_or_else(|| sentinel.to_string());
+            Ok((rendered != sentinel).then_some(rendered))
+        };
+        // absent -> unfiltered, and the caller may substitute the sentinel
+        let out = conds(vec![Some(Value::Null)])
+            .try_resolve_all("Toy", render)
             .unwrap();
-        assert_eq!(out, vec!["*".to_string(), "{\"a\":1}".to_string()]);
+        assert!(!out[0].is_filtered());
+        // declared but rendering the sentinel -> Err, never a match-all run
+        let err = conds(vec![Some(json!({"and":[]}))])
+            .try_resolve_all("Toy", render)
+            .unwrap_err();
+        assert!(err.contains("UNFILTERED"), "{err}");
+    }
+
+    /// `resolve_all_total` also doubled as a raw-JSON accessor
+    /// (`resolve_all_total(|| Null, |c| Ok(c.clone()))` handed back
+    /// `Vec<Value>` for every query, absent ones included). It is gone.
+    ///
+    /// The nearest surviving spelling is `resolve_all("X", |c| Some(c.clone()))`
+    /// — documented in the module header as escape (2). This test pins exactly
+    /// how far it gets: it can echo a DECLARED condition (nothing here can tell
+    /// an echo from a real filter), but it still cannot produce raw JSON for an
+    /// absent one, and it still cannot turn a declared filter into an unfiltered
+    /// query.
+    #[test]
+    fn the_echo_escape_still_cannot_unfilter_a_declared_query() {
+        let out = conds(vec![Some(Value::Null), Some(json!({"and":[]}))])
+            .resolve_all("Toy", |v| Some(v.clone()))
+            .unwrap();
+        assert!(!out[0].is_filtered(), "an absent condition yields no JSON");
+        assert_eq!(out[1].as_ref(), Some(&json!({"and":[]})));
+    }
+
+    #[test]
+    fn query_conditions_reports_its_shape_without_exposing_it() {
+        let c = conds(vec![Some(Value::Null), Some(json!({"and":[]}))]);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.declared_count(), 1);
+    }
+
+    #[test]
+    fn the_dataset_name_is_named_in_the_error() {
+        let err = QueryConditions::new(vec![Some(json!({"and":[]}))])
+            .from_dataset("random-geo-radius-100-angular-filters")
+            .resolve_all("Toy", toy)
+            .unwrap_err();
+        assert!(
+            err.contains("random-geo-radius-100-angular-filters"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unfiltered_conditions_declare_nothing() {
+        let c = QueryConditions::unfiltered(4);
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.declared_count(), 0);
+        assert!(c
+            .resolve_all("Toy", toy)
+            .unwrap()
+            .iter()
+            .all(|f| !f.is_filtered()));
     }
 
     /// The four spellings of "absent" all resolve; only the declared one is a

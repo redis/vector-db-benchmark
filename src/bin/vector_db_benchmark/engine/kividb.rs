@@ -728,8 +728,12 @@ pub(crate) mod kividb_filter {
     /// `parse_vertex_filter` is the same shape — the no-conditions case is split
     /// structurally instead, here by returning the explicit [`MATCH_ALL`]
     /// prefilter (the caller does the same for an absent condition). "Parsed to
-    /// nothing" is unreachable by construction: every leaf path either emits a
-    /// clause or errors.
+    /// nothing" is NOT unreachable here — `{"and": []}`, `{"or": []}`, a bare
+    /// leaf and a non-object all render [`MATCH_ALL`] — so the CALLER maps a
+    /// match-all render back to "produced nothing" and lets
+    /// `QueryConditions::try_resolve_all` reject it. Keeping that check at the
+    /// call site rather than here is what stops the sentinel laundering a
+    /// dropped filter into an unfiltered run.
     pub fn parse_conditions(conditions: &Value) -> Result<String, String> {
         let Some(obj) = conditions.as_object() else {
             return Ok(MATCH_ALL.to_string());
@@ -1163,6 +1167,10 @@ pub(crate) mod kividb_filter {
         }
 
         #[test]
+        /// The BUILDER renders match-all for these. That is not the same as the
+        /// engine accepting them: the search path maps a match-all render back
+        /// to "produced nothing", so `{"and": []}` and friends fail the run.
+        /// See `kividb_match_all_render_is_rejected_at_the_call_site`.
         fn no_conditions_yields_the_explicit_match_all_prefilter() {
             // Not `Ok(None)` — see `parse_conditions`' doc comment on issue #219.
             // The absence of a filter is expressed as the `*` prefilter, which is
@@ -2127,10 +2135,20 @@ impl Engine for KividbEngine {
         //
         // The absent-condition case is split out HERE rather than folded into an
         // `Option` return (issue #219) — see `kividb_filter::parse_conditions`.
-        let prefilters: Vec<String> = conditions.resolve_all_total(
-            || kividb_filter::MATCH_ALL.to_string(),
-            kividb_filter::parse_conditions,
-        )?;
+        // A declared filter that renders the match-all prefilter IS the #219
+        // drop, so it is mapped to `None` and `try_resolve_all` rejects it;
+        // only a genuinely absent condition reaches `MATCH_ALL` here.
+        let prefilters: Vec<String> = conditions
+            .try_resolve_all("KiviDB", |v| {
+                let rendered = kividb_filter::parse_conditions(v)?;
+                Ok((rendered != kividb_filter::MATCH_ALL).then_some(rendered))
+            })?
+            .into_iter()
+            .map(|f| {
+                f.into_inner()
+                    .unwrap_or_else(|| kividb_filter::MATCH_ALL.to_string())
+            })
+            .collect();
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {
