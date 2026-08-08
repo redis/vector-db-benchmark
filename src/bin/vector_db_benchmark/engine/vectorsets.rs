@@ -15,6 +15,7 @@ use redis::Connection;
 use super::redis_utils;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
+use crate::engine::index_naming::derive_index_name;
 use crate::engine::{Engine, SearchResults, UpdateSearchRatio, UploadStats};
 use vector_db_benchmark::parsers::datetime_to_epoch_secs;
 use vector_db_benchmark::query_filter::QueryFilter;
@@ -24,6 +25,11 @@ use vector_db_benchmark::start_gate::WorkerPool;
 /// VectorSets engine configuration
 #[derive(Clone)]
 pub struct VectorSetsConfig {
+    /// The Redis key holding this config's vector set — the single addressable
+    /// namespace for VADD/VSIM/VINFO/DEL. Derived per config (#236, mirroring
+    /// #151-4) so two VectorSets configs on one server cannot clobber each
+    /// other's corpus. See [`VectorSetsEngine::new`].
+    pub key: String,
     pub quant: String,
     pub m: i64,
     pub ef_construction: i64,
@@ -91,6 +97,16 @@ impl VectorSetsEngine {
             name: engine_config.name.clone(),
             redis_url,
             config: VectorSetsConfig {
+                // #236: VectorSets addresses ONE Redis key, and it used to be the
+                // literal `idx` for every config. Two configs (or two datasets, or
+                // two concurrent runs) on one server therefore shared one vector
+                // set and `configure()`'s `DEL` wiped the neighbour mid-flight.
+                // Derive it from the config name exactly as the Redis-wire engines
+                // derive their index name (#151-4), including the
+                // `VECTORSETS_INDEX_NAME` base override and its `_EXACT` pin.
+                // There is no key-prefix analogue: a vector set is a single key,
+                // not a keyspace of doc hashes, so this name IS the namespace.
+                key: derive_index_name("VECTORSETS_INDEX_NAME", "idx", &engine_config.name),
                 quant,
                 m,
                 ef_construction,
@@ -220,7 +236,8 @@ impl VectorSetsEngine {
 }
 
 /// Execute a batch of VADD commands via pipeline.
-/// VADD idx FP32 <vec_bytes> <id> <quant> M <M> EF <EF_CONSTRUCTION> [CAS] [SETATTR '<json>']
+/// VADD <key> FP32 <vec_bytes> <id> <quant> M <M> EF <EF_CONSTRUCTION> [CAS] [SETATTR '<json>']
+/// (`<key>` is `config.key`, the per-config vector set — see [`VectorSetsConfig::key`].)
 fn vadd_batch(
     conn: &mut Connection,
     config: &VectorSetsConfig,
@@ -234,7 +251,7 @@ fn vadd_batch(
         let vec_bytes: Vec<u8> = vectors[i].iter().flat_map(|f| f.to_le_bytes()).collect();
 
         let mut cmd = redis::cmd("VADD");
-        cmd.arg("idx")
+        cmd.arg(&config.key)
             .arg("FP32")
             .arg(&vec_bytes[..])
             .arg(ids[i].to_string())
@@ -341,7 +358,7 @@ fn encode_query_vector(query_vector: &[f32]) -> Vec<u8> {
 }
 
 /// Execute VSIM query and return (id, score) pairs.
-/// VSIM idx FP32 <vec_bytes> WITHSCORES COUNT <top> EF <ef> [FILTER '<expr>' [FILTER-EF <n>]]
+/// VSIM <key> FP32 <vec_bytes> WITHSCORES COUNT <top> EF <ef> [FILTER '<expr>' [FILTER-EF <n>]]
 /// Response: alternating [id, score, id, score, ...]
 /// Score conversion: 1.0 - score (VectorSets: 1=identical, 0=opposite)
 ///
@@ -350,6 +367,7 @@ fn encode_query_vector(query_vector: &[f32]) -> Vec<u8> {
 /// parse (all legitimate server latency).
 fn vsim_search(
     conn: &mut Connection,
+    key: &str,
     vec_bytes: &[u8],
     top: usize,
     ef: i64,
@@ -357,7 +375,7 @@ fn vsim_search(
     filter_ef: Option<i64>,
 ) -> Result<Vec<(i64, f64)>, String> {
     let mut cmd = redis::cmd("VSIM");
-    cmd.arg("idx")
+    cmd.arg(key)
         .arg("FP32")
         .arg(vec_bytes)
         .arg("WITHSCORES")
@@ -426,7 +444,7 @@ fn vadd_single(
     let vec_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
 
     let mut cmd = redis::cmd("VADD");
-    cmd.arg("idx")
+    cmd.arg(&config.key)
         .arg("FP32")
         .arg(&vec_bytes[..])
         .arg(id.to_string())
@@ -465,12 +483,20 @@ impl Engine for VectorSetsEngine {
         let mut conn = self.get_connection()?;
 
         println!(
-            "Using VectorSets with QUANT: {}, M: {}, EF_CONSTRUCTION: {}, CAS: {}",
-            self.config.quant, self.config.m, self.config.ef_construction, self.config.cas
+            "Using VectorSets key '{}' with QUANT: {}, M: {}, EF_CONSTRUCTION: {}, CAS: {}",
+            self.config.key,
+            self.config.quant,
+            self.config.m,
+            self.config.ef_construction,
+            self.config.cas
         );
 
-        // Delete existing key if any
-        let _ = redis::cmd("DEL").arg("idx").query::<()>(&mut conn);
+        // Delete THIS config's key if any. Scoped to the derived per-config key
+        // (#236), so a sibling config's vector set on the same server survives —
+        // before, this `DEL idx` wiped every VectorSets config's corpus.
+        let _ = redis::cmd("DEL")
+            .arg(&self.config.key)
+            .query::<()>(&mut conn);
 
         self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
         Ok(())
@@ -598,6 +624,9 @@ impl Engine for VectorSetsEngine {
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(s, "vectorsets-search", parallel);
+            // Borrowed (not cloned) per worker: `&str` is Copy, and the scope
+            // guarantees `self` outlives every worker.
+            let key: &str = &self.config.key;
             for _ in 0..parallel {
                 let redis_url = self.redis_url.clone();
                 let neighbors = &neighbors;
@@ -642,6 +671,7 @@ impl Engine for VectorSetsEngine {
                         let prime_top = explicit_top.unwrap_or(10);
                         let _ = vsim_search(
                             &mut conn,
+                            key,
                             &encoded_queries[0],
                             prime_top,
                             ef,
@@ -679,6 +709,7 @@ impl Engine for VectorSetsEngine {
                         let query_start = Instant::now();
                         let results = vsim_search(
                             &mut conn,
+                            key,
                             &encoded_queries[idx],
                             top,
                             ef,
@@ -882,8 +913,15 @@ impl Engine for VectorSetsEngine {
                             // measurement behavior exactly.
                             let query_start = Instant::now();
                             let vec_bytes = encode_query_vector(&queries[idx]);
-                            let results =
-                                vsim_search(&mut conn, &vec_bytes, top, ef, filter_ref, filter_ef);
+                            let results = vsim_search(
+                                &mut conn,
+                                &config.key,
+                                &vec_bytes,
+                                top,
+                                ef,
+                                filter_ref,
+                                filter_ef,
+                            );
                             let query_time = query_start.elapsed().as_secs_f64();
 
                             match results {
@@ -1002,7 +1040,11 @@ impl Engine for VectorSetsEngine {
 
     fn delete(&mut self) -> Result<(), String> {
         let mut conn = self.get_connection()?;
-        let _ = redis::cmd("DEL").arg("idx").query::<()>(&mut conn);
+        // Scoped to this config's key (#236): tearing one config down leaves the
+        // other configs sharing the server intact.
+        let _ = redis::cmd("DEL")
+            .arg(&self.config.key)
+            .query::<()>(&mut conn);
         Ok(())
     }
 
@@ -1019,7 +1061,7 @@ impl Engine for VectorSetsEngine {
 
         // Vector-set stats via VINFO (quant-type, hnsw-m, vector-dim, size, ...).
         let index_info: Option<serde_json::Value> = redis::cmd("VINFO")
-            .arg("idx")
+            .arg(&self.config.key)
             .query::<redis::Value>(&mut conn)
             .ok()
             .map(|v| redis_utils::value_to_json(&v));
@@ -1037,7 +1079,7 @@ impl Engine for VectorSetsEngine {
         // VectorSets has no FT index; VINFO returns the vector-set metadata.
         // Errors on the BEFORE snapshot (vset not yet created) → index_info: null.
         let vinfo = redis::cmd("VINFO")
-            .arg("idx")
+            .arg(&self.config.key)
             .query::<redis::Value>(&mut conn)
             .ok()
             .map(|v| redis_utils::value_to_json(&v));

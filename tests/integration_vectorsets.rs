@@ -16,7 +16,14 @@
 //! grammar needs 8.8+). Start with:
 //!   docker run -d --rm -p 6398:6379 redis:8.8.0
 //! Run with:
-//!   VECTORSETS_PORT=6398 cargo test --test integration_vectorsets -- --test-threads=1
+//!   VECTORSETS_PORT=6398 cargo test --test integration_vectorsets
+//!
+//! The suite is parallel-safe since #236: each config's corpus lives in its own
+//! `idx:<config-name>` vector set, so tests no longer share one `idx` key that
+//! each `configure()` deleted out from under its neighbours. (Before that fix the
+//! `--test-threads=1` flag was mandatory, not merely advisable — without it most
+//! of these tests failed at recall 0.000.) Every test below therefore MUST use a
+//! distinct engine-config name; that name is the isolation boundary.
 
 use std::time::{Duration, Instant};
 
@@ -381,6 +388,248 @@ fn test_binary_vectorsets_mixed_benchmark() {
     assert!(
         p50 <= p95 && p95 <= p99,
         "percentiles must be monotone: p50={p50} p95={p95} p99={p99}"
+    );
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+// ── #236: per-config key namespacing ─────────────────────────────────────────
+
+/// Open a connection to the live server used by these tests.
+fn conn() -> redis::Connection {
+    let url = format!("redis://{}:{}/", TEST_HOST, test_port());
+    redis::Client::open(url.as_str())
+        .expect("redis client")
+        .get_connection()
+        .expect("redis connection")
+}
+
+/// `VCARD <key>` — element count of a vector set, `0` when the key is absent.
+/// This is the load-bearing read-back: it is answered by the SERVER about the
+/// SERVER's state, so it cannot be satisfied by a plausible-looking recall.
+fn vcard(conn: &mut redis::Connection, key: &str) -> i64 {
+    redis::cmd("VCARD").arg(key).query::<i64>(conn).unwrap_or(0)
+}
+
+/// `VDIM <key>` — dimensionality of the vectors stored in a vector set, `0` when
+/// the key is absent. Two configs uploaded at different dims therefore have
+/// distinguishable *contents*, not merely distinguishable counts.
+fn vdim(conn: &mut redis::Connection, key: &str) -> i64 {
+    redis::cmd("VDIM").arg(key).query::<i64>(conn).unwrap_or(0)
+}
+
+/// `vector_count` as written into the fixture's `datasets/datasets.json`, i.e.
+/// exactly how many vectors a completed upload must leave on the server.
+fn expected_count(root: &std::path::Path) -> i64 {
+    let raw = std::fs::read_to_string(root.join("datasets/datasets.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    v[0]["vector_count"].as_i64().expect("vector_count")
+}
+
+/// Issue #236 — two VectorSets configs sharing one server must own two DISJOINT
+/// vector sets.
+///
+/// Before this fix every config addressed the literal key `idx`, and
+/// `configure()` opened with `DEL idx`. So starting config B did not merely
+/// interleave with config A — it **deleted A's entire corpus**, then rebuilt the
+/// same key with its own. That is the #151-4 hazard the Redis family was fixed
+/// for, applied to a single key instead of an index + keyspace.
+///
+/// The assertions are deliberately all server-side (`VCARD`/`VDIM`/`EXISTS`),
+/// never recall. Two same-shaped corpora produce a perfectly plausible recall
+/// whichever one actually answered the query, which is precisely why this bug
+/// survived a suite full of recall assertions — see the repo's silent-wrong
+/// bug class. The two configs upload at DIFFERENT dimensionalities (8 and 16),
+/// so a surviving key can be attributed to its owner by content and not only by
+/// count.
+///
+/// RED on master: after run B, `VCARD idx:vectorsets-iso-a` is 0 — A's corpus is
+/// gone and only the shared `idx` exists.
+#[test]
+fn test_vectorsets_two_configs_do_not_clobber_each_other() {
+    wait_for_vectorsets();
+
+    let name_a = "vectorsets-iso-a";
+    let name_b = "vectorsets-iso-b";
+    // Must match `index_naming::derive_index_name("VECTORSETS_INDEX_NAME", "idx", …)`.
+    // Spelled out literally rather than imported: the point of the test is to pin
+    // the on-the-wire key, so it must fail if the derivation changes shape.
+    let key_a = format!("idx:{name_a}");
+    let key_b = format!("idx:{name_b}");
+    const LEGACY_KEY: &str = "idx";
+
+    let proj_a = common::write_match_any_cosine_project("vs-iso-a", &vectorsets_config(name_a), 8);
+    let proj_b = common::write_match_any_cosine_project("vs-iso-b", &vectorsets_config(name_b), 16);
+    let n_a = expected_count(&proj_a.root);
+    let n_b = expected_count(&proj_b.root);
+
+    let mut c = conn();
+    // Clean slate for exactly the three keys this test reasons about (never
+    // FLUSHALL — the suite shares one server with the other VectorSets tests).
+    for k in [key_a.as_str(), key_b.as_str(), LEGACY_KEY] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+
+    let port = test_port().to_string();
+    let env = [("REDIS_PORT", port.as_str())];
+
+    // ── Run config A, keeping its data resident ──
+    assert!(
+        common::run_binary_extra(
+            &proj_a.root,
+            name_a,
+            "vs-iso-a",
+            TEST_HOST,
+            &env,
+            &["--keep-data"]
+        ),
+        "config A run failed"
+    );
+    // Snapshot rather than assert here: every assertion is deferred to the end so
+    // that a regression prints the WHOLE before/after picture (including what
+    // landed in the legacy shared key) instead of aborting at the first symptom.
+    let card_a_after_a = vcard(&mut c, &key_a);
+    println!(
+        "#236 read-back after config A: VCARD {key_a}={card_a_after_a} (VDIM {}) | \
+         legacy VCARD {LEGACY_KEY}={} (VDIM {})",
+        vdim(&mut c, &key_a),
+        vcard(&mut c, LEGACY_KEY),
+        vdim(&mut c, LEGACY_KEY),
+    );
+
+    // ── Run config B against the SAME server ──
+    assert!(
+        common::run_binary_extra(
+            &proj_b.root,
+            name_b,
+            "vs-iso-b",
+            TEST_HOST,
+            &env,
+            &["--keep-data"]
+        ),
+        "config B run failed"
+    );
+
+    // Both corpora coexist, each with its own count …
+    let card_a = vcard(&mut c, &key_a);
+    let card_b = vcard(&mut c, &key_b);
+    println!(
+        "#236 read-back after config B: VCARD {key_a}={card_a} (VDIM {}), \
+         VCARD {key_b}={card_b} (VDIM {}) | legacy VCARD {LEGACY_KEY}={} (VDIM {})",
+        vdim(&mut c, &key_a),
+        vdim(&mut c, &key_b),
+        vcard(&mut c, LEGACY_KEY),
+        vdim(&mut c, LEGACY_KEY),
+    );
+    assert_eq!(
+        card_a_after_a, n_a,
+        "config A must upload into its own key '{key_a}' (#236)"
+    );
+    assert_eq!(
+        card_a, n_a,
+        "config B clobbered config A's corpus (#236): VCARD {key_a} = {card_a}, expected {n_a}"
+    );
+    assert_eq!(
+        card_b, n_b,
+        "config B did not land in its own key (#236): VCARD {key_b} = {card_b}, expected {n_b}"
+    );
+
+    // … and neither key holds the other's vectors: the dims are the ones each
+    // config uploaded, so no key was rebuilt from the other's corpus.
+    assert_eq!(
+        vdim(&mut c, &key_a),
+        8,
+        "'{key_a}' does not hold A's 8-d vectors"
+    );
+    assert_eq!(
+        vdim(&mut c, &key_b),
+        16,
+        "'{key_b}' does not hold B's 16-d vectors"
+    );
+
+    // And nothing was written to the old shared key at all.
+    let legacy_exists: i64 = redis::cmd("EXISTS")
+        .arg(LEGACY_KEY)
+        .query(&mut c)
+        .unwrap_or(0);
+    assert_eq!(
+        legacy_exists, 0,
+        "the hardcoded shared key '{LEGACY_KEY}' must no longer be written (#236)"
+    );
+
+    // Teardown: this test opted into --keep-data, so it owns the cleanup.
+    for k in [key_a.as_str(), key_b.as_str(), LEGACY_KEY] {
+        let _ = redis::cmd("DEL").arg(k).query::<i64>(&mut c);
+    }
+    std::fs::remove_dir_all(&proj_a.root).ok();
+    std::fs::remove_dir_all(&proj_b.root).ok();
+}
+
+/// Issue #236, part 2 — VectorSets must PARTICIPATE in the #151-4 startup
+/// collision guard, not just derive a good default.
+///
+/// The derivation alone leaves one way back into the shared-key world: the
+/// `VECTORSETS_INDEX_NAME_EXACT` pin drops the per-config suffix, so N configs
+/// resolve to one verbatim key again. The Redis-family engines have that case
+/// rejected at startup; before this fix `experiment::run`'s guard did not know
+/// the string `"vectorsets"` at all, so the pin silently re-armed the bug.
+///
+/// Asserted on the ERROR TEXT, not merely a non-zero exit: without a live
+/// server (or with any other misconfiguration) the run would fail anyway, and a
+/// bare exit-code assertion would pass against a removed guard.
+#[test]
+fn test_vectorsets_exact_pin_with_two_configs_is_rejected_at_startup() {
+    let configs = serde_json::json!([
+        {
+            "name": "vectorsets-guard-a",
+            "engine": "vectorsets",
+            "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        },
+        {
+            "name": "vectorsets-guard-b",
+            "engine": "vectorsets",
+            "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        },
+    ]);
+    let proj = common::write_match_any_cosine_project(
+        "vs-guard",
+        &serde_json::to_string(&configs).unwrap(),
+        8,
+    );
+
+    let out = std::process::Command::new(common::binary_path())
+        .args([
+            "--engines",
+            "vectorsets-guard-*",
+            "--datasets",
+            "vs-guard",
+            "--host",
+            TEST_HOST,
+            "--skip-if-exists",
+            "false",
+        ])
+        .current_dir(&proj.root)
+        .env("REDIS_PORT", test_port().to_string())
+        .env("VECTORSETS_INDEX_NAME", "shared-vset")
+        .env("VECTORSETS_INDEX_NAME_EXACT", "1")
+        .output()
+        .expect("run vector-db-benchmark");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "exact-pinned sweep of 2 vectorsets configs must be rejected, not run: {combined}"
+    );
+    assert!(
+        combined.contains("derive the same index namespace"),
+        "the failure must be the #151-4 collision guard, not an incidental error: {combined}"
+    );
+    assert!(
+        combined.contains("VECTORSETS_INDEX_NAME_EXACT is set"),
+        "the guard must name the exact-pin as the cause so the fix is obvious: {combined}"
     );
     std::fs::remove_dir_all(&proj.root).ok();
 }

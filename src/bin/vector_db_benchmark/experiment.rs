@@ -215,8 +215,8 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     // Collision guard (#151-4): among the selected configs, no two configs of the
-    // same destructive Redis-wire engine (redis/valkey/dragonfly/kividb) may derive
-    // the same index namespace, or a sweep would silently overwrite one config's graph
+    // same destructive Redis-wire engine (redis/valkey/dragonfly/kividb/vectorsets)
+    // may derive the same index namespace, or a sweep would silently overwrite one config's graph
     // and keyspace with another's (the exact bug this fix closes). Also fires when
     // an `*_INDEX_NAME_EXACT` pin is set with >1 config for that engine (every
     // config then resolves to the same verbatim base). In --skip-vector-index mode
@@ -232,6 +232,10 @@ pub fn run(args: &Args) -> Result<(), String> {
                 "valkey" => "VALKEY_INDEX_NAME",
                 "dragonfly" => "DRAGONFLY_INDEX_NAME",
                 "kividb" => "KIVIDB_INDEX_NAME",
+                // #236: VectorSets' "index" is the single Redis key holding the
+                // vector set, derived by the same helper, so it collides the same
+                // way and belongs in the same guard.
+                "vectorsets" => "VECTORSETS_INDEX_NAME",
                 _ => continue,
             };
             let idx = derive_index_name(base_env, "idx", &config.name);
