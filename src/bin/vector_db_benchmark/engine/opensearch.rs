@@ -3076,6 +3076,93 @@ mod tests {
         assert!(resolve_force_merge_budget(FORCE_MERGE_TIMEOUT_UNLIMITED, None).is_some());
     }
 
+    // The bounds must be resolved at CONSTRUCTION, not inside force_merge, which
+    // runs after the whole upload: a malformed value parsed there rejects the run
+    // only once there is a multi-hour ingest to throw away. This covers the
+    // resolution path end to end — env in, stored Durations out — including that
+    // a bad value fails `new()` rather than the merge.
+    #[test]
+    fn merge_bounds_are_resolved_when_the_engine_is_constructed() {
+        use crate::config::EngineConfig;
+
+        fn engine(env: &[(&str, Option<&str>)]) -> Result<OpenSearchEngine, String> {
+            // SAFETY: these variables are touched by no other test.
+            for (k, v) in env {
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+            let cfg: EngineConfig = serde_json::from_value(serde_json::json!({
+                "name": "os-bounds-test",
+                "engine": "opensearch",
+            }))
+            .unwrap();
+            OpenSearchEngine::new(&cfg, "http://127.0.0.1")
+        }
+
+        let clear = [
+            ("OPENSEARCH_TIMEOUT", None),
+            ("OPENSEARCH_FORCE_MERGE_TIMEOUT", None),
+            ("OPENSEARCH_FORCE_MERGE_BUDGET", None),
+        ];
+
+        // Defaults: the 300 s client timeout must NOT bound a merge, and the
+        // budget tracks the deadline rather than being a constant.
+        let e = engine(&clear).unwrap_or_else(|e| panic!("defaults must construct: {e}"));
+        assert_eq!(
+            e.force_merge_deadline,
+            std::time::Duration::from_secs(3_600)
+        );
+        assert_eq!(
+            e.force_merge_budget,
+            Some(std::time::Duration::from_secs(7_200))
+        );
+
+        // Both knobs reach the stored values — if either were dropped, the run
+        // would silently use the default while the operator believed otherwise.
+        let e = engine(&[
+            ("OPENSEARCH_TIMEOUT", None),
+            ("OPENSEARCH_FORCE_MERGE_TIMEOUT", Some("120")),
+            ("OPENSEARCH_FORCE_MERGE_BUDGET", Some("300")),
+        ])
+        .unwrap_or_else(|e| panic!("explicit values must construct: {e}"));
+        assert_eq!(e.force_merge_deadline, std::time::Duration::from_secs(120));
+        assert_eq!(
+            e.force_merge_budget,
+            Some(std::time::Duration::from_secs(300))
+        );
+
+        // 0 = unlimited on both, not "expire immediately" / "no retries".
+        let e = engine(&[
+            ("OPENSEARCH_TIMEOUT", None),
+            ("OPENSEARCH_FORCE_MERGE_TIMEOUT", Some("0")),
+            ("OPENSEARCH_FORCE_MERGE_BUDGET", Some("0")),
+        ])
+        .unwrap_or_else(|e| panic!("0 must construct: {e}"));
+        assert!(!e.force_merge_deadline.is_zero());
+        assert_eq!(e.force_merge_budget, None);
+
+        // A malformed value fails HERE, before any upload exists to discard.
+        let err = engine(&[
+            ("OPENSEARCH_TIMEOUT", None),
+            ("OPENSEARCH_FORCE_MERGE_TIMEOUT", None),
+            ("OPENSEARCH_FORCE_MERGE_BUDGET", Some("2h")),
+        ])
+        .err()
+        .expect("a malformed budget must fail at construction");
+        assert!(
+            err.contains("OPENSEARCH_FORCE_MERGE_BUDGET"),
+            "the error must name the variable: {err}"
+        );
+
+        for (k, _) in clear {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
     // A present-but-unusable value must fail loudly rather than silently
     // reinstating the default — the same rule `parse_number_of_shards` enforces
     // in this file.
@@ -3269,9 +3356,12 @@ mod tests {
         let mut calls = 0usize;
 
         let policy = RetryPolicy {
-            // Deliberately generous: if the budget were ignored, the attempt count
-            // is what would end this, and the assertions below would fail.
-            max_retries: 1_000_000,
+            // High enough that the budget is what ends a correct run, low enough
+            // that a broken one still ENDS. An earlier version used 1_000_000
+            // here; with the budget mutated off that does not fail the test, it
+            // hangs for hours (1M attempts x capped backoff), which in CI is a
+            // timeout rather than a diagnosis. A mutation must fail fast.
+            max_retries: 60,
             base_delay_ms: 1,
             budget: Some(std::time::Duration::from_millis(150)),
         };
@@ -3303,9 +3393,9 @@ mod tests {
             calls > 1,
             "must actually have retried before giving up, got {calls} call(s)"
         );
-        // Stopped by time, nowhere near the 1,000,000-attempt ceiling.
+        // Stopped by time, well short of the 60-retry ceiling.
         assert!(
-            calls < 1_000,
+            calls <= 60,
             "budget did not bound the loop; {calls} attempts"
         );
         assert!(
