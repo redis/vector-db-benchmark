@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Dataset configuration from datasets.json
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -227,81 +228,362 @@ pub fn datasets_dir() -> PathBuf {
     project_root().join("datasets")
 }
 
+/// Where one configuration entry came from: a file, and its index in that
+/// file's top-level array. The index matters — a generated 24-entry file that
+/// declares one name twice would otherwise report the same path twice and leave
+/// the user to grep for it.
+#[derive(Debug, Clone)]
+struct ConfigOrigin {
+    file: String,
+    index: usize,
+}
+
+impl ConfigOrigin {
+    fn describe(&self) -> String {
+        format!("entry {} of {}", self.index, self.file)
+    }
+}
+
+/// Registry that lets a name be claimed exactly once, recording every clash
+/// instead of aborting on the first — two duplicates should cost one fix-and-
+/// rerun cycle, not two.
+#[derive(Default)]
+struct NameRegistry {
+    origins: HashMap<String, ConfigOrigin>,
+    collisions: Vec<(String, ConfigOrigin, ConfigOrigin)>,
+}
+
+impl NameRegistry {
+    /// Claim `name` for `origin`. Returns false when it was already taken, in
+    /// which case the FIRST claim stands and the clash is recorded.
+    fn claim(&mut self, name: &str, origin: ConfigOrigin) -> bool {
+        if let Some(first) = self.origins.get(name) {
+            self.collisions
+                .push((name.to_string(), first.clone(), origin));
+            return false;
+        }
+        self.origins.insert(name.to_string(), origin);
+        true
+    }
+
+    /// One error naming EVERY collision, or `Ok(())`.
+    ///
+    /// `kind` is the noun used in the message ("engine configuration",
+    /// "dataset").
+    fn into_result(self, kind: &str) -> Result<(), String> {
+        if self.collisions.is_empty() {
+            return Ok(());
+        }
+        let cross_file = self.collisions.iter().any(|(_, a, b)| a.file != b.file);
+        let mut msg = format!(
+            "duplicate {kind} name(s). A name selects exactly one definition, so a duplicate \
+             resolves to whichever one loads last"
+        );
+        // `glob` yields paths in alphabetical order (documented, and stable), so
+        // a cross-file winner is decided by FILENAME, deterministically — not by
+        // the filesystem and not by anything the author chose. Intra-file
+        // duplicates involve no filenames at all, so that clause is only emitted
+        // when at least one pair really does span two files.
+        if cross_file {
+            msg.push_str(" — an accident of filename ordering rather than a choice");
+        }
+        msg.push_str(":\n");
+        for (name, first, second) in &self.collisions {
+            msg.push_str(&format!(
+                "  {:?}\n    defined in:      {}\n    also defined in: {}\n",
+                name,
+                first.describe(),
+                second.describe()
+            ));
+        }
+        msg.push_str("Rename one entry of each pair, or delete the redundant definition.");
+        if cross_file {
+            msg.push_str(
+                "\n(\"defined in\" is whichever came first in alphabetical file order, which \
+                 says nothing about which was authored first.)",
+            );
+        }
+        Err(msg)
+    }
+}
+
 /// Read all dataset configurations
+///
+/// A duplicated dataset `name` is a hard error for the same reason a duplicated
+/// engine-configuration name is (#239), only worse: the name selects a corpus
+/// AND its ground truth, so a shadowed entry silently scores a run against a
+/// different corpus than the one the result JSON's `dataset` field names.
 pub fn read_dataset_configs() -> Result<HashMap<String, DatasetConfig>, String> {
-    let datasets_json = project_root().join("datasets/datasets.json");
-    let content = fs::read_to_string(&datasets_json)
+    read_dataset_configs_from_file(&project_root().join("datasets/datasets.json"))
+}
+
+/// [`read_dataset_configs`] against an explicit path, so the uniqueness rule can
+/// be tested against a fixture as well as the shipped registry.
+pub fn read_dataset_configs_from_file(
+    datasets_json: &Path,
+) -> Result<HashMap<String, DatasetConfig>, String> {
+    let content = fs::read_to_string(datasets_json)
         .map_err(|e| format!("Failed to read datasets.json at {:?}: {}", datasets_json, e))?;
 
     let configs: Vec<DatasetConfig> = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse datasets.json: {}", e))?;
 
+    let file = datasets_json.display().to_string();
+    let mut registry = NameRegistry::default();
     let mut map = HashMap::new();
-    for config in configs {
-        map.insert(config.name.clone(), config);
+    for (index, config) in configs.into_iter().enumerate() {
+        let origin = ConfigOrigin {
+            file: file.clone(),
+            index,
+        };
+        if registry.claim(&config.name, origin) {
+            map.insert(config.name.clone(), config);
+        }
     }
+    registry.into_result("dataset")?;
     Ok(map)
 }
 
-/// Read all engine configurations from experiments/configurations/*.json
-/// Read engine configs. When `engines_file` is `Some`, ONLY that JSON file is
-/// read (the `--engines-file` flag); otherwise every
-/// `experiments/configurations/*.json` is globbed. A `--engines-file` that is
-/// missing or malformed is a hard error (the previous glob-only behavior
-/// silently ignored the flag, so `--engines-file x.json` failed with a
-/// confusing "no engines match" — see issue #151).
-pub fn read_engine_configs(
-    engines_file: Option<&str>,
-) -> Result<HashMap<String, EngineConfig>, String> {
+/// A `experiments/configurations/*.json` file that could not be turned into
+/// configurations, and why.
+///
+/// serde rejects the WHOLE array on one bad entry, so a single typo deletes
+/// every configuration defined in that file. Carried out of the loader (rather
+/// than only printed) because a stderr warning does not survive to the artifact
+/// — same reasoning as `uncalibrated_configs` in #217.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedConfigFile {
+    pub path: String,
+    pub error: String,
+}
+
+/// Files the current run could not load, recorded once by
+/// [`crate::experiment::run`] so [`crate::summary::save_summary`] can stamp them
+/// into every summary JSON the run writes. Empty unless
+/// `--allow-partial-configs` was passed, because otherwise the run refuses to
+/// start.
+static SKIPPED_CONFIG_FILES: Mutex<Vec<SkippedConfigFile>> = Mutex::new(Vec::new());
+
+/// Record the run's skipped configuration files (replaces any previous value).
+pub fn record_skipped_config_files(skipped: Vec<SkippedConfigFile>) {
+    *SKIPPED_CONFIG_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = skipped;
+}
+
+/// The run's skipped configuration files, for stamping into result artifacts.
+pub fn skipped_config_files() -> Vec<SkippedConfigFile> {
+    SKIPPED_CONFIG_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Read every `*.json` engine configuration in `dir`.
+///
+/// Returns the configurations AND the files that could not be read or parsed.
+/// A duplicated `name` is a hard error naming every clash; an unloadable file is
+/// reported to the caller, which decides whether a partial config set may run.
+///
+/// A configuration's `name` is the run's identity: it is what `--engines`
+/// selects, what the result JSON is keyed by, and what a chart legend or a
+/// commit message quotes. Two definitions sharing one name means the name no
+/// longer denotes a single set of parameters, and the previous `HashMap::insert`
+/// resolved that by last-write-wins — deterministically, since `glob` yields
+/// paths alphabetically, but by an accident of filename ordering rather than by
+/// anyone's choice, and with nothing in the output saying which definition ran.
+/// See issue #239: `vectorsets-fp32-default` was a live collision, and the
+/// alphabetically-later file won every time.
+///
+/// This is the repo's recurring silent-wrong class, so it errors rather than
+/// warns: a shadowed configuration changes the reported number by definition.
+///
+/// Split out from [`read_engine_configs`] so both rules can be tested against a
+/// fixture directory as well as against the shipped one.
+pub fn read_engine_configs_from_dir(
+    dir: &Path,
+) -> Result<(HashMap<String, EngineConfig>, Vec<SkippedConfigFile>), String> {
     let mut all_configs = HashMap::new();
+    let mut registry = NameRegistry::default();
+    let mut skipped = Vec::new();
 
-    if let Some(file) = engines_file {
-        let content = fs::read_to_string(file)
-            .map_err(|e| format!("failed to read --engines-file {}: {}", file, e))?;
-        let configs: Vec<EngineConfig> = serde_json::from_str(&content)
-            .map_err(|e| format!("invalid JSON in --engines-file {}: {}", file, e))?;
-        for config in configs {
-            all_configs.insert(config.name.clone(), config);
-        }
-        return Ok(all_configs);
-    }
-
-    let configs_dir = project_root().join("experiments/configurations");
-    let pattern = configs_dir.join("*.json");
-    for path in glob::glob(pattern.to_str().unwrap())
+    let pattern = dir.join("*.json");
+    let pattern = pattern
+        .to_str()
+        .ok_or_else(|| format!("engine configuration path is not valid UTF-8: {:?}", dir))?;
+    // `glob` already yields paths in alphabetical order (documented at
+    // glob-0.3.3 lib.rs:163 and implemented by sorting each directory's entries
+    // onto a LIFO stack), so this sort is belt-and-braces: it pins the order the
+    // collision message reports as "defined in" against a future glob release
+    // that stops promising it. It is NOT what makes the load deterministic —
+    // glob already did.
+    //
+    // `.flatten()` here drops `GlobError`s (an unreadable directory), which
+    // cannot partially shrink the set: `glob` surfaces such an error for the
+    // directory as a whole, so the result is zero configs, and zero configs is
+    // already a hard error downstream ("No engines match pattern").
+    let mut paths: Vec<PathBuf> = glob::glob(pattern)
         .map_err(|e| e.to_string())?
         .flatten()
-    {
+        .collect();
+    paths.sort();
+
+    for path in paths {
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Warning: skipping engine config {:?}: {}", path, e);
+                skipped.push(SkippedConfigFile {
+                    path: path.display().to_string(),
+                    error: e.to_string(),
+                });
                 continue;
             }
         };
-        // NEVER swallow the parse error. serde rejects the WHOLE file on one bad
-        // entry, so a single typo deletes every engine defined in it and the run
-        // fails with a baffling "no engines match" — e.g. a typo anywhere in
-        // qdrant-on-disk.json removes all four of its configurations. The typed
-        // fields and aliases on this branch make that easy to trip:
+        // NEVER swallow the parse error, and never let it merely warn. serde
+        // rejects the WHOLE file on one bad entry, so a single typo deletes every
+        // configuration defined in it — and under the DEFAULT `--engines '*'`,
+        // or any wildcard, the sweep simply gets smaller and still exits 0. On
+        // the shipped tree, even for engines whose configurations are SPLIT over
+        // several files, one file still owns at least half of that engine's
+        // sweep — so a single typo takes most of a curve with it, and
+        // `opensearch-5-shard.json` in particular is half the opensearch entries,
+        // which makes a shard-count comparison single-sided.
+        //
+        // Those shares are DERIVED from the tree, not restated here, by
+        // `one_unloadable_file_removes_a_large_share_of_an_engines_sweep` below.
+        // Do not hard-code a total in this comment: a stale count in a comment is
+        // the same defect class this guard exists for. `summary.rs` picks the best
+        // QPS among the points that DID run and `plot.rs` charts them, so the
+        // published peak and Pareto frontier are quietly truncated. Only an exact
+        // single-name `--engines` selection turns this into "no engines match".
+        //
+        // The typed fields and aliases make the typo easy to trip:
         //   hnsw_config: {"on_disk": "true"}          -> invalid type: string
         //   {"search_params": {...}, "config": {...}} -> duplicate field
         //   {"config": {"ef": 64, "EF": 512}}         -> duplicate field
         //   {"config": 5}                             -> invalid type
         match serde_json::from_str::<Vec<EngineConfig>>(&content) {
             Ok(configs) => {
-                for config in configs {
-                    all_configs.insert(config.name.clone(), config);
+                let file = path.display().to_string();
+                for (index, config) in configs.into_iter().enumerate() {
+                    let origin = ConfigOrigin {
+                        file: file.clone(),
+                        index,
+                    };
+                    if registry.claim(&config.name, origin) {
+                        all_configs.insert(config.name.clone(), config);
+                    }
                 }
             }
-            Err(e) => eprintln!(
-                "Warning: engine config {:?} does not parse, so ALL of its entries were \
-                 skipped: {}",
-                path, e
-            ),
+            Err(e) => skipped.push(SkippedConfigFile {
+                path: path.display().to_string(),
+                error: e.to_string(),
+            }),
         }
     }
-    Ok(all_configs)
+    registry.into_result("engine configuration")?;
+    Ok((all_configs, skipped))
+}
+
+/// Read engine configs, reporting any file that could not be loaded.
+///
+/// When `engines_file` is `Some`, ONLY that JSON file is read (the
+/// `--engines-file` flag) and an unreadable or malformed file is a hard error —
+/// the previous glob-only behavior silently ignored the flag, so
+/// `--engines-file x.json` failed with a confusing "no engines match" (#151).
+/// Otherwise every `experiments/configurations/*.json` is globbed and files that
+/// fail to load come back in the second tuple element for the caller to rule on.
+///
+/// A duplicated `name` — within one file or across two — is always a hard error
+/// naming every clash (#239).
+pub fn read_engine_configs_reporting_skips(
+    engines_file: Option<&str>,
+) -> Result<(HashMap<String, EngineConfig>, Vec<SkippedConfigFile>), String> {
+    if let Some(file) = engines_file {
+        let mut all_configs = HashMap::new();
+        let mut registry = NameRegistry::default();
+        let content = fs::read_to_string(file)
+            .map_err(|e| format!("failed to read --engines-file {}: {}", file, e))?;
+        let configs: Vec<EngineConfig> = serde_json::from_str(&content)
+            .map_err(|e| format!("invalid JSON in --engines-file {}: {}", file, e))?;
+        for (index, config) in configs.into_iter().enumerate() {
+            let origin = ConfigOrigin {
+                file: file.to_string(),
+                index,
+            };
+            if registry.claim(&config.name, origin) {
+                all_configs.insert(config.name.clone(), config);
+            }
+        }
+        registry.into_result("engine configuration")?;
+        return Ok((all_configs, Vec::new()));
+    }
+
+    read_engine_configs_from_dir(&project_root().join("experiments/configurations"))
+}
+
+/// STRICT read: any configuration file that fails to load is a hard error.
+///
+/// This is the default for every caller that does not explicitly opt into a
+/// partial config set, because a silently smaller sweep changes the published
+/// number (see the comment in [`read_engine_configs_from_dir`]). The same
+/// failure was already a hard error on the `--engines-file` path, so this also
+/// ends the split where one flag errored and the other shrugged.
+pub fn read_engine_configs(
+    engines_file: Option<&str>,
+) -> Result<HashMap<String, EngineConfig>, String> {
+    let (configs, skipped) = read_engine_configs_reporting_skips(engines_file)?;
+    if !skipped.is_empty() {
+        return Err(describe_skipped_config_files(&skipped, SkipReport::Refusal));
+    }
+    Ok(configs)
+}
+
+/// Who is reporting the unloadable files, and therefore what the message should
+/// say about them. The three cases want genuinely different text: only one of
+/// them is refusing, only one of them is about to measure something, and only
+/// one of them has no run at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReport {
+    /// A run refusing to start. Explains the consequence and offers the opt-in.
+    Refusal,
+    /// A run proceeding under `--allow-partial-configs`. Same consequence, but
+    /// must not tell the user to pass a flag they already passed.
+    PartialRun,
+    /// `--describe`, which is listing the directory rather than measuring
+    /// anything. No sweep, no published number, and `--allow-partial-configs`
+    /// would be a no-op here, so neither is mentioned.
+    Listing,
+}
+
+/// The user-facing report for configuration files that could not be loaded.
+pub fn describe_skipped_config_files(skipped: &[SkippedConfigFile], report: SkipReport) -> String {
+    let mut msg = match report {
+        SkipReport::Listing => format!(
+            "{} engine configuration file(s) could not be loaded, so every configuration they \
+             define is MISSING from the listing below:\n",
+            skipped.len()
+        ),
+        SkipReport::Refusal | SkipReport::PartialRun => format!(
+            "{} engine configuration file(s) could not be loaded, so EVERY configuration they \
+             define is missing from this run. Under a wildcard `--engines` (the default is `*`) \
+             that silently shrinks the sweep and still exits 0, which truncates the peak QPS and \
+             the Pareto frontier that get published:\n",
+            skipped.len()
+        ),
+    };
+    for s in skipped {
+        msg.push_str(&format!("  {}\n    {}\n", s.path, s.error));
+    }
+    match report {
+        SkipReport::Refusal => msg.push_str(
+            "Fix the file(s), or pass --allow-partial-configs to run anyway (the run then \
+             records `skipped_config_files` in every summary JSON it writes).",
+        ),
+        SkipReport::Listing => msg.push_str("Fix the file(s) to see their configurations here."),
+        SkipReport::PartialRun => {}
+    }
+    msg
 }
 
 /// Match a name against a pattern (supports * wildcard)
@@ -476,8 +758,20 @@ pub fn describe_datasets(verbose: bool) -> Result<(), String> {
 }
 
 /// Describe available engines
+///
+/// Unlike a run, this tolerates a file that failed to load and lists it instead
+/// — the whole point of `--describe` is to diagnose the config directory, so
+/// refusing to print anything would hide the very thing the user is looking for.
+/// The unloadable files are printed FIRST, so the engine list below them is
+/// never mistaken for the complete set.
 pub fn describe_engines(verbose: bool) -> Result<(), String> {
-    let configs = read_engine_configs(None)?;
+    let (configs, skipped) = read_engine_configs_reporting_skips(None)?;
+    if !skipped.is_empty() {
+        eprintln!(
+            "{}",
+            describe_skipped_config_files(&skipped, SkipReport::Listing)
+        );
+    }
     println!("Available engines ({}):", configs.len());
     for (name, config) in configs.iter() {
         if verbose {
@@ -932,6 +1226,452 @@ mod tests {
             "compact --describe engines"
         );
         assert!(describe_engines(true).is_ok(), "verbose --describe engines");
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #239 — duplicate names, and partial config sets, must never
+    // resolve silently.
+    // ---------------------------------------------------------------------
+
+    /// The shipped configuration directory, located from the crate manifest
+    /// rather than the process CWD so these tests do not depend on where the
+    /// test binary was launched from.
+    fn shipped_configs_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("experiments/configurations")
+    }
+
+    fn write_config_file(dir: &Path, file: &str, names: &[&str]) -> PathBuf {
+        let entries: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| json!({"name": n, "engine": "redis"}))
+            .collect();
+        let path = dir.join(file);
+        fs::write(&path, serde_json::to_string(&entries).unwrap()).unwrap();
+        path
+    }
+
+    /// Two files declaring one name is exactly the #239 shape:
+    /// `vectorsets-fp32-default` lived in both `vectorsets-NOQUANT.json` and
+    /// `vectorsets-rs-NOQUANT.json`. `glob` yields paths alphabetically, so the
+    /// `-rs-` file deterministically won on every platform — the shadowing was
+    /// stable, not flaky, which is precisely why nobody noticed. RED against the
+    /// old loader, which returned `Ok` with one silent survivor.
+    #[test]
+    fn duplicate_name_across_two_files_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "a-first.json", &["shared-name", "only-in-a"]);
+        write_config_file(dir.path(), "b-second.json", &["shared-name"]);
+
+        let err = read_engine_configs_from_dir(dir.path())
+            .expect_err("a duplicated configuration name must not load");
+
+        assert!(
+            err.contains("shared-name"),
+            "error must name the duplicated config: {err}"
+        );
+        // Both competing files must be named, or the user cannot act on it.
+        assert!(
+            err.contains("a-first.json"),
+            "error must name the first file: {err}"
+        );
+        assert!(
+            err.contains("b-second.json"),
+            "error must name the second file: {err}"
+        );
+        // Neutral wording: "first defined in" would tell someone who just added
+        // `aaa-mine.json` that THEIR new file is the original.
+        assert!(
+            !err.contains("first defined in") && !err.contains("redefined in"),
+            "ordering here is alphabetical, not chronological: {err}"
+        );
+        assert!(err.contains("also defined in"), "{err}");
+    }
+
+    /// Same rule within a single file. The message must carry the array index —
+    /// in a generated 24-entry file, naming the path twice leaves the user to
+    /// grep — and must NOT blame filename ordering, since no glob is involved.
+    #[test]
+    fn duplicate_name_within_one_file_names_the_entry_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "twins.json", &["other", "twin", "twin"]);
+
+        let err = read_engine_configs_from_dir(dir.path())
+            .expect_err("a duplicated name inside one file must not load");
+        assert!(err.contains("twin"), "{err}");
+        assert!(err.contains("twins.json"), "{err}");
+        assert!(err.contains("entry 1 of"), "must locate the first: {err}");
+        assert!(err.contains("entry 2 of"), "must locate the second: {err}");
+        assert!(
+            !err.contains("filename ordering"),
+            "no glob is involved in an intra-file duplicate: {err}"
+        );
+    }
+
+    /// Every collision in one error. Two duplicates must cost ONE fix-and-rerun
+    /// cycle, not two.
+    #[test]
+    fn all_collisions_are_reported_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "a.json", &["alpha", "beta", "gamma"]);
+        write_config_file(dir.path(), "b.json", &["alpha", "beta"]);
+
+        let err = read_engine_configs_from_dir(dir.path()).expect_err("two collisions");
+        assert!(err.contains("alpha"), "{err}");
+        assert!(err.contains("beta"), "{err}");
+        assert!(
+            !err.contains("gamma"),
+            "the clean name must not be blamed: {err}"
+        );
+    }
+
+    /// `--engines-file` takes the same registry.
+    #[test]
+    fn duplicate_name_in_engines_file_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config_file(dir.path(), "explicit.json", &["dup", "dup"]);
+
+        let err = read_engine_configs(Some(path.to_str().unwrap()))
+            .expect_err("--engines-file must reject duplicates too");
+        assert!(err.contains("dup"), "{err}");
+    }
+
+    /// Distinct names still load, and every one is reachable.
+    #[test]
+    fn distinct_names_across_files_load_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "a.json", &["one", "two"]);
+        write_config_file(dir.path(), "b.json", &["three"]);
+
+        let (configs, skipped) = read_engine_configs_from_dir(dir.path()).expect("no collisions");
+        assert_eq!(configs.len(), 3);
+        assert!(skipped.is_empty());
+        for n in ["one", "two", "three"] {
+            assert!(configs.contains_key(n), "missing {n}");
+        }
+    }
+
+    // ---- partial config sets ------------------------------------------------
+
+    /// serde rejects a whole file on one bad entry. Under the DEFAULT
+    /// `--engines '*'`, or any wildcard, that used to shrink the sweep and exit
+    /// 0 — publishing a lower peak QPS and a truncated Pareto frontier. The
+    /// strict read must refuse, naming the file and the parse error.
+    #[test]
+    fn unparseable_file_is_a_hard_error_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "good.json", &["kept"]);
+        // The realistic typo: a typed bool given as a string.
+        fs::write(
+            dir.path().join("broken.json"),
+            r#"[{"name":"lost","engine":"qdrant",
+                "collection_params":{"hnsw_config":{"on_disk":"true"}}}]"#,
+        )
+        .unwrap();
+
+        let (configs, skipped) =
+            read_engine_configs_from_dir(dir.path()).expect("names are unique");
+        assert_eq!(configs.len(), 1, "the good file still loads");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the broken file is REPORTED, not swallowed"
+        );
+        assert!(skipped[0].path.ends_with("broken.json"), "{:?}", skipped[0]);
+        assert!(
+            skipped[0].error.contains("invalid type"),
+            "the parse error must survive: {:?}",
+            skipped[0]
+        );
+
+        // The refusal a run without --allow-partial-configs prints: names the
+        // file, the parse error, and the opt-in flag.
+        let refusal = describe_skipped_config_files(&skipped, SkipReport::Refusal);
+        assert!(refusal.contains("broken.json"), "{refusal}");
+        assert!(refusal.contains("invalid type"), "{refusal}");
+        assert!(
+            refusal.contains("--allow-partial-configs"),
+            "the refusal must name its escape hatch: {refusal}"
+        );
+        // ...and the notice printed when the flag WAS passed does not re-offer it.
+        let notice = describe_skipped_config_files(&skipped, SkipReport::PartialRun);
+        assert!(notice.contains("broken.json"), "{notice}");
+        assert!(
+            !notice.contains("--allow-partial-configs"),
+            "do not tell the user to pass a flag they already passed: {notice}"
+        );
+        // ...and `--describe`, where there is no run at all, must not talk about
+        // a sweep or a published frontier, and must not offer an opt-in that
+        // would be a no-op there.
+        let listing = describe_skipped_config_files(&skipped, SkipReport::Listing);
+        assert!(listing.contains("broken.json"), "{listing}");
+        assert!(
+            !listing.contains("--allow-partial-configs"),
+            "the flag is a no-op for --describe: {listing}"
+        );
+        for run_only in ["this run", "sweep", "Pareto", "published"] {
+            assert!(
+                !listing.contains(run_only),
+                "--describe has no run to describe, yet the message says {run_only:?}: {listing}"
+            );
+        }
+    }
+
+    /// `--engines-file` was already strict about a malformed file; keep it that
+    /// way, so one failure mode does not have two policies split by flag.
+    #[test]
+    fn engines_file_with_a_bad_entry_is_still_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-engines.json");
+        fs::write(
+            &path,
+            r#"[{"name":"x","engine":"redis","search_params":5}]"#,
+        )
+        .unwrap();
+
+        let err = read_engine_configs(Some(path.to_str().unwrap()))
+            .expect_err("a malformed --engines-file must not be tolerated");
+        assert!(err.contains("bad-engines.json"), "{err}");
+    }
+
+    /// An unreadable file is the same failure with a different cause, and must
+    /// be reported the same way rather than warned past.
+    #[test]
+    fn unreadable_file_is_reported_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "good.json", &["kept"]);
+        // A dangling symlink: present to the glob, unreadable to `read_to_string`.
+        std::os::unix::fs::symlink(dir.path().join("nowhere.json"), dir.path().join("bad.json"))
+            .unwrap();
+
+        let (configs, skipped) = read_engine_configs_from_dir(dir.path()).unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(skipped.len(), 1, "unreadable file must be reported");
+        assert!(skipped[0].path.ends_with("bad.json"), "{:?}", skipped[0]);
+    }
+
+    /// A duplicate name outranks a skipped file: the collision is a wrong
+    /// measurement, the skip is a missing one, and reporting only the latter
+    /// would let a collision hide behind an unrelated typo.
+    #[test]
+    fn collision_wins_over_skipped_file_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config_file(dir.path(), "a.json", &["clash"]);
+        write_config_file(dir.path(), "b.json", &["clash"]);
+        fs::write(dir.path().join("c-broken.json"), "{ not json").unwrap();
+
+        let err = read_engine_configs_from_dir(dir.path()).expect_err("collision must surface");
+        assert!(err.contains("clash"), "{err}");
+    }
+
+    // ---- the shipped registries --------------------------------------------
+
+    /// Regress-guard for the shipped set itself: run the REAL loader over the
+    /// REAL `experiments/configurations/` directory. Any future PR that
+    /// reintroduces a duplicate name — the #239 root cause — fails here rather
+    /// than silently mis-measuring a run.
+    ///
+    /// The recount below is a second opinion, not an independent one: it reuses
+    /// the same `serde_json::from_str::<Vec<EngineConfig>>`, so it agrees with
+    /// the loader by construction on WHICH entries exist and only disagrees on
+    /// how many survived name-keying. In particular a file that fails to parse
+    /// is skipped on BOTH sides, so this test alone cannot see an unparseable
+    /// file — `every_shipped_engine_config_file_parses` is what covers that, and
+    /// deleting it would silently widen this test's blind spot. The `skipped`
+    /// assertion below closes the gap from this side too.
+    #[test]
+    fn shipped_engine_configs_have_no_duplicate_names() {
+        let dir = shipped_configs_dir();
+        assert!(dir.is_dir(), "shipped config dir not found at {dir:?}");
+
+        let (configs, skipped) = read_engine_configs_from_dir(&dir)
+            .expect("every shipped engine configuration name must be unique");
+        assert!(
+            skipped.is_empty(),
+            "shipped config files must all load: {skipped:?}"
+        );
+
+        let mut declared = 0usize;
+        for path in glob::glob(dir.join("*.json").to_str().unwrap())
+            .unwrap()
+            .flatten()
+        {
+            let content = fs::read_to_string(&path).unwrap();
+            if let Ok(entries) = serde_json::from_str::<Vec<EngineConfig>>(&content) {
+                declared += entries.len();
+            }
+        }
+        assert!(
+            declared > 100,
+            "suspiciously few shipped configs: {declared}"
+        );
+        assert_eq!(
+            configs.len(),
+            declared,
+            "shipped configurations shadow each other: {} declared, {} distinct names",
+            declared,
+            configs.len()
+        );
+    }
+
+    /// The mirror image for datasets, which is the strictly worse half of the
+    /// bug: a dataset name selects a corpus AND its ground truth, so a shadowed
+    /// entry scores a run against a different corpus than the `dataset` field of
+    /// the result JSON claims. A duplicate appended to `datasets.json` used to
+    /// pass the entire suite.
+    #[test]
+    fn duplicate_dataset_name_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasets.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&json!([
+                {"name": "twin", "path": "a/twin.npy", "vector_size": 128},
+                {"name": "solo", "path": "a/solo.npy", "vector_size": 128},
+                {"name": "twin", "path": "b/twin.npy", "vector_size": 768},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = read_dataset_configs_from_file(&path).expect_err("duplicate dataset name");
+        assert!(err.contains("twin"), "{err}");
+        assert!(
+            !err.contains("solo"),
+            "the clean name must not be blamed: {err}"
+        );
+        assert!(err.contains("entry 0 of"), "{err}");
+        assert!(err.contains("entry 2 of"), "{err}");
+        assert!(err.contains("dataset"), "the noun must be right: {err}");
+    }
+
+    #[test]
+    fn distinct_dataset_names_load_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("datasets.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&json!([
+                {"name": "a", "path": "a.npy"},
+                {"name": "b", "path": "b.npy"},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_dataset_configs_from_file(&path).unwrap().len(), 2);
+    }
+
+    /// Regress-guard for the shipped dataset registry, mirroring
+    /// `shipped_engine_configs_have_no_duplicate_names`.
+    #[test]
+    fn shipped_datasets_have_no_duplicate_names() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("datasets/datasets.json");
+        assert!(path.is_file(), "datasets.json not found at {path:?}");
+
+        // Not `.expect("... must be unique")`: this loader also rejects a file
+        // that does not PARSE, and labelling that failure "must be unique" sends
+        // the reader hunting for a duplicate that does not exist. Engines avoid
+        // this by having `every_shipped_engine_config_file_parses` next door;
+        // `every_shipped_dataset_file_parses` below is the dataset twin.
+        let configs = match read_dataset_configs_from_file(&path) {
+            Ok(c) => c,
+            Err(e) => panic!("datasets.json failed to load: {e}"),
+        };
+
+        let declared: usize =
+            serde_json::from_str::<Vec<DatasetConfig>>(&fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .len();
+        // LIVE: catches an emptied or truncated registry.
+        assert!(declared > 10, "suspiciously few datasets: {declared}");
+        // NOT live for duplicates any more — the loader hard-errors above before
+        // this can be reached, and a name collision is the only way these two
+        // could diverge. Kept as a cheap belt-and-braces invariant, but do not
+        // mistake it for the coverage; the `match` above is what guards #239.
+        assert_eq!(
+            configs.len(),
+            declared,
+            "shipped datasets shadow each other: {} declared, {} distinct names",
+            declared,
+            configs.len()
+        );
+    }
+
+    /// Dataset twin of `every_shipped_engine_config_file_parses`: a typo in
+    /// `datasets.json` makes EVERY dataset vanish, and `read_dataset_configs`
+    /// reports it as a parse failure — which the uniqueness guard above must not
+    /// be left to mislabel.
+    #[test]
+    fn every_shipped_dataset_file_parses() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("datasets/datasets.json");
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed = serde_json::from_str::<Vec<DatasetConfig>>(&content);
+        assert!(
+            parsed.is_ok(),
+            "{:?} does not parse — EVERY dataset would disappear from every run: {}",
+            path,
+            parsed.unwrap_err()
+        );
+    }
+
+    /// Derives the claim the loader's comment makes: on the shipped tree, one
+    /// unloadable file removes a large share of some engine's configurations, so
+    /// a wildcard sweep that tolerated it would publish a materially truncated
+    /// curve.
+    ///
+    /// Computed from the tree rather than written down, so it cannot go stale
+    /// the way a hard-coded "15 of 56" did.
+    #[test]
+    fn one_unloadable_file_removes_a_large_share_of_an_engines_sweep() {
+        let dir = shipped_configs_dir();
+        // engine -> total entries, and (file, engine) -> entries in that file.
+        let mut per_engine: HashMap<String, usize> = HashMap::new();
+        let mut per_file: HashMap<(String, String), usize> = HashMap::new();
+        for path in glob::glob(dir.join("*.json").to_str().unwrap())
+            .unwrap()
+            .flatten()
+        {
+            let content = fs::read_to_string(&path).unwrap();
+            let entries: Vec<EngineConfig> = serde_json::from_str(&content).unwrap();
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            for c in entries {
+                let engine = c.engine.unwrap_or_default();
+                *per_engine.entry(engine.clone()).or_default() += 1;
+                *per_file.entry((file.clone(), engine)).or_default() += 1;
+            }
+        }
+
+        // Restrict to engines whose configurations are SPLIT across more than one
+        // file. Without that, the measurement is trivial: an engine defined in a
+        // single file always scores 100%, which would make the assertion
+        // tautological (verified — it passed at a 99% threshold before this
+        // filter was added).
+        let mut files_per_engine: HashMap<&str, usize> = HashMap::new();
+        for (_, engine) in per_file.keys() {
+            *files_per_engine.entry(engine.as_str()).or_default() += 1;
+        }
+
+        let (worst, share, count, total) = per_file
+            .iter()
+            .filter(|((_, engine), _)| files_per_engine[engine.as_str()] > 1)
+            .map(|((file, engine), n)| {
+                (
+                    format!("{file} ({engine})"),
+                    *n as f64 / per_engine[engine] as f64,
+                    *n,
+                    per_engine[engine],
+                )
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("at least one engine is split across several files");
+
+        assert!(
+            share >= 0.5,
+            "even among engines split across several files, one file should own at least half \
+             of that engine's configurations — worst-case here is {worst} at {count}/{total} \
+             ({:.0}%). If this ever drops, the loader comment about a single typo truncating a \
+             sweep needs revisiting.",
+            share * 100.0
+        );
     }
 }
 

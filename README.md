@@ -232,6 +232,9 @@ Usage: vector-db-benchmark [OPTIONS]
 Options:
     --engines <PATTERN>        Engine config patterns (wildcards supported) [default: *]
     --engines-file <PATH>      Path to JSON file with custom engine configs
+    --allow-partial-configs    Run even if some experiments/configurations/*.json
+                               failed to load (off by default; see "Engine
+                               Configurations" below)
     --datasets <PATTERN>       Dataset patterns (wildcards supported) [default: *]
     --host <HOST>              Redis/engine host [default: localhost]
     --parallels <N,N,...>      Filter by parallel thread counts
@@ -493,6 +496,23 @@ cargo run --release --bin vector-db-benchmark -- \
 ## Engine Configurations
 
 Engine configurations live in [`experiments/configurations/`](./experiments/configurations/). Each JSON file defines one or more experiment configurations specifying the engine, index parameters, search parameters, and upload parallelism.
+
+Two rules are enforced at load time, and breaking either aborts the **run** rather than
+quietly changing what gets measured. `--describe engines` is deliberately exempt from the
+second one: its job is to diagnose the configuration directory, so it lists the unloadable
+files first and then shows the configurations that did load. (A duplicate name aborts
+`--describe` too — there is nothing useful to show when one name means two things.)
+
+- **`name` must be unique across every file in the directory**, not just within one
+  file. The name is what `--engines` selects and what the result JSON is keyed by, so
+  two definitions sharing a name would mean the reported number came from whichever
+  one happened to load last. A duplicate is an error naming both definitions (#239).
+  The same rule applies to dataset names in `datasets/datasets.json`.
+- **Every `*.json` in the directory must parse.** `serde` rejects a whole file on one
+  bad entry, so a single typo removes every configuration that file defines — and
+  under a wildcard `--engines` (the default is `*`) the sweep would just get smaller
+  and still exit 0. Pass `--allow-partial-configs` to run anyway; the run then records
+  the offending files under `skipped_config_files` in every summary JSON it writes.
 
 Example (`redis-docker-test.json`):
 
