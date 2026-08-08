@@ -1056,10 +1056,26 @@ fn test_binary_opensearch_fulltext() {
 /// segments, or trusting the merge response, would both pass while the numbers
 /// stayed exactly as wrong as before.
 ///
-/// The upload deliberately uses several parallel workers and small batches: each
-/// worker fills its own Lucene indexing buffer, so the pre-merge index has more
-/// than one segment and the assertion below has something to prove. (Verified by
-/// reverting `max_num_segments(1)`, which makes this test fail.)
+/// **This test would be a coin flip without the merge-stats guard below.** The
+/// pre-merge segment count is not a property of the fixture, it is however many
+/// Lucene indexing buffers happened to be live at the single end-of-upload
+/// refresh — the upload is far too small to fill one. Measured on the engine's
+/// own upload shape: 8 concurrent workers give 2-6 segments, but a run that ends
+/// up effectively serialised gives exactly **1**, and then a bare `_forcemerge`
+/// is a no-op that also leaves 1, so `searchable == 1` holds on unfixed code too.
+/// A 2-vCPU CI runner reaches that state often. So the assertion alone would go
+/// green on roughly half of all reverts, which is worse than no guard at all,
+/// because it looks like protection.
+///
+/// The fix is to check that the force merge actually *had* something to merge.
+/// `merges.total_docs` is exact and deterministic here: measured 400 (the whole
+/// corpus, one merge) whenever the pre-merge index had >1 segment, and **0**
+/// whenever it had exactly 1. So the run either proves the invariant or fails
+/// loudly saying it could not — it never passes vacuously.
+///
+/// `batch_size` is small so the upload spans many bulk requests and the workers
+/// overlap for as long as possible; that raises the odds of a multi-segment
+/// pre-merge state, but the guard is what makes the test *correct* regardless.
 #[test]
 fn test_binary_opensearch_force_merge_single_segment() {
     wait_for_opensearch();
@@ -1069,7 +1085,7 @@ fn test_binary_opensearch_force_merge_single_segment() {
     let configs = serde_json::json!([{
         "name": "os-fm", "engine": "opensearch",
         "search_params": [{"parallel": 1, "num_candidates": 400}],
-        "upload_params": {"parallel": 8, "batch_size": 20}
+        "upload_params": {"parallel": 8, "batch_size": 5}
     }]);
     let proj = common::write_match_any_project(
         "force-merge-test",
@@ -1095,6 +1111,7 @@ fn test_binary_opensearch_force_merge_single_segment() {
     );
 
     let client = os_client();
+
     let resp = client
         .get(format!("{}/{}/_segments", os_base_url(), INDEX))
         .send()
@@ -1129,6 +1146,47 @@ fn test_binary_opensearch_force_merge_single_segment() {
         }
     }
 
-    // Clean up: this test is the only one that keeps its index.
+    // The invariant held — but did it hold because the fix works, or because
+    // there was only ever one segment and nothing to merge? Checked AFTER the
+    // assertion above, deliberately: on genuinely unfixed code both conditions
+    // are true at once, and the segment-count failure is the accurate diagnosis,
+    // so it must be the one that fires.
+    //
+    // `merges.total_docs` counts docs rewritten by merges. Merging the corpus
+    // into one segment moves all of them; a merge with nothing to do moves none.
+    // Measured: 400 whenever the pre-merge index had >1 segment, 0 when it had 1.
+    let doc_count = client
+        .get(format!("{}/{}/_count", os_base_url(), INDEX))
+        .send()
+        .expect("_count request")
+        .json::<serde_json::Value>()
+        .unwrap()["count"]
+        .as_u64()
+        .expect("count");
+    assert!(doc_count > 0, "fixture uploaded no documents");
+
+    let merge_stats = client
+        .get(format!("{}/{}/_stats/merge", os_base_url(), INDEX))
+        .send()
+        .expect("_stats/merge request")
+        .json::<serde_json::Value>()
+        .unwrap();
+    let merged_docs = merge_stats["_all"]["primaries"]["merges"]["total_docs"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no merges.total_docs in {}", merge_stats));
+
+    // Clean up before the last assertion so a failure does not leak the index.
     let _ = client.delete(format!("{}/{}", os_base_url(), INDEX)).send();
+
+    assert!(
+        merged_docs >= doc_count,
+        "INCONCLUSIVE, not a pass: the index ended with one searchable segment, \
+         but merges rewrote only {} of {} docs — so the upload produced a \
+         single-segment index and this run proved nothing (the same result would \
+         hold without max_num_segments(1)). Raise upload_params.parallel, lower \
+         batch_size, or grow the fixture until the upload produces a \
+         multi-segment index on this machine.",
+        merged_docs,
+        doc_count
+    );
 }
