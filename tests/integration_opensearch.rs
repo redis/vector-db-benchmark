@@ -1036,3 +1036,99 @@ fn test_binary_opensearch_fulltext() {
         recall
     );
 }
+
+/// #210: after a run, exactly ONE **searchable** segment per shard must remain.
+///
+/// This is a comparability invariant, not a tidiness one. A segment is one HNSW
+/// graph; a k-NN query searches every segment of every shard and merges the
+/// per-segment result lists, so segment count moves both recall and latency.
+/// Before the fix the engine force-merged without `max_num_segments`, leaving
+/// whatever Lucene's merge policy happened to settle on — a number that depends
+/// on ingest timing, batch size and worker count, so it varies between runs of
+/// the same config and differs from Elasticsearch's pinned 1.
+///
+/// `"search": true` is the load-bearing part of the assertion, not a detail. A
+/// force merge commits the new segment but only refreshes Lucene's INTERNAL
+/// reader; the searcher that answers queries keeps the pre-merge segments until
+/// an external refresh. An implementation that merges without refreshing
+/// afterwards leaves a `_segments` response that *contains* a single big
+/// segment while every query still runs against the old ones — so counting all
+/// segments, or trusting the merge response, would both pass while the numbers
+/// stayed exactly as wrong as before.
+///
+/// The upload deliberately uses several parallel workers and small batches: each
+/// worker fills its own Lucene indexing buffer, so the pre-merge index has more
+/// than one segment and the assertion below has something to prove. (Verified by
+/// reverting `max_num_segments(1)`, which makes this test fail.)
+#[test]
+fn test_binary_opensearch_force_merge_single_segment() {
+    wait_for_opensearch();
+
+    const INDEX: &str = "bench_forcemerge";
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "os-fm", "engine": "opensearch",
+        "search_params": [{"parallel": 1, "num_candidates": 400}],
+        "upload_params": {"parallel": 8, "batch_size": 20}
+    }]);
+    let proj = common::write_match_any_project(
+        "force-merge-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "os-fm",
+            "force-merge-test",
+            // Explicit http:// scheme: the OpenSearch engine defaults to https
+            // for a bare host, but the CI container runs plaintext http (security
+            // plugin disabled).
+            "http://127.0.0.1",
+            &[("OPENSEARCH_PORT", "9202"), ("OPENSEARCH_INDEX", INDEX)],
+            // Keep the index so its segment layout can be inspected; without this
+            // the engine drops it at the end of the run.
+            &["--keep-data"],
+        ),
+        "opensearch force-merge run failed"
+    );
+
+    let client = os_client();
+    let resp = client
+        .get(format!("{}/{}/_segments", os_base_url(), INDEX))
+        .send()
+        .expect("_segments request");
+    assert!(resp.status().is_success(), "_segments failed: {:?}", resp);
+    let body: serde_json::Value = resp.json().unwrap();
+
+    let shards = body["indices"][INDEX]["shards"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no shards in _segments response: {}", body));
+    assert!(!shards.is_empty(), "index reported zero shards: {}", body);
+
+    for (shard_id, replicas) in shards {
+        for replica in replicas.as_array().expect("shard entry is an array") {
+            let segments = replica["segments"].as_object().expect("segments object");
+            let searchable: Vec<&String> = segments
+                .iter()
+                .filter(|(_, s)| s["search"].as_bool().unwrap_or(false))
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(
+                searchable.len(),
+                1,
+                "shard {} serves queries from {} searchable segments, expected 1 \
+                 (force merge did not pin max_num_segments=1, or did not refresh \
+                 afterwards so the searcher still holds the pre-merge segments); \
+                 response: {}",
+                shard_id,
+                searchable.len(),
+                body
+            );
+        }
+    }
+
+    // Clean up: this test is the only one that keeps its index.
+    let _ = client.delete(format!("{}/{}", os_base_url(), INDEX)).send();
+}
