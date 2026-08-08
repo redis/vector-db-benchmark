@@ -529,12 +529,8 @@ impl Engine for VectorSetsEngine {
             .as_ref()
             .and_then(|sp| sp.ef)
             .unwrap_or(64);
-        let filter_ef: Option<i64> = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.extra.as_ref())
-            .and_then(|extra| extra.get("filter_ef"))
-            .and_then(|v| v.as_i64());
+        // Nested or flat placement — see SearchParams::knob.
+        let filter_ef: Option<i64> = params.knob("filter_ef").and_then(|v| v.as_i64());
         let parallel = params.parallel.unwrap_or(1) as usize;
 
         // Read queries and ground truth
@@ -768,12 +764,8 @@ impl Engine for VectorSetsEngine {
             .as_ref()
             .and_then(|sp| sp.ef)
             .unwrap_or(64);
-        let filter_ef: Option<i64> = params
-            .search_params
-            .as_ref()
-            .and_then(|sp| sp.extra.as_ref())
-            .and_then(|extra| extra.get("filter_ef"))
-            .and_then(|v| v.as_i64());
+        // Nested or flat placement — see SearchParams::knob.
+        let filter_ef: Option<i64> = params.knob("filter_ef").and_then(|v| v.as_i64());
         let parallel = params.parallel.unwrap_or(1) as usize;
 
         // Read queries and ground truth

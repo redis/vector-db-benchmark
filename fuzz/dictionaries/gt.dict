@@ -1,0 +1,21 @@
+# libFuzzer dictionary for the binary `results.gt` k-NN ground-truth format.
+#
+#   [ n: u32 ][ d: u32 ][ ids: i32 x (n*d) ][ scores: f32 x (n*d) ]
+#
+# The header is a pair of little-endian u32s, so the CSR dictionary's i64
+# building blocks are the wrong width for it — these are u32/i32-sized.
+zero_u32="\x00\x00\x00\x00"
+one_u32="\x01\x00\x00\x00"
+two_u32="\x02\x00\x00\x00"
+ten_u32="\x0a\x00\x00\x00"
+max_u32="\xff\xff\xff\xff"
+# n=0,d=0: the empty-but-valid file (whole header, nothing else).
+header_empty="\x00\x00\x00\x00\x00\x00\x00\x00"
+# n=1,d=1: the smallest header with a payload.
+header_1x1="\x01\x00\x00\x00\x01\x00\x00\x00"
+# n=1,d=10: the shape the real msmarco-sparse ground truth uses.
+header_1x10="\x01\x00\x00\x00\x0a\x00\x00\x00"
+# n>0 with d=0 — the shape the reader must reject.
+header_zero_width="\x01\x00\x00\x00\x00\x00\x00\x00"
+neg_one_i32="\xff\xff\xff\xff"
+f32_one="\x00\x00\x80\x3f"
