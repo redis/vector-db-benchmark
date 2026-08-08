@@ -352,11 +352,22 @@ full-size corpus uploaded by a sibling config, or by a different dataset, passes
 The count proves the corpus is the right SIZE, never that it is the right corpus.
 
 **pgvector's count is an estimate on purpose.** The engine never `VACUUM`s and
-forces `STORAGE PLAIN`, so `SELECT count(*) FROM items` plans a Seq Scan: ~2.6s
-and ~1.1GB of I/O on a 1M-row table (~6GB at 1536 dims), pulling the whole corpus
-into the page cache and shared buffers *immediately before the search phase* —
-silently turning a cold-cache run warm and changing the published number. The
-check uses `ANALYZE` + `reltuples` instead and can therefore only warn.
+forces `STORAGE PLAIN`, so `SELECT count(*) FROM items` plans a Seq Scan over the
+whole heap *immediately before the search phase*, silently turning a cold-cache
+run warm and changing the published number. Measured on a cold 1M-row / 768-dim
+table built like this engine's (3906 MB, 500000 relpages):
+
+| | heap blocks touched | cache primed | cold wall clock |
+|---|---|---|---|
+| `SELECT count(*)` | 500,000 | 3906 MB | 1.58 s |
+| `ANALYZE items` | 30,001 | 234 MB | 0.84 s |
+
+The point is not the 16.7x ratio but that ANALYZE's sample is capped at
+`300 * default_statistics_target` = 30,000 rows **regardless of table size**, so
+its footprint is bounded while `count(*)` grows linearly — at 1536 dims (~7.8 GB)
+`count(*)` primes all of it and ANALYZE still touches ~30,000 blocks. Bounded is
+not free (~6% of this heap), so the perturbation is capped, not eliminated. The
+check uses `ANALYZE` + `reltuples` and can therefore only warn, never abort.
 
 Two-phase workflows are unchanged, and now provably non-destructive: upload with
 `--keep-data`, then re-run with `--skip-upload --skip-if-exists false`. A

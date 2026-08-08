@@ -233,14 +233,31 @@ impl Engine for PgVectorEngine {
     ///
     /// It is deliberately not `SELECT count(*) FROM items`. This engine never
     /// VACUUMs and forces `STORAGE PLAIN`, so an exact count plans a Seq Scan
-    /// over the whole heap — 2.6s and ~1.1GB of I/O on a 1M-row table, ~6GB at
-    /// 1536 dims — pulling the entire corpus into the OS page cache and shared
-    /// buffers **immediately before the search phase**. That silently converts a
-    /// cold-cache pgvector run into a warm one and changes the published number,
-    /// which is a worse failure than the one the guard prevents.
+    /// over the whole heap, pulling the entire corpus into shared buffers and the
+    /// OS page cache **immediately before the search phase** — silently turning a
+    /// cold-cache run warm and changing the published number, a worse failure
+    /// than the one this guard prevents.
     ///
-    /// So: `ANALYZE` (a bounded sample) then read the planner's `reltuples`.
-    /// Being approximate, it can only ever warn — never abort a run.
+    /// Measured on a cold 1M-row / 768-dim table built exactly like this engine's
+    /// (3906 MB, 500000 relpages, never VACUUMed, `STORAGE PLAIN`):
+    ///
+    /// ```text
+    ///                      heap blocks touched   cache primed   cold wall clock
+    ///   SELECT count(*)          500 000           3906 MB          1.58 s
+    ///   ANALYZE items             30 001            234 MB          0.84 s
+    /// ```
+    ///
+    /// `EXPLAIN (ANALYZE, BUFFERS)` confirms the plan: `Parallel Seq Scan on
+    /// items … Buffers: shared hit=96 read=499904`.
+    ///
+    /// The decisive property is not the 16.7x ratio but that ANALYZE's sample is
+    /// capped at `300 * default_statistics_target` = 30 000 rows **regardless of
+    /// table size**, so its footprint is BOUNDED while `count(*)` grows linearly:
+    /// at 1536 dims (~7.8 GB) `count(*)` primes the whole 7.8 GB and ANALYZE
+    /// still touches ~30 000 blocks. It is bounded, not free — ~234 MB, ~6% of
+    /// this heap — so the perturbation is capped rather than eliminated.
+    ///
+    /// Being approximate, the result can only ever warn — never abort a run.
     fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         let mut conn = self.connect()?;
         // A missing table is "nothing to reuse", not a probe failure.
