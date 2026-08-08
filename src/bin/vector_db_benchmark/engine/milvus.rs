@@ -19,6 +19,138 @@ use vector_db_benchmark::readers::metadata::{is_multivalued_keyword_field, Metad
 
 const DEFAULT_COLLECTION: &str = "Benchmark";
 
+/// How one dataset schema field is materialised in Milvus: the column's
+/// `dataType`, and the SCALAR INDEX type that column must get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MilvusFieldKind {
+    data_type: &'static str,
+    /// Milvus `indexType` for the scalar index on this column.
+    index_type: &'static str,
+}
+
+/// Map a dataset schema field to its Milvus column type AND its scalar index
+/// type, or `None` if the field is not materialised as a column at all.
+///
+/// This is the single source of truth shared by `create_collection` (which
+/// builds the columns) and `scalar_index_plan` (which indexes them). Keeping
+/// one mapping is the point: issue #218 was exactly a column that existed with
+/// no index, so every filtered query degenerated into a brute-force scalar scan
+/// behind the ANN search, and no recall check could ever notice (an unindexed
+/// scan returns the SAME rows — only slower).
+///
+/// ## Why these index types (verified live against `milvusdb/milvus:v2.6.19`,
+/// the image pinned in `tests/docker-compose.test.yml`)
+///
+/// Milvus 2.6 offers INVERTED, BITMAP, STL_SORT, Trie and NGRAM for scalar
+/// fields. Probing every (column type × index type) pair against v2.6.19 gives:
+///
+/// | column          | INVERTED | BITMAP | STL_SORT | Trie |
+/// |-----------------|----------|--------|----------|------|
+/// | VarChar         | ok       | ok     | ok       | ok   |
+/// | Int64           | ok       | ok     | ok       | ✗    |
+/// | Double          | ok       | ✗      | ok       | ✗    |
+/// | Bool            | ok       | ok     | ✗        | ✗    |
+/// | Array(VarChar)  | ok       | ok     | ✗        | ✗    |
+///
+/// (✗ = server rejects with error 1100: BITMAP is "only supported on bool, int,
+/// string and array field"; STL_SORT "only on numeric, varchar or timestamptz";
+/// Trie "only supported on varchar field".)
+///
+/// * **INVERTED for VarChar / Int64 / Double / Array** — it is the only type
+///   accepted on all four, it serves BOTH predicate shapes this benchmark emits
+///   (point: `==`, `in [...]`, `array_contains*`, `TEXT_MATCH`; and range:
+///   `<`/`>=` over `int`, `float` and the Int64-epoch `datetime` column), and
+///   it makes no cardinality assumption. That last point matters: our keyword
+///   fields span 2 distinct values (`random-100-match-kw-small-vocab-filters`)
+///   to tens of thousands (`prod_name` in `h-and-m-2048-angular-filters`).
+///   INVERTED is also precisely what Milvus's own AUTOINDEX selects for
+///   VARCHAR/INT*/FLOAT/DOUBLE, so we are not hand-tuning the engine past its
+///   own default — we are giving it the default it should always have had.
+/// * **BITMAP for Bool** — a boolean column has exactly 2 distinct values, the
+///   canonical BITMAP case, and it is under BITMAP's documented ~500-cardinality
+///   ceiling for every dataset by construction. STL_SORT is rejected on Bool.
+/// * **Not STL_SORT** for the numerics: it is a sorted-array structure aimed at
+///   ranges only, and it cannot cover the Array/Bool columns, so it would mean
+///   two structures where INVERTED covers both shapes — and it is not what
+///   AUTOINDEX picks.
+/// * **Not Trie**: VARCHAR-only and prefix-only. This benchmark never emits a
+///   prefix predicate (`like "abc%"`), so Trie would not serve `==` / `in`.
+/// * **Not a bare `create_index` with no `indexType`** (upstream's approach,
+///   i.e. AUTOINDEX): the REST `indexes/describe` reply then reports
+///   `indexType: ""`, which makes the read-back assertion in
+///   `tests/integration_milvus.rs` unable to prove WHICH index exists. Naming
+///   the type keeps the choice auditable from the server's own reply.
+///
+/// `geo` deliberately returns `None`: `milvus.rs` does not materialise a geo
+/// column and drops geo predicates (issue #223, out of scope here). Routing
+/// both the column pass and the index pass through this one function is what
+/// guarantees we never index a column that does not exist, or leave one that
+/// does unindexed.
+fn milvus_field_kind(field_name: &str, schema_type: &str) -> Option<MilvusFieldKind> {
+    // A multi-valued keyword field (`labels`) is an Array of VarChar (#88).
+    if (schema_type == "keyword" || schema_type == "text")
+        && is_multivalued_keyword_field(field_name)
+    {
+        return Some(MilvusFieldKind {
+            data_type: "Array",
+            index_type: "INVERTED",
+        });
+    }
+    let (data_type, index_type) = match schema_type {
+        "int" => ("Int64", "INVERTED"),
+        // A `uuid` is an exact-match opaque string → a plain VarChar (no
+        // analyzer), same as keyword.
+        "keyword" | "text" | "uuid" => ("VarChar", "INVERTED"),
+        "float" => ("Double", "INVERTED"),
+        // Milvus has a native Bool type; 2 distinct values → BITMAP.
+        "bool" => ("Bool", "BITMAP"),
+        // No native date type, so datetimes are stored as Int64 epoch seconds
+        // (upload + the range filter both convert via datetime_to_epoch_secs)
+        // and take the same INVERTED range index as `int`.
+        "datetime" => ("Int64", "INVERTED"),
+        _ => return None,
+    };
+    Some(MilvusFieldKind {
+        data_type,
+        index_type,
+    })
+}
+
+/// Every `(column, scalar index type)` pair that must exist for this dataset —
+/// i.e. every schema field `create_collection` materialised as a column. `id`
+/// (the primary key) and `vector` are excluded: the PK is indexed implicitly and
+/// `vector` gets the ANN index. Mirrors upstream
+/// `engine/clients/milvus/upload.py`, which loops every non-`id`/`vector` field
+/// of the collection schema and calls `create_index` on it.
+fn scalar_index_plan(dataset: &Dataset) -> Vec<(String, &'static str)> {
+    let mut plan = Vec::new();
+    if let Some(obj) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) {
+        for (field_name, field_type) in obj {
+            if field_name == "id" || field_name == "vector" {
+                continue;
+            }
+            if let Some(kind) = milvus_field_kind(field_name, field_type.as_str().unwrap_or("")) {
+                plan.push((field_name.clone(), kind.index_type));
+            }
+        }
+    }
+    plan
+}
+
+/// True when a failed `indexes/create` response means "this field already has an
+/// index", which is not an error for us — mirrors upstream tolerating pymilvus
+/// error code 1 ("index already exist"). v2.6.19 returns code 0 for an identical
+/// re-create, and 1100 with one of these messages when an index of a DIFFERENT
+/// type/name already covers the field. Either way the column IS indexed, so the
+/// property we care about holds. Anything else must surface as a hard error
+/// rather than silently leaving a column unindexed.
+fn is_already_indexed_error(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("already exist")
+        || m.contains("at most one distinct index is allowed per field")
+        || m.contains("creating multiple indexes on same field is not supported")
+}
+
 pub struct MilvusEngine {
     name: String,
     collection_name: String,
@@ -179,13 +311,18 @@ impl MilvusEngine {
             if let Some(schema_obj) = schema.as_object() {
                 for (field_name, field_type) in schema_obj {
                     let ft = field_type.as_str().unwrap_or("");
+                    // Single source of truth for "does this schema field become a
+                    // column, and of what Milvus type" — shared with the scalar
+                    // index pass so the two can never disagree (a column with no
+                    // index means a brute-force scan; see issue #218).
+                    let Some(kind) = milvus_field_kind(field_name, ft) else {
+                        continue;
+                    };
                     // A multi-valued keyword field (`labels`) is declared as an
                     // Array of VarChar so `array_contains_any` can match a single
                     // element; a scalar VarChar could only test whole-string
                     // equality against the joined value (issue #88).
-                    let field = if (ft == "keyword" || ft == "text")
-                        && is_multivalued_keyword_field(field_name)
-                    {
+                    let field = if kind.data_type == "Array" {
                         serde_json::json!({
                             "fieldName": field_name,
                             "dataType": "Array",
@@ -193,21 +330,7 @@ impl MilvusEngine {
                             "elementTypeParams": {"max_length": "500", "max_capacity": "128"},
                         })
                     } else {
-                        let milvus_type = match ft {
-                            "int" => "Int64",
-                            // A `uuid` is an exact-match opaque string → a plain
-                            // VarChar (no analyzer), same as keyword. Without this
-                            // arm it hit `_ => continue`, so no field was created
-                            // and every uuid filter silently broke.
-                            "keyword" | "text" | "uuid" => "VarChar",
-                            "float" => "Double",
-                            // Milvus has a native Bool type. No native date type, so
-                            // datetimes are stored as Int64 epoch seconds (upload +
-                            // filter both convert via datetime_to_epoch_secs).
-                            "bool" => "Bool",
-                            "datetime" => "Int64",
-                            _ => continue,
-                        };
+                        let milvus_type = kind.data_type;
                         let mut field = serde_json::json!({
                             "fieldName": field_name,
                             "dataType": milvus_type,
@@ -270,7 +393,11 @@ impl MilvusEngine {
         Ok(())
     }
 
-    fn create_index(&self, client: &reqwest::blocking::Client) -> Result<(), String> {
+    fn create_index(
+        &self,
+        client: &reqwest::blocking::Client,
+        dataset: &Dataset,
+    ) -> Result<(), String> {
         let body = serde_json::json!({
             "collectionName": self.collection_name,
             "indexParams": [{
@@ -301,6 +428,86 @@ impl MilvusEngine {
             ));
         }
 
+        self.create_scalar_indexes(client, dataset)
+    }
+
+    /// Create a scalar (payload) index on EVERY column built from the dataset
+    /// schema. Without this, Milvus has nothing to look up the filter with and
+    /// resolves every filtered query by scanning the scalar column behind the
+    /// ANN search — the same rows, just far slower, which is why recall-based
+    /// tests never caught it (issue #218).
+    ///
+    /// One request per field (rather than one batched request) so that an
+    /// "already indexed" field is tolerated individually instead of failing the
+    /// whole batch — the same granularity as upstream's per-field loop.
+    fn create_scalar_indexes(
+        &self,
+        client: &reqwest::blocking::Client,
+        dataset: &Dataset,
+    ) -> Result<(), String> {
+        let plan = scalar_index_plan(dataset);
+        if plan.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!("{}/v2/vectordb/indexes/create", self.base_url);
+        let mut created = Vec::with_capacity(plan.len());
+        for (field_name, index_type) in &plan {
+            let body = serde_json::json!({
+                "collectionName": self.collection_name,
+                "indexParams": [{
+                    "fieldName": field_name,
+                    "indexName": format!("{}_index", field_name),
+                    "indexType": index_type,
+                }]
+            });
+            let resp = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("Failed to create scalar index on {}: {}", field_name, e))?;
+
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "Failed to create scalar index on {}: {} {}",
+                    field_name,
+                    resp.status(),
+                    resp.text().unwrap_or_default()
+                ));
+            }
+
+            // The REST layer answers 200 with an application-level `code`, so the
+            // HTTP status alone proves nothing — an unchecked `code != 0` here is
+            // precisely how a missing index stays invisible.
+            let resp_body: serde_json::Value = resp.json().unwrap_or_default();
+            let code = resp_body.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+            if code != 0 {
+                let msg = resp_body
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                if is_already_indexed_error(msg) {
+                    println!(
+                        "  scalar index on '{}' already exists, skipping",
+                        field_name
+                    );
+                    continue;
+                }
+                return Err(format!(
+                    "Failed to create scalar index on {}: {}",
+                    field_name, msg
+                ));
+            }
+            created.push(format!("{}({})", field_name, index_type));
+        }
+
+        println!(
+            "Created {}/{} scalar index(es): {}",
+            created.len(),
+            plan.len(),
+            created.join(", ")
+        );
         Ok(())
     }
 
@@ -937,7 +1144,7 @@ impl Engine for MilvusEngine {
             self.index_type, self.index_m, self.index_ef_construction, self.metric_type
         );
         let index_start = Instant::now();
-        self.create_index(&client)?;
+        self.create_index(&client, dataset)?;
 
         // Load collection into memory
         self.load_collection(&client)?;
@@ -1408,6 +1615,124 @@ mod tests {
             build_milvus_filter("flag", "match", &json!({"value":true})).unwrap(),
             "flag == true"
         );
+    }
+
+    // ── #218: scalar (payload) index coverage ──────────────────────────────
+    //
+    // Before the fix, `create_index` posted a single `indexParams` entry for
+    // `vector` and nothing else, so every filtered query was resolved by a
+    // brute-force scan of the unindexed scalar column. No recall assertion can
+    // see that (an unindexed scan returns the SAME rows), so these tests pin
+    // the structural property instead.
+
+    fn dataset_with_schema(schema: serde_json::Value) -> Dataset {
+        Dataset::new(crate::config::DatasetConfig {
+            name: "t".into(),
+            dataset_type: Some("tar".into()),
+            path: json!("t/"),
+            distance: Some("l2".into()),
+            vector_size: Some(8),
+            vector_count: Some(1),
+            link: None,
+            schema: Some(schema),
+            description: None,
+        })
+    }
+
+    /// THE invariant behind #218: a schema field that becomes a COLUMN must
+    /// also get an INDEX. Both passes read `milvus_field_kind`, so this asserts
+    /// the two can never diverge again for any schema type we support.
+    #[test]
+    fn every_materialised_column_is_also_indexed() {
+        let schema = json!({
+            "kw": "keyword", "txt": "text", "uid": "uuid", "n": "int",
+            "f": "float", "flag": "bool", "ts": "datetime", "labels": "keyword",
+            "loc": "geo", "weird": "not-a-type",
+        });
+        let plan = scalar_index_plan(&dataset_with_schema(schema.clone()));
+        let indexed: std::collections::BTreeSet<&str> =
+            plan.iter().map(|(f, _)| f.as_str()).collect();
+
+        for (field, ty) in schema.as_object().unwrap() {
+            let has_column = milvus_field_kind(field, ty.as_str().unwrap()).is_some();
+            assert_eq!(
+                has_column,
+                indexed.contains(field.as_str()),
+                "field '{}' ({}) has column={} but indexed={} — a column without an \
+                 index makes every filter on it a full scan (#218)",
+                field,
+                ty,
+                has_column,
+                indexed.contains(field.as_str())
+            );
+        }
+        // `geo` is not materialised at all (issue #223), so it must be in
+        // neither set — not indexed, and not silently indexed either.
+        assert!(!indexed.contains("loc"));
+        assert!(!indexed.contains("weird"));
+    }
+
+    /// The per-type index choice, verified live against milvusdb/milvus:v2.6.19
+    /// (see `milvus_field_kind`'s doc comment for the full acceptance matrix).
+    #[test]
+    fn scalar_index_types_per_field_type() {
+        let expect = |field: &str, ty: &str| milvus_field_kind(field, ty).unwrap();
+        // Point + range predicates over one structure; also what AUTOINDEX picks.
+        assert_eq!(expect("kw", "keyword").index_type, "INVERTED");
+        assert_eq!(expect("b", "text").index_type, "INVERTED");
+        assert_eq!(expect("u", "uuid").index_type, "INVERTED");
+        assert_eq!(expect("n", "int").index_type, "INVERTED");
+        assert_eq!(expect("f", "float").index_type, "INVERTED");
+        // datetime is an Int64 epoch column, filtered by range → same as int.
+        assert_eq!(expect("ts", "datetime").index_type, "INVERTED");
+        assert_eq!(expect("ts", "datetime").data_type, "Int64");
+        // Bool has exactly 2 distinct values → BITMAP (STL_SORT is rejected on
+        // Bool by the server).
+        assert_eq!(expect("flag", "bool").index_type, "BITMAP");
+        assert_eq!(expect("flag", "bool").data_type, "Bool");
+        // Multi-valued `labels` is an Array(VarChar) (#88); only INVERTED and
+        // BITMAP are accepted there, and cardinality is unbounded → INVERTED.
+        assert_eq!(expect("labels", "keyword").data_type, "Array");
+        assert_eq!(expect("labels", "keyword").index_type, "INVERTED");
+        // A scalar keyword named anything else stays a VarChar.
+        assert_eq!(expect("color", "keyword").data_type, "VarChar");
+        // Not materialised → no column, no index.
+        assert!(milvus_field_kind("loc", "geo").is_none());
+    }
+
+    /// `id`/`vector` are excluded (PK is implicitly indexed, `vector` gets the
+    /// ANN index) — mirrors upstream's `field.name not in ("id", "vector")`.
+    #[test]
+    fn scalar_index_plan_skips_id_and_vector() {
+        let plan = scalar_index_plan(&dataset_with_schema(
+            json!({"id": "int", "vector": "int", "a": "keyword"}),
+        ));
+        assert_eq!(plan, vec![("a".to_string(), "INVERTED")]);
+    }
+
+    #[test]
+    fn scalar_index_plan_empty_for_unfiltered_dataset() {
+        assert!(scalar_index_plan(&dataset_with_schema(json!({}))).is_empty());
+    }
+
+    /// Only a genuine "the field is already indexed" reply is tolerated. Both
+    /// strings are the verbatim v2.6.19 messages for re-creating an index on a
+    /// covered field; anything else must fail loudly rather than leave a column
+    /// unindexed.
+    #[test]
+    fn already_indexed_error_detection() {
+        assert!(is_already_indexed_error(
+            "at most one distinct index is allowed per field: invalid parameter"
+        ));
+        assert!(is_already_indexed_error(
+            "CreateIndex failed: creating multiple indexes on same field is not supported: invalid parameter"
+        ));
+        assert!(is_already_indexed_error("index already exist"));
+        // Real failures must NOT be swallowed.
+        assert!(!is_already_indexed_error(
+            "bitmap index are only supported on bool, int, string and array field: invalid parameter"
+        ));
+        assert!(!is_already_indexed_error("collection not found"));
     }
 
     #[test]

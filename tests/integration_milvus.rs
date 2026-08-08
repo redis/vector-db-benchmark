@@ -1,6 +1,7 @@
 //! Integration tests for the Milvus engine.
 //!
-//! Requires Milvus 2.5.6 running on port 19531 (standalone mode with etcd + minio).
+//! Requires Milvus (v2.6.19, per tests/docker-compose.test.yml) running on port
+//! 19531 (standalone mode with etcd + minio).
 //! Start with: docker compose -f tests/docker-compose.test.yml up -d milvus --wait
 //! Run with:   MILVUS_PORT=19531 cargo test --test integration_milvus --release -- --test-threads=1
 
@@ -55,12 +56,175 @@ fn wait_for_milvus() {
 }
 
 fn drop_test_collection() {
+    drop_collection(TEST_COLLECTION);
+}
+
+/// Best-effort drop of a named collection (the index read-back tests run with
+/// `--keep-data`, so they must clean up their own collection afterwards).
+fn drop_collection(name: &str) {
     let client = http_client();
     let url = format!("{}/v2/vectordb/collections/drop", milvus_base_url());
     let _ = client
         .post(&url)
-        .json(&serde_json::json!({"collectionName": TEST_COLLECTION}))
+        .json(&serde_json::json!({"collectionName": name}))
         .send();
+}
+
+/// Read the collection's indexes back FROM THE SERVER and return
+/// `fieldName -> (indexType, indexState)`.
+///
+/// `indexes/list` returns index NAMES only, so each one is then described to
+/// recover which field it covers and what type it is. Reading it back from the
+/// server (rather than trusting the create call's 200) is the whole point: the
+/// create path already returned success while creating nothing but the vector
+/// index (issue #218).
+fn read_back_indexes(collection: &str) -> std::collections::HashMap<String, (String, String)> {
+    let client = http_client();
+    let resp = client
+        .post(format!("{}/v2/vectordb/indexes/list", milvus_base_url()))
+        .json(&serde_json::json!({ "collectionName": collection }))
+        .send()
+        .expect("indexes/list request failed");
+    let body: serde_json::Value = resp.json().expect("indexes/list not JSON");
+    assert_eq!(
+        body.get("code").and_then(|c| c.as_i64()),
+        Some(0),
+        "indexes/list failed for '{}': {:?}",
+        collection,
+        body
+    );
+
+    let mut out = std::collections::HashMap::new();
+    for name in body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let name = name.as_str().unwrap_or_default();
+        let resp = client
+            .post(format!(
+                "{}/v2/vectordb/indexes/describe",
+                milvus_base_url()
+            ))
+            .json(&serde_json::json!({"collectionName": collection, "indexName": name}))
+            .send()
+            .expect("indexes/describe request failed");
+        let body: serde_json::Value = resp.json().expect("indexes/describe not JSON");
+        for row in body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            let field = row
+                .get("fieldName")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let itype = row
+                .get("indexType")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let state = row
+                .get("indexState")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            out.insert(field, (itype, state));
+        }
+    }
+    out
+}
+
+/// The scalar `indexType` the engine must create for a dataset schema type —
+/// the test's INDEPENDENT copy of `milvus_field_kind`'s decision, so a silent
+/// change to the engine's mapping fails here rather than passing by circularity.
+/// `None` = the type is not materialised as a column (only `geo`, issue #223).
+fn expected_index_type(field_name: &str, schema_type: &str) -> Option<&'static str> {
+    if schema_type == "geo" {
+        return None;
+    }
+    if field_name == "labels" && (schema_type == "keyword" || schema_type == "text") {
+        return Some("INVERTED"); // Array(VarChar)
+    }
+    match schema_type {
+        "bool" => Some("BITMAP"),
+        "int" | "float" | "datetime" | "keyword" | "text" | "uuid" => Some("INVERTED"),
+        _ => None,
+    }
+}
+
+/// **Issue #218 guard.** Assert that EVERY field of the dataset schema has a
+/// scalar index on the server, of the expected type and in a built state — plus
+/// the `vector` ANN index.
+///
+/// This cannot be replaced by a recall assertion: an unindexed scalar column
+/// returns exactly the same rows as an indexed one, so recall is identical and
+/// only latency differs. That is precisely why a Milvus collection ran for this
+/// long with no scalar index at all. The property must be read back from the
+/// server's own index catalogue.
+fn assert_all_schema_fields_indexed(collection: &str, schema: &serde_json::Value) {
+    let found = read_back_indexes(collection);
+    println!("milvus index read-back for '{}': {:?}", collection, found);
+
+    let vector = found.get("vector").unwrap_or_else(|| {
+        panic!(
+            "collection '{}' has no vector index: {:?}",
+            collection, found
+        )
+    });
+    assert_eq!(
+        vector.0, "HNSW",
+        "vector index type unexpected in '{}': {:?}",
+        collection, found
+    );
+
+    let mut expected_fields = std::collections::BTreeSet::new();
+    for (field, ty) in schema.as_object().expect("schema must be an object") {
+        let schema_type = ty.as_str().unwrap_or_default();
+        let Some(expected) = expected_index_type(field, schema_type) else {
+            continue;
+        };
+        expected_fields.insert(field.clone());
+        let (itype, state) = found.get(field).unwrap_or_else(|| {
+            panic!(
+                "schema field '{}' ({}) has NO index in collection '{}' — a filter on it is a \
+                 brute-force scalar scan (issue #218). Indexes present: {:?}",
+                field, schema_type, collection, found
+            )
+        });
+        assert_eq!(
+            itype, expected,
+            "schema field '{}' ({}) is indexed as {} in '{}', expected {}",
+            field, schema_type, itype, collection, expected
+        );
+        assert_eq!(
+            state, "Finished",
+            "index on '{}' in '{}' is not built (state={})",
+            field, collection, state
+        );
+    }
+    assert!(
+        !expected_fields.is_empty(),
+        "fixture schema declared no indexable field — the assertion would be vacuous"
+    );
+
+    // Exact set equality, not just containment: an index on the server that the
+    // caller's schema literal does not mention means this test's copy of the
+    // fixture schema has drifted, and the "every field is indexed" claim would
+    // be checked against the wrong field list.
+    let actual_fields: std::collections::BTreeSet<String> = found
+        .keys()
+        .filter(|f| f.as_str() != "vector")
+        .cloned()
+        .collect();
+    assert_eq!(
+        actual_fields, expected_fields,
+        "scalar indexes on '{}' do not match the declared schema",
+        collection
+    );
 }
 
 fn generate_test_vectors(count: usize, dim: usize) -> (Vec<i64>, Vec<Vec<f32>>) {
@@ -471,7 +635,7 @@ fn test_binary_milvus_bool() {
         common::write_bool_project("bool-test", &serde_json::to_string(&configs).unwrap(), dim);
     assert!(proj.matching_docs >= proj.top);
     assert!(
-        common::run_binary(
+        common::run_binary_extra(
             &proj.root,
             "milvus-bool",
             "bool-test",
@@ -480,9 +644,12 @@ fn test_binary_milvus_bool() {
                 ("MILVUS_PORT", "19531"),
                 ("MILVUS_COLLECTION_NAME", "bench_bool")
             ],
+            &["--keep-data"],
         ),
         "milvus bool run failed"
     );
+    assert_all_schema_fields_indexed("bench_bool", &serde_json::json!({"flag": "bool"}));
+    drop_collection("bench_bool");
     let recall = common::read_recall(&proj.root, "milvus-bool");
     println!("milvus bool recall={:.3}", recall);
     assert!(recall >= 0.9, "milvus bool recall {:.3} < 0.9", recall);
@@ -505,7 +672,7 @@ fn test_binary_milvus_uuid() {
         common::write_uuid_project("uuid-test", &serde_json::to_string(&configs).unwrap(), dim);
     assert!(proj.matching_docs >= proj.top);
     assert!(
-        common::run_binary(
+        common::run_binary_extra(
             &proj.root,
             "milvus-uuid",
             "uuid-test",
@@ -514,9 +681,12 @@ fn test_binary_milvus_uuid() {
                 ("MILVUS_PORT", "19531"),
                 ("MILVUS_COLLECTION_NAME", "bench_uuid")
             ],
+            &["--keep-data"],
         ),
         "milvus uuid run failed"
     );
+    assert_all_schema_fields_indexed("bench_uuid", &serde_json::json!({"uid": "uuid"}));
+    drop_collection("bench_uuid");
     let recall = common::read_recall(&proj.root, "milvus-uuid");
     println!("milvus uuid recall={:.3}", recall);
     assert!(recall >= 0.9, "milvus uuid recall {:.3} < 0.9", recall);
@@ -541,7 +711,7 @@ fn test_binary_milvus_and_filter() {
     );
     assert!(proj.matching_docs >= proj.top);
     assert!(
-        common::run_binary(
+        common::run_binary_extra(
             &proj.root,
             "milvus-and",
             "and-test",
@@ -550,9 +720,15 @@ fn test_binary_milvus_and_filter() {
                 ("MILVUS_PORT", "19531"),
                 ("MILVUS_COLLECTION_NAME", "bench_and")
             ],
+            &["--keep-data"],
         ),
         "milvus and-filter run failed"
     );
+    assert_all_schema_fields_indexed(
+        "bench_and",
+        &serde_json::json!({"color": "keyword", "size": "int"}),
+    );
+    drop_collection("bench_and");
     let recall = common::read_recall(&proj.root, "milvus-and");
     println!("milvus and-filter recall={:.3}", recall);
     assert!(
@@ -611,7 +787,7 @@ fn test_binary_milvus_datetime() {
         common::write_datetime_project("dt-test", &serde_json::to_string(&configs).unwrap(), dim);
     assert!(proj.matching_docs >= proj.top);
     assert!(
-        common::run_binary(
+        common::run_binary_extra(
             &proj.root,
             "milvus-dt",
             "dt-test",
@@ -620,9 +796,12 @@ fn test_binary_milvus_datetime() {
                 ("MILVUS_PORT", "19531"),
                 ("MILVUS_COLLECTION_NAME", "bench_dt")
             ],
+            &["--keep-data"],
         ),
         "milvus datetime run failed"
     );
+    assert_all_schema_fields_indexed("bench_dt", &serde_json::json!({"ts": "datetime"}));
+    drop_collection("bench_dt");
     let recall = common::read_recall(&proj.root, "milvus-dt");
     println!("milvus datetime recall={:.3}", recall);
     assert!(recall >= 0.9, "milvus datetime recall {:.3} < 0.9", recall);
@@ -645,7 +824,7 @@ fn test_binary_milvus_fulltext() {
         common::write_fulltext_project("ft-test", &serde_json::to_string(&configs).unwrap(), dim);
     assert!(proj.matching_docs >= proj.top);
     assert!(
-        common::run_binary(
+        common::run_binary_extra(
             &proj.root,
             "milvus-ft",
             "ft-test",
@@ -654,9 +833,12 @@ fn test_binary_milvus_fulltext() {
                 ("MILVUS_PORT", "19531"),
                 ("MILVUS_COLLECTION_NAME", "bench_ft")
             ],
+            &["--keep-data"],
         ),
         "milvus fulltext run failed"
     );
+    assert_all_schema_fields_indexed("bench_ft", &serde_json::json!({"body": "text"}));
+    drop_collection("bench_ft");
     let recall = common::read_recall(&proj.root, "milvus-ft");
     println!("milvus fulltext recall={:.3}", recall);
     assert!(recall >= 0.9, "milvus fulltext recall {:.3} < 0.9", recall);
@@ -732,7 +914,7 @@ fn test_binary_milvus_match_any_labels() {
     );
 
     assert!(
-        common::run_binary(
+        common::run_binary_extra(
             &proj.root,
             "milvus-mal",
             "match-any-labels-test",
@@ -741,10 +923,16 @@ fn test_binary_milvus_match_any_labels() {
                 ("MILVUS_PORT", "19531"),
                 ("MILVUS_COLLECTION_NAME", "bench_matchany_labels"),
             ],
+            &["--keep-data"],
         ),
         "milvus match_any labels run failed"
     );
 
+    assert_all_schema_fields_indexed(
+        "bench_matchany_labels",
+        &serde_json::json!({"labels": "keyword"}),
+    );
+    drop_collection("bench_matchany_labels");
     let recall = common::read_recall(&proj.root, "milvus-mal");
     println!("milvus match_any labels recall={:.3}", recall);
     assert!(
