@@ -965,6 +965,53 @@ mod tests {
         assert!(build_chroma_leaf("body", "match", &json!({"text":"quick"})).is_none());
     }
 
+    /// The refusal must cover the WHOLE tree, not just the geo leaf.
+    ///
+    /// Without the `conditions_mention_geo` guard at the top of both builders,
+    /// `and(geo, keyword)` renders `{"color":{"$eq":"red"}}` — a filter that
+    /// looks real, satisfies the #219 guard, and constrains LESS than the ground
+    /// truth does. That is the partial-drop escape `query_filter.rs` documents,
+    /// and it is exactly the silent under-filtering this PR exists to remove.
+    ///
+    /// The integration test cannot see this: its fixture is geo-ONLY, so the
+    /// leaf builder refuses on its own and the guard could be deleted with every
+    /// test still green. This is the only thing holding it.
+    #[test]
+    fn a_geo_leaf_refuses_the_whole_tree_not_just_itself() {
+        let mixed = json!({"and": [
+            {"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 5.0}}},
+            {"color": {"match": {"value": "red"}}}
+        ]});
+        // The sibling alone IS expressible — so `None` below is the guard, not
+        // an inability to render the keyword leaf.
+        assert!(
+            build_chroma_where(&json!({"and": [{"color": {"match": {"value": "red"}}}]})).is_some()
+        );
+        assert_eq!(build_chroma_where(&mixed), None);
+        assert_eq!(build_chroma_where_document(&mixed), None);
+
+        // Same for a geo leaf mixed with a FULL-TEXT sibling, which lives in the
+        // other builder: `where_document` has its own copy of the guard.
+        let mixed_text = json!({"and": [
+            {"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 5.0}}},
+            {"body": {"match": {"text": "quick"}}}
+        ]});
+        assert!(build_chroma_where_document(
+            &json!({"and": [{"body": {"match": {"text": "quick"}}}]})
+        )
+        .is_some());
+        assert_eq!(build_chroma_where(&mixed_text), None);
+        assert_eq!(build_chroma_where_document(&mixed_text), None);
+
+        // And a nested tree, where the geo leaf is two levels down.
+        let nested = json!({"or": [
+            {"and": [{"loc": {"geo": {"lat": 1.0, "lon": 2.0, "radius": 5.0}}}]},
+            {"and": [{"color": {"match": {"value": "red"}}}]}
+        ]});
+        assert_eq!(build_chroma_where(&nested), None);
+        assert_eq!(build_chroma_where_document(&nested), None);
+    }
+
     #[test]
     fn fulltext_routes_to_where_document_contains() {
         let cond = json!({"and":[{"body":{"match":{"text":"quick"}}}]});

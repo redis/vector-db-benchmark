@@ -827,12 +827,19 @@ pub fn write_datetime_keyword_schema_cosine_project(
     )
 }
 
-/// Great-circle distance in metres (haversine, R=6_371_000 m). Used to
-/// brute-force geo-radius ground truth. The ~55 m margin baked into
+/// Earth radius these fixtures' ground truth is computed on. Matches Milvus'
+/// `ST_DWITHIN` refine step and `engine::geo::EARTH_RADIUS_M` exactly; other
+/// engines' models differ by up to ~0.11 % (see `engine/geo.rs`), which is why
+/// every fixture except `write_geo_edge_project` keeps a wide boundary margin.
+const GT_EARTH_RADIUS_M: f64 = 6_371_000.0;
+
+/// Great-circle distance in metres (haversine, R=[`GT_EARTH_RADIUS_M`]). Used to
+/// brute-force geo-radius ground truth. The margin baked into
 /// [`write_geo_project`] keeps every doc clearly inside or outside the radius
-/// despite tiny differences vs each engine's own earth model.
+/// despite tiny differences vs each engine's own earth model — measured, its
+/// tightest is **16.6 m** (an earlier comment said ~55 m).
 fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0;
+    const R: f64 = GT_EARTH_RADIUS_M;
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
     let dphi = (lat2 - lat1).to_radians();
     let dlambda = (lon2 - lon1).to_radians();
@@ -845,6 +852,15 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// doc 0's location selecting the nearest ~198 docs; ground truth is brute-forced
 /// with [`haversine_m`]. The reader parses geo as `{"lon":..,"lat":..}`; the
 /// query condition is `{geo:{lat,lon,radius}}` with radius in METERS.
+///
+/// **What it proves, and what it does not.** Every document lies on ONE
+/// meridian, so a lat/lon BOUNDING BOX and the great-circle CIRCLE of the same
+/// radius select the identical set. Measured: swapping an engine's geo predicate
+/// for a real lat/lon polygon still scores **1.000** here, and **0.240** on
+/// [`write_geo_corner_project`]. So this fixture shows that *a* geo-ish filter
+/// was applied — not that its shape is a circle. Prefer the corner fixture for
+/// anything new; this one is kept because several engines' geo tests already
+/// reference it.
 pub fn write_geo_project(
     dataset_name: &str,
     engine_configs_json: &str,
@@ -892,8 +908,19 @@ pub fn write_geo_project(
 // Ground truth is the top-10 over the 100 in-circle documents only (25 %
 // selectivity). An engine applying the true radius scores ~1.0; an engine
 // applying the bounding box, or no filter at all, searches all 400 and lands
-// roughly a quarter of the correct neighbours — around 0.25, far below the 0.9
-// floor every filter test in this repo asserts.
+// roughly a quarter of the correct neighbours — measured at 0.240-0.280, far
+// below the 0.9 floor every filter test in this repo asserts.
+//
+// WHAT IT IS BLIND TO, stated so nobody over-reads it. The guard band is
+// [0.7065, 1.1013] * radius, so ANY radius within [-29.4 %, +10.1 %] selects the
+// identical 100 documents — a wrong radius is a provably equivalent mutant here
+// (measured: x1.101 -> 100 docs, x1.11 -> 104, x1.15 -> 128, x1.40 -> 400).
+// So is `>` vs `>=` (nothing sits within 10 % of the boundary), and so is an
+// equirectangular approximation (~1e-5 relative error at 20 km, deep inside the
+// band). Those are caught by the exact-string unit pins on each engine's emitted
+// filter and by `engine::geo`'s poles-and-antimeridian haversine grid, NOT by
+// this fixture. It is blind in both directions, which is also why it cannot see
+// a prune box SMALLER than the cap — see `write_geo_edge_project` for that.
 //
 // `tests/integration_redis.rs` runs it against RediSearch's native
 // `@f:[lon lat r m]` as a control, so a failure here is the engine, not the
@@ -1043,6 +1070,174 @@ pub fn write_and_filter_project(
         ] }),
         move |id| id % 2 == 0 && (id % 100) as i64 >= 50,
     )
+}
+
+// ── Antimeridian / near-boundary geo fixture (issue #223, Milvus RTREE) ─────
+//
+// `write_geo_corner_project` above defeats a bounding box that is LARGER than
+// the circle. It cannot see the opposite bug — a prune box that is SMALLER —
+// because its in-circle documents all sit at <= 0.71 * radius, comfortably
+// inside any such box, and its out-of-circle documents are meant to be excluded
+// anyway.
+//
+// Milvus has exactly that bug when a `Geometry` column carries an `RTREE`:
+// `create_bounding_box_for_dwithin` divides by `111320.0` m/degree where the
+// truth is 111 194.93, so the prune box is ~0.11 % short in every direction, the
+// longitude half-width underestimates further at high latitude, and it does not
+// wrap the antimeridian at all. Anything inside the cap but outside that box is
+// discarded before the exact `ST_DWITHIN` refine ever runs. On the shipped
+// dataset that silently caps recall at ~0.935.
+//
+// This fixture puts documents exactly where those three defects bite:
+//
+//   * query 0 — centre (81 N, 10 E), the high-latitude case, with in-cap
+//     documents on all four cardinal bearings at 0.9990-0.9997 * radius: inside
+//     the cap, outside a box 0.11 % short;
+//   * query 1 — centre (0 N, 179.9 E), with in-cap documents 30-199 km east and
+//     west, so half of them sit ACROSS the antimeridian at negative longitudes,
+//     which an unwrapped box drops outright.
+//
+// Measured first-hand against `milvusdb/milvus:v2.6.19`, identical rows in two
+// collections that differ only by the presence of the RTREE:
+//
+//   centre (81, 10), r = 200 km : truth 20 docs — RTREE returned 14, dropping
+//     the six at 0.9990-0.9995 * radius due NORTH and SOUTH (the latitude
+//     half-width is the one the 111 320 divisor shortens);
+//   centre (0, 179.9), r = 200 km : truth 8 docs — RTREE returned 4, dropping
+//     every one of the four that crossed +180.
+//
+// Without the index both cases return the full truth.
+//
+// NOTE ON WHAT THIS FIXTURE'S RECALL CAN SEE. Re-adding the RTREE and running
+// the fixture through the harness was tried: recall stayed **1.000**. With 400
+// documents and random vectors the handful of pruned documents are rarely in a
+// query's top-10, so the defect is invisible to recall at this scale even though
+// it costs 6.4 % of the ground truth at 1M. The assertion that actually fires is
+// the index-presence one in `tests/integration_milvus.rs`; this fixture supplies
+// the geometry and a per-query recall floor, not the catch.
+//
+// CALIBRATION WARNING. The query-0 band is only 0.1 % wide, which is NARROWER
+// than the spread between engines' earth radii (pgvector's `earthdistance` uses
+// 6 378 168 m, 0.11 % above the 6 371 000 m this fixture's ground truth uses, so
+// it would legitimately exclude those documents). Use this fixture only with an
+// engine whose radius is 6 371 000 m — Milvus' `ST_DWITHIN` is. The query-1
+// antimeridian half has no such caveat: those documents are 30-150 km inside a
+// 200 km cap under any earth model, so that half discriminates robustly.
+
+/// Destination point from `(lat, lon)` after travelling `dist_m` on `bearing`,
+/// on a sphere of [`GT_EARTH_RADIUS_M`]. Longitude is normalised to [-180, 180],
+/// which is what makes the antimeridian cases actually cross it.
+fn dest_point(lat: f64, lon: f64, bearing_deg: f64, dist_m: f64) -> (f64, f64) {
+    let ang = dist_m / GT_EARTH_RADIUS_M;
+    let (phi1, lam1, theta) = (lat.to_radians(), lon.to_radians(), bearing_deg.to_radians());
+    let phi2 = (phi1.sin() * ang.cos() + phi1.cos() * ang.sin() * theta.cos()).asin();
+    let lam2 =
+        lam1 + (theta.sin() * ang.sin() * phi1.cos()).atan2(ang.cos() - phi1.sin() * phi2.sin());
+    let mut lon2 = lam2.to_degrees();
+    // Normalise into [-180, 180) so a point past +180 comes back as negative.
+    while lon2 >= 180.0 {
+        lon2 -= 360.0;
+    }
+    while lon2 < -180.0 {
+        lon2 += 360.0;
+    }
+    (phi2.to_degrees(), lon2)
+}
+
+/// The two query centres and their radius. Query 0 is the high-latitude
+/// near-boundary case, query 1 the antimeridian case.
+const GEO_EDGE_CENTRES: [(f64, f64); 2] = [(81.0, 10.0), (0.0, 179.9)];
+const GEO_EDGE_RADIUS_M: f64 = 200_000.0;
+
+/// Where document `id` sits. 0..199 belong to centre 0, 200..399 to centre 1;
+/// within each half the first 150 are inside the cap and the last 50 outside.
+fn geo_edge_loc(id: usize) -> (f64, f64) {
+    let half = id / 200;
+    let k = id % 200;
+    let (clat, clon) = GEO_EDGE_CENTRES[half];
+    // East and west first — those are the bearings the longitude defect hits.
+    let bearing = [90.0, 270.0, 0.0, 180.0][k % 4];
+    if k < 150 {
+        let frac = if half == 0 {
+            // 0.9990 .. 0.9997 — inside the cap, outside a 0.11 %-short box.
+            0.9990 + 0.0007 * (k / 4) as f64 / 37.0
+        } else {
+            // 0.15 .. 0.75 of the radius: 30-150 km out, robustly inside the cap
+            // under any earth model, but across the antimeridian going east.
+            0.15 + 0.60 * (k / 4) as f64 / 37.0
+        };
+        dest_point(clat, clon, bearing, GEO_EDGE_RADIUS_M * frac)
+    } else {
+        // Outside: 1.05 .. 1.40 of the radius.
+        let frac = 1.05 + 0.35 * ((k - 150) / 4) as f64 / 12.0;
+        dest_point(clat, clon, bearing, GEO_EDGE_RADIUS_M * frac)
+    }
+}
+
+/// Antimeridian / near-boundary geo fixture. Two queries, each a geo-radius on
+/// the `location` field, with ground truth brute-forced per query.
+pub fn write_geo_edge_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    let matches = |q: usize, id: usize| {
+        let (lat, lon) = geo_edge_loc(id);
+        let (clat, clon) = GEO_EDGE_CENTRES[q];
+        haversine_m(lat, lon, clat, clon) <= GEO_EDGE_RADIUS_M
+    };
+
+    let proj = write_filter_project_multi(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        GtMetric::L2,
+        GEO_EDGE_CENTRES.len(),
+        serde_json::json!({ "location": "geo" }),
+        move |id| {
+            let (lat, lon) = geo_edge_loc(id);
+            serde_json::json!({ "location": { "lon": lon, "lat": lat } })
+        },
+        move |q| {
+            let (clat, clon) = GEO_EDGE_CENTRES[q];
+            serde_json::json!({ "and": [ { "location": { "geo": {
+                "lat": clat, "lon": clon, "radius": GEO_EDGE_RADIUS_M } } } ] })
+        },
+        matches,
+    );
+
+    // The fixture is worthless unless it actually contains the two shapes it
+    // claims, so assert them rather than trusting the layout arithmetic.
+    let mut near_boundary = 0usize; // in-cap, but outside a 0.11 %-short box
+    let mut across_antimeridian = 0usize; // in-cap for q1, opposite lon sign
+    for id in 0..N_DOCS {
+        let (lat, lon) = geo_edge_loc(id);
+        if matches(0, id) {
+            let d = haversine_m(lat, lon, GEO_EDGE_CENTRES[0].0, GEO_EDGE_CENTRES[0].1);
+            if d > GEO_EDGE_RADIUS_M * 0.99888 {
+                near_boundary += 1;
+            }
+        }
+        if matches(1, id) && lon < 0.0 {
+            across_antimeridian += 1;
+        }
+    }
+    assert!(
+        near_boundary >= 20,
+        "fixture must hold documents inside the cap but outside a 0.11 %-short \
+         prune box, got {near_boundary}"
+    );
+    assert!(
+        across_antimeridian >= 20,
+        "fixture must hold in-cap documents on the far side of the antimeridian, \
+         got {across_antimeridian}"
+    );
+    assert!(
+        proj.matching_docs >= proj.top,
+        "every query needs >= top matching docs, smallest is {}",
+        proj.matching_docs
+    );
+    proj
 }
 
 /// Multi-condition OR fixture: same `color`/`size` payload as the AND fixture,

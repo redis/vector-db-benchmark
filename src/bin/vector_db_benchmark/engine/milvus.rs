@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 
+use super::geo;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::{Engine, SearchResults, UploadStats};
@@ -26,8 +27,10 @@ const DEFAULT_COLLECTION: &str = "Benchmark";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MilvusFieldKind {
     data_type: &'static str,
-    /// Milvus `indexType` for the scalar index on this column.
-    index_type: &'static str,
+    /// Milvus `indexType` for the scalar index on this column, or `None` for a
+    /// column that must deliberately stay UNINDEXED. `geo` is the only such
+    /// case — see the `"geo"` arm of [`milvus_field_kind`] for why.
+    index_type: Option<&'static str>,
 }
 
 /// Map a dataset schema field to its Milvus column type AND its scalar index
@@ -121,30 +124,65 @@ fn milvus_field_kind(field_name: &str, schema_type: &str) -> Option<MilvusFieldK
     {
         return Some(MilvusFieldKind {
             data_type: "Array",
-            index_type: "INVERTED",
+            index_type: Some("INVERTED"),
         });
     }
     let (data_type, index_type) = match schema_type {
-        "int" => ("Int64", "INVERTED"),
+        "int" => ("Int64", Some("INVERTED")),
         // A `uuid` is an exact-match opaque string → a plain VarChar (no
         // analyzer), same as keyword.
-        "keyword" | "text" | "uuid" => ("VarChar", "INVERTED"),
-        "float" => ("Double", "INVERTED"),
+        "keyword" | "text" | "uuid" => ("VarChar", Some("INVERTED")),
+        "float" => ("Double", Some("INVERTED")),
         // Milvus has a native Bool type; 2 distinct values → BITMAP.
-        "bool" => ("Bool", "BITMAP"),
+        "bool" => ("Bool", Some("BITMAP")),
         // No native date type, so datetimes are stored as Int64 epoch seconds
         // (upload + the range filter both convert via datetime_to_epoch_secs)
         // and take the same INVERTED range index as `int`.
-        "datetime" => ("Int64", "INVERTED"),
+        "datetime" => ("Int64", Some("INVERTED")),
         // Native geospatial column (issue #223). `Geometry` stores OGC WKT and
         // is queried with `ST_DWITHIN(field, 'POINT(lon lat)', metres)`, which
         // for a POINT column against a POINT query is an exact great-circle
         // haversine test on R = 6 371 000 m in the server's own C++
-        // (`internal/core/src/common/Geometry.h`) — the same earth radius
-        // `engine::geo::EARTH_RADIUS_M` and the fixtures' ground truth use.
-        // Added in Milvus 2.6.4; the pinned test image is v2.6.19. RTREE is the
-        // only index type for a Geometry column.
-        "geo" => ("Geometry", "RTREE"),
+        // (`internal/core/src/common/Geometry.h::dwithin`) — the same earth
+        // radius `engine::geo::EARTH_RADIUS_M` uses. Added in Milvus 2.6.4; the
+        // pinned test image is v2.6.19.
+        //
+        // DELIBERATELY UNINDEXED, which is the one exception to the #218
+        // column-implies-index rule. `RTREE` is the only index type Milvus
+        // offers for a Geometry column, and it is not merely a *coarse* filter —
+        // it prunes with a box that is SMALLER than the cap it is supposed to
+        // bound, so true hits are discarded before the exact refine step ever
+        // sees them. `GISFunctionFilterExpr.cpp::create_bounding_box_for_dwithin`
+        // builds it with
+        //
+        // ```cpp
+        // const double metersPerDegreeLat = 111320.0;
+        // double lonOffset = distance_meters / (metersPerDegreeLat * cos(latRad));
+        // ```
+        //
+        // 111 320 is larger than the true 111 194.93 m/degree, so the box is
+        // ~0.11 % short in every direction; the flat `theta/cos(phi)` longitude
+        // half-width also underestimates at high latitude, and there is no
+        // antimeridian wrap at all. Measured on the shipped
+        // `random-geo-radius-100-angular-filters` (first 500 queries against the
+        // 1M payload set, ground truth from `tests.jsonl`): **806 of 12 500
+        // ground-truth neighbours become unreachable (6.4 %)**, 145 of 500
+        // queries (29 %) lose at least one, and top-25 recall is capped at
+        // ~0.935 before HNSW loses anything — silently. Worst cases land exactly
+        // where the geometry predicts: `lat 81.1`, `lat -86.3`, `lon 178.32`.
+        //
+        // Verified first-hand on v2.6.19, identical rows in two collections
+        // differing only by the RTREE: centre (81, 10) with r = 200 km returned
+        // 14 of 20 in-cap documents WITH the index (the six at 0.9990-0.9995 *
+        // radius due north and south were pruned) and 20 of 20 without it;
+        // centre (0, 179.9) returned 4 of 8 with it (every document across +180
+        // pruned) and 8 of 8 without. `tests/common/mod.rs::write_geo_edge_project`
+        // is that experiment as a fixture.
+        //
+        // Without the index Milvus scans the column and `ST_DWITHIN` alone is
+        // exact. A slower scan is the right trade for a tool whose output is a
+        // recall number.
+        "geo" => ("Geometry", None),
         _ => return None,
     };
     Some(MilvusFieldKind {
@@ -166,8 +204,14 @@ fn scalar_index_plan(dataset: &Dataset) -> Vec<(String, &'static str)> {
             if field_name == "id" || field_name == "vector" {
                 continue;
             }
-            if let Some(kind) = milvus_field_kind(field_name, field_type.as_str().unwrap_or("")) {
-                plan.push((field_name.clone(), kind.index_type));
+            // `index_type: None` = materialised but deliberately unindexed
+            // (geo — see `milvus_field_kind`), so it is not in the plan and the
+            // read-back must not expect an index for it.
+            if let Some(index_type) =
+                milvus_field_kind(field_name, field_type.as_str().unwrap_or(""))
+                    .and_then(|kind| kind.index_type)
+            {
+                plan.push((field_name.clone(), index_type));
             }
         }
     }
@@ -1371,8 +1415,14 @@ fn build_milvus_filter(
             if !lon.is_finite() || !lat.is_finite() || !radius.is_finite() || radius < 0.0 {
                 return None;
             }
+            // Plain decimals only: `{:?}` switches to exponent form below 1e-4
+            // and a WKT literal like `POINT(-52.5 -1.9e-5)` is not portable
+            // across WKT parsers. See `geo::plain_decimal`.
             Some(format!(
-                "ST_DWITHIN({field_name}, 'POINT({lon:?} {lat:?})', {radius:?})"
+                "ST_DWITHIN({field_name}, 'POINT({} {})', {})",
+                geo::plain_decimal(lon),
+                geo::plain_decimal(lat),
+                geo::plain_decimal(radius)
             ))
         }
         _ => None,
@@ -1994,21 +2044,28 @@ mod tests {
             plan.iter().map(|(f, _)| f.as_str()).collect();
 
         for (field, ty) in schema.as_object().unwrap() {
-            let has_column = milvus_field_kind(field, ty.as_str().unwrap()).is_some();
+            let kind = milvus_field_kind(field, ty.as_str().unwrap());
+            // The invariant is now "a column is indexed unless its mapping says
+            // it must not be", which is a stronger statement than the original
+            // "a column is indexed": the exception has to be spelled out in
+            // `milvus_field_kind` with its reason, and there is exactly one
+            // (geo — an RTREE there loses true hits, #223).
+            let wants_index = kind.and_then(|k| k.index_type).is_some();
             assert_eq!(
-                has_column,
+                wants_index,
                 indexed.contains(field.as_str()),
-                "field '{}' ({}) has column={} but indexed={} — a column without an \
-                 index makes every filter on it a full scan (#218)",
+                "field '{}' ({}) wants_index={} but indexed={} — a column whose \
+                 mapping names an index must get it, and one whose mapping says \
+                 None must not (#218, #223)",
                 field,
                 ty,
-                has_column,
+                wants_index,
                 indexed.contains(field.as_str())
             );
         }
-        // `geo` IS materialised now (issue #223) and must therefore also be
-        // indexed; an unknown type still gets neither.
-        assert!(indexed.contains("loc"));
+        // `geo` is materialised (issue #223) but deliberately NOT indexed, so
+        // it must be absent from the plan; an unknown type gets neither.
+        assert!(!indexed.contains("loc"));
         assert!(!indexed.contains("weird"));
     }
 
@@ -2018,28 +2075,37 @@ mod tests {
     fn scalar_index_types_per_field_type() {
         let expect = |field: &str, ty: &str| milvus_field_kind(field, ty).unwrap();
         // Point + range predicates over one structure; also what AUTOINDEX picks.
-        assert_eq!(expect("kw", "keyword").index_type, "INVERTED");
-        assert_eq!(expect("b", "text").index_type, "INVERTED");
-        assert_eq!(expect("u", "uuid").index_type, "INVERTED");
-        assert_eq!(expect("n", "int").index_type, "INVERTED");
-        assert_eq!(expect("f", "float").index_type, "INVERTED");
+        assert_eq!(expect("kw", "keyword").index_type, Some("INVERTED"));
+        assert_eq!(expect("b", "text").index_type, Some("INVERTED"));
+        assert_eq!(expect("u", "uuid").index_type, Some("INVERTED"));
+        assert_eq!(expect("n", "int").index_type, Some("INVERTED"));
+        assert_eq!(expect("f", "float").index_type, Some("INVERTED"));
         // datetime is an Int64 epoch column, filtered by range → same as int.
-        assert_eq!(expect("ts", "datetime").index_type, "INVERTED");
+        assert_eq!(expect("ts", "datetime").index_type, Some("INVERTED"));
         assert_eq!(expect("ts", "datetime").data_type, "Int64");
         // Bool has exactly 2 distinct values → BITMAP (STL_SORT is rejected on
         // Bool by the server).
-        assert_eq!(expect("flag", "bool").index_type, "BITMAP");
+        assert_eq!(expect("flag", "bool").index_type, Some("BITMAP"));
         assert_eq!(expect("flag", "bool").data_type, "Bool");
         // Multi-valued `labels` is an Array(VarChar) (#88); only INVERTED and
         // BITMAP are accepted there, and cardinality is unbounded → INVERTED.
         assert_eq!(expect("labels", "keyword").data_type, "Array");
-        assert_eq!(expect("labels", "keyword").index_type, "INVERTED");
+        assert_eq!(expect("labels", "keyword").index_type, Some("INVERTED"));
         // A scalar keyword named anything else stays a VarChar.
         assert_eq!(expect("color", "keyword").data_type, "VarChar");
-        // Native geospatial column: OGC WKT in a `Geometry` field, RTREE index
-        // (the only index type Milvus offers for it) — issue #223.
+        // Native geospatial column: OGC WKT in a `Geometry` field, and
+        // DELIBERATELY UNINDEXED — Milvus' only Geometry index (RTREE) prunes
+        // with a box smaller than the cap and silently drops true hits (#223,
+        // see `milvus_field_kind`). This is the sole column-without-index in the
+        // engine, and it is asserted so re-adding the index is a deliberate act.
         assert_eq!(expect("loc", "geo").data_type, "Geometry");
-        assert_eq!(expect("loc", "geo").index_type, "RTREE");
+        assert_eq!(expect("loc", "geo").index_type, None);
+        // Every OTHER materialised type must still carry an index.
+        for ty in [
+            "int", "float", "keyword", "text", "uuid", "bool", "datetime",
+        ] {
+            assert!(expect("f", ty).index_type.is_some(), "{ty}");
+        }
         // An unknown type is still not materialised.
         assert!(milvus_field_kind("loc", "nope").is_none());
     }

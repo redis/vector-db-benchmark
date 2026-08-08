@@ -60,9 +60,9 @@ Two operational consequences worth knowing:
 * **The check runs in `search()`, after `configure()` and `upload()`.** On the
   geo datasets, chroma/turbopuffer will ingest the whole corpus and *then*
   abort. KiviDB is the exception — it rejects in
-  `configure()`, before any ingest. Moving the check earlier for the other five
-  needs the dataset's conditions at configure time and is tracked separately;
-  until then, budget the ingest time or exclude those datasets up front.
+  `configure()`, before any ingest. Moving the check earlier for those two needs
+  the dataset's conditions at configure time and is tracked separately; until
+  then, budget the ingest time or exclude those datasets up front.
 * **With the default `--exit-on-error true`, one refusal ends the sweep.** A
   `--engines '*' --datasets 'random-geo*'` run aborts at the first refusal.
   Pass `--exit-on-error false` to let the rest of the matrix finish; each

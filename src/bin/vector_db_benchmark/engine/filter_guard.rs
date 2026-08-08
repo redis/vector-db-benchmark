@@ -625,6 +625,78 @@ fn every_shipped_condition_shape_is_expressible_or_a_tracked_gap() {
     );
 }
 
+/// The MongoDB column above claims to route by SCHEMA the way production does.
+/// Nothing else checks that: `build_mongo_filter_entry` has its own MQL
+/// `$geoWithin` arm (for the `find()` path), so forcing the resolver to the MQL
+/// dialect leaves every geo cell resolving to `Some` and the whole matrix green.
+///
+/// This pins the routing itself — that the two dialects are genuinely different
+/// grammars and that a geo schema selects the `$search` one — so the column
+/// cannot silently start testing a filter MongoDB would never send.
+#[test]
+fn the_mongodb_column_tests_the_dialect_production_would_send() {
+    let geo = json!({"and": [{"a": {"geo": {"lon": 116.0, "lat": -52.0, "radius": 326_341.0}}}]});
+
+    // The routing rule, straight from the engine.
+    let geo_schema = json!({"a": "geo", "b": "geo"});
+    let kw_schema = json!({"a": "keyword", "b": "keyword"});
+    assert!(super::mongodb_engine::schema_declares_geo(Some(
+        &geo_schema
+    )));
+    assert!(!super::mongodb_engine::schema_declares_geo(Some(
+        &kw_schema
+    )));
+
+    // The two grammars are NOT interchangeable, so which one the column picks is
+    // observable. MQL puts the operator under the FIELD; the Search dialect puts
+    // the field under the OPERATOR.
+    let mql = super::mongodb_engine::parse_mongo_conditions(&geo)
+        .map(|d| format!("{d:?}"))
+        .expect("MQL renders a $geoWithin for the find() path");
+    let search = super::mongodb_engine::parse_mongo_search_conditions(&geo)
+        .expect("the search dialect must not error")
+        .map(|d| format!("{d:?}"))
+        .expect("the search dialect renders a geoWithin");
+    assert!(
+        mql.contains("$geoWithin") && mql.contains("$centerSphere"),
+        "{mql}"
+    );
+    assert!(
+        search.contains("geoWithin") && search.contains("circle") && !search.contains("$geoWithin"),
+        "{search}"
+    );
+    assert_ne!(mql, search, "the two dialects must be distinguishable");
+
+    // And the matrix cell for a geo-schema shape must be the SEARCH rendering.
+    let engines = engines();
+    let (_, mongodb) = engines
+        .iter()
+        .find(|(name, _)| *name == "mongodb")
+        .expect("mongodb column");
+    let schema: HashMap<String, String> =
+        [("a".to_string(), "geo".to_string())].into_iter().collect();
+    assert_eq!(mongodb(&geo, &schema), Ok(Some(search)));
+
+    // ...and for a non-geo schema, the same resolver must produce MQL. A keyword
+    // shape is the honest control: it renders in both dialects, differently.
+    let kw = json!({"and": [{"a": {"match": {"value": "red"}}}]});
+    let kw_schema: HashMap<String, String> = [("a".to_string(), "keyword".to_string())]
+        .into_iter()
+        .collect();
+    let kw_mql = super::mongodb_engine::parse_mongo_conditions(&kw)
+        .map(|d| format!("{d:?}"))
+        .unwrap();
+    let kw_search = super::mongodb_engine::parse_mongo_search_conditions(&kw)
+        .unwrap()
+        .map(|d| format!("{d:?}"))
+        .unwrap();
+    assert_ne!(
+        kw_mql, kw_search,
+        "the control shape must also distinguish them"
+    );
+    assert_eq!(mongodb(&kw, &kw_schema), Ok(Some(kw_mql)));
+}
+
 /// Every exemption must name an engine and a shape that exist. Otherwise a
 /// renamed shape silently retires a gap, which is how a stale exemption starts
 /// hiding a live bug.
