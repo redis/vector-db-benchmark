@@ -55,12 +55,17 @@ pub struct Args {
     /// than the dataset declares — including zero, i.e. a missing index — because
     /// recall is scored against ground truth for the FULL corpus and a short
     /// corpus therefore publishes a wrong number under a config name that claims
-    /// otherwise. It also aborts when the check cannot be made at all: when the
-    /// server-side count cannot be read (restrictive ACLs, unreachable server),
-    /// and when the dataset's own expected row count cannot be determined —
-    /// typically because its corpus is not on this machine, which is exactly the
-    /// `--skip-upload` situation (#290). Set this to run anyway; the waiver is
-    /// recorded in the result file under `params.corpus_reuse`.
+    /// otherwise. It also aborts when the probe for the server-side count FAILS
+    /// (restrictive ACLs, unreachable server), and when the dataset's own
+    /// expected row count cannot be determined even after the corpus has been
+    /// fetched — an unmeasurable layout with no `vector_count`, or a corpus that
+    /// is neither on this machine nor downloadable (#290).
+    ///
+    /// It does NOT abort when an engine simply has no row-count probe wired up
+    /// (Chroma, Milvus, Weaviate, Turbopuffer, Vertex): that prints a note and
+    /// runs, with or without this flag. Set this to run anyway in the cases that
+    /// do abort; the waiver is recorded in the result file under
+    /// `params.corpus_reuse`.
     #[arg(long, default_value = "false")]
     pub allow_partial_corpus: bool,
 

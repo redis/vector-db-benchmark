@@ -327,19 +327,34 @@ rules follow, and all three are enforced:
      failure*. It is never reported as "the corpus is empty": that names the wrong
      problem and invites a re-upload over a corpus that was fine.
    - the **dataset's own expected row count cannot be determined** → a hard error
-     as well (issue #290). That count is measured from the corpus *file*, so this
-     is squarely a `--skip-upload` situation: a `sparse`/`h5-multi` layout whose
-     files are not on this machine, a corpus file deleted to reclaim disk while
-     `tests.jsonl` (queries + ground truth) stayed behind, or a header read that
-     failed. Until #290 it printed a note and ran anyway — and over an empty
-     corpus that publishes `mean_recall: 0.0` with `failed_queries: 0` and exit 0.
-     It is the same outcome as a short corpus with *less* information, not a
-     milder one. `--allow-partial-corpus` waives it, and the waiver is recorded.
-   - no count implemented for the engine → a printed note that the reuse went
-     unverified. Implemented for Redis, Valkey, Dragonfly, KiviDB, VectorSets,
-     Qdrant, Elasticsearch, OpenSearch, pgvector and MongoDB. Chroma, Milvus and
-     Weaviate all expose a count we have simply not wired up yet; Turbopuffer and
-     Vertex are the only genuinely uncountable ones.
+     as well (issue #290), because it is the same outcome as a short corpus with
+     *less* information. Until #290 it printed a note and ran anyway, and over an
+     empty corpus that publishes `mean_recall: 0.0` with `failed_queries: 0` and
+     exit 0. Where the count comes from depends on the layout, and so does the
+     remedy:
+     - measurable layouts (`tar`, `h5`, `jsonl`, `hybrid` — 53 of the 57 shipped
+       datasets) read it from the corpus file's header/line count. **The check
+       fetches the dataset first**, using the same `get_path()` the search phase
+       is about to call, so "not downloaded yet" is not an error — only a corpus
+       that is neither present nor fetchable is. The realistic case is a corpus
+       file deleted to reclaim disk while `tests.jsonl` (queries + ground truth)
+       stayed behind, so the run still searches and still publishes.
+     - `sparse` and `h5-multi` have no cheap row count, so the number comes from
+       `vector_count` in `datasets.json` — and, unlike the shared-corpus upload
+       gate, **without** requiring every corpus file to be present locally, since
+       `--skip-upload` never uploads. Missing `vector_count` is the error, and
+       the message says so.
+
+     `--allow-partial-corpus` waives it, and the waiver is recorded.
+   - no count read back for the engine → a printed note that the reuse went
+     unverified, **whatever the dataset side says**: with neither side available
+     there is nothing to compare in either direction, so this never escalates to
+     an abort. A probe is implemented for Redis, Valkey, Dragonfly, KiviDB,
+     VectorSets, Qdrant, Elasticsearch, OpenSearch, pgvector and MongoDB. Chroma,
+     Milvus and Weaviate all expose a count we have simply not wired up yet;
+     Turbopuffer and Vertex are the only genuinely uncountable ones. (Qdrant's
+     probe is wired up but can reply without a `points_count`, which lands here
+     too — hence "no count read back" rather than "not implemented".)
 
    **On a sweep, the right remedy for a rejected config is `--exit-on-error false`**
    (`--exit-on-error` defaults to true, so one stale config otherwise kills the
@@ -350,8 +365,10 @@ rules follow, and all three are enforced:
 
 The verdict is recorded in every result file it applies to, under
 `params.corpus_reuse` (`status` — one of `verified`, `surplus`, `short`,
-`corpus_size_unknown`, `unverified` — plus `expected_rows`, `actual_rows`,
-`actual_is_estimate`, `waived_by_allow_partial_corpus`), and a rejected
+`corpus_size_unknown`, `unverified`, or `probe_failed`, which is written by the
+probe-failure branch and carries `detail` instead of the count fields — plus
+`expected_rows`, `actual_rows`, `actual_is_estimate`,
+`waived_by_allow_partial_corpus`), and a rejected
 experiment is listed in the summary under `rejected_experiments` — otherwise a
 sweep that lost most of its configs produces a summary and a chart
 indistinguishable from a complete one.
@@ -441,16 +458,18 @@ until you `DEL` it.
   corpus-reuse check (#238/#271) is what makes that promise reach the fifth member
   of this family.
 
-  **The guarantee is conditional on the tool knowing how many rows to expect.**
-  The check compares a server-side count against the corpus measured on disk; when
-  that expected count cannot be determined — sparse/`h5-multi` dataset layouts, an
-  unresolvable dataset path, or any error reading it — the verdict is
-  `Unverifiable`, which prints `Reuse check — SKIPPED` and **lets the run
-  proceed**. On that path a missing corpus is still measured and still published.
-  The result file records `params.corpus_reuse.status = "unverified"`, so it is not
-  silent, but it is not a hard error either: treat a `SKIPPED` line as "this run's
-  corpus was never verified" and check it yourself. (Inherited from #238/#271, not
-  specific to VectorSets.)
+  **The guarantee is conditional on the tool knowing how many rows to expect** —
+  and since #290 it stops rather than guesses. When the expected count cannot be
+  determined (an unmeasurable layout with no `vector_count`, or a corpus that is
+  neither on this machine nor fetchable), the verdict is `corpus_size_unknown`
+  and the run is a **hard error**, waivable with `--allow-partial-corpus`. Before
+  #290 that path printed `Reuse check — SKIPPED` and let the run proceed, so a
+  missing corpus was still measured and still published as `recall 0.0` at exit 0.
+  One softer case remains and still prints `SKIPPED`: when no server-side count is
+  read back at all (`status = "unverified"`, e.g. Chroma/Milvus/Weaviate/
+  Turbopuffer/Vertex), there is nothing to compare in either direction, so the run
+  continues — treat that `SKIPPED` line as "this run's corpus was never verified"
+  and check it yourself. (Inherited from #238/#271, not specific to VectorSets.)
 - Two-phase coexistence sweep: `… --keep-data` (upload + search all configs,
   keep the data), then `… --skip-upload --keep-data --skip-if-exists false`
   (search each against its own index). Per-config prefixing stores N copies of

@@ -879,6 +879,57 @@ mod tests {
         );
     }
 
+    /// A shipped dataset whose layout has NO cheap row count must declare a
+    /// `vector_count` (#290 review).
+    ///
+    /// `sparse` (CSR) and `h5-multi` cannot be measured from their files, so
+    /// `vector_count` is the only answer the `--skip-upload` reuse check can
+    /// get. Without it that check has nothing to compare a server-side count
+    /// against and the run is rejected — which is how `synthetic-sparse-300`
+    /// (150 rows, no declared count) was found, by reading the entry rather
+    /// than by any test: it is `sparse`, its files are exactly where the code
+    /// expects, and no suite exercises `--skip-upload` against it. This catches
+    /// the class from `datasets.json` alone, with no corpus on disk.
+    ///
+    /// It deliberately does NOT check the value — nothing here can measure a
+    /// CSR corpus — only that a value exists. The sibling test above is what
+    /// polices values whose path advertises a size.
+    #[test]
+    fn unmeasurable_shipped_layouts_declare_a_vector_count() {
+        let configs = read_dataset_configs().expect("datasets.json must parse");
+        let mut checked = 0;
+        let mut missing = Vec::new();
+        for (name, cfg) in &configs {
+            if !matches!(
+                cfg.dataset_type.as_deref().unwrap_or(""),
+                "sparse" | "h5-multi"
+            ) {
+                continue;
+            }
+            checked += 1;
+            if cfg.vector_count.filter(|&n| n > 0).is_none() {
+                missing.push(format!(
+                    "  dataset '{name}' has layout '{}' (no measurable row count) but declares \
+                     vector_count {:?}",
+                    cfg.dataset_type.as_deref().unwrap_or(""),
+                    cfg.vector_count,
+                ));
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "{} unmeasurable dataset(s) declare no vector_count, so --skip-upload cannot \
+             verify them (#290):\n{}",
+            missing.len(),
+            missing.join("\n"),
+        );
+        assert!(
+            checked >= 4,
+            "expected to find the shipped sparse/h5-multi datasets, found {checked}"
+        );
+    }
+
     #[test]
     fn path_implied_corpus_size_only_fires_on_real_magnitude_tokens() {
         let s = |v: &str| serde_json::Value::String(v.to_string());

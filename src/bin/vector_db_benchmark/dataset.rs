@@ -275,6 +275,22 @@ impl Dataset {
         }
     }
 
+    /// Whether this layout has no cheap row count at all — `sparse` (CSR) and
+    /// `h5-multi` (many part files). For these the declared `vector_count` is
+    /// the only available answer to "how many rows should exist"; everything
+    /// else must be MEASURED (#224).
+    ///
+    /// Deliberately says nothing about whether the files are present: callers
+    /// that must not skip an upload want [`Self::unmeasurable_corpus_is_present`]
+    /// as well, but the `--skip-upload` reuse check does not upload and so does
+    /// not need it (#290 review).
+    pub fn has_no_cheap_row_count(&self) -> bool {
+        matches!(
+            self.config.dataset_type.as_deref().unwrap_or(""),
+            "sparse" | "h5-multi"
+        )
+    }
+
     /// Whether this is one of the layouts with no cheap row count AND all of its
     /// corpus files are on disk (no download attempted).
     ///

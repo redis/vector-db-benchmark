@@ -1412,6 +1412,7 @@
   {
     "name": "synthetic-sparse-300",
     "vector_size": 300,
+    "vector_count": 150,
     "distance": "dot",
     "type": "sparse",
     "path": "synthetic-sparse-300",
