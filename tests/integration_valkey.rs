@@ -2081,6 +2081,16 @@ fn test_binary_valkey_mixed_updates_that_miss_the_corpus_are_fatal() {
     let update_count = r["update_count"].as_u64().unwrap();
     let unattributed = r["update_unattributed"].as_u64().unwrap();
     println!("valkey #293 waived: update_count={update_count} update_unattributed={unattributed}");
+
+    // POSITIVE evidence that the reuse check was satisfied and this test really
+    // is exercising the #293 gate. The `!contains("incomplete")` check on the
+    // rejected arm above is a negative; this reads the verdict the run recorded.
+    let reuse = common::read_params_obj(&proj.root, cfg)["corpus_reuse"].clone();
+    assert_eq!(
+        reuse["status"], "verified",
+        "the shifted corpus must verify on row count, or this fixture is testing \
+         the #238 reuse gate instead: {reuse}"
+    );
     assert!(unattributed > 0, "the missed updates must be recorded");
     assert_eq!(
         update_count, 0,

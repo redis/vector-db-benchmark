@@ -54,9 +54,6 @@ fn wait_for_mongodb() {
     }
 }
 
-/// Drop the search index (if any), wait for it to disappear, then drop the
-/// collection and wait for it to be gone.  Mirrors the engine's configure()
-/// cleanup so tests exercise the same Atlas-safe path.
 /// The server reply the #293 guard reads on MongoDB.
 ///
 /// `update_one_doc` returns "did this write match nothing" straight from
@@ -118,6 +115,9 @@ fn test_update_one_matched_count_distinguishes_a_missing_document_from_an_update
     let _ = coll.drop().run();
 }
 
+/// Drop the search index (if any), wait for it to disappear, then drop the
+/// collection and wait for it to be gone.  Mirrors the engine's configure()
+/// cleanup so tests exercise the same Atlas-safe path.
 fn drop_test_collection() {
     let client = mongodb_client();
     let db = client.database(TEST_DB);
@@ -2259,6 +2259,16 @@ fn test_binary_mongodb_mixed_updates_that_miss_the_corpus_are_fatal() {
     let update_count = r["update_count"].as_u64().unwrap();
     let unattributed = r["update_unattributed"].as_u64().unwrap();
     println!("mongodb #293 waived: update_count={update_count} update_unattributed={unattributed}");
+
+    // POSITIVE evidence that the reuse check was satisfied and this test really
+    // is exercising the #293 gate. The `!contains("incomplete")` check on the
+    // rejected arm above is a negative; this reads the verdict the run recorded.
+    let reuse = common::read_params_obj(&proj.root, cfg)["corpus_reuse"].clone();
+    assert_eq!(
+        reuse["status"], "verified",
+        "the shifted corpus must verify on row count, or this fixture is testing \
+         the #238 reuse gate instead: {reuse}"
+    );
     assert!(unattributed > 0, "the missed updates must be recorded");
     assert_eq!(
         update_count, 0,

@@ -926,10 +926,23 @@ fn check_corpus_reuse_precondition(
 ///    its own `Short` verdict to a warning when the count is approximate,
 ///    because a false abort on a planner figure would be its own wrong result;
 ///    this gate has to honour the same downgrade or a run that warned there
-///    would hard-abort here with no waiver available. Unreachable today —
+///    would hard-abort here with no waiver available.
+///
+///    Two honest caveats. First, this waiver is WIDER than "honours the same
+///    downgrade": `actual_is_estimate` is set on the `Ok` verdict too, so an
+///    approximate-but-*sufficient* count — where the reuse check was fully
+///    satisfied and warned about nothing — also waives this gate. Narrowing it
+///    would mean reading the verdict rather than the estimate flag, which is
+///    not worth doing for a path nothing can reach. Second, unreachable is why:
 ///    `CorpusCount::estimated` is built only by pgvector, which has no
-///    `search_mixed` — so it is a latch for the day a mixed-capable engine
-///    reports an estimate, not a live path. It is NOT covered by a test.
+///    `search_mixed`. This is a latch for the day a mixed-capable engine reports
+///    an estimate.
+///
+///    COVERAGE: `an_estimated_corpus_size_waives_the_rejection_like_the_reuse_
+///    check_does` pins the decision inside this function. The WIRING — that the
+///    caller reads `actual_is_estimate` out of `corpus_reuse` and passes it —
+///    is unpinned: replacing that argument with a literal `false` kills no test,
+///    because no reachable configuration produces an estimate to notice.
 ///
 /// A waived run still publishes `update_unattributed`, so the artifact records
 /// how many of its updates did not overwrite an existing row.
@@ -2726,8 +2739,10 @@ mod update_attribution_gate_tests {
     /// server-side count is only an ESTIMATE. This gate has to honour the same
     /// downgrade, or a run that was allowed to continue there would hard-abort
     /// here with no waiver available. Unreachable today (only pgvector reports
-    /// an estimate and it has no `search_mixed`), so this unit test is the ONLY
-    /// coverage of that latch — there is no integration test for it.
+    /// an estimate and it has no `search_mixed`), so this unit test is the only
+    /// coverage of the DECISION, and the wiring that feeds it — the caller
+    /// reading `actual_is_estimate` out of `corpus_reuse` — is not covered at
+    /// all: replacing that argument with a literal `false` kills no test.
     #[test]
     fn an_estimated_corpus_size_waives_the_rejection_like_the_reuse_check_does() {
         let r = gate(results(10, 5, 0), false, true)
@@ -2736,6 +2751,117 @@ mod update_attribution_gate_tests {
         // ...and it is the estimate doing the waiving, not a blanket pass:
         // the same input with an exact count is still rejected.
         assert!(gate(results(10, 5, 0), false, false).is_err());
+    }
+
+    /// The JSON site, not the fold (#293 cross-engine review).
+    ///
+    /// `VERTEX_UPDATE_ATTRIBUTION` pins the tier on `SearchResults`, but nothing
+    /// asserted what `build_search_result_json` WRITES for a non-`corpus_row`
+    /// engine — and because all four live mixed engines are `corpus_row` and the
+    /// Vertex integration test self-skips, hardcoding `json!("corpus_row")` at
+    /// that line was behaviour-preserving for the entire suite. Same exposure one
+    /// line over for `update_failures`, which every mixed test only ever asserts
+    /// is 0.
+    ///
+    /// So: drive the emitter directly with a non-default `ack_only` result and
+    /// read the emitted object.
+    #[test]
+    fn the_json_emitter_writes_the_engines_own_tier_and_counts_not_constants() {
+        use super::build_search_result_json;
+        use crate::config::SearchParams;
+        use crate::engine::SearchResults;
+
+        let params: SearchParams =
+            serde_json::from_value(serde_json::json!({"parallel": 1, "top": 10})).unwrap();
+        let results = SearchResults {
+            top: 10,
+            latencies: vec![0.001],
+            update_search_ratio: Some("1:5".to_string()),
+            update_count: Some(7),
+            update_rps: Some(3.5),
+            update_failures: Some(4),
+            update_attribution: Some("ack_only".to_string()),
+            // Omitted under ack_only — a published 0 would read like a
+            // corpus_row engine's verified zero.
+            update_unattributed: None,
+            update_attribution_detail: Some("upsertDatapoints returns an empty body".to_string()),
+            ..Default::default()
+        };
+        let doc = build_search_result_json(
+            "vertex-test",
+            "random-100",
+            &params,
+            &results,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let res = doc["results"].as_object().unwrap();
+
+        assert_eq!(
+            res["update_attribution"], "ack_only",
+            "the emitter must write the engine's own tier, not a constant"
+        );
+        assert_eq!(
+            res["update_failures"], 4,
+            "the emitter must write the engine's own failure count, not a constant"
+        );
+        assert_eq!(
+            res["update_attribution_detail"],
+            "upsertDatapoints returns an empty body"
+        );
+        assert!(
+            !res.contains_key("update_unattributed"),
+            "under ack_only the field must be ABSENT, not 0: a 0 here is \
+             indistinguishable from a corpus_row engine's verified zero. Got: {:?}",
+            res.get("update_unattributed")
+        );
+        // Control: the same emitter DOES write the field when the engine measured
+        // it, so the absence above is the tier and not a broken emitter.
+        let measured = SearchResults {
+            update_unattributed: Some(0),
+            update_attribution: Some("corpus_row".to_string()),
+            ..results.clone()
+        };
+        let doc2 = build_search_result_json(
+            "redis-test",
+            "random-100",
+            &params,
+            &measured,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(doc2["results"]["update_unattributed"], 0);
+        assert_eq!(doc2["results"]["update_attribution"], "corpus_row");
+    }
+
+    /// The gate must RECORD a rejection, not only return `Err`. Without this a
+    /// sweep run with `--exit-on-error false` drops the point and its summary is
+    /// indistinguishable from a complete one. Mirrors
+    /// `a_short_exact_count_still_aborts_and_is_recorded_as_rejected`, which
+    /// pins the same behaviour at the reuse gate.
+    #[test]
+    fn a_rejected_mixed_point_is_recorded_for_the_summary() {
+        gate_update_attribution(results(0, 100, 0), false, false, "m9bad", "ds9bad")
+            .expect_err("must reject");
+        let rejected = crate::summary::rejected_experiments();
+        assert!(
+            rejected.iter().any(|r| r["engine"] == "m9bad"
+                && r["dataset"] == "ds9bad"
+                && r["reason"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("dispatched updates"))),
+            "the rejected mixed point must reach the summary: {rejected:?}"
+        );
     }
 
     /// An `ack_only` engine publishes `update_unattributed: None` rather than a
