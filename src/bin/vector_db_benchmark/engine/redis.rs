@@ -90,6 +90,11 @@ fn shared_key_prefix() -> Option<String> {
     // The raw text is not the value used: it is trimmed and gains a `:`, and a
     // whitespace-only setting turns shared-corpus mode OFF while still showing
     // up as set. Record what the run actually keyed on (#212).
+    //
+    // NOTE the appended `:` makes this digest while `env.REDIS_KEY_PREFIX` two
+    // keys away shows the same text in the clear, so the digest buys no secrecy
+    // here — it is recorded for the resolution (trimmed, suffixed, or None),
+    // not for confidentiality.
     crate::effective_config::record_effective(
         "shared_corpus_key_prefix",
         resolved

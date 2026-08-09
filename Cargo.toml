@@ -37,8 +37,10 @@ opensearch = "2.3.0"
 mongodb = { version = "3", features = ["sync"] }
 turbopuffer-client = "0.0.4"
 rand = "0.8"
-# Real URL parser for credential redaction (#212): a hand-written tokeniser
-# leaked in six consecutive rounds; structured fields have no desync states.
+# Digest for credential redaction (#212). A hand-written sanitiser leaked in
+# seven of eight review rounds, and a real URL parser only moved the desync;
+# every structured value is now hashed instead of rendered. Version pinned to
+# the one already in the lock — "0.10" pulls in six extra crate versions.
 sha2 = "0.11"
 hdrhistogram = "7.5"
 base64 = "0.22"

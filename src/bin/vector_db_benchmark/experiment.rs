@@ -469,6 +469,10 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
 /// These paths land in every artifact, and an absolute one publishes the local
 /// username to anyone the file is shared with. The part that carries provenance
 /// — which subtree the configs and results came from — survives.
+///
+/// A path OUTSIDE `$HOME` is still published absolute (`/srv/bench/...`), which
+/// can name an internal mount. Deliberate: the directory the sweep globbed is
+/// the fact that decides which configs ran, and a digest would make it useless.
 fn tildeify(path: &std::path::Path) -> String {
     let shown = path.display().to_string();
     match std::env::var_os("HOME").map(std::path::PathBuf::from) {

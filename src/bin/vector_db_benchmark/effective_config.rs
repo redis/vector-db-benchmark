@@ -210,10 +210,6 @@ fn is_publishable_declared_key(key: &str) -> bool {
     DECLARED_KEY_ALLOWLIST.contains(&key)
 }
 
-/// Keys whose values are prose WE author, never user or server input, and which
-/// must therefore be reproduced intact rather than reconstructed.
-const PROSE_KEYS: &[&str] = &["reason", "covers"];
-
 /// The single, unconditional treatment for any value that is not a plain token.
 ///
 /// Eight rounds; seven leaked. Every mechanism that preserved readable output
@@ -241,6 +237,12 @@ fn opaque_digest(value: &str) -> String {
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     // No `len=`: against a known template it discloses the credential's exact
     // character count.
+    //
+    // NOTE this is an UNSALTED hash of the plaintext, so it is a COMMITMENT,
+    // not a one-way secret: anyone holding the artifact can confirm a guessed
+    // endpoint offline. That is inherent to "same connection => same token
+    // across runs", which is the property the field exists for; a salt would
+    // make two runs incomparable. Stated so the trade is chosen, not inherited.
     format!("<redacted:opaque sha256={hex}>")
 }
 
@@ -252,10 +254,37 @@ fn opaque_digest(value: &str) -> String {
 /// no shape test can tell that from `idx:redis-docker-test`. The index name is
 /// derivable from `params.experiment`, so that loss is recoverable; a published
 /// password is not.
+///
+/// **This test protects nothing punctuation-free.** A 32-char hex API key, a
+/// UUID, unpadded base64url, `ghp_…`, `AKIA…`, `sk_live_…` and a bare `hunter2`
+/// are all plain tokens and are published verbatim. For those the sole defence
+/// is [`is_secret`] on the KEY, and it has to stay sound: all 97 recorded
+/// environment names were enumerated and every credential-bearing one matches
+/// `SECRET_MARKERS`. A new knob that carries a bare token under a
+/// non-credential name would be published, and no shape test can prevent that.
 fn is_plain_token(value: &str) -> bool {
     value
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '/' | '~'))
+}
+
+/// Literal text for `ignored_declared_keys.covers`, hoisted so the assembly and
+/// the post-scrub splice cannot drift apart.
+const IGNORED_KEYS_COVERS: &str = "hnsw_config keys serde could not type, plus \
+                                   the CI-asserted KNOWN_UNREAD inventory for \
+                                   this engine";
+
+/// One declared-vs-used divergence.
+///
+/// `reason` is `&'static str` on purpose: only a literal can reach it, which is
+/// what makes "prose we author" a property of the TYPE rather than of a key
+/// name. The key-name version published operator-supplied text verbatim.
+#[derive(Debug, Clone)]
+struct Override {
+    key: String,
+    declared: Value,
+    effective: Value,
+    reason: &'static str,
 }
 
 /// Fields that a sibling `key` must NOT make secret: they carry the knob's name
@@ -271,10 +300,6 @@ const ENTRY_KEY_EXEMPT: &[&str] = &["key", "reason"];
 /// caught just like a bare string, and so is every leaf of a raw configuration
 /// file block copied in wholesale.
 fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
-    scrub_value_inner(value, secret_ancestor, false)
-}
-
-fn scrub_value_inner(value: &Value, secret_ancestor: bool, prose: bool) -> Value {
     match value {
         // `null` under a secret key means "read and unset" — a fact, not a leak.
         Value::Null => Value::Null,
@@ -294,11 +319,7 @@ fn scrub_value_inner(value: &Value, secret_ancestor: bool, prose: bool) -> Value
                             .is_some_and(is_secret);
                     (
                         k.clone(),
-                        scrub_value_inner(
-                            v,
-                            secret_ancestor || is_secret(k) || seeded,
-                            PROSE_KEYS.contains(&k.as_str()),
-                        ),
+                        scrub_value(v, secret_ancestor || is_secret(k) || seeded),
                     )
                 })
                 .collect(),
@@ -306,14 +327,13 @@ fn scrub_value_inner(value: &Value, secret_ancestor: bool, prose: bool) -> Value
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|v| scrub_value_inner(v, secret_ancestor, prose))
+                .map(|v| scrub_value(v, secret_ancestor))
                 .collect(),
         ),
         // NOTE: this changes a JSON *type* — a number under a credential-named
         // key becomes a string. Zero false positives across all shipped configs
         // and every recorded knob name today; tracked in #289.
         _ if secret_ancestor => Value::from(REDACTED),
-        Value::String(s) if prose => Value::from(s.clone()),
         Value::String(s) => Value::from(redact_connection_like(s)),
         other => other.clone(),
     }
@@ -376,9 +396,14 @@ fn assert_no_cleartext_secrets(value: &Value, secret_ancestor: bool, path: &str)
         }
         leaf => assert!(
             !secret_ancestor || matches!(leaf.as_str(), Some(REDACTED) | Some(REDACTED_DEFAULT)),
+            // The offending value is DIGESTED, not printed. This fires only when
+            // the redactor has a bug — precisely the moment the credential must
+            // not be written anywhere — and benchmark stderr gets pasted into
+            // issues. The digest still tells two failures apart.
             "refusing to publish `{path}` in the clear: a credential-named key \
-             reached the artifact carrying {leaf}. Every value under such a key \
-             must go through `scrub_value`."
+             reached the artifact carrying {}. Every value under such a key must \
+             go through `scrub_value`.",
+            opaque_digest(&leaf.to_string())
         ),
     }
 }
@@ -408,7 +433,7 @@ pub struct Recorder {
     /// Resolved values, keyed by knob name. This is the authoritative "what ran".
     effective: BTreeMap<String, Value>,
     /// Declared-vs-used divergences, both sides retained.
-    overridden: Vec<Value>,
+    overridden: Vec<Override>,
     /// Declared configuration keys known not to be consumed. NOT exhaustive —
     /// see the note emitted alongside it.
     ignored: BTreeSet<String>,
@@ -478,15 +503,33 @@ impl Recorder {
     }
 
     /// Record that `declared` lost to `effective`, and why.
-    pub fn note_override(&mut self, key: &str, declared: Value, effective: Value, reason: &str) {
+    pub fn note_override(
+        &mut self,
+        key: &str,
+        declared: Value,
+        effective: Value,
+        reason: &'static str,
+    ) {
         let secret = is_secret(key);
-        let entry = json!({
-            "key": key,
-            "declared": scrub_value(&declared, secret),
-            "effective": scrub_value(&effective, secret),
-            "reason": reason,
-        });
-        if !self.overridden.contains(&entry) {
+        // The reason is held SEPARATELY, as a `&'static str`, and spliced into
+        // the document AFTER scrubbing — see `Recorder::snapshot`. It used to
+        // live in the tree and be protected by a `PROSE_KEYS` key-name test,
+        // which meant any `reason` key anywhere — including one inside a raw
+        // configuration subtree that `set_declared` forwards verbatim — was
+        // published in the clear. Same value, `<dropped>` on the allow-listed
+        // path and cleartext two keys away.
+        let entry = Override {
+            key: key.to_string(),
+            declared: scrub_value(&declared, secret),
+            effective: scrub_value(&effective, secret),
+            reason,
+        };
+        if !self.overridden.iter().any(|o| {
+            o.key == entry.key
+                && o.declared == entry.declared
+                && o.effective == entry.effective
+                && o.reason == entry.reason
+        }) {
             self.overridden.push(entry);
         }
     }
@@ -528,7 +571,15 @@ impl Recorder {
     /// discovering we are about to leak.
     pub fn snapshot(&self) -> Value {
         let doc = self.assemble();
-        let scrubbed = scrub_value(&doc, false);
+        let mut scrubbed = scrub_value(&doc, false);
+        // Authored prose is spliced in AFTER the scrub, by position, never
+        // matched by key name. `reason` is `&'static str` and `covers` is a
+        // literal here, so neither can carry operator input — which is what the
+        // key-name test could not establish.
+        for (i, o) in self.overridden.iter().enumerate() {
+            scrubbed["overridden"][i]["reason"] = Value::from(o.reason);
+        }
+        scrubbed["ignored_declared_keys"]["covers"] = Value::from(IGNORED_KEYS_COVERS);
         assert_no_cleartext_secrets(&scrubbed, false, "engine_params");
         scrubbed
     }
@@ -541,14 +592,21 @@ impl Recorder {
             "declared": self.declared,
             "effective": self.effective,
             "env": self.env,
-            "overridden": self.overridden,
+            "overridden": self
+                .overridden
+                .iter()
+                .map(|o| json!({
+                    "key": o.key,
+                    "declared": o.declared,
+                    "effective": o.effective,
+                }))
+                .collect::<Vec<_>>(),
             "ignored_declared_keys": {
                 // Naming the limit inside the artifact, because `[]` under a
                 // bare `ignored_declared_keys` reads as "every declared key was
                 // honoured" and that is not what this can establish.
                 "exhaustive": false,
-                "covers": "hnsw_config keys serde could not type, plus the \
-                           CI-asserted KNOWN_UNREAD inventory for this engine",
+                "covers": IGNORED_KEYS_COVERS,
                 // Key NAMES only, never values — the one snapshot member the
                 // redaction assertion has nothing to check.
                 "keys": self.ignored.iter().collect::<Vec<_>>(),
@@ -907,7 +965,7 @@ pub fn note_override(
     key: &str,
     declared: impl Into<Value>,
     effective: impl Into<Value>,
-    reason: &str,
+    reason: &'static str,
 ) {
     recorder().note_override(key, declared.into(), effective.into(), reason);
 }
@@ -1178,10 +1236,10 @@ mod recorder_coverage_guard {
     /// `KNOWN_UNRECORDED` and `EXEMPT_CALLS`. This was the one inventory here
     /// that had only a skip filter and no assertion — and a stale skip row is
     /// the worst kind, because it silently WIDENS what the scanner ignores.
-    /// `src/vectorsets/` is being deleted (#297) and `src/redisearch/` next
-    /// (#296); when either lands, the row must go with it, and the test below
-    /// is what makes that a build failure instead of a rotting exemption.
-    const UNCOMPILED: &[&str] = &["src/redisearch/", "src/vectorsets/"];
+    /// `src/vectorsets/` was deleted by #297 and its row went with it — the
+    /// guard below failed on the merge and named the string to remove, which is
+    /// the contract working. `src/redisearch/` is next (#296).
+    const UNCOMPILED: &[&str] = &["src/redisearch/"];
 
     /// Environment variables still read through the plain [`super::env_var`]
     /// shim, which records the raw text and nothing else.
@@ -2264,6 +2322,14 @@ mod tests {
     /// which is precisely where the next round's blocker came from.
     ///
     /// Fixed seed, bounded case count. This runs in CI; it is not the campaign.
+    ///
+    /// **Where its coverage stops.** It drives `redact_connection_like` and
+    /// `invocation.host` only. It does not reach `env`, `effective`,
+    /// `declared`, `overridden` or `ignored`, nor nested objects and arrays,
+    /// nor non-string JSON types — and it cannot express an operator-supplied
+    /// key NAME. No seed of it could have found the `PROSE_KEYS` leak, which
+    /// came from a key-name test rather than a value shape. Reach those through
+    /// `Recorder` directly.
     #[test]
     fn no_fragment_of_a_forbidden_span_reaches_the_output() {
         use rand::rngs::StdRng;
@@ -2305,6 +2371,7 @@ mod tests {
 
         let mut rng = StdRng::seed_from_u64(0x0002_1220_2608);
         let mut checked = 0usize;
+        let mut digested = 0usize;
 
         for case in 0..6000u32 {
             // Alphabet G-Z only: disjoint from lowercase hex, so a fragment can
@@ -2361,6 +2428,9 @@ mod tests {
 
             checked += 1;
             let out = redact_connection_like(&input);
+            if out.starts_with("<redacted:opaque") {
+                digested += 1;
+            }
             assert_no_fragment(&out, &secret, FRAGMENT, &input);
 
             // …and through the full snapshot path, where it would be written.
@@ -2369,9 +2439,14 @@ mod tests {
             let dumped = serde_json::to_string(&r.snapshot()).unwrap();
             assert_no_fragment(&dumped, &secret, FRAGMENT, &input);
         }
+        // `checked` incremented once per iteration, so asserting on it proved
+        // only that the loop ran. Count the cases that actually exercised the
+        // digest path instead — if the generator drifted into producing plain
+        // tokens, this is what notices.
         assert!(
-            checked > 5000,
-            "only {checked} cases carried a forbidden span; the oracle proves nothing"
+            digested > 5000,
+            "only {digested} of {checked} generated cases were structured enough \
+             to digest; the generator is no longer producing adversarial input"
         );
     }
 
@@ -2444,6 +2519,23 @@ mod tests {
         // The dimension round 8 was missing: every `@` row had its canary in the
         // userinfo half, so no row could ever exercise "the tail after the `@`
         // is promoted into the host slot". Both halves must be represented.
+        // Per-ROW, not a loose floor: the old `>= 5` against an actual 14 left
+        // slack 9, so nine `@`-rows could be defanged unnoticed — including
+        // `userinfo-slash-pw`, the row that memorialises round 5's regression.
+        // Dropping its pre-`@` canary survived the whole suite.
+        for (label, value) in CONNECTION_SHAPE_CORPUS {
+            if !label.starts_with("userinfo") {
+                continue;
+            }
+            let at = value
+                .find('@')
+                .unwrap_or_else(|| panic!("[{label}] is a userinfo row with no `@`"));
+            assert!(
+                value[..at].contains("CANARY"),
+                "[{label}] lost the canary BEFORE its `@` — that half is the \
+                 userinfo, and this row exists to prove it is never published"
+            );
+        }
         assert!(
             canary_before_at >= 5,
             "only {canary_before_at} rows probe the userinfo side of an `@`"
@@ -2520,6 +2612,79 @@ mod tests {
         let a = redact_connection_like("host=db sslmode=require");
         assert_eq!(a, redact_connection_like("host=db sslmode=require"));
         assert_ne!(a, redact_connection_like("host=other sslmode=require"));
+    }
+
+    /// A `reason` or `covers` key inside OPERATOR data must not be published.
+    ///
+    /// `prose` used to be derived from the JSON key name at any depth, so a
+    /// config placing a `{"reason": …}` object at a path `set_declared`
+    /// forwards to `note_override` published it verbatim — the same value
+    /// `<dropped>` on the allow-listed path and cleartext two keys away. It is
+    /// now a property of the TYPE (`&'static str`, spliced in after the scrub),
+    /// which a key name cannot forge.
+    #[test]
+    fn operator_supplied_prose_keys_are_not_published() {
+        let mut r = Recorder::new();
+        r.set_declared(
+            Some(&json!({
+                "hnsw_config": {
+                    "DISTANCE_METRIC": {
+                        "reason": "redis://admin:PROSECANARY1@10.0.0.5:6379/0",
+                        "covers": "host=db password=PROSECANARY2 sslmode=require",
+                    }
+                }
+            })),
+            None,
+        );
+        r.note_override(
+            "collection_params.hnsw_config.DISTANCE_METRIC",
+            json!({
+                "reason": "redis://admin:PROSECANARY3@10.0.0.5:6379/0",
+                "covers": "host=db password=PROSECANARY4 sslmode=require",
+            }),
+            Value::Null,
+            "authored literal, the only thing that survives verbatim",
+        );
+        let s = r.snapshot();
+        let dumped = serde_json::to_string(&s).unwrap();
+        for c in [
+            "PROSECANARY1",
+            "PROSECANARY2",
+            "PROSECANARY3",
+            "PROSECANARY4",
+        ] {
+            assert!(!dumped.contains(c), "{c} leaked: {dumped}");
+        }
+        // …while the authored reason still reaches the artifact intact.
+        assert_eq!(
+            s["overridden"][0]["reason"],
+            "authored literal, the only thing that survives verbatim"
+        );
+        assert!(s["ignored_declared_keys"]["covers"]
+            .as_str()
+            .unwrap()
+            .contains("KNOWN_UNREAD"));
+    }
+
+    /// The plain-token alphabet is a decision, not an accident.
+    ///
+    /// Only `:` and `=` were pinned by any test; adding `@`, `;`, `&`, `#`,
+    /// `?`, `%`, `,`, `*` or `!` to it each survived the whole suite. Widening
+    /// it is a deliberate act that edits this list.
+    #[test]
+    fn plain_token_alphabet_is_pinned() {
+        for c in ['a', 'Z', '0', '9', '.', '_', '+', '-', '/', '~'] {
+            assert!(is_plain_token(&format!("x{c}y")), "{c} should be plain");
+        }
+        for c in [
+            ':', '=', '@', ';', '&', '#', '?', '%', ',', '*', '!', ' ', '\t', '"', '\'', '\\', '|',
+            '<', '>', '(', ')', '[', ']', '{', '}', '$', '`', '^', '\u{a0}', '\u{0}',
+        ] {
+            assert!(
+                !is_plain_token(&format!("x{c}y")),
+                "{c:?} must force a digest"
+            );
+        }
     }
 
     /// An override ON a credential knob must still record the knob's NAME and
