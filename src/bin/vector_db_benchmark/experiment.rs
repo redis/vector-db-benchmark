@@ -3395,6 +3395,7 @@ mod update_attribution_gate_tests {
             None,
             None,
             None,
+            &serde_json::json!({}),
         );
         let res = doc["results"].as_object().unwrap();
 
@@ -3435,6 +3436,7 @@ mod update_attribution_gate_tests {
             None,
             None,
             None,
+            &serde_json::json!({}),
         );
         assert_eq!(doc2["results"]["update_unattributed"], 0);
         assert_eq!(doc2["results"]["update_attribution"], "corpus_row");

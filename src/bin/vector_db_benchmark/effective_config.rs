@@ -2742,6 +2742,18 @@ mod tests {
     /// new one that skips `scrub_value` is published verbatim. This is the
     /// replacement for the guarantee that removal took away: adding a member
     /// fails here, and the fix is to scrub it and add its name below.
+    ///
+    /// **Scope: `engine_params` only.** The rest of a result file is not
+    /// covered, deliberately. `server_metadata` alone contributes ~1,400
+    /// server-supplied strings (a full INFO/CONFIG dump) that churn with every
+    /// engine version, and it carries its OWN redaction — a distinct
+    /// `<redacted>` for credential-named CONFIG keys (`requirepass`,
+    /// `masterauth`, `tls-*-pass`), verified present. The `results` block is
+    /// numbers plus a few authored strings: #298's `update_failures` and
+    /// `update_unattributed` are counters, `update_attribution` is a closed
+    /// three-value enum, and `update_attribution_detail` is per-engine literals.
+    /// So a new field elsewhere in the artifact does NOT fail this test; if it
+    /// can carry operator input it needs its own treatment.
     #[test]
     fn member_set_is_pinned_so_a_new_one_must_be_scrubbed_deliberately() {
         const MEMBERS: &[&str] = &[
