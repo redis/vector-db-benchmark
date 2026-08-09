@@ -1944,32 +1944,68 @@ pub fn read_results_obj(root: &Path, engine: &str) -> serde_json::Value {
 // Four integration suites (`integration_redis`, `integration_valkey`,
 // `integration_dragonfly`, `integration_kividb`) share one `flush_db()` shape:
 // drop every index `FT._LIST` reports, then `FLUSHALL`. That destroys the WHOLE
-// server, and each suite's default port is a shared container from
-// `tests/docker-compose.test.yml`. Two incidents were caused by a port override
-// that looked applied but was not, so the run silently destroyed a server it did
-// not own.
+// server — every database, not just db 0 — and each suite's default port is a
+// shared container from `tests/docker-compose.test.yml`. Two incidents were
+// caused by a port override that looked applied but was not, so the run silently
+// destroyed a server it did not own.
 //
-// The guard below makes the destructive suites refuse to touch a server that
-// already holds state this harness did not create. It is deliberately placed
-// behind the suites' `test_port()`, because EVERY path that reaches the server
-// — direct `redis::Client` connections and the `REDIS_PORT`-style env vars
-// handed to spawned benchmark binaries alike — resolves its port there.
+// The guard below makes the destructive suites refuse to touch a server unless
+// they can POSITIVELY establish it is safe. It is deliberately placed behind the
+// suites' `test_port()`, because EVERY path that reaches the server — direct
+// `redis::Client` connections and the `REDIS_PORT`-style env vars handed to
+// spawned benchmark binaries alike — resolves its port there.
+//
+// Design rule, learned the hard way: **every way the probe can fail must refuse.**
+// The first version coerced an unreachable server, a denied command and an
+// unsupported command all to "0 keys", i.e. to `Fresh`, which fails OPEN in the
+// one function whose job is to refuse.
 
-/// Env var an operator sets to waive [`claim_resp_instance`]'s ownership check.
+/// Env var an operator sets to waive the ownership check.
 pub const ALLOW_DIRTY_ENV: &str = "VDBB_TEST_ALLOW_DIRTY";
+
+/// How long [`claim_resp_instance`] waits for the server to become reachable.
+///
+/// Must be >= the longest `wait_for_*()` deadline in the guarded suites (30 s in
+/// `integration_valkey` / `_dragonfly` / `_kividb`, 10 s in `integration_redis`).
+/// If it were shorter, the documented "bring the container up, then run the
+/// suite" workflow would race past the guard: the probe would give up, the
+/// suite's own wait would succeed, and — because the claim runs once per process
+/// behind a `OnceLock` — it would never be retried.
+const CLAIM_REACHABLE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-attempt connect timeout inside that window.
+const CLAIM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What the pre-flight probe managed to learn about the target server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// The server answered every question the guard asked.
+    Reachable {
+        /// Keys summed over ALL databases (`INFO keyspace`), not just db 0.
+        /// `DBSIZE` was wrong here: it counts one database while `FLUSHALL`
+        /// destroys all of them, so keys parked in db 1+ read as "empty".
+        keys: i64,
+        /// Number of entries `FT._LIST` returned.
+        index_count: usize,
+        /// Per-start server identity; see [`server_identity`]. May be empty.
+        server_id: String,
+    },
+    /// The guard could not establish that the server is safe to destroy —
+    /// unreachable, still loading, or a probe command that errored. Carries a
+    /// short reason for the message.
+    Inconclusive(String),
+}
 
 /// Verdict of the ownership check a FLUSHALL-issuing suite runs before it
 /// touches a server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
-    /// Server held no keys and no indexes, so this process takes it over.
+    /// Server holds nothing, so this process takes it over.
     Fresh,
     /// Server is non-empty, but either the operator waived the check or the
-    /// server's identity matches the claim this target directory recorded, so
-    /// the state is this harness's own leftovers.
+    /// server's identity matches the claim this target directory recorded.
     Reused,
-    /// Server holds state this harness never created. Carries the message to
-    /// show the operator.
+    /// Not established as safe. Carries the message to show the operator.
     Refuse(String),
 }
 
@@ -1977,51 +2013,27 @@ pub enum Claim {
 /// with no live server.
 #[derive(Debug, Clone)]
 pub struct ClaimInputs<'a> {
-    /// Cargo test target, e.g. `"integration_redis"`. Used in the message.
+    /// Cargo test target, e.g. `"integration_redis"`.
     pub target: &'a str,
     /// Env var that selects this suite's port, e.g. `"REDIS_TEST_PORT"`.
     pub port_env: &'a str,
     pub host: &'a str,
     pub port: u16,
-    /// `DBSIZE` reported by the target server.
-    pub dbsize: i64,
-    /// Number of entries `FT._LIST` returned (0 when the command is
-    /// unsupported or errored).
-    pub index_count: usize,
+    /// What the probe learned.
+    pub probe: &'a Probe,
     /// Server identity this target directory recorded the last time it claimed
     /// `host:port`, if any.
     pub prior_claim: Option<&'a str>,
-    /// Server identity now (see [`server_identity`]). Empty when the server
-    /// reports neither `run_id` nor `master_replid` — an empty identity NEVER
-    /// matches a prior claim, so such a server can only be used when it is empty
-    /// or the check is waived.
-    pub server_id: &'a str,
+    /// Where that claim is stored, for the message.
+    pub claim_path: &'a str,
     /// Operator set [`ALLOW_DIRTY_ENV`].
     pub forced: bool,
 }
 
-/// Decide whether a destructive suite may run against the server described by
-/// `i`. Pure: no I/O, no env reads.
-pub fn claim_verdict(i: &ClaimInputs<'_>) -> Claim {
-    if i.forced {
-        return Claim::Reused;
-    }
-    if i.dbsize <= 0 && i.index_count == 0 {
-        return Claim::Fresh;
-    }
-    if !i.server_id.is_empty() && i.prior_claim == Some(i.server_id) {
-        return Claim::Reused;
-    }
-    Claim::Refuse(format!(
-        "\n\n\
-         REFUSING TO RUN `{target}` AGAINST {host}:{port}\n\
-         \n\
-         That server already holds {dbsize} key(s) and {indexes} search index(es) that this\n\
-         test harness did not create. Every test in `{target}` calls `flush_db()`, which\n\
-         drops every index `FT._LIST` reports and then issues `FLUSHALL` — running here\n\
-         would destroy all of it.\n\
-         \n\
-         Point the suite at a container of your own:\n\
+/// Advice appended to every refusal.
+fn refusal_footer(i: &ClaimInputs<'_>) -> String {
+    format!(
+        "Point the suite at a container of your own:\n\
          \n\
          \x20   docker run -d --rm -p <your-port>:6379 --name <your-name> <image>\n\
          \x20   {port_env}=<your-port> cargo test --test {target} -- --test-threads=1\n\
@@ -2029,29 +2041,152 @@ pub fn claim_verdict(i: &ClaimInputs<'_>) -> Claim {
          `{port_env}` is the ONLY supported way to move the suite. Editing the port literal\n\
          in tests/{target}.rs is rejected by tests/harness_invariants.rs.\n\
          \n\
-         If that data really is disposable, re-run with {allow}=1 to waive this check.\n",
+         If the server really is yours and its contents are disposable, re-run with\n\
+         {allow}=1 to waive this check.\n",
+        port_env = i.port_env,
+        target = i.target,
+        allow = ALLOW_DIRTY_ENV,
+    )
+}
+
+/// Decide whether a destructive suite may run against the server described by
+/// `i`. Pure: no I/O, no env reads, no clock.
+pub fn claim_verdict(i: &ClaimInputs<'_>) -> Claim {
+    if i.forced {
+        return Claim::Reused;
+    }
+
+    let (keys, index_count, server_id) = match i.probe {
+        Probe::Inconclusive(why) => {
+            return Claim::Refuse(format!(
+                "\n\n\
+                 REFUSING TO RUN `{target}` AGAINST {host}:{port}\n\
+                 \n\
+                 The safety check could not establish that this server is safe to destroy:\n\
+                 \x20   {why}\n\
+                 \n\
+                 Every test in `{target}` calls `flush_db()`, which drops every index\n\
+                 `FT._LIST` reports and then issues `FLUSHALL` — destroying EVERY database on\n\
+                 the server. The check refuses rather than guess, because guessing wrong is\n\
+                 unrecoverable.\n\
+                 \n\
+                 {footer}",
+                target = i.target,
+                host = i.host,
+                port = i.port,
+                why = why,
+                footer = refusal_footer(i),
+            ));
+        }
+        Probe::Reachable {
+            keys,
+            index_count,
+            server_id,
+        } => (*keys, *index_count, server_id.as_str()),
+    };
+
+    if keys <= 0 && index_count == 0 {
+        return Claim::Fresh;
+    }
+    if !server_id.is_empty() && i.prior_claim == Some(server_id) {
+        return Claim::Reused;
+    }
+
+    // Non-empty and unclaimed. Say WHY, because the two cases need opposite
+    // actions from the operator.
+    let diagnosis = match i.prior_claim {
+        None => format!(
+            "This target directory has NO claim recorded for {host}:{port}.\n\
+             \x20   (looked in {claim_path})\n\
+             \n\
+             Either the server is not yours, or your claim was removed — `cargo clean`, a\n\
+             fresh CARGO_TARGET_DIR, a new worktree, or `--target <triple>` (which relocates\n\
+             the claim under <target>/<triple>/) all lose it. A previous run that was killed\n\
+             mid-suite also leaves the server populated with no claim.",
+            host = i.host,
+            port = i.port,
+            claim_path = i.claim_path,
+        ),
+        Some(prior) if server_id.is_empty() => format!(
+            "A claim IS recorded for {host}:{port} ({claim_path}, instance {prior}), but this\n\
+             server reports neither `run_id` nor `master_replid`, so nothing can be matched\n\
+             against it. An unidentifiable server is never auto-authorised.",
+            host = i.host,
+            port = i.port,
+            claim_path = i.claim_path,
+            prior = display_id(prior),
+        ),
+        Some(prior) => format!(
+            "A claim IS recorded for {host}:{port} ({claim_path}), but it does not match:\n\
+             \x20   claimed instance: {prior}\n\
+             \x20   instance now:     {now}\n\
+             \n\
+             The server was restarted or replaced. NOTE: `docker restart` of your OWN\n\
+             container changes both `run_id` and `master_replid` while an RDB-persisted\n\
+             dataset survives — so if this is your container, this refusal is a false alarm.\n\
+             Delete {claim_path} (or set {allow}=1) and re-run.",
+            host = i.host,
+            port = i.port,
+            claim_path = i.claim_path,
+            prior = display_id(prior),
+            now = display_id(server_id),
+            allow = ALLOW_DIRTY_ENV,
+        ),
+    };
+
+    Claim::Refuse(format!(
+        "\n\n\
+         REFUSING TO RUN `{target}` AGAINST {host}:{port}\n\
+         \n\
+         That server holds {keys} key(s) across all databases and {indexes} search index(es)\n\
+         that this target directory has no claim for. Every test in `{target}` calls\n\
+         `flush_db()`, which drops every index `FT._LIST` reports and then issues `FLUSHALL`\n\
+         — destroying EVERY database on the server, not just db 0.\n\
+         \n\
+         {diagnosis}\n\
+         \n\
+         {footer}",
         target = i.target,
         host = i.host,
         port = i.port,
-        dbsize = i.dbsize,
-        indexes = i.index_count,
-        port_env = i.port_env,
-        allow = ALLOW_DIRTY_ENV,
+        keys = keys,
+        indexes = index_count,
+        diagnosis = diagnosis,
+        footer = refusal_footer(i),
     ))
 }
 
-/// Path of the file recording which server identity this target directory last
-/// claimed for `host:port`. Lives beside the test binaries (derived from
-/// `current_exe()`: `<target>/<profile>/deps/<bin>` -> `<target>`), so a session
-/// running with its own `CARGO_TARGET_DIR` has its own claims.
-fn claim_file(target: &str, host: &str, port: u16) -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let target_dir = exe.parent()?.parent()?.parent()?;
-    Some(
-        target_dir
-            .join("vdbb-test-claims")
-            .join(format!("{target}-{host}-{port}.claim")),
-    )
+/// Render a possibly-empty instance id for a message.
+fn display_id(id: &str) -> &str {
+    if id.is_empty() {
+        "<none reported>"
+    } else {
+        id
+    }
+}
+
+/// Sum `keys=` across every `dbN:` line of an `INFO keyspace` section.
+///
+/// Redis omits empty databases entirely, so an empty section legitimately means
+/// zero keys. Field ORDER and the extra fields differ per engine — verified live
+/// on redis:8.8.0 (`db0:keys=1,expires=0,avg_ttl=0,subexpiry=0`),
+/// valkey-bundle (`...,keys_with_volatile_items=0`), dragonfly df-v1.40.1
+/// (`db0:keys=1,expires=0,hits=0,misses=0,hit_ratio=0.00,avg_ttl=-1`) and
+/// kividb v1.0.2-full (`db0:keys=1,expires=0,avg_ttl=0`) — so parse by name.
+pub fn sum_keyspace_keys(info: &str) -> i64 {
+    info.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("db") {
+                return None;
+            }
+            let (_db, fields) = line.split_once(':')?;
+            fields
+                .split(',')
+                .find_map(|kv| kv.trim().strip_prefix("keys="))
+                .and_then(|v| v.trim().parse::<i64>().ok())
+        })
+        .sum()
 }
 
 /// Pull `field:` out of an `INFO` section body.
@@ -2064,13 +2199,23 @@ pub fn info_field(info: &str, field: &str) -> String {
         .to_string()
 }
 
-/// A per-instance random identity for the server, so a claim recorded against
-/// one server is not honoured for a different one that later took the port.
+/// A per-START identity for the server, so a claim recorded against one server
+/// is not honoured for a different one that later took the port.
 ///
-/// `run_id` from `INFO server` where available (Redis, Valkey, KiviDB), falling
-/// back to `master_replid` from `INFO replication` (Dragonfly df-v1.40.1 reports
-/// no `run_id`; both were checked live). Empty when neither is present — an
-/// empty identity never matches a prior claim.
+/// `run_id` from `INFO server` where available (redis:8.8.0, valkey-bundle,
+/// kividb v1.0.2-full), falling back to `master_replid` from `INFO replication`
+/// (dragonfly df-v1.40.1 reports no `run_id`; all four checked live). Empty when
+/// neither is present — an empty identity never matches a prior claim.
+///
+/// LIMITS, both measured:
+///   * `master_replid` identifies a REPLICATION GROUP, not an instance: a
+///     Dragonfly replica reports the same value as its primary. A claim recorded
+///     against a primary would therefore also authorise a replica of it that
+///     later occupied the same host:port.
+///   * Both values are re-generated on restart, so `docker restart` of your own
+///     container invalidates its claim even though an RDB-persisted dataset
+///     survives. That direction is safe (it refuses), and the refusal message
+///     names it explicitly.
 fn server_identity(conn: &mut redis::Connection) -> String {
     let server: String = redis::cmd("INFO")
         .arg("server")
@@ -2087,57 +2232,150 @@ fn server_identity(conn: &mut redis::Connection) -> String {
     info_field(&repl, "master_replid")
 }
 
-/// Claim `host:port` for a destructive suite, or panic with the refusal message.
-///
-/// Called once per test process from the suite's `test_port()`. A server that
-/// cannot be reached is left alone: connecting is the suite's own
-/// `wait_for_*()` job, and an unreachable server cannot be damaged.
-pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) {
+/// Probe the server. EVERY failure path yields [`Probe::Inconclusive`], which
+/// [`claim_verdict`] refuses on.
+fn probe_server(host: &str, port: u16, wait: std::time::Duration) -> Probe {
     let url = format!("redis://{host}:{port}/");
     let Ok(client) = redis::Client::open(url.as_str()) else {
-        return;
-    };
-    let Ok(mut conn) = client.get_connection_with_timeout(std::time::Duration::from_secs(2)) else {
-        return;
+        return Probe::Inconclusive(format!("could not parse the connection URL {url}"));
     };
 
-    let dbsize: i64 = redis::cmd("DBSIZE").query(&mut conn).unwrap_or(0);
-    let index_count = redis::cmd("FT._LIST")
-        .query::<Vec<String>>(&mut conn)
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let server_id = server_identity(&mut conn);
+    // Wait for the server the same way the suite's own `wait_for_*()` does. A
+    // container that is still starting must NOT skip the check: that was the
+    // whole bug — the probe gave up, the suite's 10-30 s wait then succeeded,
+    // and the `OnceLock` meant the claim was never retried.
+    let deadline = std::time::Instant::now() + wait;
+    let mut conn = loop {
+        match client.get_connection_with_timeout(CLAIM_CONNECT_TIMEOUT) {
+            Ok(c) => break c,
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    return Probe::Inconclusive(format!(
+                        "could not reach {host}:{port} within {}s ({e})",
+                        wait.as_secs()
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+
+    // A server replaying its RDB/AOF answers INFO but reports a keyspace that is
+    // still filling, so "0 keys" would be a lie.
+    if let Ok(persistence) = redis::cmd("INFO")
+        .arg("persistence")
+        .query::<String>(&mut conn)
+    {
+        if info_field(&persistence, "loading") == "1" {
+            return Probe::Inconclusive(format!(
+                "{host}:{port} is still loading its dataset (INFO persistence reports \
+                 loading:1), so its keyspace cannot be trusted yet"
+            ));
+        }
+    }
+
+    let keyspace = match redis::cmd("INFO")
+        .arg("keyspace")
+        .query::<String>(&mut conn)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return Probe::Inconclusive(format!(
+                "`INFO keyspace` failed on {host}:{port} ({e}), so the number of keys at \
+                 risk is unknown"
+            ));
+        }
+    };
+    let keys = sum_keyspace_keys(&keyspace);
+
+    let index_count = match redis::cmd("FT._LIST").query::<Vec<String>>(&mut conn) {
+        Ok(v) => v.len(),
+        Err(e) => {
+            return Probe::Inconclusive(format!(
+                "`FT._LIST` failed on {host}:{port} ({e}); `flush_db()` drops every index it \
+                 reports, so the indexes at risk are unknown"
+            ));
+        }
+    };
+
+    Probe::Reachable {
+        keys,
+        index_count,
+        server_id: server_identity(&mut conn),
+    }
+}
+
+/// Path of the file recording which server identity this target directory last
+/// claimed for `host:port`. Lives beside the test binaries (derived from
+/// `current_exe()`: `<target>/<profile>/deps/<bin>` -> `<target>`), so a session
+/// running with its own `CARGO_TARGET_DIR` has its own claims.
+fn claim_file(target: &str, host: &str, port: u16) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let target_dir = exe.parent()?.parent()?.parent()?;
+    Some(
+        target_dir
+            .join("vdbb-test-claims")
+            .join(format!("{target}-{host}-{port}.claim")),
+    )
+}
+
+/// Claim `host:port` for a destructive suite, or panic with the refusal message.
+///
+/// Called once per test process from the suite's `test_port()`.
+pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) {
+    let forced = std::env::var(ALLOW_DIRTY_ENV)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if forced {
+        // Never silent: a stale `export` in a shell rc would otherwise disable
+        // the guard permanently with no signal at all.
+        //
+        // Written straight to the process's stderr handle, NOT via `eprintln!`:
+        // libtest redirects the print macros into its per-test capture buffer and
+        // only replays it for FAILING tests, so an `eprintln!` here is invisible
+        // in exactly the case that matters — a passing run whose guard is off.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "WARNING: {ALLOW_DIRTY_ENV} is set, so `{target}` will NOT verify that it owns \
+             {host}:{port} before `flush_db()` drops every FT._LIST index and FLUSHALLs the \
+             server. Unset {ALLOW_DIRTY_ENV} to restore the #292 safety check."
+        );
+    }
+
+    let probe = probe_server(host, port, CLAIM_REACHABLE_WAIT);
 
     let path = claim_file(target, host, port);
+    let path_display = path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<claim path unavailable>".to_string());
     let prior = path
         .as_ref()
         .and_then(|p| fs::read_to_string(p).ok())
         .map(|s| s.trim().to_string());
-
-    let forced = std::env::var(ALLOW_DIRTY_ENV)
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
 
     let verdict = claim_verdict(&ClaimInputs {
         target,
         port_env,
         host,
         port,
-        dbsize,
-        index_count,
+        probe: &probe,
         prior_claim: prior.as_deref(),
-        server_id: &server_id,
+        claim_path: &path_display,
         forced,
     });
 
     match verdict {
         Claim::Refuse(msg) => panic!("{msg}"),
         Claim::Fresh | Claim::Reused => {
-            if let Some(p) = path {
-                if let Some(dir) = p.parent() {
-                    let _ = fs::create_dir_all(dir);
+            if let Probe::Reachable { server_id, .. } = &probe {
+                if let Some(p) = path {
+                    if let Some(dir) = p.parent() {
+                        let _ = fs::create_dir_all(dir);
+                    }
+                    let _ = fs::write(&p, server_id);
                 }
-                let _ = fs::write(&p, &server_id);
             }
         }
     }

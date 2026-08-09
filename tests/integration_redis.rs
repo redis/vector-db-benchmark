@@ -15,7 +15,9 @@
 //! this file: `tests/harness_invariants.rs` rejects a second port literal, and
 //! an edit is invisible to anyone reading the command you ran. As a backstop,
 //! `test_port()` claims the instance on first use and refuses to run at all if
-//! the server already holds state this harness did not create.
+//! the server already holds state it has no recorded claim for. Any probe it
+//! cannot complete (unreachable, still loading, a denied or unsupported command)
+//! also refuses, because guessing "empty" is unrecoverable.
 
 use std::fs;
 use std::path::PathBuf;
@@ -40,7 +42,7 @@ mod common;
 /// each other.
 ///
 /// The first call also claims the instance (`common::claim_resp_instance`): if
-/// the server already holds keys or indexes this harness did not create, every
+/// the server already holds keys or indexes it has no recorded claim for, every
 /// test fails with an explanatory panic instead of destroying that data. The
 /// claim lives here rather than in `flush_db()` because `test_port()` is the one
 /// place EVERY path to the server goes through — the direct `redis::Client`

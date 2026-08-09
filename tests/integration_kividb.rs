@@ -9,7 +9,8 @@
 //! supported way to point the suite at your own container — do NOT edit the port
 //! in this file (`tests/harness_invariants.rs` rejects a second port literal).
 //! `test_port()` also claims the instance on first use and refuses to run if the
-//! server holds state this harness did not create.
+//! server holds state it has no recorded claim for. Any probe it cannot complete
+//! (unreachable, still loading, a denied or unsupported command) also refuses.
 //!
 //! Scope: vector KNN (whole-corpus COSINE ground truth, so recall reflects index
 //! quality alone), plus HNSW/FLAT algorithm selection, EF_RUNTIME behavior,

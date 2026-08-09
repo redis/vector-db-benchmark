@@ -9,7 +9,8 @@
 //! supported way to point the suite at your own container — do NOT edit the port
 //! in this file (`tests/harness_invariants.rs` rejects a second port literal).
 //! `test_port()` also claims the instance on first use and refuses to run if the
-//! server holds state this harness did not create.
+//! server holds state it has no recorded claim for. Any probe it cannot complete
+//! (unreachable, still loading, a denied or unsupported command) also refuses.
 //!
 //! Scope: vector KNN (whole-corpus COSINE ground truth, so recall reflects index
 //! quality alone) PLUS metadata filtering — Dragonfly Search supports hybrid
@@ -39,7 +40,7 @@ type KnnData = (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<i64>>);
 /// move this suite off the shared default — these tests call `flush_db()`,
 /// which `FLUSHALL`s the whole server. The first call also claims the instance
 /// (see `common::claim_resp_instance`), so a server holding state this harness
-/// did not create is refused instead of destroyed.
+/// no recorded claim for is refused instead of destroyed.
 fn test_port() -> u16 {
     static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
     *PORT.get_or_init(|| {
