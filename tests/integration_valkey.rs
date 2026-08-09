@@ -30,8 +30,8 @@ mod common;
 /// Valkey port under test. `VALKEY_PORT` is the ONLY supported way to move this
 /// suite off the shared default — these tests call `flush_db()`, which
 /// `FLUSHALL`s the whole server. The first call also claims the instance (see
-/// `common::claim_resp_instance`), so a server holding state this harness did
-/// not create is refused instead of destroyed.
+/// `common::claim_resp_instance`), so a server holding state this harness
+/// has no recorded claim for is refused instead of destroyed.
 fn test_port() -> u16 {
     static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
     *PORT.get_or_init(|| {
@@ -39,7 +39,7 @@ fn test_port() -> u16 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(6380);
-        common::claim_resp_instance("integration_valkey", "VALKEY_PORT", TEST_HOST, port);
+        common::claim_resp_instance("integration_valkey", "VALKEY_PORT", TEST_HOST, port, 6379);
         port
     })
 }

@@ -54,7 +54,13 @@ fn test_port() -> u16 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(6399);
-        common::claim_resp_instance("integration_redis", "REDIS_TEST_PORT", TEST_HOST, port);
+        common::claim_resp_instance(
+            "integration_redis",
+            "REDIS_TEST_PORT",
+            TEST_HOST,
+            port,
+            6379,
+        );
         port
     })
 }

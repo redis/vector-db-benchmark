@@ -2026,6 +2026,13 @@ pub struct ClaimInputs<'a> {
     pub prior_claim: Option<&'a str>,
     /// Where that claim is stored, for the message.
     pub claim_path: &'a str,
+    /// Port this engine's server listens on INSIDE its container, so the
+    /// `docker run -p …` line in the refusal is runnable. NOT always 6379 —
+    /// kividb listens on 6380 (`tests/docker-compose.test.yml` maps
+    /// `6386:6380`), and an operator who followed a hardcoded `:6379` would get
+    /// a container the suite cannot reach and then a second refusal from this
+    /// very guard.
+    pub container_port: u16,
     /// Operator set [`ALLOW_DIRTY_ENV`].
     pub forced: bool,
 }
@@ -2035,14 +2042,17 @@ fn refusal_footer(i: &ClaimInputs<'_>) -> String {
     format!(
         "Point the suite at a container of your own:\n\
          \n\
-         \x20   docker run -d --rm -p <your-port>:6379 --name <your-name> <image>\n\
+         \x20   docker run -d --rm -p <your-port>:{container} --name <your-name> <image>\n\
          \x20   {port_env}=<your-port> cargo test --test {target} -- --test-threads=1\n\
          \n\
-         `{port_env}` is the ONLY supported way to move the suite. Editing the port literal\n\
-         in tests/{target}.rs is rejected by tests/harness_invariants.rs.\n\
+         `{port_env}` is the supported way to move the suite. Do not edit the port in\n\
+         tests/{target}.rs instead: tests/harness_invariants.rs pins that default to the\n\
+         `{target}` mapping in tests/docker-compose.test.yml, so an edit fails the build,\n\
+         and it would move the default for everyone rather than just for you.\n\
          \n\
          If the server really is yours and its contents are disposable, re-run with\n\
          {allow}=1 to waive this check.\n",
+        container = i.container_port,
         port_env = i.port_env,
         target = i.target,
         allow = ALLOW_DIRTY_ENV,
@@ -2358,16 +2368,25 @@ fn claim_file(target: &str, host: &str, port: u16) -> Option<std::path::PathBuf>
 ///
 /// That split matters. The suites memoize the port with
 /// `OnceLock::get_or_init`, and `get_or_init` does NOT memoize an initializer
-/// that panics — so putting the panic inside it made every one of the 44 tests
-/// re-run the whole 30 s reachability loop. Measured against a dead port, two
-/// tests took 60.14 s instead of 20.13 s; the full suite would have taken ~22
-/// minutes to report "server not available". Here the memoized value is the
-/// VERDICT (`None` = allowed, `Some(msg)` = refuse) and the panic happens
-/// outside the initializer, so only the first test pays.
+/// that panics — so putting the panic inside it made EVERY test re-run the whole
+/// 30 s reachability loop. Measured against a dead port, the same two tests took
+/// 60.21 s with the panic inside the initializer and 30.07 s with it outside; the
+/// 44-test suite would have needed ~22 min (44 x 30 s) to report "server not
+/// available" and now finishes in 30.17 s. Here the memoized value is the VERDICT
+/// (`None` = allowed, `Some(msg)` = refuse) and the panic happens outside the
+/// initializer, so only the first test pays the loop.
 static CLAIM_OUTCOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
-pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) {
-    if let Some(msg) = CLAIM_OUTCOME.get_or_init(|| claim_outcome(target, port_env, host, port)) {
+pub fn claim_resp_instance(
+    target: &str,
+    port_env: &str,
+    host: &str,
+    port: u16,
+    container_port: u16,
+) {
+    if let Some(msg) =
+        CLAIM_OUTCOME.get_or_init(|| claim_outcome(target, port_env, host, port, container_port))
+    {
         panic!("{msg}");
     }
 }
@@ -2376,7 +2395,13 @@ pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) 
 ///
 /// One `OnceLock` per process is enough because a test binary is one suite
 /// against one server: `target`/`host`/`port` are identical on every call.
-fn claim_outcome(target: &str, port_env: &str, host: &str, port: u16) -> Option<String> {
+fn claim_outcome(
+    target: &str,
+    port_env: &str,
+    host: &str,
+    port: u16,
+    container_port: u16,
+) -> Option<String> {
     let forced = std::env::var(ALLOW_DIRTY_ENV)
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
@@ -2417,6 +2442,7 @@ fn claim_outcome(target: &str, port_env: &str, host: &str, port: u16) -> Option<
         probe: &probe,
         prior_claim: prior.as_deref(),
         claim_path: &path_display,
+        container_port,
         forced,
     });
 

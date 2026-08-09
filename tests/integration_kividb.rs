@@ -40,11 +40,14 @@ type KnnData = (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<i64>>);
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// KiviDB port under test. `KIVIDB_PORT` is the ONLY supported way to move this
+/// KiviDB port under test. The `6380` handed to the claim is the port KiviDB
+/// listens on INSIDE its container (not 6379); it only shapes the `docker run -p`
+/// line the refusal prints, and `tests/harness_invariants.rs` checks it against
+/// the `kividb` mapping in `tests/docker-compose.test.yml`. `KIVIDB_PORT` is the ONLY supported way to move this
 /// suite off the shared default — these tests call `flush_db()`, which
 /// `FLUSHALL`s the whole server. The first call also claims the instance (see
-/// `common::claim_resp_instance`), so a server holding state this harness did
-/// not create is refused instead of destroyed.
+/// `common::claim_resp_instance`), so a server holding state this harness
+/// has no recorded claim for is refused instead of destroyed.
 fn test_port() -> u16 {
     static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
     *PORT.get_or_init(|| {
@@ -52,7 +55,7 @@ fn test_port() -> u16 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(6386);
-        common::claim_resp_instance("integration_kividb", "KIVIDB_PORT", TEST_HOST, port);
+        common::claim_resp_instance("integration_kividb", "KIVIDB_PORT", TEST_HOST, port, 6380);
         port
     })
 }

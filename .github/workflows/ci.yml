@@ -77,9 +77,10 @@ jobs:
       run: cargo test --test overhead_invariants --release
 
     - name: Run test-harness invariants (no container)
-      # INV-P1/P2/P3 (#292): each integration suite's port has exactly one source
-      # of truth, and every FLUSHALL-issuing suite claims its instance from
-      # inside `test_port()` so it cannot destroy a server it does not own.
+      # INV-P1..P6 (#292): each suite has exactly one source of truth for its
+      # port and it matches docker-compose.test.yml; every server-wiping suite
+      # claims its instance from inside `test_port()`; the claim decision fails
+      # closed; and no shared helper under tests/common/ can wipe a server.
       run: cargo test --test harness_invariants --release
 
   integration-redis:

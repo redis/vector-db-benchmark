@@ -48,7 +48,13 @@ fn test_port() -> u16 {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(6385);
-        common::claim_resp_instance("integration_dragonfly", "DRAGONFLY_PORT", TEST_HOST, port);
+        common::claim_resp_instance(
+            "integration_dragonfly",
+            "DRAGONFLY_PORT",
+            TEST_HOST,
+            port,
+            6379,
+        );
         port
     })
 }

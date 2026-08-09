@@ -18,7 +18,7 @@
 //!   2. A `docker run -p 6399:6379` failed because the shared container already
 //!      held the port, so the writes landed in the shared server instead.
 //!
-//! Four invariants are locked in:
+//! Six invariants are locked in:
 //!
 //!   INV-P1  A suite's default port appears exactly ONCE in its executable
 //!           source: the `.unwrap_or(<port>)` inside `fn test_port()`. Any other
@@ -41,6 +41,17 @@
 //!           guard coerced an unreachable server, a denied `DBSIZE` and an
 //!           unsupported command all to "0 keys" — i.e. to `Fresh` — which fails
 //!           open in the one function whose job is to refuse.
+//!
+//!   INV-P5  No shared helper under `tests/common/` issues a server wipe. Every
+//!           suite includes `mod common;`, non-destructive ones included, so a
+//!           wipe there would be invisible to the per-suite scan in P2/P3.
+//!
+//!   INV-P6  Each wiping suite's default port equals the host port
+//!           `tests/docker-compose.test.yml` publishes for it, and the container
+//!           port it hands the claim equals the mapped container port. P1 rejects
+//!           a SECOND literal; only this rejects EDITING the single one — the
+//!           bypass incident 1 used, and the one the refusal message promises is
+//!           rejected.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -104,17 +115,17 @@ fn default_port(src: &str) -> Option<(usize, u16)> {
     Some((line, port))
 }
 
-/// True when `hay[at..at + len]` is a standalone number (not a digit of a longer
-/// one).
+/// True when `hay[at..at + len]` is a standalone NUMBER — not a run of digits
+/// inside a longer number (`163990`) and not part of an identifier
+/// (`foo_6399`, `PORT_6399`, `x6399`).
+///
+/// The identifier half matters: with only the digit check, `let foo_6399 = 1;`
+/// was reported as a bare port literal even though the line contains no literal
+/// at all, because `_` is not a digit and so read as a boundary.
 fn is_standalone_number(hay: &str, at: usize, len: usize) -> bool {
-    let before_ok = hay[..at]
-        .chars()
-        .next_back()
-        .is_none_or(|c| !c.is_ascii_digit());
-    let after_ok = hay[at + len..]
-        .chars()
-        .next()
-        .is_none_or(|c| !c.is_ascii_digit());
+    let boundary = |c: char| !c.is_ascii_alphanumeric() && c != '_';
+    let before_ok = hay[..at].chars().next_back().is_none_or(boundary);
+    let after_ok = hay[at + len..].chars().next().is_none_or(boundary);
     before_ok && after_ok
 }
 
@@ -210,6 +221,50 @@ fn wiping_suites() -> BTreeSet<String> {
         .collect()
 }
 
+/// The compose service each wiping suite is meant to talk to.
+const SUITE_COMPOSE_SERVICE: &[(&str, &str)] = &[
+    ("integration_dragonfly", "dragonfly"),
+    ("integration_kividb", "kividb"),
+    ("integration_redis", "redis"),
+    ("integration_valkey", "valkey"),
+];
+
+/// `(host_port, container_port)` from the first published port of a
+/// `tests/docker-compose.test.yml` service, e.g. `- "6386:6380"` -> `(6386, 6380)`.
+fn compose_ports(service: &str) -> Option<(u16, u16)> {
+    let compose = fs::read_to_string(tests_dir().join("docker-compose.test.yml")).ok()?;
+    let mut in_service = false;
+    let mut in_ports = false;
+    for line in compose.lines() {
+        // A service header is exactly two spaces of indent, e.g. `  kividb:`.
+        if let Some(name) = line.strip_prefix("  ").and_then(|l| l.strip_suffix(':')) {
+            if !name.starts_with(' ') {
+                in_service = name == service;
+                in_ports = false;
+                continue;
+            }
+        }
+        if !in_service {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed == "ports:" {
+            in_ports = true;
+            continue;
+        }
+        if in_ports {
+            if let Some(entry) = trimmed.strip_prefix("- ") {
+                let (host, container) = entry.trim().trim_matches('"').split_once(':')?;
+                return Some((host.parse().ok()?, container.parse().ok()?));
+            }
+            if !trimmed.starts_with('#') && !trimmed.is_empty() {
+                in_ports = false;
+            }
+        }
+    }
+    None
+}
+
 /// The env var a `test_port()` body reads, e.g. `REDIS_TEST_PORT`.
 fn port_env_var(body: &str) -> Option<String> {
     let at = body.find("std::env::var(\"")? + "std::env::var(\"".len();
@@ -218,9 +273,11 @@ fn port_env_var(body: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Collapse runs of whitespace so a match survives rustfmt rewrapping.
+/// Normalise a call so the match survives rustfmt: drop all whitespace (it may
+/// rewrap the arguments one per line) and the trailing comma it then adds.
 fn squeeze(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let no_ws: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    no_ws.replace(",)", ")")
 }
 
 // ---------------------------------------------------------------------------
@@ -347,12 +404,45 @@ fn test_port() -> u16 {
         hits[0].1.contains("6_399"),
         "the ORIGINAL line must be reported, not the normalised one: {hits:?}"
     );
-    // ..and a separator that is not between two digits must not be collapsed,
-    // or `PORT_6399` would start matching.
+    // The stripper only joins digits across a separator that sits BETWEEN two
+    // digits, so an identifier keeps its underscore. (Whether `foo_6399` is
+    // FLAGGED is a separate question, settled by `is_standalone_number` and
+    // covered by the next test.)
     assert_eq!(
         strip_digit_separators("let foo_6399 = 1_000;"),
         "let foo_6399 = 1000;"
     );
+}
+
+#[test]
+fn inv_p1_scanner_does_not_flag_identifiers_that_merely_end_in_the_port() {
+    // Negative control with teeth: none of these lines contains a port literal,
+    // and an earlier `is_standalone_number` flagged the first two — it treated
+    // `_` as a boundary, so `foo_6399` read as the bare number 6399.
+    let src = "\
+fn test_port() -> u16 {
+    std::env::var(\"REDIS_TEST_PORT\")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6399)
+}
+fn unrelated() {
+    let foo_6399 = 1;
+    let port_6399 = 2;
+    let x6399y = 3;
+}
+";
+    let (line, port) = default_port(src).unwrap();
+    let hits = bare_port_hits(src, port, line);
+    assert!(
+        hits.is_empty(),
+        "identifiers ending in the port number are not port literals: {hits:?}"
+    );
+    // ..and the real thing on the very same shape of line is still caught, so
+    // the precision fix did not cost the scanner its teeth.
+    let real = src.replace("let foo_6399 = 1;", "cmd.env(\"REDIS_PORT\", \"6399\");");
+    let (line, port) = default_port(&real).unwrap();
+    assert_eq!(bare_port_hits(&real, port, line).len(), 1);
 }
 
 #[test]
@@ -505,9 +595,19 @@ fn inv_p2_wiping_suites_claim_their_instance_in_test_port() {
         // Check the ARGUMENTS, not merely that some call exists: a copy-paste
         // passing another suite's target name or env var would otherwise pass,
         // recording the claim under the wrong key and naming the wrong override
-        // in the refusal message.
-        let expected =
-            format!("common::claim_resp_instance(\"{suite}\", \"{env}\", TEST_HOST, port);");
+        // in the refusal message. The container port is checked against compose
+        // for the same reason — the refusal prints a `docker run -p X:<it>` line,
+        // and kividb's is 6380, not 6379.
+        let service = SUITE_COMPOSE_SERVICE
+            .iter()
+            .find(|(s, _)| *s == suite)
+            .map(|(_, svc)| *svc)
+            .unwrap_or_else(|| panic!("{suite} must be listed in SUITE_COMPOSE_SERVICE"));
+        let (_host_port, container_port) = compose_ports(service)
+            .unwrap_or_else(|| panic!("no published port for compose service {service}"));
+        let expected = format!(
+            "common::claim_resp_instance(\"{suite}\", \"{env}\", TEST_HOST, port, {container_port});"
+        );
         assert!(
             squeeze(body).contains(&squeeze(&expected)),
             "{}: `fn test_port()` must call exactly\n    {expected}\n\
@@ -515,6 +615,43 @@ fn inv_p2_wiping_suites_claim_their_instance_in_test_port() {
             path.display(),
         );
     }
+}
+
+#[test]
+fn inv_p6_suite_defaults_match_the_compose_mapping() {
+    // INV-P1 rejects a SECOND literal for the port; on its own it does not
+    // reject EDITING the single one — `default_port()` re-reads whatever is on
+    // the `.unwrap_or(..)` line, so changing 6399 to 7911 left all invariants
+    // green. That is precisely the bypass incident 1 in #292 used, and the
+    // refusal message tells operators it is rejected. This is what makes that
+    // sentence true: the default is pinned to the port
+    // `tests/docker-compose.test.yml` publishes, so an edit fails the build, and
+    // the suite default and the compose mapping cannot drift apart either way.
+    for (suite, service) in SUITE_COMPOSE_SERVICE {
+        let src = fs::read_to_string(tests_dir().join(format!("{suite}.rs"))).unwrap();
+        let (_line, default) = default_port(&src)
+            .unwrap_or_else(|| panic!("{suite}: no `fn test_port()` fallback to check"));
+        let (host_port, _container) = compose_ports(service)
+            .unwrap_or_else(|| panic!("no published port for compose service {service}"));
+        assert_eq!(
+            default, host_port,
+            "{suite}'s default port ({default}) must equal the host port \
+             tests/docker-compose.test.yml publishes for `{service}` ({host_port}). \
+             To run against your own server use the suite's env var — editing this \
+             literal moves the default for everyone."
+        );
+    }
+}
+
+#[test]
+fn inv_p6_compose_parser_reads_a_non_6379_container_port() {
+    // Positive control for the parser, and the case that motivated it: kividb
+    // does NOT listen on 6379.
+    assert_eq!(compose_ports("kividb"), Some((6386, 6380)));
+    assert_eq!(compose_ports("redis"), Some((6399, 6379)));
+    // Negative control: an absent service must be reported as absent, not as
+    // some default that would make INV-P6 pass vacuously.
+    assert_eq!(compose_ports("no-such-service"), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +675,7 @@ fn inputs<'a>(probe: &'a Probe, prior: Option<&'a str>) -> ClaimInputs<'a> {
         probe,
         prior_claim: prior,
         claim_path: "/tmp/target/vdbb-test-claims/integration_redis-127.0.0.1-6399.claim",
+        container_port: 6379,
         forced: false,
     }
 }
@@ -667,12 +805,14 @@ fn refusal_message_states_the_mechanism_and_the_way_out() {
         "127.0.0.1:6399",    // which server
         "400 key(s) across all databases",
         "2 search index(es)",
-        "FLUSHALL",           // the true mechanism of the damage
-        "FT._LIST",           // ..and the index half of it
-        "REDIS_TEST_PORT",    // the supported override
-        ALLOW_DIRTY_ENV,      // the escape hatch
-        "harness_invariants", // why editing the source will not work
-        "vdbb-test-claims",   // WHERE the claim was looked for
+        "FLUSHALL",                // the true mechanism of the damage
+        "FT._LIST",                // ..and the index half of it
+        "REDIS_TEST_PORT",         // the supported override
+        ALLOW_DIRTY_ENV,           // the escape hatch
+        "harness_invariants",      // why editing the source will not work
+        "docker-compose.test.yml", // ..and the mechanism that makes that true
+        "vdbb-test-claims",        // WHERE the claim was looked for
+        "-p <your-port>:6379",     // a runnable remedy, with the RIGHT port
     ] {
         assert!(
             msg.contains(expected),
@@ -687,6 +827,35 @@ fn refusal_message_states_the_mechanism_and_the_way_out() {
          only knows there is no matching claim. Message was:\n{msg}"
     );
     assert!(msg.contains("no claim for"));
+
+    // The message must not claim a policing power the invariants do not have.
+    // The earlier wording — "Editing the port literal in tests/X.rs is rejected
+    // by tests/harness_invariants.rs" — was false: INV-P1 rejects a SECOND
+    // literal, and editing the single one left all invariants green. That is now
+    // true only because INV-P6 pins the default to the compose mapping, so the
+    // message has to cite THAT, and this asserts it does. Naming the file alone
+    // is what let the false sentence ship.
+    assert!(
+        msg.contains("pins that default to the"),
+        "the message must name the mechanism that actually rejects an edit \
+         (INV-P6's compose pin), not just the file: {msg}"
+    );
+
+    // The remedy has to be runnable for the suite it is printed for. kividb
+    // listens on 6380, so a hardcoded 6379 would hand the operator a container
+    // the suite cannot reach — and then a second refusal from this guard.
+    let mut kividb = inputs(&p, None);
+    kividb.target = "integration_kividb";
+    kividb.port_env = "KIVIDB_PORT";
+    kividb.container_port = 6380;
+    let Claim::Refuse(kv) = claim_verdict(&kividb) else {
+        panic!("expected a refusal");
+    };
+    assert!(
+        kv.contains("-p <your-port>:6380"),
+        "kividb's remedy must publish to 6380, not 6379: {kv}"
+    );
+    assert!(!kv.contains("-p <your-port>:6379"), "{kv}");
 }
 
 #[test]
