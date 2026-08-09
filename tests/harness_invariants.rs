@@ -18,7 +18,7 @@
 //!   2. A `docker run -p 6399:6379` failed because the shared container already
 //!      held the port, so the writes landed in the shared server instead.
 //!
-//! Six invariants are locked in:
+//! Seven invariants are locked in:
 //!
 //!   INV-P1  A suite's default port appears exactly ONCE in its executable
 //!           source: the `.unwrap_or(<port>)` inside `fn test_port()`. Any other
@@ -52,6 +52,10 @@
 //!           a SECOND literal; only this rejects EDITING the single one — the
 //!           bypass incident 1 used, and the one the refusal message promises is
 //!           rejected.
+//!
+//!   INV-P7  The set of test targets under tests/ is pinned, so a wiping suite
+//!           named outside the `integration_*.rs` pattern cannot slip past the
+//!           INV-P3 scan unclassified.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -193,16 +197,20 @@ fn bare_port_hits(src: &str, port: u16, allowed_line: usize) -> Vec<(usize, Stri
 /// `FLUSHDB` counts: it wipes db 0 of a shared server, and it is the verb an
 /// author reaches for precisely because it sounds safer.
 fn wipes_whole_server(src: &str) -> bool {
+    // `\` counts as a quote boundary so an ESCAPED literal — `\"FLUSHALL\"`, the
+    // natural Rust spelling of a Lua payload or a printed message — is caught.
+    // Without it the "either quote style" claim was false.
+    let is_quote = |c: char| c == '"' || c == '\'' || c == '\\';
     let upper = src.to_ascii_uppercase();
     for verb in ["FLUSHALL", "FLUSHDB"] {
         let mut from = 0;
         while let Some(rel) = upper[from..].find(verb) {
             let at = from + rel;
-            let quoted_before = matches!(upper[..at].chars().next_back(), Some('"') | Some('\''));
-            let quoted_after = matches!(
-                upper[at + verb.len()..].chars().next(),
-                Some('"') | Some('\'')
-            );
+            let quoted_before = upper[..at].chars().next_back().is_some_and(is_quote);
+            let quoted_after = upper[at + verb.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_quote);
             if quoted_before && quoted_after {
                 return true;
             }
@@ -278,6 +286,117 @@ fn port_env_var(body: &str) -> Option<String> {
 fn squeeze(s: &str) -> String {
     let no_ws: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     no_ws.replace(",)", ")")
+}
+
+/// Remove `//` and `/* */` comments, leaving string literals intact so
+/// `"redis://host"` survives.
+///
+/// INV-P2 used to match against RAW source, so **commenting the claim call out**
+/// — one `/` character — left all invariants green while the suite went on to
+/// `FLUSHALL` a server it had not claimed. `bare_port_hits` had skipped comment
+/// lines since the first round; INV-P2 was the same file, one dimension short.
+fn strip_comments(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            out.push(c);
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    out.push(chars[i]);
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                out.push(chars[i]);
+                i += 1;
+                if chars[i - 1] == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// The one shape a wiping suite's `fn test_port()` is allowed to have.
+///
+/// INV-P2 asserts the WHOLE body equals this, not merely that it contains the
+/// claim call. Containment could be satisfied while the call was disabled —
+/// commented out, wrapped in `if false { .. }`, or parked inside
+/// `stringify!(..)`. Equality means any extra or missing token fails, so the
+/// choke point cannot be neutered without the build going red. It also makes the
+/// rustfmt tolerance in `squeeze` load-bearing: an identity `squeeze` no longer
+/// matches.
+fn expected_test_port_body(suite: &str, env: &str, default: u16, container: u16) -> String {
+    format!(
+        "fn test_port() -> u16 {{
+            static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+            *PORT.get_or_init(|| {{
+                let port = std::env::var(\"{env}\")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or({default});
+                common::claim_resp_instance(\"{suite}\", \"{env}\", TEST_HOST, port, {container});
+                port
+            }})"
+    )
+}
+
+/// Every `.rs` file under `tests/common/`, at ANY depth.
+///
+/// `read_dir` reads one level, so INV-P5 — round 3's headline fix — was evaded in
+/// its own idiom by putting the wipe helper in `tests/common/wipe/mod.rs`.
+fn common_sources() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&tests_dir().join("common"), &mut out);
+    out.sort();
+    out
+}
+
+/// Body of a top-level `fn <name>(..)` in `tests/common/mod.rs`, comments kept.
+fn common_fn_body(name: &str) -> String {
+    let src = fs::read_to_string(tests_dir().join("common").join("mod.rs")).unwrap();
+    let marker = format!("fn {name}(");
+    let start = src
+        .find(&marker)
+        .unwrap_or_else(|| panic!("tests/common/mod.rs must define `fn {name}`"));
+    let rest = &src[start..];
+    let end = rest.find("\n}").unwrap_or(rest.len());
+    rest[..end].to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +645,12 @@ fn inv_p3_scanner_is_case_insensitive() {
             "lua",
             "redis::cmd(\"EVAL\").arg(\"redis.call('flushall')\").query(c)",
         ),
+        // Escaped double quotes — the natural Rust spelling, and the one that
+        // beat the "either quote style" matcher.
+        (
+            "escaped",
+            "redis::cmd(\"EVAL\").arg(\"return redis.call(\\\"FLUSHALL\\\")\").query(c)",
+        ),
     ] {
         assert!(
             wipes_whole_server(src),
@@ -542,15 +667,9 @@ fn inv_p5_shared_helpers_must_not_wipe_a_server() {
     // suite a server-wiping path that INV-P2/P3 cannot see — and that refactor is
     // the LIKELY one, since the premise of this whole guard is that four suites
     // share one `flush_db()` shape.
-    let dir = tests_dir().join("common");
-    let mut scanned = 0usize;
-    for entry in fs::read_dir(&dir).expect("tests/common must be readable") {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        scanned += 1;
-        let src = fs::read_to_string(&path).unwrap();
+    let sources = common_sources();
+    for path in &sources {
+        let src = fs::read_to_string(path).unwrap();
         assert!(
             !wipes_whole_server(&src),
             "{}: shared test helpers must not issue FLUSHALL/FLUSHDB. Every suite \
@@ -560,7 +679,99 @@ fn inv_p5_shared_helpers_must_not_wipe_a_server() {
             path.display(),
         );
     }
-    assert!(scanned > 0, "found no .rs files under {}", dir.display());
+    // Pin the file set, not just `> 0`. The first version used `read_dir`, which
+    // reads ONE level, so a helper at `tests/common/wipe/mod.rs` evaded the check
+    // entirely — this invariant re-evaded in its own idiom. `common_sources()`
+    // now recurses, and pinning the names means a new shared file has to be
+    // acknowledged here rather than silently joining (or dodging) the scan.
+    let names: BTreeSet<String> = sources
+        .iter()
+        .map(|p| {
+            p.strip_prefix(tests_dir().join("common"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let expected: BTreeSet<String> = ["mod.rs"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        names, expected,
+        "the set of shared helper files under tests/common/ changed; add it here \
+         so the wipe scan provably covers it"
+    );
+}
+
+#[test]
+fn inv_p5_scanner_recurses() {
+    // Positive control for the walker: the evasion was depth, not content, so
+    // the fix has to be demonstrated on depth.
+    let nested = tests_dir().join("common").join("mod.rs");
+    assert!(
+        common_sources().contains(&nested),
+        "the walker must find tests/common/mod.rs: {:?}",
+        common_sources()
+    );
+    // ..and it must be a real walk, not a hardcoded list: point it at a tree it
+    // has never seen and it must find the nested file.
+    let tmp = std::env::temp_dir().join(format!("vdbb-p5-{}", std::process::id()));
+    let deep = tmp.join("a").join("b");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("wipe.rs"), "redis::cmd(\"FLUSHALL\")").unwrap();
+    fs::write(tmp.join("top.rs"), "fn x() {}").unwrap();
+    let mut found: Vec<String> = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        for e in fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                out.push(p.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    walk(&tmp, &mut found);
+    found.sort();
+    fs::remove_dir_all(&tmp).ok();
+    assert_eq!(found, vec!["top.rs".to_string(), "wipe.rs".to_string()]);
+}
+
+#[test]
+fn inv_p7_the_scanned_test_target_set_is_pinned() {
+    // The wipe scan only sees `tests/integration_*.rs`, so a wiping suite named
+    // `tests/zz_wipe_smoke.rs` would never be classified at all. Pinning the
+    // target list means a new one must be acknowledged here.
+    let mut found: Vec<String> = fs::read_dir(tests_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    let expected = vec![
+        "harness_invariants.rs",
+        "integration_chroma.rs",
+        "integration_cli.rs",
+        "integration_dragonfly.rs",
+        "integration_elasticsearch.rs",
+        "integration_kividb.rs",
+        "integration_milvus.rs",
+        "integration_mongodb.rs",
+        "integration_opensearch.rs",
+        "integration_pgvector.rs",
+        "integration_qdrant.rs",
+        "integration_redis.rs",
+        "integration_valkey.rs",
+        "integration_vectorsets.rs",
+        "integration_vertex.rs",
+        "integration_weaviate.rs",
+        "overhead_invariants.rs",
+    ];
+    assert_eq!(
+        found, expected,
+        "the set of test targets changed. A new one that wipes a server must be \
+         named `integration_*.rs` so the INV-P3 scan sees it, and listed here."
+    );
 }
 
 #[test]
@@ -592,12 +803,16 @@ fn inv_p2_wiping_suites_claim_their_instance_in_test_port() {
         });
         let env = port_env_var(body)
             .unwrap_or_else(|| panic!("{}: `fn test_port()` must read an env var", path.display()));
-        // Check the ARGUMENTS, not merely that some call exists: a copy-paste
-        // passing another suite's target name or env var would otherwise pass,
-        // recording the claim under the wrong key and naming the wrong override
-        // in the refusal message. The container port is checked against compose
-        // for the same reason — the refusal prints a `docker run -p X:<it>` line,
-        // and kividb's is 6380, not 6379.
+        // Compare the WHOLE body, comments stripped, against the one allowed
+        // shape. Containment was not enough: commenting the claim line out left
+        // every invariant green while the suite went on to wipe an unclaimed
+        // server, and `if false { .. }` / `stringify!(..)` do the same. Equality
+        // also pins the arguments — a copy-paste carrying another suite's target
+        // name or env var would record the claim under the wrong key and name
+        // the wrong override in the refusal — and the container port, which the
+        // refusal prints in its `docker run -p X:<it>` line (kividb's is 6380).
+        let (_line, default) = default_port(&src)
+            .unwrap_or_else(|| panic!("{}: no `test_port()` fallback", path.display()));
         let service = SUITE_COMPOSE_SERVICE
             .iter()
             .find(|(s, _)| *s == suite)
@@ -605,16 +820,64 @@ fn inv_p2_wiping_suites_claim_their_instance_in_test_port() {
             .unwrap_or_else(|| panic!("{suite} must be listed in SUITE_COMPOSE_SERVICE"));
         let (_host_port, container_port) = compose_ports(service)
             .unwrap_or_else(|| panic!("no published port for compose service {service}"));
-        let expected = format!(
-            "common::claim_resp_instance(\"{suite}\", \"{env}\", TEST_HOST, port, {container_port});"
-        );
-        assert!(
-            squeeze(body).contains(&squeeze(&expected)),
-            "{}: `fn test_port()` must call exactly\n    {expected}\n\
-             (the choke point every path to the server goes through). Body was:\n{body}",
+        let expected = expected_test_port_body(&suite, &env, default, container_port);
+        assert_eq!(
+            squeeze(&strip_comments(body)),
+            squeeze(&expected),
+            "{}: `fn test_port()` must be EXACTLY this shape (whitespace and \
+             comments aside) — it is the choke point every path to the server \
+             goes through, so nothing may be added, removed or disabled:\n\
+             {expected}\n\nfound:\n{body}",
             path.display(),
         );
     }
+}
+
+#[test]
+fn inv_p2_rejects_a_commented_out_or_disabled_claim() {
+    // The evasions equality closes, each proved to wipe a real server while the
+    // containment check stayed green.
+    let (suite, env, default, container) =
+        ("integration_redis", "REDIS_TEST_PORT", 6399u16, 6379u16);
+    let good = expected_test_port_body(suite, env, default, container);
+    assert_eq!(
+        squeeze(&strip_comments(&good)),
+        squeeze(&expected_test_port_body(suite, env, default, container)),
+        "positive control: the canonical body must match itself"
+    );
+    for (name, mutant) in [
+        ("commented out", good.replace("common::claim", "// common::claim")),
+        (
+            "wrapped in if false",
+            good.replace(
+                "common::claim_resp_instance(",
+                "if false { common::claim_resp_instance(",
+            ) + " }",
+        ),
+        (
+            "parked in stringify!",
+            good.replace("common::claim_resp_instance(", "stringify!(common::claim_resp_instance("),
+        ),
+        ("deleted", good.replace("common::claim_resp_instance(\"integration_redis\", \"REDIS_TEST_PORT\", TEST_HOST, port, 6379);", "")),
+    ] {
+        assert_ne!(
+            squeeze(&strip_comments(&mutant)),
+            squeeze(&good),
+            "a {name} claim must not satisfy INV-P2"
+        );
+    }
+}
+
+#[test]
+fn comment_stripper_keeps_string_literals() {
+    // Negative control: without this the stripper would eat the `//` in every
+    // `redis://` URL and INV-P2 would compare mangled text against mangled text.
+    let src = "let url = format!(\"redis://{}:{}/\", h, p); // trailing\n/* block */ let x = 1;";
+    let out = strip_comments(src);
+    assert!(out.contains("\"redis://{}:{}/\""), "{out}");
+    assert!(!out.contains("trailing"), "{out}");
+    assert!(!out.contains("block"), "{out}");
+    assert!(out.contains("let x = 1;"), "{out}");
 }
 
 #[test]
@@ -712,6 +975,142 @@ fn inv_p4_an_unreachable_server_is_not_treated_as_empty() {
         claim_verdict(&inputs(&probe, None)),
         Claim::Fresh,
         "an unreachable server must never be classified Fresh"
+    );
+}
+
+#[test]
+fn inv_p4_probe_server_reports_a_closed_port_as_inconclusive() {
+    // INV-P4 only ever exercised `claim_verdict`, the CONSUMER. Everything
+    // between it and the wire was untested, so a `probe_server` returning
+    // `Reachable { keys: 0, index_count: 0 }` for an unreachable server — the
+    // exact regression INV-P4's docstring cites — passed every invariant. A
+    // zero wait keeps this a pure, fast test.
+    let port = closed_port();
+    let probe = common::probe_server("127.0.0.1", port, std::time::Duration::ZERO);
+    assert!(
+        matches!(probe, Probe::Inconclusive(_)),
+        "a closed port must probe as Inconclusive, got {probe:?}"
+    );
+    // ..and it must flow through to a refusal, not merely be Inconclusive.
+    assert!(matches!(
+        claim_verdict(&inputs(&probe, None)),
+        Claim::Refuse(_)
+    ));
+}
+
+/// A TCP port with nothing listening: bind one, read the number, drop it.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+#[test]
+fn inv_p4_the_producer_side_keeps_its_shape() {
+    // Source pins for the three mutations that make the guard INERT and that no
+    // integration suite can catch — a permissive mutation makes every suite pass
+    // harder, not fail.
+    let probe = common_fn_body("probe_server");
+    let inconclusive = probe.matches("Probe::Inconclusive(").count();
+    let reachable = probe.matches("Probe::Reachable {").count();
+    assert!(
+        inconclusive >= 5,
+        "`probe_server` must refuse on every failure path (unreachable, loading, \
+         INFO keyspace error, unparseable keyspace, FT._LIST error); found only \
+         {inconclusive} `Probe::Inconclusive(` sites"
+    );
+    assert_eq!(
+        reachable, 1,
+        "`Probe::Reachable` must be constructed at exactly one place in \
+         `probe_server`, so it cannot be reached before both probes succeeded"
+    );
+    let last_reachable = probe.rfind("Probe::Reachable {").unwrap();
+    let last_inconclusive = probe.rfind("Probe::Inconclusive(").unwrap();
+    assert!(
+        last_reachable > last_inconclusive,
+        "the single `Probe::Reachable` must be the FINAL statement, after every \
+         inconclusive early return"
+    );
+
+    // The refusal must actually stop the test.
+    let claim = common_fn_body("claim_resp_instance");
+    assert!(
+        claim.contains("panic!(\"{msg}\")"),
+        "`claim_resp_instance` must panic on a refusal; swallowing it makes the \
+         whole guard inert. Body was:\n{claim}"
+    );
+
+    // The waiver must default to OFF: `unwrap_or(true)` would disable the guard
+    // for everyone while every suite kept passing.
+    let outcome = common_fn_body("claim_outcome");
+    assert!(
+        outcome.contains("std::env::var(ALLOW_DIRTY_ENV)") && outcome.contains(".unwrap_or(false)"),
+        "the waiver must be opt-IN — an absent {ALLOW_DIRTY_ENV} has to mean the \
+         guard is ON. Body was:\n{outcome}"
+    );
+}
+
+#[test]
+fn inv_p4_claim_wait_covers_every_suite_wait_for() {
+    // A documented relation with no guard until now: if the claim gave up sooner
+    // than a suite's own `wait_for_*()`, the startup race that caused BLOCKER 1
+    // would reopen — the probe would quit, the suite's wait would succeed, and
+    // the `OnceLock` would never retry.
+    let common_src = fs::read_to_string(tests_dir().join("common").join("mod.rs")).unwrap();
+    let claim_wait: u64 = common_src
+        .lines()
+        .find_map(|l| {
+            l.contains("const CLAIM_REACHABLE_WAIT")
+                .then(|| {
+                    l.split("from_secs(")
+                        .nth(1)?
+                        .split(')')
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+                .flatten()
+        })
+        .expect("CLAIM_REACHABLE_WAIT must be a literal `from_secs(N)`");
+    let mut worst = 0u64;
+    for (suite, _) in SUITE_COMPOSE_SERVICE {
+        let src = fs::read_to_string(tests_dir().join(format!("{suite}.rs"))).unwrap();
+        for line in strip_comments(&src).lines() {
+            if !line.contains("Instant::now() + Duration::from_secs(") {
+                continue;
+            }
+            if let Some(n) = line
+                .split("from_secs(")
+                .nth(1)
+                .and_then(|r| r.split(')').next())
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                worst = worst.max(n);
+            }
+        }
+    }
+    assert!(
+        worst > 0,
+        "found no `wait_for_*()` deadline to compare against"
+    );
+    assert!(
+        claim_wait >= worst,
+        "CLAIM_REACHABLE_WAIT ({claim_wait}s) must be >= the longest \
+         `wait_for_*()` deadline in the guarded suites ({worst}s), or a slow \
+         container start races past the claim"
+    );
+}
+
+#[test]
+fn claim_verdict_refuses_indexes_even_with_no_keys() {
+    // The index half of the emptiness test was unpinned: `Fresh` whenever
+    // `keys == 0` would have passed everything, even though `flush_db()` drops
+    // every index `FT._LIST` reports and the refusal counts them.
+    let p = reachable(0, 1, "abc");
+    assert!(
+        matches!(claim_verdict(&inputs(&p, None)), Claim::Refuse(_)),
+        "a server with no keys but a live search index must still be refused"
     );
 }
 

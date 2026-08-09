@@ -2263,8 +2263,16 @@ fn server_identity(conn: &mut redis::Connection) -> String {
 }
 
 /// Probe the server. EVERY failure path yields [`Probe::Inconclusive`], which
-/// [`claim_verdict`] refuses on.
-fn probe_server(host: &str, port: u16, wait: std::time::Duration) -> Probe {
+/// [`claim_verdict`] refuses on. `Probe::Reachable` is constructed at exactly
+/// one place: the final statement, after `INFO keyspace` AND `FT._LIST` both
+/// returned `Ok`.
+///
+/// `pub` and `wait`-parameterised so `tests/harness_invariants.rs` can assert the
+/// unreachable case directly against a closed port with a zero wait. Without
+/// that, the whole producer side was untested: a mutant returning
+/// `Reachable { keys: 0, index_count: 0 }` for an unreachable server — the exact
+/// regression INV-P4's docstring cites — passed every invariant.
+pub fn probe_server(host: &str, port: u16, wait: std::time::Duration) -> Probe {
     let url = format!("redis://{host}:{port}/");
     let Ok(client) = redis::Client::open(url.as_str()) else {
         return Probe::Inconclusive(format!("could not parse the connection URL {url}"));
