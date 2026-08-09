@@ -2772,8 +2772,8 @@ impl Engine for RedisEngine {
             total_time,
             crate::engine::UpdateAttribution::CorpusRow,
             ratio,
-            "HSET reported newly-added fields, where overwriting an already-populated \
-             corpus document reports 0",
+            "HSET reported EVERY field it wrote as newly added, which is the reply for a \
+             key that did not exist; overwriting a document already in the corpus replies 0",
         );
         Ok(results)
     }

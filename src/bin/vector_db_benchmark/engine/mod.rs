@@ -779,14 +779,18 @@ pub fn create_engine(engine_config: &EngineConfig, host: &str) -> Result<Box<dyn
 
 /// Unit coverage for the mixed-workload update accounting (#293).
 ///
-/// SCOPE LIMIT: these exercise the shared fold, not any engine's write path.
-/// That the SERVER actually reports "created" vs "overwrote" the way the
-/// engines read it is a separate, live-server claim — pinned by
-/// `test_vadd_reply_distinguishes_a_new_element_from_an_overwrite`
-/// (tests/integration_vectorsets.rs) and
-/// `test_hset_reply_distinguishes_a_new_document_from_an_overwrite`
-/// (tests/integration_redis.rs). Neither of these unit tests could have failed
-/// on master, because `finalize_update_stats` did not exist there.
+/// SCOPE LIMIT, in three parts:
+///
+/// 1. These seven tests exercise the shared FOLD only — not any engine's write
+///    path, and not the policy that acts on what the fold records (that is
+///    `experiment::update_attribution_gate_tests`).
+/// 2. None of the seven could have failed on master: `finalize_update_stats`
+///    did not exist there. They are regression cover, not RED evidence.
+/// 3. That the SERVER really reports "created" vs "overwrote" the way the
+///    engines read it is a separate, live-server claim these cannot make. It is
+///    pinned by the four `*_reply_distinguishes_*` tests in
+///    tests/integration_{vectorsets,redis,valkey,mongodb}.rs — which pass on
+///    master too, because they assert server behaviour rather than our code.
 #[cfg(test)]
 mod update_accounting_tests {
     use super::{

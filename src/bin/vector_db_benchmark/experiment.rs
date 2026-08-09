@@ -914,6 +914,12 @@ fn check_corpus_reuse_precondition(
 /// nonzero one means `update_count`/`update_rps` describe writes that `recall`
 /// cannot see.
 ///
+/// Applied per REPETITION, before the point can reach `best`/`pending_saves`,
+/// so a rejected point writes no result file. Note the narrow gap that leaves:
+/// with `--repetitions N > 1`, only the reps that trip the gate are discarded,
+/// and a run in which some rep came back clean still publishes that rep. A
+/// genuine #293 defect fails every rep, so this matters only for a transient.
+///
 /// `--allow-partial-corpus` waives it. That flag already declares the corpus may
 /// hold fewer rows than the dataset (`--skip-upload` + a `Short` verdict, or a
 /// probe that could not run), and updates addressed to the rows that are missing
@@ -936,19 +942,20 @@ fn gate_update_attribution(
         .update_unattributed_detail
         .as_deref()
         .unwrap_or("no detail recorded");
-    // Deliberately does NOT assert a single cause: the server reports only that
-    // the row was not there. Naming one mechanism in a message that fires for
-    // several would be a false mechanism claim.
+    // The message states the SERVER SIGNAL and stops there. The server reports
+    // only that the row was not present; it cannot tell us why, and several
+    // distinct causes produce the identical signal. Naming one of them would be
+    // a shipped error message asserting a mechanism the code cannot know.
     let msg = format!(
         "mixed workload: {unattributed} of {dispatched} dispatched updates were accepted by the \
-         server but did NOT replace a row that already existed in the corpus being searched \
-         ({detail}). On the normal upload → mixed path every update rewrites a vector this same \
-         run uploaded, so this count should be 0. It is not, which means the update half and the \
-         searched corpus are not the same target — the writes may be addressed to a different \
-         key/collection, or those rows may be absent (a short `--skip-upload` corpus, or rows \
-         lost to eviction or failover mid-run). Either way update_count/update_rps would describe \
-         writes that recall cannot see (issue #293). Re-upload this config, or pass \
-         --allow-partial-corpus to measure a deliberately partial corpus anyway."
+         server, which reported that the row each one addressed did not already exist \
+         ({detail}). Those writes therefore did not update the corpus this run searched, and \
+         `recall` cannot show it — the searched corpus is complete either way (issue #293). \
+         The signal does not say WHY the rows were absent; all of these produce it: the update \
+         half addressing a different key/collection than the search half; a reused corpus \
+         (`--skip-upload`) that is shorter than the dataset or was written with a different \
+         document shape; or rows lost mid-run to eviction or failover. Re-upload this config, or \
+         pass --allow-partial-corpus to measure a deliberately partial corpus anyway."
     );
     if allow_partial_corpus {
         eprintln!("\t⚠ WARNING: {msg}");

@@ -57,6 +57,67 @@ fn wait_for_mongodb() {
 /// Drop the search index (if any), wait for it to disappear, then drop the
 /// collection and wait for it to be gone.  Mirrors the engine's configure()
 /// cleanup so tests exercise the same Atlas-safe path.
+/// The server reply the #293 guard reads on MongoDB.
+///
+/// `update_one_doc` returns "did this write match nothing" straight from
+/// `UpdateResult::matched_count`, and `gate_update_attribution` rejects a mixed
+/// run whose updates matched nothing. That guard is only as good as the driver
+/// and server reporting `matched_count` honestly for a no-upsert update — a
+/// server behaviour no unit test can pin, and one that would make the guard
+/// silently vacuous if it regressed.
+///
+/// This test does NOT exercise the benchmark's mixed path; it pins the single
+/// server fact that path depends on.
+#[test]
+fn test_update_one_matched_count_distinguishes_a_missing_document_from_an_update() {
+    wait_for_mongodb();
+    let client = mongodb_client();
+    // Own collection, so this never races the shared `vectors` corpus.
+    let coll = client
+        .database(TEST_DB)
+        .collection::<Document>("probe_293_matched_count");
+    let _ = coll.drop().run();
+
+    // POSITIVE CONTROL: with nothing inserted, the update must report a MISS.
+    // If matched_count were always >= 1 the guard could never fire, and the
+    // assertion below would pass vacuously.
+    let missed = coll
+        .update_one(
+            doc! { "_id": 1i64 },
+            doc! { "$set": { "vector": [1.0, 2.0] } },
+        )
+        .run()
+        .expect("update_one against an absent _id must succeed, not error");
+    assert_eq!(
+        missed.matched_count, 0,
+        "update_one without upsert must match 0 documents when the _id is absent"
+    );
+    assert_eq!(
+        coll.count_documents(doc! {}).run().unwrap(),
+        0,
+        "a non-upsert update must not have created the document"
+    );
+
+    // The mixed-workload case: the document exists, so the write lands on it.
+    coll.insert_one(doc! { "_id": 1i64, "vector": [0.0, 0.0] })
+        .run()
+        .unwrap();
+    let matched = coll
+        .update_one(
+            doc! { "_id": 1i64 },
+            doc! { "$set": { "vector": [1.0, 2.0] } },
+        )
+        .run()
+        .unwrap();
+    assert_eq!(
+        matched.matched_count, 1,
+        "update_one must match the existing document — this 1-vs-0 is the whole \
+         #293 signal for MongoDB"
+    );
+
+    let _ = coll.drop().run();
+}
+
 fn drop_test_collection() {
     let client = mongodb_client();
     let db = client.database(TEST_DB);
@@ -1064,6 +1125,20 @@ fn test_binary_mongodb_mixed_parallel() {
     assert!(
         p50 <= p95 && p95 <= p99,
         "percentiles must be monotone: p50={p50} p95={p95} p99={p99}"
+    );
+    // #293: recall and update_count are both blind to whether the updates landed
+    // on the documents the search reads. The engine folds `matched_count` in and
+    // publishes the attribution tier it achieved.
+    assert_eq!(
+        r["update_attribution"].as_str(),
+        Some("corpus_row"),
+        "MongoDB must publish that every counted update matched an existing document"
+    );
+    assert_eq!(r["update_failures"].as_u64(), Some(0));
+    assert_eq!(
+        r["update_unattributed"].as_u64(),
+        Some(0),
+        "a healthy mixed run must match an existing document for every update"
     );
     drop_test_collection();
     fs::remove_dir_all(&proj.root).ok();

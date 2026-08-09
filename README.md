@@ -641,7 +641,8 @@ reused corpus, or rows lost to eviction/failover mid-run are all consistent with
 it), which is why the message enumerates the causes instead of asserting one.
 
 Both field names are additive. `update_count` and `update_rps` keep their names
-so existing result files, `summary.rs` and the plotting path stay comparable;
+so existing result files stay comparable and `summary.rs` — the only code that
+reads either field — keeps working;
 `update_failures` and `update_attribution` are simply absent from files written
 before #293.
 

@@ -20,7 +20,13 @@
 //! - `search`: `findNeighbors` against the public endpoint, one persistent
 //!   worker per `parallel`, timing only the RPC + reply parse.
 //!
-//! No metadata filters, no mixed workload, no quantization — pure vector KNN.
+//! - `search_mixed`: interleaves `findNeighbors` with single-datapoint
+//!   `upsertDatapoints` writes. The upsert reply is an empty body, so an update
+//!   here is only ever "the server accepted it" — this engine publishes
+//!   `update_attribution: "ack_only"` for that reason (#293).
+//!
+//! Metadata filters ARE supported (`restricts` / `numericRestricts`, see
+//! `build_vertex_filter`). No quantization knobs.
 //!
 //! Auth: `VERTEX_ACCESS_TOKEN` if set, otherwise `gcloud auth
 //! print-access-token`. Tokens are short-lived; the token is re-fetched at the
