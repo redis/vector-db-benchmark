@@ -117,6 +117,11 @@ const SECRET_MARKERS: &[&str] = &[
     // is FALSE, which is how the leading-underscore forms missed them.
     "TOKEN",
     "AUTH",
+    // The corpus carries `bearer=` as a credential shape; the marker list did
+    // not, so `index_params.bearer` read `<dropped>` (not-a-knob) rather than
+    // `<redacted:set>` (a secret we removed). Harmless while it is dropped —
+    // and a live leak the moment anyone allow-lists the key.
+    "BEARER",
     "SECRET",
     "CREDENTIAL",
     "SESSION",
@@ -330,6 +335,18 @@ fn scrub(value: &Value, secret_ancestor: bool, declared_mode: bool) -> Value {
                             .and_then(Value::as_str)
                             .is_some_and(is_secret);
                     let secret = secret_ancestor || is_secret(k) || seeded;
+                    // JSON map KEYS are never scrubbed anywhere — they are
+                    // structure, not data. That holds for every member except
+                    // `declared`, whose keys come from the configuration FILE,
+                    // so `{"password=SECRET": 1}` would publish the secret in
+                    // the key position where no value scrub can see it. All 47
+                    // shipped keys are plain tokens, so this costs nothing.
+                    let k = if declared_mode && !is_plain_token(k) {
+                        opaque_digest(k)
+                    } else {
+                        k.clone()
+                    };
+                    let k = &k;
                     // Declared keys are allow-listed in this same pass.
                     if declared_mode && !is_publishable_declared_key(k) {
                         let kept = matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null);
@@ -447,8 +464,9 @@ pub struct Recorder {
     /// How the tool was invoked: the flags that change what a run measures but
     /// live neither in the config file nor in the environment.
     invocation: Option<Value>,
-    /// Which phase's state this block describes.
-    phase: Option<String>,
+    /// Which phase's state this block describes. `&'static str` so only a
+    /// literal can reach it — the same move as `Override::reason`.
+    phase: Option<&'static str>,
     /// Environment variables this run read, mapped to the raw text seen
     /// (`null` when the variable was unset, i.e. a default applied).
     env: BTreeMap<String, Value>,
@@ -487,8 +505,8 @@ impl Recorder {
         self.invocation = Some(invocation);
     }
 
-    pub fn set_phase(&mut self, phase: &str) {
-        self.phase = Some(phase.to_string());
+    pub fn set_phase(&mut self, phase: &'static str) {
+        self.phase = Some(phase);
     }
 
     /// Note that `name` was read from the environment, and what was there.
@@ -511,13 +529,10 @@ impl Recorder {
     /// Record the value a knob resolved to. Last write wins: a knob resolved
     /// twice (e.g. a per-phase re-resolution) should report the latest.
     ///
-    /// **Redaction happens HERE, not in the callers.** It used to live in
-    /// `env_or` only, which meant a knob resolved through `env_parsed::<String>`
-    /// or a bare `record_effective` published its plaintext while the `env` map
-    /// two keys away said `<redacted:set>` — the artifact claiming to have
-    /// redacted a value it had already printed. One choke point removes that
-    /// from every present and future caller; [`Recorder::snapshot`] then asserts
-    /// it held.
+    /// Stores the value RAW. Redaction happens once, in
+    /// [`Recorder::snapshot`], with the key in hand — this function used to
+    /// scrub, and that second pass over the module's own output is what a
+    /// forged `<redacted:opaque sha256=…>` exploited.
     pub fn record_effective(&mut self, key: &str, value: Value) {
         self.effective.insert(key.to_string(), value);
         self.from_default.remove(key);
@@ -543,7 +558,6 @@ impl Recorder {
         effective: Value,
         reason: &'static str,
     ) {
-        let _ = is_secret(key);
         // The reason is held SEPARATELY, as a `&'static str`, and spliced into
         // the document AFTER scrubbing — see `Recorder::snapshot`. It used to
         // live in the tree and be protected by a `PROSE_KEYS` key-name test,
@@ -571,10 +585,10 @@ impl Recorder {
     /// Clear every field, so the next experiment starts from nothing.
     ///
     /// `declared`, `invocation` and `phase` are overwritten each experiment and
-    /// self-heal; `env`, `effective`, `overridden` and `ignored` only ACCUMULATE
-    /// and are cleared here and nowhere else. That asymmetry is why dropping the
-    /// clear was caught by only one test, and flakily: it is the single point of
-    /// failure for four of the seven fields.
+    /// self-heal; `env`, `effective`, `overridden`, `ignored` and `from_default`
+    /// only ACCUMULATE and are cleared here and nowhere else. That asymmetry is
+    /// why dropping the clear was caught by only one test, and flakily: it is
+    /// the single point of failure for five of the eight fields.
     pub fn begin(&mut self) {
         *self = Recorder::new();
     }
@@ -586,17 +600,27 @@ impl Recorder {
 
     /// The `engine_params` block for an artifact.
     ///
-    /// Everything the block will publish is passed through [`scrub_value`] as
-    /// one tree, then re-walked to assert the invariant held.
+    /// Assembles the block, scrubbing each member as it goes, then re-walks the
+    /// result to assert the invariant held.
     ///
-    /// The previous version enumerated two flat maps (`env`, `effective`) while
-    /// `snapshot` emitted five value-bearing members. The three it never
-    /// inspected — `invocation`, `declared`, `overridden` — were exactly the
-    /// three this block added, and two of them leaked live: `--host
-    /// 'user:pw@127.0.0.1'` and a configuration file's `api_key` were published
-    /// verbatim, three keys from a `<redacted:set>`. Scrubbing the assembled
-    /// document instead of named maps is what makes "cannot miss a map somebody
-    /// adds later" true rather than aspirational.
+    /// **The enumeration below is MANUAL, and this doc used to claim it was
+    /// not.** An earlier version scrubbed the assembled document as one tree and
+    /// said that made "cannot miss a map somebody adds later" true rather than
+    /// aspirational. Removing the double pass — which a forged
+    /// `<redacted:opaque sha256=…>` had exploited — put the enumeration back,
+    /// and the claim went stale with it. A member added here that is not passed
+    /// through [`scrub_value`] WILL be published verbatim.
+    ///
+    /// `member_set_is_pinned_so_a_new_one_must_be_scrubbed_deliberately` is what
+    /// makes that a build failure instead of a silent one. Every member is
+    /// scrubbed today, including the three that carry NAMES rather than values
+    /// (`overridden[].key`, `ignored_declared_keys.keys`) and `phase`, which is
+    /// `&'static str` so only a literal can reach it.
+    ///
+    /// One thing is deliberately NOT scrubbed anywhere: JSON map KEYS, which are
+    /// structure rather than data — except under `declared`, whose keys come
+    /// from the configuration file, where a non-plain-token key is replaced by a
+    /// digest.
     ///
     /// # Panics
     ///
@@ -647,7 +671,11 @@ impl Recorder {
                 .map(|o| {
                     let secret = is_secret(&o.key);
                     json!({
-                        "key": o.key,
+                        // Scrubbed like any other string: these are literals or
+                        // env-var names today, so plain tokens survive, but the
+                        // enumeration below is manual and a name is not exempt
+                        // from it just for being a name.
+                        "key": redact_connection_like(&o.key),
                         "declared": scrub_value(&o.declared, secret),
                         "effective": scrub_value(&o.effective, secret),
                     })
@@ -656,7 +684,13 @@ impl Recorder {
             "ignored_declared_keys": {
                 "exhaustive": false,
                 "covers": IGNORED_KEYS_COVERS,
-                "keys": self.ignored.iter().collect::<Vec<_>>(),
+                // Operator-supplied: `note_ignored` builds these from
+                // `hnsw_config` key names in the configuration FILE.
+                "keys": self
+                    .ignored
+                    .iter()
+                    .map(|k| redact_connection_like(k))
+                    .collect::<Vec<_>>(),
             },
         });
         // Authored prose is spliced in AFTER the scrub, by position, never
@@ -773,7 +807,7 @@ pub fn set_invocation(invocation: Value) {
 }
 
 /// Tag the block with the phase whose resolved state it describes.
-pub fn set_phase(phase: &str) {
+pub fn set_phase(phase: &'static str) {
     recorder().set_phase(phase);
 }
 
@@ -2701,6 +2735,59 @@ mod tests {
         assert_ne!(a, redact_connection_like("host=other sslmode=require"));
     }
 
+    /// The snapshot's member set is pinned, because the enumeration is manual.
+    ///
+    /// The whole-document scrub is gone (a forged `<redacted:opaque sha256=…>`
+    /// exploited the second pass), so `snapshot` names its members again and a
+    /// new one that skips `scrub_value` is published verbatim. This is the
+    /// replacement for the guarantee that removal took away: adding a member
+    /// fails here, and the fix is to scrub it and add its name below.
+    #[test]
+    fn member_set_is_pinned_so_a_new_one_must_be_scrubbed_deliberately() {
+        const MEMBERS: &[&str] = &[
+            "declared",
+            "effective",
+            "env",
+            "ignored_declared_keys",
+            "invocation",
+            "overridden",
+            "phase",
+            "schema_version",
+        ];
+        let s = Recorder::new().snapshot();
+        let mut actual: Vec<&str> = s.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, MEMBERS,
+            "the `engine_params` member set changed. A new member is published \
+             VERBATIM unless `snapshot` passes it through `scrub_value` — do \
+             that, then add its name here."
+        );
+    }
+
+    /// Operator-supplied text in a declared KEY position is not published.
+    ///
+    /// Map keys are structure, not data, and are never scrubbed — which is fine
+    /// everywhere except `declared`, whose keys come from the configuration
+    /// file. A value scrub cannot see a secret sitting in the key.
+    #[test]
+    fn a_secret_in_a_declared_key_name_is_not_published() {
+        let mut r = Recorder::new();
+        r.set_declared(
+            Some(&json!({
+                "hnsw_config": { "M": 16 },
+                "password=KEYCANARY": 1,
+                "redis://u:KEYCANARY@h": "x",
+            })),
+            None,
+        );
+        let dumped = serde_json::to_string(&r.snapshot()).unwrap();
+        assert!(!dumped.contains("KEYCANARY"), "{dumped}");
+        // …while the ordinary keys are untouched.
+        let d = &r.snapshot()["declared"]["collection_params"];
+        assert_eq!(d["hnsw_config"]["M"], 16);
+    }
+
     /// Both sentinels must reach the artifact intact.
     ///
     /// Eight comments and a commit message asserted they did while `snapshot`'s
@@ -2714,7 +2801,11 @@ mod tests {
         let raw = json!({
             "name": "sentinel-probe",
             "engine": "redis",
-            "collection_params": { "bearer": "not-a-knob", "hnsw_config": { "M": 16 } },
+            "collection_params": {
+                "unknown_knob": "not-a-knob",
+                "bearer": "credential-named",
+                "hnsw_config": { "M": 16 }
+            },
         });
         let mut cfg: crate::config::EngineConfig = serde_json::from_value(raw.clone()).unwrap();
         cfg.raw = Some(raw);
@@ -2729,9 +2820,13 @@ mod tests {
 
         let s = r.snapshot();
         assert_eq!(
-            s["declared"]["collection_params"]["bearer"], DROPPED,
+            s["declared"]["collection_params"]["unknown_knob"], DROPPED,
             "`<dropped>` was re-scrubbed into a digest of itself"
         );
+        // A credential-named declared key says `<redacted:set>`, not
+        // `<dropped>`: "we removed a secret" and "this is not a knob we read"
+        // are different facts.
+        assert_eq!(s["declared"]["collection_params"]["bearer"], REDACTED);
         assert_eq!(
             s["effective"]["ELASTIC_PASSWORD"], REDACTED_DEFAULT,
             "a run with NO password set must not claim one was supplied"
@@ -3046,6 +3141,7 @@ mod tests {
         r.set_declared(Some(&json!({"x": 1})), None);
         r.set_invocation(json!({"host": "h"}));
         r.set_phase("search");
+        r.record_effective_from_default("VDBB_PW", json!("builtin"));
 
         r.begin();
 
@@ -3067,6 +3163,8 @@ mod tests {
         assert!(s["declared"].is_null());
         assert!(s["invocation"].is_null());
         assert!(s["phase"].is_null());
+        // `from_default` is the eighth field and accumulates like the rest.
+        assert!(r.from_default.is_empty(), "from_default survived");
     }
 
     /// Non-string values cannot carry a credential and must survive intact —
