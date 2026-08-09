@@ -611,7 +611,7 @@ two attribution tiers it achieved, under `update_attribution`:
 
 | `update_attribution` | Engines | What the server's reply establishes |
 | --- | --- | --- |
-| `corpus_row` | Redis, Valkey, VectorSets, MongoDB | The write **replaced state that already existed**. `VADD` replies 1 for a new element and 0 for an overwrite; `HSET` replies with the number of newly-added fields; `update_one` reports `matched_count`. Every mixed update rewrites a row this same run uploaded, so a reply meaning "created new state" proves the write missed the corpus under measurement — that is a **hard error** and the run publishes nothing. |
+| `corpus_row` | Redis, Valkey, VectorSets, MongoDB | The write **replaced state that already existed**. `VADD` replies 1 for a new element and 0 for an overwrite; `HSET` replies with the number of newly-added fields (all-new ⇒ the document did not exist); `update_one` reports `matched_count`. Every mixed update rewrites a row this same run uploaded, so a reply meaning "the row was not there" is counted in `update_unattributed` and **rejects the point** — no result file is written for it. |
 | `ack_only` | Vertex AI | Only that the write was accepted (HTTP 2xx). `upsertDatapoints` returns an empty body, so there is nothing to attribute to a datapoint and the corpus-row guard cannot run. `update_count` here is weaker than the same field on a `corpus_row` engine. |
 
 Writes that **errored** are excluded from `update_count`, `update_rps` and the
@@ -621,11 +621,24 @@ treatment `failed_queries` gets on the search side. A run with
 the reported figures; the Redis-wire engines additionally hard-error on
 server-rejected writes through the existing `INFO commandstats` check.
 
+**`--allow-partial-corpus` waives the rejection.** That flag already declares the
+corpus may hold fewer rows than the dataset (`--skip-upload` against a `Short`
+corpus, or a size probe that could not run), and updates addressed to the rows
+that are missing then legitimately create rather than overwrite. Aborting a run
+the operator explicitly waived into would be an over-strict gate, so the waiver
+downgrades the rejection to a warning — and the run still publishes
+`update_unattributed`, so the artifact records how much of its update half never
+touched the searched corpus. Outside that waiver the count is always 0 in a
+published file.
+
 **The limit, stated plainly:** `corpus_row` proves each counted write overwrote
 a row that was already there. It does not prove that row is reachable by the
 query path — a write to a *different but already-populated* row would still
 report an overwrite. Neither tier is a claim that the updated vector was visible
-to a later search.
+to a later search. And a nonzero `update_unattributed` says only that the row
+was absent; it does not identify *why* (writes addressed elsewhere, a short
+reused corpus, or rows lost to eviction/failover mid-run are all consistent with
+it), which is why the message enumerates the causes instead of asserting one.
 
 Both field names are additive. `update_count` and `update_rps` keep their names
 so existing result files, `summary.rs` and the plotting path stay comparable;

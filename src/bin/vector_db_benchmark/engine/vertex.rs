@@ -2425,7 +2425,7 @@ impl Engine for VertexEngine {
             // Unreachable under AckOnly: nothing ever sets `unattributed`, because
             // the upsert reply carries no row-level information to set it from.
             "unused — Vertex cannot attribute a write to a datapoint",
-        )?;
+        );
         Ok(results)
     }
 

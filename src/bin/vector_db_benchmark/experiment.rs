@@ -901,6 +901,66 @@ fn check_corpus_reuse_precondition(
 ///
 /// `--skip-upload` gets its own wording because it is not a user preference but
 /// an invariant (#238): a run that did not upload the corpus never deletes it.
+/// Decide whether a mixed run's unattributed updates are fatal (issue #293).
+///
+/// The engine half only measures: `finalize_update_stats` records how many
+/// writes the server accepted without attributing them to a row that already
+/// existed. This is the policy half — the same split as `failed_queries`
+/// (measured by `compute_search_stats`) vs `--fail-on-dropped-queries`
+/// (enforced by the runner).
+///
+/// Fatal by default, because on the normal upload → mixed path every update
+/// rewrites a vector the same run just uploaded, so the count should be 0 and a
+/// nonzero one means `update_count`/`update_rps` describe writes that `recall`
+/// cannot see.
+///
+/// `--allow-partial-corpus` waives it. That flag already declares the corpus may
+/// hold fewer rows than the dataset (`--skip-upload` + a `Short` verdict, or a
+/// probe that could not run), and updates addressed to the rows that are missing
+/// then legitimately create instead of overwrite. Aborting a run the operator
+/// explicitly waived into would be the same class of over-strict gate as #295.
+/// The waived run still publishes `update_unattributed`, so the artifact records
+/// how much of its update half never touched the searched corpus.
+fn gate_update_attribution(
+    results: crate::engine::SearchResults,
+    allow_partial_corpus: bool,
+) -> Result<crate::engine::SearchResults, String> {
+    let unattributed = results.update_unattributed.unwrap_or(0);
+    if unattributed == 0 {
+        return Ok(results);
+    }
+    let applied = results.update_count.unwrap_or(0);
+    let failed = results.update_failures.unwrap_or(0);
+    let dispatched = applied + unattributed + failed;
+    let detail = results
+        .update_unattributed_detail
+        .as_deref()
+        .unwrap_or("no detail recorded");
+    // Deliberately does NOT assert a single cause: the server reports only that
+    // the row was not there. Naming one mechanism in a message that fires for
+    // several would be a false mechanism claim.
+    let msg = format!(
+        "mixed workload: {unattributed} of {dispatched} dispatched updates were accepted by the \
+         server but did NOT replace a row that already existed in the corpus being searched \
+         ({detail}). On the normal upload → mixed path every update rewrites a vector this same \
+         run uploaded, so this count should be 0. It is not, which means the update half and the \
+         searched corpus are not the same target — the writes may be addressed to a different \
+         key/collection, or those rows may be absent (a short `--skip-upload` corpus, or rows \
+         lost to eviction or failover mid-run). Either way update_count/update_rps would describe \
+         writes that recall cannot see (issue #293). Re-upload this config, or pass \
+         --allow-partial-corpus to measure a deliberately partial corpus anyway."
+    );
+    if allow_partial_corpus {
+        eprintln!("\t⚠ WARNING: {msg}");
+        eprintln!(
+            "\t  (continuing because --allow-partial-corpus is set; `update_unattributed` is \
+             recorded in the result file)"
+        );
+        return Ok(results);
+    }
+    Err(msg)
+}
+
 fn keep_data_reason(args: &Args) -> &'static str {
     if args.skip_upload {
         "--skip-upload did not create this corpus, so it does not delete it"
@@ -1366,6 +1426,12 @@ fn run_single_experiment(
                             None => engine.search(dataset, effective_params, args.queries),
                         });
                     let cpu_after = crate::proc_cpu::sample();
+
+                    // #293. Applied BEFORE the point can reach `best`/`pending_saves`,
+                    // so a rejected mixed point publishes no result file at all; a
+                    // waived one carries the count into the file it writes.
+                    let search_result = search_result
+                        .and_then(|r| gate_update_attribution(r, args.allow_partial_corpus));
 
                     match search_result {
                         Ok(mut results) => {
@@ -2129,6 +2195,11 @@ fn build_search_result_json(
         if let Some(failures) = results.update_failures {
             results_obj.insert("update_failures".to_string(), json!(failures));
         }
+        // Only ever nonzero on a run waived by --allow-partial-corpus (otherwise
+        // `gate_update_attribution` rejected the point and no file was written).
+        if let Some(unattributed) = results.update_unattributed {
+            results_obj.insert("update_unattributed".to_string(), json!(unattributed));
+        }
         if let Some(t) = results.update_mean_time {
             results_obj.insert("update_mean_time".to_string(), json!(t));
         }
@@ -2509,6 +2580,82 @@ mod tests {
                 note
             );
         }
+    }
+}
+
+/// Policy half of the #293 guard: which mixed runs may publish their update
+/// metrics. The measurement half is unit-tested in
+/// `engine::update_accounting_tests`.
+#[cfg(test)]
+mod update_attribution_gate_tests {
+    use super::gate_update_attribution;
+    use crate::engine::SearchResults;
+
+    fn results(applied: usize, unattributed: usize, failed: usize) -> SearchResults {
+        SearchResults {
+            update_count: Some(applied),
+            update_failures: Some(failed),
+            update_unattributed: Some(unattributed),
+            update_unattributed_detail: (unattributed > 0)
+                .then(|| "VADD replied 1 — a new element was added".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The #293 condition: reject, and say how many of how many.
+    #[test]
+    fn unattributed_updates_reject_the_point_by_default() {
+        let err = gate_update_attribution(results(0, 399, 0), false).unwrap_err();
+        assert!(err.contains("399 of 399"), "{err}");
+        assert!(err.contains("VADD replied 1"), "{err}");
+        // The message must offer the escape hatch it actually honours.
+        assert!(err.contains("--allow-partial-corpus"), "{err}");
+    }
+
+    /// The dispatched total is applied + unattributed + failed, so the ratio in
+    /// the message is not silently computed off a partial denominator.
+    #[test]
+    fn the_rejection_counts_every_dispatched_write_in_its_denominator() {
+        let err = gate_update_attribution(results(90, 7, 3), false).unwrap_err();
+        assert!(err.contains("7 of 100"), "{err}");
+    }
+
+    /// BLOCKER CLASS (#295): `--skip-upload --allow-partial-corpus` deliberately
+    /// measures a corpus that is SHORT, and updates addressed to the rows that
+    /// are missing then legitimately create instead of overwrite. Aborting a run
+    /// the operator explicitly waived into would be an over-strict gate, so the
+    /// waiver must let the point through — still carrying its count.
+    #[test]
+    fn allow_partial_corpus_waives_the_rejection_and_keeps_the_count() {
+        let r = gate_update_attribution(results(10, 5, 0), true)
+            .expect("--allow-partial-corpus must not abort the run");
+        assert_eq!(
+            r.update_unattributed,
+            Some(5),
+            "the waived run must still record how many updates missed the corpus"
+        );
+    }
+
+    /// POSITIVE CONTROL: a clean run passes untouched under BOTH settings — the
+    /// tests above cannot be satisfied by a gate that rejects (or waives)
+    /// everything.
+    #[test]
+    fn a_clean_run_passes_with_and_without_the_waiver() {
+        for waived in [false, true] {
+            let r = gate_update_attribution(results(1000, 0, 0), waived)
+                .expect("a clean mixed run must never be rejected");
+            assert_eq!(r.update_unattributed, Some(0));
+            assert_eq!(r.update_count, Some(1000));
+        }
+    }
+
+    /// Search-only runs have no update fields at all; the gate must be inert
+    /// rather than reading `None` as a violation.
+    #[test]
+    fn a_search_only_run_is_untouched_by_the_gate() {
+        let r = gate_update_attribution(SearchResults::default(), false)
+            .expect("search-only runs must pass the mixed-update gate");
+        assert!(r.update_unattributed.is_none());
     }
 }
 

@@ -2188,7 +2188,7 @@ impl Engine for MongoDBEngine {
             crate::engine::UpdateAttribution::CorpusRow,
             ratio,
             "update_one matched 0 documents in the searched collection",
-        )?;
+        );
         Ok(results)
     }
 

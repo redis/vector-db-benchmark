@@ -1151,7 +1151,7 @@ impl Engine for VectorSetsEngine {
             ratio,
             "VADD replied 1 — a new element was added — where an overwrite of an \
              already-present element replies 0",
-        )?;
+        );
         Ok(results)
     }
 

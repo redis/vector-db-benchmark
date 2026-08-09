@@ -1810,13 +1810,19 @@ fn ft_search_knn(
 
 /// Single-record HSET update (for mixed benchmark).
 ///
-/// Returns `Ok(true)` when the server reports the write **added fields that did
-/// not exist** rather than overwriting an already-populated document: `HSET`
-/// replies with the number of NEW fields, and 0 when every field was already
-/// there (verified live). `upload_batch_internal` writes exactly the same field
-/// set from the same source vectors, so on the supported paths a corpus
-/// document is always fully populated and a nonzero reply means the write did
-/// not land on it (#293).
+/// Returns `Ok(true)` when the server reports the target document **did not
+/// exist**: `HSET` replies with the number of NEW fields, so a reply equal to
+/// the number of fields written means nothing was there (verified live). A
+/// reply of 0 is a clean overwrite; a reply strictly between the two means the
+/// document existed with a different field set (schema drift), which is
+/// deliberately NOT treated as a missed write — see the comment at the reply.
+///
+/// LOAD-BEARING PARITY: `upload_batch_internal` must keep writing the same
+/// field NAMES as this function (both are `"vector"` plus `meta.fields`, from
+/// the same `dataset.read_vectors()` call). Adding a field to one path only
+/// would not break the #293 signal — the all-or-nothing test above tolerates a
+/// partial overlap — but it would make the two halves disagree about the
+/// document's shape, which is worth knowing before you edit either.
 fn hset_single(
     conn: &mut Connection,
     config: &RedisEngineConfig,
@@ -1829,9 +1835,11 @@ fn hset_single(
 
     let mut cmd = redis::cmd("HSET");
     cmd.arg(key.as_str()).arg("vector").arg(&vec_bytes[..]);
+    let mut written_fields: i64 = 1;
 
     if let Some(meta) = metadata {
         for (k, v) in &meta.fields {
+            written_fields += 1;
             match v {
                 MetadataValue::String(s) => {
                     cmd.arg(k.as_str()).arg(encode_string_field(config, k, s));
@@ -1856,7 +1864,12 @@ fn hset_single(
     let new_fields: i64 = cmd
         .query(conn)
         .map_err(|e| format!("HSET update error: {}", e))?;
-    Ok(new_fields != 0)
+    // ALL fields new => the key did not exist. Deliberately NOT `new_fields != 0`:
+    // a partial count means the document was there but carried a different field
+    // set, which is schema drift between the upload and the update half — a real
+    // difference, but not "the write missed the corpus", and turning it into a
+    // hard error would abort a run whose updates did land.
+    Ok(new_fields == written_fields)
 }
 
 /// Format a string metadata field for storage. `datetime` schema fields whose
@@ -2761,7 +2774,7 @@ impl Engine for RedisEngine {
             ratio,
             "HSET reported newly-added fields, where overwriting an already-populated \
              corpus document reports 0",
-        )?;
+        );
         Ok(results)
     }
 

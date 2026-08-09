@@ -156,6 +156,14 @@ pub struct SearchResults {
     /// How firmly this engine can tie `update_count` to the searched corpus:
     /// `"corpus_row"` or `"ack_only"`. See [`UpdateAttribution`].
     pub update_attribution: Option<String>,
+    /// Writes the server accepted but did NOT attribute to a row that already
+    /// existed in the searched corpus. Always 0 under `ack_only` (no signal to
+    /// derive it from). Nonzero is fatal unless `--allow-partial-corpus` — see
+    /// `experiment::gate_update_attribution`.
+    pub update_unattributed: Option<usize>,
+    /// The server signal that produced a nonzero `update_unattributed`, for the
+    /// error/warning text. `None` when the count is 0.
+    pub update_unattributed_detail: Option<String>,
 }
 
 /// How firmly an engine can tie a counted mixed-workload update to the corpus
@@ -168,9 +176,9 @@ pub struct SearchResults {
 pub enum UpdateAttribution {
     /// The server's reply to the write states whether it replaced state that
     /// already existed. A write reported as having created new state instead is
-    /// counted as `unattributed` and aborts the run — on the supported paths
-    /// every mixed update rewrites a row the same run uploaded, so "created new
-    /// state" means the write did not land in the corpus under measurement.
+    /// counted in `update_unattributed`, which
+    /// `experiment::gate_update_attribution` rejects the run over unless
+    /// `--allow-partial-corpus` waives it.
     CorpusRow,
     /// The server acknowledged the write but says nothing about which row it
     /// landed on. `update_count` here means "writes the server accepted", and
@@ -223,13 +231,15 @@ impl UpdateTally {
 /// `unattributed_detail` must name the *actual* server signal the engine read,
 /// because it is quoted verbatim in the abort message.
 ///
-/// Hard error when any accepted write was not attributable to a pre-existing
-/// corpus row: that changes what the published `update_count`/`update_rps`
-/// describe, while `recall` stays high because the searched corpus is untouched
-/// — the exact combination issue #293 reports. Failed writes only *shrink* the
-/// reported count (they are excluded, and published as `update_failures`), so
-/// they warn rather than abort, matching how `failed_queries` is handled on the
-/// search side.
+/// This function only MEASURES. It records `update_unattributed` and returns
+/// `Ok`; whether that count is fatal is decided by the runner
+/// (`experiment::gate_update_attribution`), which is the layer that knows about
+/// `--allow-partial-corpus`. Same split as `failed_queries` (computed here) vs
+/// `--fail-on-dropped-queries` (enforced there).
+///
+/// Failed writes are excluded from the count/rate/percentiles and published as
+/// `update_failures`; they warn here because they only ever *shrink* the
+/// reported figures.
 pub fn finalize_update_stats(
     results: &mut SearchResults,
     tally: UpdateTally,
@@ -237,20 +247,13 @@ pub fn finalize_update_stats(
     attribution: UpdateAttribution,
     ratio: &UpdateSearchRatio,
     unattributed_detail: &str,
-) -> Result<(), String> {
-    if tally.unattributed > 0 {
-        return Err(format!(
-            "mixed workload: {} of {} dispatched updates were accepted by the server but did \
-             NOT replace a row that already existed in the corpus being searched ({}). Every \
-             mixed update rewrites a vector this same run uploaded, so this means the writes \
-             landed somewhere no query reads: update_count/update_rps would describe that \
-             other target while recall stays high on the untouched corpus (issue #293). \
-             Refusing to publish these numbers.",
-            tally.unattributed,
-            tally.attempted(),
-            unattributed_detail
-        ));
-    }
+) {
+    results.update_unattributed = Some(tally.unattributed);
+    results.update_unattributed_detail = if tally.unattributed > 0 {
+        Some(unattributed_detail.to_string())
+    } else {
+        None
+    };
     if tally.failed > 0 {
         eprintln!(
             "\t⚠ mixed workload: {} of {} updates failed and are excluded from update_count, \
@@ -275,7 +278,7 @@ pub fn finalize_update_stats(
         results.update_p95_time = None;
         results.update_p99_time = None;
         results.update_latencies = Some(times);
-        return Ok(());
+        return;
     }
 
     let mut sorted = times.clone();
@@ -286,7 +289,6 @@ pub fn finalize_update_stats(
     results.update_p95_time = Some(percentile_linear(&sorted, 0.95));
     results.update_p99_time = Some(percentile_linear(&sorted, 0.99));
     results.update_latencies = Some(times);
-    Ok(())
 }
 
 /// Deterministic arrival schedule for fixed-rate, open-loop search.
@@ -798,73 +800,68 @@ mod update_accounting_tests {
         }
     }
 
-    /// The #293 case: writes the server accepted but did not attribute to an
-    /// existing corpus row must abort instead of being published.
-    #[test]
-    fn unattributed_updates_are_a_hard_error_not_a_published_number() {
+    fn fold(tally: UpdateTally, total_time: f64, attr: UpdateAttribution) -> SearchResults {
         let mut r = SearchResults::default();
-        let tally = UpdateTally {
-            times: vec![],
-            unattributed: 7,
-            failed: 0,
-        };
-        let err = finalize_update_stats(
-            &mut r,
-            tally,
-            1.0,
-            UpdateAttribution::CorpusRow,
-            &ratio(),
-            "VADD replied 1",
-        )
-        .unwrap_err();
-        assert!(err.contains("7 of 7"), "{err}");
-        assert!(err.contains("VADD replied 1"), "{err}");
-        // Nothing may be published from an aborted fold.
-        assert!(r.update_count.is_none());
-        assert!(r.update_rps.is_none());
+        finalize_update_stats(&mut r, tally, total_time, attr, &ratio(), "VADD replied 1");
+        r
     }
 
-    /// One bad write in an otherwise clean run is still the #293 condition.
+    /// The #293 case is MEASURED here and adjudicated by the runner: this fold
+    /// must record the count and the signal that produced it, so
+    /// `gate_update_attribution` has something to reject on.
     #[test]
-    fn a_single_unattributed_update_among_many_still_aborts() {
-        let mut r = SearchResults::default();
-        let tally = UpdateTally {
-            times: vec![0.001; 99],
-            unattributed: 1,
-            failed: 0,
-        };
-        let err = finalize_update_stats(
-            &mut r,
-            tally,
+    fn unattributed_updates_are_recorded_with_the_server_signal_that_found_them() {
+        let r = fold(
+            UpdateTally {
+                times: vec![],
+                unattributed: 7,
+                failed: 0,
+            },
             1.0,
             UpdateAttribution::CorpusRow,
-            &ratio(),
-            "HSET reported newly-added fields",
-        )
-        .unwrap_err();
-        assert!(err.contains("1 of 100"), "{err}");
+        );
+        assert_eq!(r.update_unattributed, Some(7));
+        assert_eq!(
+            r.update_unattributed_detail.as_deref(),
+            Some("VADD replied 1")
+        );
+        // The writes that missed the corpus must NOT be counted as updates.
+        assert_eq!(r.update_count, Some(0));
     }
 
-    /// POSITIVE CONTROL: the guard must not reject a clean run. Without this,
-    /// the test above would pass just as well against a fold that refused
-    /// everything.
+    /// One bad write among many is still recorded, and is not diluted into the
+    /// applied count.
     #[test]
-    fn a_clean_run_publishes_its_update_metrics() {
-        let mut r = SearchResults::default();
-        let tally = UpdateTally {
-            times: vec![0.1, 0.2, 0.3, 0.4],
-            unattributed: 0,
-            failed: 0,
-        };
-        finalize_update_stats(
-            &mut r,
-            tally,
+    fn a_single_unattributed_update_among_many_is_still_recorded() {
+        let r = fold(
+            UpdateTally {
+                times: vec![0.001; 99],
+                unattributed: 1,
+                failed: 0,
+            },
+            1.0,
+            UpdateAttribution::CorpusRow,
+        );
+        assert_eq!(r.update_unattributed, Some(1));
+        assert_eq!(r.update_count, Some(99));
+    }
+
+    /// POSITIVE CONTROL: a clean run must record 0 and no signal string, and
+    /// must publish its metrics. Without this, the tests above would pass just
+    /// as well against a fold that flagged everything.
+    #[test]
+    fn a_clean_run_publishes_its_update_metrics_and_flags_nothing() {
+        let r = fold(
+            UpdateTally {
+                times: vec![0.1, 0.2, 0.3, 0.4],
+                unattributed: 0,
+                failed: 0,
+            },
             2.0,
             UpdateAttribution::CorpusRow,
-            &ratio(),
-            "unused",
-        )
-        .unwrap();
+        );
+        assert_eq!(r.update_unattributed, Some(0));
+        assert!(r.update_unattributed_detail.is_none());
         assert_eq!(r.update_count, Some(4));
         assert_eq!(r.update_failures, Some(0));
         assert_eq!(r.update_attribution.as_deref(), Some("corpus_row"));
@@ -881,21 +878,15 @@ mod update_accounting_tests {
     /// published separately.
     #[test]
     fn failed_updates_are_excluded_from_the_count_and_the_rate() {
-        let mut r = SearchResults::default();
-        let tally = UpdateTally {
-            times: vec![0.1, 0.1],
-            unattributed: 0,
-            failed: 8,
-        };
-        finalize_update_stats(
-            &mut r,
-            tally,
+        let r = fold(
+            UpdateTally {
+                times: vec![0.1, 0.1],
+                unattributed: 0,
+                failed: 8,
+            },
             1.0,
             UpdateAttribution::CorpusRow,
-            &ratio(),
-            "unused",
-        )
-        .unwrap();
+        );
         assert_eq!(
             r.update_count,
             Some(2),
@@ -910,16 +901,7 @@ mod update_accounting_tests {
     /// read like a search-only run.
     #[test]
     fn zero_landed_updates_publishes_zero_rather_than_omitting_the_fields() {
-        let mut r = SearchResults::default();
-        finalize_update_stats(
-            &mut r,
-            UpdateTally::default(),
-            1.0,
-            UpdateAttribution::CorpusRow,
-            &ratio(),
-            "unused",
-        )
-        .unwrap();
+        let r = fold(UpdateTally::default(), 1.0, UpdateAttribution::CorpusRow);
         assert_eq!(r.update_count, Some(0));
         assert_eq!(r.update_rps, Some(0.0));
         assert!(r.update_mean_time.is_none());
@@ -930,24 +912,19 @@ mod update_accounting_tests {
     /// rather than let `update_count` read the same as a corpus-row engine's.
     #[test]
     fn ack_only_engines_publish_their_weaker_attribution() {
-        let mut r = SearchResults::default();
-        let tally = UpdateTally {
-            times: vec![0.1],
-            unattributed: 0,
-            failed: 1,
-        };
-        finalize_update_stats(
-            &mut r,
-            tally,
+        let r = fold(
+            UpdateTally {
+                times: vec![0.1],
+                unattributed: 0,
+                failed: 1,
+            },
             1.0,
             UpdateAttribution::AckOnly,
-            &ratio(),
-            "unused",
-        )
-        .unwrap();
+        );
         assert_eq!(r.update_attribution.as_deref(), Some("ack_only"));
         assert_eq!(r.update_count, Some(1));
         assert_eq!(r.update_failures, Some(1));
+        assert_eq!(r.update_unattributed, Some(0));
     }
 
     #[test]
