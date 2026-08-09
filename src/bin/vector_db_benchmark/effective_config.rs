@@ -147,6 +147,14 @@ const REDACTED_USERINFO: &str = "<redacted:userinfo>";
 /// Matched case-insensitively. Deliberately excludes anything whose value can
 /// itself contain pairs — `options` above all (`options='-c password=X'` is a
 /// live libpq shape).
+/// NOTE: `authsource` and `target_session_attrs` were removed rather than
+/// exempted. They matched `is_secret` (AUTH / SESSION), so publishing them made
+/// the two inventories contradict each other in one artifact — `?authSource=admin`
+/// published in a URI while `"authSource": "admin"` as a JSON key became
+/// `<redacted:set>`. Dropping them costs a little provenance and keeps
+/// `no_allow_listed_parameter_is_credential_named` enforceable, which is what
+/// blocks `sslpassword` / `passfile` / `proxyPassword` / `authMechanismProperties`
+/// from being added in good faith later.
 const SAFE_PARAM_KEYS: &[&str] = &[
     // libpq
     "host",
@@ -157,13 +165,11 @@ const SAFE_PARAM_KEYS: &[&str] = &[
     "sslmode",
     "connect_timeout",
     "application_name",
-    "target_session_attrs",
     // mongo
     "w",
     "retrywrites",
     "readpreference",
     "replicaset",
-    "authsource",
     "tls",
     "ssl",
     "maxpoolsize",
@@ -218,6 +224,161 @@ fn sanitise_param_name(k: &str) -> String {
     }
 }
 
+/// Configuration keys whose VALUES may be published in the `declared` block.
+///
+/// The allow-list inversion applied to connection-string *values* but not to
+/// JSON *keys*: `declared` copies `collection_params`/`upload_params` in as raw
+/// file JSON, so any key not matching `SECRET_MARKERS` whose value contained no
+/// `://`, `@` or `=` was published untouched. One ordinary run put 11 of 14
+/// planted canaries on disk — `bearer`, `accountkey`, `jwt`, `pw`, `signature`,
+/// `cookie`, and `Server:h;Pwd:X` (colon-delimited, so the connection-string
+/// fast path never saw it). `bearer` and `AccountKey` are two of the shapes
+/// documented as "closed by construction": they are, as connection-string
+/// parameter names, and were wide open as JSON key names.
+///
+/// Derived from every key in every shipped `experiments/configurations/*.json`
+/// (47 of them) and asserted to still cover them by
+/// `declared_allowlist_covers_every_shipped_config_key`, so a new shipped knob
+/// forces a decision instead of silently becoming `<dropped>`.
+const DECLARED_KEY_ALLOWLIST: &[&str] = &[
+    // HNSW / index build
+    "hnsw_config",
+    "index_options",
+    "index_params",
+    "index_type",
+    "vectors_config",
+    "vectorIndexConfig",
+    "method",
+    "parameters",
+    "payload_index_params",
+    "m",
+    "M",
+    "ef_construct",
+    "ef_construction",
+    "EF_CONSTRUCTION",
+    "efConstruction",
+    "maxConnections",
+    "on_disk",
+    "on_disk_payload",
+    "payload_m",
+    "inline_storage",
+    "full_scan_threshold",
+    "max_indexing_threads",
+    "algorithm",
+    "data_type",
+    "datatype",
+    "distance",
+    "DISTANCE_METRIC",
+    "type",
+    "number_of_shards",
+    "is_tenant",
+    // SVS-VAMANA
+    "svs-vamana_config",
+    "GRAPH_MAX_DEGREE",
+    "CONSTRUCTION_WINDOW_SIZE",
+    "compression",
+    "REDUCE",
+    // quantization
+    "quantization_config",
+    "scalar",
+    "product",
+    "binary",
+    "quantile",
+    "always_ram",
+    "quant",
+    // optimizers / segments
+    "optimizers_config",
+    "memmap_threshold",
+    "max_segment_size",
+    "default_segment_number",
+    // upload
+    "parallel",
+    "batch_size",
+    "timeout",
+    // a single-letter key that a shipped config genuinely uses
+    "a",
+];
+
+fn is_publishable_declared_key(key: &str) -> bool {
+    DECLARED_KEY_ALLOWLIST.contains(&key)
+}
+
+/// URI schemes whose NAME is safe to publish. Allow-listed for the same reason
+/// parameter names are: the slot is attacker-controlled text.
+const SAFE_SCHEMES: &[&str] = &[
+    "redis",
+    "rediss",
+    "redis+sentinel",
+    "valkey",
+    "http",
+    "https",
+    "grpc",
+    "grpcs",
+    "mongodb",
+    "mongodb+srv",
+    "postgres",
+    "postgresql",
+    "jdbc:postgresql",
+    "jdbc:mysql",
+    "qdrant",
+    "file",
+    "s3",
+    "gs",
+];
+
+fn is_safe_scheme(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    SAFE_SCHEMES.contains(&lower.as_str())
+}
+
+/// Scheme grammar (RFC 3986 plus the `jdbc:sub` form). Used only to decide
+/// whether an unrecognised prefix is a *scheme we do not know* (emit
+/// `<dropped>://`, keeping the URL shape) or *not a URL at all* (parse the whole
+/// string as a parameter blob).
+fn looks_like_scheme(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 32
+        && s.starts_with(|c: char| c.is_ascii_alphabetic())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-' | ':'))
+}
+
+/// Publish an authority only as `host` or `host:port`, where the port is
+/// digits.
+///
+/// Permitting a bare `:` here is what let `admin:LEAKCANARY` through once the
+/// `@` search had failed. A colon that is not a port makes the whole token
+/// unrecognised, so it is dropped.
+fn scrub_authority(authority: &str) -> String {
+    if authority.is_empty() {
+        return String::new();
+    }
+    let host_ok = |h: &str| {
+        !h.is_empty()
+            && h.len() <= 255
+            && h.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '[' | ']' | ':'))
+            // Only a bracketed IPv6 literal may contain `:` in the host slot.
+            && (!h.contains(':') || (h.starts_with('[') && h.ends_with(']')))
+    };
+    match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            if host_ok(h) {
+                format!("{h}:{port}")
+            } else {
+                DROPPED.to_string()
+            }
+        }
+        _ => {
+            if host_ok(authority) {
+                authority.to_string()
+            } else {
+                DROPPED.to_string()
+            }
+        }
+    }
+}
+
 /// True when a string is shaped like a connection string / URI / `key=value`
 /// blob, and therefore must never be published verbatim.
 fn is_connection_like(value: &str) -> bool {
@@ -250,49 +411,57 @@ fn redact_connection_like(value: &str) -> String {
         return value.to_string();
     }
 
+    // The SCHEME slot is allow-listed, not copied. `value[..i+3]` is everything
+    // before the first `://`, which is not a scheme: it republished
+    // `password=LEAKCANARY;endpoint=x://h` byte for byte, because the presence
+    // of a `://` anywhere disabled the parameter path for the whole prefix.
     let (scheme, rest) = match value.find("://") {
-        Some(i) => (&value[..i + 3], &value[i + 3..]),
-        None => ("", value),
+        Some(i) if is_safe_scheme(&value[..i]) => (&value[..i + 3], &value[i + 3..]),
+        Some(i) if looks_like_scheme(&value[..i]) => ("<dropped>://", &value[i + 3..]),
+        // Not a URL at all — parse the WHOLE thing as a parameter blob so the
+        // allow-list runs over it.
+        _ => ("", value),
     };
 
-    // A bare `k=v` blob has no authority: `=` or `;` shows up before any `/?#`.
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority_candidate = &rest[..authority_end];
-    let looks_like_authority = scheme.is_empty()
-        && (authority_candidate.contains('=') || authority_candidate.contains(';'));
+    // USERINFO FIRST, over the whole remainder — never after slicing on
+    // `/?#`. Slicing first is how round 2's bug returned in round 5: a password
+    // containing `/`, `?` or `#` pushes the `@` outside the authority slice,
+    // `rfind` finds nothing, and `admin:LEAKCANARY` falls through to the host
+    // slot and is published. Restores the "malformed-but-dangerous fallback"
+    // that b9d4e02 had and this rewrite dropped.
+    let at = rest.rfind('@');
+    let (userinfo_present, after_userinfo) = match at {
+        Some(i) => (true, &rest[i + 1..]),
+        None => (false, rest),
+    };
+
+    let authority_end = after_userinfo
+        .find(['/', '?', '#'])
+        .unwrap_or(after_userinfo.len());
+    let authority = &after_userinfo[..authority_end];
+    let tail = &after_userinfo[authority_end..];
+
+    // A bare `k=v` blob has no authority.
+    let looks_like_blob =
+        scheme.is_empty() && !userinfo_present && (rest.contains('=') || rest.contains(';'));
 
     let mut out = String::new();
-    let params_text: &str = if looks_like_authority {
-        // Whole string is a parameter blob.
+    let params_text: &str = if looks_like_blob {
         rest
     } else {
         out.push_str(scheme);
-        let (authority, tail) = rest.split_at(authority_end);
-        // Userinfo: everything before the LAST `@`, unconditionally dropped.
-        let host_part = match authority.rfind('@') {
-            Some(at) => {
-                out.push_str(REDACTED_USERINFO);
-                out.push('@');
-                &authority[at + 1..]
-            }
-            None => authority,
-        };
-        // Host[:port], only if it is a plausible host token.
-        let host_ok = !host_part.is_empty()
-            && host_part.len() <= 255
-            && host_part.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']' | '%' | '_')
-            });
-        out.push_str(if host_ok { host_part } else { DROPPED });
-
+        if userinfo_present {
+            out.push_str(REDACTED_USERINFO);
+            out.push('@');
+        }
+        out.push_str(&scrub_authority(authority));
         let (path, query) = match tail.find('?') {
             Some(i) => (&tail[..i], &tail[i + 1..]),
             None => (tail, ""),
         };
-        // Path: no pairs, no whitespace, no quotes.
-        let path_ok = path.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '%' | '~' | ':')
-        });
+        let path_ok = path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '%' | '~'));
         out.push_str(if path_ok { path } else { DROPPED });
         query
     };
@@ -314,7 +483,7 @@ fn redact_connection_like(value: &str) -> String {
         .collect();
 
     if !kept.is_empty() {
-        if !looks_like_authority {
+        if !looks_like_blob {
             out.push('?');
         }
         out.push_str(&kept.join("&"));
@@ -709,7 +878,7 @@ pub fn set_phase(phase: &str) {
 /// was declared.
 pub fn set_declared(engine_config: &crate::config::EngineConfig) {
     let raw = engine_config.raw.as_ref();
-    let field = |name: &str| raw.and_then(|r| r.get(name)).cloned();
+    let field = |name: &str| raw.and_then(|r| r.get(name)).map(allowlist_declared);
     let collection = field("collection_params");
     let upload = field("upload_params");
     recorder().set_declared(collection.as_ref(), upload.as_ref());
@@ -745,6 +914,34 @@ pub fn set_declared(engine_config: &crate::config::EngineConfig) {
                 );
             }
         }
+    }
+}
+
+/// Drop the value of any declared key that is not on
+/// [`DECLARED_KEY_ALLOWLIST`], keeping the key so the shape of the declaration
+/// is still visible.
+///
+/// Numbers and booleans are kept regardless of key: they cannot carry a
+/// credential and they are most of what `declared` exists to show.
+fn allowlist_declared(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let keep = is_publishable_declared_key(k) && !is_secret(k);
+                    let scrubbed = match v {
+                        Value::Object(_) | Value::Array(_) if keep => allowlist_declared(v),
+                        // A non-string leaf is safe whatever its key is named.
+                        Value::Number(_) | Value::Bool(_) | Value::Null => v.clone(),
+                        _ if keep => v.clone(),
+                        _ => Value::from(DROPPED),
+                    };
+                    (k.clone(), scrubbed)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(allowlist_declared).collect()),
+        other => other.clone(),
     }
 }
 
@@ -957,17 +1154,64 @@ pub fn snapshot() -> Value {
 /// that survived when the assertion lived in memory.
 #[cfg(test)]
 pub const CONNECTION_SHAPE_CORPUS: &[(&str, &str)] = &[
+    // ---------------------------------------------------------------------
+    // APPEND-ONLY. Every shape ever demonstrated to leak stays here forever.
+    //
+    // Five rewrites of this redactor each closed the shapes just reported and
+    // silently lost one that had been closed before — round 5 reintroduced
+    // round 2's authority-slicing bug verbatim, because the corpus only ever
+    // grew by whatever was found last. Deleting or weakening a row is how that
+    // happens, so `corpus_is_append_only_and_probes_both_sides_of_every_delimiter`
+    // pins the count and the shape of every entry.
+    //
+    // RULE: every entry containing a delimiter (`/ ? # @ : ; & =`) must carry a
+    // canary on BOTH sides of it. Round 5's `userinfo-slash-pw` had the canary
+    // only after the `/`, in the half that gets dropped — so the two rows that
+    // named the shape were the two that hid it.
+    // ---------------------------------------------------------------------
+
+    // -- userinfo, round 1-2 --------------------------------------------------
     ("userinfo", "default:CANARY@127.0.0.1"),
     ("userinfo-url", "redis://admin:CANARY@10.0.0.5:6379/0"),
+    ("mongodb-srv", "mongodb+srv://u:CANARY@cluster.example.net"),
+    // -- userinfo with a delimiter INSIDE the password (round 2, lost in 5) ---
     (
         "userinfo-slash-pw",
-        "redis://admin:hunt/CANARY@10.0.0.5:6379/0",
+        "redis://adminCANARY:CANARY/CANARY@10.0.0.5:6379/0",
     ),
     (
         "userinfo-question-pw",
-        "redis://admin:hu?CANARY@10.0.0.5:6379/0",
+        "redis://adminCANARY:CANARY?CANARY@10.0.0.5:6379/0",
     ),
-    ("mongodb-srv", "mongodb+srv://u:CANARY@cluster.example.net"),
+    (
+        "userinfo-hash-pw",
+        "redis://adminCANARY:CANARY#CANARY@10.0.0.5:6379/0",
+    ),
+    (
+        "userinfo-slash-schemeless",
+        "defaultCANARY:CANARY/CANARY@127.0.0.1",
+    ),
+    (
+        "userinfo-slash-mongo",
+        "mongodb://userCANARY:CANARY/CANARY@cluster.example.net/db",
+    ),
+    (
+        "userinfo-hash-pg",
+        "postgresql://benchCANARY:CANARY#CANARY@db.internal:5432/vec",
+    ),
+    (
+        "userinfo-at-in-pw",
+        "redis://adminCANARY:CANARY@CANARY@10.0.0.5:6379/0",
+    ),
+    (
+        "userinfo-semi-pw",
+        "redis://adminCANARY:CANARY;CANARY@10.0.0.5:6379/0",
+    ),
+    (
+        "userinfo-eq-pw",
+        "redis://adminCANARY:CANARY=CANARY@10.0.0.5:6379/0",
+    ),
+    // -- query strings, round 4 ----------------------------------------------
     ("query-string", "mongodb://h/db?w=majority&password=CANARY"),
     (
         "query-retrywrites",
@@ -995,6 +1239,7 @@ pub const CONNECTION_SHAPE_CORPUS: &[(&str, &str)] = &[
     ("odbc-password", "Server=h;Password=CANARY;Encrypt=yes"),
     ("odbc-in-quotes", "cs=\"Server=h;Pwd=CANARY;\""),
     ("jdbc", "jdbc:postgresql://h:5432/db?user=u&password=CANARY"),
+    // -- libpq, round 3-4 -----------------------------------------------------
     (
         "libpq",
         "host=db user=bench password=CANARY sslmode=require",
@@ -1010,13 +1255,20 @@ pub const CONNECTION_SHAPE_CORPUS: &[(&str, &str)] = &[
     ("sql-doubled-quote", "password='ab''CANARY'"),
     ("pwd", "pwd=CANARY"),
     ("amp", "user=u&password=CANARY&ssl=true"),
-    // Tokeniser-desync probes: a quoted run under a NON-secret key.
+    // -- tokeniser desync, round 5 -------------------------------------------
     ("desync-unbalanced", "note='hello password=CANARY"),
     ("desync-balanced", "note='x password=CANARY' host=h"),
     ("desync-escaped-quote", "note='x\\' password=CANARY"),
     ("desync-nested-odbc", "cs=\"Server=h;Pwd=CANARY;\""),
     ("desync-options", "options='-c password=CANARY'"),
     ("desync-double-quote", "note=\"a password=CANARY\""),
+    // -- prefix before `://` republished verbatim, round 6 --------------------
+    ("prefix-before-scheme", "password=CANARY;endpoint=x://h"),
+    ("bare-unknown-scheme", "CANARY://h"),
+    (
+        "unknown-scheme-with-userinfo",
+        "CANARY://uCANARY:CANARY@h/p",
+    ),
 ];
 
 /// Serialises the tests that mutate the process environment and drive the
@@ -1099,6 +1351,14 @@ mod recorder_coverage_guard {
              facts that matter, since the first decides which configs the sweep \
              globs. Asserted by \
              `the_cited_compensating_record_for_current_dir_exists`",
+        ),
+        (
+            "src/bin/vector_db_benchmark/experiment.rs",
+            "env::var_os(\"HOME\")",
+            "read ONLY to strip the home prefix out of the paths this block \
+             publishes (`tildeify`). Routing it through the recorder would put \
+             the absolute home directory — and therefore the local username — \
+             into `env`, republishing the exact thing the call exists to remove",
         ),
         (
             "src/bin/vector_db_benchmark/download.rs",
@@ -1597,6 +1857,94 @@ mod recorder_coverage_guard {
             callers.is_empty(),
             "`RedisConfig::from_env` bypasses the recorder and is exempted on the \
              grounds that nothing compiled calls it. These do: {callers:?}"
+        );
+    }
+
+    /// The declared allow-list covers every key every shipped config declares.
+    ///
+    /// Bidirectional in the way that matters: a new shipped knob that is not
+    /// listed becomes `<dropped>` in the artifact, which is safe but silently
+    /// loses provenance — so it fails here and forces a decision. Reads the real
+    /// `experiments/configurations/*.json`.
+    #[test]
+    fn declared_allowlist_covers_every_shipped_config_key() {
+        let dir = repo_root().join("experiments/configurations");
+        let mut missing: std::collections::BTreeSet<String> = Default::default();
+        let mut seen = 0usize;
+
+        fn walk(
+            v: &serde_json::Value,
+            missing: &mut std::collections::BTreeSet<String>,
+            seen: &mut usize,
+        ) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, x) in m {
+                        *seen += 1;
+                        if !super::is_publishable_declared_key(k) {
+                            missing.insert(k.clone());
+                        }
+                        walk(x, missing, seen);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, missing, seen)),
+                _ => {}
+            }
+        }
+
+        let entries = std::fs::read_dir(&dir).expect("configurations dir");
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "json") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            for entry in doc.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                for blk in ["collection_params", "upload_params"] {
+                    if let Some(b) = entry.get(blk) {
+                        walk(b, &mut missing, &mut seen);
+                    }
+                }
+            }
+        }
+        assert!(
+            seen > 100,
+            "only {seen} declared keys scanned — the shipped \
+             configurations were not read, so this guard proves nothing"
+        );
+        assert!(
+            missing.is_empty(),
+            "these keys are declared by shipped configs but are not on \
+             DECLARED_KEY_ALLOWLIST, so their values publish as `<dropped>` and \
+             the artifact silently loses provenance: {missing:?}"
+        );
+    }
+
+    /// No allow-listed parameter name may also be credential-named.
+    ///
+    /// The two inventories disagreed on disk in one artifact: `?authSource=admin`
+    /// in a URI was published while `"authSource": "admin"` as a JSON key became
+    /// `<redacted:set>`. Beyond the inconsistency, the gap admits good-faith
+    /// future additions that DO carry secrets — `sslpassword`, `passfile`,
+    /// `proxyPassword`, and `authMechanismProperties`, which sits in the same
+    /// driver-doc table as `authSource` and legitimately carries
+    /// `AWS_SESSION_TOKEN:<token>`.
+    #[test]
+    fn no_allow_listed_parameter_is_credential_named() {
+        let clashing: Vec<&&str> = super::SAFE_PARAM_KEYS
+            .iter()
+            .filter(|k| super::is_secret(k))
+            .collect();
+        assert!(
+            clashing.is_empty(),
+            "SAFE_PARAM_KEYS publishes the values of keys that `is_secret` treats \
+             as credentials: {clashing:?}. One of the two inventories is wrong, \
+             and the safe resolution is dropping the parameter."
         );
     }
 
@@ -2119,6 +2467,60 @@ mod tests {
         // Simulate a future member that skipped `scrub_value`.
         doc["declared"]["api_key"] = json!("leaked");
         assert_no_cleartext_secrets(&doc, false, "engine_params");
+    }
+
+    /// The corpus is APPEND-ONLY and every delimiter is probed on both sides.
+    ///
+    /// This is the structural answer to five rewrites each losing a
+    /// previously-closed shape. Two properties, both mechanical:
+    ///
+    /// 1. the entry count never shrinks — a rewrite that "simplifies" the corpus
+    ///    by dropping rows fails here rather than silently narrowing coverage;
+    /// 2. any entry containing a delimiter carries a canary on BOTH sides of it.
+    ///    Round 5's `userinfo-slash-pw` put the canary only after the `/`, in
+    ///    the half that gets dropped, so the row that named the shape was the
+    ///    row that hid it — the same accidental-masking failure as
+    ///    `?authSource=` two rounds earlier.
+    #[test]
+    fn corpus_is_append_only_and_probes_both_sides_of_every_delimiter() {
+        // Raise this when you ADD shapes. Lowering it means coverage was
+        // deleted, which is the failure this pins.
+        const MINIMUM_SHAPES: usize = 44;
+        assert!(
+            CONNECTION_SHAPE_CORPUS.len() >= MINIMUM_SHAPES,
+            "the corpus shrank to {} entries (floor {MINIMUM_SHAPES}). Every shape \
+             ever demonstrated to leak stays: five rewrites each closed what was \
+             just reported and lost one that had been closed before.",
+            CONNECTION_SHAPE_CORPUS.len()
+        );
+
+        let mut names = std::collections::BTreeSet::new();
+        for (label, value) in CONNECTION_SHAPE_CORPUS {
+            assert!(names.insert(*label), "duplicate corpus label {label}");
+            assert!(
+                value.contains("CANARY") || label.contains("empty"),
+                "[{label}] carries no canary, so it can never fail"
+            );
+            // Both-sides rule: for each delimiter present, a canary must appear
+            // before AND after at least one occurrence of it.
+            for d in ['/', '?', '#', '@', ';', '&'] {
+                if let Some(i) = value.find(d) {
+                    let (before, after) = value.split_at(i);
+                    if before.contains("CANARY") || after.contains("CANARY") {
+                        // At least one side probed; require the other for the
+                        // delimiters that split a credential from its host.
+                        if matches!(d, '@') {
+                            assert!(
+                                before.contains("CANARY"),
+                                "[{label}] has no canary BEFORE its `@` — the \
+                                 userinfo half is exactly what must not be \
+                                 published"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The full corpus of connection-string shapes reported across four review

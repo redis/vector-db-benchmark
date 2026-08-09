@@ -457,12 +457,30 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
         // the artifacts landed. `project_root()` resolves both from the process
         // cwd via `env::current_dir()`, the one raw environment read guard 1
         // waives — and this is the compensating record that waiver cites.
-        "configurations_dir": crate::config::project_root()
-            .join("experiments/configurations")
-            .display()
-            .to_string(),
-        "results_dir": results_dir().display().to_string(),
+        "configurations_dir": tildeify(
+            &crate::config::project_root().join("experiments/configurations"),
+        ),
+        "results_dir": tildeify(&results_dir()),
     })
+}
+
+/// Replace the invoking user's home directory with `~`.
+///
+/// These paths land in every artifact, and an absolute one publishes the local
+/// username to anyone the file is shared with. The part that carries provenance
+/// — which subtree the configs and results came from — survives.
+fn tildeify(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(home) if !home.as_os_str().is_empty() => {
+            let home = home.display().to_string();
+            match shown.strip_prefix(&home) {
+                Some(rest) => format!("~{rest}"),
+                None => shown,
+            }
+        }
+        _ => shown,
+    }
 }
 
 /// Parse "U:S" ratio string into UpdateSearchRatio.
