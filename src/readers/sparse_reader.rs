@@ -389,11 +389,53 @@ mod tests {
         f
     }
 
-    /// `csr_row_count` reads n_row from the 24-byte header and must agree with
-    /// what `read_sparse_matrix` actually yields — the whole point is that it is
-    /// a cheap substitute for parsing, not a second opinion (#290 review).
+    /// The count must come out of LITERAL little-endian bytes, not out of
+    /// whatever `write_sparse_matrix` happens to emit (#290 review).
+    ///
+    /// Without this, `csr_row_count`, `read_sparse_matrix` and the fixture
+    /// writer all agree by construction: a COHERENT endianness flip
+    /// (`from_le_bytes` + `to_le_bytes` → `_be_`) left the whole suite green,
+    /// because every party to the comparison flipped together. The CSR format is
+    /// little-endian by definition — it is what qdrant/vector-db-benchmark's
+    /// `sparse_reader.py` writes — so a byte fixture is the only thing that pins
+    /// it. `results.gt` already has this treatment in
+    /// `gt_decodes_a_literal_little_endian_fixture`; with both, that flip now
+    /// fails two tests instead of none.
+    ///
+    /// `n_row = 150` is the real `synthetic-sparse-300` count, and decodes
+    /// big-endian to 0x9600000000000000 — wildly wrong rather than subtly so.
     #[test]
-    fn csr_row_count_matches_a_full_parse() {
+    fn csr_row_count_decodes_a_literal_little_endian_fixture() {
+        #[rustfmt::skip]
+        let bytes: &[u8] = &[
+            // n_row = 150
+            0x96, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // n_col = 300 — two non-zero bytes, so a swap shows here too if the
+            // header fields are ever read in a different order
+            0x2c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // n_non_zero = 1500
+            0xdc, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let f = write_tmp(bytes);
+        assert_eq!(
+            csr_row_count(f.path().to_str().unwrap()).unwrap(),
+            150,
+            "n_row must decode little-endian"
+        );
+    }
+
+    /// `csr_row_count` must agree with what `read_sparse_matrix` yields on a
+    /// WELL-FORMED file — it is a cheap substitute for parsing, not a second
+    /// opinion (#290 review).
+    ///
+    /// Scope, so the name does not overstate: they agree on well-formed input
+    /// only. A valid header over a truncated body gives `Ok(n)` here and `Err`
+    /// there, by design — a count read must not have to parse the matrix to
+    /// answer. The header is itself a declaration, just one stored inside the
+    /// corpus rather than in `datasets.json`; what the change buys is that the
+    /// declaration now travels WITH the file it describes.
+    #[test]
+    fn csr_row_count_agrees_with_a_full_parse_on_well_formed_input() {
         for n in [0usize, 1, 150] {
             let rows: Vec<SparseVector> = (0..n)
                 .map(|i| SparseVector {

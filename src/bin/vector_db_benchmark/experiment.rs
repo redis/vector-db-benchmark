@@ -616,12 +616,29 @@ fn reuse_expected_rows(dataset: &Dataset) -> Result<u64, String> {
     // re-fetched, however valid its link — saying "could not be fetched" there
     // would describe an attempt that was never made.
     if dataset.corpus_path_exists() {
+        // The remedy is gated on there actually BEING something to re-fetch.
+        // 8 of the 57 shipped datasets have no `link` — the locally generated
+        // ones, `random-100`, and laion — and for those "delete the directory"
+        // is not merely useless but destructive: it also removes `tests.jsonl`
+        // and `payloads.jsonl`, which nothing can restore. Advising it would
+        // repeat the mistake this branch exists to fix (a message describing an
+        // attempt that cannot be made), with data loss attached.
+        let remedy = if dataset.config.link.is_some() {
+            format!(
+                "restore the corpus file — or delete '{path}' to make the next run fetch it \
+                 fresh from the dataset's link"
+            )
+        } else {
+            "restore the corpus file. This dataset has no download link, so deleting the \
+             directory would NOT re-fetch it — and would destroy the query and payload files \
+             sitting beside the missing corpus"
+                .to_string()
+        };
         return Err(format!(
             "dataset '{}' is present at '{}' but its corpus file is not in it (dataset_type \
              '{}'), so there is no number to check the server against. A dataset whose path \
-             already exists is never re-downloaded, so restore the corpus file — or delete '{}' \
-             to make the next run fetch it fresh",
-            dataset.config.name, path, dataset_type, path,
+             already exists is never re-downloaded, so {}",
+            dataset.config.name, path, dataset_type, remedy,
         ));
     }
     Err(format!(
@@ -722,8 +739,6 @@ fn check_corpus_reuse_precondition(
     // verdict is fatal (`Short`, `CorpusSizeUnknown`) now pays for the fetch
     // before it aborts. That is the price of measuring rather than trusting, and
     // it is bounded to the cases where a measurement could change the verdict.
-    // The error is dropped on purpose — this is not the place that reports it,
-    // and `read_queries()` re-runs the identical resolution and fails properly.
     // The resolve error is KEPT, not dropped. When the fetch is what failed —
     // a 404, a dead mirror — that status code is the whole answer, and it used
     // to survive only as `Download attempt N/15 failed:` lines on stderr, with
@@ -2716,6 +2731,28 @@ mod reuse_precondition_tests {
         assert!(
             err.contains("never re-downloaded"),
             "it must warn that an existing directory is not re-fetched: {err}"
+        );
+        // `dataset_at` builds a LINK-LESS dataset, like 8 of the 57 shipped ones
+        // (the generated fixtures, random-100, laion). "Delete the directory" is
+        // not just useless for those, it destroys tests.jsonl/payloads.jsonl
+        // that nothing can restore — so it must not be offered here.
+        assert!(
+            !err.contains("delete"),
+            "a link-less dataset must never be told to delete its directory: {err}"
+        );
+        assert!(
+            err.contains("no download link"),
+            "it must say why deleting would not help: {err}"
+        );
+        // Positive control: the SAME state WITH a link does get the delete-and-
+        // refetch remedy, so the branch above is a real distinction and not a
+        // blanket removal.
+        let mut linked_cfg = dataset_at(dir.path(), "tar", Some(400));
+        linked_cfg.config.link = Some("https://example.invalid/ds.tgz".to_string());
+        let linked_err = reuse_expected_rows(&linked_cfg).expect_err("still unmeasurable");
+        assert!(
+            linked_err.contains("delete") && linked_err.contains("fetch it fresh"),
+            "a fetchable dataset should still be told it can be re-fetched: {linked_err}"
         );
         // The other shape: nothing at that path at all. Different message, and
         // it must not claim a directory is sitting there.

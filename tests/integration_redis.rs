@@ -3590,7 +3590,8 @@ fn test_binary_redis_skip_upload_unverifiable_corpus_is_fatal() {
 /// search phase's own `get_path()` fails on an unresolvable dataset and prints
 /// the same reason as a warning — a reviewer demonstrated exactly that mutation
 /// passing an earlier version of this test. The discriminating assertions are
-/// the absence of `Experiment stage: Search` and of `Dataset path not found`.
+/// the absence of `Experiment stage: Search` (a rejected run never reaches the
+/// search phase) and of `WARNING: --skip-upload` (a fatal arm never warns).
 #[test]
 fn test_binary_redis_skip_upload_fetches_the_dataset_before_judging_it() {
     wait_for_redis();
