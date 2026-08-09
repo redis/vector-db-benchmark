@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::{claim_verdict, Claim, ClaimInputs, ALLOW_DIRTY_ENV};
+use common::{claim_verdict, info_field, Claim, ClaimInputs, ALLOW_DIRTY_ENV};
 
 // ---------------------------------------------------------------------------
 // Source scanning helpers (pure — unit-tested against synthetic input below)
@@ -417,4 +417,35 @@ fn refusal_message_states_the_mechanism_and_the_way_out() {
             "refusal message must mention {expected:?}; message was:\n{msg}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server identity parsing (what makes a prior claim match, or not)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn info_field_reads_run_id_and_master_replid() {
+    // Captured live from redis:8.8.0 `INFO server` (abridged).
+    let server = "# Server\r\nredis_version:8.8.0\r\ntcp_port:6379\r\n\
+                  run_id:e47fa0a6160528b56d01a21bfc4146d716ee02e3\r\nuptime_in_seconds:12\r\n";
+    assert_eq!(
+        info_field(server, "run_id"),
+        "e47fa0a6160528b56d01a21bfc4146d716ee02e3"
+    );
+
+    // Dragonfly df-v1.40.1 `INFO server` reports NO run_id, which is why
+    // `server_identity` falls back to `master_replid` from `INFO replication`.
+    let df_server = "# Server\r\nredis_version:7.4.0\r\ndragonfly_version:df-v1.40.1\r\n\
+                     tcp_port:6379\r\nuptime_in_seconds:23\r\n";
+    assert_eq!(
+        info_field(df_server, "run_id"),
+        "",
+        "absent field must yield the empty identity, which never matches a claim"
+    );
+    let df_repl = "# Replication\r\nrole:master\r\n\
+                   master_replid:4da04ff40e648670f83234caa27706516c67588b\r\n";
+    assert_eq!(
+        info_field(df_repl, "master_replid"),
+        "4da04ff40e648670f83234caa27706516c67588b"
+    );
 }

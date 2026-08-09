@@ -1991,9 +1991,10 @@ pub struct ClaimInputs<'a> {
     /// Server identity this target directory recorded the last time it claimed
     /// `host:port`, if any.
     pub prior_claim: Option<&'a str>,
-    /// Server identity now: `run_id` from `INFO server`. Empty when the server
-    /// does not report one — an empty identity NEVER matches a prior claim, so
-    /// such a server can only be used when it is empty or the check is waived.
+    /// Server identity now (see [`server_identity`]). Empty when the server
+    /// reports neither `run_id` nor `master_replid` — an empty identity NEVER
+    /// matches a prior claim, so such a server can only be used when it is empty
+    /// or the check is waived.
     pub server_id: &'a str,
     /// Operator set [`ALLOW_DIRTY_ENV`].
     pub forced: bool,
@@ -2053,18 +2054,37 @@ fn claim_file(target: &str, host: &str, port: u16) -> Option<std::path::PathBuf>
     )
 }
 
-/// `run_id` from `INFO server`, or an empty string when the server does not
-/// report one.
-fn server_run_id(conn: &mut redis::Connection) -> String {
-    let info: String = redis::cmd("INFO")
-        .arg("server")
-        .query(conn)
-        .unwrap_or_default();
+/// Pull `field:` out of an `INFO` section body.
+pub fn info_field(info: &str, field: &str) -> String {
+    let prefix = format!("{field}:");
     info.lines()
-        .find_map(|l| l.trim().strip_prefix("run_id:"))
+        .find_map(|l| l.trim().strip_prefix(prefix.as_str()))
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+/// A per-instance random identity for the server, so a claim recorded against
+/// one server is not honoured for a different one that later took the port.
+///
+/// `run_id` from `INFO server` where available (Redis, Valkey, KiviDB), falling
+/// back to `master_replid` from `INFO replication` (Dragonfly df-v1.40.1 reports
+/// no `run_id`; both were checked live). Empty when neither is present — an
+/// empty identity never matches a prior claim.
+fn server_identity(conn: &mut redis::Connection) -> String {
+    let server: String = redis::cmd("INFO")
+        .arg("server")
+        .query(conn)
+        .unwrap_or_default();
+    let run_id = info_field(&server, "run_id");
+    if !run_id.is_empty() {
+        return run_id;
+    }
+    let repl: String = redis::cmd("INFO")
+        .arg("replication")
+        .query(conn)
+        .unwrap_or_default();
+    info_field(&repl, "master_replid")
 }
 
 /// Claim `host:port` for a destructive suite, or panic with the refusal message.
@@ -2086,7 +2106,7 @@ pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) 
         .query::<Vec<String>>(&mut conn)
         .map(|v| v.len())
         .unwrap_or(0);
-    let server_id = server_run_id(&mut conn);
+    let server_id = server_identity(&mut conn);
 
     let path = claim_file(target, host, port);
     let prior = path
