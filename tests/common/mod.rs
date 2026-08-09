@@ -1936,3 +1936,189 @@ pub fn read_results_obj(root: &Path, engine: &str) -> serde_json::Value {
     let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     v["results"].clone()
 }
+
+// ---------------------------------------------------------------------------
+// Destructive-suite instance ownership (issue #292)
+// ---------------------------------------------------------------------------
+//
+// Four integration suites (`integration_redis`, `integration_valkey`,
+// `integration_dragonfly`, `integration_kividb`) share one `flush_db()` shape:
+// drop every index `FT._LIST` reports, then `FLUSHALL`. That destroys the WHOLE
+// server, and each suite's default port is a shared container from
+// `tests/docker-compose.test.yml`. Two incidents were caused by a port override
+// that looked applied but was not, so the run silently destroyed a server it did
+// not own.
+//
+// The guard below makes the destructive suites refuse to touch a server that
+// already holds state this harness did not create. It is deliberately placed
+// behind the suites' `test_port()`, because EVERY path that reaches the server
+// — direct `redis::Client` connections and the `REDIS_PORT`-style env vars
+// handed to spawned benchmark binaries alike — resolves its port there.
+
+/// Env var an operator sets to waive [`claim_resp_instance`]'s ownership check.
+pub const ALLOW_DIRTY_ENV: &str = "VDBB_TEST_ALLOW_DIRTY";
+
+/// Verdict of the ownership check a FLUSHALL-issuing suite runs before it
+/// touches a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// Server held no keys and no indexes, so this process takes it over.
+    Fresh,
+    /// Server is non-empty, but either the operator waived the check or the
+    /// server's identity matches the claim this target directory recorded, so
+    /// the state is this harness's own leftovers.
+    Reused,
+    /// Server holds state this harness never created. Carries the message to
+    /// show the operator.
+    Refuse(String),
+}
+
+/// Everything [`claim_verdict`] depends on, so the decision is unit-testable
+/// with no live server.
+#[derive(Debug, Clone)]
+pub struct ClaimInputs<'a> {
+    /// Cargo test target, e.g. `"integration_redis"`. Used in the message.
+    pub target: &'a str,
+    /// Env var that selects this suite's port, e.g. `"REDIS_TEST_PORT"`.
+    pub port_env: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    /// `DBSIZE` reported by the target server.
+    pub dbsize: i64,
+    /// Number of entries `FT._LIST` returned (0 when the command is
+    /// unsupported or errored).
+    pub index_count: usize,
+    /// Server identity this target directory recorded the last time it claimed
+    /// `host:port`, if any.
+    pub prior_claim: Option<&'a str>,
+    /// Server identity now: `run_id` from `INFO server`. Empty when the server
+    /// does not report one — an empty identity NEVER matches a prior claim, so
+    /// such a server can only be used when it is empty or the check is waived.
+    pub server_id: &'a str,
+    /// Operator set [`ALLOW_DIRTY_ENV`].
+    pub forced: bool,
+}
+
+/// Decide whether a destructive suite may run against the server described by
+/// `i`. Pure: no I/O, no env reads.
+pub fn claim_verdict(i: &ClaimInputs<'_>) -> Claim {
+    if i.forced {
+        return Claim::Reused;
+    }
+    if i.dbsize <= 0 && i.index_count == 0 {
+        return Claim::Fresh;
+    }
+    if !i.server_id.is_empty() && i.prior_claim == Some(i.server_id) {
+        return Claim::Reused;
+    }
+    Claim::Refuse(format!(
+        "\n\n\
+         REFUSING TO RUN `{target}` AGAINST {host}:{port}\n\
+         \n\
+         That server already holds {dbsize} key(s) and {indexes} search index(es) that this\n\
+         test harness did not create. Every test in `{target}` calls `flush_db()`, which\n\
+         drops every index `FT._LIST` reports and then issues `FLUSHALL` — running here\n\
+         would destroy all of it.\n\
+         \n\
+         Point the suite at a container of your own:\n\
+         \n\
+         \x20   docker run -d --rm -p <your-port>:6379 --name <your-name> <image>\n\
+         \x20   {port_env}=<your-port> cargo test --test {target} -- --test-threads=1\n\
+         \n\
+         `{port_env}` is the ONLY supported way to move the suite. Editing the port literal\n\
+         in tests/{target}.rs is rejected by tests/harness_invariants.rs.\n\
+         \n\
+         If that data really is disposable, re-run with {allow}=1 to waive this check.\n",
+        target = i.target,
+        host = i.host,
+        port = i.port,
+        dbsize = i.dbsize,
+        indexes = i.index_count,
+        port_env = i.port_env,
+        allow = ALLOW_DIRTY_ENV,
+    ))
+}
+
+/// Path of the file recording which server identity this target directory last
+/// claimed for `host:port`. Lives beside the test binaries (derived from
+/// `current_exe()`: `<target>/<profile>/deps/<bin>` -> `<target>`), so a session
+/// running with its own `CARGO_TARGET_DIR` has its own claims.
+fn claim_file(target: &str, host: &str, port: u16) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let target_dir = exe.parent()?.parent()?.parent()?;
+    Some(
+        target_dir
+            .join("vdbb-test-claims")
+            .join(format!("{target}-{host}-{port}.claim")),
+    )
+}
+
+/// `run_id` from `INFO server`, or an empty string when the server does not
+/// report one.
+fn server_run_id(conn: &mut redis::Connection) -> String {
+    let info: String = redis::cmd("INFO")
+        .arg("server")
+        .query(conn)
+        .unwrap_or_default();
+    info.lines()
+        .find_map(|l| l.trim().strip_prefix("run_id:"))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// Claim `host:port` for a destructive suite, or panic with the refusal message.
+///
+/// Called once per test process from the suite's `test_port()`. A server that
+/// cannot be reached is left alone: connecting is the suite's own
+/// `wait_for_*()` job, and an unreachable server cannot be damaged.
+pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) {
+    let url = format!("redis://{host}:{port}/");
+    let Ok(client) = redis::Client::open(url.as_str()) else {
+        return;
+    };
+    let Ok(mut conn) = client.get_connection_with_timeout(std::time::Duration::from_secs(2)) else {
+        return;
+    };
+
+    let dbsize: i64 = redis::cmd("DBSIZE").query(&mut conn).unwrap_or(0);
+    let index_count = redis::cmd("FT._LIST")
+        .query::<Vec<String>>(&mut conn)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let server_id = server_run_id(&mut conn);
+
+    let path = claim_file(target, host, port);
+    let prior = path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string());
+
+    let forced = std::env::var(ALLOW_DIRTY_ENV)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+
+    let verdict = claim_verdict(&ClaimInputs {
+        target,
+        port_env,
+        host,
+        port,
+        dbsize,
+        index_count,
+        prior_claim: prior.as_deref(),
+        server_id: &server_id,
+        forced,
+    });
+
+    match verdict {
+        Claim::Refuse(msg) => panic!("{msg}"),
+        Claim::Fresh | Claim::Reused => {
+            if let Some(p) = path {
+                if let Some(dir) = p.parent() {
+                    let _ = fs::create_dir_all(dir);
+                }
+                let _ = fs::write(&p, &server_id);
+            }
+        }
+    }
+}

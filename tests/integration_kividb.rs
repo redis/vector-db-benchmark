@@ -4,6 +4,13 @@
 //! Start with: docker compose -f tests/docker-compose.test.yml up -d kividb
 //! Run with:   KIVIDB_PORT=6386 cargo test --test integration_kividb -- --test-threads=1
 //!
+//! DESTRUCTIVE. Every test calls `flush_db()`, which drops every index
+//! `FT._LIST` reports and then issues `FLUSHALL`. `KIVIDB_PORT` is the ONLY
+//! supported way to point the suite at your own container — do NOT edit the port
+//! in this file (`tests/harness_invariants.rs` rejects a second port literal).
+//! `test_port()` also claims the instance on first use and refuses to run if the
+//! server holds state this harness did not create.
+//!
 //! Scope: vector KNN (whole-corpus COSINE ground truth, so recall reflects index
 //! quality alone), plus HNSW/FLAT algorithm selection, EF_RUNTIME behavior,
 //! per-config keyspace coexistence / --skip-upload, AND metadata filtering
@@ -32,11 +39,21 @@ type KnnData = (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<i64>>);
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// KiviDB port under test. `KIVIDB_PORT` is the ONLY supported way to move this
+/// suite off the shared default — these tests call `flush_db()`, which
+/// `FLUSHALL`s the whole server. The first call also claims the instance (see
+/// `common::claim_resp_instance`), so a server holding state this harness did
+/// not create is refused instead of destroyed.
 fn test_port() -> u16 {
-    std::env::var("KIVIDB_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6386)
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        let port = std::env::var("KIVIDB_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6386);
+        common::claim_resp_instance("integration_kividb", "KIVIDB_PORT", TEST_HOST, port);
+        port
+    })
 }
 
 const TEST_HOST: &str = "127.0.0.1";
