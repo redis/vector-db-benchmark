@@ -566,7 +566,10 @@ vector-db-benchmark --engines vectorsets-docker-test --datasets h-and-m-2048-ang
 
 The ratio format is `U:S` where U = number of updates and S = number of searches per cycle. Each worker thread performs S searches followed by U updates in a loop.
 
-**Supported engines**: Redis, VectorSets, Valkey
+**Supported engines**: Redis, VectorSets, Valkey, MongoDB, Vertex AI. The other
+ten engines reject `--update-search-ratio` with
+`mixed benchmark not supported for engine '<name>'` rather than silently running
+a search-only benchmark under a mixed label.
 
 Results JSON includes separate metrics for both operation types:
 
@@ -579,6 +582,9 @@ Results JSON includes separate metrics for both operation types:
     "p50_time": 0.00032,
     "p95_time": 0.00089,
     "p99_time": 0.00142,
+    "update_count": 5891,
+    "update_failures": 0,
+    "update_attribution": "corpus_row",
     "update_rps": 589.1,
     "update_mean_time": 0.00045,
     "update_p50_time": 0.00041,
@@ -590,6 +596,41 @@ Results JSON includes separate metrics for both operation types:
 ```
 
 Omitting the flag preserves the standard search-only benchmark behavior.
+
+### What `update_count` counts, and what it cannot prove (#293)
+
+`update_count` used to be a count of **client-side loop iterations**: every write
+helper discarded the server's reply (`let _ = <write>`), so the counter went up
+whether the write succeeded, was rejected, or landed on a key no query reads.
+`update_rps` inherited that, and looked plausible because a misdirected write
+still costs a round trip. Recall could not see it either: the searched corpus is
+complete and correct whether or not the updates reached it.
+
+It now counts **writes the server accepted**, and every engine publishes which of
+two attribution tiers it achieved, under `update_attribution`:
+
+| `update_attribution` | Engines | What the server's reply establishes |
+| --- | --- | --- |
+| `corpus_row` | Redis, Valkey, VectorSets, MongoDB | The write **replaced state that already existed**. `VADD` replies 1 for a new element and 0 for an overwrite; `HSET` replies with the number of newly-added fields; `update_one` reports `matched_count`. Every mixed update rewrites a row this same run uploaded, so a reply meaning "created new state" proves the write missed the corpus under measurement — that is a **hard error** and the run publishes nothing. |
+| `ack_only` | Vertex AI | Only that the write was accepted (HTTP 2xx). `upsertDatapoints` returns an empty body, so there is nothing to attribute to a datapoint and the corpus-row guard cannot run. `update_count` here is weaker than the same field on a `corpus_row` engine. |
+
+Writes that **errored** are excluded from `update_count`, `update_rps` and the
+update percentiles, and published separately as `update_failures` — the same
+treatment `failed_queries` gets on the search side. A run with
+`update_failures > 0` warns rather than aborting, because failures only shrink
+the reported figures; the Redis-wire engines additionally hard-error on
+server-rejected writes through the existing `INFO commandstats` check.
+
+**The limit, stated plainly:** `corpus_row` proves each counted write overwrote
+a row that was already there. It does not prove that row is reachable by the
+query path — a write to a *different but already-populated* row would still
+report an overwrite. Neither tier is a claim that the updated vector was visible
+to a later search.
+
+Both field names are additive. `update_count` and `update_rps` keep their names
+so existing result files, `summary.rs` and the plotting path stay comparable;
+`update_failures` and `update_attribution` are simply absent from files written
+before #293.
 
 ## Multi-tenancy
 

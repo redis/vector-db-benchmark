@@ -927,13 +927,19 @@ fn insert_batch(
 }
 
 /// Update a single document's vector and metadata.
+///
+/// Returns `Ok(true)` when the server reports the update **matched no
+/// document** — `update_one` runs without `upsert`, so a `matched_count` of 0
+/// means the write changed nothing in this collection. Every mixed update
+/// targets an `_id` this same run inserted, so a 0 means the write was not
+/// applied to the corpus being searched (#293).
 fn update_one_doc(
     coll: &mongodb::sync::Collection<Document>,
     id: i64,
     vector: &[f32],
     metadata: Option<&MetadataItem>,
     schema_types: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let bson_vec: Vec<mongodb::bson::Bson> = vector
         .iter()
         .map(|&f| mongodb::bson::Bson::Double(f as f64))
@@ -947,11 +953,12 @@ fn update_one_doc(
         }
     }
 
-    coll.update_one(doc! { "_id": id }, doc! { "$set": set_doc })
+    let result = coll
+        .update_one(doc! { "_id": id }, doc! { "$set": set_doc })
         .run()
         .map_err(|e| format!("Update failed for id {}: {}", id, e))?;
 
-    Ok(())
+    Ok(result.matched_count == 0)
 }
 
 /// Execute a filter-only find (no vector search).
@@ -2035,7 +2042,7 @@ impl Engine for MongoDBEngine {
         let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut u_times: Vec<f64> = Vec::new();
+        let mut tally = crate::engine::UpdateTally::default();
 
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(parallel);
@@ -2061,7 +2068,7 @@ impl Engine for MongoDBEngine {
                     let mut r: Vec<f64> = Vec::new();
                     let mut mr: Vec<f64> = Vec::new();
                     let mut nd: Vec<f64> = Vec::new();
-                    let mut ut: Vec<f64> = Vec::new();
+                    let mut ut = crate::engine::UpdateTally::default();
                     let mut pb_pending: u64 = 0;
 
                     let client = match Client::with_uri_str(&uri) {
@@ -2121,7 +2128,7 @@ impl Engine for MongoDBEngine {
                             let data_idx = update_seq[uidx % update_seq_len];
 
                             let update_start = Instant::now();
-                            let _ = update_one_doc(
+                            let outcome = update_one_doc(
                                 &coll,
                                 upd_ids[data_idx],
                                 &upd_vectors[data_idx],
@@ -2129,7 +2136,18 @@ impl Engine for MongoDBEngine {
                                 schema_types,
                             );
                             let update_time = update_start.elapsed().as_secs_f64();
-                            ut.push(update_time);
+                            match outcome {
+                                // matched_count >= 1: an existing document in the
+                                // searched collection was updated.
+                                Ok(false) => ut.times.push(update_time),
+                                // matched_count == 0: nothing in this collection
+                                // carried that _id, so the write changed nothing.
+                                Ok(true) => ut.unattributed += 1,
+                                Err(e) => {
+                                    ut.failed += 1;
+                                    eprintln!("Mixed update {} failed: {}", uidx, e);
+                                }
+                            }
                         }
                     }
                     if pb_pending > 0 {
@@ -2146,7 +2164,7 @@ impl Engine for MongoDBEngine {
                 recs.extend(r);
                 mrr_vals.extend(mr);
                 ndcg_vals.extend(nd);
-                u_times.extend(ut);
+                tally.merge(ut);
             }
         });
 
@@ -2157,40 +2175,20 @@ impl Engine for MongoDBEngine {
             return Err("No searches completed".to_string());
         }
 
-        // Update latency stats (linear-interpolation percentiles, matching the
-        // shared search-stats path).
-        let (update_count, update_rps, update_mean_time, update_p50, update_p95, update_p99) =
-            if !u_times.is_empty() {
-                let u_rps = u_times.len() as f64 / total_time;
-                let u_mean = u_times.iter().sum::<f64>() / u_times.len() as f64;
-                let mut u_sorted: Vec<f64> = u_times.clone();
-                u_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                (
-                    Some(u_times.len()),
-                    Some(u_rps),
-                    Some(u_mean),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.50)),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.95)),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.99)),
-                )
-            } else {
-                (None, None, None, None, None, None)
-            };
-
         // Search latency + quality stats through the shared percentile path so the
         // mixed harness matches the main search() footing.
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
         let mut results = crate::engine::compute_search_stats(
             &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
         )?;
-        results.update_count = update_count;
-        results.update_rps = update_rps;
-        results.update_mean_time = update_mean_time;
-        results.update_p50_time = update_p50;
-        results.update_p95_time = update_p95;
-        results.update_p99_time = update_p99;
-        results.update_latencies = Some(u_times);
-        results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+        crate::engine::finalize_update_stats(
+            &mut results,
+            tally,
+            total_time,
+            crate::engine::UpdateAttribution::CorpusRow,
+            ratio,
+            "update_one matched 0 documents in the searched collection",
+        )?;
         Ok(results)
     }
 

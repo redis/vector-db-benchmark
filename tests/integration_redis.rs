@@ -2133,7 +2133,84 @@ fn test_binary_redis_mixed_parallel() {
         p50 <= p95 && p95 <= p99,
         "percentiles must be monotone: p50={p50} p95={p95} p99={p99}"
     );
+    // #293: neither recall nor update_count can see whether the updates reached
+    // the documents the search reads. The engine now folds HSET's own reply into
+    // the count, and publishes which of the two attribution tiers it achieved.
+    assert_eq!(
+        r["update_attribution"].as_str(),
+        Some("corpus_row"),
+        "Redis must publish that every counted update was confirmed by the server \
+         to have overwritten an already-populated corpus document"
+    );
+    assert_eq!(
+        r["update_failures"].as_u64(),
+        Some(0),
+        "no update should have failed in this run"
+    );
     fs::remove_dir_all(&proj.root).ok();
+}
+
+/// The server reply that makes `update_count` server-attributable for the
+/// hash-based engines (#293 — Redis and Valkey share this `hset_single` shape).
+///
+/// `hset_single` now returns "did this write add fields that were not there",
+/// straight from `HSET`'s integer reply, and `finalize_update_stats` aborts when
+/// any counted update did. The guard is only as good as that reply, and the
+/// reply is a server behaviour no unit test can pin — a server that always
+/// returned 0 would make the guard vacuous with every test still green.
+///
+/// This test does NOT exercise the benchmark's mixed path; it pins the single
+/// server fact that path depends on.
+#[test]
+fn test_hset_reply_distinguishes_a_new_document_from_an_overwrite() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+
+    // Own key, outside every engine key_prefix these tests use.
+    let key = "redis-293-hset-reply-probe";
+    let _: () = redis::cmd("DEL").arg(key).query(&mut conn).unwrap();
+
+    // POSITIVE CONTROL: creating the hash reports both fields as new. If HSET
+    // always reported 0 the overwrite assertion below would pass vacuously.
+    let created: i64 = redis::cmd("HSET")
+        .arg(key)
+        .arg("vector")
+        .arg("aaaa")
+        .arg("color")
+        .arg("red")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(created, 2, "HSET creating two fields must reply 2");
+
+    // The mixed-workload case: the same field set, new values.
+    let overwritten: i64 = redis::cmd("HSET")
+        .arg(key)
+        .arg("vector")
+        .arg("bbbb")
+        .arg("color")
+        .arg("blue")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(
+        overwritten, 0,
+        "HSET overwriting an already-populated document must reply 0 — the #293 \
+         guard reads this value to tell an in-corpus update from a write that \
+         landed on a key the index does not cover"
+    );
+
+    // A partially-new field set is NOT a clean overwrite, and must not read as
+    // one: this is the reply that would fire the guard.
+    let partly_new: i64 = redis::cmd("HSET")
+        .arg(key)
+        .arg("vector")
+        .arg("cccc")
+        .arg("size")
+        .arg("3")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(partly_new, 1, "one of the two fields was new");
+
+    let _: () = redis::cmd("DEL").arg(key).query(&mut conn).unwrap();
 }
 
 /// End-to-end `match_any`: filter a keyword (TAG) field to an OR-set and assert

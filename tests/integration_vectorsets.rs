@@ -389,7 +389,134 @@ fn test_binary_vectorsets_mixed_benchmark() {
         p50 <= p95 && p95 <= p99,
         "percentiles must be monotone: p50={p50} p95={p95} p99={p99}"
     );
+
+    // --- #293: none of the four assertions above can see whether the updates
+    // reached the corpus that was searched. recall/precision are measured on a
+    // corpus that is complete either way, and update_count/update_rps were
+    // counts of client-side loop iterations.
+    //
+    // What actually catches the #293 mutation (updates pointed at another key)
+    // is NOT an assertion here — it is the in-run guard, which aborts the
+    // benchmark, so `run_binary` above returns false and this test fails there.
+    // The two assertions below check that the run published the guard's verdict
+    // rather than staying silent about it.
+    assert_eq!(
+        r["update_attribution"].as_str(),
+        Some("corpus_row"),
+        "VectorSets must publish that every counted update was confirmed by the \
+         server to have overwritten an element already in the searched set"
+    );
+    assert_eq!(
+        r["update_failures"].as_u64(),
+        Some(0),
+        "no update should have failed in this run"
+    );
+
+    let url = format!("redis://{}:{}/", TEST_HOST, test_port());
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_connection().unwrap();
+    // #236: this config's corpus is the single key `idx:<config-name>`.
+    let searched_key = format!("idx:{name}");
+    let vcard: i64 = redis::cmd("VCARD")
+        .arg(&searched_key)
+        .query(&mut conn)
+        .unwrap();
+    // Positive control: without this, the equality below could be satisfied by
+    // a server that lost the corpus entirely (0 == 0 against a broken expected).
+    assert!(
+        vcard > 0,
+        "searched key {searched_key} is empty after the mixed run — the corpus \
+         assertion below would be checking nothing"
+    );
+    // A mixed update overwrites elements that are already present, so the
+    // cardinality must be exactly the uploaded corpus — an update that ADDED an
+    // element to the searched set would push this past 400.
+    //
+    // LIMIT, stated because it is easy to over-read: this equality does NOT
+    // prove the updates landed. Under the #293 mutation the searched set keeps
+    // all 400 elements untouched and this assertion passes; the guard inside the
+    // run is what fails there.
+    assert_eq!(
+        vcard, 400,
+        "the searched vector set must still hold the whole 400-doc corpus"
+    );
     std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// The server reply that makes `update_count` server-attributable (#293).
+///
+/// `vadd_single` now returns "did this write CREATE something" straight from
+/// `VADD`'s integer reply, and `finalize_update_stats` aborts the run when any
+/// counted update created rather than overwrote. That guard is only as good as
+/// the reply, and the reply is a server behaviour no unit test can pin — if a
+/// future Redis returned a constant, the guard would silently become vacuous
+/// while every test stayed green. So assert it against the live server.
+///
+/// This test does NOT exercise the benchmark's mixed path; it pins the single
+/// server fact that path depends on.
+#[test]
+fn test_vadd_reply_distinguishes_a_new_element_from_an_overwrite() {
+    wait_for_vectorsets();
+
+    let url = format!("redis://{}:{}/", TEST_HOST, test_port());
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_connection().unwrap();
+
+    // Own key, outside the `idx:` namespace every other test in this file uses,
+    // so this stays parallel-safe. Torn down at the end.
+    let key = "vsets-293-vadd-reply-probe";
+    let _: () = redis::cmd("DEL").arg(key).query(&mut conn).unwrap();
+
+    // POSITIVE CONTROL: a genuinely new element reports 1. If VADD always
+    // reported 0, the overwrite assertion below would pass vacuously and the
+    // shipped guard could never fire.
+    let created: i64 = redis::cmd("VADD")
+        .arg(key)
+        .arg("VALUES")
+        .arg(3)
+        .arg(1.0)
+        .arg(0.0)
+        .arg(0.0)
+        .arg("e1")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(created, 1, "VADD of a new element must reply 1");
+
+    // The mixed-workload case: same element id, different vector.
+    let overwritten: i64 = redis::cmd("VADD")
+        .arg(key)
+        .arg("VALUES")
+        .arg(3)
+        .arg(0.0)
+        .arg(1.0)
+        .arg(0.0)
+        .arg("e1")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(
+        overwritten, 0,
+        "VADD overwriting an existing element must reply 0 — the whole #293 guard \
+         reads this value to tell an in-corpus update from a write that landed \
+         somewhere the search never looks"
+    );
+
+    // A second distinct element is a creation again, and the set grew by
+    // exactly the two creations — not by the overwrite.
+    let created2: i64 = redis::cmd("VADD")
+        .arg(key)
+        .arg("VALUES")
+        .arg(3)
+        .arg(0.0)
+        .arg(0.0)
+        .arg(1.0)
+        .arg("e2")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(created2, 1);
+    let card: i64 = redis::cmd("VCARD").arg(key).query(&mut conn).unwrap();
+    assert_eq!(card, 2, "two creations, one overwrite => cardinality 2");
+
+    let _: () = redis::cmd("DEL").arg(key).query(&mut conn).unwrap();
 }
 
 /// Geo-radius end-to-end (issue #223).

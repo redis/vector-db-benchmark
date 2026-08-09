@@ -2232,7 +2232,11 @@ impl Engine for VertexEngine {
         let mut recalls: Vec<f64> = Vec::new();
         let mut mrrs: Vec<f64> = Vec::new();
         let mut ndcgs: Vec<f64> = Vec::new();
-        let mut update_times: Vec<f64> = Vec::new();
+        // Vertex is the one mixed-capable engine that cannot do corpus-row
+        // attribution: `upsertDatapoints` replies with an empty body, so a 2xx
+        // says the write was accepted and nothing about which datapoint it
+        // replaced. `update_attribution: "ack_only"` publishes that limit (#293).
+        let mut tally = crate::engine::UpdateTally::default();
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(s, "vertex-mixed", workers);
@@ -2246,7 +2250,7 @@ impl Engine for VertexEngine {
                     let mut r = Vec::new();
                     let mut mr = Vec::new();
                     let mut nd = Vec::new();
-                    let mut ut = Vec::new();
+                    let mut ut = crate::engine::UpdateTally::default();
                     let mut pb_pending: u64 = 0;
 
                     let mut client = match VertexWorker::new(VertexWorkerConfig {
@@ -2357,15 +2361,21 @@ impl Engine for VertexEngine {
                                 .send()
                             {
                                 Ok(rr) if rr.status().is_success() => {
-                                    ut.push(ustart.elapsed().as_secs_f64())
+                                    ut.times.push(ustart.elapsed().as_secs_f64())
                                 }
-                                Ok(rr) => eprintln!(
-                                    "Mixed update {} failed: {}: {}",
-                                    uidx,
-                                    rr.status(),
-                                    rr.text().unwrap_or_default()
-                                ),
-                                Err(e) => eprintln!("Mixed update {} failed: {}", uidx, e),
+                                Ok(rr) => {
+                                    ut.failed += 1;
+                                    eprintln!(
+                                        "Mixed update {} failed: {}: {}",
+                                        uidx,
+                                        rr.status(),
+                                        rr.text().unwrap_or_default()
+                                    );
+                                }
+                                Err(e) => {
+                                    ut.failed += 1;
+                                    eprintln!("Mixed update {} failed: {}", uidx, e);
+                                }
                             }
                         }
                     }
@@ -2384,7 +2394,7 @@ impl Engine for VertexEngine {
                 recalls.extend(r);
                 mrrs.extend(mr);
                 ndcgs.extend(nd);
-                update_times.extend(ut);
+                tally.merge(ut);
             }
             Ok(measured_start)
         })?;
@@ -2394,23 +2404,6 @@ impl Engine for VertexEngine {
         if latencies.is_empty() {
             return Err("No searches completed (all mixed queries failed)".to_string());
         }
-
-        let (update_count, update_rps, update_mean, u50, u95, u99) = if !update_times.is_empty() {
-            let rps = update_times.len() as f64 / total_time;
-            let mean = update_times.iter().sum::<f64>() / update_times.len() as f64;
-            let mut sorted = update_times.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            (
-                Some(update_times.len()),
-                Some(rps),
-                Some(mean),
-                Some(crate::engine::percentile_linear(&sorted, 0.50)),
-                Some(crate::engine::percentile_linear(&sorted, 0.95)),
-                Some(crate::engine::percentile_linear(&sorted, 0.99)),
-            )
-        } else {
-            (None, None, None, None, None, None)
-        };
 
         let mut results = crate::engine::compute_search_stats(
             &latencies,
@@ -2423,14 +2416,16 @@ impl Engine for VertexEngine {
             parallel,
             num_to_run,
         )?;
-        results.update_count = update_count;
-        results.update_rps = update_rps;
-        results.update_mean_time = update_mean;
-        results.update_p50_time = u50;
-        results.update_p95_time = u95;
-        results.update_p99_time = u99;
-        results.update_latencies = Some(update_times);
-        results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+        crate::engine::finalize_update_stats(
+            &mut results,
+            tally,
+            total_time,
+            crate::engine::UpdateAttribution::AckOnly,
+            ratio,
+            // Unreachable under AckOnly: nothing ever sets `unattributed`, because
+            // the upsert reply carries no row-level information to set it from.
+            "unused — Vertex cannot attribute a write to a datapoint",
+        )?;
         Ok(results)
     }
 

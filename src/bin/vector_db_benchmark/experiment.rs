@@ -2121,6 +2121,14 @@ fn build_search_result_json(
         if let Some(rps) = results.update_rps {
             results_obj.insert("update_rps".to_string(), json!(rps));
         }
+        // What `update_count` is a count OF, published per run because it is not
+        // uniform across engines (#293). Absent on files written before #293.
+        if let Some(ref attribution) = results.update_attribution {
+            results_obj.insert("update_attribution".to_string(), json!(attribution));
+        }
+        if let Some(failures) = results.update_failures {
+            results_obj.insert("update_failures".to_string(), json!(failures));
+        }
         if let Some(t) = results.update_mean_time {
             results_obj.insert("update_mean_time".to_string(), json!(t));
         }

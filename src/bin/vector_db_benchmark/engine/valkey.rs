@@ -1557,13 +1557,21 @@ fn extract_vector_score(fields: &[redis::Value]) -> f64 {
 }
 
 /// Single-record HSET update (for mixed benchmark).
+///
+/// Returns `Ok(true)` when the server reports the write **added fields that did
+/// not exist** rather than overwriting an already-populated document: `HSET`
+/// replies with the number of NEW fields, and 0 when every field was already
+/// there (verified live). `upload_batch_internal` writes exactly the same field
+/// set from the same source vectors, so on the supported paths a corpus
+/// document is always fully populated and a nonzero reply means the write did
+/// not land on it (#293).
 fn hset_single(
     conn: &mut Connection,
     config: &ValkeyEngineConfig,
     id: i64,
     vector: &[f32],
     metadata: Option<&MetadataItem>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let key = format!("{}{}", config.key_prefix, id);
     let vec_bytes: Vec<u8> = match config.data_type.as_str() {
         "FLOAT64" => vector
@@ -1610,8 +1618,10 @@ fn hset_single(
         }
     }
 
-    cmd.query::<()>(conn)
-        .map_err(|e| format!("HSET update error: {}", e))
+    let new_fields: i64 = cmd
+        .query(conn)
+        .map_err(|e| format!("HSET update error: {}", e))?;
+    Ok(new_fields != 0)
 }
 
 /// Format a string metadata field for storage on Valkey.
@@ -2174,7 +2184,7 @@ impl Engine for ValkeyEngine {
         let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut u_times: Vec<f64> = Vec::new();
+        let mut tally = crate::engine::UpdateTally::default();
 
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(parallel);
@@ -2202,7 +2212,7 @@ impl Engine for ValkeyEngine {
                     let mut r: Vec<f64> = Vec::new();
                     let mut mr: Vec<f64> = Vec::new();
                     let mut nd: Vec<f64> = Vec::new();
-                    let mut ut: Vec<f64> = Vec::new();
+                    let mut ut = crate::engine::UpdateTally::default();
                     let mut pb_pending: u64 = 0;
 
                     let mut conn = match ValkeyEngine::connect(&host, port) {
@@ -2280,7 +2290,7 @@ impl Engine for ValkeyEngine {
                             let data_idx = update_seq[uidx % update_seq_len];
 
                             let update_start = Instant::now();
-                            let _ = hset_single(
+                            let outcome = hset_single(
                                 &mut conn,
                                 &config,
                                 upd_ids[data_idx],
@@ -2288,7 +2298,18 @@ impl Engine for ValkeyEngine {
                                 upd_metadata[data_idx].as_ref(),
                             );
                             let update_time = update_start.elapsed().as_secs_f64();
-                            ut.push(update_time);
+                            match outcome {
+                                // HSET replied 0: every field already existed, so
+                                // an indexed corpus document was overwritten.
+                                Ok(false) => ut.times.push(update_time),
+                                // HSET added new fields: the target hash was not
+                                // the fully-populated document the search reads.
+                                Ok(true) => ut.unattributed += 1,
+                                Err(e) => {
+                                    ut.failed += 1;
+                                    eprintln!("Mixed update {} failed: {}", uidx, e);
+                                }
+                            }
                         }
                     }
                     if pb_pending > 0 {
@@ -2305,7 +2326,7 @@ impl Engine for ValkeyEngine {
                 recs.extend(r);
                 mrr_vals.extend(mr);
                 ndcg_vals.extend(nd);
-                u_times.extend(ut);
+                tally.merge(ut);
             }
         });
 
@@ -2315,26 +2336,6 @@ impl Engine for ValkeyEngine {
         if times.is_empty() {
             return Err("No searches completed".to_string());
         }
-
-        // Update latency stats (linear-interpolation percentiles, matching the
-        // shared search-stats path).
-        let (update_count, update_rps, update_mean_time, update_p50, update_p95, update_p99) =
-            if !u_times.is_empty() {
-                let u_rps = u_times.len() as f64 / total_time;
-                let u_mean = u_times.iter().sum::<f64>() / u_times.len() as f64;
-                let mut u_sorted: Vec<f64> = u_times.clone();
-                u_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                (
-                    Some(u_times.len()),
-                    Some(u_rps),
-                    Some(u_mean),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.50)),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.95)),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.99)),
-                )
-            } else {
-                (None, None, None, None, None, None)
-            };
 
         // Verify no failures occurred
         let mut check_conn = self.get_connection()?;
@@ -2351,14 +2352,15 @@ impl Engine for ValkeyEngine {
         let mut results = crate::engine::compute_search_stats(
             &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
         )?;
-        results.update_count = update_count;
-        results.update_rps = update_rps;
-        results.update_mean_time = update_mean_time;
-        results.update_p50_time = update_p50;
-        results.update_p95_time = update_p95;
-        results.update_p99_time = update_p99;
-        results.update_latencies = Some(u_times);
-        results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+        crate::engine::finalize_update_stats(
+            &mut results,
+            tally,
+            total_time,
+            crate::engine::UpdateAttribution::CorpusRow,
+            ratio,
+            "HSET reported newly-added fields, where overwriting an already-populated \
+             corpus document reports 0",
+        )?;
         Ok(results)
     }
 
