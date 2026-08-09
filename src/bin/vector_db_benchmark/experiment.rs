@@ -424,9 +424,25 @@ pub enum ReusePrecondition {
         expected: u64,
         approximate: bool,
     },
-    /// Nothing to check against: the dataset's corpus size cannot be determined,
-    /// or no server-side count is implemented for this engine. Proceed with a note.
-    Unverifiable(String),
+    /// No server-side count came back: `corpus_row_count` returned `Ok(None)`,
+    /// which happens either because no probe is wired up for this engine or
+    /// because the engine's reply carried no count (Qdrant with no
+    /// `points_count`). NOT a probe failure — that is an `Err` and is handled
+    /// before classification. Proceed with a note: an engine we have not wired
+    /// up must not become unusable under `--skip-upload`.
+    ///
+    /// Returned whenever the server side is missing, whatever the dataset side
+    /// says. With neither side available there is nothing to compare in either
+    /// direction, so a missing expected count adds no information and must not
+    /// escalate this to an abort (#290 review).
+    NoServerCount(String),
+    /// The server side IS available but the DATASET side is not: the expected
+    /// row count could not be determined. Fatal unless `--allow-partial-corpus`
+    /// (issue #290). This is the same outcome as `Short` with LESS information,
+    /// not a milder one: the server may hold the whole corpus, part of it, or
+    /// none of it, and recall is scored against ground truth for the FULL
+    /// corpus either way.
+    CorpusSizeUnknown(String),
     /// The server holds MORE rows than the dataset declares. Warn and continue:
     /// leftovers from a bigger corpus change the reported recall, but so does
     /// refusing to run, and unlike a short corpus this is often deliberate
@@ -454,7 +470,8 @@ impl ReusePrecondition {
     fn status(&self) -> &'static str {
         match self {
             ReusePrecondition::Ok { .. } => "verified",
-            ReusePrecondition::Unverifiable(_) => "unverified",
+            ReusePrecondition::NoServerCount(_) => "unverified",
+            ReusePrecondition::CorpusSizeUnknown(_) => "corpus_size_unknown",
             ReusePrecondition::Surplus { .. } => "surplus",
             ReusePrecondition::Short { .. } => "short",
         }
@@ -462,24 +479,34 @@ impl ReusePrecondition {
 }
 
 /// Classify a server-side corpus count against what the dataset declares.
+///
+/// `expected` is a `Result`, not an `Option`, so the REASON the dataset side is
+/// unavailable survives into the verdict instead of being flattened to "unknown"
+/// at the call site (issue #290).
 pub fn classify_reuse_precondition(
-    expected: Option<u64>,
+    expected: Result<u64, String>,
     actual: Option<CorpusCount>,
     engine_name: &str,
 ) -> ReusePrecondition {
-    let Some(expected) = expected else {
-        return ReusePrecondition::Unverifiable(
-            "the dataset's corpus size could not be determined".to_string(),
-        );
-    };
+    // The SERVER side is tested first, deliberately. If it is missing there is
+    // nothing to compare against in either direction, so an unavailable expected
+    // count adds no information — escalating to a fatal there would remove
+    // `--skip-upload` from exactly the engines that have no probe, protecting no
+    // number in exchange (#290 review).
     let Some(actual) = actual else {
-        // Deliberately phrased as a gap in this tool, not a limitation of the
-        // database: Chroma, Milvus and Weaviate all expose a count, we simply
-        // have not wired one up yet.
-        return ReusePrecondition::Unverifiable(format!(
-            "no server-side row count is implemented here for the engine behind config \
-             '{engine_name}' yet"
+        // Phrased as a gap on THIS side of the wire, not a limitation of the
+        // database: Chroma, Milvus and Weaviate all expose a count we have not
+        // wired up, and Qdrant's probe is wired up but can reply without one.
+        // Deliberately distinct from a probe FAILURE, which is an `Err` handled
+        // before classification and says "probe failure" out loud.
+        return ReusePrecondition::NoServerCount(format!(
+            "this tool read no server-side row count for config '{engine_name}' (either none \
+             is implemented for its engine yet, or the engine replied without one)"
         ));
+    };
+    let expected = match expected {
+        Ok(v) => v,
+        Err(why) => return ReusePrecondition::CorpusSizeUnknown(why),
     };
     let (a, e, approximate) = (actual.rows, expected, actual.approximate);
     if a < e {
@@ -519,8 +546,27 @@ pub fn classify_reuse_precondition(
 /// it exists to catch (a `Recall: 0.0000` run, exit 0). The measurement is the
 /// fact; a conflicting declaration is a `datasets.json` bug worth warning about,
 /// not a reason to stop checking.
-fn reuse_expected_rows(dataset: &Dataset) -> Result<Option<u64>, String> {
-    if let Some(measured) = dataset.measured_vector_count()? {
+///
+/// Returns `Result<u64, _>` rather than `Result<Option<u64>, _>` (issue #290):
+/// "there is no count here" is not a success. The three ways it can fail — a
+/// read that blew up, a corpus that is not on this machine, and an unmeasurable
+/// layout with no declared count — carry different messages, where before all
+/// three collapsed into one `None` at the call site.
+///
+/// For `sparse` (CSR) and `h5-multi` the declared `vector_count` is used
+/// WITHOUT requiring every corpus file to be present, which is where this
+/// deliberately parts company with `corpus_completeness_target()`. That
+/// function's file-presence gate exists to stop an UPLOAD being skipped over a
+/// half-present corpus (#188/#224); `--skip-upload` never uploads, so the gate
+/// protects nothing here and costs a great deal — `laion-…-1Billion` is
+/// `h5-multi` with 100 data parts (~3 TB) whose queries live in a separate
+/// file, so requiring all of them would make the check unpassable on exactly
+/// the upload-once/benchmark-later workflow it is meant to serve.
+fn reuse_expected_rows(dataset: &Dataset) -> Result<u64, String> {
+    if let Some(measured) = dataset
+        .measured_vector_count()
+        .map_err(|e| format!("measuring the corpus on disk failed: {e}"))?
+    {
         if let Some(declared) = dataset
             .config
             .vector_count
@@ -536,11 +582,70 @@ fn reuse_expected_rows(dataset: &Dataset) -> Result<Option<u64>, String> {
                 );
             }
         }
-        return Ok(Some(measured));
+        return Ok(measured);
     }
-    // Layouts with no cheap row count (sparse CSR, h5-multi) fall back to the
-    // declared count, but only when their files are actually present.
-    dataset.corpus_completeness_target()
+    let declared = dataset
+        .config
+        .vector_count
+        .filter(|&n| n > 0)
+        .map(|n| n as u64);
+    let dataset_type = dataset.config.dataset_type.as_deref().unwrap_or("<none>");
+    // Render the path as a plain string; `config.path` is a serde_json::Value,
+    // whose Display adds JSON quotes an operator has to look past.
+    let path = dataset
+        .config
+        .path
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| dataset.config.path.to_string());
+    if dataset.may_fall_back_to_declared_count() {
+        // Nothing to measure by design, so datasets.json IS the answer here.
+        return declared.ok_or_else(|| {
+            format!(
+                "dataset '{}' uses the '{}' layout, which carries no cheap row count to measure, \
+                 and datasets.json declares no vector_count for it — so there is no number to \
+                 check the server against. Add \"vector_count\" to this dataset's entry in \
+                 datasets/datasets.json.",
+                dataset.config.name, dataset_type,
+            )
+        });
+    }
+    // Two different situations, and conflating them sends the operator to the
+    // wrong remedy. `get_path()` returns early when the path already exists, so
+    // a dataset directory that is here but has lost its corpus file is NEVER
+    // re-fetched, however valid its link — saying "could not be fetched" there
+    // would describe an attempt that was never made.
+    if dataset.corpus_path_exists() {
+        // The remedy is gated on there actually BEING something to re-fetch.
+        // 8 of the 57 shipped datasets have no `link` — the locally generated
+        // ones, `random-100`, and laion — and for those "delete the directory"
+        // is not merely useless but destructive: it also removes `tests.jsonl`
+        // and `payloads.jsonl`, which nothing can restore. Advising it would
+        // repeat the mistake this branch exists to fix (a message describing an
+        // attempt that cannot be made), with data loss attached.
+        let remedy = if dataset.config.link.is_some() {
+            format!(
+                "restore the corpus file — or delete '{path}' to make the next run fetch it \
+                 fresh from the dataset's link"
+            )
+        } else {
+            "restore the corpus file. This dataset has no download link, so deleting the \
+             directory would NOT re-fetch it — and would destroy the query and payload files \
+             sitting beside the missing corpus"
+                .to_string()
+        };
+        return Err(format!(
+            "dataset '{}' is present at '{}' but its corpus file is not in it (dataset_type \
+             '{}'), so there is no number to check the server against. A dataset whose path \
+             already exists is never re-downloaded, so {}",
+            dataset.config.name, path, dataset_type, remedy,
+        ));
+    }
+    Err(format!(
+        "dataset '{}' has no corpus at '{}' on this machine (dataset_type '{}') and resolving it \
+         produced none, so there is no number to check the server against",
+        dataset.config.name, path, dataset_type,
+    ))
 }
 
 /// Verify the promise `--skip-upload` makes: that the corpus it is told to reuse
@@ -555,8 +660,13 @@ fn reuse_expected_rows(dataset: &Dataset) -> Result<Option<u64>, String> {
 /// LOWER half gives `mean_recall: 0.0`. A metric that is a coin flip on the
 /// deletion pattern cannot be the guard.
 ///
-/// Repo policy on what is fatal: a short corpus changes the reported number, so
-/// an exact count that comes up short is a hard error; everything softer warns.
+/// What is fatal: a short corpus changes the reported number, so an exact count
+/// that comes up short is a hard error; everything softer warns. Being unable to
+/// determine the dataset's expected count is fatal too (#290), because it is the
+/// same outcome as a short corpus with less information, not a milder one — but
+/// only once the tool has had its own chance to fetch the corpus (see below) and
+/// only when a server-side count IS available to have compared it against.
+/// `--allow-partial-corpus` waives both.
 ///
 /// Returns the verdict so it can be stamped into every result file this
 /// experiment writes.
@@ -569,18 +679,31 @@ fn check_corpus_reuse_precondition(
     if args.skip_search {
         return Ok(None);
     }
+    // The other way a run measures nothing: `--skip-vector-index` on a dataset
+    // with no schema fields has no filter conditions to search for, so the
+    // search phase returns before `read_queries()`. Same rationale as
+    // `--skip-search` above, and checking it here also keeps the fetch below
+    // from downloading a corpus for a run that will publish nothing.
+    if args.skip_vector_index
+        && !dataset
+            .config
+            .schema
+            .as_ref()
+            .and_then(|s| s.as_object())
+            .map(|o| !o.is_empty())
+            .unwrap_or(false)
+    {
+        return Ok(None);
+    }
 
-    let expected = match reuse_expected_rows(dataset) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "\tNote: could not determine the dataset's corpus size ({e}); \
-                 --skip-upload reuse left unverified"
-            );
-            None
-        }
-    };
-
+    // The SERVER side is probed FIRST — before the dataset is fetched — for the
+    // same reason `classify_reuse_precondition` tests it first: if it gives us
+    // nothing to compare against, fetching a corpus to measure buys nothing.
+    //
+    // This ordering is load-bearing, not tidiness. The fetch below can be
+    // hundreds of GB, and probing afterwards meant an unreachable or mis-ACL'd
+    // server — the case `--help` names — paid for the whole download before
+    // aborting, where master aborted having touched nothing.
     let actual = match engine.corpus_row_count() {
         Ok(v) => v,
         Err(e) => {
@@ -605,16 +728,53 @@ fn check_corpus_reuse_precondition(
         }
     };
 
+    // Only now, with a server-side number in hand that is worth comparing
+    // against, give the tool its own chance to make the corpus measurable before
+    // judging that it cannot be (#290 review). `read_queries()` opens with this
+    // same `get_path()` call, which fetches a string-path dataset that is not on
+    // disk — so measuring first turned "not downloaded yet" into a hard error
+    // for every fetchable dataset on a fresh benchmark client.
+    //
+    // Note what this does NOT claim: that the download is free. A run whose
+    // verdict is fatal (`Short`, `CorpusSizeUnknown`) now pays for the fetch
+    // before it aborts. That is the price of measuring rather than trusting, and
+    // it is bounded to the cases where a measurement could change the verdict.
+    // The resolve error is KEPT, not dropped. When the fetch is what failed —
+    // a 404, a dead mirror — that status code is the whole answer, and it used
+    // to survive only as `Download attempt N/15 failed:` lines on stderr, with
+    // the final attempt's error printed nowhere at all.
+    let resolve_error: Option<String> = if actual.is_some() {
+        dataset.get_path().err()
+    } else {
+        None
+    };
+
+    // Kept as a Result: an Err here is fatal below (#290), so degrading it to
+    // "unknown" would be the very thing this check exists to prevent.
+    let expected = reuse_expected_rows(dataset).map_err(|why| match &resolve_error {
+        Some(e) => format!("{why}; resolving the dataset failed with: {e}"),
+        None => why,
+    });
+    let expected_rows: Option<u64> = expected.as_ref().ok().copied();
+
     let verdict = classify_reuse_precondition(expected, actual, engine.name());
     let approx_note = |approximate: bool| if approximate { "≈" } else { "" };
     let record = |waived: bool| {
-        json!({
+        let mut v = json!({
             "status": verdict.status(),
-            "expected_rows": expected,
+            "expected_rows": expected_rows,
             "actual_rows": actual.map(|c| c.rows),
             "actual_is_estimate": actual.map(|c| c.approximate).unwrap_or(false),
             "waived_by_allow_partial_corpus": waived,
-        })
+        });
+        // A waived `corpus_size_unknown` is a PUBLISHED result whose count was
+        // never checked. Without the reason, the file says the count was unknown
+        // but not why — and that is the artifact someone quotes months later.
+        // `probe_failed` has carried a `detail` since #238; this matches it.
+        if let ReusePrecondition::CorpusSizeUnknown(why) = &verdict {
+            v["detail"] = json!(why);
+        }
+        v
     };
 
     match &verdict {
@@ -631,12 +791,49 @@ fn check_corpus_reuse_precondition(
             );
             Ok(Some(record(false)))
         }
-        ReusePrecondition::Unverifiable(why) => {
+        ReusePrecondition::NoServerCount(why) => {
             println!(
                 "Experiment stage: Reuse check — SKIPPED ({why}); \
                  --skip-upload is running against an unverified corpus"
             );
             Ok(Some(record(false)))
+        }
+        ReusePrecondition::CorpusSizeUnknown(why) => {
+            // Same policy as Short, for the same reason: this changes the
+            // reported number. The difference is only that we cannot say by how
+            // much (#290). `actual` is always Some in this arm — a missing
+            // server-side count classifies as NoServerCount before we get here.
+            // The `None` arm is unreachable today: a missing server-side count
+            // classifies as `NoServerCount` above. It is a wording fallback
+            // rather than an `unwrap()` so that a future reordering degrades
+            // this message instead of panicking in the middle of a sweep.
+            let held = actual
+                .map(|c| format!("{}{}", if c.approximate { "≈" } else { "" }, c.rows))
+                .unwrap_or_else(|| "an unreported number of".to_string());
+            let msg = format!(
+                "--skip-upload: the reuse check for config '{}' has nothing to compare against — \
+                 the expected row count for dataset '{}' could not be determined ({}). The server \
+                 holds {} rows, and this run cannot tell whether that is the whole corpus. \
+                 Unverified is not the same as intact: recall/precision are scored against ground \
+                 truth for the FULL corpus, so if the corpus behind this config is empty or \
+                 partial, continuing publishes a wrong number (an empty corpus scores recall 0.0 \
+                 with zero failed queries) under a config name that claims otherwise. The remedy \
+                 is whatever the reason above asks for — give this machine the dataset's corpus, \
+                 or declare its vector_count in datasets/datasets.json. On a sweep, add \
+                 --exit-on-error false so the configs that DO verify still publish their (correct) \
+                 numbers while this one is skipped. --allow-partial-corpus measures whatever the \
+                 server holds without checking; the waiver is recorded in the result file.",
+                engine.name(),
+                dataset.config.name,
+                why,
+                held,
+            );
+            if args.allow_partial_corpus {
+                eprintln!("WARNING: {msg}");
+                return Ok(Some(record(true)));
+            }
+            crate::summary::record_rejected_experiment(engine.name(), &dataset.config.name, &msg);
+            Err(msg)
         }
         ReusePrecondition::Surplus {
             actual,
@@ -2309,15 +2506,38 @@ mod tests {
 
 #[cfg(test)]
 mod reuse_precondition_tests {
-    use super::{classify_reuse_precondition, ReusePrecondition};
+    use super::{classify_reuse_precondition, reuse_expected_rows, ReusePrecondition};
+    use crate::config::DatasetConfig;
+    use crate::dataset::Dataset;
     use crate::engine::CorpusCount;
+    use vector_db_benchmark::readers::{write_npy_vectors, write_sparse_matrix, SparseVector};
+
+    /// A dataset rooted at an ABSOLUTE temp path, so `datasets_dir().join(abs)`
+    /// resolves back to `abs` and no download is ever attempted.
+    fn dataset_at(
+        path: &std::path::Path,
+        dataset_type: &str,
+        vector_count: Option<i64>,
+    ) -> Dataset {
+        Dataset::new(DatasetConfig {
+            name: "reuse-unit".to_string(),
+            dataset_type: Some(dataset_type.to_string()),
+            path: serde_json::Value::String(path.to_str().unwrap().to_string()),
+            distance: Some("l2".to_string()),
+            vector_size: Some(3),
+            vector_count,
+            link: None,
+            schema: None,
+            description: None,
+        })
+    }
 
     // A corpus shorter than the dataset declares is the case that publishes a
     // wrong recall under a config name claiming otherwise (issue #238).
     #[test]
     fn short_corpus_is_short() {
         assert_eq!(
-            classify_reuse_precondition(Some(400), Some(CorpusCount::exact(200)), "redis-x"),
+            classify_reuse_precondition(Ok(400), Some(CorpusCount::exact(200)), "redis-x"),
             ReusePrecondition::Short {
                 actual: 200,
                 expected: 400,
@@ -2331,7 +2551,7 @@ mod reuse_precondition_tests {
     #[test]
     fn missing_corpus_is_short_not_ok() {
         assert_eq!(
-            classify_reuse_precondition(Some(400), Some(CorpusCount::exact(0)), "redis-x"),
+            classify_reuse_precondition(Ok(400), Some(CorpusCount::exact(0)), "redis-x"),
             ReusePrecondition::Short {
                 actual: 0,
                 expected: 400,
@@ -2343,7 +2563,7 @@ mod reuse_precondition_tests {
     #[test]
     fn exact_match_is_ok() {
         assert_eq!(
-            classify_reuse_precondition(Some(400), Some(CorpusCount::exact(400)), "redis-x"),
+            classify_reuse_precondition(Ok(400), Some(CorpusCount::exact(400)), "redis-x"),
             ReusePrecondition::Ok {
                 actual: 400,
                 expected: 400,
@@ -2357,7 +2577,7 @@ mod reuse_precondition_tests {
     #[test]
     fn surplus_is_classified_as_surplus() {
         assert_eq!(
-            classify_reuse_precondition(Some(400), Some(CorpusCount::exact(401)), "redis-x"),
+            classify_reuse_precondition(Ok(400), Some(CorpusCount::exact(401)), "redis-x"),
             ReusePrecondition::Surplus {
                 actual: 401,
                 expected: 400,
@@ -2372,7 +2592,7 @@ mod reuse_precondition_tests {
     #[test]
     fn approximate_flag_survives_classification() {
         assert_eq!(
-            classify_reuse_precondition(Some(400), Some(CorpusCount::estimated(200)), "pg-x"),
+            classify_reuse_precondition(Ok(400), Some(CorpusCount::estimated(200)), "pg-x"),
             ReusePrecondition::Short {
                 actual: 200,
                 expected: 400,
@@ -2380,7 +2600,7 @@ mod reuse_precondition_tests {
             }
         );
         assert_eq!(
-            classify_reuse_precondition(Some(400), Some(CorpusCount::estimated(400)), "pg-x"),
+            classify_reuse_precondition(Ok(400), Some(CorpusCount::estimated(400)), "pg-x"),
             ReusePrecondition::Ok {
                 actual: 400,
                 expected: 400,
@@ -2389,27 +2609,300 @@ mod reuse_precondition_tests {
         );
     }
 
-    // Nothing to compare against must never be silently reported as "Ok" — the
-    // runner has to say the reuse went unverified.
+    // An engine with no server-side row count wired up is the SOFT arm: the
+    // runner says the reuse went unverified and proceeds, because refusing would
+    // make --skip-upload unusable on that engine rather than protect a number.
     #[test]
-    fn unknown_expected_or_actual_is_unverifiable() {
-        assert!(matches!(
-            classify_reuse_precondition(None, Some(CorpusCount::exact(400)), "redis-x"),
-            ReusePrecondition::Unverifiable(_)
-        ));
-        let why = match classify_reuse_precondition(Some(400), None, "chroma-y") {
-            ReusePrecondition::Unverifiable(w) => w,
-            other => panic!("expected Unverifiable, got {other:?}"),
+    fn missing_server_side_count_is_the_soft_arm() {
+        let verdict = classify_reuse_precondition(Ok(400), None, "chroma-y");
+        let why = match &verdict {
+            ReusePrecondition::NoServerCount(w) => w.clone(),
+            other => panic!("expected NoServerCount, got {other:?}"),
         };
+        // The tag that reaches the result file, so this pins the artifact too.
+        assert_eq!(verdict.status(), "unverified");
         assert!(
             why.contains("chroma-y"),
             "the note must name the config it could not count: {why}"
         );
-        // The wording must blame this tool, not the database: Chroma, Milvus and
-        // Weaviate all expose a count, we simply have not wired one up.
+        // The wording must blame this side of the wire, not the database, AND
+        // must not claim "not implemented" — Qdrant's probe IS implemented and
+        // lands here when the reply carries no points_count.
         assert!(
-            why.contains("implemented"),
-            "the note must read as a gap in this tool, not a database limitation: {why}"
+            why.contains("this tool read no server-side row count"),
+            "the note must read as a gap on this side of the wire: {why}"
+        );
+        assert!(
+            why.contains("or the engine replied without one"),
+            "the note must also cover the implemented-but-answered-nothing case \
+             (Qdrant), not assert it is unimplemented: {why}"
+        );
+        // Positive control: with a count present the same call classifies.
+        assert_eq!(
+            classify_reuse_precondition(Ok(400), Some(CorpusCount::exact(400)), "chroma-y"),
+            ReusePrecondition::Ok {
+                actual: 400,
+                expected: 400,
+                approximate: false
+            }
+        );
+    }
+
+    // #290 review: with NEITHER side available there is nothing to compare in
+    // either direction, so an unavailable expected count must not escalate the
+    // soft arm into an abort — that would remove --skip-upload from exactly the
+    // five engines with no probe while protecting no number.
+    #[test]
+    fn neither_side_available_stays_the_soft_arm() {
+        let verdict = classify_reuse_precondition(
+            Err("corpus not on this machine".to_string()),
+            None,
+            "wv-z",
+        );
+        assert!(
+            matches!(verdict, ReusePrecondition::NoServerCount(_)),
+            "expected NoServerCount, got {verdict:?}"
+        );
+        assert_eq!(verdict.status(), "unverified");
+        // Positive control: the SAME unavailable expected count IS fatal once a
+        // server-side count exists to have compared it against.
+        let with_count = classify_reuse_precondition(
+            Err("corpus not on this machine".to_string()),
+            Some(CorpusCount::exact(0)),
+            "wv-z",
+        );
+        assert!(
+            matches!(with_count, ReusePrecondition::CorpusSizeUnknown(_)),
+            "expected CorpusSizeUnknown, got {with_count:?}"
+        );
+        assert_eq!(with_count.status(), "corpus_size_unknown");
+    }
+
+    // Issue #290: an unavailable EXPECTED count is its own verdict, distinct
+    // from the engine-side gap above, and it carries the reason through instead
+    // of collapsing to a bare "unknown". The handler makes it fatal; keeping the
+    // variant separate is what lets it.
+    #[test]
+    fn unknown_expected_count_is_its_own_verdict_and_keeps_the_reason() {
+        let why = match classify_reuse_precondition(
+            Err("measuring the corpus on disk failed: bad npy magic".to_string()),
+            Some(CorpusCount::exact(400)),
+            "redis-x",
+        ) {
+            ReusePrecondition::CorpusSizeUnknown(w) => w,
+            other => panic!("expected CorpusSizeUnknown, got {other:?}"),
+        };
+        assert_eq!(
+            why, "measuring the corpus on disk failed: bad npy magic",
+            "the reason must survive into the verdict, not be flattened to 'unknown'"
+        );
+        // Positive control on the same input shape: a KNOWN expected count that
+        // matches must still classify as Ok, so this cannot pass by rejecting
+        // everything.
+        assert_eq!(
+            classify_reuse_precondition(Ok(400), Some(CorpusCount::exact(400)), "redis-x"),
+            ReusePrecondition::Ok {
+                actual: 400,
+                expected: 400,
+                approximate: false
+            }
+        );
+    }
+
+    // Issue #290, the widest real path to that verdict: a MEASURABLE layout
+    // whose corpus file is not on this machine. `tests.jsonl` (queries + ground
+    // truth) is still there, so the run would otherwise proceed and search — the
+    // scenario --skip-upload exists for. Pre-fix this was `Ok(None)`.
+    #[test]
+    fn absent_corpus_file_yields_an_error_not_a_silent_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tests.jsonl"), "{}\n").unwrap();
+        let ds = dataset_at(dir.path(), "tar", Some(400));
+        let err = reuse_expected_rows(&ds)
+            .expect_err("a corpus that is not on disk has no expected row count");
+        // The directory IS here — only the corpus file is gone — and `get_path()`
+        // returns early on an existing path, so this is precisely the case that
+        // a valid `link` will NOT repair. The message must say that rather than
+        // imply a download was tried (#290 review).
+        assert!(
+            err.contains("but its corpus file is not in it") && err.contains("reuse-unit"),
+            "the failure must name the dataset and the real remedy: {err}"
+        );
+        assert!(
+            err.contains("never re-downloaded"),
+            "it must warn that an existing directory is not re-fetched: {err}"
+        );
+        // `dataset_at` builds a LINK-LESS dataset, like 8 of the 57 shipped ones
+        // (the generated fixtures, random-100, laion). "Delete the directory" is
+        // not just useless for those, it destroys tests.jsonl/payloads.jsonl
+        // that nothing can restore — so it must not be offered here.
+        assert!(
+            !err.contains("delete"),
+            "a link-less dataset must never be told to delete its directory: {err}"
+        );
+        assert!(
+            err.contains("no download link"),
+            "it must say why deleting would not help: {err}"
+        );
+        // Positive control: the SAME state WITH a link does get the delete-and-
+        // refetch remedy, so the branch above is a real distinction and not a
+        // blanket removal.
+        let mut linked_cfg = dataset_at(dir.path(), "tar", Some(400));
+        linked_cfg.config.link = Some("https://example.invalid/ds.tgz".to_string());
+        let linked_err = reuse_expected_rows(&linked_cfg).expect_err("still unmeasurable");
+        assert!(
+            linked_err.contains("delete") && linked_err.contains("fetch it fresh"),
+            "a fetchable dataset should still be told it can be re-fetched: {linked_err}"
+        );
+        // The other shape: nothing at that path at all. Different message, and
+        // it must not claim a directory is sitting there.
+        let gone = dataset_at(&dir.path().join("does-not-exist"), "tar", Some(400));
+        let gone_err = reuse_expected_rows(&gone).expect_err("no corpus, no count");
+        assert!(
+            gone_err.contains("has no corpus at") && !gone_err.contains("is present at"),
+            "an absent dataset and a gutted one must not read alike: {gone_err}"
+        );
+        // Positive control: the SAME dataset, with the corpus present, measures.
+        let vectors: Vec<Vec<f32>> = (0..7).map(|i| vec![i as f32, 0.0, 0.0]).collect();
+        write_npy_vectors(dir.path().join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "tar", Some(7))).unwrap(),
+            7
+        );
+    }
+
+    // The other #290 path: `measured_vector_count()` returning Err.
+    //
+    // Scope, stated so it is not overclaimed: this function ALREADY returned Err
+    // here before the fix — the swallow was in `check_corpus_reuse_precondition`,
+    // which turned that Err into `None`. So all this test pins is that the two
+    // failure conditions now read differently to the operator. The end-to-end
+    // coverage for the swallow itself is phase (d) of
+    // `test_binary_redis_skip_upload_unverifiable_corpus_is_fatal`.
+    #[test]
+    fn a_failed_measurement_reads_as_a_failure_not_as_a_missing_count() {
+        let dir = tempfile::tempdir().unwrap();
+        // A vectors.npy that exists but is not a valid npy file: the header read
+        // fails, which is the transient-read-failure shape of this bug.
+        std::fs::write(dir.path().join("vectors.npy"), b"not an npy file at all").unwrap();
+        let ds = dataset_at(dir.path(), "tar", Some(400));
+        let err = reuse_expected_rows(&ds).expect_err("a failed header read must not become None");
+        assert!(
+            err.contains("measuring the corpus on disk failed"),
+            "a read failure and 'this layout has no cheap count' must not read alike: {err}"
+        );
+        // Positive control: repair the same file and the same call measures it,
+        // so this cannot pass by erroring on everything.
+        let vectors: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32, 0.0, 0.0]).collect();
+        write_npy_vectors(dir.path().join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "tar", Some(5))).unwrap(),
+            5
+        );
+    }
+
+    // #290 review: when the corpus cannot be measured here, datasets.json's
+    // vector_count IS the expected count — and it must be usable WITHOUT every
+    // corpus file being present locally. `corpus_completeness_target()`'s
+    // file-presence gate exists to stop an UPLOAD being skipped (#188/#224);
+    // --skip-upload never uploads, and laion-1B is `h5-multi` with 100 parts
+    // (~3 TB) whose queries are a separate file, so demanding them all would make
+    // the check unpassable on the workflow it exists to serve.
+    #[test]
+    fn unmeasurable_layout_uses_the_declared_count_without_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A `sparse` dataset directory with the queries but NOT data.csr — the
+        // shape of a client that searches a server-side corpus it never held.
+        std::fs::write(dir.path().join("queries.csr"), b"\x00").unwrap();
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "sparse", Some(100_000))).unwrap(),
+            100_000,
+            "the declared count is the only available answer while data.csr is absent"
+        );
+
+        // Without a declared count there IS no answer — and the error must name
+        // vector_count, not send the operator hunting for files.
+        let err = reuse_expected_rows(&dataset_at(dir.path(), "sparse", None))
+            .expect_err("no measurement and no declaration is not a number");
+        assert!(
+            err.contains("vector_count") && err.contains("datasets/datasets.json"),
+            "the error must name the field to add, not the files: {err}"
+        );
+        assert!(
+            !err.contains("no corpus at"),
+            "an unmeasurable layout must not be reported as a missing corpus: {err}"
+        );
+    }
+
+    // #290 review, SHOULD-FIX 1: `sparse` is no longer TRUSTED. Once `data.csr`
+    // is on disk its 24-byte header is the authority, so a wrong `vector_count`
+    // can no longer classify a correct corpus as `Short` (false abort) or a
+    // short one as `Surplus` (warn, and publish the wrong number) — the failure
+    // this whole issue is about, reached through the datasets.json door.
+    #[test]
+    fn a_present_csr_corpus_is_measured_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<SparseVector> = (0..150)
+            .map(|i| SparseVector {
+                indices: vec![i % 7],
+                values: vec![1.0],
+            })
+            .collect();
+        write_sparse_matrix(dir.path().join("data.csr").to_str().unwrap(), &rows).unwrap();
+
+        // A declaration wildly higher than the corpus must NOT win.
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "sparse", Some(999_999))).unwrap(),
+            150,
+            "the measured corpus is the authority once data.csr is present"
+        );
+        // ... and neither must one lower than it, which is the direction that
+        // would have published a wrong number as `Surplus`.
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "sparse", Some(10))).unwrap(),
+            150
+        );
+        // Positive control: an agreeing declaration measures the same.
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "sparse", Some(150))).unwrap(),
+            150
+        );
+        // And with no declaration at all it is still measurable, so the
+        // "declare vector_count" error must NOT fire here.
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "sparse", None)).unwrap(),
+            150
+        );
+    }
+
+    // `queries.csr` is a matrix too. Counting it as the corpus would report 10
+    // rows for a 150-row dataset and reject every reuse of it.
+    #[test]
+    fn the_query_matrix_is_never_mistaken_for_the_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let queries: Vec<SparseVector> = (0..10)
+            .map(|_| SparseVector {
+                indices: vec![1],
+                values: vec![1.0],
+            })
+            .collect();
+        write_sparse_matrix(dir.path().join("queries.csr").to_str().unwrap(), &queries).unwrap();
+        // Only queries.csr exists: unmeasurable, so the declaration stands.
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "sparse", Some(150))).unwrap(),
+            150
+        );
+        // Now add the real corpus; the answer must be the corpus, not the queries.
+        let rows: Vec<SparseVector> = (0..150)
+            .map(|_| SparseVector {
+                indices: vec![2],
+                values: vec![1.0],
+            })
+            .collect();
+        write_sparse_matrix(dir.path().join("data.csr").to_str().unwrap(), &rows).unwrap();
+        assert_eq!(
+            reuse_expected_rows(&dataset_at(dir.path(), "sparse", Some(150))).unwrap(),
+            150
         );
     }
 
@@ -2417,12 +2910,181 @@ mod reuse_precondition_tests {
     #[test]
     fn zero_expected_never_fires() {
         assert_eq!(
-            classify_reuse_precondition(Some(0), Some(CorpusCount::exact(0)), "redis-x"),
+            classify_reuse_precondition(Ok(0), Some(CorpusCount::exact(0)), "redis-x"),
             ReusePrecondition::Ok {
                 actual: 0,
                 expected: 0,
                 approximate: false
             }
+        );
+    }
+}
+
+/// Behavioural coverage for the `--skip-upload` reuse HANDLER, as opposed to the
+/// classifier (issue #290 review).
+///
+/// A reviewer's mutation campaign found the classifier well pinned but the
+/// handler bare: making the `NoServerCount` arm FATAL was killed by nothing —
+/// 12 unit and 8 integration tests all stayed green. That arm is the one place
+/// this PR deliberately lets #290's symptom through (five engines have no
+/// row-count probe), so the decision is worth locking down rather than leaving
+/// to the next person's judgement. Likewise, dropping
+/// `record_rejected_experiment` from the fatal arm would silently erase a
+/// rejected config from `summary.rejected_experiments` under
+/// `--exit-on-error false`.
+///
+/// These drive `check_corpus_reuse_precondition` directly through a stub engine,
+/// which is what lets a unit test force `corpus_row_count -> Ok(None)` — no
+/// live server can be asked to have an unimplemented probe.
+#[cfg(test)]
+mod reuse_handler_tests {
+    use super::*;
+    use crate::config::DatasetConfig;
+    use crate::dataset::Dataset;
+    use crate::engine::{CorpusCount, SearchResults, UploadStats};
+    use vector_db_benchmark::readers::write_npy_vectors;
+
+    /// Minimal `Engine` whose only interesting behaviour is the row-count probe.
+    /// Every other method is unreachable on this path and says so.
+    struct StubEngine {
+        name: String,
+        count: Result<Option<CorpusCount>, String>,
+        params: Vec<SearchParams>,
+    }
+
+    impl Engine for StubEngine {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn configure(&mut self, _d: &Dataset) -> Result<(), String> {
+            unreachable!("the reuse check never configures")
+        }
+        fn upload(&mut self, _d: &Dataset) -> Result<UploadStats, String> {
+            unreachable!("the reuse check never uploads")
+        }
+        fn search(
+            &mut self,
+            _d: &Dataset,
+            _p: &SearchParams,
+            _n: i64,
+        ) -> Result<SearchResults, String> {
+            unreachable!("the reuse check never searches")
+        }
+        fn delete(&mut self) -> Result<(), String> {
+            unreachable!("the reuse check never deletes")
+        }
+        fn search_params(&self) -> &[SearchParams] {
+            &self.params
+        }
+        fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
+            self.count.clone()
+        }
+    }
+
+    fn stub(name: &str, count: Result<Option<CorpusCount>, String>) -> StubEngine {
+        StubEngine {
+            name: name.to_string(),
+            count,
+            params: Vec::new(),
+        }
+    }
+
+    /// A dataset whose corpus really is on disk and really holds `rows` vectors,
+    /// so the dataset side of the comparison is genuinely available.
+    fn measurable_dataset(dir: &std::path::Path, rows: usize) -> Dataset {
+        let vectors: Vec<Vec<f32>> = (0..rows).map(|i| vec![i as f32, 0.0, 0.0]).collect();
+        write_npy_vectors(dir.join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+        Dataset::new(DatasetConfig {
+            name: "handler-unit".to_string(),
+            dataset_type: Some("tar".to_string()),
+            path: serde_json::Value::String(dir.to_str().unwrap().to_string()),
+            distance: Some("l2".to_string()),
+            vector_size: Some(3),
+            vector_count: Some(rows as i64),
+            link: None,
+            schema: None,
+            description: None,
+        })
+    }
+
+    fn args() -> Args {
+        use clap::Parser;
+        Args::parse_from(["vector-db-benchmark", "--skip-upload"])
+    }
+
+    /// The deliberate soft arm. An engine with no row-count probe must WARN and
+    /// continue, recording `unverified` — not abort. Making this fatal would
+    /// remove `--skip-upload` from Chroma, Milvus, Weaviate, Turbopuffer and
+    /// Vertex, which protects no number because neither side of the comparison
+    /// is available.
+    #[test]
+    fn no_server_side_count_warns_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = measurable_dataset(dir.path(), 400);
+        let mut engine = stub("chroma-handler", Ok(None));
+
+        let record = check_corpus_reuse_precondition(&mut engine, &ds, &args())
+            .expect("an engine with no probe must not abort the run")
+            .expect("the verdict must still be recorded in the artifact");
+
+        assert_eq!(record["status"], "unverified");
+        assert_eq!(record["actual_rows"], serde_json::Value::Null);
+        assert_eq!(record["waived_by_allow_partial_corpus"], false);
+        // The dataset side WAS available; that must not have turned into an
+        // abort just because the server side was missing.
+        assert_eq!(record["expected_rows"], 400);
+    }
+
+    /// Positive control for the test above: the same handler, same stub, one
+    /// field different — a real count that comes up short — must abort. Without
+    /// this, `no_server_side_count_warns_and_continues` would still pass if the
+    /// handler never aborted at all.
+    #[test]
+    fn a_short_exact_count_still_aborts_and_is_recorded_as_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = measurable_dataset(dir.path(), 400);
+        let mut engine = stub("redis-handler", Ok(Some(CorpusCount::exact(1))));
+
+        let err = check_corpus_reuse_precondition(&mut engine, &ds, &args())
+            .expect_err("a short exact count must abort");
+        assert!(
+            err.contains("the corpus you asked to reuse is incomplete"),
+            "{err}"
+        );
+
+        // A rejected config must reach the summary, or a sweep run with
+        // --exit-on-error false loses all record of what it skipped.
+        let rejected = crate::summary::rejected_experiments();
+        assert!(
+            rejected
+                .iter()
+                .any(|r| { r["engine"] == "redis-handler" && r["dataset"] == "handler-unit" }),
+            "the rejected experiment must be recorded for the summary: {rejected:?}"
+        );
+    }
+
+    /// `--skip-vector-index` on a schema-less dataset returns before
+    /// `read_queries()`, so the run measures nothing — the check must return
+    /// early rather than probe and fetch for a run that publishes nothing.
+    /// The stub's probe would `unreachable!()`... it cannot, so instead it is an
+    /// `Err` that would abort loudly if the early return were removed.
+    #[test]
+    fn a_run_that_will_not_search_is_not_checked_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = measurable_dataset(dir.path(), 400);
+        let mut engine = stub("never-probed", Err("probe must not run".to_string()));
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "vector-db-benchmark",
+            "--skip-upload",
+            "--skip-vector-index",
+        ]);
+        let out = check_corpus_reuse_precondition(&mut engine, &ds, &args)
+            .expect("a run that searches nothing must not be rejected");
+        assert!(
+            out.is_none(),
+            "no verdict should be recorded for a run that measures nothing: {out:?}"
         );
     }
 }

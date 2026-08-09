@@ -72,6 +72,45 @@ fn read_u32_array<T>(
         .collect())
 }
 
+/// Number of rows a CSR file declares, read from its 24-byte header WITHOUT
+/// parsing the matrix.
+///
+/// The sibling of [`crate::readers::npy_row_count`], and for the same reason: it
+/// makes the corpus — not `datasets.json` — the authority on how many vectors
+/// exist (#224). Until this existed, `sparse` was the one shipped layout with no
+/// cheap row count, so the `--skip-upload` reuse check had to TRUST the declared
+/// `vector_count`; a wrong declaration then classified a correct corpus as
+/// `Short` (false abort) or a genuinely short one as `Surplus` (warn, and publish
+/// the wrong number) — the exact failure class #290 exists to close, reached
+/// through the datasets.json door.
+///
+/// Cost is a 24-byte read, so this is safe to call on a multi-GB `data.csr`.
+/// Validation is deliberately minimal and matches what the header alone can
+/// support: the first `i64` must be non-negative, and the file must be at least
+/// as long as the three-`i64` header. Everything structural (index_pointer
+/// monotonicity, nnz agreement) is [`read_sparse_matrix`]'s job — a count read
+/// must not have to parse the matrix to answer.
+pub fn csr_row_count(path: &str) -> Result<u64, String> {
+    let file = File::open(Path::new(path)).map_err(|e| format!("open {}: {}", path, e))?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_len < 24 {
+        return Err(format!(
+            "{}: not a readable CSR file ({} bytes, header needs 24)",
+            path, file_len
+        ));
+    }
+    let mut r = BufReader::new(file);
+    let sizes = read_i64_le(&mut r, 3, file_len)?;
+    let n_row = sizes[0];
+    if n_row < 0 {
+        return Err(format!(
+            "{}: invalid CSR header (n_row {} is negative)",
+            path, n_row
+        ));
+    }
+    Ok(n_row as u64)
+}
+
 /// Parse a CSR file into a list of sparse vectors.
 pub fn read_sparse_matrix(path: &str) -> Result<Vec<SparseVector>, String> {
     let file = File::open(Path::new(path)).map_err(|e| format!("open {}: {}", path, e))?;
@@ -348,6 +387,86 @@ mod tests {
         f.write_all(bytes).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    /// The count must come out of LITERAL little-endian bytes, not out of
+    /// whatever `write_sparse_matrix` happens to emit (#290 review).
+    ///
+    /// Without this, `csr_row_count`, `read_sparse_matrix` and the fixture
+    /// writer all agree by construction: a COHERENT endianness flip
+    /// (`from_le_bytes` + `to_le_bytes` → `_be_`) left the whole suite green,
+    /// because every party to the comparison flipped together. The CSR format is
+    /// little-endian by definition — it is what qdrant/vector-db-benchmark's
+    /// `sparse_reader.py` writes — so a byte fixture is the only thing that pins
+    /// it. `results.gt` already has this treatment in
+    /// `gt_decodes_a_literal_little_endian_fixture`; with both, that flip now
+    /// fails two tests instead of none.
+    ///
+    /// `n_row = 150` is the real `synthetic-sparse-300` count, and decodes
+    /// big-endian to 0x9600000000000000 — wildly wrong rather than subtly so.
+    #[test]
+    fn csr_row_count_decodes_a_literal_little_endian_fixture() {
+        #[rustfmt::skip]
+        let bytes: &[u8] = &[
+            // n_row = 150
+            0x96, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // n_col = 300 — two non-zero bytes, so a swap shows here too if the
+            // header fields are ever read in a different order
+            0x2c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // n_non_zero = 1500
+            0xdc, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let f = write_tmp(bytes);
+        assert_eq!(
+            csr_row_count(f.path().to_str().unwrap()).unwrap(),
+            150,
+            "n_row must decode little-endian"
+        );
+    }
+
+    /// `csr_row_count` must agree with what `read_sparse_matrix` yields on a
+    /// WELL-FORMED file — it is a cheap substitute for parsing, not a second
+    /// opinion (#290 review).
+    ///
+    /// Scope, so the name does not overstate: they agree on well-formed input
+    /// only. A valid header over a truncated body gives `Ok(n)` here and `Err`
+    /// there, by design — a count read must not have to parse the matrix to
+    /// answer. The header is itself a declaration, just one stored inside the
+    /// corpus rather than in `datasets.json`; what the change buys is that the
+    /// declaration now travels WITH the file it describes.
+    #[test]
+    fn csr_row_count_agrees_with_a_full_parse_on_well_formed_input() {
+        for n in [0usize, 1, 150] {
+            let rows: Vec<SparseVector> = (0..n)
+                .map(|i| SparseVector {
+                    indices: vec![i as u32 % 5],
+                    values: vec![0.5],
+                })
+                .collect();
+            let f = tempfile::NamedTempFile::new().unwrap();
+            let path = f.path().to_str().unwrap().to_string();
+            write_sparse_matrix(&path, &rows).unwrap();
+            assert_eq!(csr_row_count(&path).unwrap(), n as u64, "n = {n}");
+            assert_eq!(read_sparse_matrix(&path).unwrap().len(), n, "n = {n}");
+        }
+    }
+
+    /// A count read must not be fooled by a file too short to hold a header, and
+    /// must not report a negative n_row as an enormous unsigned one. Both would
+    /// feed a bogus "expected rows" straight into the --skip-upload verdict.
+    #[test]
+    fn csr_row_count_rejects_a_truncated_or_negative_header() {
+        let short = write_tmp(&[0u8; 23]);
+        let err = csr_row_count(short.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not a readable CSR file"), "{err}");
+
+        let mut b = Vec::new();
+        b.extend_from_slice(&(-5i64).to_le_bytes()); // n_row
+        b.extend_from_slice(&1i64.to_le_bytes());
+        b.extend_from_slice(&0i64.to_le_bytes());
+        let neg = write_tmp(&b);
+        let err = csr_row_count(neg.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("negative"), "{err}");
     }
 
     /// Header n_row so large that `(n_row + 1) * 8` overflows usize.

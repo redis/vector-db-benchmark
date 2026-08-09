@@ -54,6 +54,19 @@ pub struct SparseData {
     pub neighbours: Vec<Vec<i64>>,
 }
 
+/// Corpus size of the shipped `synthetic-sparse-300` dataset.
+///
+/// Single source of truth, shared by `generate-dataset` (which writes the
+/// corpus) and the `datasets.json` guard in `config.rs` (which checks the
+/// declared `vector_count` against it). CI has no corpus on disk, so without
+/// this constant nothing could police that number from `datasets.json` alone —
+/// and the dataset's NAME says 300, which is its DIMENSION, so the wrong value
+/// is the easy mistake to make. It was in fact proposed during review.
+pub const SYNTHETIC_SPARSE_ROWS: usize = 150;
+
+/// Sparse dimensionality of `synthetic-sparse-300` — the `300` in its name.
+pub const SYNTHETIC_SPARSE_DIM: usize = 300;
+
 /// Generate a deterministic random sparse dataset and its dot-product
 /// (descending) ground truth. Sparse similarity is MIPS — larger dot = more
 /// similar — so the neighbours are sorted DESCENDING by dot product.

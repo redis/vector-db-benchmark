@@ -2969,8 +2969,16 @@ mod tests {
         );
     }
 
-    /// The narrow, deliberate exception: layouts with no cheap row count may use
-    /// the declared count — but only once their corpus files are actually there.
+    /// The narrow, deliberate exception: a layout that cannot be measured here
+    /// may use the declared count — but only once its corpus files are there.
+    ///
+    /// Updated for #290: `sparse` is measurable now (`csr_row_count` reads
+    /// `n_row` from `data.csr`'s header), so the fallback no longer applies to
+    /// it once that file exists. This tightens the shared-corpus gate rather
+    /// than loosening it — the MEASURED corpus wins over a declared count, which
+    /// is exactly #224's rule finally reaching this layout — and a `data.csr`
+    /// that cannot be read is now an error instead of a silent fallback to a
+    /// number nothing checked.
     #[test]
     fn unmeasurable_layouts_fall_back_only_when_their_files_exist() {
         let dir = tempfile::tempdir().unwrap();
@@ -2991,12 +2999,48 @@ mod tests {
             "empty directory is not a corpus"
         );
 
+        // A data.csr that exists but cannot be read is NOT a licence to trust
+        // the declared count — that would let a corrupt corpus authorise the
+        // shared-corpus skip (#224's failure, reached from the corpus side).
         std::fs::write(dir.path().join("data.csr"), b"").unwrap();
+        let err = sparse
+            .corpus_completeness_target()
+            .expect_err("an unreadable data.csr must not silently fall back");
+        assert!(err.contains("not a readable CSR file"), "{err}");
+
+        // A readable one is MEASURED, and the measurement beats the declaration.
+        let rows: Vec<vector_db_benchmark::readers::SparseVector> = (0..3)
+            .map(|_| vector_db_benchmark::readers::SparseVector {
+                indices: vec![0],
+                values: vec![1.0],
+            })
+            .collect();
+        vector_db_benchmark::readers::write_sparse_matrix(
+            dir.path().join("data.csr").to_str().unwrap(),
+            &rows,
+        )
+        .unwrap();
         assert_eq!(
             sparse.corpus_completeness_target().unwrap(),
-            Some(500),
-            "CSR has no cheap row count, so the declared count is all we have"
+            Some(3),
+            "the corpus on disk is the authority, not the declared 500"
         );
+
+        // h5-multi still has no cheap count, so the fallback survives for it.
+        let multi = Dataset::new(DatasetConfig {
+            name: "multi-unit".to_string(),
+            dataset_type: Some("h5-multi".to_string()),
+            path: serde_json::json!({
+                "data": [{ "path": dir.path().join("data.csr").to_str().unwrap() }]
+            }),
+            distance: Some("cosine".to_string()),
+            vector_size: Some(3),
+            vector_count: Some(500),
+            link: None,
+            schema: None,
+            description: None,
+        });
+        assert_eq!(multi.corpus_completeness_target().unwrap(), Some(500));
     }
 
     #[test]
