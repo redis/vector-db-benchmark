@@ -3,6 +3,14 @@
 //! Requires valkey/valkey-bundle running on port 6380.
 //! Start with: docker compose -f tests/docker-compose.test.yml up -d valkey
 //! Run with:   VALKEY_PORT=6380 cargo test --test integration_valkey -- --test-threads=1
+//!
+//! DESTRUCTIVE. Every test calls `flush_db()`, which drops every index
+//! `FT._LIST` reports and then issues `FLUSHALL`. `VALKEY_PORT` is the ONLY
+//! supported way to point the suite at your own container — do NOT edit the port
+//! in this file (`tests/harness_invariants.rs` rejects a second port literal).
+//! `test_port()` also claims the instance on first use and refuses to run if the
+//! server holds state it has no recorded claim for. Any probe it cannot complete
+//! (unreachable, still loading, a denied or unsupported command) also refuses.
 
 use std::fs;
 use std::path::PathBuf;
@@ -19,11 +27,21 @@ mod common;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Valkey port under test. `VALKEY_PORT` is the ONLY supported way to move this
+/// suite off the shared default — these tests call `flush_db()`, which
+/// `FLUSHALL`s the whole server. The first call also claims the instance (see
+/// `common::claim_resp_instance`), so a server holding state this harness
+/// has no recorded claim for is refused instead of destroyed.
 fn test_port() -> u16 {
-    std::env::var("VALKEY_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6380)
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        let port = std::env::var("VALKEY_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6380);
+        common::claim_resp_instance("integration_valkey", "VALKEY_PORT", TEST_HOST, port, 6379);
+        port
+    })
 }
 
 const TEST_HOST: &str = "127.0.0.1";

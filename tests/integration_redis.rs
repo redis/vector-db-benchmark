@@ -3,6 +3,21 @@
 //! Requires redis:8.6.0 running on port 6399.
 //! Start with: docker compose -f tests/docker-compose.test.yml up -d
 //! Run with:   cargo test --test integration_redis -- --test-threads=1
+//!
+//! DESTRUCTIVE. Every test calls `flush_db()`, which drops every index
+//! `FT._LIST` reports and then issues `FLUSHALL` — it destroys the whole server,
+//! not just this suite's keys. The default port 6399 is the container several
+//! sessions share, so to run against your own instance set the env var:
+//!
+//!     REDIS_TEST_PORT=<your-port> cargo test --test integration_redis -- --test-threads=1
+//!
+//! `REDIS_TEST_PORT` is the ONLY supported mechanism. Do NOT edit the port in
+//! this file: `tests/harness_invariants.rs` rejects a second port literal, and
+//! an edit is invisible to anyone reading the command you ran. As a backstop,
+//! `test_port()` claims the instance on first use and refuses to run at all if
+//! the server already holds state it has no recorded claim for. Any probe it
+//! cannot complete (unreachable, still loading, a denied or unsupported command)
+//! also refuses, because guessing "empty" is unrecoverable.
 
 use std::fs;
 use std::path::PathBuf;
@@ -21,23 +36,43 @@ mod common;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Redis port under test. Overridable so a session can run against its OWN
-/// container instead of the shared 6399 one — these tests call `flush_db()`, so
-/// two sessions sharing an instance clobber each other.
+/// Redis port under test. `REDIS_TEST_PORT` is the ONLY supported way to move
+/// this suite off the shared default — these tests call `flush_db()`, which
+/// `FLUSHALL`s the whole server, so two sessions sharing an instance clobber
+/// each other.
+///
+/// The first call also claims the instance (`common::claim_resp_instance`): if
+/// the server already holds keys or indexes it has no recorded claim for, every
+/// test fails with an explanatory panic instead of destroying that data. The
+/// claim lives here rather than in `flush_db()` because `test_port()` is the one
+/// place EVERY path to the server goes through — the direct `redis::Client`
+/// helpers and the `REDIS_PORT` value handed to spawned benchmark binaries.
 fn test_port() -> u16 {
-    std::env::var("REDIS_TEST_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6399)
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| {
+        let port = std::env::var("REDIS_TEST_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6399);
+        common::claim_resp_instance(
+            "integration_redis",
+            "REDIS_TEST_PORT",
+            TEST_HOST,
+            port,
+            6379,
+        );
+        port
+    })
 }
 const TEST_HOST: &str = "127.0.0.1";
 
 fn get_test_connection() -> Connection {
-    let url = format!("redis://{}:{}/", TEST_HOST, test_port());
+    let port = test_port();
+    let url = format!("redis://{}:{}/", TEST_HOST, port);
     let client = redis::Client::open(url.as_str()).expect("Failed to create Redis client");
-    client
-        .get_connection()
-        .expect("Failed to connect to Redis. Is redis:8.6.0 running on port 6399?")
+    client.get_connection().unwrap_or_else(|e| {
+        panic!("Failed to connect to Redis on port {port} (set REDIS_TEST_PORT to move the suite): {e}")
+    })
 }
 
 fn wait_for_redis() {
