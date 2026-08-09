@@ -154,35 +154,66 @@ pub struct SearchResults {
     /// `failed_queries` are excluded from the search side.
     pub update_failures: Option<usize>,
     /// How firmly this engine can tie `update_count` to the searched corpus:
-    /// `"corpus_row"` or `"ack_only"`. See [`UpdateAttribution`].
+    /// `"corpus_row"`, `"matched_row"` or `"ack_only"`. See
+    /// [`UpdateAttribution`].
     pub update_attribution: Option<String>,
     /// Writes the server accepted but did NOT attribute to a row that already
-    /// existed in the searched corpus. Always 0 under `ack_only` (no signal to
-    /// derive it from). Nonzero is fatal unless `--allow-partial-corpus` — see
-    /// `experiment::gate_update_attribution`.
+    /// existed in the searched corpus. `None` under `ack_only`, where the reply
+    /// carries nothing to derive it from — a published `0` must mean "verified
+    /// none", never "not measured". Nonzero is fatal unless
+    /// `--allow-partial-corpus` — see `experiment::gate_update_attribution`.
     pub update_unattributed: Option<usize>,
-    /// The server signal that produced a nonzero `update_unattributed`, for the
-    /// error/warning text. `None` when the count is 0.
-    pub update_unattributed_detail: Option<String>,
+    /// Plain-language description of the exact server signal this engine read,
+    /// published on EVERY mixed run as `update_attribution_detail` and quoted in
+    /// the gate's message. The tier label alone is three words; two engines can
+    /// share one and still be reading materially different things, so the
+    /// artifact carries the mechanism rather than only the grade.
+    pub update_attribution_detail: Option<String>,
 }
 
 /// How firmly an engine can tie a counted mixed-workload update to the corpus
 /// that the same run is searching (issue #293).
 ///
-/// This distinction is published per run because it is NOT uniform across the
-/// engines that implement `search_mixed`, and a reader comparing `update_rps`
-/// across engines is otherwise comparing two different measurements.
+/// Published per run because it is NOT uniform across the engines that
+/// implement `search_mixed`: a reader comparing `update_rps` across engines is
+/// otherwise comparing measurements with different meanings. The grade is
+/// deliberately coarse — `update_attribution_detail` carries the actual signal,
+/// because even two engines sharing a tier do not read the same thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAttribution {
-    /// The server's reply to the write states whether it replaced state that
-    /// already existed. A write reported as having created new state instead is
-    /// counted in `update_unattributed`, which
+    /// The server's reply is about the WRITE, and the object written is the
+    /// object the query path reads. A write reported as having created new state
+    /// instead is counted in `update_unattributed`, which
     /// `experiment::gate_update_attribution` rejects the run over unless
     /// `--allow-partial-corpus` waives it.
+    ///
+    /// VectorSets is the strict case: `VADD` targets `config.key`, which *is*
+    /// the object `VSIM` reads. Redis and Valkey are one inference away — `HSET`
+    /// reports on the KEY, and index membership follows from `FT.CREATE
+    /// ... PREFIX` and `hset_single` sharing `config.key_prefix`. Sound on every
+    /// supported path, but it is a construction, not something the reply states:
+    /// a document rejected by the index (e.g. a wrong-dimension vector, which
+    /// FT reports as `hash_indexing_failures`) still answers 0 here.
     CorpusRow,
-    /// The server acknowledged the write but says nothing about which row it
-    /// landed on. `update_count` here means "writes the server accepted", and
-    /// the corpus-row guard cannot run.
+    /// The server confirms a row matched the update's FILTER. Strictly weaker
+    /// than [`Self::CorpusRow`] in two ways, both MongoDB's:
+    ///
+    /// 1. `matched_count` describes the filter, not the payload. An update that
+    ///    `$set`s a field the search never reads still reports 1, so the #293
+    ///    mutation class — a write half aimed at something the search half does
+    ///    not read — is structurally invisible here, where the `CorpusRow`
+    ///    engines catch it on the first write.
+    /// 2. The collection is not the searched index. Atlas Vector Search is
+    ///    eventually consistent (hence `wait_for_index_catchup`), so an
+    ///    acknowledged update is roughly a second away from being searchable.
+    ///
+    /// The guard still fires when nothing matched at all, which is what keeps a
+    /// wholly misdirected update half from being counted.
+    MatchedRow,
+    /// The server acknowledged the write and says nothing about any row.
+    /// `update_count` means "writes the server accepted"; the guard cannot run,
+    /// and `update_unattributed` is omitted rather than published as a `0` that
+    /// would read like a verified one.
     AckOnly,
 }
 
@@ -190,8 +221,14 @@ impl UpdateAttribution {
     pub fn as_str(self) -> &'static str {
         match self {
             UpdateAttribution::CorpusRow => "corpus_row",
+            UpdateAttribution::MatchedRow => "matched_row",
             UpdateAttribution::AckOnly => "ack_only",
         }
+    }
+
+    /// Whether this tier can produce an `update_unattributed` count at all.
+    pub fn measures_unattributed(self) -> bool {
+        !matches!(self, UpdateAttribution::AckOnly)
     }
 }
 
@@ -228,8 +265,11 @@ impl UpdateTally {
 /// Fold a mixed run's per-write outcomes into `results`, enforcing the
 /// corpus-row guard (#293).
 ///
-/// `unattributed_detail` must name the *actual* server signal the engine read,
-/// because it is quoted verbatim in the abort message.
+/// `signal_detail` must describe the *actual* server signal the engine reads. It
+/// is published as `update_attribution_detail` on EVERY mixed run and is also
+/// quoted in the gate's message, so it has to read correctly in both places: as
+/// a standing description of the mechanism, not only as an explanation of a
+/// violation.
 ///
 /// This function only MEASURES. It records `update_unattributed` and returns
 /// `Ok`; whether that count is fatal is decided by the runner
@@ -246,14 +286,15 @@ pub fn finalize_update_stats(
     total_time: f64,
     attribution: UpdateAttribution,
     ratio: &UpdateSearchRatio,
-    unattributed_detail: &str,
+    signal_detail: &str,
 ) {
-    results.update_unattributed = Some(tally.unattributed);
-    results.update_unattributed_detail = if tally.unattributed > 0 {
-        Some(unattributed_detail.to_string())
-    } else {
-        None
-    };
+    // Published on every mixed run: the tier is a grade, this is the mechanism.
+    results.update_attribution_detail = Some(signal_detail.to_string());
+    // `None` — not `Some(0)` — under ack_only. A published 0 must always mean
+    // "the server confirmed none", never "there was nothing to confirm with".
+    results.update_unattributed = attribution
+        .measures_unattributed()
+        .then_some(tally.unattributed);
     if tally.failed > 0 {
         eprintln!(
             "\t⚠ mixed workload: {} of {} updates failed and are excluded from update_count, \
@@ -826,7 +867,7 @@ mod update_accounting_tests {
         );
         assert_eq!(r.update_unattributed, Some(7));
         assert_eq!(
-            r.update_unattributed_detail.as_deref(),
+            r.update_attribution_detail.as_deref(),
             Some("VADD replied 1")
         );
         // The writes that missed the corpus must NOT be counted as updates.
@@ -865,7 +906,12 @@ mod update_accounting_tests {
             UpdateAttribution::CorpusRow,
         );
         assert_eq!(r.update_unattributed, Some(0));
-        assert!(r.update_unattributed_detail.is_none());
+        // Published even on a clean run: the tier is a grade, this is the
+        // mechanism, and a reader comparing two engines needs the mechanism.
+        assert_eq!(
+            r.update_attribution_detail.as_deref(),
+            Some("VADD replied 1")
+        );
         assert_eq!(r.update_count, Some(4));
         assert_eq!(r.update_failures, Some(0));
         assert_eq!(r.update_attribution.as_deref(), Some("corpus_row"));
@@ -928,7 +974,11 @@ mod update_accounting_tests {
         assert_eq!(r.update_attribution.as_deref(), Some("ack_only"));
         assert_eq!(r.update_count, Some(1));
         assert_eq!(r.update_failures, Some(1));
-        assert_eq!(r.update_unattributed, Some(0));
+        // NOT Some(0): under ack_only there is no signal to count with, and a
+        // published 0 would be indistinguishable from a corpus_row engine's
+        // verified zero.
+        assert_eq!(r.update_unattributed, None);
+        assert!(r.update_attribution_detail.is_some());
     }
 
     #[test]

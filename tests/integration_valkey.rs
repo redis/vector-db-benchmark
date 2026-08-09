@@ -1326,6 +1326,13 @@ fn test_binary_valkey_mixed_benchmark() {
         "Valkey must publish that every counted update was confirmed by the server \
          to have overwritten an already-populated corpus document"
     );
+    assert!(
+        r["update_attribution_detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("HSET") && d.contains("index")),
+        "the artifact must carry the signal, and say it is about the key: {:?}",
+        r["update_attribution_detail"]
+    );
     assert_eq!(r["update_failures"].as_u64(), Some(0));
     assert_eq!(
         r["update_unattributed"].as_u64(),
@@ -2051,7 +2058,10 @@ fn test_binary_valkey_mixed_updates_that_miss_the_corpus_are_fatal() {
     );
     assert!(
         combined.contains("reported that the row each one addressed did not already exist")
-            && combined.contains("HSET reported EVERY field it wrote as newly added"),
+            && combined.contains(
+                "Signal read: HSET replies with the number of fields that did not previously \
+                 exist"
+            ),
         "the error must be the #293 gate quoting Valkey's own HSET signal.\n{combined}"
     );
     assert!(

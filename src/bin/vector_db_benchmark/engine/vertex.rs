@@ -2429,9 +2429,10 @@ impl Engine for VertexEngine {
             total_time,
             VERTEX_UPDATE_ATTRIBUTION,
             ratio,
-            // Unreachable under AckOnly: nothing ever sets `unattributed`, because
-            // the upsert reply carries no row-level information to set it from.
-            "unused — Vertex cannot attribute a write to a datapoint",
+            // Published as `update_attribution_detail`; never quoted by the gate,
+            // which cannot fire under AckOnly because nothing sets `unattributed`.
+            "upsertDatapoints returns an empty body, so a 2xx is an acceptance and carries \
+             no information about which datapoint was replaced",
         );
         Ok(results)
     }
@@ -2605,11 +2606,19 @@ mod attribution_tests {
                 updates: 1,
                 searches: 5,
             },
-            "unused",
+            "upsertDatapoints returns an empty body",
         );
         assert_eq!(r.update_attribution.as_deref(), Some("ack_only"));
-        // AckOnly can never flag: there is no row-level signal to flag from.
-        assert_eq!(r.update_unattributed, Some(0));
+        // OMITTED, not Some(0): there is no row-level signal to count with, and
+        // a published 0 would read in the artifact exactly like a corpus_row
+        // engine's verified zero.
+        assert_eq!(r.update_unattributed, None);
+        // The mechanism is published even here, so a reader can see WHY the
+        // count is missing rather than guessing.
+        assert_eq!(
+            r.update_attribution_detail.as_deref(),
+            Some("upsertDatapoints returns an empty body")
+        );
     }
 }
 

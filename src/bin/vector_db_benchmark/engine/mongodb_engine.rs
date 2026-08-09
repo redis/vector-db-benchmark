@@ -2137,11 +2137,13 @@ impl Engine for MongoDBEngine {
                             );
                             let update_time = update_start.elapsed().as_secs_f64();
                             match outcome {
-                                // matched_count >= 1: an existing document in the
-                                // searched collection was updated.
+                                // matched_count >= 1: a document in the collection
+                                // carried that _id and the $set was applied to it.
+                                // Note this is the FILTER matching, not a statement
+                                // about what was written — see MatchedRow.
                                 Ok(false) => ut.times.push(update_time),
-                                // matched_count == 0: nothing in this collection
-                                // carried that _id, so the write changed nothing.
+                                // matched_count == 0: nothing carried that _id, so
+                                // the write (no upsert) changed nothing at all.
                                 Ok(true) => ut.unattributed += 1,
                                 Err(e) => {
                                     ut.failed += 1;
@@ -2185,9 +2187,15 @@ impl Engine for MongoDBEngine {
             &mut results,
             tally,
             total_time,
-            crate::engine::UpdateAttribution::CorpusRow,
+            // NOT CorpusRow: matched_count describes the update's FILTER rather
+            // than what was written, and the collection is not the searched
+            // index. See UpdateAttribution::MatchedRow.
+            crate::engine::UpdateAttribution::MatchedRow,
             ratio,
-            "update_one matched 0 documents in the searched collection",
+            "update_one reports matched_count; 0 means no document carried that _id. The \
+             count describes the update's FILTER, not the payload, and the collection lags \
+             the Atlas vector index by roughly a second, so a matched write is not yet a \
+             searchable one",
         );
         Ok(results)
     }

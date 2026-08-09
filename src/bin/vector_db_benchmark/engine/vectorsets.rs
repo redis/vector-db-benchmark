@@ -1155,8 +1155,9 @@ impl Engine for VectorSetsEngine {
             total_time,
             crate::engine::UpdateAttribution::CorpusRow,
             ratio,
-            "VADD replied 1 — a new element was added — where an overwrite of an \
-             already-present element replies 0",
+            "VADD replies 1 when it adds a new element and 0 when it overwrites one that \
+             was already present. The write targets the same vector-set key VSIM reads, so \
+             this reply is about the searched object itself",
         );
         Ok(results)
     }

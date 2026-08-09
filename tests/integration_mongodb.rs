@@ -1129,10 +1129,20 @@ fn test_binary_mongodb_mixed_parallel() {
     // #293: recall and update_count are both blind to whether the updates landed
     // on the documents the search reads. The engine folds `matched_count` in and
     // publishes the attribution tier it achieved.
+    // NOT corpus_row: `matched_count` describes the update's FILTER rather than
+    // the payload, and the collection lags the Atlas vector index — two ways
+    // weaker than the Redis-wire engines, so it must not share their label.
     assert_eq!(
         r["update_attribution"].as_str(),
-        Some("corpus_row"),
-        "MongoDB must publish that every counted update matched an existing document"
+        Some("matched_row"),
+        "MongoDB's tier must say matched_row, not borrow the stronger corpus_row"
+    );
+    assert!(
+        r["update_attribution_detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("matched_count") && d.contains("FILTER")),
+        "the artifact must carry the mechanism, not just the grade: {:?}",
+        r["update_attribution_detail"]
     );
     assert_eq!(r["update_failures"].as_u64(), Some(0));
     assert_eq!(
@@ -2233,7 +2243,7 @@ fn test_binary_mongodb_mixed_updates_that_miss_the_corpus_are_fatal() {
     );
     assert!(
         combined.contains("reported that the row each one addressed did not already exist")
-            && combined.contains("update_one matched 0 documents"),
+            && combined.contains("Signal read: update_one reports matched_count"),
         "the error must be the #293 gate quoting the matched_count signal.\n{combined}"
     );
 

@@ -425,6 +425,16 @@ fn test_binary_vectorsets_mixed_benchmark() {
         "VectorSets must publish that every counted update was confirmed by the \
          server to have overwritten an element already in the searched set"
     );
+    // VectorSets is the strict case within its tier: VADD targets the very key
+    // VSIM reads. The detail must say so, because Redis/Valkey share the label
+    // on a weaker, inferred basis.
+    assert!(
+        r["update_attribution_detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("VADD") && d.contains("VSIM")),
+        "the artifact must carry the signal and name the searched object: {:?}",
+        r["update_attribution_detail"]
+    );
     assert_eq!(
         r["update_failures"].as_u64(),
         Some(0),
@@ -1361,7 +1371,7 @@ fn test_binary_vectorsets_mixed_updates_that_miss_the_corpus_are_fatal() {
     );
     assert!(
         combined.contains("reported that the row each one addressed did not already exist")
-            && combined.contains("VADD replied 1"),
+            && combined.contains("Signal read: VADD replies 1 when it adds a new element"),
         "the error must be the #293 gate quoting the VADD signal.\n{combined}"
     );
 

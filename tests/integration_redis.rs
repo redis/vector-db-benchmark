@@ -2142,6 +2142,16 @@ fn test_binary_redis_mixed_parallel() {
         "Redis must publish that every counted update was confirmed by the server \
          to have overwritten an already-populated corpus document"
     );
+    // The tier is a three-word grade; the detail is the mechanism, and Redis
+    // shares its tier with VectorSets while reading a materially weaker signal
+    // (HSET reports on the KEY; index membership is inferred from the prefix).
+    assert!(
+        r["update_attribution_detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("HSET") && d.contains("index")),
+        "the artifact must carry the signal, and say it is about the key: {:?}",
+        r["update_attribution_detail"]
+    );
     assert_eq!(
         r["update_failures"].as_u64(),
         Some(0),
@@ -4022,7 +4032,9 @@ fn test_binary_redis_mixed_updates_that_miss_the_corpus_are_fatal_and_waivable()
         "the error must be the #293 gate, quoting the server signal.\n{combined}"
     );
     assert!(
-        combined.contains("HSET reported EVERY field it wrote as newly added"),
+        combined.contains(
+            "Signal read: HSET replies with the number of fields that did not previously exist"
+        ),
         "the error must name the engine-specific signal it read.\n{combined}"
     );
     assert!(

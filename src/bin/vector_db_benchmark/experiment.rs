@@ -948,7 +948,7 @@ fn gate_update_attribution(
     let failed = results.update_failures.unwrap_or(0);
     let dispatched = applied + unattributed + failed;
     let detail = results
-        .update_unattributed_detail
+        .update_attribution_detail
         .as_deref()
         .unwrap_or("no detail recorded");
     // The message states the SERVER SIGNAL and stops there. The server reports
@@ -957,8 +957,8 @@ fn gate_update_attribution(
     // a shipped error message asserting a mechanism the code cannot know.
     let msg = format!(
         "mixed workload: {unattributed} of {dispatched} dispatched updates were accepted by the \
-         server, which reported that the row each one addressed did not already exist \
-         ({detail}). Those writes therefore did not OVERWRITE a row that was already in the \
+         server, which reported that the row each one addressed did not already exist. \
+         Signal read: {detail}. Those writes therefore did not OVERWRITE a row already in the \
          corpus this run searched, and `recall` cannot show it — the rows the queries score \
          against are there either way (issue #293). \
          The signal does not say WHY the rows were absent; all of these produce it: the update \
@@ -2243,8 +2243,18 @@ fn build_search_result_json(
         if let Some(failures) = results.update_failures {
             results_obj.insert("update_failures".to_string(), json!(failures));
         }
-        // Only ever nonzero on a run waived by --allow-partial-corpus (otherwise
-        // `gate_update_attribution` rejected the point and no file was written).
+        // The exact server signal behind `update_attribution`, on every mixed
+        // run. The tier is a three-word grade and two engines can share one while
+        // reading materially different things, so the artifact carries the
+        // mechanism as well (#293 cross-engine review).
+        if let Some(ref detail) = results.update_attribution_detail {
+            results_obj.insert("update_attribution_detail".to_string(), json!(detail));
+        }
+        // Absent entirely under `ack_only`, where there is no signal to count
+        // with: a published 0 there would be indistinguishable from a
+        // corpus_row engine's verified zero. Otherwise only ever nonzero on a run
+        // waived by --allow-partial-corpus, since `gate_update_attribution`
+        // rejects the point and writes no file.
         if let Some(unattributed) = results.update_unattributed {
             results_obj.insert("update_unattributed".to_string(), json!(unattributed));
         }
@@ -2653,8 +2663,10 @@ mod update_attribution_gate_tests {
             update_count: Some(applied),
             update_failures: Some(failed),
             update_unattributed: Some(unattributed),
-            update_unattributed_detail: (unattributed > 0)
-                .then(|| "VADD replied 1 — a new element was added".to_string()),
+            update_attribution_detail: Some(
+                "VADD replies 1 when it adds a new element and 0 when it overwrites one"
+                    .to_string(),
+            ),
             ..Default::default()
         }
     }
@@ -2664,7 +2676,11 @@ mod update_attribution_gate_tests {
     fn unattributed_updates_reject_the_point_by_default() {
         let err = gate(results(0, 399, 0), false, false).unwrap_err();
         assert!(err.contains("399 of 399"), "{err}");
-        assert!(err.contains("VADD replied 1"), "{err}");
+        // The signal is quoted, introduced as a signal rather than as a cause.
+        assert!(
+            err.contains("Signal read: VADD replies 1 when it adds a new element"),
+            "{err}"
+        );
         // The message must offer the escape hatch it actually honours.
         assert!(err.contains("--allow-partial-corpus"), "{err}");
     }
@@ -2720,6 +2736,19 @@ mod update_attribution_gate_tests {
         // ...and it is the estimate doing the waiving, not a blanket pass:
         // the same input with an exact count is still rejected.
         assert!(gate(results(10, 5, 0), false, false).is_err());
+    }
+
+    /// An `ack_only` engine publishes `update_unattributed: None` rather than a
+    /// `0` that would look like a verified zero. The gate must read that absence
+    /// as "nothing to adjudicate", not as a violation, and must not invent a
+    /// count for it.
+    #[test]
+    fn an_ack_only_run_has_nothing_to_adjudicate_and_passes() {
+        let mut r = results(10, 0, 0);
+        r.update_unattributed = None;
+        r.update_attribution = Some("ack_only".to_string());
+        let out = gate(r, false, false).expect("ack_only runs carry no violation to reject");
+        assert!(out.update_unattributed.is_none());
     }
 
     /// Search-only runs have no update fields at all; the gate must be inert

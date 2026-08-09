@@ -2323,11 +2323,14 @@ impl Engine for ValkeyEngine {
                             );
                             let update_time = update_start.elapsed().as_secs_f64();
                             match outcome {
-                                // HSET replied 0: every field already existed, so
-                                // an indexed corpus document was overwritten.
+                                // The key existed. Either HSET replied 0 (every
+                                // field was already there) or it replied with a
+                                // PARTIAL count — some fields new, some not, i.e.
+                                // schema drift on a document that was present.
+                                // Both are applied updates; only all-new is not.
                                 Ok(false) => ut.times.push(update_time),
-                                // HSET added new fields: the target hash was not
-                                // the fully-populated document the search reads.
+                                // Every field HSET wrote was new, which is the
+                                // reply for a key that did not exist at all.
                                 Ok(true) => ut.unattributed += 1,
                                 Err(e) => {
                                     ut.failed += 1;
@@ -2382,8 +2385,11 @@ impl Engine for ValkeyEngine {
             total_time,
             crate::engine::UpdateAttribution::CorpusRow,
             ratio,
-            "HSET reported EVERY field it wrote as newly added, which is the reply for a \
-             key that did not exist; overwriting a document already in the corpus replies 0",
+            "HSET replies with the number of fields that did not previously exist; all-new \
+             means the key was absent. The reply is about the KEY, not about index \
+             membership — that is inferred from FT.CREATE's PREFIX and hset_single sharing \
+             one key_prefix, so a document the index rejected (e.g. a wrong-dimension \
+             vector) would still answer 0 here",
         );
         Ok(results)
     }
