@@ -63,16 +63,10 @@ pub struct ElasticsearchEngine {
 
 impl ElasticsearchEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("ELASTIC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(9200);
+        let port: u16 = crate::effective_config::env_parsed("ELASTIC_PORT", 9200);
 
-        let index_name = std::env::var("ELASTIC_INDEX").unwrap_or_else(|_| "bench".to_string());
-        let timeout: u64 = std::env::var("ELASTIC_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        let index_name = crate::effective_config::env_or("ELASTIC_INDEX", "bench");
+        let timeout: u64 = crate::effective_config::env_parsed("ELASTIC_TIMEOUT", 300);
 
         // Extract HNSW config from collection_params.index_options (ES-specific)
         let (m, ef_construction) = engine_config
@@ -471,9 +465,9 @@ fn build_index_settings() -> serde_json::Value {
 
 /// Build the base URL with authentication from env vars.
 fn build_base_url(host: &str, port: u16) -> String {
-    let api_key = std::env::var("ELASTIC_API_KEY").ok();
-    let user = std::env::var("ELASTIC_USER").unwrap_or_else(|_| "elastic".to_string());
-    let password = std::env::var("ELASTIC_PASSWORD").unwrap_or_else(|_| "passwd".to_string());
+    let api_key = crate::effective_config::env_var("ELASTIC_API_KEY").ok();
+    let user = crate::effective_config::env_or("ELASTIC_USER", "elastic");
+    let password = crate::effective_config::env_or("ELASTIC_PASSWORD", "passwd");
 
     let scheme_host = if host.starts_with("http") {
         host.to_string()
@@ -1445,6 +1439,7 @@ mod tests {
             search_params: None,
             upload_params: None,
             skip_vector_index: false,
+            raw: None,
         };
         let engine = ElasticsearchEngine::new(&config, "localhost").unwrap();
         assert_eq!(engine.name, "test-es");
@@ -1475,6 +1470,7 @@ mod tests {
                 "batch_size": 1000
             })),
             skip_vector_index: false,
+            raw: None,
         };
         let engine = ElasticsearchEngine::new(&config, "localhost").unwrap();
         assert_eq!(engine.config.m, 32);

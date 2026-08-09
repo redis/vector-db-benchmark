@@ -49,23 +49,15 @@ pub struct ChromaEngine {
 
 impl ChromaEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("CHROMA_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8000);
+        let port: u16 = crate::effective_config::env_parsed("CHROMA_PORT", 8000);
 
         let collection_name =
-            std::env::var("CHROMA_COLLECTION").unwrap_or_else(|_| DEFAULT_COLLECTION.to_string());
+            crate::effective_config::env_or("CHROMA_COLLECTION", DEFAULT_COLLECTION);
 
-        let tenant =
-            std::env::var("CHROMA_TENANT").unwrap_or_else(|_| "default_tenant".to_string());
-        let database =
-            std::env::var("CHROMA_DATABASE").unwrap_or_else(|_| "default_database".to_string());
+        let tenant = crate::effective_config::env_or("CHROMA_TENANT", "default_tenant");
+        let database = crate::effective_config::env_or("CHROMA_DATABASE", "default_database");
 
-        let timeout: u64 = std::env::var("CHROMA_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        let timeout: u64 = crate::effective_config::env_parsed("CHROMA_TIMEOUT", 300);
 
         let parallel = engine_config
             .upload_params

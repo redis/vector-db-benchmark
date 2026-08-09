@@ -95,10 +95,7 @@ pub struct DragonflyEngine {
 
 impl DragonflyEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("DRAGONFLY_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6385);
+        let port: u16 = crate::effective_config::env_parsed("DRAGONFLY_PORT", 6385);
 
         // Extract HNSW config
         let (m, ef_construction) = engine_config
@@ -122,9 +119,9 @@ impl DragonflyEngine {
         // for larger-dimensional datasets, so managed-cloud runs set
         // DRAGONFLY_UPLOAD_PARALLEL=16 without having to edit the shared config;
         // search throughput is unaffected by upload concurrency.
-        let parallel = std::env::var("DRAGONFLY_UPLOAD_PARALLEL")
+        let parallel = crate::effective_config::env_var("DRAGONFLY_UPLOAD_PARALLEL")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .or_else(|| {
                 engine_config
                     .upload_params
@@ -134,10 +131,15 @@ impl DragonflyEngine {
                     .map(|v| v as usize)
             })
             .unwrap_or(100);
+        // Resolved from THREE sources (env > upload_params > default), so no
+        // single recorder helper sees the winner. Recording it here is what
+        // keeps `DRAGONFLY_UPLOAD_PARALLEL` from being a knob whose raw text is in
+        // the artifact while the value the upload actually ran at is not.
+        crate::effective_config::record_effective("upload_parallel", parallel);
 
-        let batch_size = std::env::var("DRAGONFLY_UPLOAD_BATCH_SIZE")
+        let batch_size = crate::effective_config::env_var("DRAGONFLY_UPLOAD_BATCH_SIZE")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .or_else(|| {
                 engine_config
                     .upload_params
@@ -147,6 +149,11 @@ impl DragonflyEngine {
                     .map(|v| v as usize)
             })
             .unwrap_or(64);
+        // Resolved from THREE sources (env > upload_params > default), so no
+        // single recorder helper sees the winner. Recording it here is what
+        // keeps `DRAGONFLY_UPLOAD_BATCH_SIZE` from being a knob whose raw text is in
+        // the artifact while the value the upload actually ran at is not.
+        crate::effective_config::record_effective("upload_batch_size", batch_size);
 
         Ok(Self {
             name: engine_config.name.clone(),
@@ -173,8 +180,8 @@ impl DragonflyEngine {
     }
 
     fn connect(host: &str, port: u16) -> Result<Connection, String> {
-        let auth = std::env::var("DRAGONFLY_AUTH").ok();
-        let user = std::env::var("DRAGONFLY_USER").ok();
+        let auth = crate::effective_config::env_var("DRAGONFLY_AUTH").ok();
+        let user = crate::effective_config::env_var("DRAGONFLY_USER").ok();
 
         let auth_part = match (&user, &auth) {
             (Some(u), Some(p)) => format!("{}:{}@", u, p),
@@ -504,10 +511,11 @@ impl DragonflyEngine {
 /// (`DRAGONFLY_PROTOCOL=resp3`). Defaults to RESP2 (empty suffix). The FT.SEARCH
 /// response parser handles both shapes, so recall is identical either way.
 fn dragonfly_url_suffix() -> &'static str {
-    if std::env::var("DRAGONFLY_PROTOCOL")
-        .map(|v| v.eq_ignore_ascii_case("resp3"))
-        .unwrap_or(false)
-    {
+    // `env_flag` records the protocol actually selected. With the plain shim,
+    // `DRAGONFLY_PROTOCOL=" resp3 "` recorded `" resp3 "` and spoke RESP2 — the
+    // artifact showing what looks like a successful opt-in to the other wire
+    // protocol.
+    if crate::effective_config::env_flag("DRAGONFLY_PROTOCOL", &["resp3"]) {
         "?protocol=resp3"
     } else {
         ""
@@ -1040,10 +1048,8 @@ impl Engine for DragonflyEngine {
             .and_then(|sp| sp.ef)
             .unwrap_or(64);
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let query_timeout: i64 = std::env::var("DRAGONFLY_QUERY_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(60_000);
+        let query_timeout: i64 =
+            crate::effective_config::env_parsed("DRAGONFLY_QUERY_TIMEOUT", 60_000);
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());

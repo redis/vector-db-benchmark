@@ -500,6 +500,7 @@ pub fn save_summary(
     entries: &[SearchEntry],
     upload_json: Option<&serde_json::Value>,
     results_dir: &Path,
+    engine_params: &serde_json::Value,
 ) -> Result<(), String> {
     let buckets = analyze_precision_performance(entries);
 
@@ -608,6 +609,13 @@ pub fn save_summary(
         // `mean_precisions` / `precision_summary` keys are precision-at-returned) or
         // an upstream file (they are recall@top); the two cannot be told apart, so
         // they must not be charted on one axis.
+        //
+        // Deliberately NOT bumped by #212. This marker versions the metric
+        // DEFINITIONS, and #212 did not move one; the provenance block it added
+        // carries its own `engine_params.schema_version`, emitted in all three
+        // file kinds. Bumping here would tell a consumer gating "are these
+        // metrics comparable?" that a v2 and a v3 file differ when they are
+        // metric-identical.
         "metrics_schema_version": 2,
         "metrics_definitions": {
             "mean_precision_at_returned": "hits / |deduped results kept (<= top)|",
@@ -615,6 +623,14 @@ pub fn save_summary(
             "precision_summary": "keyed by mean_precision_at_returned buckets",
             "upstream_qdrant_mean_precisions": "len(ids & expected[:top]) / top — never emitted under that key here",
         },
+        // What this sweep actually ran with (#212): declared collection/upload
+        // params verbatim, the resolved engine + environment knobs, which
+        // environment variables were consulted, and any declared value the run
+        // overrode. Top level rather than per-entry because one summary covers
+        // exactly one (engine config, dataset) pair, so the block is invariant
+        // across `search_results` — repeating it under every entry would add
+        // bytes and invite the two copies to disagree.
+        "engine_params": engine_params,
         "search_results": search_results,
         "precision_summary": precision_summary,
         "concurrency_curve": concurrency_curve,
@@ -754,6 +770,7 @@ mod tests {
             &[calibrated, plain],
             None,
             dir.path(),
+            &serde_json::json!({}),
         )
         .unwrap();
         let raw = fs::read_to_string(dir.path().join("redis-test-h-and-m-summary.json")).unwrap();
@@ -769,6 +786,60 @@ mod tests {
         assert_eq!(un[0]["target"], 0.95);
     }
 
+    /// The summary is the file a dashboard reads instead of the 200 per-search
+    /// files, so it has to answer "what was this run configured with?" on its
+    /// own (#212). `metrics_schema_version` deliberately does NOT move: it
+    /// versions the metric definitions, which #212 did not touch. The marker for
+    /// this block is `engine_params.schema_version`.
+    #[test]
+    fn summary_carries_the_engine_params_block_at_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_params = json!({
+            "schema_version": 1,
+            "declared": {"collection_params": {"hnsw_config": {"M": 64, "EF_CONSTRUCTION": 512}}},
+            "effective": {"m": 64, "ef_construction": 512, "OPENSEARCH_BULK_MAX_RETRIES": 8},
+            "env": {"OPENSEARCH_BULK_MAX_RETRIES": null},
+            "overridden": [{"key": "collection_params.number_of_shards",
+                            "declared": 3, "effective": 1, "reason": "pinned in code"}],
+            "ignored_declared_keys": {
+                "exhaustive": false,
+                "covers": "…",
+                "keys": ["collection_params.hnsw_config.DISTANCE_METRIC"],
+            },
+        });
+        save_summary(
+            "es-tuned",
+            "glove",
+            &[prec_entry(0.99, 100.0, false)],
+            None,
+            dir.path(),
+            &engine_params,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("es-tuned-glove-summary.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(v["metrics_schema_version"], 2);
+        assert_eq!(v["engine_params"]["effective"]["m"], 64);
+        assert_eq!(
+            v["engine_params"]["effective"]["OPENSEARCH_BULK_MAX_RETRIES"],
+            8
+        );
+        // The declared shard count and the one actually used are BOTH present.
+        assert_eq!(v["engine_params"]["overridden"][0]["declared"], 3);
+        assert_eq!(v["engine_params"]["overridden"][0]["effective"], 1);
+        assert_eq!(
+            v["engine_params"]["ignored_declared_keys"]["keys"][0],
+            "collection_params.hnsw_config.DISTANCE_METRIC"
+        );
+        assert_eq!(
+            v["engine_params"]["ignored_declared_keys"]["exhaustive"],
+            false
+        );
+    }
+
     #[test]
     fn summary_without_calibration_lists_no_uncalibrated_configs() {
         let dir = tempfile::tempdir().unwrap();
@@ -778,6 +849,7 @@ mod tests {
             &[prec_entry(0.99, 100.0, false)],
             None,
             dir.path(),
+            &serde_json::json!({}),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -808,6 +880,7 @@ mod tests {
             &[prec_entry(0.99, 100.0, false)],
             None,
             dir.path(),
+            &serde_json::json!({}),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(
@@ -833,6 +906,7 @@ mod tests {
             &[prec_entry(0.99, 100.0, false)],
             None,
             dir.path(),
+            &serde_json::json!({}),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(

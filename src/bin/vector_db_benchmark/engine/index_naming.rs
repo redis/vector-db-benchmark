@@ -45,7 +45,7 @@ pub fn sanitize_token(name: &str) -> String {
 /// index). Combining exact mode with >1 config for the engine is caught by the
 /// startup collision guard in `experiment::run`.
 pub fn derive_index_name(base_env: &str, default_base: &str, engine_name: &str) -> String {
-    let base = std::env::var(base_env).unwrap_or_else(|_| default_base.to_string());
+    let base = crate::effective_config::env_or(base_env, default_base);
     if index_name_exact(base_env) {
         return base;
     }
@@ -54,9 +54,10 @@ pub fn derive_index_name(base_env: &str, default_base: &str, engine_name: &str) 
 
 /// Whether the `<base_env>_EXACT` escape hatch is enabled (value `1`/`true`).
 pub fn index_name_exact(base_env: &str) -> bool {
-    std::env::var(format!("{base_env}_EXACT"))
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    // `env_flag`, not `env_var`: the raw text alone cannot show that
+    // `..._EXACT="yes"` left the escape hatch CLOSED, and a reader grepping the
+    // artifact for the variable would read "yes" as an opt-in that happened.
+    crate::effective_config::env_flag(&format!("{base_env}_EXACT"), &["1", "true"])
 }
 
 /// Per-config key prefix: `"<sanitized-config-name>:"`. The trailing `:` is the
@@ -100,6 +101,11 @@ mod tests {
     /// the separator or the default base has to be made deliberately.
     #[test]
     fn vectorsets_configs_derive_distinct_keys() {
+        // `derive_index_name` / `index_name_exact` resolve through the process-wide
+        // recorder (#212), so they must serialize with every other test that drives
+        // it — otherwise an observation lands between another test's
+        // `begin_experiment` and its `snapshot()`.
+        let _recorder_lock = crate::effective_config::test_lock();
         let a = derive_index_name("VECTORSETS_INDEX_NAME_UNSET_236", "idx", "vectorsets-fp32");
         let b = derive_index_name("VECTORSETS_INDEX_NAME_UNSET_236", "idx", "vectorsets-q8");
         assert_eq!(a, "idx:vectorsets-fp32");
@@ -116,6 +122,11 @@ mod tests {
     /// so no other test observes it.
     #[test]
     fn exact_pin_drops_the_config_suffix() {
+        // `derive_index_name` / `index_name_exact` resolve through the process-wide
+        // recorder (#212), so they must serialize with every other test that drives
+        // it — otherwise an observation lands between another test's
+        // `begin_experiment` and its `snapshot()`.
+        let _recorder_lock = crate::effective_config::test_lock();
         let base_env = "VECTORSETS_INDEX_NAME_EXACTTEST_236";
         std::env::set_var(base_env, "myvset");
         std::env::set_var(format!("{base_env}_EXACT"), "1");

@@ -331,18 +331,12 @@ pub struct MilvusEngine {
 
 impl MilvusEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("MILVUS_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(19530);
+        let port: u16 = crate::effective_config::env_parsed("MILVUS_PORT", 19530);
 
-        let collection_name = std::env::var("MILVUS_COLLECTION_NAME")
-            .unwrap_or_else(|_| DEFAULT_COLLECTION.to_string());
+        let collection_name =
+            crate::effective_config::env_or("MILVUS_COLLECTION_NAME", DEFAULT_COLLECTION);
 
-        let timeout: u64 = std::env::var("MILVUS_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        let timeout: u64 = crate::effective_config::env_parsed("MILVUS_TIMEOUT", 300);
 
         let parallel = engine_config
             .upload_params
@@ -800,10 +794,8 @@ impl MilvusEngine {
         uploaded_rows: usize,
     ) -> Result<(), String> {
         let expect_rows = uploaded_rows > 0;
-        let timeout_secs: u64 = std::env::var("MILVUS_INDEX_BUILD_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1800);
+        let timeout_secs: u64 =
+            crate::effective_config::env_parsed("MILVUS_INDEX_BUILD_TIMEOUT", 1800);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let mut backoff = std::time::Duration::from_millis(500);
         let max_backoff = std::time::Duration::from_secs(10);

@@ -46,13 +46,12 @@ pub struct TurbopufferEngine {
 
 impl TurbopufferEngine {
     pub fn new(engine_config: &EngineConfig, _host: &str) -> Result<Self, String> {
-        let api_key = std::env::var("TURBOPUFFER_API_KEY").map_err(|_| {
+        let api_key = crate::effective_config::env_var("TURBOPUFFER_API_KEY").map_err(|_| {
             "TURBOPUFFER_API_KEY environment variable is required for turbopuffer engine"
                 .to_string()
         })?;
 
-        let namespace = std::env::var("TURBOPUFFER_NAMESPACE")
-            .unwrap_or_else(|_| DEFAULT_NAMESPACE.to_string());
+        let namespace = crate::effective_config::env_or("TURBOPUFFER_NAMESPACE", DEFAULT_NAMESPACE);
 
         let parallel = engine_config
             .upload_params

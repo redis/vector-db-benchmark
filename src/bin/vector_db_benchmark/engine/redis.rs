@@ -77,15 +77,32 @@ pub struct RedisEngineConfig {
 /// prefix and disjoint keyspace. A trailing `:` is appended if missing so the
 /// value is a clean key namespace. Resolved in `new()`, never in a timed window.
 fn shared_key_prefix() -> Option<String> {
-    let s = std::env::var("REDIS_KEY_PREFIX").ok()?;
-    let s = s.trim();
-    if s.is_empty() {
-        None
-    } else if s.ends_with(':') {
-        Some(s.to_string())
-    } else {
-        Some(format!("{s}:"))
-    }
+    let raw = crate::effective_config::env_var("REDIS_KEY_PREFIX").ok();
+    let resolved = raw.as_deref().map(str::trim).and_then(|s| {
+        if s.is_empty() {
+            None
+        } else if s.ends_with(':') {
+            Some(s.to_string())
+        } else {
+            Some(format!("{s}:"))
+        }
+    });
+    // The raw text is not the value used: it is trimmed and gains a `:`, and a
+    // whitespace-only setting turns shared-corpus mode OFF while still showing
+    // up as set. Record what the run actually keyed on (#212).
+    //
+    // NOTE the appended `:` makes this digest while `env.REDIS_KEY_PREFIX` two
+    // keys away shows the same text in the clear, so the digest buys no secrecy
+    // here — it is recorded for the resolution (trimmed, suffixed, or None),
+    // not for confidentiality.
+    crate::effective_config::record_effective(
+        "shared_corpus_key_prefix",
+        resolved
+            .clone()
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    resolved
 }
 
 /// Count keys matching `<prefix>*` via cursor-based SCAN (non-blocking; the
@@ -211,18 +228,34 @@ impl RedisEngine {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .or_else(|| {
-                        std::env::var("REDIS_SVS_COMPRESSION")
+                        crate::effective_config::env_var("REDIS_SVS_COMPRESSION")
                             .ok()
                             .map(|s| s.trim().to_string())
                     })
                     .filter(|s| !s.is_empty());
                 let reduce = svs_i64("REDUCE")
                     .or_else(|| {
-                        std::env::var("REDIS_SVS_REDUCE")
+                        crate::effective_config::env_var("REDIS_SVS_REDUCE")
                             .ok()
                             .and_then(|s| s.trim().parse::<i64>().ok())
                     })
                     .filter(|&n| n > 0);
+                // `REDIS_SVS_*` reach these only after config precedence, a
+                // trim and an emptiness/positivity filter, so the raw text in
+                // `env` is not what the index was built with.
+                crate::effective_config::record_effective(
+                    "svs_compression",
+                    compression
+                        .clone()
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                crate::effective_config::record_effective(
+                    "svs_reduce",
+                    reduce
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                );
                 (
                     svs_i64("GRAPH_MAX_DEGREE"),
                     svs_i64("CONSTRUCTION_WINDOW_SIZE"),
@@ -787,10 +820,7 @@ impl RedisEngine {
         }
 
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let query_timeout: i64 = std::env::var("REDIS_QUERY_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(90_000);
+        let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
 
         // Read queries (we only need the filter conditions)
         let query_path = dataset.get_path()?;
@@ -2137,11 +2167,8 @@ impl Engine for RedisEngine {
 
         let ef = resolve_ef(params);
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let hybrid_policy = std::env::var("REDIS_HYBRID_POLICY").unwrap_or_default();
-        let query_timeout: i64 = std::env::var("REDIS_QUERY_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(90_000);
+        let hybrid_policy = crate::effective_config::env_or("REDIS_HYBRID_POLICY", "");
+        let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
 
         // Read queries, ground truth, and filter conditions
         let query_path = dataset.get_path()?;
@@ -2547,11 +2574,8 @@ impl Engine for RedisEngine {
 
         let ef = resolve_ef(params);
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let hybrid_policy = std::env::var("REDIS_HYBRID_POLICY").unwrap_or_default();
-        let query_timeout: i64 = std::env::var("REDIS_QUERY_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(90_000);
+        let hybrid_policy = crate::effective_config::env_or("REDIS_HYBRID_POLICY", "");
+        let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
 
         // Read queries and ground truth
         let query_path = dataset.get_path()?;

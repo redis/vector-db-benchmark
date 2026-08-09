@@ -60,16 +60,12 @@ pub struct MongoDBEngine {
 
 impl MongoDBEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("MONGODB_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(27017);
+        let port: u16 = crate::effective_config::env_parsed("MONGODB_PORT", 27017);
 
-        let db_name = std::env::var("MONGODB_DB").unwrap_or_else(|_| DEFAULT_DB.to_string());
+        let db_name = crate::effective_config::env_or("MONGODB_DB", DEFAULT_DB);
         let collection_name =
-            std::env::var("MONGODB_COLLECTION").unwrap_or_else(|_| DEFAULT_COLLECTION.to_string());
-        let index_name =
-            std::env::var("MONGODB_INDEX_NAME").unwrap_or_else(|_| DEFAULT_INDEX_NAME.to_string());
+            crate::effective_config::env_or("MONGODB_COLLECTION", DEFAULT_COLLECTION);
+        let index_name = crate::effective_config::env_or("MONGODB_INDEX_NAME", DEFAULT_INDEX_NAME);
 
         let parallel = engine_config
             .upload_params
@@ -820,8 +816,8 @@ fn build_hnsw_options(
 }
 
 fn build_uri(host: &str, port: u16) -> String {
-    let user = std::env::var("MONGODB_USER").ok();
-    let password = std::env::var("MONGODB_PASSWORD").ok();
+    let user = crate::effective_config::env_var("MONGODB_USER").ok();
+    let password = crate::effective_config::env_var("MONGODB_PASSWORD").ok();
 
     let host_part = if host.starts_with("mongodb") {
         // Already a full URI
@@ -2758,8 +2754,8 @@ mod tests {
     // mutated concurrently by parallel test threads (no serial_test dep here).
     #[test]
     fn build_uri_covers_passthrough_auth_and_noauth() {
-        let saved_user = std::env::var("MONGODB_USER").ok();
-        let saved_pass = std::env::var("MONGODB_PASSWORD").ok();
+        let saved_user = crate::effective_config::env_var("MONGODB_USER").ok();
+        let saved_pass = crate::effective_config::env_var("MONGODB_PASSWORD").ok();
 
         // Full mongodb:// URI is passed through verbatim (env ignored).
         std::env::set_var("MONGODB_USER", "u");

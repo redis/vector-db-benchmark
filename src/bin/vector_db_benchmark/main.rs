@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod dataset;
 mod download;
+mod effective_config;
 mod engine;
 mod experiment;
 mod ground_truth;

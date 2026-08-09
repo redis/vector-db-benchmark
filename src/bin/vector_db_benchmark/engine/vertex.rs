@@ -72,8 +72,7 @@ enum VertexQueryTransport {
 
 impl VertexQueryTransport {
     fn from_env() -> Result<Self, String> {
-        match std::env::var("VERTEX_QUERY_TRANSPORT")
-            .unwrap_or_else(|_| "rest".to_string())
+        match crate::effective_config::env_or("VERTEX_QUERY_TRANSPORT", "rest")
             .to_ascii_lowercase()
             .replace('_', "-")
             .as_str()
@@ -93,9 +92,9 @@ impl VertexQueryTransport {
 /// the caller-owned resources are left in place). Reuse requires all three.
 fn reuse_index_ids() -> Option<(String, String, String)> {
     Some((
-        std::env::var("VERTEX_INDEX").ok()?,
-        std::env::var("VERTEX_INDEX_ENDPOINT").ok()?,
-        std::env::var("VERTEX_DEPLOYED_INDEX_ID").ok()?,
+        crate::effective_config::env_var("VERTEX_INDEX").ok()?,
+        crate::effective_config::env_var("VERTEX_INDEX_ENDPOINT").ok()?,
+        crate::effective_config::env_var("VERTEX_DEPLOYED_INDEX_ID").ok()?,
     ))
 }
 
@@ -833,28 +832,22 @@ pub struct VertexEngine {
 
 impl VertexEngine {
     pub fn new(engine_config: &EngineConfig, _host: &str) -> Result<Self, String> {
-        let project = std::env::var("VERTEX_PROJECT").map_err(|_| {
+        let project = crate::effective_config::env_var("VERTEX_PROJECT").map_err(|_| {
             "VERTEX_PROJECT environment variable is required for the vertex engine".to_string()
         })?;
-        let region = std::env::var("VERTEX_REGION").unwrap_or_else(|_| DEFAULT_REGION.to_string());
-        let machine_type = std::env::var("VERTEX_MACHINE_TYPE")
-            .unwrap_or_else(|_| DEFAULT_MACHINE_TYPE.to_string());
-        let display_name = std::env::var("VERTEX_INDEX_DISPLAY_NAME")
-            .unwrap_or_else(|_| DEFAULT_DISPLAY_NAME.to_string());
+        let region = crate::effective_config::env_or("VERTEX_REGION", DEFAULT_REGION);
+        let machine_type =
+            crate::effective_config::env_or("VERTEX_MACHINE_TYPE", DEFAULT_MACHINE_TYPE);
+        let display_name =
+            crate::effective_config::env_or("VERTEX_INDEX_DISPLAY_NAME", DEFAULT_DISPLAY_NAME);
 
-        let deploy_timeout = Duration::from_secs(
-            std::env::var("VERTEX_DEPLOY_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3600),
-        );
+        let deploy_timeout = Duration::from_secs(crate::effective_config::env_parsed(
+            "VERTEX_DEPLOY_TIMEOUT_SECS",
+            3600,
+        ));
 
-        let env_i64 = |k: &str, default: i64| -> i64 {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
-        };
+        let env_i64 =
+            |k: &str, default: i64| -> i64 { crate::effective_config::env_parsed(k, default) };
 
         let parallel = engine_config
             .upload_params
@@ -891,20 +884,11 @@ impl VertexEngine {
                 DEFAULT_LEAF_EMBEDDING_COUNT,
             ),
             leaf_search_percent: env_i64("VERTEX_LEAF_SEARCH_PERCENT", DEFAULT_LEAF_SEARCH_PERCENT),
-            shard_size: std::env::var("VERTEX_SHARD_SIZE")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
+            shard_size: crate::effective_config::env_opt("VERTEX_SHARD_SIZE"),
             query_transport: VertexQueryTransport::from_env()?,
-            grpc_address: std::env::var("VERTEX_GRPC_ADDRESS")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-            gcs_staging_bucket: std::env::var("VERTEX_GCS_STAGING_BUCKET")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-            batch_threshold: std::env::var("VERTEX_BATCH_THRESHOLD")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(100_000),
+            grpc_address: crate::effective_config::env_opt("VERTEX_GRPC_ADDRESS"),
+            gcs_staging_bucket: crate::effective_config::env_opt("VERTEX_GCS_STAGING_BUCKET"),
+            batch_threshold: crate::effective_config::env_parsed("VERTEX_BATCH_THRESHOLD", 100_000),
             index_name: String::new(),
             index_endpoint_name: String::new(),
             deployed_index_id: String::new(),
@@ -982,7 +966,7 @@ impl VertexEngine {
     /// print-access-token`. Re-fetched per phase so a long deploy doesn't run on
     /// an expired token.
     fn access_token(&self) -> Result<String, String> {
-        if let Ok(t) = std::env::var("VERTEX_ACCESS_TOKEN") {
+        if let Ok(t) = crate::effective_config::env_var("VERTEX_ACCESS_TOKEN") {
             let t = t.trim().to_string();
             if !t.is_empty() {
                 return Ok(t);
@@ -1108,21 +1092,28 @@ impl VertexEngine {
     fn wait_for_index_sync(&self, expected_count: usize) -> Result<(), String> {
         // Env-gated knobs. Malformed values fall back to the defaults rather
         // than aborting the whole benchmark over a typo.
-        let timeout_secs = std::env::var("VERTEX_SYNC_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(900);
+        let timeout_secs = crate::effective_config::env_parsed("VERTEX_SYNC_TIMEOUT_SECS", 900);
         // A non-positive timeout is an explicit opt-out of the wait entirely.
         if timeout_secs <= 0 {
             println!("Vertex index sync wait disabled (VERTEX_SYNC_TIMEOUT_SECS <= 0)");
             return Ok(());
         }
         let timeout = Duration::from_secs(timeout_secs as u64);
-        let poll_secs = std::env::var("VERTEX_SYNC_POLL_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|s| *s > 0)
-            .unwrap_or(10);
+        let parsed: u64 = crate::effective_config::env_parsed("VERTEX_SYNC_POLL_SECS", 10);
+        // A zero interval would busy-loop, so it is clamped — and a clamp that
+        // nobody records is a declared value silently losing.
+        let poll_secs = if parsed == 0 {
+            crate::effective_config::note_override(
+                "VERTEX_SYNC_POLL_SECS",
+                0,
+                10,
+                "a zero poll interval would busy-loop; the default was used instead",
+            );
+            crate::effective_config::record_effective("VERTEX_SYNC_POLL_SECS", 10);
+            10
+        } else {
+            parsed
+        };
 
         let expected = expected_count as u64;
         println!(

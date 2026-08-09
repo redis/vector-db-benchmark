@@ -63,16 +63,10 @@ pub struct OpenSearchEngine {
 
 impl OpenSearchEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
-        let port: u16 = std::env::var("OPENSEARCH_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(9200);
+        let port: u16 = crate::effective_config::env_parsed("OPENSEARCH_PORT", 9200);
 
-        let index_name = std::env::var("OPENSEARCH_INDEX").unwrap_or_else(|_| "bench".to_string());
-        let timeout: u64 = std::env::var("OPENSEARCH_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
+        let index_name = crate::effective_config::env_or("OPENSEARCH_INDEX", "bench");
+        let timeout: u64 = crate::effective_config::env_parsed("OPENSEARCH_TIMEOUT", 300);
 
         // Extract HNSW config from collection_params.method.parameters (OpenSearch format)
         // or fall back to index_options (ES format) or defaults
@@ -657,8 +651,8 @@ fn extract_hnsw_params(engine_config: &EngineConfig) -> (i64, i64) {
 }
 
 fn build_base_url(host: &str, port: u16) -> String {
-    let user = std::env::var("OPENSEARCH_USER").unwrap_or_else(|_| "admin".to_string());
-    let password = std::env::var("OPENSEARCH_PASSWORD").unwrap_or_else(|_| "admin".to_string());
+    let user = crate::effective_config::env_or("OPENSEARCH_USER", "admin");
+    let password = crate::effective_config::env_or("OPENSEARCH_PASSWORD", "admin");
 
     let scheme_host = if host.starts_with("http") {
         host.to_string()
@@ -944,14 +938,9 @@ fn upload_bulk_batch(
     // Rejections also arrive as HTTP 200 with per-item errors (bulk is partial by
     // design), so item-level 429 / es_rejected_execution_exception /
     // circuit_breaking_exception are treated as retryable too.
-    let max_retries: u32 = std::env::var("OPENSEARCH_BULK_MAX_RETRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-    let base_delay_ms: u64 = std::env::var("OPENSEARCH_BULK_RETRY_BASE_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(500);
+    let max_retries: u32 = crate::effective_config::env_parsed("OPENSEARCH_BULK_MAX_RETRIES", 8);
+    let base_delay_ms: u64 =
+        crate::effective_config::env_parsed("OPENSEARCH_BULK_RETRY_BASE_MS", 500);
 
     let mut attempt: u32 = 0;
     loop {
@@ -1110,14 +1099,9 @@ struct RetryPolicy {
 impl RetryPolicy {
     fn from_env(max_var: &str, base_var: &str, default_max: u32, default_base_ms: u64) -> Self {
         Self {
-            max_retries: std::env::var(max_var)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default_max),
-            base_delay_ms: std::env::var(base_var)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default_base_ms),
+            max_retries: crate::effective_config::env_parsed(max_var, default_max),
+            base_delay_ms: crate::effective_config::env_parsed(base_var, default_base_ms),
+            // #246's per-policy budget; kept as it landed.
             budget: None,
         }
     }
@@ -1330,16 +1314,27 @@ const FORCE_MERGE_TIMEOUT_UNLIMITED: std::time::Duration =
 /// `-1` — the exact "silently ignored setting" failure `parse_number_of_shards`
 /// exists to prevent in this same file. An operator who sets a merge timeout and
 /// gets the default instead is worse off than one who gets an error.
+///
+/// Reads through [`crate::effective_config`] so the resolved value reaches the
+/// result JSON (#212). It is the STRICT counterpart of `env_parsed`: this one
+/// refuses an unusable value rather than defaulting and recording the
+/// divergence. #260 wants the rest of this file's knobs moved onto the same
+/// footing, at which point this belongs in `effective_config` as a reusable
+/// sibling rather than here.
 fn parse_env_secs(var: &str) -> Result<Option<u64>, String> {
-    match std::env::var(var) {
+    match crate::effective_config::env_var(var) {
         Err(_) => Ok(None),
-        Ok(raw) => raw.trim().parse::<u64>().map(Some).map_err(|_| {
-            format!(
-                "{} must be a whole number of seconds (got {:?}). Use 0 for no limit; \
-                 suffixes like \"1h\" or \"3600s\" are not accepted.",
-                var, raw
-            )
-        }),
+        Ok(raw) => {
+            let parsed = raw.trim().parse::<u64>().map_err(|_| {
+                format!(
+                    "{} must be a whole number of seconds (got {:?}). Use 0 for no limit; \
+                     suffixes like \"1h\" or \"3600s\" are not accepted.",
+                    var, raw
+                )
+            })?;
+            crate::effective_config::record_effective(var, parsed);
+            Ok(Some(parsed))
+        }
     }
 }
 
@@ -1536,12 +1531,10 @@ impl SearchRetryPolicy {
         Self {
             max_retries: base.max_retries,
             base_delay_ms: base.base_delay_ms,
-            budget: std::time::Duration::from_millis(
-                std::env::var("OPENSEARCH_SEARCH_RETRY_BUDGET_MS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(2_000),
-            ),
+            budget: std::time::Duration::from_millis(crate::effective_config::env_parsed(
+                "OPENSEARCH_SEARCH_RETRY_BUDGET_MS",
+                2_000,
+            )),
         }
     }
 }
