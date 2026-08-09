@@ -292,20 +292,6 @@ struct Override {
 /// `overridden` entry into four identical placeholders that record nothing.
 const ENTRY_KEY_EXEMPT: &[&str] = &["key", "reason"];
 
-/// True for the placeholders this module emits, so a second scrub pass leaves
-/// them alone.
-///
-/// An operator-supplied value that merely LOOKS like one is passed through
-/// unchanged, which is harmless: these are 9-to-40 character literals, none of
-/// them a credential, and a forged `<redacted:opaque …>` is no more misleading
-/// than any other arbitrary string a config can contain.
-fn is_sentinel(s: &str) -> bool {
-    s == REDACTED
-        || s == REDACTED_DEFAULT
-        || s == DROPPED
-        || s.starts_with("<redacted:opaque sha256=")
-}
-
 /// Scrub one JSON value for publication.
 ///
 /// `secret_ancestor` is true when any key on the path to this value is
@@ -314,6 +300,18 @@ fn is_sentinel(s: &str) -> bool {
 /// caught just like a bare string, and so is every leaf of a raw configuration
 /// file block copied in wholesale.
 fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
+    scrub(value, secret_ancestor, false)
+}
+
+/// The single scrub pass.
+///
+/// `declared_mode` folds the declared-key allow-list into the SAME traversal.
+/// It used to run first, as `allowlist_declared`, emitting `<dropped>`; the
+/// scrub then re-read that output and digested it. Every sentinel is now
+/// produced by a terminal arm of this one pass and never inspected again, so
+/// there is no "is this already one of ours?" question to answer — and so no
+/// forged `<redacted:opaque sha256=…> password=SECRET` can answer it wrongly.
+fn scrub(value: &Value, secret_ancestor: bool, declared_mode: bool) -> Value {
     match value {
         // `null` under a secret key means "read and unset" — a fact, not a leak.
         Value::Null => Value::Null,
@@ -331,29 +329,34 @@ fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
                             .get("key")
                             .and_then(Value::as_str)
                             .is_some_and(is_secret);
-                    (
-                        k.clone(),
-                        scrub_value(v, secret_ancestor || is_secret(k) || seeded),
-                    )
+                    let secret = secret_ancestor || is_secret(k) || seeded;
+                    // Declared keys are allow-listed in this same pass.
+                    if declared_mode && !is_publishable_declared_key(k) {
+                        let kept = matches!(v, Value::Number(_) | Value::Bool(_) | Value::Null);
+                        return (
+                            k.clone(),
+                            match (kept, secret) {
+                                // A credential-named key says `<redacted:set>`,
+                                // not `<dropped>`: "we removed a secret" and
+                                // "this knob is not one we read" are different
+                                // facts, and the leak guard rightly rejects the
+                                // second standing in for the first.
+                                (_, true) => Value::from(REDACTED),
+                                (true, false) => v.clone(),
+                                (false, false) => Value::from(DROPPED),
+                            },
+                        );
+                    }
+                    (k.clone(), scrub(v, secret, declared_mode))
                 })
                 .collect(),
         ),
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|v| scrub_value(v, secret_ancestor))
+                .map(|v| scrub(v, secret_ancestor, declared_mode))
                 .collect(),
         ),
-        // A value that is ALREADY a sentinel survives the second pass. Without
-        // this, `snapshot`'s whole-document scrub re-processed both of them:
-        // `<dropped>` is not a plain token so it digested to
-        // `<redacted:opaque sha256=36d00e96…>` — the hash of the literal string
-        // `<dropped>` — and `<redacted:default>` under a credential-named key
-        // fell into the arm below and became `<redacted:set>`. The second was
-        // the damaging one: a run with NO password set published
-        // `ELASTIC_PASSWORD = "<redacted:set>"`, the artifact asserting a
-        // credential was supplied when the built-in default was used.
-        Value::String(s) if is_sentinel(s) => Value::String(s.clone()),
         // NOTE: this changes a JSON *type* — a number under a credential-named
         // key becomes a string. Zero false positives across all shipped configs
         // and every recorded knob name today; tracked in #289.
@@ -381,11 +384,6 @@ fn redact_connection_like(value: &str) -> String {
     } else {
         opaque_digest(value)
     }
-}
-
-/// Redact a raw environment value for publication.
-fn redact(name: &str, raw: &str) -> Value {
-    scrub_value(&Value::from(raw), is_secret(name))
 }
 
 /// Assert that no credential-named key anywhere in `value` carries anything but
@@ -461,6 +459,10 @@ pub struct Recorder {
     /// Declared configuration keys known not to be consumed. NOT exhaustive —
     /// see the note emitted alongside it.
     ignored: BTreeSet<String>,
+    /// `effective` keys whose value came from a built-in default rather than
+    /// the environment. Tracked structurally so the artifact can say
+    /// `<redacted:default>` without the scrub having to recognise a string.
+    from_default: BTreeSet<String>,
 }
 
 impl Recorder {
@@ -494,11 +496,14 @@ impl Recorder {
     /// First observation wins: a variable read twice in a run yields the same
     /// value both times (the process environment is not mutated mid-run), and
     /// keeping the first keeps the map stable.
+    /// Stores the RAW text. Scrubbing happens once, in
+    /// [`Recorder::snapshot`], with the map key in hand — writing a scrubbed
+    /// value here is what created a second pass over this module's own output.
     pub fn observe_env(&mut self, name: &str, raw: Option<&str>) {
         self.env
             .entry(name.to_string())
             .or_insert_with(|| match raw {
-                Some(v) => redact(name, v),
+                Some(v) => Value::from(v),
                 None => Value::Null,
             });
     }
@@ -514,16 +519,20 @@ impl Recorder {
     /// from every present and future caller; [`Recorder::snapshot`] then asserts
     /// it held.
     pub fn record_effective(&mut self, key: &str, value: Value) {
-        // `scrub_value`, not a string-only check: a credential nested inside an
-        // object under a secret-named key is still a credential.
-        self.effective
-            .insert(key.to_string(), scrub_value(&value, is_secret(key)));
+        self.effective.insert(key.to_string(), value);
+        self.from_default.remove(key);
     }
 
-    /// Insert a value that is ALREADY a safe placeholder, bypassing the scrub
-    /// that would rewrite `<redacted:default>` into `<redacted:set>`.
-    fn record_effective_raw(&mut self, key: &str, value: Value) {
+    /// Record that this credential's value came from a built-in DEFAULT rather
+    /// than from the environment.
+    ///
+    /// A marker on the KEY, not a magic string in the value. The previous
+    /// version inserted the literal `<redacted:default>` and relied on the
+    /// scrub recognising it later, which is the string-inspection this refactor
+    /// removes.
+    fn record_effective_from_default(&mut self, key: &str, value: Value) {
         self.effective.insert(key.to_string(), value);
+        self.from_default.insert(key.to_string());
     }
 
     /// Record that `declared` lost to `effective`, and why.
@@ -534,7 +543,7 @@ impl Recorder {
         effective: Value,
         reason: &'static str,
     ) {
-        let secret = is_secret(key);
+        let _ = is_secret(key);
         // The reason is held SEPARATELY, as a `&'static str`, and spliced into
         // the document AFTER scrubbing — see `Recorder::snapshot`. It used to
         // live in the tree and be protected by a `PROSE_KEYS` key-name test,
@@ -542,10 +551,11 @@ impl Recorder {
         // configuration subtree that `set_declared` forwards verbatim — was
         // published in the clear. Same value, `<dropped>` on the allow-listed
         // path and cleartext two keys away.
+        // Raw; scrubbed once in `snapshot` with `key` in hand.
         let entry = Override {
             key: key.to_string(),
-            declared: scrub_value(&declared, secret),
-            effective: scrub_value(&effective, secret),
+            declared,
+            effective,
             reason,
         };
         if !self.overridden.iter().any(|o| {
@@ -594,8 +604,61 @@ impl Recorder {
     /// get pasted into issues; aborting the run is the correct response to
     /// discovering we are about to leak.
     pub fn snapshot(&self) -> Value {
-        let doc = self.assemble();
-        let mut scrubbed = scrub_value(&doc, false);
+        // ONE scrub, per member, over values this module has never processed
+        // before. `declared` additionally runs the declared-key allow-list in
+        // the same traversal. Nothing downstream re-reads a sentinel, so there
+        // is no "did we emit this?" test for an operator string to satisfy —
+        // `--host '<redacted:opaque sha256=x> password=SECRET'` was published
+        // verbatim by exactly such a test.
+        let mut scrubbed = json!({
+            "schema_version": ENGINE_PARAMS_SCHEMA_VERSION,
+            "phase": self.phase,
+            "invocation": scrub_value(
+                self.invocation.as_ref().unwrap_or(&Value::Null),
+                false,
+            ),
+            // Allow-list mode starts INSIDE each block: `collection_params`
+            // and `upload_params` are this module's own wrapper keys, not
+            // declared knobs, so applying it at the wrapper dropped both.
+            "declared": self.declared.as_ref().map_or(Value::Null, |d| {
+                json!({
+                    "collection_params": scrub(
+                        d.get("collection_params").unwrap_or(&Value::Null),
+                        false,
+                        true,
+                    ),
+                    "upload_params": scrub(
+                        d.get("upload_params").unwrap_or(&Value::Null),
+                        false,
+                        true,
+                    ),
+                })
+            }),
+            "effective": self.scrubbed_effective(),
+            "env": Value::Object(
+                self.env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), scrub_value(v, is_secret(k))))
+                    .collect(),
+            ),
+            "overridden": self
+                .overridden
+                .iter()
+                .map(|o| {
+                    let secret = is_secret(&o.key);
+                    json!({
+                        "key": o.key,
+                        "declared": scrub_value(&o.declared, secret),
+                        "effective": scrub_value(&o.effective, secret),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "ignored_declared_keys": {
+                "exhaustive": false,
+                "covers": IGNORED_KEYS_COVERS,
+                "keys": self.ignored.iter().collect::<Vec<_>>(),
+            },
+        });
         // Authored prose is spliced in AFTER the scrub, by position, never
         // matched by key name. `reason` is `&'static str` and `covers` is a
         // literal here, so neither can carry operator input — which is what the
@@ -603,39 +666,28 @@ impl Recorder {
         for (i, o) in self.overridden.iter().enumerate() {
             scrubbed["overridden"][i]["reason"] = Value::from(o.reason);
         }
-        scrubbed["ignored_declared_keys"]["covers"] = Value::from(IGNORED_KEYS_COVERS);
         assert_no_cleartext_secrets(&scrubbed, false, "engine_params");
         scrubbed
     }
 
-    fn assemble(&self) -> Value {
-        json!({
-            "schema_version": ENGINE_PARAMS_SCHEMA_VERSION,
-            "phase": self.phase,
-            "invocation": self.invocation,
-            "declared": self.declared,
-            "effective": self.effective,
-            "env": self.env,
-            "overridden": self
-                .overridden
+    /// `effective`, scrubbed, with the built-in-default marker applied by KEY.
+    fn scrubbed_effective(&self) -> Value {
+        Value::Object(
+            self.effective
                 .iter()
-                .map(|o| json!({
-                    "key": o.key,
-                    "declared": o.declared,
-                    "effective": o.effective,
-                }))
-                .collect::<Vec<_>>(),
-            "ignored_declared_keys": {
-                // Naming the limit inside the artifact, because `[]` under a
-                // bare `ignored_declared_keys` reads as "every declared key was
-                // honoured" and that is not what this can establish.
-                "exhaustive": false,
-                "covers": IGNORED_KEYS_COVERS,
-                // Key NAMES only, never values — the one snapshot member the
-                // redaction assertion has nothing to check.
-                "keys": self.ignored.iter().collect::<Vec<_>>(),
-            },
-        })
+                .map(|(k, v)| {
+                    let out = if is_secret(k) && self.from_default.contains(k) {
+                        // Distinguishes "a credential was supplied" from "the
+                        // built-in default was used" without either the writer
+                        // or the scrub round-tripping a magic string.
+                        Value::from(REDACTED_DEFAULT)
+                    } else {
+                        scrub_value(v, is_secret(k))
+                    };
+                    (k.clone(), out)
+                })
+                .collect(),
+        )
     }
 }
 
@@ -736,7 +788,7 @@ pub fn set_phase(phase: &str) {
 /// was declared.
 pub fn set_declared(engine_config: &crate::config::EngineConfig) {
     let raw = engine_config.raw.as_ref();
-    let field = |name: &str| raw.and_then(|r| r.get(name)).map(allowlist_declared);
+    let field = |name: &str| raw.and_then(|r| r.get(name)).cloned();
     let collection = field("collection_params");
     let upload = field("upload_params");
     recorder().set_declared(collection.as_ref(), upload.as_ref());
@@ -772,34 +824,6 @@ pub fn set_declared(engine_config: &crate::config::EngineConfig) {
                 );
             }
         }
-    }
-}
-
-/// Drop the value of any declared key that is not on
-/// [`DECLARED_KEY_ALLOWLIST`], keeping the key so the shape of the declaration
-/// is still visible.
-///
-/// Numbers and booleans are kept regardless of key: they cannot carry a
-/// credential and they are most of what `declared` exists to show.
-fn allowlist_declared(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, v)| {
-                    let keep = is_publishable_declared_key(k) && !is_secret(k);
-                    let scrubbed = match v {
-                        Value::Object(_) | Value::Array(_) if keep => allowlist_declared(v),
-                        // A non-string leaf is safe whatever its key is named.
-                        Value::Number(_) | Value::Bool(_) | Value::Null => v.clone(),
-                        _ if keep => v.clone(),
-                        _ => Value::from(DROPPED),
-                    };
-                    (k.clone(), scrubbed)
-                })
-                .collect(),
-        ),
-        Value::Array(items) => Value::Array(items.iter().map(allowlist_declared).collect()),
-        other => other.clone(),
     }
 }
 
@@ -902,13 +926,14 @@ pub fn env_or(name: &str, default: &str) -> String {
     rec.observe_env(name, raw.as_deref());
     let was_set = raw.is_some();
     let value = raw.unwrap_or_else(|| default.to_string());
-    // Redaction is applied by `record_effective` itself; passing the plaintext
-    // is correct and is what every other caller does. The one thing it cannot
-    // know is whether the value came from the environment or from the built-in
-    // default, which is the difference between `<redacted:set>` and
-    // `<redacted:default>`.
-    if is_secret(name) && !was_set {
-        rec.record_effective_raw(name, Value::from(REDACTED_DEFAULT));
+    // The plaintext is passed either way — the single scrub in `snapshot`
+    // redacts it. The one thing that pass cannot infer is whether the value
+    // came from the environment or from the built-in default, which is the
+    // difference between `<redacted:set>` and `<redacted:default>`, so that is
+    // recorded as a marker on the KEY rather than as a magic string in the
+    // value.
+    if !was_set {
+        rec.record_effective_from_default(name, Value::from(value.clone()));
     } else {
         rec.record_effective(name, Value::from(value.clone()));
     }
@@ -1148,6 +1173,27 @@ pub const CONNECTION_SHAPE_CORPUS: &[(&str, &str)] = &[
     (
         "query-no-equals",
         "https://api.example.com/v1?sk_live_CANARY",
+    ),
+    // -- forged sentinels, round 10: a value that LOOKS like our own output ---
+    // The suffix is the dimension that matters: an exact-match test passes
+    // these, a prefix-match test published them verbatim.
+    (
+        "forged-digest-prefix",
+        "<redacted:opaque sha256=x> password=CANARY",
+    ),
+    (
+        "forged-digest-wellformed",
+        "<redacted:opaque sha256=0123456789abcdef> pw=CANARY",
+    ),
+    ("forged-redacted-set", "<redacted:set> password=CANARY"),
+    (
+        "forged-redacted-default",
+        "<redacted:default> password=CANARY",
+    ),
+    ("forged-dropped", "<dropped> password=CANARY"),
+    (
+        "forged-userinfo",
+        "<redacted:userinfo>@h/db?password=CANARY",
     ),
     // -- prefix before `://` republished verbatim, round 6 --------------------
     ("prefix-before-scheme", "password=CANARY;endpoint=x://h"),
@@ -2323,10 +2369,10 @@ mod tests {
             .unwrap()
             .starts_with("<redacted:opaque"));
         assert_eq!(s["declared"]["upload_params"]["parallel"], 8);
-        assert!(s["declared"]["collection_params"]["endpoint"]
-            .as_str()
-            .unwrap()
-            .starts_with("<redacted:opaque"));
+        // `endpoint` is not an allow-listed declared knob, so it is dropped
+        // before the digest path is reached — the allow-list runs first now,
+        // in the same pass.
+        assert_eq!(s["declared"]["collection_params"]["endpoint"], DROPPED);
     }
 
     /// The assertion is a real backstop, not a restatement of the scrubber: it
@@ -2511,7 +2557,7 @@ mod tests {
     fn corpus_is_append_only_and_probes_both_sides_of_every_delimiter() {
         // Raise this when you ADD shapes. Lowering it means coverage was
         // deleted, which is the failure this pins.
-        const MINIMUM_SHAPES: usize = 56;
+        const MINIMUM_SHAPES: usize = 62;
         assert!(
             CONNECTION_SHAPE_CORPUS.len() >= MINIMUM_SHAPES,
             "the corpus shrank to {} entries (floor {MINIMUM_SHAPES}). Every shape \
@@ -2673,13 +2719,11 @@ mod tests {
         let mut cfg: crate::config::EngineConfig = serde_json::from_value(raw.clone()).unwrap();
         cfg.raw = Some(raw);
         r.set_declared(
-            Some(&allowlist_declared(
-                cfg.raw.as_ref().unwrap().get("collection_params").unwrap(),
-            )),
+            Some(cfg.raw.as_ref().unwrap().get("collection_params").unwrap()),
             None,
         );
         // A credential whose value came from a built-in DEFAULT, not the env.
-        r.record_effective_raw("ELASTIC_PASSWORD", Value::from(REDACTED_DEFAULT));
+        r.record_effective_from_default("ELASTIC_PASSWORD", Value::from("builtin"));
         // …and one that really was set.
         r.record_effective("QDRANT_API_KEY", json!("actual-key"));
 
