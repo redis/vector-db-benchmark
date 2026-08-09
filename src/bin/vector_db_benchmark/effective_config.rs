@@ -292,6 +292,20 @@ struct Override {
 /// `overridden` entry into four identical placeholders that record nothing.
 const ENTRY_KEY_EXEMPT: &[&str] = &["key", "reason"];
 
+/// True for the placeholders this module emits, so a second scrub pass leaves
+/// them alone.
+///
+/// An operator-supplied value that merely LOOKS like one is passed through
+/// unchanged, which is harmless: these are 9-to-40 character literals, none of
+/// them a credential, and a forged `<redacted:opaque …>` is no more misleading
+/// than any other arbitrary string a config can contain.
+fn is_sentinel(s: &str) -> bool {
+    s == REDACTED
+        || s == REDACTED_DEFAULT
+        || s == DROPPED
+        || s.starts_with("<redacted:opaque sha256=")
+}
+
 /// Scrub one JSON value for publication.
 ///
 /// `secret_ancestor` is true when any key on the path to this value is
@@ -330,6 +344,16 @@ fn scrub_value(value: &Value, secret_ancestor: bool) -> Value {
                 .map(|v| scrub_value(v, secret_ancestor))
                 .collect(),
         ),
+        // A value that is ALREADY a sentinel survives the second pass. Without
+        // this, `snapshot`'s whole-document scrub re-processed both of them:
+        // `<dropped>` is not a plain token so it digested to
+        // `<redacted:opaque sha256=36d00e96…>` — the hash of the literal string
+        // `<dropped>` — and `<redacted:default>` under a credential-named key
+        // fell into the arm below and became `<redacted:set>`. The second was
+        // the damaging one: a run with NO password set published
+        // `ELASTIC_PASSWORD = "<redacted:set>"`, the artifact asserting a
+        // credential was supplied when the built-in default was used.
+        Value::String(s) if is_sentinel(s) => Value::String(s.clone()),
         // NOTE: this changes a JSON *type* — a number under a credential-named
         // key becomes a string. Zero false positives across all shipped configs
         // and every recorded knob name today; tracked in #289.
@@ -1007,7 +1031,10 @@ pub const CONNECTION_SHAPE_CORPUS: &[(&str, &str)] = &[
     // -- userinfo, round 1-2 --------------------------------------------------
     ("userinfo", "default:CANARY@127.0.0.1"),
     ("userinfo-url", "redis://admin:CANARY@10.0.0.5:6379/0"),
-    ("mongodb-srv", "mongodb+srv://u:CANARY@cluster.example.net"),
+    (
+        "userinfo-mongodb-srv",
+        "mongodb+srv://uCANARY:CANARY@cluster.example.net",
+    ),
     // -- userinfo with a delimiter INSIDE the password (round 2, lost in 5) ---
     (
         "userinfo-slash-pw",
@@ -1159,11 +1186,11 @@ mod recorder_coverage_guard {
     ///
     /// `effective_config.rs` is the recorder itself. `config.rs` (the library
     /// crate) carries `RedisConfig::from_env`, a `pub` recorder-bypassing
-    /// constructor whose only callers are `src/redisearch/` and
-    /// `src/vectorsets/` — directories that are NOT in `lib.rs`'s module list
-    /// and therefore are not compiled at all. Exempted rather than deleted here
-    /// to keep this change to provenance; removing the dead constructor and the
-    /// two dead directories is tracked separately.
+    /// constructor with no caller compiled into any binary — its remaining
+    /// callers live in `src/redisearch/`, which `lib.rs` does not declare.
+    /// (`src/vectorsets/` held the others until #297 deleted it.) Exempted
+    /// rather than deleted here to keep this change to provenance; #296 removes
+    /// the last directory, after which the constructor should go too.
     /// Whole files exempt from guard 1. Only the recorder itself: `src/config.rs`
     /// used to be here, and is now covered by the per-call `EXEMPT_CALLS` rows
     /// below instead — the prose above them still described the old whole-file
@@ -1181,9 +1208,9 @@ mod recorder_coverage_guard {
              into any binary — asserted by \
              `the_exempted_dead_constructor_has_no_live_caller`, which states \
              the durable fact rather than naming the directories the callers \
-             happen to live in today (#297 deletes src/vectorsets/, #296 \
-             src/redisearch/; after both, the right move is deleting this \
-             constructor, not exempting it). Tracked in #275, superseded \
+             happen to live in today (#297 deleted src/vectorsets/; #296 removes \
+             src/redisearch/, after which the right move is deleting this \
+             constructor rather than exempting it). Tracked in #275, superseded \
              piecemeal by #291/#296/#297",
         ),
         (
@@ -1698,9 +1725,10 @@ mod recorder_coverage_guard {
     /// caller.
     ///
     /// The reasons used to justify themselves by naming `src/redisearch/` and
-    /// `src/vectorsets/` as the only callers. That becomes half-true when #297
-    /// lands and false when #296 does, so the rows now assert the durable
-    /// property instead: nothing that is COMPILED calls it.
+    /// `src/vectorsets/` as the only callers. #297 deleted the second and #296
+    /// removes the first, so the rows assert the durable property instead:
+    /// nothing that is COMPILED calls it. This test is why they survived #297
+    /// unchanged.
     #[test]
     fn the_exempted_dead_constructor_has_no_live_caller() {
         let callers: Vec<String> = rust_sources()
@@ -2470,7 +2498,11 @@ mod tests {
     ///
     /// 1. the entry count never shrinks — a rewrite that "simplifies" the corpus
     ///    by dropping rows fails here rather than silently narrowing coverage;
-    /// 2. any entry containing a delimiter carries a canary on BOTH sides of it.
+    /// 2. any entry containing an `@` carries a canary on at least one side, and
+    ///    the corpus as a whole probes BOTH halves (a set property: per row a
+    ///    `/` inside a password moves the apparent boundary). Every `userinfo*`
+    ///    row additionally carries one in the userinfo before its first internal
+    ///    delimiter.
     ///    Round 5's `userinfo-slash-pw` put the canary only after the `/`, in
     ///    the half that gets dropped, so the row that named the shape was the
     ///    row that hid it — the same accidental-masking failure as
@@ -2479,7 +2511,7 @@ mod tests {
     fn corpus_is_append_only_and_probes_both_sides_of_every_delimiter() {
         // Raise this when you ADD shapes. Lowering it means coverage was
         // deleted, which is the failure this pins.
-        const MINIMUM_SHAPES: usize = 55;
+        const MINIMUM_SHAPES: usize = 56;
         assert!(
             CONNECTION_SHAPE_CORPUS.len() >= MINIMUM_SHAPES,
             "the corpus shrank to {} entries (floor {MINIMUM_SHAPES}). Every shape \
@@ -2530,10 +2562,19 @@ mod tests {
             let at = value
                 .find('@')
                 .unwrap_or_else(|| panic!("[{label}] is a userinfo row with no `@`"));
+            // The canary must sit in the userinfo BEFORE its first internal
+            // delimiter. "Somewhere before the `@`" was too weak: mutating this
+            // row to `redis://admin:pw/CANARY@10.0.0.5:6379/0` — precisely the
+            // round-5 shape the corpus header names — keeps a canary before the
+            // `@` and survived 852/852, because that canary sits in the half the
+            // buggy code dropped.
+            let after_scheme = value.find("://").map(|i| i + 3).unwrap_or(0);
+            let userinfo = &value[after_scheme..at];
+            let head = &userinfo[..userinfo.find(['/', '?', '#']).unwrap_or(userinfo.len())];
             assert!(
-                value[..at].contains("CANARY"),
-                "[{label}] lost the canary BEFORE its `@` — that half is the \
-                 userinfo, and this row exists to prove it is never published"
+                head.contains("CANARY"),
+                "[{label}] has no canary in the userinfo before its first \
+                 internal delimiter — that is the half round 5 published"
             );
         }
         assert!(
@@ -2612,6 +2653,95 @@ mod tests {
         let a = redact_connection_like("host=db sslmode=require");
         assert_eq!(a, redact_connection_like("host=db sslmode=require"));
         assert_ne!(a, redact_connection_like("host=other sslmode=require"));
+    }
+
+    /// Both sentinels must reach the artifact intact.
+    ///
+    /// Eight comments and a commit message asserted they did while `snapshot`'s
+    /// whole-document scrub re-processed them — `<dropped>` digested to the hash
+    /// of the literal `<dropped>`, and `<redacted:default>` became
+    /// `<redacted:set>`. Nothing asserted either, which is exactly why it
+    /// drifted, so both are pinned here.
+    #[test]
+    fn sentinels_survive_the_whole_document_scrub() {
+        let mut r = Recorder::new();
+        let raw = json!({
+            "name": "sentinel-probe",
+            "engine": "redis",
+            "collection_params": { "bearer": "not-a-knob", "hnsw_config": { "M": 16 } },
+        });
+        let mut cfg: crate::config::EngineConfig = serde_json::from_value(raw.clone()).unwrap();
+        cfg.raw = Some(raw);
+        r.set_declared(
+            Some(&allowlist_declared(
+                cfg.raw.as_ref().unwrap().get("collection_params").unwrap(),
+            )),
+            None,
+        );
+        // A credential whose value came from a built-in DEFAULT, not the env.
+        r.record_effective_raw("ELASTIC_PASSWORD", Value::from(REDACTED_DEFAULT));
+        // …and one that really was set.
+        r.record_effective("QDRANT_API_KEY", json!("actual-key"));
+
+        let s = r.snapshot();
+        assert_eq!(
+            s["declared"]["collection_params"]["bearer"], DROPPED,
+            "`<dropped>` was re-scrubbed into a digest of itself"
+        );
+        assert_eq!(
+            s["effective"]["ELASTIC_PASSWORD"], REDACTED_DEFAULT,
+            "a run with NO password set must not claim one was supplied"
+        );
+        assert_eq!(s["effective"]["QDRANT_API_KEY"], REDACTED);
+        // The knob that IS declared still reads normally.
+        assert_eq!(s["declared"]["collection_params"]["hnsw_config"]["M"], 16);
+    }
+
+    /// `env_or`'s set-vs-default branch is reachable end to end.
+    #[test]
+    fn an_unset_credential_default_is_distinguishable_from_a_set_one() {
+        let _l = test_lock();
+        {
+            let _g = EnvGuard::set("VDBB_TEST_PASSWORD", None);
+            reset();
+            assert_eq!(env_or("VDBB_TEST_PASSWORD", "builtin"), "builtin");
+            let s = snapshot();
+            assert_eq!(s["effective"]["VDBB_TEST_PASSWORD"], REDACTED_DEFAULT);
+            assert_eq!(s["env"]["VDBB_TEST_PASSWORD"], Value::Null);
+        }
+        let _g = EnvGuard::set("VDBB_TEST_PASSWORD", Some("supplied"));
+        reset();
+        assert_eq!(env_or("VDBB_TEST_PASSWORD", "builtin"), "supplied");
+        let s = snapshot();
+        assert_eq!(s["effective"]["VDBB_TEST_PASSWORD"], REDACTED);
+        assert_eq!(s["env"]["VDBB_TEST_PASSWORD"], REDACTED);
+    }
+
+    /// The splice attaches each authored reason to ITS OWN entry.
+    ///
+    /// `assemble` emits `overridden` in order and `snapshot` splices by index —
+    /// a convention shared between two functions and asserted nowhere. Reversing
+    /// the iteration in `assemble` mis-attributes every reason and leaves the
+    /// whole suite green, because no test had two overrides with distinct
+    /// reasons.
+    #[test]
+    fn each_override_keeps_its_own_reason() {
+        let mut r = Recorder::new();
+        r.note_override("knob_a", json!(1), json!(2), "REASON-A");
+        r.note_override("knob_b", json!(3), json!(4), "REASON-B");
+        r.note_override("knob_c", json!(5), json!(6), "REASON-C");
+        let s = r.snapshot();
+        for (i, (key, reason)) in [
+            ("knob_a", "REASON-A"),
+            ("knob_b", "REASON-B"),
+            ("knob_c", "REASON-C"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(s["overridden"][i]["key"], *key);
+            assert_eq!(s["overridden"][i]["reason"], *reason);
+        }
     }
 
     /// A `reason` or `covers` key inside OPERATOR data must not be published.
