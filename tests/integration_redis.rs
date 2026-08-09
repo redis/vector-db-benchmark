@@ -3280,3 +3280,528 @@ fn test_binary_redis_skip_upload_without_keep_data_preserves_corpus() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #290 — `--skip-upload` must not run against a corpus it cannot VERIFY
+// ---------------------------------------------------------------------------
+
+/// A `--skip-upload` run whose dataset offers no expected row count must abort,
+/// not proceed with a printed note (issue #290).
+///
+/// Before this fix the guard compared an `Option<u64>` expected count against
+/// the server-side count, and `None` short-circuited to a printed "Reuse check —
+/// SKIPPED" and `Ok`. `None` is reachable without any user error: the count is
+/// measured from the corpus FILE, and `--skip-upload` exists precisely for the
+/// case where the corpus lives on the server and not on this machine.
+///
+/// This test reaches that state the way the tool's own doc comment describes it
+/// — "one whose big `vectors.npy` was deleted to reclaim disk while
+/// `tests.jsonl` stayed behind so queries still work" — by deleting
+/// `vectors.npy` from the fixture. Queries and ground truth are in
+/// `tests.jsonl`, so the run still searches and still publishes.
+///
+/// What the assertions rest on: the server-side row count read back with
+/// `FT.INFO` (`ft_info_num_docs`), before and after each run. Recall is asserted
+/// once, at the very end, only to show what the waiver publishes — it is NOT the
+/// detector, and could not be: on a truncated corpus recall is a coin flip on
+/// which rows went.
+///
+/// Structure: a POSITIVE CONTROL first (everything present → the run must
+/// succeed and record `verified`), then the guard with the server corpus INTACT
+/// (proving it fires on unverifiability itself, not on missing data), then with
+/// the server corpus EMPTY (the published-recall-0.0 case from the issue), then
+/// the `--allow-partial-corpus` waiver, then the second `None` path: a corpus
+/// file whose header cannot be READ. That last phase is the one that covers the
+/// swallowed-`Err` half of #290 — `reuse_expected_rows` already returned `Err`
+/// for it on master; it was the caller that turned that into "cannot verify".
+///
+/// RED on unfixed master `7ed81eb`: every guarded run here exits 0 and writes a
+/// search result file; the empty-corpus one publishes `mean_recall` 0.0 with
+/// `corpus_reuse.status` `"unverified"` and `failed_queries` 0.
+#[test]
+fn test_binary_redis_skip_upload_unverifiable_corpus_is_fatal() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg290unver", "engine": "redis",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg290unver-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
+    let results_dir = proj.root.join("results");
+    let vectors_npy = proj
+        .root
+        .join("datasets")
+        .join("cfg290unver-test")
+        .join("vectors.npy");
+
+    // Phase 1: build the corpus the later runs are told to reuse.
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg290unver",
+            "cfg290unver-test",
+            "localhost",
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg290unver"),
+        common::N_DOCS as i64,
+        "phase 1 must leave a complete corpus"
+    );
+    delete_search_result_files(&results_dir);
+
+    let bin = binary_path();
+    let run = |extra: &[&str]| {
+        let mut cmd = Command::new(&bin);
+        cmd.args([
+            "--engines",
+            "cfg290unver",
+            "--datasets",
+            "cfg290unver-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ]);
+        cmd.args(extra);
+        cmd.env("REDIS_PORT", &port)
+            .current_dir(&proj.root)
+            .output()
+            .expect("run vector-db-benchmark")
+    };
+    let combined = |out: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let wrote_search_result = || {
+        fs::read_dir(&results_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("-search-"))
+    };
+
+    // POSITIVE CONTROL. Corpus file present, server corpus complete: the guard
+    // must let this through, or the test could pass by rejecting everything.
+    let control = run(&[]);
+    assert!(
+        control.status.success(),
+        "--skip-upload over a corpus that IS verifiable and complete must succeed.\n{}",
+        combined(&control)
+    );
+    let reuse = common::read_params_obj(&proj.root, "cfg290unver")["corpus_reuse"].clone();
+    assert_eq!(reuse["status"], "verified", "control verdict: {reuse}");
+    assert_eq!(reuse["expected_rows"], common::N_DOCS as u64);
+    assert_eq!(reuse["actual_rows"], common::N_DOCS as u64);
+    delete_search_result_files(&results_dir);
+
+    // Take the corpus FILE away. tests.jsonl (queries + ground truth) and
+    // payloads.jsonl stay, so nothing else about the run changes: it can still
+    // search, and the dataset directory still exists so no download is
+    // attempted. Only the expected row count is now unobtainable.
+    fs::remove_file(&vectors_npy).expect("remove vectors.npy");
+
+    // (a) Server corpus INTACT. The number this run would publish is in fact
+    // correct — and the tool has no way to know that. Asserting the FT.INFO
+    // count here is what proves the abort is about unverifiability and not
+    // about missing data.
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg290unver"),
+        common::N_DOCS as i64,
+        "the server-side corpus must still be complete at this point"
+    );
+    let intact = run(&[]);
+    let intact_out = combined(&intact);
+    assert!(
+        !intact.status.success(),
+        "--skip-upload must abort when the dataset's expected row count cannot be \
+         determined (issue #290), but the run succeeded.\n{intact_out}"
+    );
+    assert!(
+        intact_out.contains("has nothing to compare against")
+            && intact_out.contains("config 'cfg290unver'")
+            // The dataset DIRECTORY is still here — only vectors.npy is gone —
+            // and `get_path()` returns early on an existing path, so nothing was
+            // fetched and nothing could be. The message must say that, not imply
+            // a download was attempted (#290 review).
+            && intact_out.contains("but its corpus file is not in it")
+            && intact_out.contains("never re-downloaded"),
+        "the error must name the missing side of the comparison, and the real \
+         remedy for a directory that exists without its corpus.\n{intact_out}"
+    );
+    assert!(
+        !wrote_search_result(),
+        "a rejected --skip-upload run must not leave a search result file behind"
+    );
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg290unver"),
+        common::N_DOCS as i64,
+        "the reuse check must never modify the corpus"
+    );
+
+    // (b) Server corpus EMPTY — the case from the issue. Index kept so the probe
+    // still succeeds and reports an exact 0; dropping it would instead exercise
+    // the (already fatal) probe-failure branch.
+    for id in 0..common::N_DOCS {
+        let _: () = redis::cmd("UNLINK")
+            .arg(format!("cfg290unver:{id}"))
+            .query(&mut conn)
+            .unwrap();
+    }
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg290unver"),
+        0,
+        "server-side ground truth for this phase: the corpus is gone"
+    );
+    let empty = run(&[]);
+    let empty_out = combined(&empty);
+    assert!(
+        !empty.status.success(),
+        "--skip-upload over an EMPTY corpus it cannot verify must abort.\n{empty_out}"
+    );
+    assert!(
+        !wrote_search_result(),
+        "the rejected run must not publish a result file for an empty corpus"
+    );
+
+    // (c) The waiver. It must work, must warn, and must be recorded.
+    let waived = run(&["--allow-partial-corpus"]);
+    assert!(
+        waived.status.success(),
+        "--allow-partial-corpus must downgrade the guard to a warning.\n{}",
+        combined(&waived)
+    );
+    assert!(
+        String::from_utf8_lossy(&waived.stderr).contains("WARNING: --skip-upload"),
+        "the override must still warn.\n{}",
+        combined(&waived)
+    );
+    let reuse = common::read_params_obj(&proj.root, "cfg290unver")["corpus_reuse"].clone();
+    assert_eq!(
+        reuse["status"], "corpus_size_unknown",
+        "the waived verdict must be distinguishable from an engine-side \
+         'unverified' in the artifact: {reuse}"
+    );
+    assert_eq!(reuse["expected_rows"], serde_json::Value::Null);
+    assert_eq!(reuse["actual_rows"], 0);
+    assert_eq!(reuse["waived_by_allow_partial_corpus"], true);
+    // A waived run is a PUBLISHED result whose count was never checked, so the
+    // reason has to travel in the file — `probe_failed` has carried `detail`
+    // since #238 and this arm now matches it (#290 review).
+    assert!(
+        reuse["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("but its corpus file is not in it")),
+        "the waived artifact must record WHY the count was unknown: {reuse}"
+    );
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg290unver"),
+        0,
+        "the reuse check must never modify the corpus, waived or not"
+    );
+
+    // Illustrative only: this is the number the default path used to publish
+    // with exit 0. It is NOT the detector — see the doc comment.
+    assert_eq!(
+        common::read_recall(&proj.root, "cfg290unver"),
+        0.0,
+        "an empty corpus scores recall 0.0 — the number #290 is about"
+    );
+    assert_eq!(
+        common::read_results_obj(&proj.root, "cfg290unver")["failed_queries"],
+        0,
+        "and it scores it with no failed queries, which is why nothing else catches it"
+    );
+
+    // (d) The OTHER #290 path, and the widest one: the corpus file IS present
+    // but its header cannot be read. `reuse_expected_rows` already returned Err
+    // here before this fix — it was the CALL SITE that degraded that Err to
+    // `None`, leaving the guard inert for the run. So this phase, not the unit
+    // tests, is what covers the swallowed-Err half of the issue.
+    delete_search_result_files(&results_dir);
+    fs::write(&vectors_npy, b"not an npy file at all").expect("write junk vectors.npy");
+    let junk = run(&[]);
+    let junk_out = combined(&junk);
+    assert!(
+        !junk.status.success(),
+        "a failed corpus measurement must abort the run, not be swallowed into \
+         'cannot verify' (issue #290).\n{junk_out}"
+    );
+    assert!(
+        junk_out.contains("measuring the corpus on disk failed"),
+        "the error must say the measurement FAILED, not that the layout has no \
+         count — they are different conditions.\n{junk_out}"
+    );
+    assert!(
+        !wrote_search_result(),
+        "the rejected run must not publish a result file after a failed measurement"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// Issue #290 review, BLOCKER 1: the reuse check must not reject a dataset the
+/// tool is about to fetch for itself.
+///
+/// The check runs before the search phase, and the search phase's very first act
+/// is `read_queries()` → `get_path()`, which downloads a dataset that is not on
+/// disk yet. 49 of the 57 shipped datasets carry a `link`. Measuring before that
+/// fetch made "not downloaded yet" indistinguishable from "not obtainable", so
+/// the first `--skip-upload` run on a fresh benchmark client — a machine that
+/// loaded the server from somewhere else, which is the flag's central use case —
+/// was rejected seconds before the tool would have fetched the corpus. With
+/// `--exit-on-error` defaulting to true, one such dataset kills a whole sweep.
+///
+/// This test serves the dataset as a `.tgz` from a `TcpListener` on localhost —
+/// no external network — and deletes it from disk, leaving the server corpus
+/// complete.
+///
+/// The load-bearing assertion is `corpus_reuse.status == "verified"` with
+/// `expected_rows == 400`. That is stronger than "the run succeeded": it is only
+/// reachable if the corpus was fetched BEFORE the count was measured. It is RED
+/// on both trees for different reasons — master `7ed81eb` succeeds but records
+/// `"unverified"` with `expected_rows: null` (the search phase downloaded the
+/// corpus *after* the check), and `ce51f65` aborts outright.
+///
+/// The final phase is the control that keeps the fetch-first step from simply
+/// disabling the guard: same corpus-absent state with the `link` removed, so
+/// nothing can resolve it, must still be a hard error.
+///
+/// That control asserts WHERE the run stopped, not just that it stopped. Exit
+/// code and the message text are both satisfied by a neutered guard, because the
+/// search phase's own `get_path()` fails on an unresolvable dataset and prints
+/// the same reason as a warning — a reviewer demonstrated exactly that mutation
+/// passing an earlier version of this test. The discriminating assertions are
+/// the absence of `Experiment stage: Search` (a rejected run never reaches the
+/// search phase) and of `WARNING: --skip-upload` (a fatal arm never warns).
+#[test]
+fn test_binary_redis_skip_upload_fetches_the_dataset_before_judging_it() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": "cfg290fetch", "engine": "redis",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project(
+        "cfg290fetch-test",
+        &serde_json::to_string(&configs).unwrap(),
+        dim,
+    );
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
+    let results_dir = proj.root.join("results");
+    let ds_dir = proj.root.join("datasets").join("cfg290fetch-test");
+    let datasets_json = proj.root.join("datasets").join("datasets.json");
+
+    // Phase 1: build the corpus the reuse run is told to reuse.
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg290fetch",
+            "cfg290fetch-test",
+            "localhost",
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg290fetch"),
+        common::N_DOCS as i64,
+        "phase 1 must leave a complete corpus"
+    );
+    delete_search_result_files(&results_dir);
+
+    // Pack the dataset directory into a .tgz, exactly the layout `extract_tgz`
+    // unpacks into `datasets/<name>/`.
+    let tgz: Vec<u8> = {
+        let mut buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::fast());
+            let mut ar = tar::Builder::new(enc);
+            ar.append_dir_all("", &ds_dir).expect("tar the dataset");
+            ar.into_inner()
+                .expect("finish tar")
+                .finish()
+                .expect("finish gzip");
+        }
+        buf
+    };
+
+    // Serve it from localhost. One thread, answers every request with the same
+    // body; the binary makes exactly one GET, but a loop keeps a stray probe
+    // from wedging the download's 15-attempt retry.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local http server");
+    let http_port = listener.local_addr().unwrap().port();
+    let body = tgz.clone();
+    let server = thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            use std::io::{Read, Write};
+            let mut scratch = [0u8; 2048];
+            let _ = s.read(&mut scratch); // request line + headers; content ignored
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if s.write_all(head.as_bytes()).is_err() || s.write_all(&body).is_err() {
+                break;
+            }
+            let _ = s.flush();
+        }
+    });
+
+    let write_link = |link: Option<&str>| {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&datasets_json).unwrap()).unwrap();
+        let entry = &mut v.as_array_mut().unwrap()[0];
+        match link {
+            Some(l) => {
+                entry["link"] = serde_json::json!(l);
+            }
+            None => {
+                entry.as_object_mut().unwrap().remove("link");
+            }
+        }
+        fs::write(&datasets_json, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    };
+    write_link(Some(&format!(
+        "http://127.0.0.1:{http_port}/cfg290fetch.tgz"
+    )));
+
+    // The dataset is gone from this machine. The server corpus is untouched.
+    fs::remove_dir_all(&ds_dir).expect("remove the dataset from disk");
+    assert!(
+        !ds_dir.exists(),
+        "the dataset must be absent before the run"
+    );
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg290fetch"),
+        common::N_DOCS as i64,
+        "the server-side corpus must still be complete"
+    );
+
+    let wrote_search_result = || {
+        fs::read_dir(&results_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("-search-"))
+    };
+    let bin = binary_path();
+    let run = || {
+        let mut cmd = Command::new(&bin);
+        cmd.args([
+            "--engines",
+            "cfg290fetch",
+            "--datasets",
+            "cfg290fetch-test",
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ]);
+        cmd.env("REDIS_PORT", &port)
+            .current_dir(&proj.root)
+            .output()
+            .expect("run vector-db-benchmark")
+    };
+
+    let out = run();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "a dataset that is merely not downloaded yet must not be a hard error \
+         (#290 review, BLOCKER 1).\n{combined}"
+    );
+    assert!(
+        ds_dir.join("vectors.npy").exists(),
+        "the run must have fetched the corpus.\n{combined}"
+    );
+    let reuse = common::read_params_obj(&proj.root, "cfg290fetch")["corpus_reuse"].clone();
+    assert_eq!(
+        reuse["status"], "verified",
+        "the fetch must happen BEFORE the count is measured — 'unverified' here \
+         means the corpus arrived too late to be checked: {reuse}"
+    );
+    assert_eq!(reuse["expected_rows"], common::N_DOCS as u64);
+    assert_eq!(reuse["actual_rows"], common::N_DOCS as u64);
+    assert_eq!(
+        ft_info_num_docs(&mut conn, "idx:cfg290fetch"),
+        common::N_DOCS as i64,
+        "the reuse check must never modify the corpus"
+    );
+
+    // CONTROL: fetching first must not have disabled the guard. Same absent
+    // corpus, but now nothing can fetch it — that is still a hard error.
+    delete_search_result_files(&results_dir);
+    fs::remove_dir_all(&ds_dir).expect("remove the dataset again");
+    write_link(None);
+    let out2 = run();
+    let combined2 = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        !out2.status.success(),
+        "a corpus that is not on this machine and cannot be resolved must still abort.\n{combined2}"
+    );
+    assert!(
+        combined2.contains("has no corpus at"),
+        "the error must name the corpus, not the layout.\n{combined2}"
+    );
+    // The assertions above are NOT enough on their own, and saying so is the
+    // point of this comment. A neutered guard — `CorpusSizeUnknown` downgraded
+    // to warn-and-continue — still exits non-zero here, because the search
+    // phase's own `get_path()` cannot resolve the dataset either, and still
+    // prints the reason as a warning. Both would pass while the guard did
+    // nothing. What separates them is WHERE the run stopped: the guard aborts
+    // before the search phase begins, so neither the stage banner nor the
+    // reader's own failure may appear.
+    assert!(
+        !combined2.contains("Experiment stage: Search"),
+        "the reuse check must reject this BEFORE the search phase — reaching it \
+         means the guard did not fire and something else failed the run.\n{combined2}"
+    );
+    assert!(
+        !combined2.contains("WARNING: --skip-upload"),
+        "the guard must REJECT here, not warn: a warning means the arm was \
+         downgraded and the run died downstream instead.\n{combined2}"
+    );
+    assert!(
+        !wrote_search_result(),
+        "the rejected run must not leave a search result file behind"
+    );
+
+    drop(server); // the listener closes with the test process
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
