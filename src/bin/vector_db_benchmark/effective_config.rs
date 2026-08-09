@@ -1065,25 +1065,30 @@ mod recorder_coverage_guard {
         (
             "src/config.rs",
             "env::var(\"REDIS_PORT\")",
-            "RedisConfig::from_env is a pub constructor whose only callers are \
-             src/redisearch/ and src/vectorsets/, neither of which lib.rs \
-             declares — dead code, tracked for deletion in #275",
+            "RedisConfig::from_env is a pub constructor with NO caller compiled \
+             into any binary — asserted by \
+             `the_exempted_dead_constructor_has_no_live_caller`, which states \
+             the durable fact rather than naming the directories the callers \
+             happen to live in today (#297 deletes src/vectorsets/, #296 \
+             src/redisearch/; after both, the right move is deleting this \
+             constructor, not exempting it). Tracked in #275, superseded \
+             piecemeal by #291/#296/#297",
         ),
         (
             "src/config.rs",
             "env::var(\"REDIS_AUTH\")",
-            "as REDIS_PORT above (#275)",
+            "as REDIS_PORT above",
         ),
         (
             "src/config.rs",
             "env::var(\"REDIS_USER\")",
-            "as REDIS_PORT above (#275)",
+            "as REDIS_PORT above",
         ),
         (
             "src/config.rs",
             "env::var(\"REDIS_CLUSTER\")",
-            "as REDIS_PORT above (#275); also documented in v0/DOCKER_README.md \
-             and read by nothing live",
+            "as REDIS_PORT above; also documented in v0/DOCKER_README.md and \
+             read by nothing live",
         ),
         (
             "src/bin/vector_db_benchmark/config.rs",
@@ -1105,6 +1110,15 @@ mod recorder_coverage_guard {
 
     /// Directories on disk that no crate root declares, so nothing in them is
     /// compiled and nothing in them can read the environment at runtime.
+    ///
+    /// Asserted in BOTH directions by
+    /// `uncompiled_directories_are_present_and_genuinely_uncompiled`, like
+    /// `KNOWN_UNRECORDED` and `EXEMPT_CALLS`. This was the one inventory here
+    /// that had only a skip filter and no assertion — and a stale skip row is
+    /// the worst kind, because it silently WIDENS what the scanner ignores.
+    /// `src/vectorsets/` is being deleted (#297) and `src/redisearch/` next
+    /// (#296); when either lands, the row must go with it, and the test below
+    /// is what makes that a build failure instead of a rotting exemption.
     const UNCOMPILED: &[&str] = &["src/redisearch/", "src/vectorsets/"];
 
     /// Environment variables still read through the plain [`super::env_var`]
@@ -1558,6 +1572,79 @@ mod recorder_coverage_guard {
             "the recording must begin BEFORE the engine is built — engines resolve most of \
              their environment knobs in `new()`, so a later reset would erase them"
         );
+    }
+
+    /// The dead constructor the `src/config.rs` rows excuse really has no live
+    /// caller.
+    ///
+    /// The reasons used to justify themselves by naming `src/redisearch/` and
+    /// `src/vectorsets/` as the only callers. That becomes half-true when #297
+    /// lands and false when #296 does, so the rows now assert the durable
+    /// property instead: nothing that is COMPILED calls it.
+    #[test]
+    fn the_exempted_dead_constructor_has_no_live_caller() {
+        let callers: Vec<String> = rust_sources()
+            .into_iter()
+            .filter(|(path, _)| {
+                !UNCOMPILED.iter().any(|d| path.starts_with(d))
+                    // Its own definition and unit tests do not make it live.
+                    && path != "src/config.rs"
+            })
+            .filter(|(_, src)| strip_test_modules(src).contains("RedisConfig::from_env"))
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            callers.is_empty(),
+            "`RedisConfig::from_env` bypasses the recorder and is exempted on the \
+             grounds that nothing compiled calls it. These do: {callers:?}"
+        );
+    }
+
+    /// GUARD 1c — the "not compiled, so not scanned" rows are true, both ways.
+    ///
+    /// Two legs, because a skip filter can rot in two directions:
+    ///
+    /// 1. the directory still EXISTS — otherwise the row excuses nothing and is
+    ///    the stale exemption these inventories exist to prevent;
+    /// 2. no crate root DECLARES it — otherwise the code is compiled, can read
+    ///    the environment at runtime, and is being skipped anyway.
+    ///
+    /// Leg 2 is the one that matters: adding `mod vectorsets;` to `lib.rs` would
+    /// silently bring 1,400 unscanned lines into the build.
+    #[test]
+    fn uncompiled_directories_are_present_and_genuinely_uncompiled() {
+        let root = repo_root();
+        let crate_roots: Vec<String> = [
+            "src/lib.rs",
+            "src/bin/vector_db_benchmark/main.rs",
+            "src/bin/bench_hdf5.rs",
+            "src/bin/bench_jsonl.rs",
+            "src/bin/bench_npy.rs",
+            "src/bin/generate_dataset.rs",
+        ]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(root.join(p)).ok())
+        .collect();
+
+        for dir in UNCOMPILED {
+            assert!(
+                root.join(dir).is_dir(),
+                "UNCOMPILED lists `{dir}`, which no longer exists — delete the row \
+                 (and any EXEMPT_CALLS reason that cites it) so the skip filter \
+                 cannot silently widen what the scanner ignores. Tracked in \
+                 #275 / #296 / #297."
+            );
+            let module = dir.trim_start_matches("src/").trim_end_matches('/');
+            for src in &crate_roots {
+                let declared = strip_test_modules(src);
+                assert!(
+                    !declared.contains(&format!("mod {module};")),
+                    "`{dir}` IS declared as a module and therefore compiled, but \
+                     UNCOMPILED tells the scanner to skip it — every environment \
+                     read in it would be invisible. Remove the row."
+                );
+            }
+        }
     }
 
     /// GUARD 1b — the scoped exemptions are real.
