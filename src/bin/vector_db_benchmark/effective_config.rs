@@ -1639,6 +1639,14 @@ mod recorder_coverage_guard {
 
     /// GUARD 1 — nothing outside the recorder reads the environment.
     ///
+    /// Walks `src/` only. `tests/` is deliberately out of scope: test code
+    /// legitimately reads the environment (`tests/harness_invariants.rs` has
+    /// nine such reads and `tests/common/mod.rs` two), none of it is compiled
+    /// into a binary, and nothing there can put a value in an artifact. That
+    /// territory belongs to #300's `harness_invariants`, which walks `tests/`
+    /// and not `src/` — the two scanners are disjoint by construction and
+    /// cannot disagree about a file.
+    ///
     /// Catches a raw `std::env::var` added the ordinary way, which compiles
     /// clean, passes the suite, and drops its knob from every artifact.
     #[test]
