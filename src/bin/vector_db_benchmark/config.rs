@@ -879,6 +879,150 @@ mod tests {
         );
     }
 
+    /// A shipped dataset that cannot be measured without its corpus must
+    /// declare a `vector_count` (#290 review).
+    ///
+    /// `h5-multi` has no cheap row count at all — its total is the sum of 100
+    /// part headers. `sparse` IS measurable now (`csr_row_count` reads `n_row`
+    /// from `data.csr`'s 24-byte header), but only where that file is, which
+    /// under `--skip-upload` is often not this machine. For both, then,
+    /// `vector_count` is the fallback the reuse check falls back TO, and without
+    /// it the check has nothing to compare a server-side count against and the
+    /// run is rejected. That is how `synthetic-sparse-300` (150 rows, no
+    /// declared count) was found — by reading the entry, not by any test: its
+    /// files are exactly where the code expects, and no suite exercises
+    /// `--skip-upload` against it. This catches the class from `datasets.json`
+    /// alone, with no corpus on disk.
+    ///
+    /// It also checks the VALUE, two ways from `datasets.json` alone plus one
+    /// that needs the corpus:
+    ///
+    /// 1. `synthetic-sparse-300` against the generator's own
+    ///    `SYNTHETIC_SPARSE_ROWS`. Its name says 300, which is the DIMENSION —
+    ///    a reviewer proposed exactly that as the row count, and it would have
+    ///    made a correct 150-row corpus classify as `Short`.
+    /// 2. An `h5-multi` count against the span its own parts declare: laion's
+    ///    100 parts carry `start_idx`/`end_idx`, so its 1e9 is checkable with no
+    ///    corpus and no network. That matters most for this layout, since it is
+    ///    the one still TRUSTED at runtime.
+    /// 3. Any `sparse` corpus that happens to be on this machine, measured. A
+    ///    no-op in CI, which has none.
+    ///
+    /// What closes the wrong-value class at RUNTIME is the header read: with
+    /// `data.csr` present the measurement wins, so no declaration can steer the
+    /// verdict. The residual is a wrong declaration on a machine WITHOUT the
+    /// corpus, where there is nothing to measure against — which is what checks
+    /// 1 and 2 exist to cover for the shipped set.
+    #[test]
+    fn unmeasurable_shipped_layouts_declare_a_vector_count() {
+        let configs = read_dataset_configs().expect("datasets.json must parse");
+        let mut checked = 0;
+        let mut measured_against = 0;
+        let mut missing = Vec::new();
+        for (name, cfg) in &configs {
+            if !matches!(
+                cfg.dataset_type.as_deref().unwrap_or(""),
+                "sparse" | "h5-multi"
+            ) {
+                continue;
+            }
+            checked += 1;
+            let declared = cfg.vector_count.filter(|&n| n > 0);
+            let Some(declared) = declared else {
+                missing.push(format!(
+                    "  dataset '{name}' has layout '{}' (not measurable without its corpus) but \
+                     declares vector_count {:?}",
+                    cfg.dataset_type.as_deref().unwrap_or(""),
+                    cfg.vector_count,
+                ));
+                continue;
+            };
+            // Value pin 1, from datasets.json ALONE: the one shipped sparse
+            // dataset this repo generates itself is checked against the
+            // generator's own constant. Its name says 300, which is the
+            // DIMENSION — a reviewer proposed exactly that as the row count, and
+            // it would have made a correct 150-row corpus classify as `Short`.
+            if name == "synthetic-sparse-300" {
+                measured_against += 1;
+                let expected = vector_db_benchmark::synthetic::SYNTHETIC_SPARSE_ROWS as i64;
+                if declared != expected {
+                    missing.push(format!(
+                        "  dataset '{name}' declares vector_count {declared} but \
+                         generate-dataset writes {expected} rows (SYNTHETIC_SPARSE_ROWS); \
+                         note {} is its DIMENSION, not its row count",
+                        vector_db_benchmark::synthetic::SYNTHETIC_SPARSE_DIM,
+                    ));
+                }
+            }
+
+            // Value pin 2, also from datasets.json alone: an `h5-multi` count
+            // must equal the span its own parts describe. laion's 100 parts each
+            // carry start_idx/end_idx, so the declared total is checkable with
+            // no corpus and no network — and this layout is the one that stays
+            // TRUSTED at runtime, since summing 100 headers is not an option.
+            if cfg.dataset_type.as_deref() == Some("h5-multi") {
+                if let Some(parts) = cfg.path.get("data").and_then(|d| d.as_array()) {
+                    let span: i64 = parts
+                        .iter()
+                        .filter_map(|p| {
+                            Some(p.get("end_idx")?.as_i64()? - p.get("start_idx")?.as_i64()?)
+                        })
+                        .sum();
+                    if span > 0 {
+                        measured_against += 1;
+                        if span != declared {
+                            missing.push(format!(
+                                "  dataset '{name}' declares vector_count {declared} but its \
+                                 {} parts span {span} rows",
+                                parts.len()
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Value check, only when the corpus is actually here (a no-op in CI).
+            if cfg.dataset_type.as_deref() == Some("sparse") {
+                let csr = cfg
+                    .path
+                    .as_str()
+                    .map(|p| datasets_dir().join(p).join("data.csr"));
+                if let Some(csr) = csr.filter(|p| p.exists()) {
+                    measured_against += 1;
+                    match vector_db_benchmark::readers::csr_row_count(csr.to_str().unwrap()) {
+                        Ok(rows) if rows != declared as u64 => missing.push(format!(
+                            "  dataset '{name}' declares vector_count {declared} but its \
+                             {} holds {rows} rows",
+                            csr.display()
+                        )),
+                        Ok(_) => {}
+                        Err(e) => missing.push(format!(
+                            "  dataset '{name}' has a data.csr that cannot be read: {e}"
+                        )),
+                    }
+                }
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "{} unmeasurable dataset(s) declare no vector_count, so --skip-upload cannot \
+             verify them (#290):\n{}",
+            missing.len(),
+            missing.join("\n"),
+        );
+        assert!(
+            checked >= 4,
+            "expected to find the shipped sparse/h5-multi datasets, found {checked}"
+        );
+        // Not an assertion on `measured_against`: CI has no corpus on disk, so
+        // it is legitimately 0 there. Printed so a local run says whether the
+        // value check actually ran.
+        if measured_against > 0 {
+            println!("(value-checked {measured_against} sparse corpora present on this machine)");
+        }
+    }
+
     #[test]
     fn path_implied_corpus_size_only_fires_on_real_magnitude_tokens() {
         let s = |v: &str| serde_json::Value::String(v.to_string());

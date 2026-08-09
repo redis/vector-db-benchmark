@@ -9,7 +9,7 @@ use crate::download;
 use vector_db_benchmark::query_filter::QueryConditions;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
-    hdf5_train_row_count, npy_row_count, read_compound_data, read_compound_queries,
+    csr_row_count, hdf5_train_row_count, npy_row_count, read_compound_data, read_compound_queries,
     read_gt_neighbours, read_hdf5_vectors, read_jsonl_queries, read_jsonl_vectors,
     read_npy_vectors, read_sparse_matrix, SparseVector,
 };
@@ -127,24 +127,19 @@ impl Dataset {
                 "jsonl" => "jsonl",
                 _ => return Ok(None),
             },
-            // "sparse" (CSR) and "h5-multi" (many part files) are not measured
-            // here, so they fall back to the declared count via
-            // `unmeasurable_corpus_is_present`.
-            //
-            // This matters now: `msmarco-sparse-100K` / `-1M` are `sparse` AND
-            // declare a vector_count, so their gate target IS the declared
-            // number. What keeps that honest is the path-size CI check in
-            // config.rs — their leaf segments (`100K`, `1M`) advertise their
-            // size, so a wrong count fails CI from datasets.json alone, with no
-            // corpus on disk. The residual it does NOT cover is a correct count
-            // paired with the wrong `data.csr` (the two sizes share one query
-            // set), which would let the gate skip early.
-            //
-            // Closing that properly is cheap and worth doing: the CSR header's
-            // FIRST i64 is n_row, so a 24-byte read yields an exact row count —
-            // the same trick `npy_row_count` uses. Deliberately left out of the
-            // merge that introduced this collision so it lands with its own
-            // tests rather than riding in as a conflict resolution.
+            // "sparse" (CSR) IS measurable: the header's first i64 is n_row, so
+            // a 24-byte read gives an exact count — the same trick
+            // `npy_row_count` uses. Doing it here is what stops `datasets.json`
+            // being TRUSTED for this layout: a wrong declaration otherwise makes
+            // a correct corpus classify `Short` (false abort) or a short one
+            // classify `Surplus` (warn, publish the wrong number). It also
+            // closes the residual the config.rs path-size check could not:
+            // `msmarco-sparse-100K`/`-1M` share one query set, so a correct
+            // count paired with the WRONG `data.csr` used to pass.
+            "sparse" => "csr",
+            // "h5-multi" (many part files) is the one layout left with no cheap
+            // row count: the total is the sum of 100 part headers and the parts
+            // are not all present. It still falls back to the declared count.
             _ => return Ok(None),
         };
 
@@ -164,6 +159,18 @@ impl Dataset {
             "hdf5" => {
                 let s = path.to_str().ok_or("Invalid HDF5 path encoding")?;
                 hdf5_train_row_count(s).map(Some)
+            }
+            "csr" => {
+                // The corpus lives in <dir>/data.csr; queries.csr is a separate
+                // matrix and must never be counted as the corpus. An absent
+                // data.csr is the --skip-upload case (corpus on the server, not
+                // here), which is "unknown", not zero.
+                let csr = path.join("data.csr");
+                if !csr.exists() {
+                    return Ok(None);
+                }
+                let s = csr.to_str().ok_or("Invalid data.csr path encoding")?;
+                csr_row_count(s).map(Some)
             }
             _ => {
                 let file = if path.is_dir() {
@@ -273,6 +280,39 @@ impl Dataset {
         } else {
             Ok(None)
         }
+    }
+
+    /// Whether anything exists at this dataset's local path — the corpus
+    /// directory or file — WITHOUT triggering a download.
+    ///
+    /// The `--skip-upload` check uses it to tell two failures apart that read
+    /// alike otherwise: a dataset that is not on this machine at all, and a
+    /// dataset directory that IS here but has lost its corpus file. The second
+    /// is not re-fetchable — [`Self::get_path`] returns early when the path
+    /// exists, so a valid `link` is never followed for it — and saying so is the
+    /// difference between an actionable error and a misleading one.
+    pub fn corpus_path_exists(&self) -> bool {
+        self.local_path().is_some()
+    }
+
+    /// Whether the declared `vector_count` may stand in when this layout's
+    /// corpus cannot be measured here.
+    ///
+    /// `sparse` IS measurable now — [`csr_row_count`] reads `n_row` out of
+    /// `data.csr`'s 24-byte header — but only when that file is on this machine,
+    /// which under `--skip-upload` it often is not. `h5-multi` is the one layout
+    /// with no cheap count at all: the total is the sum of 100 part headers.
+    /// Everything else must be MEASURED and is never allowed to fall back (#224).
+    ///
+    /// Deliberately says nothing about whether the files are present: callers
+    /// that must not skip an upload want [`Self::unmeasurable_corpus_is_present`]
+    /// as well, but the `--skip-upload` reuse check does not upload and so does
+    /// not need it (#290 review).
+    pub fn may_fall_back_to_declared_count(&self) -> bool {
+        matches!(
+            self.config.dataset_type.as_deref().unwrap_or(""),
+            "sparse" | "h5-multi"
+        )
     }
 
     /// Whether this is one of the layouts with no cheap row count AND all of its

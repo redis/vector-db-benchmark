@@ -49,14 +49,25 @@ pub struct Args {
     pub skip_upload: bool,
 
     /// Downgrade the `--skip-upload` reuse precondition from a hard error to a
-    /// warning (issue #238).
+    /// warning (issues #238, #290).
     ///
     /// By default a `--skip-upload` run aborts when the engine holds fewer rows
     /// than the dataset declares — including zero, i.e. a missing index — because
     /// recall is scored against ground truth for the FULL corpus and a short
     /// corpus therefore publishes a wrong number under a config name that claims
-    /// otherwise. Set this to measure a deliberately partial corpus, or when the
-    /// server-side count cannot be read at all (restrictive ACLs).
+    /// otherwise. It also aborts when the probe for the server-side count FAILS
+    /// (restrictive ACLs, unreachable server), and when the dataset's own
+    /// expected row count cannot be determined even after the corpus has been
+    /// resolved — an unmeasurable layout with no `vector_count`, a dataset that
+    /// is not on this machine, or a dataset directory that is here but has lost
+    /// its corpus file (#290). Note the last one is not re-downloaded: a path
+    /// that already exists is never re-fetched, whatever its link says.
+    ///
+    /// It does NOT abort when an engine simply has no row-count probe wired up
+    /// (Chroma, Milvus, Weaviate, Turbopuffer, Vertex): that prints a note and
+    /// runs, with or without this flag. Set this to run anyway in the cases that
+    /// do abort; the waiver is recorded in the result file under
+    /// `params.corpus_reuse`.
     #[arg(long, default_value = "false")]
     pub allow_partial_corpus: bool,
 

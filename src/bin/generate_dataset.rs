@@ -34,7 +34,8 @@ use rand::{Rng, SeedableRng};
 
 use vector_db_benchmark::readers::{write_npy_vectors, write_sparse_matrix};
 use vector_db_benchmark::synthetic::{
-    generate_hybrid, generate_sparse, write_neighbours_jsonl, SparseData,
+    generate_hybrid, generate_sparse, write_neighbours_jsonl, SparseData, SYNTHETIC_SPARSE_DIM,
+    SYNTHETIC_SPARSE_ROWS,
 };
 
 /// Dataset names as registered in `datasets/datasets.json`.
@@ -106,12 +107,21 @@ fn file_name(path: &Path) -> String {
 // ── sparse ──────────────────────────────────────────────────────────────────
 
 fn gen_sparse(base: &Path) -> Result<(), String> {
-    // dim=300, nnz=10, 150 docs, 10 queries, top-10 GT. Fixed seed → reproducible.
+    // nnz=10, 10 queries, top-10 GT. Fixed seed → reproducible. The corpus size
+    // and dimensionality come from shared constants so the `datasets.json` guard
+    // can check the declared vector_count against the number actually written.
     let SparseData {
         data,
         queries,
         neighbours,
-    } = generate_sparse(0x5A5A_5EED, 300, 10, 150, 10, 10);
+    } = generate_sparse(
+        0x5A5A_5EED,
+        SYNTHETIC_SPARSE_DIM,
+        10,
+        SYNTHETIC_SPARSE_ROWS,
+        10,
+        10,
+    );
 
     let dir = base.join(SPARSE_NAME);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
