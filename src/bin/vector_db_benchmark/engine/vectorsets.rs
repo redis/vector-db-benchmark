@@ -489,12 +489,18 @@ fn parse_vsim_response(response: &[redis::Value]) -> Vec<(i64, f64)> {
 }
 
 /// Single-record VADD update (for mixed benchmark).
-/// One mixed-workload update. Returns `Ok(true)` when the server reports the
-/// write **created a new element** rather than updating one that was already
-/// there — `VADD` replies 1 for a newly added element and 0 for an update of an
-/// existing one (verified live against redis:8.8.0). Every mixed update
-/// rewrites a vector this same run uploaded into `config.key`, so a 1 means the
-/// write did not land in the corpus being searched (#293).
+///
+/// Returns `Ok(true)` when the server reports the write **created a new
+/// element** rather than updating one that was already there: `VADD` replies 1
+/// for a newly added element and 0 for an update of an existing one (verified
+/// live against redis:8.8.0).
+///
+/// Note what a 1 does and does not mean. The write always goes to
+/// `config.key` — the very set `search_mixed` queries — so a 1 does NOT mean it
+/// landed elsewhere; it means the element was not already in that set, and the
+/// write therefore ENLARGED the corpus instead of overwriting a row of it. Every
+/// mixed update rewrites a vector this same run uploaded, so on a healthy run
+/// that cannot happen (#293).
 fn vadd_single(
     conn: &mut Connection,
     config: &VectorSetsConfig,

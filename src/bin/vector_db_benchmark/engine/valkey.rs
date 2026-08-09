@@ -1558,16 +1558,20 @@ fn extract_vector_score(fields: &[redis::Value]) -> f64 {
 
 /// Single-record HSET update (for mixed benchmark).
 ///
-/// Returns `Ok(true)` when the server reports the target document **did not
-/// exist**: `HSET` replies with the number of NEW fields, so a reply equal to
-/// the number of fields written means nothing was there (verified live). A
-/// reply of 0 is a clean overwrite; a reply strictly between the two means the
-/// document existed with a different field set (schema drift), which is
-/// deliberately NOT treated as a missed write — see the comment at the reply.
+/// Returns `Ok(true)` when the server reports that **none of the fields it
+/// wrote were already there**: `HSET` replies with the number of NEW fields, so
+/// a reply equal to the number written means none existed (verified live). On
+/// the supported paths that is the reply for a key that does not exist at all —
+/// a pre-existing document always carries at least the `vector` field this
+/// writes. A reply of 0 is a clean overwrite; a reply strictly between the two
+/// means the document was there with a different field set (schema drift),
+/// which is deliberately NOT treated as a missed write.
 ///
 /// LOAD-BEARING PARITY: `upload_batch_internal` must keep writing the same
-/// field NAMES as this function (both are `"vector"` plus `meta.fields`, from
-/// the same `dataset.read_vectors()` call). Adding a field to one path only
+/// field NAMES as this function. Both are `"vector"` plus `meta.fields`, and
+/// while the upload and the mixed phase make SEPARATE `dataset.read_vectors()`
+/// calls, that read is deterministic, so the names agree per row. Adding a
+/// field to one path only
 /// would not break the #293 signal — the all-or-nothing test above tolerates a
 /// partial overlap — but it would make the two halves disagree about the
 /// document's shape, which is worth knowing before you edit either.
@@ -1629,11 +1633,18 @@ fn hset_single(
     let new_fields: i64 = cmd
         .query(conn)
         .map_err(|e| format!("HSET update error: {}", e))?;
-    // ALL fields new => the key did not exist. Deliberately NOT `new_fields != 0`:
+    // ALL fields new => none of them was there. Deliberately NOT `new_fields != 0`:
     // a partial count means the document was there but carried a different field
     // set, which is schema drift between the upload and the update half — a real
     // difference, but not "the write missed the corpus", and turning it into a
     // hard error would abort a run whose updates did land.
+    //
+    // `written_fields` counts `meta.fields` entries, so a duplicate metadata key
+    // (or one literally named `vector`) would overcount it. Not reachable with
+    // any shipped dataset, and note the direction: an overcount makes the
+    // equality UNSATISFIABLE, so it would silently disable the guard rather than
+    // fire it spuriously. `test_binary_{redis,valkey}_mixed_updates_that_miss_
+    // the_corpus_are_fatal` is what catches a wrong `written_fields`.
     Ok(new_fields == written_fields)
 }
 

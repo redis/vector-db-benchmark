@@ -1953,3 +1953,211 @@ fn test_binary_valkey_skip_upload_short_corpus_is_fatal() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+// ── #293: the update half missing the corpus, end to end ────────────────────
+//
+// Valkey has its own `hset_single` with its own copy of the `new == written`
+// predicate, so the Redis twin of these tests does not cover it. Without them
+// both "discard the HSET reply" and the pre-fix "`new_fields != 0`" survive the
+// whole suite: every other test here exercises only the healthy branch, where
+// the failing arm is dead code.
+//
+// Fixture: shift every document id behind the tool's back. The corpus keeps its
+// exact row count, so `--skip-upload`'s reuse check passes and is NOT what
+// fires, but no id the update half addresses exists any more.
+
+/// Every mixed update creates instead of overwriting → hard error, and the
+/// waiver publishes honest zeros instead.
+#[test]
+fn test_binary_valkey_mixed_updates_that_miss_the_corpus_are_fatal() {
+    wait_for_valkey();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let cfg = "cfg293vkmiss";
+    let ds = "cfg293vkmiss-test";
+    let configs = serde_json::json!([{
+        "name": cfg, "engine": "valkey",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj =
+        common::write_match_any_project_n(ds, &serde_json::to_string(&configs).unwrap(), 8, 500);
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("VALKEY_PORT", port.as_str())];
+
+    // Rebuilt before each run: the gate rejects the numbers after the timed
+    // window, so a rejected run has already written the keys it complained were
+    // missing. Reusing that state would silently test the healthy path.
+    let build_shifted_corpus = |conn: &mut Connection| {
+        flush_db(conn);
+        assert!(
+            common::run_binary_extra(
+                &proj.root,
+                cfg,
+                ds,
+                "localhost",
+                &envs,
+                &["--keep-data", "--skip-search"],
+            ),
+            "fixture upload failed"
+        );
+        for id in 0..common::N_DOCS {
+            let _: () = redis::cmd("RENAME")
+                .arg(format!("{cfg}:{id}"))
+                .arg(format!("{cfg}:{}", 90_000 + id))
+                .query(conn)
+                .unwrap();
+        }
+        delete_search_result_files(&proj.root);
+    };
+
+    let run = |extra: &[&str]| {
+        let mut cmd = Command::new(binary_path());
+        cmd.args([
+            "--engines",
+            cfg,
+            "--datasets",
+            ds,
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+            "--update-search-ratio",
+            "1:5",
+            "--repetitions",
+            "1",
+        ]);
+        cmd.args(extra);
+        cmd.env("VALKEY_PORT", &port)
+            .current_dir(&proj.root)
+            .output()
+            .expect("run vector-db-benchmark")
+    };
+
+    build_shifted_corpus(&mut conn);
+    let out = run(&[]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a mixed run whose every update missed the corpus must be a hard error \
+         (#293), but the run succeeded.\n{combined}"
+    );
+    assert!(
+        combined.contains("reported that the row each one addressed did not already exist")
+            && combined.contains("HSET reported EVERY field it wrote as newly added"),
+        "the error must be the #293 gate quoting Valkey's own HSET signal.\n{combined}"
+    );
+    assert!(
+        !combined.contains("the corpus you asked to reuse is incomplete"),
+        "the row-count reuse check must NOT be what fired.\n{combined}"
+    );
+
+    build_shifted_corpus(&mut conn);
+    let out2 = run(&["--allow-partial-corpus"]);
+    assert!(
+        out2.status.success(),
+        "--allow-partial-corpus must downgrade the #293 gate to a warning.\n{}{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let r = common::read_results_obj(&proj.root, cfg);
+    let update_count = r["update_count"].as_u64().unwrap();
+    let unattributed = r["update_unattributed"].as_u64().unwrap();
+    println!("valkey #293 waived: update_count={update_count} update_unattributed={unattributed}");
+    assert!(unattributed > 0, "the missed updates must be recorded");
+    assert_eq!(
+        update_count, 0,
+        "not one update landed, so the count must be 0"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// POSITIVE CONTROL for Valkey's copy of the `new == written` predicate: a
+/// document that exists with a different field set is schema drift, not a missed
+/// write. The pre-#293 `new_fields != 0` would abort this healthy run.
+#[test]
+fn test_binary_valkey_mixed_update_onto_a_partially_populated_document_still_counts() {
+    wait_for_valkey();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let cfg = "cfg293vkdrift";
+    let ds = "cfg293vkdrift-test";
+    let configs = serde_json::json!([{
+        "name": cfg, "engine": "valkey",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj =
+        common::write_match_any_project_n(ds, &serde_json::to_string(&configs).unwrap(), 8, 500);
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("VALKEY_PORT", port.as_str())];
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            cfg,
+            ds,
+            "localhost",
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+
+    // Drop one of the three fields the upload wrote (`vector`, `color`, `size`).
+    for id in 0..common::N_DOCS {
+        let removed: i64 = redis::cmd("HDEL")
+            .arg(format!("{cfg}:{id}"))
+            .arg("size")
+            .query(&mut conn)
+            .unwrap();
+        assert_eq!(
+            removed, 1,
+            "doc {id} should have had a `size` field to drop"
+        );
+    }
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            cfg,
+            ds,
+            "localhost",
+            &envs,
+            &[
+                "--skip-upload",
+                "--keep-data",
+                "--update-search-ratio",
+                "1:5",
+                "--repetitions",
+                "1",
+            ],
+        ),
+        "a mixed run whose updates land on documents that exist must NOT be \
+         rejected, even though HSET reports the re-added field as new"
+    );
+
+    let r = common::read_results_obj(&proj.root, cfg);
+    let unattributed = r["update_unattributed"].as_u64().unwrap();
+    let update_count = r["update_count"].as_u64().unwrap();
+    println!("valkey #293 drift: update_count={update_count} update_unattributed={unattributed}");
+    assert_eq!(
+        unattributed, 0,
+        "HSET reported 1 of 3 fields new — the document was there, so this is \
+         drift and NOT a missed write. `new_fields != 0` would flag it."
+    );
+    assert!(update_count > 0, "the updates landed and must be counted");
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

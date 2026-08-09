@@ -897,10 +897,6 @@ fn check_corpus_reuse_precondition(
     }
 }
 
-/// Why a run is not tearing its corpus down, for the "Keep data" line.
-///
-/// `--skip-upload` gets its own wording because it is not a user preference but
-/// an invariant (#238): a run that did not upload the corpus never deletes it.
 /// Decide whether a mixed run's unattributed updates are fatal (issue #293).
 ///
 /// The engine half only measures: `finalize_update_stats` records how many
@@ -920,16 +916,29 @@ fn check_corpus_reuse_precondition(
 /// and a run in which some rep came back clean still publishes that rep. A
 /// genuine #293 defect fails every rep, so this matters only for a transient.
 ///
-/// `--allow-partial-corpus` waives it. That flag already declares the corpus may
-/// hold fewer rows than the dataset (`--skip-upload` + a `Short` verdict, or a
-/// probe that could not run), and updates addressed to the rows that are missing
-/// then legitimately create instead of overwrite. Aborting a run the operator
+/// Two conditions waive it, because both mean the corpus was already permitted
+/// to be short — and updates addressed to the rows that are missing then
+/// legitimately create instead of overwrite. Aborting a run the operator
 /// explicitly waived into would be the same class of over-strict gate as #295.
-/// The waived run still publishes `update_unattributed`, so the artifact records
-/// how much of its update half never touched the searched corpus.
+///
+/// 1. `--allow-partial-corpus`, which declares exactly that.
+/// 2. A corpus size the reuse check could only ESTIMATE. That check downgrades
+///    its own `Short` verdict to a warning when the count is approximate,
+///    because a false abort on a planner figure would be its own wrong result;
+///    this gate has to honour the same downgrade or a run that warned there
+///    would hard-abort here with no waiver available. Unreachable today —
+///    `CorpusCount::estimated` is built only by pgvector, which has no
+///    `search_mixed` — so it is a latch for the day a mixed-capable engine
+///    reports an estimate, not a live path. It is NOT covered by a test.
+///
+/// A waived run still publishes `update_unattributed`, so the artifact records
+/// how many of its updates did not overwrite an existing row.
 fn gate_update_attribution(
     results: crate::engine::SearchResults,
     allow_partial_corpus: bool,
+    corpus_size_was_estimated: bool,
+    engine_name: &str,
+    dataset_name: &str,
 ) -> Result<crate::engine::SearchResults, String> {
     let unattributed = results.update_unattributed.unwrap_or(0);
     if unattributed == 0 {
@@ -949,25 +958,39 @@ fn gate_update_attribution(
     let msg = format!(
         "mixed workload: {unattributed} of {dispatched} dispatched updates were accepted by the \
          server, which reported that the row each one addressed did not already exist \
-         ({detail}). Those writes therefore did not update the corpus this run searched, and \
-         `recall` cannot show it — the searched corpus is complete either way (issue #293). \
+         ({detail}). Those writes therefore did not OVERWRITE a row that was already in the \
+         corpus this run searched, and `recall` cannot show it — the rows the queries score \
+         against are there either way (issue #293). \
          The signal does not say WHY the rows were absent; all of these produce it: the update \
          half addressing a different key/collection than the search half; a reused corpus \
          (`--skip-upload`) that is shorter than the dataset or was written with a different \
          document shape; or rows lost mid-run to eviction or failover. Re-upload this config, or \
          pass --allow-partial-corpus to measure a deliberately partial corpus anyway."
     );
-    if allow_partial_corpus {
+    if allow_partial_corpus || corpus_size_was_estimated {
+        let why = if allow_partial_corpus {
+            "--allow-partial-corpus is set"
+        } else {
+            "the corpus size could only be estimated, so the reuse check warned rather than \
+             rejecting, and this gate honours the same downgrade"
+        };
         eprintln!("\t⚠ WARNING: {msg}");
         eprintln!(
-            "\t  (continuing because --allow-partial-corpus is set; `update_unattributed` is \
-             recorded in the result file)"
+            "\t  (continuing because {why}; `update_unattributed` is recorded in the result file)"
         );
         return Ok(results);
     }
+    // Same bookkeeping as the reuse check five functions up: without this a
+    // sweep run with --exit-on-error false drops the point silently and its
+    // summary is indistinguishable from a complete one.
+    crate::summary::record_rejected_experiment(engine_name, dataset_name, &msg);
     Err(msg)
 }
 
+/// Why a run is not tearing its corpus down, for the "Keep data" line.
+///
+/// `--skip-upload` gets its own wording because it is not a user preference but
+/// an invariant (#238): a run that did not upload the corpus never deletes it.
 fn keep_data_reason(args: &Args) -> &'static str {
     if args.skip_upload {
         "--skip-upload did not create this corpus, so it does not delete it"
@@ -1425,6 +1448,8 @@ fn run_single_experiment(
                         if phase.is_some() { "mixed" } else { "search" },
                         effective_params.parallel.unwrap_or(1),
                     );
+                    // Bound before the watchdog closure takes `engine` mutably.
+                    let engine_label = engine.name().to_string();
                     let search_result =
                         run_with_search_watchdog(args.search_timeout, &wd_label, || match phase {
                             Some(ratio) => {
@@ -1437,8 +1462,24 @@ fn run_single_experiment(
                     // #293. Applied BEFORE the point can reach `best`/`pending_saves`,
                     // so a rejected mixed point publishes no result file at all; a
                     // waived one carries the count into the file it writes.
-                    let search_result = search_result
-                        .and_then(|r| gate_update_attribution(r, args.allow_partial_corpus));
+                    // The reuse check downgrades a `Short` verdict to a warning when the
+                    // server-side count is only an estimate; this gate must honour the
+                    // same downgrade rather than hard-aborting a run that was allowed
+                    // to continue there.
+                    let corpus_size_was_estimated = corpus_reuse
+                        .as_ref()
+                        .and_then(|v| v.get("actual_is_estimate"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let search_result = search_result.and_then(|r| {
+                        gate_update_attribution(
+                            r,
+                            args.allow_partial_corpus,
+                            corpus_size_was_estimated,
+                            &engine_label,
+                            &dataset.config.name,
+                        )
+                    });
 
                     match search_result {
                         Ok(mut results) => {
@@ -2598,6 +2639,15 @@ mod update_attribution_gate_tests {
     use super::gate_update_attribution;
     use crate::engine::SearchResults;
 
+    /// `gate(results, allow_partial_corpus, corpus_size_was_estimated)`.
+    fn gate(
+        r: SearchResults,
+        allow_partial_corpus: bool,
+        estimated: bool,
+    ) -> Result<SearchResults, String> {
+        gate_update_attribution(r, allow_partial_corpus, estimated, "eng", "ds")
+    }
+
     fn results(applied: usize, unattributed: usize, failed: usize) -> SearchResults {
         SearchResults {
             update_count: Some(applied),
@@ -2612,7 +2662,7 @@ mod update_attribution_gate_tests {
     /// The #293 condition: reject, and say how many of how many.
     #[test]
     fn unattributed_updates_reject_the_point_by_default() {
-        let err = gate_update_attribution(results(0, 399, 0), false).unwrap_err();
+        let err = gate(results(0, 399, 0), false, false).unwrap_err();
         assert!(err.contains("399 of 399"), "{err}");
         assert!(err.contains("VADD replied 1"), "{err}");
         // The message must offer the escape hatch it actually honours.
@@ -2623,7 +2673,7 @@ mod update_attribution_gate_tests {
     /// the message is not silently computed off a partial denominator.
     #[test]
     fn the_rejection_counts_every_dispatched_write_in_its_denominator() {
-        let err = gate_update_attribution(results(90, 7, 3), false).unwrap_err();
+        let err = gate(results(90, 7, 3), false, false).unwrap_err();
         assert!(err.contains("7 of 100"), "{err}");
     }
 
@@ -2634,7 +2684,7 @@ mod update_attribution_gate_tests {
     /// waiver must let the point through — still carrying its count.
     #[test]
     fn allow_partial_corpus_waives_the_rejection_and_keeps_the_count() {
-        let r = gate_update_attribution(results(10, 5, 0), true)
+        let r = gate(results(10, 5, 0), true, false)
             .expect("--allow-partial-corpus must not abort the run");
         assert_eq!(
             r.update_unattributed,
@@ -2649,18 +2699,34 @@ mod update_attribution_gate_tests {
     #[test]
     fn a_clean_run_passes_with_and_without_the_waiver() {
         for waived in [false, true] {
-            let r = gate_update_attribution(results(1000, 0, 0), waived)
+            let r = gate(results(1000, 0, 0), waived, false)
                 .expect("a clean mixed run must never be rejected");
             assert_eq!(r.update_unattributed, Some(0));
             assert_eq!(r.update_count, Some(1000));
         }
     }
 
+    /// The reuse check downgrades its own `Short` verdict to a warning when the
+    /// server-side count is only an ESTIMATE. This gate has to honour the same
+    /// downgrade, or a run that was allowed to continue there would hard-abort
+    /// here with no waiver available. Unreachable today (only pgvector reports
+    /// an estimate and it has no `search_mixed`), so this unit test is the ONLY
+    /// coverage of that latch — there is no integration test for it.
+    #[test]
+    fn an_estimated_corpus_size_waives_the_rejection_like_the_reuse_check_does() {
+        let r = gate(results(10, 5, 0), false, true)
+            .expect("an approximate corpus count must not abort the run here");
+        assert_eq!(r.update_unattributed, Some(5));
+        // ...and it is the estimate doing the waiving, not a blanket pass:
+        // the same input with an exact count is still rejected.
+        assert!(gate(results(10, 5, 0), false, false).is_err());
+    }
+
     /// Search-only runs have no update fields at all; the gate must be inert
     /// rather than reading `None` as a violation.
     #[test]
     fn a_search_only_run_is_untouched_by_the_gate() {
-        let r = gate_update_attribution(SearchResults::default(), false)
+        let r = gate(SearchResults::default(), false, false)
             .expect("search-only runs must pass the mixed-update gate");
         assert!(r.update_unattributed.is_none());
     }

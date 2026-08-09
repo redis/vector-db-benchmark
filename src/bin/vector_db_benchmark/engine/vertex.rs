@@ -25,8 +25,9 @@
 //!   here is only ever "the server accepted it" — this engine publishes
 //!   `update_attribution: "ack_only"` for that reason (#293).
 //!
-//! Metadata filters ARE supported (`restricts` / `numericRestricts`, see
-//! `build_vertex_filter`). No quantization knobs.
+//! Metadata filters ARE supported (`restricts` / `numericRestricts`, built by
+//! `metadata_to_filter` and rendered by `filter_to_rest` / `filter_to_batch`).
+//! No quantization knobs.
 //!
 //! Auth: `VERTEX_ACCESS_TOKEN` if set, otherwise `gcloud auth
 //! print-access-token`. Tokens are short-lived; the token is re-fetched at the
@@ -2426,7 +2427,7 @@ impl Engine for VertexEngine {
             &mut results,
             tally,
             total_time,
-            crate::engine::UpdateAttribution::AckOnly,
+            VERTEX_UPDATE_ATTRIBUTION,
             ratio,
             // Unreachable under AckOnly: nothing ever sets `unattributed`, because
             // the upsert reply carries no row-level information to set it from.
@@ -2553,6 +2554,62 @@ impl VertexEngine {
                 .progress_chars("#>-"),
         );
         pb
+    }
+}
+
+/// The attribution tier Vertex publishes for mixed-workload updates (#293).
+///
+/// A named constant so a unit test can pin it: `tests/integration_vertex.rs`
+/// self-skips without `VERTEX_PROJECT`, so nothing else in the suite would
+/// notice this being raised to `CorpusRow` — a claim Vertex cannot make, since
+/// `upsertDatapoints` replies with an empty body and never names the datapoint
+/// it touched.
+pub const VERTEX_UPDATE_ATTRIBUTION: crate::engine::UpdateAttribution =
+    crate::engine::UpdateAttribution::AckOnly;
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::VERTEX_UPDATE_ATTRIBUTION;
+    use crate::engine::{
+        finalize_update_stats, SearchResults, UpdateAttribution, UpdateSearchRatio, UpdateTally,
+    };
+
+    /// Vertex must never claim corpus-row attribution: `upsertDatapoints`
+    /// returns an empty body, so a 2xx says the write was accepted and nothing
+    /// about which datapoint it replaced. Raising this to `CorpusRow` would put
+    /// a stronger claim in the artifact than the API can support — and it is
+    /// otherwise untestable, because the Vertex integration test self-skips
+    /// without `VERTEX_PROJECT`.
+    #[test]
+    fn vertex_publishes_ack_only_and_never_claims_corpus_row() {
+        assert_eq!(VERTEX_UPDATE_ATTRIBUTION, UpdateAttribution::AckOnly);
+        assert_ne!(VERTEX_UPDATE_ATTRIBUTION, UpdateAttribution::CorpusRow);
+    }
+
+    /// ...and that constant is what reaches the result JSON, so the weaker tier
+    /// is visible to anyone comparing `update_rps` across engines. This is the
+    /// only place an `ack_only` run is produced anywhere in the suite.
+    #[test]
+    fn the_ack_only_tier_reaches_the_published_fields() {
+        let mut r = SearchResults::default();
+        finalize_update_stats(
+            &mut r,
+            UpdateTally {
+                times: vec![0.01, 0.02],
+                unattributed: 0,
+                failed: 0,
+            },
+            1.0,
+            VERTEX_UPDATE_ATTRIBUTION,
+            &UpdateSearchRatio {
+                updates: 1,
+                searches: 5,
+            },
+            "unused",
+        );
+        assert_eq!(r.update_attribution.as_deref(), Some("ack_only"));
+        // AckOnly can never flag: there is no row-level signal to flag from.
+        assert_eq!(r.update_unattributed, Some(0));
     }
 }
 

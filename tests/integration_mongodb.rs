@@ -2094,3 +2094,167 @@ fn test_binary_mongodb_skip_upload_short_corpus_is_fatal() {
     drop_test_collection();
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #293 end to end: every mixed update matches nothing → hard error;
+/// `--allow-partial-corpus` → honest zeros.
+///
+/// Without this the `Ok(true) => ut.unattributed += 1` arm in `search_mixed` is
+/// dead in every run, so reading `matched_count` and discarding it are
+/// indistinguishable and the fix could be reverted at the source with the suite
+/// green. The mixed tests above only pin the healthy branch.
+///
+/// Fixture: shift every `_id` behind the tool's back. The collection keeps its
+/// exact document count, so `--skip-upload`'s reuse check (`countDocuments`)
+/// still passes and is NOT what fires.
+#[test]
+fn test_binary_mongodb_mixed_updates_that_miss_the_corpus_are_fatal() {
+    wait_for_mongodb();
+    drop_test_collection();
+
+    let port: u16 = std::env::var("MONGODB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MONGODB_PORT);
+    let port_s = port.to_string();
+
+    let cfg = "cfg293mgmiss";
+    let ds = "cfg293mgmiss-test";
+    let configs = serde_json::json!([{
+        "name": cfg, "engine": "mongodb",
+        "search_params": [{"parallel": 1, "num_candidates": 20}],
+        "upload_params": {"parallel": 1}
+    }]);
+    let proj =
+        common::write_match_any_project_n(ds, &serde_json::to_string(&configs).unwrap(), 8, 500);
+    let envs: [(&str, &str); 4] = [
+        ("MONGODB_PORT", port_s.as_str()),
+        ("MONGODB_DB", TEST_DB),
+        ("MONGODB_COLLECTION", TEST_COLLECTION),
+        ("MONGODB_INDEX_NAME", TEST_INDEX),
+    ];
+
+    // Rebuilt before EACH run: the gate rejects the numbers after the timed
+    // window. MongoDB's update is a no-upsert `update_one`, so unlike the
+    // Redis-wire engines a rejected run writes nothing — but rebuild anyway so
+    // this test does not silently depend on that difference.
+    let build_shifted_corpus = || {
+        assert!(
+            common::run_binary_extra(
+                &proj.root,
+                cfg,
+                ds,
+                MONGODB_HOST,
+                &envs,
+                &["--keep-data", "--skip-search"],
+            ),
+            "fixture upload failed"
+        );
+        let coll = mongodb_client()
+            .database(TEST_DB)
+            .collection::<Document>(TEST_COLLECTION);
+        // `_id` is immutable, so re-key by copy-then-delete.
+        let originals: Vec<Document> = coll
+            .find(doc! {})
+            .run()
+            .unwrap()
+            .map(|d| d.unwrap())
+            .collect();
+        assert_eq!(originals.len(), common::N_DOCS, "fixture corpus size");
+        let shifted: Vec<Document> = originals
+            .iter()
+            .map(|d| {
+                let mut c = d.clone();
+                let id = c.get_i64("_id").unwrap();
+                c.insert("_id", 90_000i64 + id);
+                c
+            })
+            .collect();
+        coll.delete_many(doc! {}).run().unwrap();
+        coll.insert_many(shifted).run().unwrap();
+        assert_eq!(
+            count_test_docs(),
+            common::N_DOCS as u64,
+            "the shifted corpus must keep its document count, so the reuse check \
+             passes and this test exercises the #293 gate rather than #238's"
+        );
+        let results_dir = proj.root.join("results");
+        if let Ok(entries) = fs::read_dir(&results_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("-search-"))
+                {
+                    fs::remove_file(path).ok();
+                }
+            }
+        }
+    };
+
+    let run = |extra: &[&str]| {
+        let mut cmd = Command::new(common::binary_path());
+        cmd.args([
+            "--engines",
+            cfg,
+            "--datasets",
+            ds,
+            "--host",
+            MONGODB_HOST,
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+            "--update-search-ratio",
+            "1:5",
+            "--repetitions",
+            "1",
+        ]);
+        cmd.args(extra);
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        cmd.current_dir(&proj.root)
+            .output()
+            .expect("run vector-db-benchmark")
+    };
+
+    build_shifted_corpus();
+    let out = run(&[]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a mixed run whose every update matched 0 documents must be a hard error \
+         (#293), but the run succeeded.\n{combined}"
+    );
+    assert!(
+        combined.contains("reported that the row each one addressed did not already exist")
+            && combined.contains("update_one matched 0 documents"),
+        "the error must be the #293 gate quoting the matched_count signal.\n{combined}"
+    );
+
+    build_shifted_corpus();
+    let out2 = run(&["--allow-partial-corpus"]);
+    assert!(
+        out2.status.success(),
+        "--allow-partial-corpus must downgrade the #293 gate to a warning.\n{}{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let r = common::read_results_obj(&proj.root, cfg);
+    let update_count = r["update_count"].as_u64().unwrap();
+    let unattributed = r["update_unattributed"].as_u64().unwrap();
+    println!("mongodb #293 waived: update_count={update_count} update_unattributed={unattributed}");
+    assert!(unattributed > 0, "the missed updates must be recorded");
+    assert_eq!(
+        update_count, 0,
+        "not one update matched, so the count must be 0"
+    );
+
+    drop_test_collection();
+    fs::remove_dir_all(&proj.root).ok();
+}

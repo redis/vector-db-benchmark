@@ -2147,6 +2147,13 @@ fn test_binary_redis_mixed_parallel() {
         Some(0),
         "no update should have failed in this run"
     );
+    assert_eq!(
+        r["update_unattributed"].as_u64(),
+        Some(0),
+        "a healthy mixed run must land every update on an existing corpus document \
+         — this is the gate's actual output, where the two above are the tier \
+         label and the unrelated failure count"
+    );
     fs::remove_dir_all(&proj.root).ok();
 }
 
@@ -2154,8 +2161,8 @@ fn test_binary_redis_mixed_parallel() {
 /// hash-based engines (#293 — Redis and Valkey share this `hset_single` shape).
 ///
 /// `hset_single` now returns "did this write add fields that were not there",
-/// straight from `HSET`'s integer reply, and `finalize_update_stats` aborts when
-/// any counted update did. The guard is only as good as that reply, and the
+/// straight from `HSET`'s integer reply, which `finalize_update_stats` records
+/// and `experiment::gate_update_attribution` then rejects the run over. The guard is only as good as that reply, and the
 /// reply is a server behaviour no unit test can pin — a server that always
 /// returned 0 would make the guard vacuous with every test still green.
 ///
@@ -3879,6 +3886,291 @@ fn test_binary_redis_skip_upload_fetches_the_dataset_before_judging_it() {
     );
 
     drop(server); // the listener closes with the test process
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+// ── #293: the update half missing the corpus, end to end ────────────────────
+//
+// Everything else in this suite exercises the HEALTHY branch, where every mixed
+// update overwrites a document that is already there. That leaves the failing
+// branch — `Ok(true) => ut.unattributed += 1` — dead in every run, so reading
+// the server's reply is indistinguishable from ignoring it, and the whole #293
+// fix could be reverted at the source with the suite still green.
+//
+// These two tests drive the failing branch through the real binary. Between
+// them they pin: that the reply is read at all; that the predicate is
+// `new == written` and not the pre-fix `!= 0`; that `written_fields` is the
+// real field count; that the runner actually calls the gate; that
+// `update_unattributed` is not hardcoded; and both sides of the
+// `--allow-partial-corpus` waiver.
+//
+// The fixture is the "cardinality is not identity" hole the README already
+// documents: every document id is shifted behind the tool's back, so the corpus
+// keeps its exact row count — `--skip-upload`'s reuse check passes, and is NOT
+// what fires — while no id the update half addresses exists any more.
+
+/// The corpus keeps its row count but none of its ids: every mixed update
+/// creates instead of overwriting. Default → hard error, nothing published.
+/// `--allow-partial-corpus` → completes, and publishes honest zeros next to the
+/// count of updates that missed.
+#[test]
+fn test_binary_redis_mixed_updates_that_miss_the_corpus_are_fatal_and_waivable() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let cfg = "cfg293miss";
+    let ds = "cfg293miss-test";
+    let configs = serde_json::json!([{
+        "name": cfg, "engine": "redis",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    // 500 queries so the 1:5 ratio dispatches ~100 updates, not the ~2 the
+    // default fixture would give.
+    let proj =
+        common::write_match_any_project_n(ds, &serde_json::to_string(&configs).unwrap(), 8, 500);
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
+    let results_dir = proj.root.join("results");
+
+    // Build the fixture: upload a complete corpus, then shift every document id
+    // behind the tool's back. Cardinality is preserved on purpose — the reuse
+    // check counts rows, so it still says "verified" and cannot see this.
+    //
+    // Rebuilt before EACH run below, deliberately. The gate rejects the numbers
+    // AFTER the timed window, so a rejected run has already issued its writes:
+    // run (a) leaves the very keys it complained were missing. Reusing that
+    // state for run (b) would silently test the healthy path instead.
+    let build_shifted_corpus = |conn: &mut Connection| {
+        flush_db(conn);
+        assert!(
+            common::run_binary_extra(
+                &proj.root,
+                cfg,
+                ds,
+                "localhost",
+                &envs,
+                &["--keep-data", "--skip-search"],
+            ),
+            "fixture upload failed"
+        );
+        assert_eq!(
+            ft_info_num_docs(conn, &format!("idx:{cfg}")),
+            common::N_DOCS as i64,
+            "the fixture upload must leave a complete corpus"
+        );
+        for id in 0..common::N_DOCS {
+            let _: () = redis::cmd("RENAME")
+                .arg(format!("{cfg}:{id}"))
+                .arg(format!("{cfg}:{}", 90_000 + id))
+                .query(conn)
+                .unwrap();
+        }
+        assert_eq!(
+            ft_info_num_docs(conn, &format!("idx:{cfg}")),
+            common::N_DOCS as i64,
+            "the shifted corpus must keep its row count, so the reuse check passes \
+             and this test is exercising the #293 gate rather than #238's"
+        );
+        delete_search_result_files(&proj.root.join("results"));
+    };
+
+    build_shifted_corpus(&mut conn);
+
+    let bin = binary_path();
+    let run = |extra: &[&str]| {
+        let mut cmd = Command::new(&bin);
+        cmd.args([
+            "--engines",
+            cfg,
+            "--datasets",
+            ds,
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+            "--update-search-ratio",
+            "1:5",
+            "--repetitions",
+            "1",
+        ]);
+        cmd.args(extra);
+        cmd.env("REDIS_PORT", &port)
+            .current_dir(&proj.root)
+            .output()
+            .expect("run vector-db-benchmark")
+    };
+
+    // (a) Default: fatal.
+    let out = run(&[]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a mixed run whose every update missed the corpus must be a hard error \
+         (#293), but the run succeeded.\n{combined}"
+    );
+    assert!(
+        combined.contains("reported that the row each one addressed did not already exist"),
+        "the error must be the #293 gate, quoting the server signal.\n{combined}"
+    );
+    assert!(
+        combined.contains("HSET reported EVERY field it wrote as newly added"),
+        "the error must name the engine-specific signal it read.\n{combined}"
+    );
+    assert!(
+        !combined.contains("the corpus you asked to reuse is incomplete"),
+        "the row-count reuse check must NOT be what fired — if it did, this \
+         fixture is testing #238 and not #293.\n{combined}"
+    );
+    let wrote_results = fs::read_dir(&results_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().contains("-search-"));
+    assert!(
+        !wrote_results,
+        "a rejected mixed point must not leave a search result file behind"
+    );
+
+    // (b) Waived: completes, and the artifact tells the truth about it. Note the
+    // rebuild — run (a) created the missing keys on its way to being rejected.
+    build_shifted_corpus(&mut conn);
+    let out2 = run(&["--allow-partial-corpus"]);
+    assert!(
+        out2.status.success(),
+        "--allow-partial-corpus must downgrade the #293 gate to a warning.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let r = common::read_results_obj(&proj.root, cfg);
+    let update_count = r["update_count"].as_u64().unwrap();
+    let unattributed = r["update_unattributed"].as_u64().unwrap();
+    println!(
+        "redis #293 waived: update_count={update_count} update_unattributed={unattributed} \
+         recall={}",
+        r["mean_recall"].as_f64().unwrap()
+    );
+    assert!(
+        unattributed > 0,
+        "every update in this fixture addressed an id that does not exist, so the \
+         waived run must record them"
+    );
+    assert_eq!(
+        update_count, 0,
+        "not one update landed on the searched corpus, so update_count must be 0 \
+         — this is the number that read 398 before #293"
+    );
+    assert_eq!(
+        r["update_rps"].as_f64().unwrap(),
+        0.0,
+        "update_rps must follow update_count rather than the round trips"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// POSITIVE CONTROL for the `new == written` predicate, and the arithmetic
+/// behind it.
+///
+/// A document that EXISTS but carries a different field set is schema drift, not
+/// a missed write: `HSET` reports some-but-not-all fields new. The pre-#293 draft
+/// of this guard used `new_fields != 0`, which would abort here — on a run whose
+/// updates all landed. Without this test that regression is invisible, and so is
+/// `written_fields` being wrong (any value other than the real field count makes
+/// `new == written` unsatisfiable, silently disabling the guard).
+#[test]
+fn test_binary_redis_mixed_update_onto_a_partially_populated_document_still_counts() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let cfg = "cfg293drift";
+    let ds = "cfg293drift-test";
+    let configs = serde_json::json!([{
+        "name": cfg, "engine": "redis",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj =
+        common::write_match_any_project_n(ds, &serde_json::to_string(&configs).unwrap(), 8, 500);
+    let port = test_port().to_string();
+    let envs: [(&str, &str); 1] = [("REDIS_PORT", port.as_str())];
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            cfg,
+            ds,
+            "localhost",
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (upload) failed"
+    );
+
+    // Drop ONE of the three fields the upload wrote (`vector`, `color`, `size`).
+    // The documents survive and stay indexed, so the update half will address
+    // keys that exist — but `HSET` will report `size` as newly added.
+    for id in 0..common::N_DOCS {
+        let removed: i64 = redis::cmd("HDEL")
+            .arg(format!("{cfg}:{id}"))
+            .arg("size")
+            .query(&mut conn)
+            .unwrap();
+        assert_eq!(
+            removed, 1,
+            "doc {id} should have had a `size` field to drop"
+        );
+    }
+    assert_eq!(
+        ft_info_num_docs(&mut conn, &format!("idx:{cfg}")),
+        common::N_DOCS as i64,
+        "dropping a field must not remove the documents"
+    );
+
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            cfg,
+            ds,
+            "localhost",
+            &envs,
+            &[
+                "--skip-upload",
+                "--keep-data",
+                "--update-search-ratio",
+                "1:5",
+                "--repetitions",
+                "1",
+            ],
+        ),
+        "a mixed run whose updates land on documents that exist must NOT be \
+         rejected, even though HSET reports the re-added field as new"
+    );
+
+    let r = common::read_results_obj(&proj.root, cfg);
+    let update_count = r["update_count"].as_u64().unwrap();
+    let unattributed = r["update_unattributed"].as_u64().unwrap();
+    println!("redis #293 drift: update_count={update_count} update_unattributed={unattributed}");
+    assert_eq!(
+        unattributed, 0,
+        "HSET reported 1 of 3 fields new — the document was there, so this is \
+         drift and NOT a missed write. `new_fields != 0` would flag it."
+    );
+    assert!(
+        update_count > 0,
+        "the updates landed and must be counted; 0 here would mean the predicate \
+         can never be satisfied (e.g. a wrong `written_fields`)"
+    );
+
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
