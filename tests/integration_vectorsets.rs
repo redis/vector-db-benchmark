@@ -364,7 +364,17 @@ fn test_binary_vectorsets_mixed_benchmark() {
             "vs-mx",
             TEST_HOST,
             &[("REDIS_PORT", port.as_str())],
-            &["--update-search-ratio", "1:5", "--repetitions", "1"],
+            // --keep-data suppresses the teardown `engine.delete()`, so the
+            // server-side assertions at the end of this test have a corpus to
+            // read. Without it `VCARD idx:vsets-mx` is 0 by the time the binary
+            // exits and the read proves nothing. The key is removed below.
+            &[
+                "--update-search-ratio",
+                "1:5",
+                "--repetitions",
+                "1",
+                "--keep-data",
+            ],
         ),
         "vectorsets mixed run failed"
     );
@@ -440,6 +450,11 @@ fn test_binary_vectorsets_mixed_benchmark() {
         vcard, 400,
         "the searched vector set must still hold the whole 400-doc corpus"
     );
+    // This test ran with --keep-data, so clean the corpus up itself.
+    let _: () = redis::cmd("DEL")
+        .arg(&searched_key)
+        .query(&mut conn)
+        .unwrap();
     std::fs::remove_dir_all(&proj.root).ok();
 }
 
