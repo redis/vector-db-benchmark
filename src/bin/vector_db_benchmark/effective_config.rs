@@ -1680,8 +1680,19 @@ mod recorder_coverage_guard {
                     offenders.push(format!("{path}: {probe}"));
                 }
             }
-            // Aliasing defeats a textual probe outright.
-            for alias in ["use std::env::var", "use std::env::vars"] {
+            // Aliasing defeats a textual probe outright. `use std::env::{var};`
+            // matched NEITHER of the first two probes — no `use std::env::var`
+            // substring, and the call site is then a bare `var("X")` with no
+            // `env::` prefix — so it was invisible end to end. Proven live
+            // against `engine/turbopuffer.rs`. Banning the brace form rather
+            // than trying to recognise the call it hides: this is a line scan,
+            // and the call is exactly what a line scan cannot see.
+            for alias in [
+                "use std::env::var",
+                "use std::env::vars",
+                "use std::env::{",
+                "use std::env as ",
+            ] {
                 if production.contains(alias) {
                     offenders.push(format!("{path}: {alias} (aliased import)"));
                 }
@@ -2053,7 +2064,11 @@ mod recorder_coverage_guard {
             let mut rest = production.as_str();
             while let Some(i) = rest.find("env_var(") {
                 rest = &rest[i + "env_var(".len()..];
-                if !rest.starts_with('"') && !rest.starts_with('&') {
+                // No `&` exclusion. It had no remaining user and hid
+                // `env_var(&name.to_uppercase())` from BOTH inventories at once:
+                // non-literal, so the name matching never saw it, and
+                // `&`-prefixed, so the dynamic count never saw it either.
+                if !rest.starts_with('"') {
                     dynamic.push(path.clone());
                 }
             }
