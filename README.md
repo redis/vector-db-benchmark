@@ -566,7 +566,10 @@ vector-db-benchmark --engines vectorsets-docker-test --datasets h-and-m-2048-ang
 
 The ratio format is `U:S` where U = number of updates and S = number of searches per cycle. Each worker thread performs S searches followed by U updates in a loop.
 
-**Supported engines**: Redis, VectorSets, Valkey
+**Supported engines**: Redis, VectorSets, Valkey, MongoDB, Vertex AI. The other
+ten engines reject `--update-search-ratio` with
+`mixed benchmark not supported for engine '<name>'` rather than silently running
+a search-only benchmark under a mixed label.
 
 Results JSON includes separate metrics for both operation types:
 
@@ -579,6 +582,11 @@ Results JSON includes separate metrics for both operation types:
     "p50_time": 0.00032,
     "p95_time": 0.00089,
     "p99_time": 0.00142,
+    "update_count": 5891,
+    "update_failures": 0,
+    "update_unattributed": 0,
+    "update_attribution": "corpus_row",
+    "update_attribution_detail": "HSET replies with the number of fields that did not previously exist; ...",
     "update_rps": 589.1,
     "update_mean_time": 0.00045,
     "update_p50_time": 0.00041,
@@ -590,6 +598,81 @@ Results JSON includes separate metrics for both operation types:
 ```
 
 Omitting the flag preserves the standard search-only benchmark behavior.
+
+### What `update_count` counts, and what it cannot prove (#293)
+
+`update_count` used to be a count of **client-side loop iterations**: every write
+helper discarded the server's reply (`let _ = <write>`), so the counter went up
+whether the write succeeded, was rejected, or landed on a key no query reads.
+`update_rps` inherited that, and looked plausible because a misdirected write
+still costs a round trip. Recall could not see it either: the searched corpus is
+complete and correct whether or not the updates reached it.
+
+It now counts **writes the server accepted**, and every engine publishes which of
+two attribution tiers it achieved, under `update_attribution`:
+
+| `update_attribution` | Engines | What the server's reply establishes |
+| --- | --- | --- |
+| `corpus_row` | VectorSets, Redis, Valkey | The server's reply is about the **write**, and the object written is the object the query path reads. `VADD` replies 1 for a new element and 0 for an overwrite; `HSET` replies with the number of newly-added fields (all-new ⇒ the key did not exist). A reply meaning "the row was not there" is counted in `update_unattributed` and **rejects the point** — no result file is written for it. (The write itself still happened: it *enlarged* the corpus rather than overwriting a row of it. The gate rejects the numbers, not the writes.) |
+| `matched_row` | MongoDB | The server confirms a row matched the update's **filter** — `update_one` reports `matched_count`, and 0 means no document carried that `_id`. Weaker than `corpus_row` in two ways: `matched_count` says nothing about the *payload* (an update that `$set`s a field the search never reads still reports 1), and the collection is not the searched index. The guard still catches an update half that matches nothing at all. |
+| `ack_only` | Vertex AI | Only that the write was accepted (HTTP 2xx). `upsertDatapoints` returns an empty body, so there is nothing to attribute to a datapoint and the guard cannot run. `update_unattributed` is **omitted** on these runs rather than published as a `0` that would be indistinguishable from a verified one. |
+
+**Even a shared tier is not a shared assurance**, which is why every mixed run
+also publishes `update_attribution_detail` — the exact server signal that engine
+read, in words. Within `corpus_row`, VectorSets is the strict case: `VADD`
+targets `config.key`, which *is* the key `VSIM` reads, so the reply is about the
+searched object itself. Redis and Valkey are one inference away: `HSET` reports
+on the **key**, and index membership follows from `FT.CREATE ... PREFIX` and
+`hset_single` sharing one `key_prefix` — sound on every supported path, but a
+construction rather than something the reply states (a document the index
+rejected, say a wrong-dimension vector counted under `hash_indexing_failures`,
+still answers 0). The tiers also differ in how far the signal sits from the
+searched index: on the Redis-wire engines an acknowledged write is searchable
+immediately, whereas MongoDB's Atlas Vector Search is eventually consistent and
+an acknowledged update is roughly a second from being searchable (which is what
+`wait_for_index_catchup` exists for).
+
+Writes that **errored** are excluded from `update_count`, `update_rps` and the
+update percentiles, and published separately as `update_failures` — the same
+treatment `failed_queries` gets on the search side. A run with
+`update_failures > 0` warns rather than aborting, because failures only shrink
+the reported figures; the Redis-wire engines additionally hard-error on
+server-rejected writes through the existing `INFO commandstats` check.
+
+**`--allow-partial-corpus` waives the rejection.** That flag already declares the
+corpus may hold fewer rows than the dataset (`--skip-upload` against a `Short`
+corpus, or a size probe that could not run), and updates addressed to the rows
+that are missing then legitimately create rather than overwrite. Aborting a run
+the operator explicitly waived into would be an over-strict gate, so the waiver
+downgrades the rejection to a warning — and the run still publishes
+`update_unattributed`, so the artifact records how many of its updates did not
+overwrite a row that was already there. Outside that waiver the count is always
+0 in a published file.
+
+A second, currently unreachable condition waives it too: a corpus size the reuse
+check could only **estimate**. That check downgrades its own `Short` verdict to a
+warning on an approximate count, and this gate honours the same downgrade rather
+than hard-aborting a run that was allowed to continue there. Only pgvector
+reports an estimate today and it has no mixed workload, so this is a latch for
+the future, not a live path — and it has unit coverage only.
+
+**The limit, stated plainly:** `corpus_row` proves each counted write overwrote
+a row that was already there. It does not prove that row is reachable by the
+query path — a write to a *different but already-populated* row would still
+report an overwrite. Neither tier is a claim that the updated vector was visible
+to a later search. And a nonzero `update_unattributed` says only that the row
+was absent; it does not identify *why* (writes addressed elsewhere, a short
+reused corpus, or rows lost to eviction/failover mid-run are all consistent with
+it), which is why the message enumerates the causes instead of asserting one.
+
+All four new field names are additive. `update_count` and `update_rps` keep
+their names so existing result files stay comparable and `summary.rs` — the only
+code that reads either field — keeps working; `update_failures`,
+`update_unattributed`, `update_attribution` and `update_attribution_detail` are
+simply absent from files written before #293. All are present on **every** mixed
+run, `0` included, so a reader can tell "clean" from "written by an older build"
+— with the one deliberate exception that `update_unattributed` is omitted under
+`ack_only`, where a `0` would claim a verification that never happened.
 
 ## Multi-tenancy
 

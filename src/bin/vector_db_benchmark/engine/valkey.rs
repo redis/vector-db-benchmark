@@ -1553,13 +1553,31 @@ fn extract_vector_score(fields: &[redis::Value]) -> f64 {
 }
 
 /// Single-record HSET update (for mixed benchmark).
+///
+/// Returns `Ok(true)` when the server reports that **none of the fields it
+/// wrote were already there**: `HSET` replies with the number of NEW fields, so
+/// a reply equal to the number written means none existed (verified live). On
+/// the supported paths that is the reply for a key that does not exist at all —
+/// a pre-existing document always carries at least the `vector` field this
+/// writes. A reply of 0 is a clean overwrite; a reply strictly between the two
+/// means the document was there with a different field set (schema drift),
+/// which is deliberately NOT treated as a missed write.
+///
+/// LOAD-BEARING PARITY: `upload_batch_internal` must keep writing the same
+/// field NAMES as this function. Both are `"vector"` plus `meta.fields`, and
+/// while the upload and the mixed phase make SEPARATE `dataset.read_vectors()`
+/// calls, that read is deterministic, so the names agree per row. Adding a
+/// field to one path only
+/// would not break the #293 signal — the all-or-nothing test above tolerates a
+/// partial overlap — but it would make the two halves disagree about the
+/// document's shape, which is worth knowing before you edit either.
 fn hset_single(
     conn: &mut Connection,
     config: &ValkeyEngineConfig,
     id: i64,
     vector: &[f32],
     metadata: Option<&MetadataItem>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let key = format!("{}{}", config.key_prefix, id);
     let vec_bytes: Vec<u8> = match config.data_type.as_str() {
         "FLOAT64" => vector
@@ -1582,9 +1600,11 @@ fn hset_single(
 
     let mut cmd = redis::cmd("HSET");
     cmd.arg(key.as_str()).arg("vector").arg(&vec_bytes[..]);
+    let mut written_fields: i64 = 1;
 
     if let Some(meta) = metadata {
         for (k, v) in &meta.fields {
+            written_fields += 1;
             match v {
                 MetadataValue::String(s) => {
                     cmd.arg(k.as_str()).arg(encode_string_field(config, k, s));
@@ -1606,8 +1626,22 @@ fn hset_single(
         }
     }
 
-    cmd.query::<()>(conn)
-        .map_err(|e| format!("HSET update error: {}", e))
+    let new_fields: i64 = cmd
+        .query(conn)
+        .map_err(|e| format!("HSET update error: {}", e))?;
+    // ALL fields new => none of them was there. Deliberately NOT `new_fields != 0`:
+    // a partial count means the document was there but carried a different field
+    // set, which is schema drift between the upload and the update half — a real
+    // difference, but not "the write missed the corpus", and turning it into a
+    // hard error would abort a run whose updates did land.
+    //
+    // `written_fields` counts `meta.fields` entries, so a duplicate metadata key
+    // (or one literally named `vector`) would overcount it. Not reachable with
+    // any shipped dataset, and note the direction: an overcount makes the
+    // equality UNSATISFIABLE, so it would silently disable the guard rather than
+    // fire it spuriously. `test_binary_{redis,valkey}_mixed_updates_that_miss_
+    // the_corpus_are_fatal` is what catches a wrong `written_fields`.
+    Ok(new_fields == written_fields)
 }
 
 /// Format a string metadata field for storage on Valkey.
@@ -2166,7 +2200,7 @@ impl Engine for ValkeyEngine {
         let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut u_times: Vec<f64> = Vec::new();
+        let mut tally = crate::engine::UpdateTally::default();
 
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(parallel);
@@ -2194,7 +2228,7 @@ impl Engine for ValkeyEngine {
                     let mut r: Vec<f64> = Vec::new();
                     let mut mr: Vec<f64> = Vec::new();
                     let mut nd: Vec<f64> = Vec::new();
-                    let mut ut: Vec<f64> = Vec::new();
+                    let mut ut = crate::engine::UpdateTally::default();
                     let mut pb_pending: u64 = 0;
 
                     let mut conn = match ValkeyEngine::connect(&host, port) {
@@ -2272,7 +2306,7 @@ impl Engine for ValkeyEngine {
                             let data_idx = update_seq[uidx % update_seq_len];
 
                             let update_start = Instant::now();
-                            let _ = hset_single(
+                            let outcome = hset_single(
                                 &mut conn,
                                 &config,
                                 upd_ids[data_idx],
@@ -2280,7 +2314,21 @@ impl Engine for ValkeyEngine {
                                 upd_metadata[data_idx].as_ref(),
                             );
                             let update_time = update_start.elapsed().as_secs_f64();
-                            ut.push(update_time);
+                            match outcome {
+                                // The key existed. Either HSET replied 0 (every
+                                // field was already there) or it replied with a
+                                // PARTIAL count — some fields new, some not, i.e.
+                                // schema drift on a document that was present.
+                                // Both are applied updates; only all-new is not.
+                                Ok(false) => ut.times.push(update_time),
+                                // Every field HSET wrote was new, which is the
+                                // reply for a key that did not exist at all.
+                                Ok(true) => ut.unattributed += 1,
+                                Err(e) => {
+                                    ut.failed += 1;
+                                    eprintln!("Mixed update {} failed: {}", uidx, e);
+                                }
+                            }
                         }
                     }
                     if pb_pending > 0 {
@@ -2297,7 +2345,7 @@ impl Engine for ValkeyEngine {
                 recs.extend(r);
                 mrr_vals.extend(mr);
                 ndcg_vals.extend(nd);
-                u_times.extend(ut);
+                tally.merge(ut);
             }
         });
 
@@ -2307,26 +2355,6 @@ impl Engine for ValkeyEngine {
         if times.is_empty() {
             return Err("No searches completed".to_string());
         }
-
-        // Update latency stats (linear-interpolation percentiles, matching the
-        // shared search-stats path).
-        let (update_count, update_rps, update_mean_time, update_p50, update_p95, update_p99) =
-            if !u_times.is_empty() {
-                let u_rps = u_times.len() as f64 / total_time;
-                let u_mean = u_times.iter().sum::<f64>() / u_times.len() as f64;
-                let mut u_sorted: Vec<f64> = u_times.clone();
-                u_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                (
-                    Some(u_times.len()),
-                    Some(u_rps),
-                    Some(u_mean),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.50)),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.95)),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.99)),
-                )
-            } else {
-                (None, None, None, None, None, None)
-            };
 
         // Verify no failures occurred
         let mut check_conn = self.get_connection()?;
@@ -2343,14 +2371,18 @@ impl Engine for ValkeyEngine {
         let mut results = crate::engine::compute_search_stats(
             &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
         )?;
-        results.update_count = update_count;
-        results.update_rps = update_rps;
-        results.update_mean_time = update_mean_time;
-        results.update_p50_time = update_p50;
-        results.update_p95_time = update_p95;
-        results.update_p99_time = update_p99;
-        results.update_latencies = Some(u_times);
-        results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+        crate::engine::finalize_update_stats(
+            &mut results,
+            tally,
+            total_time,
+            crate::engine::UpdateAttribution::CorpusRow,
+            ratio,
+            "HSET replies with the number of fields that did not previously exist; all-new \
+             means the key was absent. The reply is about the KEY, not about index \
+             membership — that is inferred from FT.CREATE's PREFIX and hset_single sharing \
+             one key_prefix, so a document the index rejected (e.g. a wrong-dimension \
+             vector) would still answer 0 here",
+        );
         Ok(results)
     }
 

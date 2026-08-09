@@ -489,13 +489,25 @@ fn parse_vsim_response(response: &[redis::Value]) -> Vec<(i64, f64)> {
 }
 
 /// Single-record VADD update (for mixed benchmark).
+///
+/// Returns `Ok(true)` when the server reports the write **created a new
+/// element** rather than updating one that was already there: `VADD` replies 1
+/// for a newly added element and 0 for an update of an existing one (verified
+/// live against redis:8.8.0).
+///
+/// Note what a 1 does and does not mean. The write always goes to
+/// `config.key` — the very set `search_mixed` queries — so a 1 does NOT mean it
+/// landed elsewhere; it means the element was not already in that set, and the
+/// write therefore ENLARGED the corpus instead of overwriting a row of it. Every
+/// mixed update rewrites a vector this same run uploaded, so on a healthy run
+/// that cannot happen (#293).
 fn vadd_single(
     conn: &mut Connection,
     config: &VectorSetsConfig,
     id: i64,
     vector: &[f32],
     metadata: Option<&MetadataItem>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let vec_bytes: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
 
     let mut cmd = redis::cmd("VADD");
@@ -517,8 +529,10 @@ fn vadd_single(
         cmd.arg("SETATTR").arg(json_str);
     }
 
-    cmd.query::<()>(conn)
-        .map_err(|e| format!("VADD update error: {}", e))
+    let added: i64 = cmd
+        .query(conn)
+        .map_err(|e| format!("VADD update error: {}", e))?;
+    Ok(added != 0)
 }
 
 /// Establish the commandstats baseline if configure() did not (issue #238).
@@ -969,7 +983,7 @@ impl Engine for VectorSetsEngine {
         let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut u_times: Vec<f64> = Vec::new();
+        let mut tally = crate::engine::UpdateTally::default();
 
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(parallel);
@@ -994,7 +1008,7 @@ impl Engine for VectorSetsEngine {
                     let mut r: Vec<f64> = Vec::new();
                     let mut mr: Vec<f64> = Vec::new();
                     let mut nd: Vec<f64> = Vec::new();
-                    let mut ut: Vec<f64> = Vec::new();
+                    let mut ut = crate::engine::UpdateTally::default();
                     let mut pb_pending: u64 = 0;
 
                     let client = match redis::Client::open(redis_url.as_str()) {
@@ -1073,7 +1087,7 @@ impl Engine for VectorSetsEngine {
                             let data_idx = update_seq[uidx % update_seq_len];
 
                             let update_start = Instant::now();
-                            let _ = vadd_single(
+                            let outcome = vadd_single(
                                 &mut conn,
                                 &config,
                                 upd_ids[data_idx],
@@ -1081,7 +1095,18 @@ impl Engine for VectorSetsEngine {
                                 upd_metadata[data_idx].as_ref(),
                             );
                             let update_time = update_start.elapsed().as_secs_f64();
-                            ut.push(update_time);
+                            match outcome {
+                                // VADD replied 0: an element that was already in
+                                // the searched vector set was overwritten.
+                                Ok(false) => ut.times.push(update_time),
+                                // VADD replied 1: a NEW element was created, so
+                                // this write did not land in the uploaded corpus.
+                                Ok(true) => ut.unattributed += 1,
+                                Err(e) => {
+                                    ut.failed += 1;
+                                    eprintln!("Mixed update {} failed: {}", uidx, e);
+                                }
+                            }
                         }
                     }
                     if pb_pending > 0 {
@@ -1098,7 +1123,7 @@ impl Engine for VectorSetsEngine {
                 recs.extend(r);
                 mrr_vals.extend(mr);
                 ndcg_vals.extend(nd);
-                u_times.extend(ut);
+                tally.merge(ut);
             }
         });
 
@@ -1108,26 +1133,6 @@ impl Engine for VectorSetsEngine {
         if times.is_empty() {
             return Err("No searches completed".to_string());
         }
-
-        // Update latency stats (linear-interpolation percentiles, matching the
-        // shared search-stats path).
-        let (update_count, update_rps, update_mean_time, update_p50, update_p95, update_p99) =
-            if !u_times.is_empty() {
-                let u_rps = u_times.len() as f64 / total_time;
-                let u_mean = u_times.iter().sum::<f64>() / u_times.len() as f64;
-                let mut u_sorted: Vec<f64> = u_times.clone();
-                u_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                (
-                    Some(u_times.len()),
-                    Some(u_rps),
-                    Some(u_mean),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.50)),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.95)),
-                    Some(crate::engine::percentile_linear(&u_sorted, 0.99)),
-                )
-            } else {
-                (None, None, None, None, None, None)
-            };
 
         // Verify no failures occurred
         let mut check_conn = self.get_connection()?;
@@ -1144,14 +1149,16 @@ impl Engine for VectorSetsEngine {
         let mut results = crate::engine::compute_search_stats(
             &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
         )?;
-        results.update_count = update_count;
-        results.update_rps = update_rps;
-        results.update_mean_time = update_mean_time;
-        results.update_p50_time = update_p50;
-        results.update_p95_time = update_p95;
-        results.update_p99_time = update_p99;
-        results.update_latencies = Some(u_times);
-        results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+        crate::engine::finalize_update_stats(
+            &mut results,
+            tally,
+            total_time,
+            crate::engine::UpdateAttribution::CorpusRow,
+            ratio,
+            "VADD replies 1 when it adds a new element and 0 when it overwrites one that \
+             was already present. The write targets the same vector-set key VSIM reads, so \
+             this reply is about the searched object itself",
+        );
         Ok(results)
     }
 

@@ -20,7 +20,14 @@
 //! - `search`: `findNeighbors` against the public endpoint, one persistent
 //!   worker per `parallel`, timing only the RPC + reply parse.
 //!
-//! No metadata filters, no mixed workload, no quantization — pure vector KNN.
+//! - `search_mixed`: interleaves `findNeighbors` with single-datapoint
+//!   `upsertDatapoints` writes. The upsert reply is an empty body, so an update
+//!   here is only ever "the server accepted it" — this engine publishes
+//!   `update_attribution: "ack_only"` for that reason (#293).
+//!
+//! Metadata filters ARE supported (`restricts` / `numericRestricts`, built by
+//! `metadata_to_filter` and rendered by `filter_to_rest` / `filter_to_batch`).
+//! No quantization knobs.
 //!
 //! Auth: `VERTEX_ACCESS_TOKEN` if set, otherwise `gcloud auth
 //! print-access-token`. Tokens are short-lived; the token is re-fetched at the
@@ -2223,7 +2230,11 @@ impl Engine for VertexEngine {
         let mut recalls: Vec<f64> = Vec::new();
         let mut mrrs: Vec<f64> = Vec::new();
         let mut ndcgs: Vec<f64> = Vec::new();
-        let mut update_times: Vec<f64> = Vec::new();
+        // Vertex is the one mixed-capable engine that cannot do corpus-row
+        // attribution: `upsertDatapoints` replies with an empty body, so a 2xx
+        // says the write was accepted and nothing about which datapoint it
+        // replaced. `update_attribution: "ack_only"` publishes that limit (#293).
+        let mut tally = crate::engine::UpdateTally::default();
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(s, "vertex-mixed", workers);
@@ -2237,7 +2248,7 @@ impl Engine for VertexEngine {
                     let mut r = Vec::new();
                     let mut mr = Vec::new();
                     let mut nd = Vec::new();
-                    let mut ut = Vec::new();
+                    let mut ut = crate::engine::UpdateTally::default();
                     let mut pb_pending: u64 = 0;
 
                     let mut client = match VertexWorker::new(VertexWorkerConfig {
@@ -2348,15 +2359,21 @@ impl Engine for VertexEngine {
                                 .send()
                             {
                                 Ok(rr) if rr.status().is_success() => {
-                                    ut.push(ustart.elapsed().as_secs_f64())
+                                    ut.times.push(ustart.elapsed().as_secs_f64())
                                 }
-                                Ok(rr) => eprintln!(
-                                    "Mixed update {} failed: {}: {}",
-                                    uidx,
-                                    rr.status(),
-                                    rr.text().unwrap_or_default()
-                                ),
-                                Err(e) => eprintln!("Mixed update {} failed: {}", uidx, e),
+                                Ok(rr) => {
+                                    ut.failed += 1;
+                                    eprintln!(
+                                        "Mixed update {} failed: {}: {}",
+                                        uidx,
+                                        rr.status(),
+                                        rr.text().unwrap_or_default()
+                                    );
+                                }
+                                Err(e) => {
+                                    ut.failed += 1;
+                                    eprintln!("Mixed update {} failed: {}", uidx, e);
+                                }
                             }
                         }
                     }
@@ -2375,7 +2392,7 @@ impl Engine for VertexEngine {
                 recalls.extend(r);
                 mrrs.extend(mr);
                 ndcgs.extend(nd);
-                update_times.extend(ut);
+                tally.merge(ut);
             }
             Ok(measured_start)
         })?;
@@ -2385,23 +2402,6 @@ impl Engine for VertexEngine {
         if latencies.is_empty() {
             return Err("No searches completed (all mixed queries failed)".to_string());
         }
-
-        let (update_count, update_rps, update_mean, u50, u95, u99) = if !update_times.is_empty() {
-            let rps = update_times.len() as f64 / total_time;
-            let mean = update_times.iter().sum::<f64>() / update_times.len() as f64;
-            let mut sorted = update_times.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            (
-                Some(update_times.len()),
-                Some(rps),
-                Some(mean),
-                Some(crate::engine::percentile_linear(&sorted, 0.50)),
-                Some(crate::engine::percentile_linear(&sorted, 0.95)),
-                Some(crate::engine::percentile_linear(&sorted, 0.99)),
-            )
-        } else {
-            (None, None, None, None, None, None)
-        };
 
         let mut results = crate::engine::compute_search_stats(
             &latencies,
@@ -2414,14 +2414,17 @@ impl Engine for VertexEngine {
             parallel,
             num_to_run,
         )?;
-        results.update_count = update_count;
-        results.update_rps = update_rps;
-        results.update_mean_time = update_mean;
-        results.update_p50_time = u50;
-        results.update_p95_time = u95;
-        results.update_p99_time = u99;
-        results.update_latencies = Some(update_times);
-        results.update_search_ratio = Some(format!("{}:{}", ratio.updates, ratio.searches));
+        crate::engine::finalize_update_stats(
+            &mut results,
+            tally,
+            total_time,
+            VERTEX_UPDATE_ATTRIBUTION,
+            ratio,
+            // Published as `update_attribution_detail`; never quoted by the gate,
+            // which cannot fire under AckOnly because nothing sets `unattributed`.
+            "upsertDatapoints returns an empty body, so a 2xx is an acceptance and carries \
+             no information about which datapoint was replaced",
+        );
         Ok(results)
     }
 
@@ -2543,6 +2546,70 @@ impl VertexEngine {
                 .progress_chars("#>-"),
         );
         pb
+    }
+}
+
+/// The attribution tier Vertex publishes for mixed-workload updates (#293).
+///
+/// A named constant so a unit test can pin it: `tests/integration_vertex.rs`
+/// self-skips without `VERTEX_PROJECT`, so nothing else in the suite would
+/// notice this being raised to `CorpusRow` — a claim Vertex cannot make, since
+/// `upsertDatapoints` replies with an empty body and never names the datapoint
+/// it touched.
+pub const VERTEX_UPDATE_ATTRIBUTION: crate::engine::UpdateAttribution =
+    crate::engine::UpdateAttribution::AckOnly;
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::VERTEX_UPDATE_ATTRIBUTION;
+    use crate::engine::{
+        finalize_update_stats, SearchResults, UpdateAttribution, UpdateSearchRatio, UpdateTally,
+    };
+
+    /// Vertex must never claim corpus-row attribution: `upsertDatapoints`
+    /// returns an empty body, so a 2xx says the write was accepted and nothing
+    /// about which datapoint it replaced. Raising this to `CorpusRow` would put
+    /// a stronger claim in the artifact than the API can support — and it is
+    /// otherwise untestable, because the Vertex integration test self-skips
+    /// without `VERTEX_PROJECT`.
+    #[test]
+    fn vertex_publishes_ack_only_and_never_claims_corpus_row() {
+        assert_eq!(VERTEX_UPDATE_ATTRIBUTION, UpdateAttribution::AckOnly);
+        assert_ne!(VERTEX_UPDATE_ATTRIBUTION, UpdateAttribution::CorpusRow);
+    }
+
+    /// ...and that constant is what reaches the result JSON, so the weaker tier
+    /// is visible to anyone comparing `update_rps` across engines. This is the
+    /// only place an `ack_only` run is produced anywhere in the suite.
+    #[test]
+    fn the_ack_only_tier_reaches_the_published_fields() {
+        let mut r = SearchResults::default();
+        finalize_update_stats(
+            &mut r,
+            UpdateTally {
+                times: vec![0.01, 0.02],
+                unattributed: 0,
+                failed: 0,
+            },
+            1.0,
+            VERTEX_UPDATE_ATTRIBUTION,
+            &UpdateSearchRatio {
+                updates: 1,
+                searches: 5,
+            },
+            "upsertDatapoints returns an empty body",
+        );
+        assert_eq!(r.update_attribution.as_deref(), Some("ack_only"));
+        // OMITTED, not Some(0): there is no row-level signal to count with, and
+        // a published 0 would read in the artifact exactly like a corpus_row
+        // engine's verified zero.
+        assert_eq!(r.update_unattributed, None);
+        // The mechanism is published even here, so a reader can see WHY the
+        // count is missing rather than guessing.
+        assert_eq!(
+            r.update_attribution_detail.as_deref(),
+            Some("upsertDatapoints returns an empty body")
+        );
     }
 }
 

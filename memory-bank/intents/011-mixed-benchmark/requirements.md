@@ -69,6 +69,18 @@ Add a mixed workload benchmark mode that interleaves vector updates with searche
 - **Description**: Extend the search results JSON to include `update_search_ratio`, `update_count`, and the update latency metrics alongside existing search metrics. When ratio is not specified, these fields are omitted (backward compatible).
 - **Acceptance Criteria**: Existing result parsers/scripts don't break. New fields only appear when mixed mode is active.
 - **Priority**: Must
+- **AMENDED BY #293**: this document is the original intent and is left as
+  written, but `update_count`'s meaning has since changed and this file no longer
+  describes it. It was implemented as a count of client-side loop iterations; it
+  now counts writes the **server** accepted, with failures excluded into
+  `update_failures`, the attribution tier published as `update_attribution`, and
+  writes the server could not attribute to an existing corpus row counted in
+  `update_unattributed`. The README's "Mixed Benchmarks" section is the current
+  schema reference; the same caveat applies to FR-5 above and to these three
+  files, all paths relative to the repository root:
+  `memory-bank/intents/011-mixed-benchmark/units/001-mixed-benchmark-core/stories/002-engine-trait.md`,
+  `memory-bank/intents/011-mixed-benchmark/units/001-mixed-benchmark-core/stories/004-metrics-reporting.md`,
+  `memory-bank/bolts/006-mixed-benchmark-core/implementation-plan.md`.
 
 ### FR-10: Engine Trait Extension
 - **Description**: Add an `update` method to the Engine trait (or a `MixedBenchmarkSupport` sub-trait) that takes a vector ID, vector data, and optional metadata, and performs the upsert. Engines that don't support mixed mode return an error.

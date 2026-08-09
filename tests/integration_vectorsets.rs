@@ -364,7 +364,17 @@ fn test_binary_vectorsets_mixed_benchmark() {
             "vs-mx",
             TEST_HOST,
             &[("REDIS_PORT", port.as_str())],
-            &["--update-search-ratio", "1:5", "--repetitions", "1"],
+            // --keep-data suppresses the teardown `engine.delete()`, so the
+            // server-side assertions at the end of this test have a corpus to
+            // read. Without it `VCARD idx:vsets-mx` is 0 by the time the binary
+            // exits and the read proves nothing. The key is removed below.
+            &[
+                "--update-search-ratio",
+                "1:5",
+                "--repetitions",
+                "1",
+                "--keep-data",
+            ],
         ),
         "vectorsets mixed run failed"
     );
@@ -389,7 +399,157 @@ fn test_binary_vectorsets_mixed_benchmark() {
         p50 <= p95 && p95 <= p99,
         "percentiles must be monotone: p50={p50} p95={p95} p99={p99}"
     );
+
+    // --- #293: none of the four assertions above can see whether the updates
+    // reached the corpus that was searched. recall/precision are measured on a
+    // corpus that is complete either way, and update_count/update_rps were
+    // counts of client-side loop iterations.
+    //
+    // What actually catches the #293 mutation (updates pointed at another key)
+    // is NOT an assertion here — it is the in-run gate, which rejects the point,
+    // so `run_binary` above returns false and this test fails there. The failing
+    // branch itself is driven end to end by
+    // `test_binary_vectorsets_mixed_updates_that_miss_the_corpus_are_fatal`.
+    //
+    // `update_unattributed` is the gate's actual output; the other two are the
+    // tier label (a per-engine constant) and the unrelated failure count.
+    assert_eq!(
+        r["update_unattributed"].as_u64(),
+        Some(0),
+        "a healthy mixed run must land every update on an element already in the \
+         searched set"
+    );
+    assert_eq!(
+        r["update_attribution"].as_str(),
+        Some("corpus_row"),
+        "VectorSets must publish that every counted update was confirmed by the \
+         server to have overwritten an element already in the searched set"
+    );
+    // VectorSets is the strict case within its tier: VADD targets the very key
+    // VSIM reads. The detail must say so, because Redis/Valkey share the label
+    // on a weaker, inferred basis.
+    assert!(
+        r["update_attribution_detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("VADD") && d.contains("VSIM")),
+        "the artifact must carry the signal and name the searched object: {:?}",
+        r["update_attribution_detail"]
+    );
+    assert_eq!(
+        r["update_failures"].as_u64(),
+        Some(0),
+        "no update should have failed in this run"
+    );
+
+    let url = format!("redis://{}:{}/", TEST_HOST, test_port());
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_connection().unwrap();
+    // #236: this config's corpus is the single key `idx:<config-name>`.
+    let searched_key = format!("idx:{name}");
+    let vcard: i64 = redis::cmd("VCARD")
+        .arg(&searched_key)
+        .query(&mut conn)
+        .unwrap();
+    // This test ran with --keep-data, so the corpus is ours to clean up. Do it
+    // BEFORE the assertions below: a panic between the read and the DEL would
+    // otherwise leak `idx:<config>` onto the shared server for every later test.
+    let _: () = redis::cmd("DEL")
+        .arg(&searched_key)
+        .query(&mut conn)
+        .unwrap();
+
+    // Positive control: without this, the equality below could be satisfied by
+    // a server that lost the corpus entirely (0 == 0 against a broken expected).
+    assert!(
+        vcard > 0,
+        "searched key {searched_key} is empty after the mixed run — the corpus \
+         assertion below would be checking nothing"
+    );
+    // A mixed update overwrites elements that are already present, so the
+    // cardinality must be exactly the uploaded corpus — an update that ADDED an
+    // element to the searched set would push this past 400.
+    //
+    // LIMIT, stated because it is easy to over-read: this equality does NOT
+    // prove the updates landed. Under the #293 mutation the searched set keeps
+    // all 400 elements untouched and this assertion passes; the guard inside the
+    // run is what fails there.
+    assert_eq!(
+        vcard, 400,
+        "the searched vector set must still hold the whole 400-doc corpus"
+    );
     std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// The server reply that makes `update_count` server-attributable (#293).
+///
+/// `vadd_single` now returns "did this write CREATE something" straight from
+/// `VADD`'s integer reply, which `finalize_update_stats` records and
+/// `experiment::gate_update_attribution` then rejects the run over. That guard is only as good as
+/// the reply, and the reply is a server behaviour no unit test can pin — if a
+/// future Redis returned a constant, the guard would silently become vacuous
+/// while every test stayed green. So assert it against the live server.
+///
+/// This test does NOT exercise the benchmark's mixed path; it pins the single
+/// server fact that path depends on.
+#[test]
+fn test_vadd_reply_distinguishes_a_new_element_from_an_overwrite() {
+    wait_for_vectorsets();
+
+    let url = format!("redis://{}:{}/", TEST_HOST, test_port());
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_connection().unwrap();
+
+    // Own key, outside the `idx:` namespace every other test in this file uses,
+    // so this stays parallel-safe. Torn down at the end.
+    let key = "vsets-293-vadd-reply-probe";
+    let _: () = redis::cmd("DEL").arg(key).query(&mut conn).unwrap();
+
+    // POSITIVE CONTROL: a genuinely new element reports 1. If VADD always
+    // reported 0, the overwrite assertion below would pass vacuously and the
+    // shipped guard could never fire.
+    // Built in the SHAPE `vadd_single` actually sends: FP32 bytes, the quant
+    // token, M / EF, CAS (true in the shipped test configs) and SETATTR. A bare
+    // `VADD key VALUES ...` would pin a weaker command than the engine issues,
+    // and this reply is what the whole guard reads.
+    let vadd = |conn: &mut redis::Connection, vec: [f32; 3], elem: &str| -> i64 {
+        let bytes: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+        redis::cmd("VADD")
+            .arg(key)
+            .arg("FP32")
+            .arg(&bytes[..])
+            .arg(elem)
+            .arg("NOQUANT")
+            .arg("M")
+            .arg(16)
+            .arg("EF")
+            .arg(200)
+            .arg("CAS")
+            .arg("SETATTR")
+            .arg(r#"{"color":"red"}"#)
+            .query(conn)
+            .unwrap()
+    };
+
+    let created: i64 = vadd(&mut conn, [1.0, 0.0, 0.0], "e1");
+    assert_eq!(created, 1, "VADD of a new element must reply 1");
+
+    // The mixed-workload case: same element id, different vector.
+    let overwritten: i64 = vadd(&mut conn, [0.0, 1.0, 0.0], "e1");
+    assert_eq!(
+        overwritten, 0,
+        "VADD overwriting an existing element must reply 0 — the whole #293 guard \
+         reads this value to tell an in-corpus update from a write that landed \
+         somewhere the search never looks"
+    );
+
+    // A second distinct element is a creation again, and the set grew by
+    // exactly the two creations — not by the overwrite.
+    let created2: i64 = vadd(&mut conn, [0.0, 0.0, 1.0], "e2");
+    assert_eq!(created2, 1);
+    let card: i64 = redis::cmd("VCARD").arg(key).query(&mut conn).unwrap();
+    assert_eq!(card, 2, "two creations, one overwrite => cardinality 2");
+
+    let _: () = redis::cmd("DEL").arg(key).query(&mut conn).unwrap();
 }
 
 /// Geo-radius end-to-end (issue #223).
@@ -1086,4 +1246,165 @@ fn read_upload_memory(root: &std::path::Path, engine: &str) -> (i64, i64) {
         mem["index_memory_bytes"].as_i64().unwrap_or(-1),
         mem["used_memory"].as_i64().unwrap_or(-1),
     )
+}
+
+/// #293 end to end: every mixed update creates a NEW element instead of
+/// overwriting one → hard error; `--allow-partial-corpus` → honest zeros.
+///
+/// Without this the `Ok(true) => ut.unattributed += 1` arm in `search_mixed` is
+/// dead in every run, so "read the VADD reply" and "ignore it and return
+/// `Ok(false)`" are indistinguishable — the whole fix could be reverted at the
+/// source with the suite green. The mixed test above only pins the healthy
+/// branch.
+///
+/// Fixture: the corpus keeps its exact cardinality but none of its element ids,
+/// so `--skip-upload`'s reuse check (VCARD vs the declared row count) still
+/// passes and is NOT what fires.
+#[test]
+fn test_binary_vectorsets_mixed_updates_that_miss_the_corpus_are_fatal() {
+    wait_for_vectorsets();
+
+    let name = "vs293miss";
+    let ds = "vs293miss-test";
+    let configs = serde_json::json!([{
+        "name": name,
+        "engine": "vectorsets",
+        "search_params": [{"parallel": 1, "search_params": {"ef": 64}}],
+        "upload_params": {
+            "hnsw_config": {"quant": "NOQUANT", "M": 16, "EF_CONSTRUCTION": 200},
+            "CAS": true, "parallel": 1, "batch_size": 100
+        }
+    }]);
+    let proj = common::write_match_any_cosine_project_n(
+        ds,
+        &serde_json::to_string(&configs).unwrap(),
+        8,
+        500,
+    );
+    let port = test_port().to_string();
+    let key = format!("idx:{name}");
+
+    let url = format!("redis://{}:{}/", TEST_HOST, port);
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_connection().unwrap();
+
+    // Rebuilt before EACH run: the gate rejects the numbers after the timed
+    // window, so a rejected run has already added the elements it complained
+    // were missing. Reusing that state would silently test the healthy path.
+    let build_shifted_corpus = |conn: &mut redis::Connection| {
+        let _: () = redis::cmd("DEL").arg(&key).query(conn).unwrap();
+        // A vector set of the right cardinality whose element ids are all
+        // outside the dataset's 0..N_DOCS range.
+        for i in 0..common::N_DOCS {
+            let v: Vec<u8> = (0..8u32)
+                .flat_map(|d| ((i + d as usize) as f32).to_le_bytes())
+                .collect();
+            let _: i64 = redis::cmd("VADD")
+                .arg(&key)
+                .arg("FP32")
+                .arg(&v[..])
+                .arg(format!("{}", 90_000 + i))
+                .arg("NOQUANT")
+                .query(conn)
+                .unwrap();
+        }
+        let card: i64 = redis::cmd("VCARD").arg(&key).query(conn).unwrap();
+        assert_eq!(
+            card,
+            common::N_DOCS as i64,
+            "the shifted corpus must keep its cardinality, so the reuse check \
+             passes and this test exercises the #293 gate rather than #238's"
+        );
+        // Drop prior search result files so `read_results_obj` below cannot pick
+        // up a stale one from the rejected run.
+        let results_dir = proj.root.join("results");
+        if let Ok(entries) = std::fs::read_dir(&results_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("-search-"))
+                {
+                    std::fs::remove_file(path).ok();
+                }
+            }
+        }
+    };
+
+    let run = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(common::binary_path());
+        cmd.args([
+            "--engines",
+            name,
+            "--datasets",
+            ds,
+            "--host",
+            TEST_HOST,
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+            "--update-search-ratio",
+            "1:5",
+            "--repetitions",
+            "1",
+        ]);
+        cmd.args(extra);
+        cmd.current_dir(&proj.root)
+            .env("REDIS_PORT", &port)
+            .output()
+            .expect("run vector-db-benchmark")
+    };
+
+    build_shifted_corpus(&mut conn);
+    let out = run(&[]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a mixed run whose every VADD created a new element must be a hard error \
+         (#293), but the run succeeded.\n{combined}"
+    );
+    assert!(
+        combined.contains("reported that the row each one addressed did not already exist")
+            && combined.contains("Signal read: VADD replies 1 when it adds a new element"),
+        "the error must be the #293 gate quoting the VADD signal.\n{combined}"
+    );
+
+    build_shifted_corpus(&mut conn);
+    let out2 = run(&["--allow-partial-corpus"]);
+    assert!(
+        out2.status.success(),
+        "--allow-partial-corpus must downgrade the #293 gate to a warning.\n{}{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let r = common::read_results_obj(&proj.root, name);
+    let update_count = r["update_count"].as_u64().unwrap();
+    let unattributed = r["update_unattributed"].as_u64().unwrap();
+    println!(
+        "vectorsets #293 waived: update_count={update_count} update_unattributed={unattributed}"
+    );
+
+    // POSITIVE evidence that the reuse check was satisfied and this test really
+    // is exercising the #293 gate. The `!contains("incomplete")` check on the
+    // rejected arm above is a negative; this reads the verdict the run recorded.
+    let reuse = common::read_params_obj(&proj.root, name)["corpus_reuse"].clone();
+    assert_eq!(
+        reuse["status"], "verified",
+        "the shifted corpus must verify on row count, or this fixture is testing \
+         the #238 reuse gate instead: {reuse}"
+    );
+    assert!(unattributed > 0, "the missed updates must be recorded");
+    assert_eq!(
+        update_count, 0,
+        "not one update overwrote an existing element, so update_count must be 0"
+    );
+
+    let _: () = redis::cmd("DEL").arg(&key).query(&mut conn).unwrap();
+    std::fs::remove_dir_all(&proj.root).ok();
 }
