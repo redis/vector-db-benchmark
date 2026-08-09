@@ -55,11 +55,6 @@ src/
     parser.rs
     search.rs
     upload.rs
-  vectorsets/                     # VectorSets engine module
-    mod.rs
-    configure.rs
-    search.rs
-    upload.rs
   bin/
     bench_jsonl.rs                # Standalone benchmark binaries
     bench_npy.rs
