@@ -39,8 +39,7 @@ turbopuffer-client = "0.0.4"
 rand = "0.8"
 # Real URL parser for credential redaction (#212): a hand-written tokeniser
 # leaked in six consecutive rounds; structured fields have no desync states.
-url = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 hdrhistogram = "7.5"
 base64 = "0.22"
 

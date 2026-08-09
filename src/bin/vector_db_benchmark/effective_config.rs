@@ -130,99 +130,6 @@ pub fn is_secret(name: &str) -> bool {
 
 /// Placeholder for a component that was not positively recognised.
 const DROPPED: &str = "<dropped>";
-/// Placeholder for userinfo removed from an authority.
-const REDACTED_USERINFO: &str = "<redacted:userinfo>";
-
-/// Parameter names whose VALUES are safe to publish verbatim.
-///
-/// An ALLOW-list, not a block-list, and that inversion is the whole point.
-/// Three review rounds each closed the demonstrated leak and left the class
-/// open, because a block-list over connection strings is a block-list over an
-/// unbounded input language: percent-encoded (`%70assword=`), Cyrillic
-/// homoglyph (`pаssword=`), `AccountKey=`, `bearer=`, and every nested or
-/// quote-desynced form slipped past markers that had just been widened. Under
-/// an allow-list all of those are simply not recognised, so their values are
-/// dropped without anyone having to have predicted them.
-///
-/// Matched case-insensitively. Deliberately excludes anything whose value can
-/// itself contain pairs — `options` above all (`options='-c password=X'` is a
-/// live libpq shape).
-/// NOTE: `authsource` and `target_session_attrs` were removed rather than
-/// exempted. They matched `is_secret` (AUTH / SESSION), so publishing them made
-/// the two inventories contradict each other in one artifact — `?authSource=admin`
-/// published in a URI while `"authSource": "admin"` as a JSON key became
-/// `<redacted:set>`. Dropping them costs a little provenance and keeps
-/// `no_allow_listed_parameter_is_credential_named` enforceable, which is what
-/// blocks `sslpassword` / `passfile` / `proxyPassword` / `authMechanismProperties`
-/// from being added in good faith later.
-const SAFE_PARAM_KEYS: &[&str] = &[
-    // libpq
-    "host",
-    "hostaddr",
-    "port",
-    "dbname",
-    "user",
-    "sslmode",
-    "connect_timeout",
-    "application_name",
-    // mongo
-    "w",
-    "retrywrites",
-    "readpreference",
-    "replicaset",
-    "tls",
-    "ssl",
-    "maxpoolsize",
-    "minpoolsize",
-    "sockettimeoutms",
-    "connecttimeoutms",
-    "directconnection",
-    "appname",
-    // redis
-    "db",
-    "protocol",
-    "timeout",
-    // odbc / jdbc
-    "server",
-    "database",
-    "uid",
-    "encrypt",
-    "driver",
-    "trustservercertificate",
-];
-
-fn is_safe_param(key: &str) -> bool {
-    let k = key.trim().to_ascii_lowercase();
-    SAFE_PARAM_KEYS.contains(&k.as_str())
-}
-
-/// A value simple enough that it cannot hide a nested pair: no quotes, no
-/// whitespace, no `=`, `&`, `;`, `@` or `?`, and short.
-///
-/// Belt to the allow-list's braces. Without it an allow-listed key whose value
-/// happened to contain `password=…` would republish it.
-fn is_simple_param_value(v: &str) -> bool {
-    !v.is_empty()
-        && v.len() <= 64
-        && v.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | ':' | '/' | '%')
-        })
-}
-
-/// A parameter NAME safe to echo back when its value is dropped. Bounded and
-/// ASCII so a tokeniser desync cannot smuggle secret text into a key position.
-fn sanitise_param_name(k: &str) -> String {
-    let k = k.trim();
-    let ok = !k.is_empty()
-        && k.len() <= 40
-        && k.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
-        format!("{k}={DROPPED}")
-    } else {
-        DROPPED.to_string()
-    }
-}
 
 /// Configuration keys whose VALUES may be published in the `declared` block.
 ///
@@ -303,278 +210,52 @@ fn is_publishable_declared_key(key: &str) -> bool {
     DECLARED_KEY_ALLOWLIST.contains(&key)
 }
 
-/// URI schemes whose NAME is safe to publish. Allow-listed for the same reason
-/// parameter names are: the slot is attacker-controlled text.
-const SAFE_SCHEMES: &[&str] = &[
-    "redis",
-    "rediss",
-    "redis+sentinel",
-    "valkey",
-    "http",
-    "https",
-    "grpc",
-    "grpcs",
-    "mongodb",
-    "mongodb+srv",
-    "postgres",
-    "postgresql",
-    "jdbc:postgresql",
-    "jdbc:mysql",
-    "qdrant",
-    "file",
-    "s3",
-    "gs",
-];
-
-fn is_safe_scheme(s: &str) -> bool {
-    let lower = s.to_ascii_lowercase();
-    SAFE_SCHEMES.contains(&lower.as_str())
-}
-
 /// Keys whose values are prose WE author, never user or server input, and which
 /// must therefore be reproduced intact rather than reconstructed.
 const PROSE_KEYS: &[&str] = &["reason", "covers"];
 
-/// Digest for a structured string we will not publish.
+/// The single, unconditional treatment for any value that is not a plain token.
 ///
-/// L2/L4 existed only because the previous design tried to salvage readable
-/// output from arbitrary DSNs. Nobody reproducing a benchmark needs the ODBC
-/// connection string verbatim; they need to know whether two runs used the same
-/// one. A truncated SHA-256 plus the length gives exactly that with no leak
-/// surface at all, and — unlike a sanitiser — it has no tokeniser to desync.
+/// Eight rounds; seven leaked. Every mechanism that preserved readable output
+/// was a parser, and every parser had a desync: authority slicing (round 2,
+/// lost and reintroduced in round 5), scheme prefixes, quote tracking, and —
+/// last round — a host-list feature added to *recover* provenance, which let a
+/// `@` in a query value put the credential tail into the host slot while a
+/// neighbouring `<dropped>` claimed redaction. A generative campaign found six
+/// classes in 381k cases after the `url` crate had already removed three.
+///
+/// So there is no parser. Anything structured becomes a digest, always. This is
+/// unreachable-by-construction rather than guarded: there is no slice of the
+/// input on any path to the artifact.
+///
+/// What is lost is readable endpoints. That cost is real and bounded: the digest
+/// still answers "did these two runs use the same connection string?", which is
+/// the question a benchmark artifact needs. The endpoint itself lives in the
+/// operator's shell history, not in a published result.
 fn opaque_digest(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(value.as_bytes());
-    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    format!("<redacted:opaque sha256={hex} len={}>", value.len())
+    // 8 bytes, not 4: at 4 bytes birthdays start around 77k values and a
+    // measured 200k-value sweep collided 5 times, so two different endpoints
+    // rendered identically while the field asserted they were the same.
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    // No `len=`: against a known template it discloses the credential's exact
+    // character count.
+    format!("<redacted:opaque sha256={hex}>")
 }
 
-/// A host token: a domain/IP label, or a bracketed IPv6 literal whose interior
-/// is hex-and-colons only.
+/// A value safe to publish verbatim: a plain token and nothing else.
 ///
-/// The bracket check used to be `starts_with('[') && ends_with(']')` with no
-/// constraint on the interior, so `redis://[admin:LEAK]` passed the
-/// host-or-host:port rule intact (L3).
-fn is_host_token(h: &str) -> bool {
-    if h.is_empty() || h.len() > 255 {
-        return false;
-    }
-    if let Some(inner) = h.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
-        return !inner.is_empty()
-            && inner
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
-    }
-    h.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-}
-
-/// `host[:port]`, comma-separated. Replica-set seed lists
-/// (`mongodb://h1:27017,h2:27017/db`) and SQL Server's `host,port` are the
-/// reason commas are handled at all — the previous version dropped the entire
-/// host list.
-fn is_host_list(authority: &str) -> bool {
-    !authority.is_empty()
-        && authority.split(',').all(|part| {
-            let (h, port) = match part.rsplit_once(':') {
-                // A bracketed IPv6 literal owns its colons.
-                Some(_) if part.ends_with(']') => (part, None),
-                Some((h, p)) => (h, Some(p)),
-                None => (part, None),
-            };
-            is_host_token(h)
-                && port.is_none_or(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        })
-}
-
-/// True when a string is structured enough that publishing it verbatim could
-/// carry a credential.
-///
-/// `;` counts (L2: `Server:h;Pwd:LEAK` has no `://`, `@` or `=` and was
-/// published byte for byte). A bare `:` does NOT, or every index name
-/// (`idx:redis-docker-test`) would become a digest.
-fn is_connection_like(value: &str) -> bool {
-    value.contains("://") || value.contains('@') || value.contains('=') || value.contains(';')
-}
-
-/// Rebuild a connection-like value from PARSED, structured fields.
-///
-/// Six rounds of hand-written tokenising produced six generations of leak — the
-/// last found by a generative campaign that hit 116k leaking cases across five
-/// root causes, all of them desync states of the tokeniser rather than missing
-/// rules. So there is no tokeniser here any more:
-///
-/// * a `scheme://` value is parsed by the `url` crate, and only whole fields it
-///   returns are emitted — userinfo is never one of them, so a `@` anywhere
-///   (including inside a query value, which was L1) cannot promote text into
-///   the host slot;
-/// * anything that does not parse as a URL with a recognised scheme and a real
-///   host becomes an [`opaque_digest`] — identity without disclosure;
-/// * a value with no structural characters at all is returned unchanged, which
-///   is the overwhelming majority of what gets recorded.
-fn redact_connection_like(value: &str) -> String {
-    if !is_connection_like(value) {
-        return value.to_string();
-    }
-    // `url` will happily read `Server:h;Pwd:LEAK` as scheme + path, so a URL is
-    // required to look like one first.
-    if !value.contains("://") {
-        // …except a scheme-LESS authority, which is how `--host` carries a
-        // password (`default:pw@node`) and is the single most common form here.
-        // Parsed with a synthetic scheme so `url` — not a tokeniser of ours —
-        // decides where the userinfo ends. A `;` or `=` means it is a parameter
-        // blob, not an authority, so those go straight to a digest.
-        if !value.contains(';') && !value.contains('=') {
-            if let Ok(parsed) = url::Url::parse(&format!("nullscheme://{value}")) {
-                if let Some(host) = parsed.host_str() {
-                    // A bare `@` with nothing before it did not delimit
-                    // userinfo, so the string is not the authority it looks
-                    // like. Ambiguous input goes to a digest rather than having
-                    // its tail promoted into the host slot.
-                    let authority_only =
-                        &value[..value.find(['/', '?', '#']).unwrap_or(value.len())];
-                    if authority_only.contains('@')
-                        && parsed.username().is_empty()
-                        && parsed.password().is_none()
-                    {
-                        return opaque_digest(value);
-                    }
-                    // With userinfo present and no scheme, the host must look
-                    // like a real hostname. `--host p@ssword` parses as
-                    // userinfo `p` + host `ssword` by URL grammar, so the tail
-                    // of an accidentally-pasted password would be published in
-                    // the host slot — directly beside `<redacted:userinfo>`,
-                    // asserting redaction at the point it failed.
-                    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
-                    let plausible_host =
-                        host.contains('.') || host == "localhost" || host.starts_with('[');
-                    if has_userinfo && !plausible_host {
-                        return opaque_digest(value);
-                    }
-                    if is_host_token(host) {
-                        let mut out = String::new();
-                        if !parsed.username().is_empty() || parsed.password().is_some() {
-                            out.push_str(REDACTED_USERINFO);
-                            out.push('@');
-                        }
-                        out.push_str(host);
-                        if let Some(port) = parsed.port() {
-                            out.push(':');
-                            out.push_str(&port.to_string());
-                        }
-                        let path = parsed.path();
-                        let path_ok = path.chars().all(|c| {
-                            c.is_ascii_alphanumeric()
-                                || matches!(c, '.' | '-' | '_' | '/' | '%' | '~')
-                        });
-                        if !path.is_empty() && path != "/" {
-                            out.push_str(if path_ok { path } else { DROPPED });
-                        }
-                        if parsed.query().is_some() {
-                            return opaque_digest(value);
-                        }
-                        return out;
-                    }
-                }
-            }
-        }
-        return opaque_digest(value);
-    }
-    let Some(scheme_end) = value.find("://") else {
-        return opaque_digest(value);
-    };
-    if !is_safe_scheme(&value[..scheme_end]) {
-        return opaque_digest(value);
-    }
-
-    // Comma-separated seed lists are not valid URL authorities, so parse with a
-    // single placeholder host and restore the list only if EVERY element passes
-    // `is_host_list`.
-    let (probe, multi_host) = match split_authority(value) {
-        Some((prefix, authority, suffix)) if authority.contains(',') => {
-            if !is_host_list(authority) {
-                return opaque_digest(value);
-            }
-            (
-                format!("{prefix}placeholder.invalid{suffix}"),
-                Some(authority),
-            )
-        }
-        _ => (value.to_string(), None),
-    };
-
-    let Ok(parsed) = url::Url::parse(&probe) else {
-        return opaque_digest(value);
-    };
-    let Some(host) = parsed.host_str() else {
-        return opaque_digest(value);
-    };
-    let host_display = match multi_host {
-        Some(list) => list.to_string(),
-        None => {
-            if !is_host_token(host) {
-                return opaque_digest(value);
-            }
-            match parsed.port() {
-                Some(p) => format!("{host}:{p}"),
-                None => host.to_string(),
-            }
-        }
-    };
-
-    let mut out = String::new();
-    out.push_str(parsed.scheme());
-    out.push_str("://");
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        out.push_str(REDACTED_USERINFO);
-        out.push('@');
-    }
-    out.push_str(&host_display);
-    // `Url` percent-encodes and normalises the path; emit it only if it is
-    // plainly safe, otherwise say so.
-    let path = parsed.path();
-    if !path.is_empty() && path != "/" {
-        let ok = path
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '%' | '~'));
-        out.push_str(if ok { path } else { DROPPED });
-    } else {
-        out.push_str(path);
-    }
-
-    // Query parameters come from `Url`'s own pair iterator — no splitting here.
-    let kept: Vec<String> = parsed
-        .query_pairs()
-        .map(|(k, v)| {
-            if is_safe_param(&k) && is_simple_param_value(&v) {
-                format!("{k}={v}")
-            } else {
-                sanitise_param_name(&k)
-            }
-        })
-        .collect();
-    if !kept.is_empty() {
-        out.push('?');
-        out.push_str(&kept.join("&"));
-    }
-    out
-}
-
-/// Split `scheme://AUTHORITY<rest>` into its three parts, for the comma-list
-/// pre-check. Returns `None` when there is no authority.
-fn split_authority(value: &str) -> Option<(&str, &str, &str)> {
-    let i = value.find("://")? + 3;
-    let rest = &value[i..];
-    // Userinfo, if present, is not part of the host list.
-    let start = match rest.rfind('@') {
-        Some(a) => a + 1,
-        None => 0,
-    };
-    let end = rest[start..]
-        .find(['/', '?', '#'])
-        .map(|e| start + e)
-        .unwrap_or(rest.len());
-    Some((&value[..i + start], &rest[start..end], &value[i + end..]))
+/// An ALLOW-list on the value's shape, which is why it has no desync states.
+/// `/` and `~` are permitted so filesystem paths survive; `:` is not, because
+/// `:` is what separates a username from a password (`admin:Sup3rSecret`) and
+/// no shape test can tell that from `idx:redis-docker-test`. The index name is
+/// derivable from `params.experiment`, so that loss is recoverable; a published
+/// password is not.
+fn is_plain_token(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '/' | '~'))
 }
 
 /// Fields that a sibling `key` must NOT make secret: they carry the knob's name
@@ -602,15 +283,10 @@ fn scrub_value_inner(value: &Value, secret_ancestor: bool, prose: bool) -> Value
                 .map(|(k, v)| {
                     // An `overridden` entry names its knob in a sibling `key`
                     // field rather than in its own JSON key, so `declared` /
-                    // `effective` there would otherwise look benign.
-                    //
-                    // `key` and `reason` are exempt from that seeding: they hold
-                    // the knob's NAME and a prose explanation, never its value.
-                    // Without the exemption an override on a credential knob
-                    // rendered as four `<redacted:set>`s and recorded nothing at
-                    // all — the entry destroying the very thing it exists to
-                    // produce. Same for any `{"key":…, "value":…}` pair, which
-                    // lost the name alongside the secret.
+                    // `effective` there would otherwise look benign. `key` and
+                    // `reason` are exempt: they hold the knob's NAME and a prose
+                    // explanation, never its value, and blanking them made an
+                    // override on a credential knob record nothing at all.
                     let seeded = !ENTRY_KEY_EXEMPT.contains(&k.as_str())
                         && map
                             .get("key")
@@ -633,19 +309,33 @@ fn scrub_value_inner(value: &Value, secret_ancestor: bool, prose: bool) -> Value
                 .map(|v| scrub_value_inner(v, secret_ancestor, prose))
                 .collect(),
         ),
-        Value::String(s) if secret_ancestor && s == REDACTED_DEFAULT => {
-            Value::from(REDACTED_DEFAULT)
-        }
-        // NOTE: this changes a JSON *type* — `session_pool_size: 8` becomes the
-        // string `"<redacted:set>"`. A scan of all 31 shipped configs and all
-        // 97 recorder-routed knob names found zero false positives today (the
-        // figure was quoted as 104 without being re-derived), so this is
-        // a future-drift risk rather than a live defect; the direction of the
-        // bias (over-redact) is deliberate. Tracked with the marker widening.
+        // NOTE: this changes a JSON *type* — a number under a credential-named
+        // key becomes a string. Zero false positives across all shipped configs
+        // and every recorded knob name today; tracked in #289.
         _ if secret_ancestor => Value::from(REDACTED),
         Value::String(s) if prose => Value::from(s.clone()),
         Value::String(s) => Value::from(redact_connection_like(s)),
         other => other.clone(),
+    }
+}
+
+/// Publish a string value, or a digest of it.
+///
+/// Exactly two outcomes and no third path:
+///
+/// * a plain token ([`is_plain_token`]) is the identity — `localhost`,
+///   `127.0.0.1`, `bench`, `FLOAT32`, `int8_hnsw`, a filesystem path. This is
+///   the overwhelming majority of what gets recorded.
+/// * everything else is an [`opaque_digest`].
+///
+/// There is deliberately no attempt to salvage readable structure from the
+/// second case. That attempt is what leaked in seven of the eight review rounds
+/// this function has been through.
+fn redact_connection_like(value: &str) -> String {
+    if is_plain_token(value) {
+        value.to_string()
+    } else {
+        opaque_digest(value)
     }
 }
 
@@ -1348,6 +1038,32 @@ pub const CONNECTION_SHAPE_CORPUS: &[(&str, &str)] = &[
     ("desync-nested-odbc", "cs=\"Server=h;Pwd=CANARY;\""),
     ("desync-options", "options='-c password=CANARY'"),
     ("desync-double-quote", "note=\"a password=CANARY\""),
+    // -- bracketed authority (L3, round 7) — never appended at the time -------
+    ("bracketed-userpass", "redis://[admin:CANARY]"),
+    ("bracketed-with-port", "redis://[admin:CANARY]:6379/0"),
+    // -- comma / host-list, round 8: the feature added to RECOVER provenance --
+    (
+        "comma-authority-after-query-at",
+        "redis://127.0.0.1:6379/?password=p@CANARY,X",
+    ),
+    (
+        "comma-mongo",
+        "mongodb://cluster.example.net/db?password=a@CANARY,c",
+    ),
+    ("comma-minimal-fragment", "redis://h#@CANARY,Z"),
+    ("comma-odbc", "Server:h,Pwd:CANARY"),
+    ("space-odbc", "Server:h Pwd:CANARY"),
+    ("bare-userpass", "admin:CANARY"),
+    // -- fragment-level: a delimiter INSIDE the secret ------------------------
+    ("amp-in-password", "?password=abcCANARY&SUP3RCANARY"),
+    (
+        "slash-in-password",
+        "redis://u:CANARY/CANARYtail@h.example/db",
+    ),
+    (
+        "query-no-equals",
+        "https://api.example.com/v1?sk_live_CANARY",
+    ),
     // -- prefix before `://` republished verbatim, round 6 --------------------
     ("prefix-before-scheme", "password=CANARY;endpoint=x://h"),
     ("bare-unknown-scheme", "CANARY://h"),
@@ -2011,29 +1727,6 @@ mod recorder_coverage_guard {
         );
     }
 
-    /// No allow-listed parameter name may also be credential-named.
-    ///
-    /// The two inventories disagreed on disk in one artifact: `?authSource=admin`
-    /// in a URI was published while `"authSource": "admin"` as a JSON key became
-    /// `<redacted:set>`. Beyond the inconsistency, the gap admits good-faith
-    /// future additions that DO carry secrets — `sslpassword`, `passfile`,
-    /// `proxyPassword`, and `authMechanismProperties`, which sits in the same
-    /// driver-doc table as `authSource` and legitimately carries
-    /// `AWS_SESSION_TOKEN:<token>`.
-    #[test]
-    fn no_allow_listed_parameter_is_credential_named() {
-        let clashing: Vec<&&str> = super::SAFE_PARAM_KEYS
-            .iter()
-            .filter(|k| super::is_secret(k))
-            .collect();
-        assert!(
-            clashing.is_empty(),
-            "SAFE_PARAM_KEYS publishes the values of keys that `is_secret` treats \
-             as credentials: {clashing:?}. One of the two inventories is wrong, \
-             and the safe resolution is dropping the parameter."
-        );
-    }
-
     /// GUARD 1c — the "not compiled, so not scanned" rows are true, both ways.
     ///
     /// Two legs, because a skip filter can rot in two directions:
@@ -2412,7 +2105,13 @@ mod tests {
         r.observe_env("REDIS_KEY_PREFIX", Some("bench:"));
         r.observe_env("MILVUS_COLLECTION_NAME", Some("benchmark"));
         let s = r.snapshot();
-        assert_eq!(s["env"]["REDIS_KEY_PREFIX"], "bench:");
+        // `bench:` contains a `:` and therefore digests. Deliberate: no shape
+        // test can tell `idx:name` from `admin:password`, and the index name is
+        // recoverable from `params.experiment`.
+        assert!(s["env"]["REDIS_KEY_PREFIX"]
+            .as_str()
+            .unwrap()
+            .starts_with("<redacted:opaque"));
         assert_eq!(s["env"]["MILVUS_COLLECTION_NAME"], "benchmark");
     }
 
@@ -2533,12 +2232,15 @@ mod tests {
         }
         // Provenance that is NOT a secret survives.
         let s = r.snapshot();
-        assert_eq!(s["invocation"]["host"], "<redacted:userinfo>@127.0.0.1");
+        assert!(s["invocation"]["host"]
+            .as_str()
+            .unwrap()
+            .starts_with("<redacted:opaque"));
         assert_eq!(s["declared"]["upload_params"]["parallel"], 8);
         assert!(s["declared"]["collection_params"]["endpoint"]
             .as_str()
             .unwrap()
-            .contains("vendor.cloud"));
+            .starts_with("<redacted:opaque"));
     }
 
     /// The assertion is a real backstop, not a restatement of the scrubber: it
@@ -2552,122 +2254,138 @@ mod tests {
         assert_no_cleartext_secrets(&doc, false, "engine_params");
     }
 
-    /// Generative property test: no FORBIDDEN span ever reaches the output.
+    /// Generative property test: no FRAGMENT of a forbidden span reaches the
+    /// output.
     ///
-    /// The append-only corpus makes a *lost* fix fail. Only a generator makes an
-    /// *unanticipated* shape fail — and a generative campaign found five root
-    /// causes in one pass that six hand-picked rounds had missed, every one of
-    /// them a desync state rather than a missing rule.
+    /// The previous oracle was whole-canary containment, and **every live leak
+    /// class emitted a fragment** — round 6's own headline (`p@ssX -> ssX`)
+    /// would have passed it. It also never put a delimiter INSIDE a secret,
+    /// never placed a `@` after the authority, and contained no comma at all,
+    /// which is precisely where the next round's blocker came from.
     ///
-    /// Ground truth by construction: the generator knows which spans it placed
-    /// in slots the design permits (host, port, path, allow-listed parameter
-    /// values) and which it placed in slots the design forbids (userinfo, and
-    /// the values of parameters that are not allow-listed). Forbidden spans get
-    /// a unique canary; the oracle is simply that no canary survives.
-    ///
-    /// Fixed seed, bounded case count — this runs in CI, it is not the campaign.
+    /// Fixed seed, bounded case count. This runs in CI; it is not the campaign.
     #[test]
-    fn no_forbidden_span_ever_reaches_the_output() {
+    fn no_fragment_of_a_forbidden_span_reaches_the_output() {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
 
-        const SAFE_HOSTS: &[&str] = &["h.example", "10.0.0.5", "[::1]", "db-1"];
-        const SAFE_PARAMS: &[&str] = &["ssl", "db", "w", "timeout", "port"];
-        const FORBIDDEN_PARAMS: &[&str] = &[
+        // Contiguous run length that counts as a leak. Short enough to catch
+        // `ssX`-style tails, long enough not to fire on incidental overlap.
+        const FRAGMENT: usize = 5;
+        const SCHEMES: &[&str] = &[
+            "redis",
+            "mongodb",
+            "postgresql",
+            "https",
+            "notascheme",
+            "jdbc:postgresql",
+            "",
+        ];
+        const HOSTS: &[&str] = &["h.example", "10.0.0.5", "[::1]", "db-1", "h1:1,h2:2"];
+        const KEYS: &[&str] = &[
             "password",
             "Pwd",
             "bearer",
             "AccountKey",
             "%70assword",
-            "token",
-            "SharedAccessSignature",
-            "X-Amz-Signature",
+            "ssl",
+            "db",
+            "w",
             "authMechanismProperties",
+            "options",
+            "note",
+            "cs",
         ];
-        const SCHEMES: &[&str] = &["redis", "mongodb", "postgresql", "https", "notascheme", ""];
-        const JUNK: &[&str] = &[
-            "", " ", "\t", "'", "\"", "\\", ";", "&", "?", "#", "/", "@", ",", "=", "\u{a0}", "]",
-            "[", "%", ":",
+        // Delimiters placed INSIDE the secret — the dimension the old generator
+        // could not express.
+        const INNER: &[&str] = &[
+            "", "/", "?", "#", "@", ",", ";", "&", "=", ":", " ", "'", "\"", "\\", "\u{a0}", "]",
+            "[", "%", "\t",
         ];
 
-        let mut rng = StdRng::seed_from_u64(0x212_2026);
+        let mut rng = StdRng::seed_from_u64(0x0002_1220_2608);
         let mut checked = 0usize;
 
-        for case in 0..4000u32 {
-            let mut input = String::new();
-            let canary = format!("KANARY{case}");
+        for case in 0..6000u32 {
+            // Alphabet G-Z only: disjoint from lowercase hex, so a fragment can
+            // never match the digest's own characters by chance. (Digits did:
+            // `05566` appeared inside `sha256=b81dab96905566fc`.)
+            let alphabet: Vec<char> = ('G'..='Z').collect();
+            let mut secret = String::from("SECRET");
+            let mut n = case as usize + 1;
+            while n > 0 {
+                secret.push(alphabet[n % alphabet.len()]);
+                n /= alphabet.len();
+            }
+            secret.push_str("XYZW");
+            let inner = INNER[rng.gen_range(0..INNER.len())];
+            let split = rng.gen_range(0..=secret.len());
+            let planted = format!("{}{inner}{}", &secret[..split], &secret[split..]);
 
+            let mut input = String::new();
             let scheme = SCHEMES[rng.gen_range(0..SCHEMES.len())];
             if !scheme.is_empty() {
                 input.push_str(scheme);
                 input.push_str("://");
             }
-            // Userinfo is ALWAYS a forbidden slot.
-            if rng.gen_bool(0.5) {
-                input.push_str("user");
-                if rng.gen_bool(0.8) {
-                    input.push(':');
-                    input.push_str(&canary);
-                    // Delimiters inside the password: the round-2/round-5 shape.
-                    input.push_str(JUNK[rng.gen_range(0..JUNK.len())]);
+            match rng.gen_range(0..4) {
+                // userinfo
+                0 => {
+                    input.push_str("user:");
+                    input.push_str(&planted);
+                    input.push('@');
+                    input.push_str(HOSTS[rng.gen_range(0..HOSTS.len())]);
                 }
-                input.push('@');
-            }
-            input.push_str(SAFE_HOSTS[rng.gen_range(0..SAFE_HOSTS.len())]);
-            if rng.gen_bool(0.5) {
-                input.push_str(":6379");
-            }
-            if rng.gen_bool(0.4) {
-                input.push_str("/db");
-            }
-            if rng.gen_bool(0.7) {
-                input.push('?');
-                let n = rng.gen_range(1..4);
-                for i in 0..n {
-                    if i > 0 {
-                        input.push(if rng.gen_bool(0.5) { '&' } else { ';' });
-                    }
-                    if rng.gen_bool(0.5) {
-                        // Permitted slot: a safe value, never a canary.
-                        input.push_str(SAFE_PARAMS[rng.gen_range(0..SAFE_PARAMS.len())]);
-                        input.push_str("=true");
-                    } else {
-                        input.push_str(FORBIDDEN_PARAMS[rng.gen_range(0..FORBIDDEN_PARAMS.len())]);
-                        input.push('=');
-                        input.push_str(&canary);
-                        input.push_str(JUNK[rng.gen_range(0..JUNK.len())]);
-                    }
+                // query value, with the secret AFTER the authority
+                1 => {
+                    input.push_str(HOSTS[rng.gen_range(0..HOSTS.len())]);
+                    input.push_str("/db?");
+                    input.push_str(KEYS[rng.gen_range(0..KEYS.len())]);
+                    input.push('=');
+                    input.push_str(&planted);
                 }
-            }
-            if rng.gen_bool(0.2) {
-                input.push_str(JUNK[rng.gen_range(0..JUNK.len())]);
+                // DSN blob
+                2 => {
+                    input.push_str("host=db ");
+                    input.push_str(KEYS[rng.gen_range(0..KEYS.len())]);
+                    input.push('=');
+                    input.push_str(&planted);
+                    input.push_str(" sslmode=require");
+                }
+                // bare authority-ish
+                _ => {
+                    input.push_str("admin:");
+                    input.push_str(&planted);
+                }
             }
 
-            if !input.contains(&canary) {
-                continue; // this case placed no forbidden span
-            }
             checked += 1;
             let out = redact_connection_like(&input);
-            assert!(
-                !out.contains(&canary),
-                "forbidden span reached the output\n  in : {input:?}\n  out: {out:?}"
-            );
+            assert_no_fragment(&out, &secret, FRAGMENT, &input);
 
-            // …and the same through the full snapshot path, where it would
-            // actually be written.
+            // …and through the full snapshot path, where it would be written.
             let mut r = Recorder::new();
-            r.set_invocation(json!({ "host": input }));
+            r.set_invocation(json!({ "host": input.clone() }));
             let dumped = serde_json::to_string(&r.snapshot()).unwrap();
-            assert!(
-                !dumped.contains(&canary),
-                "forbidden span reached the artifact\n  in : {input:?}\n  doc: {dumped}"
-            );
+            assert_no_fragment(&dumped, &secret, FRAGMENT, &input);
         }
         assert!(
-            checked > 2000,
-            "only {checked} cases actually contained a forbidden span — the \
-             generator stopped generating them and the oracle proves nothing"
+            checked > 5000,
+            "only {checked} cases carried a forbidden span; the oracle proves nothing"
         );
+    }
+
+    /// Fail if any `len`-char contiguous run of `secret` appears in `haystack`.
+    fn assert_no_fragment(haystack: &str, secret: &str, len: usize, input: &str) {
+        let b: Vec<char> = secret.chars().collect();
+        for w in b.windows(len) {
+            let frag: String = w.iter().collect();
+            assert!(
+                !haystack.contains(&frag),
+                "fragment {frag:?} of the forbidden span reached the output\n  \
+                 in : {input:?}\n  out: {haystack:?}"
+            );
+        }
     }
 
     /// The corpus is APPEND-ONLY and every delimiter is probed on both sides.
@@ -2686,7 +2404,7 @@ mod tests {
     fn corpus_is_append_only_and_probes_both_sides_of_every_delimiter() {
         // Raise this when you ADD shapes. Lowering it means coverage was
         // deleted, which is the failure this pins.
-        const MINIMUM_SHAPES: usize = 44;
+        const MINIMUM_SHAPES: usize = 55;
         assert!(
             CONNECTION_SHAPE_CORPUS.len() >= MINIMUM_SHAPES,
             "the corpus shrank to {} entries (floor {MINIMUM_SHAPES}). Every shape \
@@ -2696,32 +2414,45 @@ mod tests {
         );
 
         let mut names = std::collections::BTreeSet::new();
+        let (mut canary_before_at, mut canary_after_at) = (0usize, 0usize);
         for (label, value) in CONNECTION_SHAPE_CORPUS {
             assert!(names.insert(*label), "duplicate corpus label {label}");
             assert!(
                 value.contains("CANARY") || label.contains("empty"),
                 "[{label}] carries no canary, so it can never fail"
             );
-            // Both-sides rule: for each delimiter present, a canary must appear
-            // before AND after at least one occurrence of it.
-            for d in ['/', '?', '#', '@', ';', '&'] {
-                if let Some(i) = value.find(d) {
-                    let (before, after) = value.split_at(i);
-                    if before.contains("CANARY") || after.contains("CANARY") {
-                        // At least one side probed; require the other for the
-                        // delimiters that split a credential from its host.
-                        if matches!(d, '@') {
-                            assert!(
-                                before.contains("CANARY"),
-                                "[{label}] has no canary BEFORE its `@` — the \
-                                 userinfo half is exactly what must not be \
-                                 published"
-                            );
-                        }
-                    }
+            // Per-row, the side an `@` divides cannot be classified soundly:
+            // in `u:CAN/ARY@host` the `/` inside the password moves the
+            // apparent authority boundary. So the per-row rule is the weak one
+            // — SOME side must be probed — and the dimensional requirement is
+            // asserted across the corpus as a set property below.
+            if let Some(i) = value.find('@') {
+                let (before, after) = value.split_at(i);
+                assert!(
+                    before.contains("CANARY") || after.contains("CANARY"),
+                    "[{label}] has an `@` with no canary on either side"
+                );
+                if before.contains("CANARY") {
+                    canary_before_at += 1;
+                }
+                if after.contains("CANARY") {
+                    canary_after_at += 1;
                 }
             }
         }
+
+        // The dimension round 8 was missing: every `@` row had its canary in the
+        // userinfo half, so no row could ever exercise "the tail after the `@`
+        // is promoted into the host slot". Both halves must be represented.
+        assert!(
+            canary_before_at >= 5,
+            "only {canary_before_at} rows probe the userinfo side of an `@`"
+        );
+        assert!(
+            canary_after_at >= 3,
+            "only {canary_after_at} rows probe the side AFTER an `@` — that is \
+             the half round 8's blocker promoted into the host slot"
+        );
     }
 
     /// The full corpus of connection-string shapes reported across four review
@@ -2739,66 +2470,56 @@ mod tests {
         }
     }
 
-    /// The provenance the reconstruction is supposed to keep. Losing all of it
-    /// would be a safe redactor and a useless one.
+    /// Exactly two outcomes, and the digest is useful.
+    ///
+    /// The previous version of this test asserted a reconstructed endpoint. That
+    /// reconstruction is gone: it was the leak surface in seven of eight rounds.
     #[test]
-    fn reconstruction_keeps_the_parts_that_identify_the_server() {
-        let cases = [
-            (
-                "mongodb://h.example/db?w=majority&password=X",
-                "mongodb://h.example/db?w=majority&password=<dropped>",
-            ),
-            (
-                "redis://admin:pw@10.0.0.5:6379/0",
-                "redis://<redacted:userinfo>@10.0.0.5:6379/0",
-            ),
-            ("default:pw@127.0.0.1", "<redacted:userinfo>@127.0.0.1"),
-            ("mongodb://[::1]:27017/db", "mongodb://[::1]:27017/db"),
-            // Replica-set seed lists survive; the whole host list used to be
-            // dropped because it is not a valid single URL authority.
-            (
-                "mongodb://h1:27017,h2:27017/db?replicaSet=rs0",
-                "mongodb://h1:27017,h2:27017/db?replicaSet=rs0",
-            ),
-            // L1: a `@` inside a query VALUE no longer promotes that value's
-            // tail into the host slot.
-            (
-                "redis://127.0.0.1:6379/?password=p@ssX",
-                "redis://127.0.0.1:6379/?password=<dropped>",
-            ),
-        ];
-        for (input, expect) in cases {
-            assert_eq!(redact_connection_like(input), expect, "input: {input}");
-        }
-        // A structured blob that is not a URL becomes an identity-preserving
-        // digest rather than a salvaged string. That is what makes L2 and L4
-        // unreachable instead of fixed: there is nothing left to desync.
-        let d = redact_connection_like("host=db sslmode=require");
-        assert!(d.starts_with("<redacted:opaque sha256="), "{d}");
-        assert_eq!(
-            d,
-            redact_connection_like("host=db sslmode=require"),
-            "the digest must be stable, so two runs can still be compared"
-        );
-        assert_ne!(d, redact_connection_like("host=other sslmode=require"));
-
-        // A value with none of the connection-string markers is the identity —
-        // which is the overwhelming majority of what gets recorded.
+    fn plain_tokens_survive_and_everything_else_digests() {
+        // Identity — the overwhelming majority of recorded values.
         for plain in [
             "localhost",
             "127.0.0.1",
-            "idx:redis-docker-test",
             "bench",
-            "redis-docker-test:",
             "FLOAT32",
             "hnsw",
             "us-central1",
-            "/home/u/experiments/configurations",
             "int8_hnsw",
+            "6379",
+            "~/experiments/configurations",
+            "/var/lib/results",
             "",
         ] {
             assert_eq!(redact_connection_like(plain), plain, "mangled: {plain}");
         }
+
+        // Everything structured — URLs, DSNs, bare user:pass, anything with
+        // whitespace — is a digest, with no slice of the input beside it.
+        for structured in [
+            "redis://admin:pw@10.0.0.5:6379/0",
+            "redis://127.0.0.1:6379/?password=p@ssX",
+            "default:pw@127.0.0.1",
+            "admin:Sup3rSecret",
+            "idx:redis-docker-test",
+            "host=db user=bench password=x sslmode=require",
+            "Server=h;Database=d;Uid=u;Pwd=x;",
+            "Server:h,Pwd:x",
+            "mongodb://h1:27017,h2:27017/db?replicaSet=rs0",
+            "redis://h#@Y,Z",
+        ] {
+            let out = redact_connection_like(structured);
+            assert!(
+                out.starts_with("<redacted:opaque sha256=") && out.ends_with('>'),
+                "{structured} -> {out}"
+            );
+            assert_eq!(out.len(), "<redacted:opaque sha256=>".len() + 16);
+        }
+
+        // Stable, and distinguishing — which is the whole point of keeping a
+        // digest rather than dropping the value.
+        let a = redact_connection_like("host=db sslmode=require");
+        assert_eq!(a, redact_connection_like("host=db sslmode=require"));
+        assert_ne!(a, redact_connection_like("host=other sslmode=require"));
     }
 
     /// An override ON a credential knob must still record the knob's NAME and
@@ -3057,8 +2778,17 @@ mod tests {
         assert!(!env_flag("VDBB_TEST_PROTOCOL", &["resp3"]));
         let s = snapshot();
         assert_eq!(s["effective"]["VDBB_TEST_PROTOCOL"], false);
-        assert_eq!(s["env"]["VDBB_TEST_PROTOCOL"], " resp3 ");
-        assert_eq!(s["overridden"][0]["declared"], " resp3 ");
+        // The untrimmed text is no longer published — whitespace forces a
+        // digest. The diagnostic survives in `overridden` below (somebody set
+        // this and it did not take), just not the exact bytes they set.
+        assert!(s["env"]["VDBB_TEST_PROTOCOL"]
+            .as_str()
+            .unwrap()
+            .starts_with("<redacted:opaque"));
+        assert!(s["overridden"][0]["declared"]
+            .as_str()
+            .unwrap()
+            .starts_with("<redacted:opaque"));
         assert_eq!(s["overridden"][0]["effective"], false);
     }
 
@@ -3106,8 +2836,12 @@ mod tests {
         assert_eq!(port, 6380);
         let s = snapshot();
         assert_eq!(s["effective"]["VDBB_TEST_PORT"], 6380);
-        // Nothing is hidden: the untrimmed text survives verbatim.
-        assert_eq!(s["env"]["VDBB_TEST_PORT"], " 6380 ");
+        // The untrimmed text digests (whitespace is not a plain token), so the
+        // artifact records THAT something unusual was set, not what.
+        assert!(s["env"]["VDBB_TEST_PORT"]
+            .as_str()
+            .unwrap()
+            .starts_with("<redacted:opaque"));
         assert!(s["overridden"].as_array().unwrap().is_empty());
     }
 
