@@ -118,6 +118,23 @@ fn is_standalone_number(hay: &str, at: usize, len: usize) -> bool {
     before_ok && after_ok
 }
 
+/// Remove Rust's digit separators so `6_399` is seen as `6399`. Only strips `_`
+/// that sits BETWEEN two digits, so `foo_6399` and `PORT_6` are untouched.
+fn strip_digit_separators(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    for (i, c) in chars.iter().enumerate() {
+        let is_separator = *c == '_'
+            && i > 0
+            && chars[i - 1].is_ascii_digit()
+            && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit());
+        if !is_separator {
+            out.push(*c);
+        }
+    }
+    out
+}
+
 /// Code lines (comment lines excluded) that write `port` as a bare literal,
 /// other than the single declaration line `allowed_line`.
 fn bare_port_hits(src: &str, port: u16, allowed_line: usize) -> Vec<(usize, String)> {
@@ -130,10 +147,12 @@ fn bare_port_hits(src: &str, port: u16, allowed_line: usize) -> Vec<(usize, Stri
         if line.trim_start().starts_with("//") {
             continue;
         }
+        let scanned = strip_digit_separators(line);
         let mut from = 0;
-        while let Some(rel) = line[from..].find(&needle) {
+        while let Some(rel) = scanned[from..].find(&needle) {
             let at = from + rel;
-            if is_standalone_number(line, at, needle.len()) {
+            if is_standalone_number(&scanned, at, needle.len()) {
+                // Report the ORIGINAL line, not the normalised one.
                 hits.push((idx + 1, line.to_string()));
                 break;
             }
@@ -145,16 +164,41 @@ fn bare_port_hits(src: &str, port: u16, allowed_line: usize) -> Vec<(usize, Stri
 
 /// True when this source sends a command that wipes a whole server.
 ///
-/// Matches the QUOTED COMMAND NAME anywhere in the file rather than one exact
-/// call spelling. The first version matched the literal `cmd("FLUSHALL")`, and a
-/// synthetic wiping suite evaded it three ways — `cmd("FLUSHDB")`, a rustfmt-
-/// wrapped `cmd(\n    "FLUSHALL",\n)`, and `Cmd::new().arg("FLUSHALL")` — each of
-/// which passed every invariant with no claim call at all.
+/// Matches a QUOTED COMMAND NAME anywhere in the file, CASE-INSENSITIVELY, in
+/// either quote style. Two rounds of evasion produced that spec, and each round
+/// found a synthetic wiping suite with no claim call at all passing every
+/// invariant:
+///
+///   * spelling:  `cmd("FLUSHDB")`, a rustfmt-wrapped `cmd(\n "FLUSHALL",\n)`,
+///     `Cmd::new().arg("FLUSHALL")` — beat the original exact-call match.
+///   * case:      `cmd("flushall")`, `cmd("FlushAll")`, `cmd("flushdb")` — beat
+///     the widened-but-still-case-sensitive match. Redis command names ARE
+///     case-insensitive on the wire (`redis-cli flushall` on redis:8.8.0 takes a
+///     server from 2 keys to 0), so these are not hypothetical.
+///
+/// Single quotes are accepted so a Lua payload — `EVAL "redis.call('flushall')"`
+/// — is caught too.
 ///
 /// `FLUSHDB` counts: it wipes db 0 of a shared server, and it is the verb an
 /// author reaches for precisely because it sounds safer.
 fn wipes_whole_server(src: &str) -> bool {
-    src.contains("\"FLUSHALL\"") || src.contains("\"FLUSHDB\"")
+    let upper = src.to_ascii_uppercase();
+    for verb in ["FLUSHALL", "FLUSHDB"] {
+        let mut from = 0;
+        while let Some(rel) = upper[from..].find(verb) {
+            let at = from + rel;
+            let quoted_before = matches!(upper[..at].chars().next_back(), Some('"') | Some('\''));
+            let quoted_after = matches!(
+                upper[at + verb.len()..].chars().next(),
+                Some('"') | Some('\'')
+            );
+            if quoted_before && quoted_after {
+                return true;
+            }
+            from = at + 1;
+        }
+    }
+    false
 }
 
 /// Test-target names of the suites that wipe a server.
@@ -285,6 +329,33 @@ fn test_port() -> u16 {
 }
 
 #[test]
+fn inv_p1_scanner_sees_through_rust_digit_separators() {
+    // `6_399` is the same literal to rustc but a different string to a grep.
+    let src = "\
+const TEST_PORT: u16 = 6_399;
+fn test_port() -> u16 {
+    std::env::var(\"REDIS_TEST_PORT\")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6399)
+}
+";
+    let (line, port) = default_port(src).unwrap();
+    let hits = bare_port_hits(src, port, line);
+    assert_eq!(hits.len(), 1, "got {hits:?}");
+    assert!(
+        hits[0].1.contains("6_399"),
+        "the ORIGINAL line must be reported, not the normalised one: {hits:?}"
+    );
+    // ..and a separator that is not between two digits must not be collapsed,
+    // or `PORT_6399` would start matching.
+    assert_eq!(
+        strip_digit_separators("let foo_6399 = 1_000;"),
+        "let foo_6399 = 1000;"
+    );
+}
+
+#[test]
 fn inv_p1_scanner_accepts_comment_mentions_and_longer_numbers() {
     // Negative control: without it, a guard that rejects everything would pass
     // the positive controls above.
@@ -348,6 +419,58 @@ fn inv_p3_scanner_catches_every_spelling_that_evaded_it() {
             "spelling {name:?} must be detected as a whole-server wipe"
         );
     }
+}
+
+#[test]
+fn inv_p3_scanner_is_case_insensitive() {
+    // Second round of evasion. Redis command names are case-insensitive on the
+    // wire — `redis-cli flushall` against redis:8.8.0 takes a server from 2 keys
+    // to 0 — so a lowercase spelling wipes just as hard while the widened but
+    // still case-sensitive matcher passed all 23 invariants with no claim call.
+    for (name, src) in [
+        ("lower", "redis::cmd(\"flushall\").query(c)"),
+        ("mixed", "redis::cmd(\"FlushAll\").query(c)"),
+        ("lower-db", "redis::cmd(\"flushdb\").query(c)"),
+        // Single quotes: a Lua payload smuggles the same wipe.
+        (
+            "lua",
+            "redis::cmd(\"EVAL\").arg(\"redis.call('flushall')\").query(c)",
+        ),
+    ] {
+        assert!(
+            wipes_whole_server(src),
+            "spelling {name:?} must be detected as a whole-server wipe"
+        );
+    }
+}
+
+#[test]
+fn inv_p5_shared_helpers_must_not_wipe_a_server() {
+    // `mod common;` is included by ALL 15 integration suites, non-destructive
+    // ones included, and `wiping_suites()` only reads `tests/integration_*.rs`.
+    // So a `pub fn wipe_server()` moved into `tests/common/` would give every
+    // suite a server-wiping path that INV-P2/P3 cannot see — and that refactor is
+    // the LIKELY one, since the premise of this whole guard is that four suites
+    // share one `flush_db()` shape.
+    let dir = tests_dir().join("common");
+    let mut scanned = 0usize;
+    for entry in fs::read_dir(&dir).expect("tests/common must be readable") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        scanned += 1;
+        let src = fs::read_to_string(&path).unwrap();
+        assert!(
+            !wipes_whole_server(&src),
+            "{}: shared test helpers must not issue FLUSHALL/FLUSHDB. Every suite \
+             includes `mod common;`, so a wipe here is invisible to the per-suite \
+             scan in INV-P2/P3. Put it in the suite that needs it, where the \
+             claim guard can see it.",
+            path.display(),
+        );
+    }
+    assert!(scanned > 0, "found no .rs files under {}", dir.display());
 }
 
 #[test]
@@ -482,7 +605,7 @@ fn claim_verdict_counts_keys_outside_db0() {
     // `DBSIZE` reported db 0 only while `FLUSHALL` destroys every database, so a
     // developer's Redis with an empty db 0 and Sidekiq/Celery data on db 1 read
     // as "empty". The probe now sums `INFO keyspace`, so this must refuse.
-    let keys = sum_keyspace_keys("# Keyspace\r\ndb1:keys=3,expires=0,avg_ttl=0\r\n");
+    let keys = sum_keyspace_keys("# Keyspace\r\ndb1:keys=3,expires=0,avg_ttl=0\r\n").unwrap();
     assert_eq!(keys, 3);
     let p = reachable(keys, 0, "abc");
     assert!(matches!(claim_verdict(&inputs(&p, None)), Claim::Refuse(_)));
@@ -630,15 +753,62 @@ fn keyspace_sum_covers_every_database_on_all_four_engines() {
             "# Keyspace\r\ndb0:keys=2,expires=0\r\ndb1:keys=3,expires=0\r\ndb9:keys=5,expires=0\r\n",
             10,
         ),
-        // Redis omits empty databases, so an empty section really is zero.
-        ("empty", "# Keyspace\r\n", 0),
+        // The two EMPTY-server layouts, both measured on a fresh container. They
+        // differ, and both must read as zero — this is the path CI takes on every
+        // run, so a parser that only handled one of them would refuse CI.
+        // redis:8.8.0 / valkey-bundle / kividb omit the db line entirely:
+        ("empty (redis/valkey/kividb)", "# Keyspace\r\n", 0),
+        // ..while dragonfly df-v1.40.1 still emits db0 with keys=0:
+        (
+            "empty (dragonfly)",
+            "# Keyspace\r\ndb0:keys=0,expires=0,hits=0,misses=0,hit_ratio=0.00,avg_ttl=-1\r\n",
+            0,
+        ),
     ] {
         assert_eq!(
             sum_keyspace_keys(info),
-            expected,
+            Some(expected),
             "keyspace sum wrong for {engine}"
         );
     }
+}
+
+#[test]
+fn keyspace_sum_says_unknown_rather_than_zero_when_it_cannot_tell() {
+    // The parser returns `i64` no more. Everything below used to collapse to
+    // `0` — i.e. to `Fresh`, i.e. to FLUSHALL — which is this guard's own bug
+    // class one notch in. All of these now yield `None`, which the probe turns
+    // into `Probe::Inconclusive` and `claim_verdict` refuses on.
+    for (name, info) in [
+        ("empty reply", ""),
+        ("no # Keyspace header", "db0:keys=3,expires=0\r\n"),
+        ("wrong section", "# Server\r\nrun_id:abc\r\n"),
+        (
+            "db line with no keys=",
+            "# Keyspace\r\ndb0:expires=0,avg_ttl=0\r\n",
+        ),
+        (
+            "unparseable keys=",
+            "# Keyspace\r\ndb0:keys=lots,expires=0\r\n",
+        ),
+        ("negative keys=", "# Keyspace\r\ndb0:keys=-1,expires=0\r\n"),
+        (
+            "overflow",
+            "# Keyspace\r\ndb0:keys=9223372036854775807\r\ndb1:keys=1\r\n",
+        ),
+    ] {
+        assert_eq!(
+            sum_keyspace_keys(info),
+            None,
+            "{name} must be reported as unknown, never as zero keys"
+        );
+    }
+    // Positive control for the header check: the guard must not now reject
+    // every real reply.
+    assert_eq!(
+        sum_keyspace_keys("# Keyspace\r\ndb0:keys=7,expires=0\r\n"),
+        Some(7)
+    );
 }
 
 #[test]

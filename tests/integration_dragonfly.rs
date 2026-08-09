@@ -40,7 +40,7 @@ type KnnData = (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<i64>>);
 /// move this suite off the shared default — these tests call `flush_db()`,
 /// which `FLUSHALL`s the whole server. The first call also claims the instance
 /// (see `common::claim_resp_instance`), so a server holding state this harness
-/// no recorded claim for is refused instead of destroyed.
+/// has no recorded claim for is refused instead of destroyed.
 fn test_port() -> u16 {
     static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
     *PORT.get_or_init(|| {

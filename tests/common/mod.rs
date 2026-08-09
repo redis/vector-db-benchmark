@@ -2165,28 +2165,48 @@ fn display_id(id: &str) -> &str {
     }
 }
 
-/// Sum `keys=` across every `dbN:` line of an `INFO keyspace` section.
+/// Sum `keys=` across every `dbN:` line of an `INFO keyspace` section, or `None`
+/// when the section cannot be trusted.
 ///
-/// Redis omits empty databases entirely, so an empty section legitimately means
-/// zero keys. Field ORDER and the extra fields differ per engine — verified live
-/// on redis:8.8.0 (`db0:keys=1,expires=0,avg_ttl=0,subexpiry=0`),
-/// valkey-bundle (`...,keys_with_volatile_items=0`), dragonfly df-v1.40.1
-/// (`db0:keys=1,expires=0,hits=0,misses=0,hit_ratio=0.00,avg_ttl=-1`) and
-/// kividb v1.0.2-full (`db0:keys=1,expires=0,avg_ttl=0`) — so parse by name.
-pub fn sum_keyspace_keys(info: &str) -> i64 {
-    info.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if !line.starts_with("db") {
-                return None;
-            }
-            let (_db, fields) = line.split_once(':')?;
-            fields
-                .split(',')
-                .find_map(|kv| kv.trim().strip_prefix("keys="))
-                .and_then(|v| v.trim().parse::<i64>().ok())
-        })
-        .sum()
+/// Redis omits empty databases entirely, so a section that has the `# Keyspace`
+/// header and no `dbN:` lines legitimately means zero keys. What must NOT read as
+/// zero is a reply that never was a keyspace section, or a `dbN:` line whose
+/// `keys=` is missing, unparseable or negative — the earlier `-> i64` version
+/// collapsed all of those to `0`, i.e. to `Fresh`, which is this guard's own bug
+/// class one notch in. `None` becomes [`Probe::Inconclusive`], which refuses.
+///
+/// Field ORDER and the extra fields differ per engine — verified live on
+/// redis:8.8.0 (`db0:keys=1,expires=0,avg_ttl=0,subexpiry=0`), valkey-bundle
+/// (`...,keys_with_volatile_items=0`), dragonfly df-v1.40.1
+/// (`db0:keys=1,expires=0,hits=0,misses=0,hit_ratio=0.00,avg_ttl=-1`) and kividb
+/// v1.0.2-full (`db0:keys=1,expires=0,avg_ttl=0`) — so parse by name. All four
+/// emit the `# Keyspace` header (measured).
+pub fn sum_keyspace_keys(info: &str) -> Option<i64> {
+    if !info
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("# keyspace"))
+    {
+        return None;
+    }
+    let mut total: i64 = 0;
+    for line in info.lines() {
+        let line = line.trim();
+        if !line.starts_with("db") {
+            continue;
+        }
+        let (_db, fields) = line.split_once(':')?;
+        let keys: i64 = fields
+            .split(',')
+            .find_map(|kv| kv.trim().strip_prefix("keys="))?
+            .trim()
+            .parse()
+            .ok()?;
+        if keys < 0 {
+            return None;
+        }
+        total = total.checked_add(keys)?;
+    }
+    Some(total)
 }
 
 /// Pull `field:` out of an `INFO` section body.
@@ -2262,6 +2282,12 @@ fn probe_server(host: &str, port: u16, wait: std::time::Duration) -> Probe {
 
     // A server replaying its RDB/AOF answers INFO but reports a keyspace that is
     // still filling, so "0 keys" would be a lie.
+    //
+    // Best-effort by design: an engine whose `INFO persistence` errors, or that
+    // omits `loading` entirely (kividb v1.0.2-full does — measured), simply gets
+    // no loading check. Making a missing section fatal would refuse those engines
+    // outright, and a server so locked down that INFO fails is caught two lines
+    // below by `INFO keyspace` anyway.
     if let Ok(persistence) = redis::cmd("INFO")
         .arg("persistence")
         .query::<String>(&mut conn)
@@ -2286,7 +2312,13 @@ fn probe_server(host: &str, port: u16, wait: std::time::Duration) -> Probe {
             ));
         }
     };
-    let keys = sum_keyspace_keys(&keyspace);
+    let Some(keys) = sum_keyspace_keys(&keyspace) else {
+        return Probe::Inconclusive(format!(
+            "could not parse the `INFO keyspace` reply from {host}:{port} (no `# Keyspace` \
+             header, or a `dbN:` line without a usable `keys=`), so the number of keys at \
+             risk is unknown; the reply was: {keyspace:?}"
+        ));
+    };
 
     let index_count = match redis::cmd("FT._LIST").query::<Vec<String>>(&mut conn) {
         Ok(v) => v.len(),
@@ -2321,8 +2353,30 @@ fn claim_file(target: &str, host: &str, port: u16) -> Option<std::path::PathBuf>
 
 /// Claim `host:port` for a destructive suite, or panic with the refusal message.
 ///
-/// Called once per test process from the suite's `test_port()`.
+/// Called from the suite's `test_port()`. The WORK happens once per process; the
+/// panic is replayed cheaply for every later test.
+///
+/// That split matters. The suites memoize the port with
+/// `OnceLock::get_or_init`, and `get_or_init` does NOT memoize an initializer
+/// that panics — so putting the panic inside it made every one of the 44 tests
+/// re-run the whole 30 s reachability loop. Measured against a dead port, two
+/// tests took 60.14 s instead of 20.13 s; the full suite would have taken ~22
+/// minutes to report "server not available". Here the memoized value is the
+/// VERDICT (`None` = allowed, `Some(msg)` = refuse) and the panic happens
+/// outside the initializer, so only the first test pays.
+static CLAIM_OUTCOME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) {
+    if let Some(msg) = CLAIM_OUTCOME.get_or_init(|| claim_outcome(target, port_env, host, port)) {
+        panic!("{msg}");
+    }
+}
+
+/// The decision, as a value. Never panics, so [`CLAIM_OUTCOME`] memoizes it.
+///
+/// One `OnceLock` per process is enough because a test binary is one suite
+/// against one server: `target`/`host`/`port` are identical on every call.
+fn claim_outcome(target: &str, port_env: &str, host: &str, port: u16) -> Option<String> {
     let forced = std::env::var(ALLOW_DIRTY_ENV)
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
@@ -2367,7 +2421,7 @@ pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) 
     });
 
     match verdict {
-        Claim::Refuse(msg) => panic!("{msg}"),
+        Claim::Refuse(msg) => Some(msg),
         Claim::Fresh | Claim::Reused => {
             if let Probe::Reachable { server_id, .. } = &probe {
                 if let Some(p) = path {
@@ -2377,6 +2431,7 @@ pub fn claim_resp_instance(target: &str, port_env: &str, host: &str, port: u16) 
                     let _ = fs::write(&p, server_id);
                 }
             }
+            None
         }
     }
 }
