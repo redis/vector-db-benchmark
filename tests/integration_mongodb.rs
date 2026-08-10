@@ -115,12 +115,51 @@ fn test_update_one_matched_count_distinguishes_a_missing_document_from_an_update
     let _ = coll.drop().run();
 }
 
+/// The collection the ENGINE addresses for config `engine_name` when the run is
+/// given `MONGODB_COLLECTION=TEST_COLLECTION` (#306).
+///
+/// Deliberately spelled out rather than imported: the engine lives in a binary
+/// crate this test cannot link against, so this literal is the independent
+/// statement of the naming contract. If the engine's derivation changes, these
+/// tests must fail — that is the point.
+fn engine_collection(engine_name: &str) -> String {
+    format!("{TEST_COLLECTION}:{engine_name}")
+}
+
+/// The search index the ENGINE builds for config `engine_name` when the run is
+/// given `MONGODB_INDEX_NAME=TEST_INDEX` (#306).
+fn engine_index(engine_name: &str) -> String {
+    format!("{TEST_INDEX}:{engine_name}")
+}
+
+/// Count documents in a specific collection of the test database, server-side.
+fn count_docs(collection: &str) -> u64 {
+    mongodb_client()
+        .database(TEST_DB)
+        .collection::<Document>(collection)
+        .count_documents(doc! {})
+        .run()
+        .expect("countDocuments")
+}
+
 /// Drop the search index (if any), wait for it to disappear, then drop the
 /// collection and wait for it to be gone.  Mirrors the engine's configure()
 /// cleanup so tests exercise the same Atlas-safe path.
+///
+/// #306: the engine no longer writes to the bare `TEST_COLLECTION`; each config
+/// gets `TEST_COLLECTION:<config>`. Those are dropped too — scoped to this
+/// file's own `vectors:` namespace rather than wiping the database, so a
+/// concurrently running suite on another branch is not collateral.
 fn drop_test_collection() {
     let client = mongodb_client();
     let db = client.database(TEST_DB);
+
+    let per_config_prefix = format!("{TEST_COLLECTION}:");
+    for name in db.list_collection_names().run().unwrap_or_default() {
+        if name.starts_with(&per_config_prefix) {
+            let _ = db.collection::<Document>(&name).drop().run();
+        }
+    }
 
     // Drop search index explicitly
     let _ = db
@@ -891,7 +930,7 @@ fn test_binary_mongodb_multi_dataset() {
     let client = mongodb_client();
     let coll = client
         .database(TEST_DB)
-        .collection::<Document>(TEST_COLLECTION);
+        .collection::<Document>(&engine_collection(engine_name));
     // Collection may already be dropped by engine.delete(), which is fine
     let doc_count = coll.count_documents(doc! {}).run().unwrap_or(0);
     assert!(
@@ -1537,14 +1576,17 @@ fn test_binary_mongodb_match_any_int() {
 /// that a default index and a tuned index produce identical results, which is
 /// precisely why issue #216 (all 96 MongoDB sweep rows measuring one default
 /// index) survived undetected — "recall looks plausible throughout".
-fn read_back_index_definition() -> Document {
+fn read_back_index_definition(engine_name: &str) -> Document {
     let client = mongodb_client();
     let db = client.database(TEST_DB);
+    // #306: per-config collection + per-config index name.
+    let collection = engine_collection(engine_name);
+    let index = engine_index(engine_name);
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let result = db
-            .run_command(doc! { "listSearchIndexes": TEST_COLLECTION })
+            .run_command(doc! { "listSearchIndexes": &collection })
             .run();
         if let Ok(result) = result {
             let batch = result
@@ -1557,7 +1599,7 @@ fn read_back_index_definition() -> Document {
                 let Some(idx) = idx.as_document() else {
                     continue;
                 };
-                if idx.get_str("name").ok() != Some(TEST_INDEX) {
+                if idx.get_str("name").ok() != Some(index.as_str()) {
                     continue;
                 }
                 if let Ok(def) = idx.get_document("latestDefinition") {
@@ -1568,9 +1610,9 @@ fn read_back_index_definition() -> Document {
         assert!(
             Instant::now() < deadline,
             "index '{}' never appeared in listSearchIndexes on {}.{}",
-            TEST_INDEX,
+            index,
             TEST_DB,
-            TEST_COLLECTION
+            collection
         );
         thread::sleep(Duration::from_secs(2));
     }
@@ -1657,7 +1699,7 @@ fn run_and_read_back_definition(
         stderr
     );
 
-    (read_back_index_definition(), project)
+    (read_back_index_definition(engine_name), project)
 }
 
 /// Issue #216: `collection_params.hnsw_config` must reach the server as
@@ -1900,9 +1942,10 @@ fn test_binary_mongodb_geo() {
     // `vectorSearch`-type index here would mean the geo filter never had a
     // chance, and only the recall assertion below would (eventually) notice.
     let client = mongodb_client();
+    let geo_index = engine_index("mongo-geo");
     let indexes: Vec<mongodb::bson::Document> = client
         .database(TEST_DB)
-        .collection::<mongodb::bson::Document>(TEST_COLLECTION)
+        .collection::<mongodb::bson::Document>(&engine_collection("mongo-geo"))
         .aggregate(vec![doc! { "$listSearchIndexes": {} }])
         .run()
         .expect("listSearchIndexes")
@@ -1910,8 +1953,8 @@ fn test_binary_mongodb_geo() {
         .collect();
     let ours = indexes
         .iter()
-        .find(|i| i.get_str("name").unwrap_or("") == TEST_INDEX)
-        .unwrap_or_else(|| panic!("no index named {TEST_INDEX}: {indexes:?}"));
+        .find(|i| i.get_str("name").unwrap_or("") == geo_index)
+        .unwrap_or_else(|| panic!("no index named {geo_index}: {indexes:?}"));
     assert_eq!(
         ours.get_str("type").unwrap_or(""),
         "search",
@@ -1927,16 +1970,6 @@ fn test_binary_mongodb_geo() {
 // ---------------------------------------------------------------------------
 // Issue #238 — `--skip-upload` must reuse the corpus, not destroy it
 // ---------------------------------------------------------------------------
-
-/// Count documents in the benchmark collection, server-side.
-fn count_test_docs() -> u64 {
-    mongodb_client()
-        .database(TEST_DB)
-        .collection::<Document>(TEST_COLLECTION)
-        .count_documents(doc! {})
-        .run()
-        .expect("countDocuments")
-}
 
 /// MongoDB's destruction path is a third shape: `collection.drop()`, which is
 /// unbounded — unlike Redis/Valkey, whose `DD`/UNLINK are scoped to this config's
@@ -1984,7 +2017,10 @@ fn test_binary_mongodb_skip_upload_skip_vector_index_preserves_corpus() {
         ),
         "phase 1 (upload with --skip-vector-index) failed"
     );
-    let before = count_test_docs();
+    // `--skip-vector-index` rewrites the config name to `<engine>-no-vector`
+    // (experiment::run), so the collection the engine addresses is derived from
+    // THAT name, not from `cfg238mg`.
+    let before = count_docs(&engine_collection("mongodb-no-vector"));
     assert_eq!(before, common::N_DOCS as u64, "phase 1 corpus");
 
     assert!(
@@ -1999,7 +2035,7 @@ fn test_binary_mongodb_skip_upload_skip_vector_index_preserves_corpus() {
         "phase 2 (--skip-upload --skip-vector-index) failed"
     );
 
-    let after = count_test_docs();
+    let after = count_docs(&engine_collection("mongodb-no-vector"));
     assert_eq!(
         after, before,
         "--skip-upload --skip-vector-index dropped the collection it was told to \
@@ -2052,17 +2088,21 @@ fn test_binary_mongodb_skip_upload_short_corpus_is_fatal() {
         ),
         "phase 1 (upload) failed"
     );
-    assert_eq!(count_test_docs(), common::N_DOCS as u64, "phase 1 corpus");
+    assert_eq!(
+        count_docs(&engine_collection("cfg238mgshort")),
+        common::N_DOCS as u64,
+        "phase 1 corpus"
+    );
 
     let half = (common::N_DOCS / 2) as i64;
     mongodb_client()
         .database(TEST_DB)
-        .collection::<Document>(TEST_COLLECTION)
+        .collection::<Document>(&engine_collection("cfg238mgshort"))
         .delete_many(doc! { "_id": { "$lt": half } })
         .run()
         .expect("delete_many");
     assert_eq!(
-        count_test_docs(),
+        count_docs(&engine_collection("cfg238mgshort")),
         half as u64,
         "half the corpus should remain"
     );
@@ -2161,7 +2201,7 @@ fn test_binary_mongodb_mixed_updates_that_miss_the_corpus_are_fatal() {
         );
         let coll = mongodb_client()
             .database(TEST_DB)
-            .collection::<Document>(TEST_COLLECTION);
+            .collection::<Document>(&engine_collection(cfg));
         // `_id` is immutable, so re-key by copy-then-delete.
         let originals: Vec<Document> = coll
             .find(doc! {})
@@ -2182,7 +2222,7 @@ fn test_binary_mongodb_mixed_updates_that_miss_the_corpus_are_fatal() {
         coll.delete_many(doc! {}).run().unwrap();
         coll.insert_many(shifted).run().unwrap();
         assert_eq!(
-            count_test_docs(),
+            count_docs(&engine_collection(cfg)),
             common::N_DOCS as u64,
             "the shifted corpus must keep its document count, so the reuse check \
              passes and this test exercises the #293 gate rather than #238's"
@@ -2274,6 +2314,272 @@ fn test_binary_mongodb_mixed_updates_that_miss_the_corpus_are_fatal() {
         update_count, 0,
         "not one update matched, so the count must be 0"
     );
+
+    drop_test_collection();
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #306 — every config addresses its OWN collection and search index
+// ---------------------------------------------------------------------------
+
+/// The headline failure of #306, end to end.
+///
+/// Before the fix every config in a sweep wrote to the one literal
+/// `bench.vectors` with the one literal `vector_index`. `--skip-upload` skips
+/// `configure()`, which is the only caller of `create_vector_index`, so config B
+/// searched config A's HNSW graph, `countDocuments` returned A's row count, the
+/// reuse check printed "holds N of N", and the run published B's `M` /
+/// `EF_CONSTRUCTION` label over A's measurement and exited 0.
+///
+/// Phase 1 uploads under config A. Phase 2 runs config B with `--skip-upload`
+/// and must be REJECTED: B's collection does not exist, so the reuse
+/// precondition sees 0 of N.
+///
+/// RED ON REVERT: with the shared collection, phase 2's `countDocuments` finds
+/// A's N documents, the precondition passes, and `run_binary_extra` returns
+/// true — the first assertion fires. The follow-up assertions pin that the
+/// rejection is the reuse gate (not an incidental connection error) and that
+/// A's corpus was left untouched.
+#[test]
+fn test_binary_mongodb_skip_upload_against_another_configs_corpus_is_fatal() {
+    wait_for_mongodb();
+    drop_test_collection();
+
+    let port: u16 = std::env::var("MONGODB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MONGODB_PORT);
+    let port_s = port.to_string();
+
+    let cfg_a = "cfg306a";
+    let cfg_b = "cfg306b";
+    let ds = "cfg306-test";
+    let configs = serde_json::json!([
+        {
+            "name": cfg_a, "engine": "mongodb",
+            "search_params": [{"parallel": 1, "num_candidates": 20}],
+            "upload_params": {"parallel": 1}
+        },
+        {
+            "name": cfg_b, "engine": "mongodb",
+            "search_params": [{"parallel": 1, "num_candidates": 20}],
+            "upload_params": {"parallel": 1}
+        },
+    ]);
+    let proj = common::write_match_any_project(ds, &serde_json::to_string(&configs).unwrap(), 8);
+    let envs: [(&str, &str); 4] = [
+        ("MONGODB_PORT", port_s.as_str()),
+        ("MONGODB_DB", TEST_DB),
+        ("MONGODB_COLLECTION", TEST_COLLECTION),
+        ("MONGODB_INDEX_NAME", TEST_INDEX),
+    ];
+
+    // Phase 1: config A populates ITS collection.
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            cfg_a,
+            ds,
+            MONGODB_HOST,
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "phase 1 (config A upload) failed"
+    );
+    assert_eq!(
+        count_docs(&engine_collection(cfg_a)),
+        common::N_DOCS as u64,
+        "config A must populate '{}' — if this is 0 the engine wrote somewhere else",
+        engine_collection(cfg_a)
+    );
+
+    // Phase 2: config B reuses "the corpus". There is no corpus of B's.
+    let out = Command::new(binary_path())
+        .args([
+            "--engines",
+            cfg_b,
+            "--datasets",
+            ds,
+            "--host",
+            MONGODB_HOST,
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+            "--keep-data",
+        ])
+        .envs(envs.iter().map(|(k, v)| (*k, *v)))
+        .current_dir(&proj.root)
+        .output()
+        .expect("run vector-db-benchmark");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "config B has no corpus of its own; --skip-upload must abort rather than \
+         measure config A's index and label it B (#306):\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!("holds 0 of the {} rows", common::N_DOCS)),
+        "the rejection must be the reuse precondition seeing an empty corpus, not \
+         an incidental failure:\n{combined}"
+    );
+    assert!(
+        combined.contains("is empty or missing"),
+        "config B's collection must read as absent, not merely short:\n{combined}"
+    );
+
+    // And B must not have destroyed A on its way out.
+    assert_eq!(
+        count_docs(&engine_collection(cfg_a)),
+        common::N_DOCS as u64,
+        "config B's aborted run touched config A's collection"
+    );
+
+    drop_test_collection();
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #306 × #151-4 — MongoDB must PARTICIPATE in the startup collision guard.
+///
+/// The derivation alone leaves one way back into the shared-collection world:
+/// `MONGODB_COLLECTION_EXACT=1` drops the per-config suffix, so N configs
+/// resolve to one verbatim collection again and `configure()`'s
+/// `collection.drop()` is back to wiping the sibling. The Redis-family engines
+/// have that case rejected at startup; the guard did not know the string
+/// `"mongodb"` at all.
+///
+/// Asserted on the ERROR TEXT, not merely a non-zero exit: without a reachable
+/// server the run would fail anyway, so a bare exit-code assertion would pass
+/// against a removed guard. This test needs no server — the guard runs before
+/// any engine is constructed.
+#[test]
+fn test_binary_mongodb_exact_pin_with_two_configs_is_rejected_at_startup() {
+    let configs = serde_json::json!([
+        {
+            "name": "mongo-guard-a", "engine": "mongodb",
+            "search_params": [{"parallel": 1, "num_candidates": 20}],
+        },
+        {
+            "name": "mongo-guard-b", "engine": "mongodb",
+            "search_params": [{"parallel": 1, "num_candidates": 20}],
+        },
+    ]);
+    let proj = common::write_match_any_project(
+        "mongo-guard",
+        &serde_json::to_string(&configs).unwrap(),
+        8,
+    );
+
+    let out = Command::new(binary_path())
+        .args([
+            "--engines",
+            "mongo-guard-*",
+            "--datasets",
+            "mongo-guard",
+            "--host",
+            MONGODB_HOST,
+            "--skip-if-exists",
+            "false",
+        ])
+        .current_dir(&proj.root)
+        .env("MONGODB_DB", TEST_DB)
+        .env("MONGODB_COLLECTION", "shared-coll")
+        .env("MONGODB_COLLECTION_EXACT", "1")
+        .output()
+        .expect("run vector-db-benchmark");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "exact-pinned sweep of 2 mongodb configs must be rejected, not run: {combined}"
+    );
+    assert!(
+        combined.contains("derive the same index namespace"),
+        "the failure must be the #151-4 collision guard, not an incidental error: {combined}"
+    );
+    assert!(
+        combined.contains("MONGODB_COLLECTION_EXACT is set"),
+        "the guard must name the exact-pin as the cause so the fix is obvious: {combined}"
+    );
+    assert!(
+        combined.contains("the mongodb collection"),
+        "the guard must name the object that would be overwritten: {combined}"
+    );
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// `--keep-data` across a multi-config sweep is documented (experiment.rs) as
+/// keeping EVERY config's data resident simultaneously. That was false for
+/// MongoDB — config B's `configure()` dropped config A's collection — and #306
+/// makes it true. This pins the documented behaviour.
+///
+/// RED ON REVERT: with one shared collection, config B's `configure()` drops it,
+/// so after the sweep only ONE collection exists and A's count is 0.
+#[test]
+fn test_binary_mongodb_keep_data_keeps_every_configs_corpus() {
+    wait_for_mongodb();
+    drop_test_collection();
+
+    let port: u16 = std::env::var("MONGODB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MONGODB_PORT);
+    let port_s = port.to_string();
+
+    let ds = "cfg306keep-test";
+    let cfg_a = "cfg306keepa";
+    let cfg_b = "cfg306keepb";
+    let configs = serde_json::json!([
+        {
+            "name": cfg_a, "engine": "mongodb",
+            "search_params": [{"parallel": 1, "num_candidates": 20}],
+            "upload_params": {"parallel": 1}
+        },
+        {
+            "name": cfg_b, "engine": "mongodb",
+            "search_params": [{"parallel": 1, "num_candidates": 20}],
+            "upload_params": {"parallel": 1}
+        },
+    ]);
+    let proj = common::write_match_any_project(ds, &serde_json::to_string(&configs).unwrap(), 8);
+    let envs: [(&str, &str); 4] = [
+        ("MONGODB_PORT", port_s.as_str()),
+        ("MONGODB_DB", TEST_DB),
+        ("MONGODB_COLLECTION", TEST_COLLECTION),
+        ("MONGODB_INDEX_NAME", TEST_INDEX),
+    ];
+
+    // One invocation, both configs (`cfg306keep*`), --keep-data.
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            "cfg306keep*",
+            ds,
+            MONGODB_HOST,
+            &envs,
+            &["--keep-data", "--skip-search"],
+        ),
+        "two-config --keep-data sweep failed"
+    );
+
+    for cfg in [cfg_a, cfg_b] {
+        assert_eq!(
+            count_docs(&engine_collection(cfg)),
+            common::N_DOCS as u64,
+            "--keep-data must leave '{}' resident; config '{}' lost its corpus to \
+             a sibling's configure() (#306)",
+            engine_collection(cfg),
+            cfg
+        );
+    }
 
     drop_test_collection();
     fs::remove_dir_all(&proj.root).ok();
