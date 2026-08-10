@@ -258,7 +258,8 @@ fn gated_engine_files() -> Vec<String> {
         ),
         (
             "turbopuffer",
-            "no warm-up gate by design: its workers start on spawn (tracked separately)",
+            "its workers still start on spawn; the ungated harness itself is tracked by \
+             UNGATED_FANOUT_DEBT below (#266), which is what will fail when it is converted",
         ),
     ];
     let mod_rs = read_engine_raw("mod.rs");
@@ -506,82 +507,414 @@ fn inv4_no_fixed_count_start_barrier() {
     );
 }
 
-/// INV-4b — every engine that fans out a timed search actually routes its start
-/// through the gate, once per harness, in the right place.
+/// One `fn` item's comment-stripped body, located by brace matching.
+struct FnSpan {
+    name: String,
+    /// Byte offset of the body's opening `{`.
+    start: usize,
+    /// Byte offset of the body's matching `}`.
+    end: usize,
+}
+
+/// Every `fn` item in `src` (already comment/string-stripped), with the exact
+/// extent of its body.
 ///
-/// Without this, INV-4 could be "satisfied" by an engine that grew some other
-/// fixed-count wait, or by one that dropped its synchronized start altogether.
-/// The engine list is derived from `engine/mod.rs`, so a new engine is opted in
-/// by default.
+/// Brace matching rather than "up to the next `fn`", because the second form
+/// bleeds one harness's body into the next one's — which is precisely how a
+/// missing gate hides: `search_mixed`'s ungated fan-out would inherit the
+/// `WorkerPool::new` that belongs to `search`.
+fn fn_spans(src: &str) -> Vec<FnSpan> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = src[cursor..].find("fn ") {
+        let at = cursor + rel;
+        cursor = at + 3;
+        // Token boundary: skip `...fn ` inside a longer identifier. A UTF-8
+        // continuation byte is >= 0x80 and so reads as a boundary, which is the
+        // safe direction (we consider the item, we do not skip it).
+        if at > 0 {
+            let prev = b[at - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                continue;
+            }
+        }
+        let name: String = src[at + 3..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        // The first `{` after the signature opens the body; a `;` first means a
+        // bodyless declaration (trait method). Neither character can occur in a
+        // Rust return type or where-clause between the two.
+        let mut j = at + 3 + name.len();
+        let body_start = loop {
+            match b.get(j) {
+                Some(b'{') => break Some(j),
+                Some(b';') | None => break None,
+                Some(_) => j += 1,
+            }
+        };
+        let Some(bs) = body_start else { continue };
+        let mut depth = 0usize;
+        let mut k = bs;
+        let body_end = loop {
+            match b.get(k) {
+                Some(b'{') => depth += 1,
+                Some(b'}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break Some(k);
+                    }
+                }
+                None => break None,
+                _ => {}
+            }
+            k += 1;
+        };
+        let Some(be) = body_end else { continue };
+        out.push(FnSpan {
+            name,
+            start: bs,
+            end: be,
+        });
+    }
+    out
+}
+
+/// A `thread::scope` worker fan-out, attributed to the function that owns it.
+struct FanOut {
+    file: String,
+    func: String,
+    body: String,
+}
+
+/// Every `thread::scope(...)` fan-out under `engine/`, one entry per owning
+/// function.
+///
+/// Attribution is to the SMALLEST enclosing `fn`, so a nested helper is
+/// reported as itself rather than as its parent.
+fn fan_out_harnesses() -> Vec<FanOut> {
+    let mut files: Vec<String> = fs::read_dir(engine_dir())
+        .expect("read engine dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    files.sort();
+
+    let mut out = Vec::new();
+    for file in files {
+        let src = read_engine(&file);
+        let spans = fn_spans(&src);
+        let mut owners: Vec<usize> = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find("thread::scope(") {
+            let at = from + rel;
+            from = at + 1;
+            let owner = spans
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.start < at && at < s.end)
+                .min_by_key(|(_, s)| s.end - s.start)
+                .map(|(i, _)| i);
+            let Some(owner) = owner else {
+                panic!(
+                    "{file}: a `thread::scope(` at byte {at} sits outside every `fn` body — \
+                     `fn_spans` mis-parsed the file, and every gate check below would silently \
+                     skip that fan-out"
+                );
+            };
+            if !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+        for owner in owners {
+            let s = &spans[owner];
+            out.push(FanOut {
+                file: file.clone(),
+                func: s.name.clone(),
+                body: src[s.start..=s.end].to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Timed fan-outs that predate the start gate and have NOT been converted yet
+/// — the #266 backlog. Each entry is a *claim that the harness is still broken*,
+/// not a permanent exemption.
+///
+/// Read this together with the assertions in
+/// `inv4_search_harnesses_route_through_the_start_gate`, which enforce a
+/// **bijection** between this list and the set of ungated timed fan-outs found
+/// in the source:
+///
+/// * an ungated harness that is NOT listed fails the build — new debt cannot be
+///   added silently;
+/// * a listed harness that IS gated fails the build — the only way to claim the
+///   debt is to DELETE its entry, so the list can never mark work as paid that
+///   was not done (#255);
+/// * a listed harness that no longer exists fails the build — a renamed or
+///   deleted function cannot leave a stale entry covering nothing.
+///
+/// Fixing one of these is therefore a two-line change: convert the harness,
+/// remove its row. Leaving the row in place is a hard failure, not a warning.
+const UNGATED_FANOUT_DEBT: &[(&str, &str, &str)] = &[
+    (
+        "redis.rs",
+        "search_filter_only",
+        "#266: --skip-vector-index path never converted to WorkerPool",
+    ),
+    (
+        "redis.rs",
+        "search_mixed",
+        "#266: --update-search-ratio path never converted to WorkerPool",
+    ),
+    (
+        "valkey.rs",
+        "search_filter_only",
+        "#266: --skip-vector-index path never converted to WorkerPool",
+    ),
+    (
+        "valkey.rs",
+        "search_mixed",
+        "#266: --update-search-ratio path never converted to WorkerPool",
+    ),
+    (
+        "vectorsets.rs",
+        "search_mixed",
+        "#266: --update-search-ratio path never converted to WorkerPool",
+    ),
+    (
+        "turbopuffer.rs",
+        "search",
+        "#266: workers start measuring on spawn; also EXCUSED from gated_engine_files()",
+    ),
+];
+
+/// INV-4b — every TIMED worker fan-out routes its start through the gate, once
+/// per harness, in the right place.
+///
+/// The 2026-08 shape of this guard counted `WorkerPool::new` occurrences per
+/// FILE and required one park each. That counts *gated* harnesses, so a fan-out
+/// that never created a pool was structurally invisible: MongoDB passed at 1
+/// gated harness out of 3, while `search_mixed` and `search_filter_only` were
+/// timing their workers from spawn and silently dropping any worker that could
+/// not connect (#307). A mutation deleting an existing gate was caught; a
+/// harness that never had one was not.
+///
+/// It now enumerates the fan-outs themselves — every `thread::scope(...)` under
+/// `engine/`, attributed to its owning `fn` — and classifies each one:
+///
+/// * publishes search stats, or is named `search*` -> TIMED, must be gated;
+/// * named `upload*` and publishes no search stats -> untimed, skipped;
+/// * anything else -> unclassified, and fails. Default-in: a new fan-out is
+///   covered without anyone remembering to add it here.
+///
+/// The pre-gate backlog lives in `UNGATED_FANOUT_DEBT` and is checked for exact
+/// agreement with reality in both directions.
 #[test]
 fn inv4_search_harnesses_route_through_the_start_gate() {
     let mut problems = Vec::new();
 
+    // (a) FILE level: every non-excused engine still uses the gate somewhere.
+    //     Kept because it also covers an engine that stops fanning out with
+    //     `thread::scope` altogether (rayon, a tokio task set) and so would
+    //     vanish from the per-harness census below.
     for file in gated_engine_files() {
         let src = read_engine(&file);
-
-        // (a) it uses the gate at all.
-        let pools = src.matches("WorkerPool::new(").count();
-        let bare_gates = src.matches("StartGate::new()").count();
-        let harnesses = pools + bare_gates;
-        if harnesses == 0 {
+        if src.matches("WorkerPool::new(").count() + src.matches("StartGate::new()").count() == 0 {
             problems.push(format!(
                 "  {file}: no `WorkerPool::new` / `StartGate::new` — the synchronized start is \
                  gone, so connection setup and the cold first query are back inside the measured \
                  window"
             ));
+        }
+    }
+
+    // (b) HARNESS level.
+    let harnesses = fan_out_harnesses();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    // (file, func) -> is it gated? Used to audit the debt list afterwards.
+    let mut timed: Vec<(String, String, bool)> = Vec::new();
+
+    for h in &harnesses {
+        let key = (h.file.clone(), h.func.clone());
+        if seen.contains(&key) {
+            problems.push(format!(
+                "  {}::{}: two fan-out functions share a name, so the debt list below cannot \
+                 address them individually — rename one",
+                h.file, h.func
+            ));
+            continue;
+        }
+        seen.push(key);
+
+        let publishes_search_stats = h.body.contains("compute_search_stats(");
+        let is_timed = publishes_search_stats || h.func.starts_with("search");
+        if !is_timed {
+            if h.func.starts_with("upload") {
+                continue; // untimed ingest fan-out: no measured window to protect.
+            }
+            problems.push(format!(
+                "  {}::{}: fans out worker threads but is neither a `search*`/stats-publishing \
+                 harness nor an `upload*` one. Classify it: if its workers are timed it must go \
+                 through `WorkerPool`; if not, name it `upload*` or excuse it here",
+                h.file, h.func
+            ));
             continue;
         }
 
-        // (b) exactly one park per harness. Catches un-gating ONE of the two
-        //     harnesses in weaviate (gRPC/GraphQL) or vertex (search/mixed).
-        let parks = src.matches("ticket.arrive_and_wait()").count();
-        if parks != harnesses {
+        let pools = h.body.matches("WorkerPool::new(").count();
+        let bare_gates = h.body.matches("StartGate::new()").count();
+        let gates = pools + bare_gates;
+        timed.push((h.file.clone(), h.func.clone(), gates > 0));
+
+        if gates == 0 {
+            let excused = UNGATED_FANOUT_DEBT
+                .iter()
+                .any(|(f, n, _)| *f == h.file && *n == h.func);
+            if !excused {
+                problems.push(format!(
+                    "  {}::{}: times a `thread::scope` worker fan-out with NO \
+                     `WorkerPool::new` / `StartGate::new`. Connection setup and the cold first \
+                     query are inside the measured window, and a worker that cannot connect \
+                     returns empty while the result is still stamped with the requested \
+                     `parallel` (#214/#307). Route it through \
+                     `vector_db_benchmark::start_gate::WorkerPool`",
+                    h.file, h.func
+                ));
+            }
+            continue;
+        }
+
+        // (c) exactly one park per gate in THIS harness. Catches un-gating one of
+        //     the two gates weaviate's `search` drives (gRPC + GraphQL).
+        let parks = h.body.matches("ticket.arrive_and_wait()").count();
+        if parks != gates {
             problems.push(format!(
-                "  {file}: {harnesses} harness(es) but {parks} `ticket.arrive_and_wait()` call(s) \
-                 — one of them no longer parks at the gate"
+                "  {}::{}: {gates} gate(s) but {parks} `ticket.arrive_and_wait()` call(s) — one \
+                 of them no longer parks at the gate",
+                h.file, h.func
             ));
         }
 
-        // (c) the abort verdict is honoured. `let _ = ticket.arrive_and_wait();`
+        // (d) the abort verdict is honoured. `let _ = ticket.arrive_and_wait();`
         //     compiles, satisfies `#[must_use]`, and silently lets every worker
         //     run on its own clock after an aborted start.
-        if src.contains("let _ = ticket.arrive_and_wait()") {
+        if h.body.contains("let _ = ticket.arrive_and_wait()") {
             problems.push(format!(
-                "  {file}: discards the `arrive_and_wait` verdict with `let _ =`. `None` means \
-                 the run was aborted; the worker must return, not measure"
+                "  {}::{}: discards the `arrive_and_wait` verdict with `let _ =`. `None` means \
+                 the run was aborted; the worker must return, not measure",
+                h.file, h.func
             ));
         }
 
-        // (d) the park sits BELOW setup. Every gated harness reports at least one
+        // (e) the park sits BELOW setup. Every gated harness reports at least one
         //     setup failure through `ticket.fail(...)` before it parks; if the
         //     first park precedes the first `fail`, the park was hoisted above
         //     client construction / the prime query, putting connection setup
-        //     back inside the measured window — the regression (a) is meant to
-        //     catch and cannot.
+        //     back inside the measured window.
         let (Some(first_park), Some(first_fail)) = (
-            src.find("ticket.arrive_and_wait()"),
-            src.find("ticket.fail("),
+            h.body.find("ticket.arrive_and_wait()"),
+            h.body.find("ticket.fail("),
         ) else {
             problems.push(format!(
-                "  {file}: no `ticket.fail(...)` — a worker that cannot set itself up is silently \
-                 reducing the run's real concurrency again"
+                "  {}::{}: no `ticket.fail(...)` — a worker that cannot set itself up is \
+                 silently reducing the run's real concurrency again",
+                h.file, h.func
             ));
             continue;
         };
         if first_park < first_fail {
             problems.push(format!(
-                "  {file}: parks at the gate before its first setup-failure arm, so client \
-                 construction and the prime query happen AFTER the start stamp — connection setup \
-                 is back inside the measured window"
+                "  {}::{}: parks at the gate before its first setup-failure arm, so client \
+                 construction and the prime query happen AFTER the start stamp — connection \
+                 setup is back inside the measured window",
+                h.file, h.func
             ));
+        }
+    }
+
+    // (f) the debt list agrees with reality in BOTH directions. A row that no
+    //     longer describes a broken harness is a failure, never a silent pass:
+    //     deleting the row is the only way to claim the fix (#255).
+    for (file, func, why) in UNGATED_FANOUT_DEBT {
+        assert!(
+            why.contains("#266"),
+            "UNGATED_FANOUT_DEBT row {file}::{func} must cite the tracking issue (#266)"
+        );
+        match timed.iter().find(|(f, n, _)| f == file && n == func) {
+            None => problems.push(format!(
+                "  {file}::{func}: listed in UNGATED_FANOUT_DEBT but no such timed fan-out \
+                 exists (renamed, deleted, or no longer fans out). Remove the row"
+            )),
+            Some((_, _, true)) => problems.push(format!(
+                "  {file}::{func}: listed in UNGATED_FANOUT_DEBT but it IS gated now. The debt \
+                 is paid — DELETE the row. Leaving it would let the next un-gating of this \
+                 harness pass silently"
+            )),
+            Some((_, _, false)) => {}
         }
     }
 
     assert!(
         problems.is_empty(),
-        "INV-4b VIOLATED (#214):\n{}",
+        "INV-4b VIOLATED (#214/#266/#307):\n{}",
         problems.join("\n")
+    );
+}
+
+/// The fan-out census must actually find the harnesses — a parser that returns
+/// nothing would make INV-4b vacuously green.
+///
+/// Pins the two properties INV-4b's correctness rests on:
+/// 1. brace-matched bodies do not bleed into the next function (mongodb's
+///    `search`, `search_mixed` and `search_filter_only` are three separate
+///    harnesses, and each must see only its own gate);
+/// 2. upload fan-outs are classified untimed, timed ones are not.
+#[test]
+fn fan_out_census_separates_each_harness_from_its_neighbours() {
+    let harnesses = fan_out_harnesses();
+    assert!(
+        harnesses.len() >= 30,
+        "expected the census to find every engine's upload + search fan-outs, found {}",
+        harnesses.len()
+    );
+
+    let find = |file: &str, func: &str| {
+        harnesses
+            .iter()
+            .find(|h| h.file == file && h.func == func)
+            .unwrap_or_else(|| panic!("census lost {file}::{func}"))
+    };
+
+    // mongodb has three search fan-outs in one file; brace matching must keep
+    // each one's gate to itself. If bodies bled, all three would look gated.
+    for func in ["search", "search_mixed", "search_filter_only"] {
+        let h = find("mongodb_engine.rs", func);
+        assert!(
+            h.body.contains("WorkerPool::new("),
+            "mongodb_engine.rs::{func} lost its gate"
+        );
+        assert_eq!(
+            h.body.matches("WorkerPool::new(").count(),
+            1,
+            "mongodb_engine.rs::{func} sees {} pools — its body bled into a neighbouring \
+             harness, which would let an ungated fan-out borrow someone else's gate",
+            h.body.matches("WorkerPool::new(").count()
+        );
+    }
+
+    // An upload fan-out must be visible to the census but classified untimed.
+    let upload = find("mongodb_engine.rs", "upload_parallel");
+    assert!(
+        !upload.body.contains("compute_search_stats("),
+        "the untimed classification keys off `compute_search_stats`; if an upload path starts \
+         publishing search stats it must be treated as timed instead"
     );
 }
 

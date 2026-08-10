@@ -175,6 +175,23 @@ impl MongoDBEngine {
             runnable_indices.len()
         };
 
+        // Per-runnable-query `top`, computed once up front so the prime query and
+        // the measured loop resolve `top` identically (and so the worker closure
+        // no longer needs to borrow `neighbors`). Aligned with `runnable_indices`.
+        let tops: Vec<usize> = runnable_indices
+            .iter()
+            .map(|&idx| {
+                explicit_top.unwrap_or_else(|| {
+                    let n = neighbors[idx].len();
+                    if n > 0 {
+                        n
+                    } else {
+                        10
+                    }
+                })
+            })
+            .collect();
+
         // Each worker accumulates latencies into a thread-local buffer and returns
         // it on join; the main thread concatenates. This keeps the timed hot loop
         // free of the per-query cross-thread Mutex<Vec> push that serialized
@@ -185,28 +202,43 @@ impl MongoDBEngine {
         let query_idx = Arc::new(AtomicUsize::new(0));
 
         let pb = self.create_progress_bar(num_to_run);
-        let start_time = Instant::now();
 
+        // Gate-synchronized start, exactly as `search()` does (#214/#307). Every
+        // worker builds its client, runs ONE discarded prime `find` and only then
+        // parks at the gate; `WorkerPool::start` stamps the shared start instant
+        // and releases them together. Two things depend on this here:
+        //
+        //  * `mongodb::sync::Client::with_uri_str` performs NO I/O — topology
+        //    discovery, the TCP/TLS handshake and auth are all deferred to the
+        //    first operation. Ungated, that entire cost landed inside the FIRST
+        //    per-query latency sample of every worker, so at `parallel: 100` a
+        //    hundred samples each carried 10-50ms of connect against a ~1ms
+        //    steady-state query — enough to own p99 outright.
+        //  * A worker that cannot build its client used to `return` its empty
+        //    buffer. Survivors still finished all `num_to_run` queries, so
+        //    `failed_queries` stayed 0 and the artifact was stamped with the
+        //    REQUESTED `parallel`: a `parallel: 100` row from a 60-worker run.
+        //    `ticket.fail(...)` makes that a hard error instead.
         let uri = self.uri.clone();
         let db_name = self.db_name.clone();
         let collection_name = self.collection_name.clone();
 
         let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(parallel);
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "mongodb-filter-only", parallel);
             for _ in 0..parallel {
                 let uri = uri.clone();
                 let db_name = db_name.clone();
                 let collection_name = collection_name.clone();
                 let parsed_filters = &parsed_filters;
                 let runnable_indices = &runnable_indices;
-                let neighbors = &neighbors;
+                let tops = &tops;
                 let errors = Arc::clone(&errors);
                 let query_idx = Arc::clone(&query_idx);
                 let pb = &pb;
 
-                handles.push(s.spawn(move || {
+                pool.spawn(move |ticket| {
                     // Thread-local sample buffer — no cross-thread lock per query.
                     let mut t: Vec<f64> = Vec::new();
                     let mut local_errs: Vec<String> = Vec::new();
@@ -214,27 +246,43 @@ impl MongoDBEngine {
 
                     let client = match Client::with_uri_str(&uri) {
                         Ok(c) => c,
-                        Err(_) => return t,
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("mongodb-filter-only worker setup failed: {e}"));
+                            return t;
+                        }
                     };
                     let coll = client
                         .database(&db_name)
                         .collection::<Document>(&collection_name);
+
+                    // Prime this connection with ONE discarded find so SDAM, the
+                    // handshake, auth and the cold first round-trip are not inside
+                    // the measured window. Best effort: read-only, errors ignored,
+                    // and its sample is NOT recorded. `runnable_indices` is
+                    // non-empty (checked above).
+                    {
+                        let idx = runnable_indices[0];
+                        let filter = parsed_filters[idx].as_ref().unwrap();
+                        let _ = filter_only_find(&coll, filter, tops[0]);
+                    }
+
+                    // Signal "connected + primed", then block until the coordinator
+                    // stamps the shared measurement start and releases everyone.
+                    let Some(_start_time) = ticket.arrive_and_wait() else {
+                        return t;
+                    };
 
                     loop {
                         let seq = query_idx.fetch_add(1, Ordering::Relaxed);
                         if seq >= num_to_run {
                             break;
                         }
-                        let idx = runnable_indices[seq % runnable_indices.len()];
-
-                        let top = explicit_top.unwrap_or_else(|| {
-                            let n = neighbors[idx].len();
-                            if n > 0 {
-                                n
-                            } else {
-                                10
-                            }
-                        });
+                        let slot = seq % runnable_indices.len();
+                        let idx = runnable_indices[slot];
+                        let top = tops[slot];
 
                         let filter = parsed_filters[idx].as_ref().unwrap();
 
@@ -273,13 +321,17 @@ impl MongoDBEngine {
                         }
                     }
                     t
-                }));
+                })?;
             }
 
-            for h in handles {
-                times.extend(h.join().unwrap());
+            // Every worker is connected + primed and parked at the gate.
+            // Stamp the shared measurement start and release them together.
+            let (per_worker, measured_start) = pool.start()?;
+            for t in per_worker {
+                times.extend(t);
             }
-        });
+            Ok(measured_start)
+        })?;
 
         {
             let logged_errors = errors.lock().unwrap();
@@ -291,7 +343,8 @@ impl MongoDBEngine {
         }
 
         pb.finish_and_clear();
-        let total_time = start_time.elapsed().as_secs_f64();
+        // total_time excludes connection setup and the cold first query.
+        let total_time = measured_start.elapsed().as_secs_f64();
 
         if times.is_empty() {
             return Err("No filter-only searches completed".to_string());
@@ -2020,8 +2073,27 @@ impl Engine for MongoDBEngine {
         let update_seq_len = update_seq.len();
 
         let pb = self.create_progress_bar(num_to_run);
-        let start_time = Instant::now();
 
+        // Gate-synchronized start, exactly as `search()` does (#214/#307). Every
+        // worker builds its client, runs ONE discarded prime search and only then
+        // parks at the gate; `WorkerPool::start` stamps the shared start instant
+        // and releases them together. Two things depend on this here:
+        //
+        //  * `mongodb::sync::Client::with_uri_str` performs NO I/O — topology
+        //    discovery, the TCP/TLS handshake and auth are all deferred to the
+        //    first operation. Ungated, that entire cost landed inside the FIRST
+        //    per-query latency sample of every worker, so at `parallel: 100` a
+        //    hundred samples each carried 10-50ms of connect against a ~1ms
+        //    steady-state query — enough to own p99 outright.
+        //  * A worker that cannot build its client used to `return` its empty
+        //    buffers. Survivors still finished all `num_to_run` searches, so
+        //    `failed_queries` stayed 0 and the artifact was stamped with the
+        //    REQUESTED `parallel`: a `parallel: 100` row from a 60-worker run.
+        //    `ticket.fail(...)` makes that a hard error instead.
+        //
+        // The shared start instant is also what `update_rps` is divided by, so
+        // both halves of the mixed window now measure the same interval — one
+        // that begins when every worker is warm, not when the first was spawned.
         let uri = self.uri.clone();
         let db_name = self.db_name.clone();
         let collection_name = self.collection_name.clone();
@@ -2040,8 +2112,8 @@ impl Engine for MongoDBEngine {
         let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
         let mut tally = crate::engine::UpdateTally::default();
 
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(parallel);
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "mongodb-mixed", parallel);
             for _ in 0..parallel {
                 let uri = uri.clone();
                 let db_name = db_name.clone();
@@ -2057,7 +2129,7 @@ impl Engine for MongoDBEngine {
                 let update_idx = Arc::clone(&update_idx);
                 let pb = &pb;
 
-                handles.push(s.spawn(move || {
+                pool.spawn(move |ticket| {
                     // Thread-local sample buffers — no cross-thread lock per query.
                     let mut t: Vec<f64> = Vec::new();
                     let mut p: Vec<f64> = Vec::new();
@@ -2069,11 +2141,34 @@ impl Engine for MongoDBEngine {
 
                     let client = match Client::with_uri_str(&uri) {
                         Ok(c) => c,
-                        Err(_) => return (t, p, r, mr, nd, ut),
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("mongodb-mixed worker setup failed: {e}"));
+                            return (t, p, r, mr, nd, ut);
+                        }
                     };
                     let coll = client
                         .database(&db_name)
                         .collection::<Document>(&collection_name);
+
+                    // Prime this connection with ONE discarded SEARCH so the cold
+                    // first round-trip is outside the measured window. Deliberately
+                    // a search and not an update: an update would mutate the corpus
+                    // `parallel` times before the run starts, changing what every
+                    // later search sees. The update half shares this connection, so
+                    // it still gets the warmed pool. Best effort: errors ignored,
+                    // sample NOT recorded.
+                    if let Some(prime_pipeline) = pipelines.first() {
+                        let _ = send_search(&coll, prime_pipeline);
+                    }
+
+                    // Signal "connected + primed", then block until the coordinator
+                    // stamps the shared measurement start and releases everyone.
+                    let Some(_start_time) = ticket.arrive_and_wait() else {
+                        return (t, p, r, mr, nd, ut);
+                    };
 
                     'outer: loop {
                         // Search phase: do S searches
@@ -2152,11 +2247,13 @@ impl Engine for MongoDBEngine {
                         pb.inc(pb_pending);
                     }
                     (t, p, r, mr, nd, ut)
-                }));
+                })?;
             }
 
-            for h in handles {
-                let (t, p, r, mr, nd, ut) = h.join().unwrap();
+            // Every worker is connected + primed and parked at the gate.
+            // Stamp the shared measurement start and release them together.
+            let (per_worker, measured_start) = pool.start()?;
+            for (t, p, r, mr, nd, ut) in per_worker {
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
@@ -2164,10 +2261,13 @@ impl Engine for MongoDBEngine {
                 ndcg_vals.extend(nd);
                 tally.merge(ut);
             }
-        });
+            Ok(measured_start)
+        })?;
 
         pb.finish_and_clear();
-        let total_time = start_time.elapsed().as_secs_f64();
+        // total_time excludes connection setup and the cold first query, for both
+        // the search half (rps/percentiles) and the update half (update_rps).
+        let total_time = measured_start.elapsed().as_secs_f64();
 
         if times.is_empty() {
             return Err("No searches completed".to_string());
