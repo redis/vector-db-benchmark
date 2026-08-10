@@ -2519,6 +2519,16 @@ fn build_upload_result_json(
         result["params"]["number_of_shards"] = shards.clone();
     }
 
+    // What the engine CONFIRMED searchable before the search phase started
+    // (#305). Absent for engines that do not verify — absence therefore reads as
+    // "unverified", NOT as "complete" — and a fraction below 1.0 says the recall
+    // in the sibling search file was measured against a partially built index.
+    if let Some(coverage) = &stats.index_coverage {
+        result["results"]["index_searchable_count"] = json!(coverage.searchable);
+        result["results"]["index_expected_count"] = json!(coverage.expected);
+        result["results"]["index_coverage_fraction"] = json!(coverage.fraction());
+    }
+
     // Same provenance block as the search files (#212), tagged `phase: "upload"`.
     // It is scoped to what had been resolved when this file was written, so a
     // knob the engine only resolves during search is absent here. The phase tag
@@ -3187,6 +3197,95 @@ mod tests {
             );
             assert_ne!(d, other);
             assert_eq!(d["results"], other["results"]);
+        }
+
+        /// #305: how much of the corpus the engine confirmed searchable has to
+        /// reach the ARTIFACT. It used to exist only as a `println!` — the
+        /// mongodb gate literally printed `10000 / 1183514 docs searchable` and
+        /// then succeeded, so the one number that invalidated the run scrolled
+        /// past while the result file said nothing.
+        ///
+        /// And absence must stay readable as "this engine does not verify",
+        /// never as "verified complete": the two are different claims and the
+        /// file is the only place a later reader can tell them apart.
+        #[test]
+        fn upload_result_carries_the_index_coverage_the_engine_confirmed() {
+            use super::super::build_upload_result_json;
+            use crate::engine::{IndexCoverage, UploadStats};
+
+            let ep = serde_json::json!({"schema_version": 1, "phase": "upload"});
+
+            // The glove-100 failure from the issue, as it would have been
+            // published: 10_000 of 1_183_514.
+            let under = build_upload_result_json(
+                "mongodb-x",
+                "glove-100-angular",
+                &UploadStats {
+                    index_coverage: Some(IndexCoverage {
+                        searchable: 10_000,
+                        expected: 1_183_514,
+                    }),
+                    ..Default::default()
+                },
+                None,
+                &ep,
+            );
+            assert_eq!(under["results"]["index_searchable_count"], 10_000);
+            assert_eq!(under["results"]["index_expected_count"], 1_183_514);
+            let fraction = under["results"]["index_coverage_fraction"]
+                .as_f64()
+                .expect("coverage fraction must be a number in the artifact");
+            assert!(
+                fraction < 0.01,
+                "0.85% coverage must be visible as such, got {fraction}"
+            );
+
+            // A complete gate is a DIFFERENT artifact from an unverified one.
+            let complete = build_upload_result_json(
+                "mongodb-x",
+                "glove-100-angular",
+                &UploadStats {
+                    index_coverage: Some(IndexCoverage {
+                        searchable: 1_183_514,
+                        expected: 1_183_514,
+                    }),
+                    ..Default::default()
+                },
+                None,
+                &ep,
+            );
+            assert_eq!(complete["results"]["index_coverage_fraction"], 1.0);
+            assert_ne!(under["results"], complete["results"]);
+
+            // Engines that do not verify emit none of the three keys, so a
+            // reader can never mistake silence for a confirmed 1.0.
+            let unverified =
+                build_upload_result_json("redis-x", "glove", &UploadStats::default(), None, &ep);
+            for key in [
+                "index_searchable_count",
+                "index_expected_count",
+                "index_coverage_fraction",
+            ] {
+                assert!(
+                    unverified["results"].get(key).is_none(),
+                    "`{key}` must be absent when the engine does not verify"
+                );
+            }
+            assert_ne!(unverified["results"], complete["results"]);
+        }
+
+        /// An empty corpus is trivially complete, and the artifact must carry a
+        /// number rather than the `null` a NaN serializes to.
+        #[test]
+        fn index_coverage_fraction_of_an_empty_corpus_is_a_number() {
+            use crate::engine::IndexCoverage;
+            let f = IndexCoverage {
+                searchable: 0,
+                expected: 0,
+            }
+            .fraction();
+            assert!(f.is_finite(), "NaN would serialize as JSON null");
+            assert_eq!(f, 1.0);
         }
 
         /// Every connection-string shape, asserted against the BYTES ON DISK.

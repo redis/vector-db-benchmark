@@ -2320,6 +2320,187 @@ fn test_binary_mongodb_mixed_updates_that_miss_the_corpus_are_fatal() {
 }
 
 // ---------------------------------------------------------------------------
+// #305: the ANN ceiling that made the capped catch-up gate unfixable in place
+// ---------------------------------------------------------------------------
+
+/// The three server facts the #305 fix stands on, at a corpus size no other
+/// test in this suite reaches.
+///
+/// Every other mongodb integration corpus here is 20-500 vectors, so the branch
+/// that broke — a catch-up gate that stopped waiting at 10_000 documents — was
+/// unreachable from the whole suite; a regression re-capping it would leave the
+/// file green. This uses 10_001 documents, the smallest corpus the old gate got
+/// wrong, and pins:
+///
+/// 1. the APPROXIMATE probe cannot see the 10_001st document even at its
+///    maximum settings (so the old gate released at 10_000/10_001 — the
+///    positive control that the bug is real, and that the exhaustive assertion
+///    below is not passing for free);
+/// 2. the ceiling is the SERVER's, not a choice: `numCandidates: 10_001` is
+///    rejected outright, so no ANN parameterisation can count the corpus;
+/// 3. the EXHAUSTIVE probe the fix uses has no such ceiling and returns all
+///    10_001 — the claim `wait_for_index_catchup` now depends on.
+///
+/// This does not exercise the benchmark's own code path (the probe builder is
+/// private to the binary and unit-tested there); it pins the server behaviour
+/// that path assumes, in the manner of the #293 `matched_count` test above.
+#[test]
+fn test_exhaustive_probe_counts_past_the_ann_10000_document_ceiling() {
+    // One document past the old cap: below this the bug is invisible.
+    const N: i64 = 10_001;
+    const DIM: usize = 4;
+    const COLL: &str = "probe_305_ann_ceiling";
+    const INDEX: &str = "probe_305_index";
+
+    wait_for_mongodb();
+    let client = mongodb_client();
+    let db = client.database(TEST_DB);
+    let coll = db.collection::<Document>(COLL);
+
+    // Own collection and own index name, so this never races the shared corpus.
+    let _ = db
+        .run_command(doc! { "dropSearchIndex": COLL, "name": INDEX })
+        .run();
+    let _ = coll.drop().run();
+
+    let mut docs = Vec::with_capacity(N as usize);
+    for i in 0..N {
+        let f = i as f64;
+        docs.push(doc! {
+            "_id": i,
+            "vector": [ (f * 0.001).sin(), (f * 0.001).cos(), (i % 97) as f64 / 97.0, 0.5 ],
+        });
+    }
+    coll.insert_many(&docs)
+        .run()
+        .expect("failed to insert the 10_001-document probe corpus");
+    assert_eq!(
+        coll.count_documents(doc! {}).run().unwrap(),
+        N as u64,
+        "the corpus must be one document past the old 10_000 cap"
+    );
+
+    db.run_command(doc! {
+        "createSearchIndexes": COLL,
+        "indexes": [ {
+            "name": INDEX,
+            "type": "vectorSearch",
+            "definition": { "fields": [ {
+                "type": "vector",
+                "path": "vector",
+                "numDimensions": DIM as i32,
+                "similarity": "cosine",
+            } ] },
+        } ],
+    })
+    .run()
+    .expect("failed to create the probe vector search index");
+
+    let query: Vec<f64> = vec![0.1, 0.2, 0.3, 0.4];
+    let enn = vec![
+        doc! { "$vectorSearch": {
+            "index": INDEX,
+            "path": "vector",
+            "queryVector": query.clone(),
+            "limit": N,
+            "exact": true,
+        } },
+        doc! { "$count": "n" },
+    ];
+
+    // FACT 3, and the wait: the exhaustive probe must eventually report the
+    // WHOLE corpus. If it plateaus below N this fails with the number it
+    // plateaued at — which is precisely the shape of the bug.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut last = 0i64;
+    let mut last_err = String::from("none");
+    loop {
+        match coll.aggregate(enn.clone()).run() {
+            Ok(cursor) => {
+                last = cursor
+                    .filter_map(|r| r.ok())
+                    .filter_map(|d| d.get_i32("n").map(i64::from).ok())
+                    .last()
+                    .unwrap_or(0);
+                if last >= N {
+                    break;
+                }
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exhaustive probe never reported the whole corpus: {last} / {N} after \
+             300s (last error: {last_err}). If `limit` above 10_000 is now \
+             rejected, the catch-up gate in mongodb_engine.rs has lost its only \
+             corpus-complete signal and must not be allowed to pass silently.",
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+    assert_eq!(
+        last, N,
+        "exhaustive probe must count every indexed document"
+    );
+
+    // FACT 1 (positive control): the approximate probe at its MAXIMUM settings
+    // sees exactly 10_000 — one short — so the old `results.len() >= want` gate
+    // with `want = min(expected, 10_000)` released here, on a corpus that is
+    // fully indexed only by luck of timing at this size and 0.85% indexed on
+    // glove-100. Without this control the exhaustive assertion above could pass
+    // on a server with no ceiling at all and prove nothing.
+    let ann = coll
+        .aggregate(vec![
+            doc! { "$vectorSearch": {
+                "index": INDEX,
+                "path": "vector",
+                "queryVector": query.clone(),
+                "limit": 10_000i64,
+                "numCandidates": 10_000i64,
+            } },
+            doc! { "$count": "n" },
+        ])
+        .run()
+        .expect("the maximal approximate probe must still be a legal query");
+    let ann_n = ann
+        .filter_map(|r| r.ok())
+        .filter_map(|d| d.get_i32("n").map(i64::from).ok())
+        .last()
+        .unwrap_or(0);
+    assert_eq!(
+        ann_n, 10_000,
+        "the maximal approximate probe must top out at 10_000 — if it did not, \
+         this test is not exercising the ceiling #305 is about"
+    );
+    assert!(
+        ann_n < N,
+        "the approximate probe cannot see the whole corpus, which is why the \
+         capped gate could never be made correct"
+    );
+
+    // FACT 2: the ceiling is the server's. No ANN parameterisation reaches N.
+    let rejected = coll
+        .aggregate(vec![doc! { "$vectorSearch": {
+            "index": INDEX,
+            "path": "vector",
+            "queryVector": query,
+            "limit": N,
+            "numCandidates": N,
+        } }])
+        .run()
+        .and_then(|c| c.collect::<Result<Vec<_>, _>>());
+    let err = rejected
+        .expect_err("numCandidates above 10_000 must be rejected, not silently clamped")
+        .to_string();
+    assert!(
+        err.contains("numCandidates"),
+        "expected the server to name numCandidates as out of bounds, got: {err}"
+    );
+
+    let _ = db
+        .run_command(doc! { "dropSearchIndex": COLL, "name": INDEX })
+        .run();
+    let _ = coll.drop().run();
+}
 // Issue #306 — every config addresses its OWN collection and search index
 // ---------------------------------------------------------------------------
 

@@ -53,6 +53,36 @@ pub use vectorsets::VectorSetsEngine;
 pub use vertex::VertexEngine;
 pub use weaviate::WeaviateEngine;
 
+/// How much of the uploaded corpus the engine CONFIRMED to be searchable
+/// before the search phase was allowed to start (#305).
+///
+/// `None` on [`UploadStats::index_coverage`] means the engine performs no such
+/// verification — which is a materially different claim from "verified, and it
+/// was complete", so the two must not be conflated in the artifact. An engine
+/// that does verify writes the achieved and expected counts here, and the
+/// upload JSON carries them, so a reader of the result file can tell what the
+/// recall in the sibling search file was measured against instead of having to
+/// find a scrolled-past line on stderr.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexCoverage {
+    /// Documents the engine observed to be searchable through the index.
+    pub searchable: usize,
+    /// Documents the upload phase sent.
+    pub expected: usize,
+}
+
+impl IndexCoverage {
+    /// `searchable / expected`. An empty corpus is trivially complete (`1.0`)
+    /// rather than `NaN`, so the emitted JSON is always a number.
+    pub fn fraction(&self) -> f64 {
+        if self.expected == 0 {
+            1.0
+        } else {
+            self.searchable as f64 / self.expected as f64
+        }
+    }
+}
+
 /// Upload statistics
 #[derive(Debug, Clone, Default)]
 pub struct UploadStats {
@@ -62,6 +92,8 @@ pub struct UploadStats {
     pub parallel: usize,
     pub batch_size: usize,
     pub memory_usage: Option<serde_json::Value>,
+    /// See [`IndexCoverage`]. `None` = this engine does not verify.
+    pub index_coverage: Option<IndexCoverage>,
 }
 
 /// Update-to-search ratio for mixed workload benchmarks.

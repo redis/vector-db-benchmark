@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use mongodb::bson::{doc, Document};
@@ -18,7 +18,9 @@ use super::geo;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use crate::engine::index_naming::derive_index_name;
-use crate::engine::{CorpusCount, Engine, SearchResults, UpdateSearchRatio, UploadStats};
+use crate::engine::{
+    CorpusCount, Engine, IndexCoverage, SearchResults, UpdateSearchRatio, UploadStats,
+};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::start_gate::WorkerPool;
@@ -656,132 +658,117 @@ impl MongoDBEngine {
         }
     }
 
-    /// Wait for the vector search index to finish indexing all uploaded documents.
+    /// Wait until EVERY uploaded document is searchable through the index, and
+    /// report how many were confirmed.
     ///
-    /// Polls `listSearchIndexes` until the index reports `queryable=true` and
-    /// `status` is READY or ACTIVE, then verifies with a probe search using
-    /// the first uploaded vector.
+    /// Atlas Vector Search is EVENTUALLY CONSISTENT, and the index STATUS
+    /// cannot detect that: `configure()` creates the index on a one-document
+    /// collection *before* the upload, so `listSearchIndexes` reports
+    /// `status: READY, queryable: true` from that moment and keeps reporting it
+    /// the whole time mongot is ingesting the real corpus off a change stream.
+    /// The searchable-document count is therefore the entire guarantee, and
+    /// searching before it is complete measures recall against a fraction of the
+    /// corpus (the observed `recall 0.27` flake).
     ///
-    /// Atlas Vector Search is EVENTUALLY CONSISTENT: the index flips to
-    /// `queryable=true` (and `$vectorSearch` starts returning PARTIAL results)
-    /// while it is still ingesting the just-uploaded documents. A probe that
-    /// stops at the first non-empty result therefore lets the benchmark search
-    /// run against a half-built index, which understates recall (the observed
-    /// `recall 0.27` flake). To close that race we run the probe as a
-    /// full-precision search (`numCandidates >= expected`) and wait until it
-    /// surfaces EVERY uploaded document — i.e. the index has fully caught up —
-    /// before returning. The required count is bounded by `PROBE_CAP` so a huge
-    /// production dataset doesn't wait on an impractically large single query.
+    /// The count comes from an EXHAUSTIVE (`exact: true`, ENN) probe reduced to
+    /// a single number server-side by `$count`. An approximate probe cannot
+    /// answer the question at all: Atlas rejects `numCandidates` above 10_000
+    /// and requires `limit <= numCandidates`, so an ANN probe can never see past
+    /// the first 10_000 documents — which is why the previous capped gate
+    /// released at 0.85% indexed on glove-100 and let the run publish recall
+    /// against a near-empty index (#305). ENN takes no `numCandidates` and so
+    /// carries no such ceiling; verified against mongodb-atlas-local 8.0.17 for
+    /// both dialects, returning 12_000 of 12_000 at `limit` 12_000 and 20_000.
+    ///
+    /// There is no success path that returns while under-indexed: either the
+    /// probe confirms the whole corpus, or this returns `Err` and the run stops
+    /// before it can publish an unbacked recall.
     fn wait_for_index_catchup(
         &self,
         expected_count: usize,
         probe_vector: &[f32],
         dialect: SearchDialect,
-    ) -> Result<(), String> {
-        // Upper bound on how many docs we require the probe to surface. Atlas
-        // caps both `limit` and `numCandidates` at 10_000, and for large corpora
-        // "index reports ready AND has surfaced this many docs" is a sufficient
-        // catch-up signal.
-        const PROBE_CAP: usize = 10_000;
-        let want = expected_count.min(PROBE_CAP);
-        // Request all wanted docs, scanning a candidate pool that covers the
-        // whole (bounded) corpus so the search is effectively exact — an indexed
-        // doc is guaranteed to be surfaced, so `results.len() < want` means the
-        // index has not finished ingesting yet.
-        let probe_top = want.max(1);
-        let probe_candidates = expected_count.saturating_mul(2).clamp(probe_top, PROBE_CAP) as i64;
+    ) -> Result<IndexCoverage, String> {
+        let plan = catchup_plan(expected_count);
+        let pipeline =
+            build_catchup_count_pipeline(&self.index_name, probe_vector, plan.limit, dialect);
 
         println!(
-            "Waiting for vector search index to index all {} documents...",
-            expected_count
+            "Waiting for vector search index to index all {} documents (exhaustive count probe, budget {}s)...",
+            expected_count,
+            plan.deadline.as_secs()
         );
         let db = self.client.database(&self.db_name);
         let coll = db.collection::<Document>(&self.collection_name);
         let start = Instant::now();
-        let deadline = start + std::time::Duration::from_secs(600);
+        let deadline = start + plan.deadline;
         let mut last_print = Instant::now();
-        let mut index_ready = false;
+        let mut last_seen = 0usize;
+        // The probe legitimately errors while mongot is still starting up ("is
+        // not queryable"), so a single error is not fatal — but the LAST one is
+        // kept so a gate that never succeeds can name why instead of reporting a
+        // bare timeout. Every arm below that reaches the deadline check assigns
+        // it, so it deliberately carries no initial value.
+        let mut last_error: Option<String>;
 
         loop {
-            if !index_ready {
-                let cmd = doc! { "listSearchIndexes": &self.collection_name };
-                if let Ok(result) = db.run_command(cmd).run() {
-                    if let Ok(cursor) = result.get_document("cursor") {
-                        if let Ok(batch) = cursor.get_array("firstBatch") {
-                            for index in batch {
-                                if let Some(index_doc) = index.as_document() {
-                                    let name = index_doc.get_str("name").unwrap_or("");
-                                    if name != self.index_name {
-                                        continue;
-                                    }
-                                    let status = index_doc.get_str("status").unwrap_or("");
-                                    let queryable =
-                                        index_doc.get_bool("queryable").unwrap_or(false);
+            let probe_start = Instant::now();
+            let outcome = run_catchup_count(&coll, &pipeline);
+            let probe_elapsed = probe_start.elapsed();
 
-                                    if (status == "READY" || status == "ACTIVE") && queryable {
-                                        index_ready = true;
-                                    } else if last_print.elapsed().as_secs() >= 10 {
-                                        println!(
-                                            "  index building... status={}, queryable={}",
-                                            status, queryable
-                                        );
-                                        last_print = Instant::now();
-                                    }
-                                }
-                            }
-                        }
+            match outcome {
+                Ok(searchable) if searchable >= plan.want => {
+                    println!(
+                        "Index caught up ({} / {} docs searchable) after {:.1}s.",
+                        searchable,
+                        expected_count,
+                        start.elapsed().as_secs_f64()
+                    );
+                    return Ok(IndexCoverage {
+                        searchable,
+                        expected: expected_count,
+                    });
+                }
+                Ok(searchable) => {
+                    last_seen = searchable;
+                    last_error = None;
+                    if last_print.elapsed().as_secs() >= 10 {
+                        println!(
+                            "  still ingesting: {} / {} docs searchable, waiting...",
+                            searchable, plan.want
+                        );
+                        last_print = Instant::now();
                     }
                 }
-            }
-
-            // Once the index reports ready, probe with a full-precision search and
-            // wait until it has surfaced EVERY uploaded document — only then has the
-            // eventually-consistent index finished ingesting (partial ingestion
-            // returns fewer than `want` and understates recall).
-            if index_ready {
-                match vector_search(
-                    &coll,
-                    &self.index_name,
-                    probe_vector,
-                    probe_top,
-                    probe_candidates,
-                    None,
-                    dialect,
-                ) {
-                    Ok(results) if results.len() >= want => {
-                        println!(
-                            "Index caught up ({} / {} docs searchable) after {:.1}s.",
-                            results.len(),
-                            expected_count,
-                            start.elapsed().as_secs_f64()
-                        );
-                        return Ok(());
+                Err(e) => {
+                    if last_print.elapsed().as_secs() >= 10 {
+                        println!("  catch-up probe not answering yet: {}", e);
+                        last_print = Instant::now();
                     }
-                    Ok(results) => {
-                        if last_print.elapsed().as_secs() >= 10 {
-                            println!(
-                                "  index ready but still ingesting: {} / {} docs searchable, waiting...",
-                                results.len(),
-                                want
-                            );
-                            last_print = Instant::now();
-                        }
-                    }
-                    Err(_) => {
-                        if last_print.elapsed().as_secs() >= 10 {
-                            println!("  index ready but probe search errored, waiting...");
-                            last_print = Instant::now();
-                        }
-                    }
+                    last_error = Some(e);
                 }
             }
 
             if Instant::now() > deadline {
-                return Err(
-                    "Vector search index did not finish indexing within 600 seconds".to_string(),
-                );
+                return Err(format!(
+                    "MongoDB index catch-up FAILED: only {} of {} documents ({:.2}%) were \
+                     searchable after {:.0}s. Refusing to run the search phase against a \
+                     partially built index — any recall it produced would be measured against \
+                     that fraction of the corpus, not the corpus the ground truth describes. \
+                     Last probe error: {}",
+                    last_seen,
+                    expected_count,
+                    IndexCoverage {
+                        searchable: last_seen,
+                        expected: expected_count
+                    }
+                    .fraction()
+                        * 100.0,
+                    start.elapsed().as_secs_f64(),
+                    last_error.as_deref().unwrap_or("none"),
+                ));
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(catchup_poll_interval(probe_elapsed));
         }
     }
 
@@ -1217,32 +1204,142 @@ fn extract_search_hits(docs: &[Document]) -> Vec<(i64, f64)> {
         .collect()
 }
 
-/// Execute a vector search end-to-end (build + send + extract).
+// ---------------------------------------------------------------------------
+// Index catch-up gate (#305)
+// ---------------------------------------------------------------------------
+
+/// Everything about the index catch-up gate that is a pure function of the
+/// corpus size.
 ///
-/// Convenience wrapper used by the untimed index-catchup probe
-/// (`wait_for_index_catchup`), where the split boundary is irrelevant. The timed
-/// search()/search_mixed() paths deliberately do NOT use this: they precompute
-/// pipelines out of the window and call `send_search`/`extract_search_hits`
-/// directly so only the RPC + decode is timed.
-fn vector_search(
-    coll: &mongodb::sync::Collection<Document>,
+/// Extracted out of `wait_for_index_catchup` — a `&self` method that needs a
+/// live `Client` — precisely because the #305 defect lived in this arithmetic
+/// and nothing could reach it: every mongodb integration corpus in this repo is
+/// 20-500 vectors, so a cap that only bites above 10_000 documents was
+/// unreachable from the whole suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatchupPlan {
+    /// Searchable documents the gate requires before it releases. This is
+    /// `expected_count` itself and MUST NOT be capped: capping it is exactly
+    /// how the gate came to release at 10_000 of glove-100's 1_183_514.
+    want: usize,
+    /// `limit` for the probe stage. `expected_count` again, floored at 1
+    /// because the stage rejects `limit: 0`.
+    limit: usize,
+    /// Wall-clock budget for the whole gate.
+    deadline: Duration,
+}
+
+/// Build the catch-up plan for a corpus of `expected_count` documents.
+fn catchup_plan(expected_count: usize) -> CatchupPlan {
+    // Ten minutes of slack for index creation and mongot startup, plus a
+    // millisecond per document — an assumed floor of 1_000 docs/sec of mongot
+    // ingest. The previous flat 600s was sized for a gate that gave up after
+    // 10_000 documents; a gate that genuinely waits for a million-document
+    // corpus would trip it on arrival.
+    const BASE_SECS: u64 = 600;
+    const ASSUMED_MIN_INGEST_DOCS_PER_SEC: u64 = 1_000;
+
+    CatchupPlan {
+        want: expected_count,
+        limit: expected_count.max(1),
+        deadline: Duration::from_secs(
+            BASE_SECS + expected_count as u64 / ASSUMED_MIN_INGEST_DOCS_PER_SEC,
+        ),
+    }
+}
+
+/// How long to sleep before the next catch-up probe.
+///
+/// The exhaustive probe costs O(corpus), so a fixed short interval would spend
+/// most of a large gate inside probes. Sleeping at least as long as the last
+/// probe took bounds probe cost at about half the gate's wall clock; the floor
+/// keeps small corpora responsive and the ceiling stops the gate overshooting
+/// catch-up by minutes on a huge one.
+fn catchup_poll_interval(last_probe: Duration) -> Duration {
+    last_probe.clamp(Duration::from_secs(2), Duration::from_secs(30))
+}
+
+/// Build the pipeline for one catch-up probe: an exhaustive nearest-neighbour
+/// query over the whole index, reduced to a single number server-side.
+///
+/// `exact: true` is what makes the count both trustworthy and UNBOUNDED. The
+/// approximate form takes `numCandidates`, which Atlas rejects above 10_000
+/// (`"numCandidates" must be within bounds [1..10000]`) while also requiring
+/// `limit <= numCandidates` — so no ANN probe can count past 10_000 documents,
+/// no matter how it is parameterised. The exhaustive form takes no
+/// `numCandidates` at all (passing one alongside `exact` is an error), scans
+/// every indexed document, and so returns the true indexed count.
+///
+/// `$count` keeps the answer cheap on the wire: mongot still scores the corpus,
+/// but a single `{n: ...}` comes back instead of a million documents.
+fn build_catchup_count_pipeline(
     index_name: &str,
     query_vector: &[f32],
-    top: usize,
-    num_candidates: i64,
-    filter: Option<&Document>,
+    limit: usize,
     dialect: SearchDialect,
-) -> Result<Vec<(i64, f64)>, String> {
-    let pipeline = build_search_pipeline(
-        index_name,
-        query_vector,
-        top,
-        num_candidates,
-        filter,
-        dialect,
-    );
-    let docs = send_search(coll, &pipeline)?;
-    Ok(extract_search_hits(&docs))
+) -> Vec<Document> {
+    let bson_vec: Vec<mongodb::bson::Bson> = query_vector
+        .iter()
+        .map(|&f| mongodb::bson::Bson::Double(f as f64))
+        .collect();
+
+    let vs_stage = doc! {
+        "path": "vector",
+        "queryVector": bson_vec,
+        "limit": limit as i64,
+        "exact": true,
+    };
+
+    let search_stage = match dialect {
+        SearchDialect::VectorSearchStage => {
+            let mut stage = doc! { "index": index_name };
+            stage.extend(vs_stage);
+            doc! { "$vectorSearch": stage }
+        }
+        SearchDialect::SearchStage => {
+            doc! { "$search": { "index": index_name, "vectorSearch": vs_stage } }
+        }
+    };
+
+    vec![search_stage, doc! { "$count": "n" }]
+}
+
+/// Read the count out of one `$count` output document.
+///
+/// `$count` emits an int32 on the servers seen so far, but nothing in the
+/// aggregation contract pins the width, and reading it as the wrong one would
+/// turn a complete index into an unreadable probe and hang the gate to its
+/// deadline. A missing `n` is an error rather than a zero: silently reporting
+/// "0 searchable" for a malformed reply would look identical to a cold index
+/// and burn the whole budget.
+fn catchup_count_from_doc(doc: &Document) -> Result<usize, String> {
+    let n = doc
+        .get_i32("n")
+        .map(i64::from)
+        .or_else(|_| doc.get_i64("n"))
+        .map_err(|_| format!("catch-up count returned no `n` field: {:?}", doc))?;
+    Ok(n.max(0) as usize)
+}
+
+/// Run a catch-up count pipeline and return the searchable-document count.
+///
+/// `$count` emits NO document when its input is empty, which is how "nothing
+/// indexed yet" arrives — zero, not an error.
+fn run_catchup_count(
+    coll: &mongodb::sync::Collection<Document>,
+    pipeline: &[Document],
+) -> Result<usize, String> {
+    let cursor = coll
+        .aggregate(pipeline.to_vec())
+        .run()
+        .map_err(|e| format!("catch-up count failed: {}", e))?;
+
+    let mut searchable = 0usize;
+    for result in cursor {
+        let doc = result.map_err(|e| format!("catch-up count read failed: {}", e))?;
+        searchable = catchup_count_from_doc(&doc)?;
+    }
+    Ok(searchable)
 }
 
 /// Parse filter conditions into MongoDB query document.
@@ -1767,6 +1864,9 @@ impl Engine for MongoDBEngine {
         );
 
         let total_time;
+        // `None` means "not verified" — the only honest value when no vector
+        // index was built. It is NOT the same claim as a verified 1.0 (#305).
+        let mut index_coverage = None;
         if self.config.skip_vector_index {
             total_time = read_time + upload_time;
             println!(
@@ -1778,11 +1878,11 @@ impl Engine for MongoDBEngine {
             // Use the first vector as a probe query to verify actual search readiness
             let probe_vector = vectors.first().ok_or("No vectors uploaded")?;
             let index_start = Instant::now();
-            self.wait_for_index_catchup(
+            index_coverage = Some(self.wait_for_index_catchup(
                 vectors.len(),
                 probe_vector,
                 SearchDialect::for_dataset(dataset),
-            )?;
+            )?);
             let index_time = index_start.elapsed().as_secs_f64();
 
             total_time = read_time + upload_time + index_time;
@@ -1799,6 +1899,7 @@ impl Engine for MongoDBEngine {
             parallel: self.config.parallel,
             batch_size: self.config.batch_size,
             memory_usage: None,
+            index_coverage,
         })
     }
 
@@ -3128,5 +3229,174 @@ mod tests {
             Some(v) => std::env::set_var("MONGODB_PASSWORD", v),
             None => std::env::remove_var("MONGODB_PASSWORD"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Index catch-up gate (#305)
+    //
+    // Every mongodb integration corpus in this repo is 20-500 vectors, so the
+    // >10_000 branch these tests pin is reachable from NOTHING else in the
+    // suite. That is why #305 survived: the gate's cap only bites above 10_000
+    // documents, and no test ever handed it that many.
+    // -----------------------------------------------------------------------
+
+    /// The #305 defect itself: `want` was `expected_count.min(10_000)`, so the
+    /// gate released once 10_000 documents of a 1_183_514-document corpus were
+    /// searchable — 0.85% — and the search phase published recall against it.
+    ///
+    /// `want` must equal the corpus, at every size, with no ceiling.
+    #[test]
+    fn catchup_plan_requires_the_whole_corpus_at_every_size() {
+        // Straddles the old cap: 9_999 passed before AND after, 10_001 is the
+        // smallest corpus the old code got wrong.
+        for expected in [1usize, 9_999, 10_000, 10_001, 1_000_000, 1_183_514] {
+            let plan = catchup_plan(expected);
+            assert_eq!(
+                plan.want, expected,
+                "catch-up must wait for all {expected} documents, not a capped \
+                 fraction of them (#305)"
+            );
+            assert_eq!(
+                plan.limit, expected,
+                "the probe must ASK for all {expected} documents; a smaller limit \
+                 makes a complete count unobservable no matter what `want` says"
+            );
+        }
+    }
+
+    /// `limit: 0` is rejected by the stage, so an empty corpus still asks for
+    /// one document — while `want` stays 0, so the gate releases immediately
+    /// rather than waiting for a document that will never exist.
+    #[test]
+    fn catchup_plan_floors_the_probe_limit_at_one() {
+        let plan = catchup_plan(0);
+        assert_eq!(plan.want, 0);
+        assert_eq!(plan.limit, 1);
+    }
+
+    /// A gate that genuinely waits for the whole corpus needs a budget that
+    /// scales with it. The flat 600s was sized for a gate that gave up after
+    /// 10_000 documents; kept flat, a corpus this tool actually ships would hit
+    /// the deadline as a matter of course and the fix would trade a silent wrong
+    /// answer for a guaranteed hard failure.
+    #[test]
+    fn catchup_plan_deadline_scales_with_the_corpus() {
+        assert_eq!(catchup_plan(0).deadline, Duration::from_secs(600));
+        assert_eq!(catchup_plan(9_999).deadline, Duration::from_secs(609));
+        assert_eq!(catchup_plan(1_000_000).deadline, Duration::from_secs(1_600));
+        assert!(
+            catchup_plan(1_183_514).deadline > Duration::from_secs(600),
+            "glove-100 must get more than the old flat budget"
+        );
+    }
+
+    /// Probe cost is O(corpus), so the interval must not be a fixed short sleep
+    /// on a large corpus, nor a long one on a small corpus.
+    #[test]
+    fn catchup_poll_interval_is_bounded_by_the_last_probe() {
+        assert_eq!(
+            catchup_poll_interval(Duration::from_millis(5)),
+            Duration::from_secs(2),
+            "floor keeps small corpora responsive"
+        );
+        assert_eq!(
+            catchup_poll_interval(Duration::from_secs(7)),
+            Duration::from_secs(7),
+            "in between, sleep as long as the probe took"
+        );
+        assert_eq!(
+            catchup_poll_interval(Duration::from_secs(600)),
+            Duration::from_secs(30),
+            "ceiling stops the gate overshooting catch-up by minutes"
+        );
+    }
+
+    /// The probe must be EXHAUSTIVE, because the approximate one physically
+    /// cannot count past 10_000: Atlas rejects `numCandidates` above 10_000 and
+    /// requires `limit <= numCandidates`. A probe carrying `numCandidates` is
+    /// therefore a probe that has silently reacquired the #305 ceiling — and it
+    /// is also the shape that produced the secondary hazard the issue names
+    /// (`limit == numCandidates == 10_000`).
+    #[test]
+    fn catchup_probe_is_exhaustive_and_carries_no_ann_knob() {
+        let query = vec![0.1f32, -0.2, 0.3];
+        let pipeline = build_catchup_count_pipeline(
+            "vidx",
+            &query,
+            1_183_514,
+            SearchDialect::VectorSearchStage,
+        );
+
+        assert_eq!(pipeline.len(), 2, "probe is <search stage> + $count");
+        let vs = pipeline[0].get_document("$vectorSearch").unwrap();
+        assert!(
+            vs.get_bool("exact").unwrap(),
+            "the probe must be exhaustive (ENN)"
+        );
+        assert!(
+            !vs.contains_key("numCandidates"),
+            "numCandidates caps the probe at 10_000 documents and is invalid \
+             alongside `exact`: {vs:?}"
+        );
+        assert_eq!(
+            vs.get_i64("limit").unwrap(),
+            1_183_514,
+            "the probe must ask for the whole corpus, above the ANN ceiling"
+        );
+        assert_eq!(vs.get_str("index").unwrap(), "vidx");
+
+        // Counted server-side: mongot still scans, but one `{n: ...}` comes back
+        // instead of a million documents.
+        assert_eq!(pipeline[1], doc! { "$count": "n" });
+    }
+
+    /// The geo datasets run the `$search` dialect (#223), and they are subject
+    /// to exactly the same ceiling — so the same exhaustive shape has to reach
+    /// the other stage too, nested under the `vectorSearch` operator.
+    #[test]
+    fn catchup_probe_is_exhaustive_on_the_search_dialect_too() {
+        let query = vec![0.1f32, -0.2, 0.3];
+        let pipeline =
+            build_catchup_count_pipeline("vidx", &query, 25_000, SearchDialect::SearchStage);
+
+        let vs = pipeline[0]
+            .get_document("$search")
+            .unwrap()
+            .get_document("vectorSearch")
+            .unwrap();
+        assert!(
+            vs.get_bool("exact").unwrap(),
+            "the probe must be exhaustive (ENN)"
+        );
+        assert!(!vs.contains_key("numCandidates"), "{vs:?}");
+        assert_eq!(vs.get_i64("limit").unwrap(), 25_000);
+        assert_eq!(
+            pipeline[0]
+                .get_document("$search")
+                .unwrap()
+                .get_str("index")
+                .unwrap(),
+            "vidx"
+        );
+        assert_eq!(pipeline[1], doc! { "$count": "n" });
+    }
+
+    /// The count reader must not depend on the integer width `$count` happens
+    /// to emit, and must not turn a malformed reply into a plausible-looking
+    /// "0 searchable" — which is indistinguishable from a cold index and would
+    /// burn the entire budget before failing.
+    #[test]
+    fn catchup_count_reads_either_integer_width_and_rejects_a_missing_count() {
+        assert_eq!(
+            catchup_count_from_doc(&doc! { "n": 10_001i32 }).unwrap(),
+            10_001
+        );
+        assert_eq!(
+            catchup_count_from_doc(&doc! { "n": 1_183_514i64 }).unwrap(),
+            1_183_514
+        );
+        let err = catchup_count_from_doc(&doc! { "total": 5i32 })
+            .expect_err("a reply without `n` is not a zero count");
+        assert!(err.contains("no `n`"), "{err}");
     }
 }

@@ -1927,6 +1927,7 @@ impl Engine for OpenSearchEngine {
             parallel: self.config.parallel,
             batch_size: self.config.batch_size,
             memory_usage: None,
+            index_coverage: None,
         })
     }
 
