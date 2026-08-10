@@ -1533,6 +1533,7 @@ impl Engine for MilvusEngine {
             parallel: self.parallel,
             batch_size: self.batch_size,
             memory_usage: None,
+            index_coverage: None,
         })
     }
 
