@@ -507,6 +507,7 @@ impl Engine for PgVectorEngine {
             parallel: self.parallel,
             batch_size: self.batch_size,
             memory_usage: None,
+            index_coverage: None,
         })
     }
 

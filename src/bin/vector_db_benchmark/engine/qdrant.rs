@@ -667,6 +667,7 @@ impl QdrantEngine {
             parallel: 1,
             batch_size: self.batch_size,
             memory_usage: None,
+            index_coverage: None,
         })
     }
 
@@ -726,6 +727,7 @@ impl QdrantEngine {
             parallel: 1,
             batch_size: self.batch_size,
             memory_usage: None,
+            index_coverage: None,
         })
     }
 
@@ -1837,6 +1839,7 @@ impl Engine for QdrantEngine {
             parallel: self.parallel,
             batch_size: self.batch_size,
             memory_usage: None,
+            index_coverage: None,
         })
     }
 

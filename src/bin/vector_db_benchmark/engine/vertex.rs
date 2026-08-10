@@ -1525,6 +1525,7 @@ impl Engine for VertexEngine {
                 parallel: 1,
                 batch_size: vectors.len(),
                 memory_usage: None,
+                index_coverage: None,
             });
         }
 
@@ -1716,6 +1717,7 @@ impl Engine for VertexEngine {
             parallel: workers,
             batch_size: self.batch_size,
             memory_usage: None,
+            index_coverage: None,
         })
     }
 
