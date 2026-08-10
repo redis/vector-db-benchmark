@@ -2449,8 +2449,7 @@ fn test_exhaustive_probe_counts_past_the_ann_10000_document_ceiling() {
         .run()
         .and_then(|c| c.collect::<Result<Vec<_>, _>>());
     let err = rejected
-        .err()
-        .expect("numCandidates above 10_000 must be rejected, not silently clamped")
+        .expect_err("numCandidates above 10_000 must be rejected, not silently clamped")
         .to_string();
     assert!(
         err.contains("numCandidates"),
