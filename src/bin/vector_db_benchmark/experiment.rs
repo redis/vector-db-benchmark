@@ -215,10 +215,10 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     // Collision guard (#151-4): among the selected configs, no two configs of the
-    // same destructive Redis-wire engine (redis/valkey/dragonfly/kividb/vectorsets)
+    // same destructive engine (redis/valkey/dragonfly/kividb/vectorsets/mongodb)
     // may derive the same index namespace, or a sweep would silently overwrite one config's graph
     // and keyspace with another's (the exact bug this fix closes). Also fires when
-    // an `*_INDEX_NAME_EXACT` pin is set with >1 config for that engine (every
+    // an `*_EXACT` pin is set with >1 config for that engine (every
     // config then resolves to the same verbatim base). In --skip-vector-index mode
     // the dedup above already leaves one config per engine, so this is a no-op.
     {
@@ -236,9 +236,24 @@ pub fn run(args: &Args) -> Result<(), String> {
                 // vector set, derived by the same helper, so it collides the same
                 // way and belongs in the same guard.
                 "vectorsets" => "VECTORSETS_INDEX_NAME",
+                // #306: MongoDB's destructible namespace is the COLLECTION, not
+                // the search index — `configure()` calls `collection.drop()`, and
+                // the search index lives inside the collection it drops. So the
+                // collection is what two configs must not share, and
+                // `MONGODB_COLLECTION` (not `MONGODB_INDEX_NAME`) is the base
+                // whose `_EXACT` pin can re-collapse a sweep.
+                "mongodb" => "MONGODB_COLLECTION",
                 _ => continue,
             };
-            let idx = derive_index_name(base_env, "idx", &config.name);
+            // MongoDB's name is bounded to fit the 255-byte `<db>.<collection>`
+            // namespace, so it must come from the engine rather than from a bare
+            // `derive_index_name` here — otherwise the guard would compare names
+            // the engine never uses.
+            let idx = if engine_type == "mongodb" {
+                crate::engine::mongodb_collection_name(&config.name)
+            } else {
+                derive_index_name(base_env, "idx", &config.name)
+            };
             if let Some(prev) =
                 seen.insert((engine_type.to_string(), idx.clone()), config.name.clone())
             {
@@ -247,10 +262,16 @@ pub fn run(args: &Args) -> Result<(), String> {
                 } else {
                     String::new()
                 };
+                let object = if engine_type == "mongodb" {
+                    "collection"
+                } else {
+                    "index"
+                };
                 return Err(format!(
-                    "Configs '{}' and '{}' derive the same index namespace '{}'; rename them — \
-                     a sweep would silently overwrite one with the other (issue #151-4).{}",
-                    prev, config.name, idx, exact_hint
+                    "Configs '{}' and '{}' derive the same index namespace '{}' (the {} {}); \
+                     rename them — a sweep would silently overwrite one with the other \
+                     (issue #151-4).{}",
+                    prev, config.name, idx, engine_type, object, exact_hint
                 ));
             }
         }

@@ -17,6 +17,7 @@ use rand::{seq::SliceRandom, SeedableRng};
 use super::geo;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
+use crate::engine::index_naming::derive_index_name;
 use crate::engine::{
     CorpusCount, Engine, IndexCoverage, SearchResults, UpdateSearchRatio, UploadStats,
 };
@@ -27,6 +28,97 @@ use vector_db_benchmark::start_gate::WorkerPool;
 const DEFAULT_DB: &str = "bench";
 const DEFAULT_COLLECTION: &str = "vectors";
 const DEFAULT_INDEX_NAME: &str = "vector_index";
+
+/// MongoDB refuses a fully-qualified namespace (`<db>.<collection>`) longer
+/// than 255 bytes. Verified live against `mongodb/mongodb-atlas-local:8.0.17`:
+/// a 200-byte collection under an 8-byte db is accepted, a 250-byte one is
+/// rejected with `Fully qualified namespace is too long`. The Redis-wire
+/// engines have no analogue — a Redis key name is bounded by 512 MB — so the
+/// bounding below is MongoDB's own concern and deliberately does NOT live in
+/// the shared `index_naming` module.
+///
+/// The search index name has no comparable ceiling: the same server accepted a
+/// 5000-byte `createSearchIndexes` name, so `index_name` is left unbounded and
+/// carries the config suffix verbatim.
+const MAX_NAMESPACE_BYTES: usize = 255;
+
+/// Per-config collection name (#306).
+///
+/// Before this, every config in a sweep addressed the one literal
+/// `bench.vectors`. Because `configure()` drops that collection, config B
+/// destroyed config A's corpus; and because `--skip-upload` skips `configure()`
+/// entirely, all twelve configs of the shipped `mongodb-single-node.json`
+/// M×EF_CONSTRUCTION sweep queried whichever HNSW graph the first config had
+/// built — twelve result files, twelve distinct labels, one measurement.
+///
+/// The suffix is derived by [`derive_index_name`], the same helper the
+/// Redis-wire engines use (#151-4), so `MONGODB_COLLECTION` keeps working as an
+/// override but is now the *base*: the config suffix is always appended, so a
+/// pinned base cannot re-collapse a sweep. `MONGODB_COLLECTION_EXACT=1` is the
+/// escape hatch that drops the suffix and uses the base verbatim; combining it
+/// with more than one MongoDB config is rejected at startup by the collision
+/// guard in `experiment::run`.
+///
+/// `db_name` is passed in rather than read here because it consumes part of the
+/// 255-byte namespace budget the collection name has to fit inside.
+pub(crate) fn derive_collection_name(db_name: &str, engine_name: &str) -> String {
+    let derived = derive_index_name("MONGODB_COLLECTION", DEFAULT_COLLECTION, engine_name);
+    // `<db>` + `.` + `<collection>` must fit in MAX_NAMESPACE_BYTES.
+    let budget = MAX_NAMESPACE_BYTES.saturating_sub(db_name.len() + 1);
+    bound_to_bytes(&derived, budget)
+}
+
+/// The collection this process's MongoDB configs address, reading `MONGODB_DB`
+/// for the namespace budget. Used by the startup collision guard, which must
+/// answer "do these two configs address the same collection?" without opening a
+/// connection.
+pub(crate) fn config_collection_name(engine_name: &str) -> String {
+    let db_name = crate::effective_config::env_or("MONGODB_DB", DEFAULT_DB);
+    derive_collection_name(&db_name, engine_name)
+}
+
+/// Deterministically bound `name` to `max_bytes` while keeping distinct inputs
+/// distinct.
+///
+/// Names already inside the bound are returned verbatim, so the common case is
+/// the readable `vectors:mongodb-m-16-efc-100`. A longer name becomes
+/// `<head>~<16 hex digits>`, where the digest is taken over the WHOLE name — the
+/// part that was cut included. A plain truncation would map
+/// `vectors:<200 shared bytes>-efc-100` and `…-efc-800` onto one collection and
+/// silently reinstate exactly the bug this function exists to prevent.
+///
+/// FNV-1a rather than `DefaultHasher`: SipHash's keys and output are not
+/// guaranteed stable across Rust releases, and this name has to resolve to the
+/// same collection next week, from a differently-built binary, or `--skip-upload`
+/// cannot find the corpus it is promised.
+fn bound_to_bytes(name: &str, max_bytes: usize) -> String {
+    if name.len() <= max_bytes {
+        return name.to_string();
+    }
+    let digest = format!("~{:016x}", fnv1a64(name.as_bytes()));
+    if max_bytes <= digest.len() {
+        // Pathological budget (an absurdly long MONGODB_DB). Keep the tail of
+        // the digest: still a function of the whole name, so still distinct.
+        return digest[digest.len() - max_bytes..].to_string();
+    }
+    // `derive_index_name`'s base comes straight from the environment and is not
+    // sanitized, so `name` may hold multi-byte UTF-8; walk back to a boundary.
+    let mut head_end = max_bytes - digest.len();
+    while head_end > 0 && !name.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    format!("{}{}", &name[..head_end], digest)
+}
+
+/// FNV-1a 64-bit. Fixed constants, no seed, no version dependence.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 #[derive(Clone)]
 struct MongoConfig {
@@ -65,9 +157,18 @@ impl MongoDBEngine {
         let port: u16 = crate::effective_config::env_parsed("MONGODB_PORT", 27017);
 
         let db_name = crate::effective_config::env_or("MONGODB_DB", DEFAULT_DB);
-        let collection_name =
-            crate::effective_config::env_or("MONGODB_COLLECTION", DEFAULT_COLLECTION);
-        let index_name = crate::effective_config::env_or("MONGODB_INDEX_NAME", DEFAULT_INDEX_NAME);
+        // #306: both objects this engine owns are per-config. The collection is
+        // the load-bearing one — `configure()` drops it, and `corpus_row_count()`
+        // counts it — but the search index carries the config's HNSW knobs, so it
+        // is namespaced too: under a pinned `MONGODB_COLLECTION_EXACT` base the
+        // collection is shared and the index name is then the only thing keeping
+        // two configs' graphs apart.
+        let collection_name = derive_collection_name(&db_name, &engine_config.name);
+        let index_name = derive_index_name(
+            "MONGODB_INDEX_NAME",
+            DEFAULT_INDEX_NAME,
+            &engine_config.name,
+        );
 
         let parallel = engine_config
             .upload_params
@@ -1647,6 +1748,19 @@ impl Engine for MongoDBEngine {
     /// (issue #238). `countDocuments({})` on the benchmark collection — an exact
     /// count, not the metadata estimate, because the estimate can lag a drop and
     /// report a corpus that is no longer there. A missing collection answers 0.
+    ///
+    /// #306 — why this stays a pure count and gained no identity marker. The
+    /// collection it counts is now per-config (see [`derive_collection_name`]),
+    /// so the "corpus built by a *different config*" case no longer reaches this
+    /// check as a plausible number: config B's collection does not exist, the
+    /// count is 0, and `classify_reuse_precondition` fails the run. An
+    /// upload-time marker document would answer the same question one layer
+    /// later and would itself be a row in the count.
+    ///
+    /// What remains unverified is the *dataset* dimension — one config reused
+    /// across two same-sized datasets still certifies. That is #279, it is
+    /// identical on every engine, and it wants one cross-engine mechanism rather
+    /// than a MongoDB-only marker that hides the gap on this engine alone.
     fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         let coll = self
             .client
@@ -2306,6 +2420,232 @@ impl Engine for MongoDBEngine {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── #306: per-config collection / index namespacing ──────────────────
+    //
+    // `derive_index_name` resolves through the process-wide effective-config
+    // recorder (#212), so every test below takes `test_lock()` to serialize with
+    // the other tests that drive it.
+
+    /// The headline of #306, pinned to literal strings.
+    ///
+    /// Two configs of the shipped M×EF_CONSTRUCTION sweep must address two
+    /// different collections AND two different search indexes. Before the fix
+    /// both resolved to the bare `vectors` / `vector_index`, so `configure()`
+    /// dropped the sibling's corpus and `--skip-upload` measured whichever HNSW
+    /// graph happened to survive.
+    ///
+    /// FAILS ON REVERT: with the constants read straight from `env_or`, both
+    /// configs get `"vectors"` and `"vector_index"` — the `assert_ne!`s and the
+    /// literal-equality assertions all break.
+    #[test]
+    fn sweep_configs_derive_distinct_collections_and_indexes() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let a = derive_collection_name("bench", "mongodb-m-16-efc-100");
+        let b = derive_collection_name("bench", "mongodb-m-64-efc-800");
+        assert_eq!(a, "vectors:mongodb-m-16-efc-100");
+        assert_eq!(b, "vectors:mongodb-m-64-efc-800");
+        assert_ne!(a, b);
+        // And neither may be the bare legacy collection every config shared.
+        assert_ne!(a, DEFAULT_COLLECTION);
+        assert_ne!(b, DEFAULT_COLLECTION);
+
+        let ia = derive_index_name(
+            "MONGODB_INDEX_NAME",
+            DEFAULT_INDEX_NAME,
+            "mongodb-m-16-efc-100",
+        );
+        let ib = derive_index_name(
+            "MONGODB_INDEX_NAME",
+            DEFAULT_INDEX_NAME,
+            "mongodb-m-64-efc-800",
+        );
+        assert_eq!(ia, "vector_index:mongodb-m-16-efc-100");
+        assert_eq!(ib, "vector_index:mongodb-m-64-efc-800");
+        assert_ne!(ia, ib);
+        assert_ne!(ia, DEFAULT_INDEX_NAME);
+    }
+
+    /// The shipped sweep is the artefact the issue names: 12 configs, 12 result
+    /// files, one measurement. Read the real file rather than a hand-copied list
+    /// so adding a 13th config that collides is caught here and not in a
+    /// published result set.
+    ///
+    /// FAILS ON REVERT: all 12 configs collapse to `"vectors"`, so the set of
+    /// distinct names is 1, not 12.
+    #[test]
+    fn shipped_hnsw_sweep_gives_every_config_its_own_collection() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/experiments/configurations/mongodb-single-node.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("shipped mongodb sweep config");
+        let configs: Vec<serde_json::Value> = serde_json::from_str(&raw).expect("valid JSON array");
+        assert!(
+            configs.len() >= 12,
+            "the sweep this issue is about ships 12 configs, found {}",
+            configs.len()
+        );
+
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for cfg in &configs {
+            let name = cfg["name"].as_str().expect("config name").to_string();
+            let coll = derive_collection_name("bench", &name);
+            if let Some(prev) = seen.insert(coll.clone(), name.clone()) {
+                panic!("configs '{prev}' and '{name}' both address collection '{coll}'");
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            configs.len(),
+            "every config must own its collection"
+        );
+    }
+
+    /// The namespace ceiling. `<db>.<collection>` over 255 bytes is refused by
+    /// the server outright, so a long config name must be bounded — and bounding
+    /// must not undo the isolation it is bounding.
+    ///
+    /// This is the collision path #294 warns about being shipped untested: the
+    /// two names below share a 300-byte prefix and differ only in the tail that
+    /// truncation throws away.
+    ///
+    /// FAILS ON REVERT of the bounding: a plain truncate makes the two names
+    /// equal. FAILS ON REVERT of #306 entirely: both become `"vectors"`, equal
+    /// again.
+    #[test]
+    fn long_config_names_are_bounded_without_colliding() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let shared = "x".repeat(300);
+        let a = derive_collection_name("bench", &format!("{shared}-efc-100"));
+        let b = derive_collection_name("bench", &format!("{shared}-efc-800"));
+
+        for (label, n) in [("a", &a), ("b", &b)] {
+            assert!(
+                "bench".len() + 1 + n.len() <= MAX_NAMESPACE_BYTES,
+                "{label} namespace is {} bytes, over MongoDB's {MAX_NAMESPACE_BYTES}: {n}",
+                "bench".len() + 1 + n.len()
+            );
+        }
+        assert_ne!(
+            a, b,
+            "two configs differing only past the truncation point must NOT share \
+             a collection — that is #306 reintroduced through the bounding"
+        );
+        assert!(a.contains('~') && b.contains('~'), "{a} / {b}");
+    }
+
+    /// A longer database name eats into the collection's budget, and the result
+    /// must still be a legal namespace. Pins that the budget is computed from the
+    /// db name rather than assumed.
+    ///
+    /// FAILS ON REVERT: `saturating_sub` removed / db length ignored → the long-db
+    /// case exceeds 255 bytes.
+    #[test]
+    fn the_namespace_budget_accounts_for_the_database_name() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let cfg = "y".repeat(400);
+        for db in ["b", "bench", &"d".repeat(200)] {
+            let coll = derive_collection_name(db, &cfg);
+            assert!(
+                db.len() + 1 + coll.len() <= MAX_NAMESPACE_BYTES,
+                "db '{}' ({} bytes) + collection ({} bytes) exceeds {MAX_NAMESPACE_BYTES}",
+                db,
+                db.len(),
+                coll.len()
+            );
+            assert!(
+                !coll.is_empty(),
+                "an empty collection name is not addressable"
+            );
+        }
+    }
+
+    /// The bounding must be reproducible across processes and builds: a
+    /// `--skip-upload` run has to resolve to the collection last week's upload
+    /// created. FNV-1a's constants are fixed; `DefaultHasher`'s are not
+    /// guaranteed to be.
+    ///
+    /// FAILS ON REVERT to a seeded/unstable hash only if the seed changes within
+    /// the process, so it also pins the literal digest — a switch to any other
+    /// hash function changes this string.
+    #[test]
+    fn bounding_is_deterministic() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+
+        let long = "z".repeat(400);
+        assert_eq!(bound_to_bytes(&long, 40), bound_to_bytes(&long, 40));
+        assert_eq!(bound_to_bytes(&long, 40).len(), 40);
+        // Short names are returned untouched — readability of the common case.
+        assert_eq!(bound_to_bytes("vectors:cfg", 255), "vectors:cfg");
+    }
+
+    /// A budget smaller than the digest itself must still produce a distinct,
+    /// non-empty, correctly-sized name rather than panicking or slicing out of
+    /// bounds. Reachable via an absurd `MONGODB_DB`.
+    #[test]
+    fn bounding_survives_a_budget_smaller_than_the_digest() {
+        // Both inputs are longer than every budget tried, so the bounded form is
+        // always exercised (a name shorter than its budget is returned verbatim).
+        let alpha = format!("vectors:{}", "a".repeat(60));
+        let beta = format!("vectors:{}", "b".repeat(60));
+        for budget in [1usize, 4, 8, 16, 17, 18, 32] {
+            let a = bound_to_bytes(&alpha, budget);
+            let b = bound_to_bytes(&beta, budget);
+            assert_eq!(a.len(), budget, "budget {budget}");
+            assert_eq!(b.len(), budget, "budget {budget}");
+            if budget >= 8 {
+                assert_ne!(a, b, "budget {budget} collapsed two distinct names");
+            }
+        }
+    }
+
+    /// Multi-byte UTF-8 in the base (which comes from the environment and is NOT
+    /// sanitized) must not be sliced mid-character.
+    #[test]
+    fn bounding_cuts_on_a_char_boundary() {
+        let name = "é".repeat(200); // 400 bytes, 200 chars
+        for budget in 17..40 {
+            // Slicing at a non-boundary would panic here — that is the assertion.
+            let out = bound_to_bytes(&name, budget);
+            assert!(out.len() <= budget, "budget {budget}: {out}");
+            let head = out.split('~').next().unwrap();
+            assert!(
+                head.chars().all(|c| c == 'é'),
+                "budget {budget} cut mid-character: {head:?}"
+            );
+        }
+    }
+
+    /// `MONGODB_COLLECTION` remains an override, but as a BASE: the config
+    /// suffix is still appended, so pinning it cannot re-collapse a sweep.
+    /// `MONGODB_COLLECTION_EXACT=1` is the documented escape hatch that drops
+    /// the suffix — and the startup guard in `experiment::run` rejects it with
+    /// more than one MongoDB config.
+    ///
+    /// FAILS ON REVERT: the non-exact half asserts the suffix is present, which
+    /// the old `env_or` passthrough does not produce.
+    #[test]
+    fn collection_env_override_is_a_base_not_a_pin() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        std::env::set_var("MONGODB_COLLECTION", "mycoll");
+        assert_eq!(
+            derive_collection_name("bench", "mongodb-m-16-efc-100"),
+            "mycoll:mongodb-m-16-efc-100"
+        );
+
+        std::env::set_var("MONGODB_COLLECTION_EXACT", "1");
+        assert_eq!(
+            derive_collection_name("bench", "mongodb-m-16-efc-100"),
+            "mycoll"
+        );
+
+        std::env::remove_var("MONGODB_COLLECTION_EXACT");
+        std::env::remove_var("MONGODB_COLLECTION");
+    }
 
     /// Issue #216: `hnsw_config` must be translated into the names MongoDB
     /// accepts, not the HNSW-generic `m`/`efConstruction` (which the server

@@ -39,6 +39,10 @@ pub use elasticsearch::ElasticsearchEngine;
 pub use kividb::KividbEngine;
 pub use milvus::MilvusEngine;
 pub use mongodb_engine::MongoDBEngine;
+// #306: the startup collision guard has to answer "do these two configs address
+// the same MongoDB collection?" before any engine is constructed — constructing
+// one would open a connection to a server the guard has no business touching.
+pub(crate) use mongodb_engine::config_collection_name as mongodb_collection_name;
 pub use opensearch::OpenSearchEngine;
 pub use pgvector::PgVectorEngine;
 pub use qdrant::QdrantEngine;
