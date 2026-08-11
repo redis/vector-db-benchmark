@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 use mongodb::bson::{doc, Document};
@@ -17,7 +17,10 @@ use rand::{seq::SliceRandom, SeedableRng};
 use super::geo;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
-use crate::engine::{CorpusCount, Engine, SearchResults, UpdateSearchRatio, UploadStats};
+use crate::engine::index_naming::derive_index_name;
+use crate::engine::{
+    CorpusCount, Engine, IndexCoverage, SearchResults, UpdateSearchRatio, UploadStats,
+};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::start_gate::WorkerPool;
@@ -25,6 +28,97 @@ use vector_db_benchmark::start_gate::WorkerPool;
 const DEFAULT_DB: &str = "bench";
 const DEFAULT_COLLECTION: &str = "vectors";
 const DEFAULT_INDEX_NAME: &str = "vector_index";
+
+/// MongoDB refuses a fully-qualified namespace (`<db>.<collection>`) longer
+/// than 255 bytes. Verified live against `mongodb/mongodb-atlas-local:8.0.17`:
+/// a 200-byte collection under an 8-byte db is accepted, a 250-byte one is
+/// rejected with `Fully qualified namespace is too long`. The Redis-wire
+/// engines have no analogue — a Redis key name is bounded by 512 MB — so the
+/// bounding below is MongoDB's own concern and deliberately does NOT live in
+/// the shared `index_naming` module.
+///
+/// The search index name has no comparable ceiling: the same server accepted a
+/// 5000-byte `createSearchIndexes` name, so `index_name` is left unbounded and
+/// carries the config suffix verbatim.
+const MAX_NAMESPACE_BYTES: usize = 255;
+
+/// Per-config collection name (#306).
+///
+/// Before this, every config in a sweep addressed the one literal
+/// `bench.vectors`. Because `configure()` drops that collection, config B
+/// destroyed config A's corpus; and because `--skip-upload` skips `configure()`
+/// entirely, all twelve configs of the shipped `mongodb-single-node.json`
+/// M×EF_CONSTRUCTION sweep queried whichever HNSW graph the first config had
+/// built — twelve result files, twelve distinct labels, one measurement.
+///
+/// The suffix is derived by [`derive_index_name`], the same helper the
+/// Redis-wire engines use (#151-4), so `MONGODB_COLLECTION` keeps working as an
+/// override but is now the *base*: the config suffix is always appended, so a
+/// pinned base cannot re-collapse a sweep. `MONGODB_COLLECTION_EXACT=1` is the
+/// escape hatch that drops the suffix and uses the base verbatim; combining it
+/// with more than one MongoDB config is rejected at startup by the collision
+/// guard in `experiment::run`.
+///
+/// `db_name` is passed in rather than read here because it consumes part of the
+/// 255-byte namespace budget the collection name has to fit inside.
+pub(crate) fn derive_collection_name(db_name: &str, engine_name: &str) -> String {
+    let derived = derive_index_name("MONGODB_COLLECTION", DEFAULT_COLLECTION, engine_name);
+    // `<db>` + `.` + `<collection>` must fit in MAX_NAMESPACE_BYTES.
+    let budget = MAX_NAMESPACE_BYTES.saturating_sub(db_name.len() + 1);
+    bound_to_bytes(&derived, budget)
+}
+
+/// The collection this process's MongoDB configs address, reading `MONGODB_DB`
+/// for the namespace budget. Used by the startup collision guard, which must
+/// answer "do these two configs address the same collection?" without opening a
+/// connection.
+pub(crate) fn config_collection_name(engine_name: &str) -> String {
+    let db_name = crate::effective_config::env_or("MONGODB_DB", DEFAULT_DB);
+    derive_collection_name(&db_name, engine_name)
+}
+
+/// Deterministically bound `name` to `max_bytes` while keeping distinct inputs
+/// distinct.
+///
+/// Names already inside the bound are returned verbatim, so the common case is
+/// the readable `vectors:mongodb-m-16-efc-100`. A longer name becomes
+/// `<head>~<16 hex digits>`, where the digest is taken over the WHOLE name — the
+/// part that was cut included. A plain truncation would map
+/// `vectors:<200 shared bytes>-efc-100` and `…-efc-800` onto one collection and
+/// silently reinstate exactly the bug this function exists to prevent.
+///
+/// FNV-1a rather than `DefaultHasher`: SipHash's keys and output are not
+/// guaranteed stable across Rust releases, and this name has to resolve to the
+/// same collection next week, from a differently-built binary, or `--skip-upload`
+/// cannot find the corpus it is promised.
+fn bound_to_bytes(name: &str, max_bytes: usize) -> String {
+    if name.len() <= max_bytes {
+        return name.to_string();
+    }
+    let digest = format!("~{:016x}", fnv1a64(name.as_bytes()));
+    if max_bytes <= digest.len() {
+        // Pathological budget (an absurdly long MONGODB_DB). Keep the tail of
+        // the digest: still a function of the whole name, so still distinct.
+        return digest[digest.len() - max_bytes..].to_string();
+    }
+    // `derive_index_name`'s base comes straight from the environment and is not
+    // sanitized, so `name` may hold multi-byte UTF-8; walk back to a boundary.
+    let mut head_end = max_bytes - digest.len();
+    while head_end > 0 && !name.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    format!("{}{}", &name[..head_end], digest)
+}
+
+/// FNV-1a 64-bit. Fixed constants, no seed, no version dependence.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 #[derive(Clone)]
 struct MongoConfig {
@@ -63,9 +157,18 @@ impl MongoDBEngine {
         let port: u16 = crate::effective_config::env_parsed("MONGODB_PORT", 27017);
 
         let db_name = crate::effective_config::env_or("MONGODB_DB", DEFAULT_DB);
-        let collection_name =
-            crate::effective_config::env_or("MONGODB_COLLECTION", DEFAULT_COLLECTION);
-        let index_name = crate::effective_config::env_or("MONGODB_INDEX_NAME", DEFAULT_INDEX_NAME);
+        // #306: both objects this engine owns are per-config. The collection is
+        // the load-bearing one — `configure()` drops it, and `corpus_row_count()`
+        // counts it — but the search index carries the config's HNSW knobs, so it
+        // is namespaced too: under a pinned `MONGODB_COLLECTION_EXACT` base the
+        // collection is shared and the index name is then the only thing keeping
+        // two configs' graphs apart.
+        let collection_name = derive_collection_name(&db_name, &engine_config.name);
+        let index_name = derive_index_name(
+            "MONGODB_INDEX_NAME",
+            DEFAULT_INDEX_NAME,
+            &engine_config.name,
+        );
 
         let parallel = engine_config
             .upload_params
@@ -608,132 +711,117 @@ impl MongoDBEngine {
         }
     }
 
-    /// Wait for the vector search index to finish indexing all uploaded documents.
+    /// Wait until EVERY uploaded document is searchable through the index, and
+    /// report how many were confirmed.
     ///
-    /// Polls `listSearchIndexes` until the index reports `queryable=true` and
-    /// `status` is READY or ACTIVE, then verifies with a probe search using
-    /// the first uploaded vector.
+    /// Atlas Vector Search is EVENTUALLY CONSISTENT, and the index STATUS
+    /// cannot detect that: `configure()` creates the index on a one-document
+    /// collection *before* the upload, so `listSearchIndexes` reports
+    /// `status: READY, queryable: true` from that moment and keeps reporting it
+    /// the whole time mongot is ingesting the real corpus off a change stream.
+    /// The searchable-document count is therefore the entire guarantee, and
+    /// searching before it is complete measures recall against a fraction of the
+    /// corpus (the observed `recall 0.27` flake).
     ///
-    /// Atlas Vector Search is EVENTUALLY CONSISTENT: the index flips to
-    /// `queryable=true` (and `$vectorSearch` starts returning PARTIAL results)
-    /// while it is still ingesting the just-uploaded documents. A probe that
-    /// stops at the first non-empty result therefore lets the benchmark search
-    /// run against a half-built index, which understates recall (the observed
-    /// `recall 0.27` flake). To close that race we run the probe as a
-    /// full-precision search (`numCandidates >= expected`) and wait until it
-    /// surfaces EVERY uploaded document — i.e. the index has fully caught up —
-    /// before returning. The required count is bounded by `PROBE_CAP` so a huge
-    /// production dataset doesn't wait on an impractically large single query.
+    /// The count comes from an EXHAUSTIVE (`exact: true`, ENN) probe reduced to
+    /// a single number server-side by `$count`. An approximate probe cannot
+    /// answer the question at all: Atlas rejects `numCandidates` above 10_000
+    /// and requires `limit <= numCandidates`, so an ANN probe can never see past
+    /// the first 10_000 documents — which is why the previous capped gate
+    /// released at 0.85% indexed on glove-100 and let the run publish recall
+    /// against a near-empty index (#305). ENN takes no `numCandidates` and so
+    /// carries no such ceiling; verified against mongodb-atlas-local 8.0.17 for
+    /// both dialects, returning 12_000 of 12_000 at `limit` 12_000 and 20_000.
+    ///
+    /// There is no success path that returns while under-indexed: either the
+    /// probe confirms the whole corpus, or this returns `Err` and the run stops
+    /// before it can publish an unbacked recall.
     fn wait_for_index_catchup(
         &self,
         expected_count: usize,
         probe_vector: &[f32],
         dialect: SearchDialect,
-    ) -> Result<(), String> {
-        // Upper bound on how many docs we require the probe to surface. Atlas
-        // caps both `limit` and `numCandidates` at 10_000, and for large corpora
-        // "index reports ready AND has surfaced this many docs" is a sufficient
-        // catch-up signal.
-        const PROBE_CAP: usize = 10_000;
-        let want = expected_count.min(PROBE_CAP);
-        // Request all wanted docs, scanning a candidate pool that covers the
-        // whole (bounded) corpus so the search is effectively exact — an indexed
-        // doc is guaranteed to be surfaced, so `results.len() < want` means the
-        // index has not finished ingesting yet.
-        let probe_top = want.max(1);
-        let probe_candidates = expected_count.saturating_mul(2).clamp(probe_top, PROBE_CAP) as i64;
+    ) -> Result<IndexCoverage, String> {
+        let plan = catchup_plan(expected_count);
+        let pipeline =
+            build_catchup_count_pipeline(&self.index_name, probe_vector, plan.limit, dialect);
 
         println!(
-            "Waiting for vector search index to index all {} documents...",
-            expected_count
+            "Waiting for vector search index to index all {} documents (exhaustive count probe, budget {}s)...",
+            expected_count,
+            plan.deadline.as_secs()
         );
         let db = self.client.database(&self.db_name);
         let coll = db.collection::<Document>(&self.collection_name);
         let start = Instant::now();
-        let deadline = start + std::time::Duration::from_secs(600);
+        let deadline = start + plan.deadline;
         let mut last_print = Instant::now();
-        let mut index_ready = false;
+        let mut last_seen = 0usize;
+        // The probe legitimately errors while mongot is still starting up ("is
+        // not queryable"), so a single error is not fatal — but the LAST one is
+        // kept so a gate that never succeeds can name why instead of reporting a
+        // bare timeout. Every arm below that reaches the deadline check assigns
+        // it, so it deliberately carries no initial value.
+        let mut last_error: Option<String>;
 
         loop {
-            if !index_ready {
-                let cmd = doc! { "listSearchIndexes": &self.collection_name };
-                if let Ok(result) = db.run_command(cmd).run() {
-                    if let Ok(cursor) = result.get_document("cursor") {
-                        if let Ok(batch) = cursor.get_array("firstBatch") {
-                            for index in batch {
-                                if let Some(index_doc) = index.as_document() {
-                                    let name = index_doc.get_str("name").unwrap_or("");
-                                    if name != self.index_name {
-                                        continue;
-                                    }
-                                    let status = index_doc.get_str("status").unwrap_or("");
-                                    let queryable =
-                                        index_doc.get_bool("queryable").unwrap_or(false);
+            let probe_start = Instant::now();
+            let outcome = run_catchup_count(&coll, &pipeline);
+            let probe_elapsed = probe_start.elapsed();
 
-                                    if (status == "READY" || status == "ACTIVE") && queryable {
-                                        index_ready = true;
-                                    } else if last_print.elapsed().as_secs() >= 10 {
-                                        println!(
-                                            "  index building... status={}, queryable={}",
-                                            status, queryable
-                                        );
-                                        last_print = Instant::now();
-                                    }
-                                }
-                            }
-                        }
+            match outcome {
+                Ok(searchable) if searchable >= plan.want => {
+                    println!(
+                        "Index caught up ({} / {} docs searchable) after {:.1}s.",
+                        searchable,
+                        expected_count,
+                        start.elapsed().as_secs_f64()
+                    );
+                    return Ok(IndexCoverage {
+                        searchable,
+                        expected: expected_count,
+                    });
+                }
+                Ok(searchable) => {
+                    last_seen = searchable;
+                    last_error = None;
+                    if last_print.elapsed().as_secs() >= 10 {
+                        println!(
+                            "  still ingesting: {} / {} docs searchable, waiting...",
+                            searchable, plan.want
+                        );
+                        last_print = Instant::now();
                     }
                 }
-            }
-
-            // Once the index reports ready, probe with a full-precision search and
-            // wait until it has surfaced EVERY uploaded document — only then has the
-            // eventually-consistent index finished ingesting (partial ingestion
-            // returns fewer than `want` and understates recall).
-            if index_ready {
-                match vector_search(
-                    &coll,
-                    &self.index_name,
-                    probe_vector,
-                    probe_top,
-                    probe_candidates,
-                    None,
-                    dialect,
-                ) {
-                    Ok(results) if results.len() >= want => {
-                        println!(
-                            "Index caught up ({} / {} docs searchable) after {:.1}s.",
-                            results.len(),
-                            expected_count,
-                            start.elapsed().as_secs_f64()
-                        );
-                        return Ok(());
+                Err(e) => {
+                    if last_print.elapsed().as_secs() >= 10 {
+                        println!("  catch-up probe not answering yet: {}", e);
+                        last_print = Instant::now();
                     }
-                    Ok(results) => {
-                        if last_print.elapsed().as_secs() >= 10 {
-                            println!(
-                                "  index ready but still ingesting: {} / {} docs searchable, waiting...",
-                                results.len(),
-                                want
-                            );
-                            last_print = Instant::now();
-                        }
-                    }
-                    Err(_) => {
-                        if last_print.elapsed().as_secs() >= 10 {
-                            println!("  index ready but probe search errored, waiting...");
-                            last_print = Instant::now();
-                        }
-                    }
+                    last_error = Some(e);
                 }
             }
 
             if Instant::now() > deadline {
-                return Err(
-                    "Vector search index did not finish indexing within 600 seconds".to_string(),
-                );
+                return Err(format!(
+                    "MongoDB index catch-up FAILED: only {} of {} documents ({:.2}%) were \
+                     searchable after {:.0}s. Refusing to run the search phase against a \
+                     partially built index — any recall it produced would be measured against \
+                     that fraction of the corpus, not the corpus the ground truth describes. \
+                     Last probe error: {}",
+                    last_seen,
+                    expected_count,
+                    IndexCoverage {
+                        searchable: last_seen,
+                        expected: expected_count
+                    }
+                    .fraction()
+                        * 100.0,
+                    start.elapsed().as_secs_f64(),
+                    last_error.as_deref().unwrap_or("none"),
+                ));
             }
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(catchup_poll_interval(probe_elapsed));
         }
     }
 
@@ -1169,32 +1257,142 @@ fn extract_search_hits(docs: &[Document]) -> Vec<(i64, f64)> {
         .collect()
 }
 
-/// Execute a vector search end-to-end (build + send + extract).
+// ---------------------------------------------------------------------------
+// Index catch-up gate (#305)
+// ---------------------------------------------------------------------------
+
+/// Everything about the index catch-up gate that is a pure function of the
+/// corpus size.
 ///
-/// Convenience wrapper used by the untimed index-catchup probe
-/// (`wait_for_index_catchup`), where the split boundary is irrelevant. The timed
-/// search()/search_mixed() paths deliberately do NOT use this: they precompute
-/// pipelines out of the window and call `send_search`/`extract_search_hits`
-/// directly so only the RPC + decode is timed.
-fn vector_search(
-    coll: &mongodb::sync::Collection<Document>,
+/// Extracted out of `wait_for_index_catchup` — a `&self` method that needs a
+/// live `Client` — precisely because the #305 defect lived in this arithmetic
+/// and nothing could reach it: every mongodb integration corpus in this repo is
+/// 20-500 vectors, so a cap that only bites above 10_000 documents was
+/// unreachable from the whole suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatchupPlan {
+    /// Searchable documents the gate requires before it releases. This is
+    /// `expected_count` itself and MUST NOT be capped: capping it is exactly
+    /// how the gate came to release at 10_000 of glove-100's 1_183_514.
+    want: usize,
+    /// `limit` for the probe stage. `expected_count` again, floored at 1
+    /// because the stage rejects `limit: 0`.
+    limit: usize,
+    /// Wall-clock budget for the whole gate.
+    deadline: Duration,
+}
+
+/// Build the catch-up plan for a corpus of `expected_count` documents.
+fn catchup_plan(expected_count: usize) -> CatchupPlan {
+    // Ten minutes of slack for index creation and mongot startup, plus a
+    // millisecond per document — an assumed floor of 1_000 docs/sec of mongot
+    // ingest. The previous flat 600s was sized for a gate that gave up after
+    // 10_000 documents; a gate that genuinely waits for a million-document
+    // corpus would trip it on arrival.
+    const BASE_SECS: u64 = 600;
+    const ASSUMED_MIN_INGEST_DOCS_PER_SEC: u64 = 1_000;
+
+    CatchupPlan {
+        want: expected_count,
+        limit: expected_count.max(1),
+        deadline: Duration::from_secs(
+            BASE_SECS + expected_count as u64 / ASSUMED_MIN_INGEST_DOCS_PER_SEC,
+        ),
+    }
+}
+
+/// How long to sleep before the next catch-up probe.
+///
+/// The exhaustive probe costs O(corpus), so a fixed short interval would spend
+/// most of a large gate inside probes. Sleeping at least as long as the last
+/// probe took bounds probe cost at about half the gate's wall clock; the floor
+/// keeps small corpora responsive and the ceiling stops the gate overshooting
+/// catch-up by minutes on a huge one.
+fn catchup_poll_interval(last_probe: Duration) -> Duration {
+    last_probe.clamp(Duration::from_secs(2), Duration::from_secs(30))
+}
+
+/// Build the pipeline for one catch-up probe: an exhaustive nearest-neighbour
+/// query over the whole index, reduced to a single number server-side.
+///
+/// `exact: true` is what makes the count both trustworthy and UNBOUNDED. The
+/// approximate form takes `numCandidates`, which Atlas rejects above 10_000
+/// (`"numCandidates" must be within bounds [1..10000]`) while also requiring
+/// `limit <= numCandidates` — so no ANN probe can count past 10_000 documents,
+/// no matter how it is parameterised. The exhaustive form takes no
+/// `numCandidates` at all (passing one alongside `exact` is an error), scans
+/// every indexed document, and so returns the true indexed count.
+///
+/// `$count` keeps the answer cheap on the wire: mongot still scores the corpus,
+/// but a single `{n: ...}` comes back instead of a million documents.
+fn build_catchup_count_pipeline(
     index_name: &str,
     query_vector: &[f32],
-    top: usize,
-    num_candidates: i64,
-    filter: Option<&Document>,
+    limit: usize,
     dialect: SearchDialect,
-) -> Result<Vec<(i64, f64)>, String> {
-    let pipeline = build_search_pipeline(
-        index_name,
-        query_vector,
-        top,
-        num_candidates,
-        filter,
-        dialect,
-    );
-    let docs = send_search(coll, &pipeline)?;
-    Ok(extract_search_hits(&docs))
+) -> Vec<Document> {
+    let bson_vec: Vec<mongodb::bson::Bson> = query_vector
+        .iter()
+        .map(|&f| mongodb::bson::Bson::Double(f as f64))
+        .collect();
+
+    let vs_stage = doc! {
+        "path": "vector",
+        "queryVector": bson_vec,
+        "limit": limit as i64,
+        "exact": true,
+    };
+
+    let search_stage = match dialect {
+        SearchDialect::VectorSearchStage => {
+            let mut stage = doc! { "index": index_name };
+            stage.extend(vs_stage);
+            doc! { "$vectorSearch": stage }
+        }
+        SearchDialect::SearchStage => {
+            doc! { "$search": { "index": index_name, "vectorSearch": vs_stage } }
+        }
+    };
+
+    vec![search_stage, doc! { "$count": "n" }]
+}
+
+/// Read the count out of one `$count` output document.
+///
+/// `$count` emits an int32 on the servers seen so far, but nothing in the
+/// aggregation contract pins the width, and reading it as the wrong one would
+/// turn a complete index into an unreadable probe and hang the gate to its
+/// deadline. A missing `n` is an error rather than a zero: silently reporting
+/// "0 searchable" for a malformed reply would look identical to a cold index
+/// and burn the whole budget.
+fn catchup_count_from_doc(doc: &Document) -> Result<usize, String> {
+    let n = doc
+        .get_i32("n")
+        .map(i64::from)
+        .or_else(|_| doc.get_i64("n"))
+        .map_err(|_| format!("catch-up count returned no `n` field: {:?}", doc))?;
+    Ok(n.max(0) as usize)
+}
+
+/// Run a catch-up count pipeline and return the searchable-document count.
+///
+/// `$count` emits NO document when its input is empty, which is how "nothing
+/// indexed yet" arrives — zero, not an error.
+fn run_catchup_count(
+    coll: &mongodb::sync::Collection<Document>,
+    pipeline: &[Document],
+) -> Result<usize, String> {
+    let cursor = coll
+        .aggregate(pipeline.to_vec())
+        .run()
+        .map_err(|e| format!("catch-up count failed: {}", e))?;
+
+    let mut searchable = 0usize;
+    for result in cursor {
+        let doc = result.map_err(|e| format!("catch-up count read failed: {}", e))?;
+        searchable = catchup_count_from_doc(&doc)?;
+    }
+    Ok(searchable)
 }
 
 /// Parse filter conditions into MongoDB query document.
@@ -1603,6 +1801,19 @@ impl Engine for MongoDBEngine {
     /// (issue #238). `countDocuments({})` on the benchmark collection — an exact
     /// count, not the metadata estimate, because the estimate can lag a drop and
     /// report a corpus that is no longer there. A missing collection answers 0.
+    ///
+    /// #306 — why this stays a pure count and gained no identity marker. The
+    /// collection it counts is now per-config (see [`derive_collection_name`]),
+    /// so the "corpus built by a *different config*" case no longer reaches this
+    /// check as a plausible number: config B's collection does not exist, the
+    /// count is 0, and `classify_reuse_precondition` fails the run. An
+    /// upload-time marker document would answer the same question one layer
+    /// later and would itself be a row in the count.
+    ///
+    /// What remains unverified is the *dataset* dimension — one config reused
+    /// across two same-sized datasets still certifies. That is #279, it is
+    /// identical on every engine, and it wants one cross-engine mechanism rather
+    /// than a MongoDB-only marker that hides the gap on this engine alone.
     fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
         let coll = self
             .client
@@ -1706,6 +1917,9 @@ impl Engine for MongoDBEngine {
         );
 
         let total_time;
+        // `None` means "not verified" — the only honest value when no vector
+        // index was built. It is NOT the same claim as a verified 1.0 (#305).
+        let mut index_coverage = None;
         if self.config.skip_vector_index {
             total_time = read_time + upload_time;
             println!(
@@ -1717,11 +1931,11 @@ impl Engine for MongoDBEngine {
             // Use the first vector as a probe query to verify actual search readiness
             let probe_vector = vectors.first().ok_or("No vectors uploaded")?;
             let index_start = Instant::now();
-            self.wait_for_index_catchup(
+            index_coverage = Some(self.wait_for_index_catchup(
                 vectors.len(),
                 probe_vector,
                 SearchDialect::for_dataset(dataset),
-            )?;
+            )?);
             let index_time = index_start.elapsed().as_secs_f64();
 
             total_time = read_time + upload_time + index_time;
@@ -1738,6 +1952,7 @@ impl Engine for MongoDBEngine {
             parallel: self.config.parallel,
             batch_size: self.config.batch_size,
             memory_usage: None,
+            index_coverage,
         })
     }
 
@@ -2305,6 +2520,232 @@ impl Engine for MongoDBEngine {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── #306: per-config collection / index namespacing ──────────────────
+    //
+    // `derive_index_name` resolves through the process-wide effective-config
+    // recorder (#212), so every test below takes `test_lock()` to serialize with
+    // the other tests that drive it.
+
+    /// The headline of #306, pinned to literal strings.
+    ///
+    /// Two configs of the shipped M×EF_CONSTRUCTION sweep must address two
+    /// different collections AND two different search indexes. Before the fix
+    /// both resolved to the bare `vectors` / `vector_index`, so `configure()`
+    /// dropped the sibling's corpus and `--skip-upload` measured whichever HNSW
+    /// graph happened to survive.
+    ///
+    /// FAILS ON REVERT: with the constants read straight from `env_or`, both
+    /// configs get `"vectors"` and `"vector_index"` — the `assert_ne!`s and the
+    /// literal-equality assertions all break.
+    #[test]
+    fn sweep_configs_derive_distinct_collections_and_indexes() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let a = derive_collection_name("bench", "mongodb-m-16-efc-100");
+        let b = derive_collection_name("bench", "mongodb-m-64-efc-800");
+        assert_eq!(a, "vectors:mongodb-m-16-efc-100");
+        assert_eq!(b, "vectors:mongodb-m-64-efc-800");
+        assert_ne!(a, b);
+        // And neither may be the bare legacy collection every config shared.
+        assert_ne!(a, DEFAULT_COLLECTION);
+        assert_ne!(b, DEFAULT_COLLECTION);
+
+        let ia = derive_index_name(
+            "MONGODB_INDEX_NAME",
+            DEFAULT_INDEX_NAME,
+            "mongodb-m-16-efc-100",
+        );
+        let ib = derive_index_name(
+            "MONGODB_INDEX_NAME",
+            DEFAULT_INDEX_NAME,
+            "mongodb-m-64-efc-800",
+        );
+        assert_eq!(ia, "vector_index:mongodb-m-16-efc-100");
+        assert_eq!(ib, "vector_index:mongodb-m-64-efc-800");
+        assert_ne!(ia, ib);
+        assert_ne!(ia, DEFAULT_INDEX_NAME);
+    }
+
+    /// The shipped sweep is the artefact the issue names: 12 configs, 12 result
+    /// files, one measurement. Read the real file rather than a hand-copied list
+    /// so adding a 13th config that collides is caught here and not in a
+    /// published result set.
+    ///
+    /// FAILS ON REVERT: all 12 configs collapse to `"vectors"`, so the set of
+    /// distinct names is 1, not 12.
+    #[test]
+    fn shipped_hnsw_sweep_gives_every_config_its_own_collection() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/experiments/configurations/mongodb-single-node.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("shipped mongodb sweep config");
+        let configs: Vec<serde_json::Value> = serde_json::from_str(&raw).expect("valid JSON array");
+        assert!(
+            configs.len() >= 12,
+            "the sweep this issue is about ships 12 configs, found {}",
+            configs.len()
+        );
+
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for cfg in &configs {
+            let name = cfg["name"].as_str().expect("config name").to_string();
+            let coll = derive_collection_name("bench", &name);
+            if let Some(prev) = seen.insert(coll.clone(), name.clone()) {
+                panic!("configs '{prev}' and '{name}' both address collection '{coll}'");
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            configs.len(),
+            "every config must own its collection"
+        );
+    }
+
+    /// The namespace ceiling. `<db>.<collection>` over 255 bytes is refused by
+    /// the server outright, so a long config name must be bounded — and bounding
+    /// must not undo the isolation it is bounding.
+    ///
+    /// This is the collision path #294 warns about being shipped untested: the
+    /// two names below share a 300-byte prefix and differ only in the tail that
+    /// truncation throws away.
+    ///
+    /// FAILS ON REVERT of the bounding: a plain truncate makes the two names
+    /// equal. FAILS ON REVERT of #306 entirely: both become `"vectors"`, equal
+    /// again.
+    #[test]
+    fn long_config_names_are_bounded_without_colliding() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let shared = "x".repeat(300);
+        let a = derive_collection_name("bench", &format!("{shared}-efc-100"));
+        let b = derive_collection_name("bench", &format!("{shared}-efc-800"));
+
+        for (label, n) in [("a", &a), ("b", &b)] {
+            assert!(
+                "bench".len() + 1 + n.len() <= MAX_NAMESPACE_BYTES,
+                "{label} namespace is {} bytes, over MongoDB's {MAX_NAMESPACE_BYTES}: {n}",
+                "bench".len() + 1 + n.len()
+            );
+        }
+        assert_ne!(
+            a, b,
+            "two configs differing only past the truncation point must NOT share \
+             a collection — that is #306 reintroduced through the bounding"
+        );
+        assert!(a.contains('~') && b.contains('~'), "{a} / {b}");
+    }
+
+    /// A longer database name eats into the collection's budget, and the result
+    /// must still be a legal namespace. Pins that the budget is computed from the
+    /// db name rather than assumed.
+    ///
+    /// FAILS ON REVERT: `saturating_sub` removed / db length ignored → the long-db
+    /// case exceeds 255 bytes.
+    #[test]
+    fn the_namespace_budget_accounts_for_the_database_name() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let cfg = "y".repeat(400);
+        for db in ["b", "bench", &"d".repeat(200)] {
+            let coll = derive_collection_name(db, &cfg);
+            assert!(
+                db.len() + 1 + coll.len() <= MAX_NAMESPACE_BYTES,
+                "db '{}' ({} bytes) + collection ({} bytes) exceeds {MAX_NAMESPACE_BYTES}",
+                db,
+                db.len(),
+                coll.len()
+            );
+            assert!(
+                !coll.is_empty(),
+                "an empty collection name is not addressable"
+            );
+        }
+    }
+
+    /// The bounding must be reproducible across processes and builds: a
+    /// `--skip-upload` run has to resolve to the collection last week's upload
+    /// created. FNV-1a's constants are fixed; `DefaultHasher`'s are not
+    /// guaranteed to be.
+    ///
+    /// FAILS ON REVERT to a seeded/unstable hash only if the seed changes within
+    /// the process, so it also pins the literal digest — a switch to any other
+    /// hash function changes this string.
+    #[test]
+    fn bounding_is_deterministic() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+
+        let long = "z".repeat(400);
+        assert_eq!(bound_to_bytes(&long, 40), bound_to_bytes(&long, 40));
+        assert_eq!(bound_to_bytes(&long, 40).len(), 40);
+        // Short names are returned untouched — readability of the common case.
+        assert_eq!(bound_to_bytes("vectors:cfg", 255), "vectors:cfg");
+    }
+
+    /// A budget smaller than the digest itself must still produce a distinct,
+    /// non-empty, correctly-sized name rather than panicking or slicing out of
+    /// bounds. Reachable via an absurd `MONGODB_DB`.
+    #[test]
+    fn bounding_survives_a_budget_smaller_than_the_digest() {
+        // Both inputs are longer than every budget tried, so the bounded form is
+        // always exercised (a name shorter than its budget is returned verbatim).
+        let alpha = format!("vectors:{}", "a".repeat(60));
+        let beta = format!("vectors:{}", "b".repeat(60));
+        for budget in [1usize, 4, 8, 16, 17, 18, 32] {
+            let a = bound_to_bytes(&alpha, budget);
+            let b = bound_to_bytes(&beta, budget);
+            assert_eq!(a.len(), budget, "budget {budget}");
+            assert_eq!(b.len(), budget, "budget {budget}");
+            if budget >= 8 {
+                assert_ne!(a, b, "budget {budget} collapsed two distinct names");
+            }
+        }
+    }
+
+    /// Multi-byte UTF-8 in the base (which comes from the environment and is NOT
+    /// sanitized) must not be sliced mid-character.
+    #[test]
+    fn bounding_cuts_on_a_char_boundary() {
+        let name = "é".repeat(200); // 400 bytes, 200 chars
+        for budget in 17..40 {
+            // Slicing at a non-boundary would panic here — that is the assertion.
+            let out = bound_to_bytes(&name, budget);
+            assert!(out.len() <= budget, "budget {budget}: {out}");
+            let head = out.split('~').next().unwrap();
+            assert!(
+                head.chars().all(|c| c == 'é'),
+                "budget {budget} cut mid-character: {head:?}"
+            );
+        }
+    }
+
+    /// `MONGODB_COLLECTION` remains an override, but as a BASE: the config
+    /// suffix is still appended, so pinning it cannot re-collapse a sweep.
+    /// `MONGODB_COLLECTION_EXACT=1` is the documented escape hatch that drops
+    /// the suffix — and the startup guard in `experiment::run` rejects it with
+    /// more than one MongoDB config.
+    ///
+    /// FAILS ON REVERT: the non-exact half asserts the suffix is present, which
+    /// the old `env_or` passthrough does not produce.
+    #[test]
+    fn collection_env_override_is_a_base_not_a_pin() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        std::env::set_var("MONGODB_COLLECTION", "mycoll");
+        assert_eq!(
+            derive_collection_name("bench", "mongodb-m-16-efc-100"),
+            "mycoll:mongodb-m-16-efc-100"
+        );
+
+        std::env::set_var("MONGODB_COLLECTION_EXACT", "1");
+        assert_eq!(
+            derive_collection_name("bench", "mongodb-m-16-efc-100"),
+            "mycoll"
+        );
+
+        std::env::remove_var("MONGODB_COLLECTION_EXACT");
+        std::env::remove_var("MONGODB_COLLECTION");
+    }
 
     /// Issue #216: `hnsw_config` must be translated into the names MongoDB
     /// accepts, not the HNSW-generic `m`/`efConstruction` (which the server
@@ -2888,5 +3329,174 @@ mod tests {
             Some(v) => std::env::set_var("MONGODB_PASSWORD", v),
             None => std::env::remove_var("MONGODB_PASSWORD"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Index catch-up gate (#305)
+    //
+    // Every mongodb integration corpus in this repo is 20-500 vectors, so the
+    // >10_000 branch these tests pin is reachable from NOTHING else in the
+    // suite. That is why #305 survived: the gate's cap only bites above 10_000
+    // documents, and no test ever handed it that many.
+    // -----------------------------------------------------------------------
+
+    /// The #305 defect itself: `want` was `expected_count.min(10_000)`, so the
+    /// gate released once 10_000 documents of a 1_183_514-document corpus were
+    /// searchable — 0.85% — and the search phase published recall against it.
+    ///
+    /// `want` must equal the corpus, at every size, with no ceiling.
+    #[test]
+    fn catchup_plan_requires_the_whole_corpus_at_every_size() {
+        // Straddles the old cap: 9_999 passed before AND after, 10_001 is the
+        // smallest corpus the old code got wrong.
+        for expected in [1usize, 9_999, 10_000, 10_001, 1_000_000, 1_183_514] {
+            let plan = catchup_plan(expected);
+            assert_eq!(
+                plan.want, expected,
+                "catch-up must wait for all {expected} documents, not a capped \
+                 fraction of them (#305)"
+            );
+            assert_eq!(
+                plan.limit, expected,
+                "the probe must ASK for all {expected} documents; a smaller limit \
+                 makes a complete count unobservable no matter what `want` says"
+            );
+        }
+    }
+
+    /// `limit: 0` is rejected by the stage, so an empty corpus still asks for
+    /// one document — while `want` stays 0, so the gate releases immediately
+    /// rather than waiting for a document that will never exist.
+    #[test]
+    fn catchup_plan_floors_the_probe_limit_at_one() {
+        let plan = catchup_plan(0);
+        assert_eq!(plan.want, 0);
+        assert_eq!(plan.limit, 1);
+    }
+
+    /// A gate that genuinely waits for the whole corpus needs a budget that
+    /// scales with it. The flat 600s was sized for a gate that gave up after
+    /// 10_000 documents; kept flat, a corpus this tool actually ships would hit
+    /// the deadline as a matter of course and the fix would trade a silent wrong
+    /// answer for a guaranteed hard failure.
+    #[test]
+    fn catchup_plan_deadline_scales_with_the_corpus() {
+        assert_eq!(catchup_plan(0).deadline, Duration::from_secs(600));
+        assert_eq!(catchup_plan(9_999).deadline, Duration::from_secs(609));
+        assert_eq!(catchup_plan(1_000_000).deadline, Duration::from_secs(1_600));
+        assert!(
+            catchup_plan(1_183_514).deadline > Duration::from_secs(600),
+            "glove-100 must get more than the old flat budget"
+        );
+    }
+
+    /// Probe cost is O(corpus), so the interval must not be a fixed short sleep
+    /// on a large corpus, nor a long one on a small corpus.
+    #[test]
+    fn catchup_poll_interval_is_bounded_by_the_last_probe() {
+        assert_eq!(
+            catchup_poll_interval(Duration::from_millis(5)),
+            Duration::from_secs(2),
+            "floor keeps small corpora responsive"
+        );
+        assert_eq!(
+            catchup_poll_interval(Duration::from_secs(7)),
+            Duration::from_secs(7),
+            "in between, sleep as long as the probe took"
+        );
+        assert_eq!(
+            catchup_poll_interval(Duration::from_secs(600)),
+            Duration::from_secs(30),
+            "ceiling stops the gate overshooting catch-up by minutes"
+        );
+    }
+
+    /// The probe must be EXHAUSTIVE, because the approximate one physically
+    /// cannot count past 10_000: Atlas rejects `numCandidates` above 10_000 and
+    /// requires `limit <= numCandidates`. A probe carrying `numCandidates` is
+    /// therefore a probe that has silently reacquired the #305 ceiling — and it
+    /// is also the shape that produced the secondary hazard the issue names
+    /// (`limit == numCandidates == 10_000`).
+    #[test]
+    fn catchup_probe_is_exhaustive_and_carries_no_ann_knob() {
+        let query = vec![0.1f32, -0.2, 0.3];
+        let pipeline = build_catchup_count_pipeline(
+            "vidx",
+            &query,
+            1_183_514,
+            SearchDialect::VectorSearchStage,
+        );
+
+        assert_eq!(pipeline.len(), 2, "probe is <search stage> + $count");
+        let vs = pipeline[0].get_document("$vectorSearch").unwrap();
+        assert!(
+            vs.get_bool("exact").unwrap(),
+            "the probe must be exhaustive (ENN)"
+        );
+        assert!(
+            !vs.contains_key("numCandidates"),
+            "numCandidates caps the probe at 10_000 documents and is invalid \
+             alongside `exact`: {vs:?}"
+        );
+        assert_eq!(
+            vs.get_i64("limit").unwrap(),
+            1_183_514,
+            "the probe must ask for the whole corpus, above the ANN ceiling"
+        );
+        assert_eq!(vs.get_str("index").unwrap(), "vidx");
+
+        // Counted server-side: mongot still scans, but one `{n: ...}` comes back
+        // instead of a million documents.
+        assert_eq!(pipeline[1], doc! { "$count": "n" });
+    }
+
+    /// The geo datasets run the `$search` dialect (#223), and they are subject
+    /// to exactly the same ceiling — so the same exhaustive shape has to reach
+    /// the other stage too, nested under the `vectorSearch` operator.
+    #[test]
+    fn catchup_probe_is_exhaustive_on_the_search_dialect_too() {
+        let query = vec![0.1f32, -0.2, 0.3];
+        let pipeline =
+            build_catchup_count_pipeline("vidx", &query, 25_000, SearchDialect::SearchStage);
+
+        let vs = pipeline[0]
+            .get_document("$search")
+            .unwrap()
+            .get_document("vectorSearch")
+            .unwrap();
+        assert!(
+            vs.get_bool("exact").unwrap(),
+            "the probe must be exhaustive (ENN)"
+        );
+        assert!(!vs.contains_key("numCandidates"), "{vs:?}");
+        assert_eq!(vs.get_i64("limit").unwrap(), 25_000);
+        assert_eq!(
+            pipeline[0]
+                .get_document("$search")
+                .unwrap()
+                .get_str("index")
+                .unwrap(),
+            "vidx"
+        );
+        assert_eq!(pipeline[1], doc! { "$count": "n" });
+    }
+
+    /// The count reader must not depend on the integer width `$count` happens
+    /// to emit, and must not turn a malformed reply into a plausible-looking
+    /// "0 searchable" — which is indistinguishable from a cold index and would
+    /// burn the entire budget before failing.
+    #[test]
+    fn catchup_count_reads_either_integer_width_and_rejects_a_missing_count() {
+        assert_eq!(
+            catchup_count_from_doc(&doc! { "n": 10_001i32 }).unwrap(),
+            10_001
+        );
+        assert_eq!(
+            catchup_count_from_doc(&doc! { "n": 1_183_514i64 }).unwrap(),
+            1_183_514
+        );
+        let err = catchup_count_from_doc(&doc! { "total": 5i32 })
+            .expect_err("a reply without `n` is not a zero count");
+        assert!(err.contains("no `n`"), "{err}");
     }
 }
