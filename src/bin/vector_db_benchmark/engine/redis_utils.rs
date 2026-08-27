@@ -393,7 +393,9 @@ pub fn ft_info_num_docs(v: &redis::Value) -> Option<u64> {
     let pairs: Vec<(String, &redis::Value)> = match v {
         redis::Value::Map(m) => m.iter().map(|(k, val)| (value_to_string(k), val)).collect(),
         redis::Value::Array(items) => items
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| (value_to_string(&c[0]), &c[1]))
             .collect(),
         _ => return None,
@@ -455,7 +457,9 @@ pub fn ft_info_index_memory_bytes(v: &redis::Value) -> Option<i64> {
     let pairs: Vec<(String, &redis::Value)> = match v {
         redis::Value::Map(m) => m.iter().map(|(k, val)| (value_to_string(k), val)).collect(),
         redis::Value::Array(items) => items
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| (value_to_string(&c[0]), &c[1]))
             .collect(),
         _ => return None,

@@ -40,9 +40,14 @@ fn read_i64_le(r: &mut impl Read, n: usize, max_bytes: u64) -> Result<Vec<i64>, 
     }
     let mut buf = vec![0u8; byte_len];
     r.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    // `as_chunks::<8>()` yields `&[u8; 8]` directly, so the fallible
+    // `try_into().unwrap()` that `chunks_exact` forced is gone: the length is
+    // now proven by the type rather than re-checked at runtime.
     Ok(buf
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect())
 }
 
@@ -66,10 +71,7 @@ fn read_u32_array<T>(
     }
     let mut buf = vec![0u8; byte_len];
     r.read_exact(&mut buf).map_err(|e| e.to_string())?;
-    Ok(buf
-        .chunks_exact(4)
-        .map(|c| f(c.try_into().unwrap()))
-        .collect())
+    Ok(buf.as_chunks::<4>().0.iter().map(|c| f(*c)).collect())
 }
 
 /// Number of rows a CSR file declares, read from its 24-byte header WITHOUT
