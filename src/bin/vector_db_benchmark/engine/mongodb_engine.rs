@@ -17,7 +17,7 @@ use rand::{seq::SliceRandom, SeedableRng};
 use super::geo;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
-use crate::engine::index_naming::derive_index_name;
+use crate::engine::index_naming::{derive_index_name, sanitize_token};
 use crate::engine::{
     CorpusCount, Engine, IndexCoverage, SearchResults, UpdateSearchRatio, UploadStats,
 };
@@ -37,10 +37,43 @@ const DEFAULT_INDEX_NAME: &str = "vector_index";
 /// bounding below is MongoDB's own concern and deliberately does NOT live in
 /// the shared `index_naming` module.
 ///
-/// The search index name has no comparable ceiling: the same server accepted a
-/// 5000-byte `createSearchIndexes` name, so `index_name` is left unbounded and
-/// carries the config suffix verbatim.
+/// The search index name has no comparable LENGTH ceiling: the same server
+/// accepted a 5000-byte `createSearchIndexes` name, so `index_name` is left
+/// unbounded. It does, however, have a CHARACTER restriction that the local
+/// image does not enforce — see [`derive_search_index_name`].
 const MAX_NAMESPACE_BYTES: usize = 255;
+
+/// Per-config search index name, safe for MongoDB **Atlas**.
+///
+/// [`derive_index_name`] joins base and config suffix with `:`, which is the
+/// natural separator for the Redis-wire engines. MongoDB Atlas rejects it:
+///
+/// ```text
+/// Error code 2 (BadValue): invalid index name vector_index:mongodb-m-64-ef-512
+/// ```
+///
+/// This did not show up in the integration tests because they run against
+/// `mongodb/mongodb-atlas-local`, which ACCEPTS a colon in a search index name.
+/// The local image is more permissive than the hosted service, so "it passed
+/// locally" is not evidence a name is valid on Atlas. The failure is total, not
+/// partial: every config in a sweep fails at `configure()`, so a real Atlas run
+/// produces zero summaries.
+///
+/// The fix is the separator, not a digest. [`sanitize_token`] already maps the
+/// config suffix into `[A-Za-z0-9_-]`, so `:` is the ONLY character the
+/// composed name can contain that Atlas refuses. Joining with `_` therefore
+/// preserves exactly the distinctness guarantee the `:` form had — two configs
+/// collide here only if they already collided before, which the startup
+/// collision guard catches.
+///
+/// The base is sanitized too: it comes straight from `MONGODB_INDEX_NAME` and is
+/// otherwise unchecked, so an operator-supplied base could reintroduce a
+/// character Atlas rejects — including under the `_EXACT` escape hatch, where
+/// the base is used with no suffix at all.
+pub(crate) fn derive_search_index_name(engine_name: &str) -> String {
+    let raw = derive_index_name("MONGODB_INDEX_NAME", DEFAULT_INDEX_NAME, engine_name);
+    sanitize_token(&raw)
+}
 
 /// Per-config collection name (#306).
 ///
@@ -164,11 +197,7 @@ impl MongoDBEngine {
         // collection is shared and the index name is then the only thing keeping
         // two configs' graphs apart.
         let collection_name = derive_collection_name(&db_name, &engine_config.name);
-        let index_name = derive_index_name(
-            "MONGODB_INDEX_NAME",
-            DEFAULT_INDEX_NAME,
-            &engine_config.name,
-        );
+        let index_name = derive_search_index_name(&engine_config.name);
 
         let parallel = engine_config
             .upload_params
@@ -2550,20 +2579,62 @@ mod tests {
         assert_ne!(a, DEFAULT_COLLECTION);
         assert_ne!(b, DEFAULT_COLLECTION);
 
-        let ia = derive_index_name(
-            "MONGODB_INDEX_NAME",
-            DEFAULT_INDEX_NAME,
-            "mongodb-m-16-efc-100",
-        );
-        let ib = derive_index_name(
-            "MONGODB_INDEX_NAME",
-            DEFAULT_INDEX_NAME,
-            "mongodb-m-64-efc-800",
-        );
-        assert_eq!(ia, "vector_index:mongodb-m-16-efc-100");
-        assert_eq!(ib, "vector_index:mongodb-m-64-efc-800");
+        // `_`, not `:` — Atlas rejects a colon in a search index name. The
+        // distinctness guarantee is unchanged: the suffix is still the whole
+        // sanitized config name.
+        let ia = derive_search_index_name("mongodb-m-16-efc-100");
+        let ib = derive_search_index_name("mongodb-m-64-efc-800");
+        assert_eq!(ia, "vector_index_mongodb-m-16-efc-100");
+        assert_eq!(ib, "vector_index_mongodb-m-64-efc-800");
         assert_ne!(ia, ib);
         assert_ne!(ia, DEFAULT_INDEX_NAME);
+    }
+
+    /// Regression for the total-failure mode: a colon anywhere in the search
+    /// index name makes Atlas reject `createSearchIndexes` with
+    /// `BadValue: invalid index name`, so EVERY config in a sweep fails at
+    /// `configure()` and the run yields zero summaries.
+    ///
+    /// `mongodb/mongodb-atlas-local` accepts the colon, which is why the
+    /// integration tests never caught this — so this has to be asserted on the
+    /// name itself rather than left to a live round-trip.
+    #[test]
+    fn search_index_names_are_atlas_legal() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        let legal = |n: &str| {
+            n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        };
+
+        for cfg in [
+            "mongodb-m-16-ef-128",
+            "mongodb-m-64-ef-512",
+            "weird name/with:punctuation.and*globs",
+            "",
+        ] {
+            let name = derive_search_index_name(cfg);
+            assert!(
+                legal(&name),
+                "search index name {name:?} (from config {cfg:?}) is not Atlas-legal"
+            );
+            assert!(!name.contains(':'), "colon survived in {name:?}");
+        }
+    }
+
+    /// The `_EXACT` escape hatch bypasses the config suffix entirely and uses
+    /// the operator-supplied base verbatim, so it is the one path where an
+    /// invalid character can reach Atlas without passing through
+    /// `sanitize_token` on the suffix. It must be sanitized too.
+    #[test]
+    fn exact_pinned_index_base_is_still_sanitized() {
+        let _recorder_lock = crate::effective_config::test_lock();
+        std::env::set_var("MONGODB_INDEX_NAME", "my:pinned:index");
+        std::env::set_var("MONGODB_INDEX_NAME_EXACT", "1");
+        let name = derive_search_index_name("mongodb-m-16-ef-128");
+        std::env::remove_var("MONGODB_INDEX_NAME");
+        std::env::remove_var("MONGODB_INDEX_NAME_EXACT");
+        assert_eq!(name, "my_pinned_index");
+        assert!(!name.contains(':'));
     }
 
     /// The shipped sweep is the artefact the issue names: 12 configs, 12 result

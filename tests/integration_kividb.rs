@@ -1226,7 +1226,12 @@ fn ft_info_field_names(v: &redis::Value) -> Vec<String> {
     }
     match v {
         redis::Value::Map(m) => m.iter().map(|(k, _)| as_str(k)).collect(),
-        redis::Value::Array(items) => items.chunks_exact(2).map(|c| as_str(&c[0])).collect(),
+        redis::Value::Array(items) => items
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| as_str(&c[0]))
+            .collect(),
         _ => Vec::new(),
     }
 }
