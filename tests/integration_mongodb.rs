@@ -128,8 +128,20 @@ fn engine_collection(engine_name: &str) -> String {
 
 /// The search index the ENGINE builds for config `engine_name` when the run is
 /// given `MONGODB_INDEX_NAME=TEST_INDEX` (#306).
+///
+/// The separator is `_`, mirroring `derive_search_index_name`: MongoDB Atlas
+/// rejects a `:` in a search index name with
+/// `BadValue: invalid index name`, even though the
+/// `mongodb/mongodb-atlas-local` image these tests run against accepts it. That
+/// permissiveness gap is why the colon survived to a real Atlas run, so keep
+/// this helper in step with production and do not "fix" it back to `:`.
+///
+/// It has to duplicate the production rule rather than call it: the engine lives
+/// in a bin target, so an integration test cannot import `derive_search_index_name`.
+/// The unit test `search_index_names_are_atlas_legal` is what actually guards the
+/// character set.
 fn engine_index(engine_name: &str) -> String {
-    format!("{TEST_INDEX}:{engine_name}")
+    format!("{TEST_INDEX}_{engine_name}")
 }
 
 /// Count documents in a specific collection of the test database, server-side.
