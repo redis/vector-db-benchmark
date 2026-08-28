@@ -2513,6 +2513,266 @@ fn test_exhaustive_probe_counts_past_the_ann_10000_document_ceiling() {
         .run();
     let _ = coll.drop().run();
 }
+
+// ---------------------------------------------------------------------------
+// #313 — the exhaustive catch-up probe partitioned by `_id` range
+// ---------------------------------------------------------------------------
+//
+// mongodb-atlas-local cannot reproduce the wire-limit failure itself at any
+// scale this suite can afford (it needs a real Atlas-scale corpus and a real
+// mongot->mongod hop — see #313's own body, and #305/#311 before it for the
+// same class of gap). These tests instead pin the two server facts
+// `run_partitioned_catchup_count` depends on, at a scale CI can run every
+// time, using an artificially small partition width so a small corpus still
+// exercises the multi-partition summation/early-exit path.
+
+/// N small, `_id`-range-filtered exhaustive probes, summed, must equal the
+/// same total a single unpartitioned probe would report — proving
+/// partitioning is a pure transport change, not a weaker completeness check.
+/// A gap or overlap in the range tiling would show up here as a wrong sum.
+#[test]
+fn test_partitioned_probe_sums_multiple_id_ranges_to_the_full_corpus() {
+    const N: i64 = 1_200;
+    const WIDTH: i64 = 500; // tiles into 500 + 500 + 200: 2 full partitions, 1 partial
+    const DIM: usize = 4;
+    const COLL: &str = "probe_313_partition_sum";
+    const INDEX: &str = "probe_313_index";
+
+    wait_for_mongodb();
+    let client = mongodb_client();
+    let db = client.database(TEST_DB);
+    let coll = db.collection::<Document>(COLL);
+
+    let _ = db
+        .run_command(doc! { "dropSearchIndex": COLL, "name": INDEX })
+        .run();
+    let _ = coll.drop().run();
+
+    let mut docs = Vec::with_capacity(N as usize);
+    for i in 0..N {
+        let f = i as f64;
+        docs.push(doc! {
+            "_id": i,
+            "vector": [ (f * 0.001).sin(), (f * 0.001).cos(), (i % 97) as f64 / 97.0, 0.5 ],
+        });
+    }
+    coll.insert_many(&docs)
+        .run()
+        .expect("failed to insert the partition-sum probe corpus");
+
+    // Same index shape `create_vector_index` now builds (#313): `_id` as a
+    // range-filterable field alongside the vector field.
+    db.run_command(doc! {
+        "createSearchIndexes": COLL,
+        "indexes": [ {
+            "name": INDEX,
+            "type": "vectorSearch",
+            "definition": { "fields": [
+                { "type": "vector", "path": "vector", "numDimensions": DIM as i32, "similarity": "cosine" },
+                { "type": "filter", "path": "_id" },
+            ] },
+        } ],
+    })
+    .run()
+    .expect("failed to create the probe vector search index");
+
+    let query: Vec<f64> = vec![0.1, 0.2, 0.3, 0.4];
+    let mut ranges = Vec::new();
+    let mut lo = 0i64;
+    while lo < N {
+        let hi = (lo + WIDTH).min(N);
+        ranges.push((lo, hi));
+        lo = hi;
+    }
+    assert_eq!(
+        ranges.len(),
+        3,
+        "the test corpus must actually straddle 3 partitions, or this test proves nothing"
+    );
+
+    let probe_range = |lo: i64, hi: i64| -> i64 {
+        let pipeline = vec![
+            doc! { "$vectorSearch": {
+                "index": INDEX,
+                "path": "vector",
+                "queryVector": query.clone(),
+                "limit": hi - lo,
+                "exact": true,
+                "filter": { "_id": { "$gte": lo, "$lt": hi } },
+            } },
+            doc! { "$count": "n" },
+        ];
+        coll.aggregate(pipeline)
+            .run()
+            .ok()
+            .and_then(|c| {
+                c.filter_map(|r| r.ok())
+                    .filter_map(|d| d.get_i32("n").map(i64::from).ok())
+                    .last()
+            })
+            .unwrap_or(0)
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let total = loop {
+        let total: i64 = ranges.iter().map(|&(lo, hi)| probe_range(lo, hi)).sum();
+        if total >= N {
+            break total;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "partitioned probe never summed to the whole corpus: {total} / {N}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    };
+    assert_eq!(
+        total, N,
+        "summed partition counts must equal the true corpus size exactly"
+    );
+
+    let _ = db
+        .run_command(doc! { "dropSearchIndex": COLL, "name": INDEX })
+        .run();
+    let _ = coll.drop().run();
+}
+
+/// The #305-regression guard, re-proved under partitioning: if fewer
+/// documents are actually indexed than the corpus claims, the partitioned sum
+/// must report LESS than the claimed total — never accidentally reach it —
+/// so a gate built on top of this still refuses to release on a partial
+/// corpus. #313 must not reopen #305.
+#[test]
+fn test_partitioned_probe_reports_incomplete_coverage_honestly() {
+    const CLAIMED: i64 = 1_200;
+    const ACTUALLY_INSERTED: i64 = 800; // fewer than claimed, on purpose
+    const WIDTH: i64 = 500;
+    const DIM: usize = 4;
+    const COLL: &str = "probe_313_partial_coverage";
+    const INDEX: &str = "probe_313_partial_index";
+
+    wait_for_mongodb();
+    let client = mongodb_client();
+    let db = client.database(TEST_DB);
+    let coll = db.collection::<Document>(COLL);
+
+    let _ = db
+        .run_command(doc! { "dropSearchIndex": COLL, "name": INDEX })
+        .run();
+    let _ = coll.drop().run();
+
+    let mut docs = Vec::with_capacity(ACTUALLY_INSERTED as usize);
+    for i in 0..ACTUALLY_INSERTED {
+        let f = i as f64;
+        docs.push(doc! {
+            "_id": i,
+            "vector": [ (f * 0.001).sin(), (f * 0.001).cos(), (i % 97) as f64 / 97.0, 0.5 ],
+        });
+    }
+    coll.insert_many(&docs)
+        .run()
+        .expect("failed to insert the partial-coverage probe corpus");
+
+    db.run_command(doc! {
+        "createSearchIndexes": COLL,
+        "indexes": [ {
+            "name": INDEX,
+            "type": "vectorSearch",
+            "definition": { "fields": [
+                { "type": "vector", "path": "vector", "numDimensions": DIM as i32, "similarity": "cosine" },
+                { "type": "filter", "path": "_id" },
+            ] },
+        } ],
+    })
+    .run()
+    .expect("failed to create the probe vector search index");
+
+    // Wait for the actually-inserted documents to finish indexing, so a
+    // still-catching-up race can't be mistaken for the deliberate shortfall
+    // this test asserts below.
+    let query: Vec<f64> = vec![0.1, 0.2, 0.3, 0.4];
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let n: i64 = coll
+            .aggregate(vec![
+                doc! { "$vectorSearch": {
+                    "index": INDEX,
+                    "path": "vector",
+                    "queryVector": query.clone(),
+                    "limit": ACTUALLY_INSERTED,
+                    "exact": true,
+                } },
+                doc! { "$count": "n" },
+            ])
+            .run()
+            .ok()
+            .and_then(|c| {
+                c.filter_map(|r| r.ok())
+                    .filter_map(|d| d.get_i32("n").map(i64::from).ok())
+                    .last()
+            })
+            .unwrap_or(0);
+        if n >= ACTUALLY_INSERTED {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the actually-inserted documents never finished indexing"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    // Sum partitions over the CLAIMED range, exactly as the gate would with
+    // `expected_count = CLAIMED`.
+    let mut ranges = Vec::new();
+    let mut lo = 0i64;
+    while lo < CLAIMED {
+        let hi = (lo + WIDTH).min(CLAIMED);
+        ranges.push((lo, hi));
+        lo = hi;
+    }
+    let total: i64 = ranges
+        .iter()
+        .map(|&(lo, hi)| {
+            let pipeline = vec![
+                doc! { "$vectorSearch": {
+                    "index": INDEX,
+                    "path": "vector",
+                    "queryVector": query.clone(),
+                    "limit": hi - lo,
+                    "exact": true,
+                    "filter": { "_id": { "$gte": lo, "$lt": hi } },
+                } },
+                doc! { "$count": "n" },
+            ];
+            coll.aggregate(pipeline)
+                .run()
+                .ok()
+                .and_then(|c| {
+                    c.filter_map(|r| r.ok())
+                        .filter_map(|d| d.get_i32("n").map(i64::from).ok())
+                        .last()
+                })
+                .unwrap_or(0)
+        })
+        .sum();
+
+    assert_eq!(
+        total, ACTUALLY_INSERTED,
+        "the partitioned sum must equal what's actually indexed, not a stray number"
+    );
+    assert!(
+        total < CLAIMED,
+        "a partial corpus must sum to LESS than the claimed count — this is the \
+         #305 guarantee partitioning must not weaken"
+    );
+
+    let _ = db
+        .run_command(doc! { "dropSearchIndex": COLL, "name": INDEX })
+        .run();
+    let _ = coll.drop().run();
+}
+
+// ---------------------------------------------------------------------------
 // Issue #306 — every config addresses its OWN collection and search index
 // ---------------------------------------------------------------------------
 

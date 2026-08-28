@@ -29,6 +29,11 @@ const DEFAULT_DB: &str = "bench";
 const DEFAULT_COLLECTION: &str = "vectors";
 const DEFAULT_INDEX_NAME: &str = "vector_index";
 
+/// The field the catch-up gate's partitioned completeness probe filters on
+/// (#313). It is `_id` — dense, sequential, and already written by
+/// `insert_batch` — so no separate field or write path is needed.
+const CATCHUP_ID_FILTER_FIELD: &str = "_id";
+
 /// MongoDB refuses a fully-qualified namespace (`<db>.<collection>`) longer
 /// than 255 bytes. Verified live against `mongodb/mongodb-atlas-local:8.0.17`:
 /// a 200-byte collection under an 8-byte db is accepted, a 250-byte one is
@@ -651,6 +656,14 @@ impl MongoDBEngine {
                     );
                 }
             }
+            // `_id` as a range-filterable field: the catch-up gate's completeness
+            // probe filters on `_id` to stay under mongot's internal wire limit
+            // (#313) no matter the corpus size. No shipped schema names a field
+            // `_id`, but the check costs nothing and avoids an untested
+            // duplicate-`path` shape on Atlas if one ever does.
+            if !mapped.contains_key(CATCHUP_ID_FILTER_FIELD) {
+                mapped.insert(CATCHUP_ID_FILTER_FIELD, doc! { "type": "number" });
+            }
             doc! {
                 "name": &self.index_name,
                 "type": "search",
@@ -669,6 +682,14 @@ impl MongoDBEngine {
                         });
                     }
                 }
+            }
+
+            // See the `search`-type branch above (#313): same field, same reason.
+            if !schema_declares_field(dataset.config.schema.as_ref(), CATCHUP_ID_FILTER_FIELD) {
+                fields.push(doc! {
+                    "type": "filter",
+                    "path": CATCHUP_ID_FILTER_FIELD,
+                });
             }
 
             doc! {
@@ -753,14 +774,23 @@ impl MongoDBEngine {
     /// corpus (the observed `recall 0.27` flake).
     ///
     /// The count comes from an EXHAUSTIVE (`exact: true`, ENN) probe reduced to
-    /// a single number server-side by `$count`. An approximate probe cannot
-    /// answer the question at all: Atlas rejects `numCandidates` above 10_000
-    /// and requires `limit <= numCandidates`, so an ANN probe can never see past
-    /// the first 10_000 documents — which is why the previous capped gate
-    /// released at 0.85% indexed on glove-100 and let the run publish recall
-    /// against a near-empty index (#305). ENN takes no `numCandidates` and so
-    /// carries no such ceiling; verified against mongodb-atlas-local 8.0.17 for
-    /// both dialects, returning 12_000 of 12_000 at `limit` 12_000 and 20_000.
+    /// a single number server-side by `$count`, PARTITIONED by `_id` range and
+    /// summed (#313) — never one probe over the whole corpus. An approximate
+    /// probe cannot answer the question at all: Atlas rejects `numCandidates`
+    /// above 10_000 and requires `limit <= numCandidates`, so an ANN probe can
+    /// never see past the first 10_000 documents — which is why the previous
+    /// capped gate released at 0.85% indexed on glove-100 and let the run
+    /// publish recall against a near-empty index (#305). ENN takes no
+    /// `numCandidates` and so carries no ANN ceiling; verified against
+    /// mongodb-atlas-local 8.0.17 for both dialects, returning 12_000 of 12_000
+    /// at `limit` 12_000 and 20_000.
+    ///
+    /// A SEPARATE ceiling applies to an unpartitioned exhaustive probe: mongot
+    /// streams one entry per matched document to mongod before `$count`
+    /// collapses it, and that internal hop blows mongod's own message-size
+    /// limits above roughly 888k documents — every dataset this suite ships.
+    /// Partitioning the `_id` range, not the choice of `exact`, is what removes
+    /// THAT ceiling; see `run_partitioned_catchup_count`.
     ///
     /// There is no success path that returns while under-indexed: either the
     /// probe confirms the whole corpus, or this returns `Err` and the run stops
@@ -772,11 +802,9 @@ impl MongoDBEngine {
         dialect: SearchDialect,
     ) -> Result<IndexCoverage, String> {
         let plan = catchup_plan(expected_count);
-        let pipeline =
-            build_catchup_count_pipeline(&self.index_name, probe_vector, plan.limit, dialect);
 
         println!(
-            "Waiting for vector search index to index all {} documents (exhaustive count probe, budget {}s)...",
+            "Waiting for vector search index to index all {} documents (partitioned exhaustive count probe, budget {}s)...",
             expected_count,
             plan.deadline.as_secs()
         );
@@ -795,7 +823,14 @@ impl MongoDBEngine {
 
         loop {
             let probe_start = Instant::now();
-            let outcome = run_catchup_count(&coll, &pipeline);
+            let outcome = run_partitioned_catchup_count(
+                &coll,
+                &self.index_name,
+                probe_vector,
+                dialect,
+                expected_count,
+                CATCHUP_PARTITION_WIDTH,
+            );
             let probe_elapsed = probe_start.elapsed();
 
             match outcome {
@@ -1287,7 +1322,7 @@ fn extract_search_hits(docs: &[Document]) -> Vec<(i64, f64)> {
 }
 
 // ---------------------------------------------------------------------------
-// Index catch-up gate (#305)
+// Index catch-up gate (#305, partitioned in #313)
 // ---------------------------------------------------------------------------
 
 /// Everything about the index catch-up gate that is a pure function of the
@@ -1304,9 +1339,6 @@ struct CatchupPlan {
     /// `expected_count` itself and MUST NOT be capped: capping it is exactly
     /// how the gate came to release at 10_000 of glove-100's 1_183_514.
     want: usize,
-    /// `limit` for the probe stage. `expected_count` again, floored at 1
-    /// because the stage rejects `limit: 0`.
-    limit: usize,
     /// Wall-clock budget for the whole gate.
     deadline: Duration,
 }
@@ -1323,7 +1355,6 @@ fn catchup_plan(expected_count: usize) -> CatchupPlan {
 
     CatchupPlan {
         want: expected_count,
-        limit: expected_count.max(1),
         deadline: Duration::from_secs(
             BASE_SECS + expected_count as u64 / ASSUMED_MIN_INGEST_DOCS_PER_SEC,
         ),
@@ -1341,8 +1372,158 @@ fn catchup_poll_interval(last_probe: Duration) -> Duration {
     last_probe.clamp(Duration::from_secs(2), Duration::from_secs(30))
 }
 
+// --- Wire-limit-safe partitioning (#313) ------------------------------------
+//
+// A single exhaustive probe over the WHOLE corpus is unusable above roughly
+// 888k documents: mongot streams one entry per matched document to mongod
+// BEFORE `$count` collapses it, and that internal hop hits mongod's own
+// message-size limits — not the aggregation OUTPUT's 16MB BSON cap `$count`
+// alone would suggest. Measured live against Atlas 8.0.30 on glove-100-angular
+// (100d), the mongot->mongod message for a fully-indexed 1_183_514-document
+// corpus plateaued at exactly 63_982_277 bytes = 54.06 bytes/doc, and the
+// error surfaced two ways depending on where the message crossed a limit:
+//
+//   Error code 10334 (BSONObjectTooLarge): BSONObj size: ... is invalid.
+//     Size must be between 0 and 16793600(16MB)
+//   Error code 17 (ProtocolError): recv(): message msgLen ... is invalid.
+//     Min 16 Max: 48000000
+//
+// The fix is to never let one probe response cover more than a small,
+// wire-safe slice of the corpus: partition `0..expected_count` into
+// contiguous `_id` ranges (dense and sequential for every dataset reader in
+// this repo), probe each range independently, and sum. `CatchupPlan.want`
+// stays the full uncapped `expected_count` throughout — only the TRANSPORT of
+// the completeness count is chunked, never the bar it is compared against, so
+// this does not reopen #305.
+
+/// Single empirical sample (see above): Atlas 8.0.30, glove-100-angular, 100
+/// dimensions. Not a documented server contract — it is one measurement, and
+/// the safety margin below exists because a higher-dimensional shipped
+/// dataset (e.g. dbpedia-openai-1M-1536-angular at 1536d) may cost more bytes
+/// per matched document than this.
+const OBSERVED_BYTES_PER_DOC: f64 = 54.06;
+
+/// The tighter of the two wire ceilings #313 hit — the exact figure from the
+/// `BSONObjectTooLarge` error text, in bytes.
+const WIRE_HARD_CEILING_BYTES: f64 = 16_793_600.0;
+
+/// How much of `WIRE_HARD_CEILING_BYTES` a partition's OWN response is allowed
+/// to plan for, given `OBSERVED_BYTES_PER_DOC` is one sample, not a bound.
+const WIRE_SAFETY_MARGIN: f64 = 0.5;
+
+/// Default documents per catch-up partition — deliberately far below the
+/// wire-safe maximum the constants above would allow, since
+/// `OBSERVED_BYTES_PER_DOC` is one 100-dimension sample and a higher-dim
+/// shipped dataset could cost more per document than that.
+const CATCHUP_PARTITION_WIDTH: usize = 50_000;
+
+/// Compile-time guard: fails the BUILD, not just a test, if
+/// `CATCHUP_PARTITION_WIDTH` is ever raised past the wire-safety budget
+/// without re-deriving the math — silently reproducing #313 is not an
+/// available outcome of editing this one line.
+const _: () = assert!(
+    ((CATCHUP_PARTITION_WIDTH as f64 * OBSERVED_BYTES_PER_DOC) as u64)
+        < ((WIRE_HARD_CEILING_BYTES * WIRE_SAFETY_MARGIN) as u64),
+    "CATCHUP_PARTITION_WIDTH plans for more bytes than the wire-limit safety budget allows"
+);
+
+/// Bisection floor: a partition that still overflows the wire at this width is
+/// treated as a hard failure rather than split further.
+const CATCHUP_MIN_PARTITION_WIDTH: usize = 500;
+
+/// Tile `0..expected_count` into contiguous, half-open `[lo, hi)` ranges of at
+/// most `width` documents each — gap-free, overlap-free, summing their widths
+/// to exactly `expected_count`. This is the safety-critical arithmetic behind
+/// the catch-up gate's completeness guarantee: a gap or overlap here would
+/// silently under- or over-count the corpus.
+fn partition_ranges(expected_count: usize, width: usize) -> Vec<(i64, i64)> {
+    let width = width.max(1);
+    let mut ranges = Vec::new();
+    let mut lo = 0usize;
+    while lo < expected_count {
+        let hi = (lo + width).min(expected_count);
+        ranges.push((lo as i64, hi as i64));
+        lo = hi;
+    }
+    ranges
+}
+
+/// Whether an aggregation error is the mongot->mongod wire-overflow shape
+/// #313 identified, as opposed to some other probe failure (e.g. "index not
+/// queryable yet") that bisecting the range cannot help with.
+fn is_wire_overflow_error(e: &str) -> bool {
+    e.contains("BSONObjectTooLarge") || e.contains("ProtocolError") || e.contains("msgLen")
+}
+
+/// One partition's searchable-document count, with adaptive bisection on a
+/// wire-overflow error: halve the range and retry each half, down to
+/// `CATCHUP_MIN_PARTITION_WIDTH`, before giving up and surfacing the original
+/// error. This is what keeps a wrong `CATCHUP_PARTITION_WIDTH` a matter of a
+/// few extra round trips rather than a repeat of #313 — the default width is
+/// sized off a single empirical sample, and other datasets may need less.
+fn run_catchup_count_range(
+    coll: &mongodb::sync::Collection<Document>,
+    index_name: &str,
+    probe_vector: &[f32],
+    dialect: SearchDialect,
+    lo: i64,
+    hi: i64,
+) -> Result<usize, String> {
+    let pipeline = build_catchup_count_pipeline(index_name, probe_vector, (lo, hi), dialect);
+    match run_catchup_count(coll, &pipeline) {
+        Ok(n) => Ok(n),
+        Err(e)
+            if is_wire_overflow_error(&e) && (hi - lo) as usize > CATCHUP_MIN_PARTITION_WIDTH =>
+        {
+            let mid = lo + (hi - lo) / 2;
+            let left = run_catchup_count_range(coll, index_name, probe_vector, dialect, lo, mid)?;
+            let right = run_catchup_count_range(coll, index_name, probe_vector, dialect, mid, hi)?;
+            Ok(left + right)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Run one full sweep of the exhaustive catch-up probe, partitioned by `_id`
+/// range so no single probe response can trip mongot's internal wire limit
+/// (#313) no matter how large the corpus.
+///
+/// Ranges are swept in DESCENDING `_id` order: `upload_parallel` claims
+/// batches off an ascending atomic counter, so while a run is still catching
+/// up, the highest-id partition is the one most likely to still be short —
+/// scanning it first lets the early-exit below fire sooner. This is an
+/// ordering heuristic only; correctness never depends on it, because the
+/// full sum is still required to declare completeness.
+///
+/// Because `want == expected_count == sum of every partition's own width`, a
+/// partition returning fewer documents than its own width already proves this
+/// sweep is incomplete — the loop returns the partial sum immediately rather
+/// than paying for the remaining partitions on every single poll.
+fn run_partitioned_catchup_count(
+    coll: &mongodb::sync::Collection<Document>,
+    index_name: &str,
+    probe_vector: &[f32],
+    dialect: SearchDialect,
+    expected_count: usize,
+    width: usize,
+) -> Result<usize, String> {
+    let mut ranges = partition_ranges(expected_count, width);
+    ranges.reverse();
+
+    let mut total = 0usize;
+    for (lo, hi) in ranges {
+        let count = run_catchup_count_range(coll, index_name, probe_vector, dialect, lo, hi)?;
+        total += count;
+        if count < (hi - lo) as usize {
+            return Ok(total);
+        }
+    }
+    Ok(total)
+}
+
 /// Build the pipeline for one catch-up probe: an exhaustive nearest-neighbour
-/// query over the whole index, reduced to a single number server-side.
+/// query over one `_id` range of the index, reduced to a single number
+/// server-side.
 ///
 /// `exact: true` is what makes the count both trustworthy and UNBOUNDED. The
 /// approximate form takes `numCandidates`, which Atlas rejects above 10_000
@@ -1350,26 +1531,42 @@ fn catchup_poll_interval(last_probe: Duration) -> Duration {
 /// `limit <= numCandidates` — so no ANN probe can count past 10_000 documents,
 /// no matter how it is parameterised. The exhaustive form takes no
 /// `numCandidates` at all (passing one alongside `exact` is an error), scans
-/// every indexed document, and so returns the true indexed count.
+/// every indexed document in range, and so returns the true indexed count for
+/// that range.
 ///
-/// `$count` keeps the answer cheap on the wire: mongot still scores the corpus,
-/// but a single `{n: ...}` comes back instead of a million documents.
+/// The `[lo, hi)` filter on `_id` is what keeps the probe's OWN response small
+/// — `$count` alone only shrinks the reply on the CLIENT wire; mongot still
+/// streams one entry per matched document to mongod first, and an
+/// unpartitioned probe blows that internal hop above ~888k documents (#313).
+/// Partitioning the range, not the choice of `exact`, is what removes the
+/// ceiling.
 fn build_catchup_count_pipeline(
     index_name: &str,
     query_vector: &[f32],
-    limit: usize,
+    range: (i64, i64),
     dialect: SearchDialect,
 ) -> Vec<Document> {
+    let (lo, hi) = range;
     let bson_vec: Vec<mongodb::bson::Bson> = query_vector
         .iter()
         .map(|&f| mongodb::bson::Bson::Double(f as f64))
         .collect();
 
+    let filter = match dialect {
+        SearchDialect::VectorSearchStage => {
+            doc! { CATCHUP_ID_FILTER_FIELD: { "$gte": lo, "$lt": hi } }
+        }
+        SearchDialect::SearchStage => {
+            doc! { "range": { "path": CATCHUP_ID_FILTER_FIELD, "gte": lo, "lt": hi } }
+        }
+    };
+
     let vs_stage = doc! {
         "path": "vector",
         "queryVector": bson_vec,
-        "limit": limit as i64,
+        "limit": (hi - lo).max(0),
         "exact": true,
+        "filter": filter,
     };
 
     let search_stage = match dialect {
@@ -1612,6 +1809,15 @@ pub(crate) fn schema_declares_geo(schema: Option<&serde_json::Value>) -> bool {
     schema
         .and_then(|s| s.as_object())
         .is_some_and(|o| o.values().any(|t| t.as_str() == Some("geo")))
+}
+
+/// Whether the dataset schema already declares a field named `field_name` —
+/// used to avoid pushing a duplicate `path` into the index definition when
+/// adding the catch-up gate's own `_id` filter field (#313).
+fn schema_declares_field(schema: Option<&serde_json::Value>, field_name: &str) -> bool {
+    schema
+        .and_then(|s| s.as_object())
+        .is_some_and(|o| o.contains_key(field_name))
 }
 
 /// The `mappings.fields` entry for one schema field in a `search`-type index.
@@ -3095,6 +3301,19 @@ mod tests {
         assert!(!schema_declares_geo(None));
     }
 
+    /// Guards the duplicate-`path` avoidance in `create_vector_index` (#313):
+    /// the catch-up gate's own `_id` filter field must not be pushed twice if
+    /// a dataset schema ever names a field `_id`.
+    #[test]
+    fn schema_declares_field_checks_by_name_not_by_type() {
+        assert!(schema_declares_field(Some(&json!({"_id": "int"})), "_id"));
+        assert!(!schema_declares_field(
+            Some(&json!({"category": "keyword"})),
+            "_id"
+        ));
+        assert!(!schema_declares_field(None, "_id"));
+    }
+
     #[test]
     fn search_dialect_geo_emits_geo_within_circle_in_metres() {
         let d = parse_mongo_search_conditions(
@@ -3427,22 +3646,7 @@ mod tests {
                 "catch-up must wait for all {expected} documents, not a capped \
                  fraction of them (#305)"
             );
-            assert_eq!(
-                plan.limit, expected,
-                "the probe must ASK for all {expected} documents; a smaller limit \
-                 makes a complete count unobservable no matter what `want` says"
-            );
         }
-    }
-
-    /// `limit: 0` is rejected by the stage, so an empty corpus still asks for
-    /// one document — while `want` stays 0, so the gate releases immediately
-    /// rather than waiting for a document that will never exist.
-    #[test]
-    fn catchup_plan_floors_the_probe_limit_at_one() {
-        let plan = catchup_plan(0);
-        assert_eq!(plan.want, 0);
-        assert_eq!(plan.limit, 1);
     }
 
     /// A gate that genuinely waits for the whole corpus needs a budget that
@@ -3487,14 +3691,16 @@ mod tests {
     /// requires `limit <= numCandidates`. A probe carrying `numCandidates` is
     /// therefore a probe that has silently reacquired the #305 ceiling — and it
     /// is also the shape that produced the secondary hazard the issue names
-    /// (`limit == numCandidates == 10_000`).
+    /// (`limit == numCandidates == 10_000`). It must also carry the `_id` range
+    /// filter (#313) — without it, one probe covers the whole corpus again and
+    /// reproduces the wire-limit failure the partitioning exists to avoid.
     #[test]
-    fn catchup_probe_is_exhaustive_and_carries_no_ann_knob() {
+    fn catchup_probe_is_exhaustive_partitioned_and_carries_no_ann_knob() {
         let query = vec![0.1f32, -0.2, 0.3];
         let pipeline = build_catchup_count_pipeline(
             "vidx",
             &query,
-            1_183_514,
+            (200_000, 250_000),
             SearchDialect::VectorSearchStage,
         );
 
@@ -3511,24 +3717,30 @@ mod tests {
         );
         assert_eq!(
             vs.get_i64("limit").unwrap(),
-            1_183_514,
-            "the probe must ask for the whole corpus, above the ANN ceiling"
+            50_000,
+            "the probe must ask for exactly this partition's width, not the whole corpus"
         );
         assert_eq!(vs.get_str("index").unwrap(), "vidx");
 
+        let filter = vs.get_document("filter").unwrap();
+        let id_range = filter.get_document("_id").unwrap();
+        assert_eq!(id_range.get_i64("$gte").unwrap(), 200_000);
+        assert_eq!(id_range.get_i64("$lt").unwrap(), 250_000);
+
         // Counted server-side: mongot still scans, but one `{n: ...}` comes back
-        // instead of a million documents.
+        // instead of the whole partition's documents.
         assert_eq!(pipeline[1], doc! { "$count": "n" });
     }
 
     /// The geo datasets run the `$search` dialect (#223), and they are subject
-    /// to exactly the same ceiling — so the same exhaustive shape has to reach
-    /// the other stage too, nested under the `vectorSearch` operator.
+    /// to exactly the same ceiling — so the same exhaustive, partitioned shape
+    /// has to reach the other stage too, nested under the `vectorSearch`
+    /// operator, with the `_id` range in that dialect's own filter grammar.
     #[test]
-    fn catchup_probe_is_exhaustive_on_the_search_dialect_too() {
+    fn catchup_probe_is_exhaustive_partitioned_on_the_search_dialect_too() {
         let query = vec![0.1f32, -0.2, 0.3];
         let pipeline =
-            build_catchup_count_pipeline("vidx", &query, 25_000, SearchDialect::SearchStage);
+            build_catchup_count_pipeline("vidx", &query, (0, 25_000), SearchDialect::SearchStage);
 
         let vs = pipeline[0]
             .get_document("$search")
@@ -3549,7 +3761,85 @@ mod tests {
                 .unwrap(),
             "vidx"
         );
+
+        let range = vs
+            .get_document("filter")
+            .unwrap()
+            .get_document("range")
+            .unwrap();
+        assert_eq!(range.get_str("path").unwrap(), "_id");
+        assert_eq!(range.get_i64("gte").unwrap(), 0);
+        assert_eq!(range.get_i64("lt").unwrap(), 25_000);
+
         assert_eq!(pipeline[1], doc! { "$count": "n" });
+    }
+
+    /// The safety-critical arithmetic behind the completeness guarantee: the
+    /// tiling must be gap-free, overlap-free, and sum its widths to exactly
+    /// `expected_count` — a bug here would silently under- or over-count the
+    /// corpus (#313).
+    #[test]
+    fn partition_ranges_tiles_the_corpus_without_gaps_or_overlaps() {
+        for (expected_count, width) in [
+            (0usize, 50_000usize),
+            (1, 50_000),
+            (49_999, 50_000),
+            (50_000, 50_000),
+            (50_001, 50_000),
+            (1_183_514, 50_000),
+            (10, 1),
+        ] {
+            let ranges = partition_ranges(expected_count, width);
+            let mut expected_lo = 0i64;
+            for &(lo, hi) in &ranges {
+                assert_eq!(
+                    lo, expected_lo,
+                    "range must start exactly where the previous one ended \
+                     (expected_count={expected_count}, width={width})"
+                );
+                assert!(hi > lo, "range must be non-empty: ({lo}, {hi})");
+                expected_lo = hi;
+            }
+            assert_eq!(
+                expected_lo, expected_count as i64,
+                "the tiling must cover exactly [0, expected_count) with nothing left over \
+                 (expected_count={expected_count}, width={width})"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_ranges_is_empty_for_an_empty_corpus() {
+        assert_eq!(partition_ranges(0, 50_000), Vec::<(i64, i64)>::new());
+    }
+
+    /// A corpus smaller than the partition width must produce exactly the one
+    /// range the un-partitioned probe used to ask for — partitioning must not
+    /// change behaviour below the width it exists to protect against.
+    #[test]
+    fn partition_ranges_is_a_single_range_below_the_width() {
+        assert_eq!(partition_ranges(10_001, 50_000), vec![(0, 10_001)]);
+    }
+
+    // `CATCHUP_PARTITION_WIDTH` staying under the wire-safety budget is
+    // enforced by a compile-time `const _: () = assert!(...)` right next to
+    // its definition — a build-time guard, not just a test-time one.
+
+    #[test]
+    fn wire_overflow_error_is_recognised_by_either_observed_shape() {
+        assert!(is_wire_overflow_error(
+            "catch-up count failed: Error code 10334 (BSONObjectTooLarge): BSONObj size: \
+             28234354 is invalid. Size must be between 0 and 16793600(16MB)"
+        ));
+        assert!(is_wire_overflow_error(
+            "catch-up count failed: Error code 17 (ProtocolError): PlanExecutor error during \
+             aggregation :: caused by :: recv(): message msgLen 63982277 is invalid. Min 16 \
+             Max: 48000000"
+        ));
+        assert!(
+            !is_wire_overflow_error("catch-up count failed: index 'vidx' is not queryable yet"),
+            "an unrelated probe error must not trigger bisection — it cannot help"
+        );
     }
 
     /// The count reader must not depend on the integer width `$count` happens
