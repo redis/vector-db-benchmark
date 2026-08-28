@@ -46,6 +46,24 @@ const CATCHUP_ID_FILTER_FIELD: &str = "_id";
 /// accepted a 5000-byte `createSearchIndexes` name, so `index_name` is left
 /// unbounded. It does, however, have a CHARACTER restriction that the local
 /// image does not enforce — see [`derive_search_index_name`].
+/// How long to wait for `createSearchIndexes` to report the index queryable.
+///
+/// This was a flat 120s, which is not enough on Atlas. Index creation there is a
+/// control-plane operation whose latency depends on the fleet rather than on our
+/// corpus: observed at 8 concurrent clusters in one project, one
+/// `gist-960-euclidean` config exceeded 120s and was lost with
+/// `Vector search index did not become ready within 120 seconds`, while the five
+/// configs beside it — same cluster, same dataset, same corpus — passed. A
+/// benchmark that randomly drops a build cell yields a partial grid, and a
+/// partial grid biases matched-recall comparison, so the flake is not cosmetic.
+///
+/// 600s matches the base allowance the catch-up gate already gives itself
+/// (`catchup_plan`'s `BASE_SECS`), so the two waits are no longer an order of
+/// magnitude apart for no stated reason. This only changes how long a genuinely
+/// stuck index takes to report failure; a healthy one still returns as soon as
+/// it is queryable.
+const INDEX_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 const MAX_NAMESPACE_BYTES: usize = 255;
 
 /// Per-config search index name, safe for MongoDB **Atlas**.
@@ -720,7 +738,7 @@ impl MongoDBEngine {
     fn wait_for_index_ready(&self) -> Result<(), String> {
         println!("Waiting for vector search index to become ready...");
         let db = self.client.database(&self.db_name);
-        let deadline = Instant::now() + std::time::Duration::from_secs(120);
+        let deadline = Instant::now() + INDEX_READY_TIMEOUT;
 
         loop {
             let cmd = doc! {
@@ -753,9 +771,10 @@ impl MongoDBEngine {
             }
 
             if Instant::now() > deadline {
-                return Err(
-                    "Vector search index did not become ready within 120 seconds".to_string(),
-                );
+                return Err(format!(
+                    "Vector search index did not become ready within {}s",
+                    INDEX_READY_TIMEOUT.as_secs()
+                ));
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
