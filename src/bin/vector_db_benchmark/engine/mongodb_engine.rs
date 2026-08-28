@@ -1472,7 +1472,9 @@ fn run_catchup_count_range(
     let pipeline = build_catchup_count_pipeline(index_name, probe_vector, (lo, hi), dialect);
     match run_catchup_count(coll, &pipeline) {
         Ok(n) => Ok(n),
-        Err(e) if is_wire_overflow_error(&e) && (hi - lo) as usize > CATCHUP_MIN_PARTITION_WIDTH => {
+        Err(e)
+            if is_wire_overflow_error(&e) && (hi - lo) as usize > CATCHUP_MIN_PARTITION_WIDTH =>
+        {
             let mid = lo + (hi - lo) / 2;
             let left = run_catchup_count_range(coll, index_name, probe_vector, dialect, lo, mid)?;
             let right = run_catchup_count_range(coll, index_name, probe_vector, dialect, mid, hi)?;
@@ -3304,10 +3306,7 @@ mod tests {
     /// a dataset schema ever names a field `_id`.
     #[test]
     fn schema_declares_field_checks_by_name_not_by_type() {
-        assert!(schema_declares_field(
-            Some(&json!({"_id": "int"})),
-            "_id"
-        ));
+        assert!(schema_declares_field(Some(&json!({"_id": "int"})), "_id"));
         assert!(!schema_declares_field(
             Some(&json!({"category": "keyword"})),
             "_id"
@@ -3740,12 +3739,8 @@ mod tests {
     #[test]
     fn catchup_probe_is_exhaustive_partitioned_on_the_search_dialect_too() {
         let query = vec![0.1f32, -0.2, 0.3];
-        let pipeline = build_catchup_count_pipeline(
-            "vidx",
-            &query,
-            (0, 25_000),
-            SearchDialect::SearchStage,
-        );
+        let pipeline =
+            build_catchup_count_pipeline("vidx", &query, (0, 25_000), SearchDialect::SearchStage);
 
         let vs = pipeline[0]
             .get_document("$search")
@@ -3767,7 +3762,11 @@ mod tests {
             "vidx"
         );
 
-        let range = vs.get_document("filter").unwrap().get_document("range").unwrap();
+        let range = vs
+            .get_document("filter")
+            .unwrap()
+            .get_document("range")
+            .unwrap();
         assert_eq!(range.get_str("path").unwrap(), "_id");
         assert_eq!(range.get_i64("gte").unwrap(), 0);
         assert_eq!(range.get_i64("lt").unwrap(), 25_000);
