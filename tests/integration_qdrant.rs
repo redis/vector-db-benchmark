@@ -637,6 +637,150 @@ fn test_binary_qdrant_sparse() {
     assert!(precision >= 0.9, "sparse precision {:.3} < 0.9", precision);
 }
 
+/// End-to-end MULTIVECTOR (ColBERT-style / MaxSim) coverage: build a small
+/// multivector dataset (via the shared `write_multivector_project` fixture,
+/// genuinely brute-forced ground truth — see `generate_multivector`), run the
+/// real engine (a "colbert" named vector with `multivector_config`/`MaxSim`,
+/// upsert of ragged per-doc token vectors, and a `query_points` search using
+/// that named vector), then assert recall against the brute-force MaxSim
+/// ranking. `indexing_threshold` is a KB-of-vector-data size, not a doc count
+/// — at this fixture's size (150 docs, mean 6 tokens each of 16-dim f32
+/// vectors, ≈56 KB of vector data total) Qdrant's collection stays roughly
+/// 350x (~2.5 orders of magnitude) under the default HNSW `indexing_threshold`
+/// (20000 KB), so no segment is ever indexed and the search is an exact full
+/// scan, not ANN — recall must therefore be exact, not merely above a
+/// tolerant floor.
+#[test]
+fn test_binary_qdrant_multivector() {
+    wait_for_qdrant();
+
+    let configs = serde_json::json!([{
+        "name": "qdrant-multivector-cov", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1}], "upload_params": {"parallel": 1, "batch_size": 50}
+    }]);
+    let proj = common::write_multivector_project(
+        "multivector-cov",
+        &serde_json::to_string(&configs).unwrap(),
+    );
+
+    assert!(
+        run_qdrant_binary(&proj.root, "qdrant-multivector-cov", "multivector-cov"),
+        "multivector run failed"
+    );
+    let recall = common::read_recall(&proj.root, "qdrant-multivector-cov");
+    println!("qdrant multivector recall={:.3} (top={})", recall, proj.top);
+    assert!(
+        recall >= 0.999,
+        "multivector recall {:.3} < 0.999 — this fixture is small enough that Qdrant \
+         never builds an HNSW segment (exact full scan), so recall must be exact",
+        recall
+    );
+}
+
+/// The normalization guard must survive `--skip-upload`, which skips
+/// `configure`/`upload` entirely and so never reaches the Qdrant-side check
+/// inside `create_multivector_collection` — yet search still reads via
+/// `Dataset::read_multivector_queries`, which is where the guard now also
+/// lives (#316 review round 2: the guard was originally placed ONLY in
+/// `create_multivector_collection`, leaving this exact entry point open).
+///
+/// Reproduces the reviewer's scenario precisely: upload once under a
+/// `dot`-distance registration (the guard doesn't fire, so a real 150-point
+/// corpus lands in Qdrant), then re-register the SAME corpus under `cosine`
+/// and rerun with `--skip-upload` — corpus reuse succeeds (the collection
+/// genuinely holds all 150 points), so the run reaches search, which must now
+/// fail on the normalization guard rather than publish a wrong recall number.
+#[test]
+fn test_binary_qdrant_multivector_skip_upload_rejects_cosine() {
+    wait_for_qdrant();
+    delete_collection();
+
+    let configs = serde_json::json!([{
+        "name": "qdrant-multivector-cosine-guard", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1}], "upload_params": {"parallel": 1, "batch_size": 50}
+    }]);
+    let proj = common::write_multivector_project(
+        "multivector-cosine-guard",
+        &serde_json::to_string(&configs).unwrap(),
+    );
+
+    let run = |extra: &[&str]| -> std::process::Output {
+        let mut cmd = std::process::Command::new(binary_path());
+        cmd.args([
+            "--engines",
+            "qdrant-multivector-cosine-guard",
+            "--datasets",
+            &proj.dataset_name,
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+        ])
+        .args(extra)
+        .env("QDRANT_GRPC_PORT", qdrant_grpc_port().to_string())
+        .env("QDRANT_REST_PORT", qdrant_rest_port().to_string())
+        .current_dir(&proj.root);
+        cmd.output().expect("run vector-db-benchmark")
+    };
+
+    // --keep-data: phase 2 needs the collection still present under
+    // --skip-upload — without it the normal end-of-run cleanup would delete
+    // it, and phase 2 would fail on "corpus is empty" instead of the guard.
+    let phase1 = run(&["--keep-data"]);
+    assert!(
+        phase1.status.success(),
+        "phase 1 (dot upload) failed:\n{}{}",
+        String::from_utf8_lossy(&phase1.stdout),
+        String::from_utf8_lossy(&phase1.stderr)
+    );
+
+    // Re-register the IDENTICAL corpus/collection under "cosine" — same
+    // dataset name and path, so data.mvec and the Qdrant collection are
+    // unchanged; only the declared distance flips.
+    let datasets_json = serde_json::json!([{
+        "name": proj.dataset_name, "type": "multivector", "path": proj.dataset_name,
+        "distance": "cosine", "vector_size": proj.dim,
+    }]);
+    std::fs::write(
+        proj.root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+
+    let phase2 = run(&["--skip-upload", "--keep-data"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&phase2.stdout),
+        String::from_utf8_lossy(&phase2.stderr)
+    );
+    assert!(
+        !phase2.status.success(),
+        "--skip-upload against a cosine-declared multivector dataset must fail.\n{combined}"
+    );
+    // The guard's message also appears in the non-fatal ground-truth-profiling
+    // Note ("could not profile ground-truth widths"), which fires on every run
+    // of this dataset regardless of what (if anything) kills it later — so a
+    // bare substring match over the whole output can't tell the fatal
+    // search-phase guard from that harmless note. `main.rs` prints the
+    // top-level fatal error as its own "Error: ..." line, but wrapped in
+    // "[config=... dataset=...] search failed (all N repetition(s)): ..."
+    // context first, so "Error: multivector dataset" is NOT a contiguous
+    // substring — find the actual "Error:" line and check ITS content.
+    let error_line = combined
+        .lines()
+        .find(|l| l.starts_with("Error:"))
+        .unwrap_or_else(|| panic!("no top-level 'Error:' line in output.\n{combined}"));
+    assert!(
+        error_line.contains("per-token normalization"),
+        "the fatal Error: line must be the normalization guard, not something else.\n{error_line}"
+    );
+
+    delete_collection();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
 /// End-to-end HYBRID (dense + sparse) coverage WITH a negative control.
 ///
 /// The planted dataset's ground truth is recoverable ONLY by fusing both

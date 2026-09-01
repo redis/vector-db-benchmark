@@ -9,9 +9,10 @@ use crate::download;
 use vector_db_benchmark::query_filter::QueryConditions;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
-    csr_row_count, hdf5_train_row_count, npy_row_count, read_compound_data, read_compound_queries,
-    read_gt_neighbours, read_hdf5_vectors, read_jsonl_queries, read_jsonl_vectors,
-    read_npy_vectors, read_sparse_matrix, SparseVector,
+    csr_row_count, hdf5_train_row_count, mvec_row_count, npy_row_count, read_compound_data,
+    read_compound_queries, read_gt_neighbours, read_hdf5_vectors, read_jsonl_queries,
+    read_jsonl_vectors, read_multivector_matrix, read_npy_vectors, read_sparse_matrix, MultiVector,
+    SparseVector,
 };
 
 /// Dataset wrapper that provides access to vectors and metadata
@@ -137,6 +138,9 @@ impl Dataset {
             // `msmarco-sparse-100K`/`-1M` share one query set, so a correct
             // count paired with the WRONG `data.csr` used to pass.
             "sparse" => "csr",
+            // "multivector" (.mvec) is measurable the same way: its 8-byte
+            // header's first u32 is num_rows (see multivector_reader.rs).
+            "multivector" => "mvec",
             // "h5-multi" (many part files) is the one layout left with no cheap
             // row count: the total is the sum of 100 part headers and the parts
             // are not all present. It still falls back to the declared count.
@@ -171,6 +175,17 @@ impl Dataset {
                 }
                 let s = csr.to_str().ok_or("Invalid data.csr path encoding")?;
                 csr_row_count(s).map(Some)
+            }
+            "mvec" => {
+                // Mirrors the "csr" case: the corpus lives in <dir>/data.mvec,
+                // queries.mvec is separate, and an absent data.mvec is the
+                // --skip-upload case, not zero.
+                let mvec = path.join("data.mvec");
+                if !mvec.exists() {
+                    return Ok(None);
+                }
+                let s = mvec.to_str().ok_or("Invalid data.mvec path encoding")?;
+                mvec_row_count(s).map(Some)
             }
             _ => {
                 let file = if path.is_dir() {
@@ -249,8 +264,8 @@ impl Dataset {
     /// Prefers the MEASURED corpus size over the declared `vector_count`, so a
     /// wrong number in `datasets.json` can no longer authorise an early skip
     /// (#224). It falls back to the declared count ONLY for the layouts that
-    /// genuinely have no cheap row count (`sparse`, `h5-multi`) and whose corpus
-    /// files are all present; everything else must be measured or is reported as
+    /// genuinely have no cheap row count (`sparse`, `multivector`, `h5-multi`)
+    /// and whose corpus files are all present; everything else must be measured or is reported as
     /// `Ok(None)` — which callers must read as "cannot confirm completeness, do
     /// NOT skip".
     ///
@@ -300,9 +315,11 @@ impl Dataset {
     ///
     /// `sparse` IS measurable now — [`csr_row_count`] reads `n_row` out of
     /// `data.csr`'s 24-byte header — but only when that file is on this machine,
-    /// which under `--skip-upload` it often is not. `h5-multi` is the one layout
-    /// with no cheap count at all: the total is the sum of 100 part headers.
-    /// Everything else must be MEASURED and is never allowed to fall back (#224).
+    /// which under `--skip-upload` it often is not. `multivector` is measurable
+    /// the same way ([`mvec_row_count`]), for the same reason. `h5-multi` is the
+    /// one layout with no cheap count at all: the total is the sum of 100 part
+    /// headers. Everything else must be MEASURED and is never allowed to fall
+    /// back (#224).
     ///
     /// Deliberately says nothing about whether the files are present: callers
     /// that must not skip an upload want [`Self::unmeasurable_corpus_is_present`]
@@ -311,7 +328,7 @@ impl Dataset {
     pub fn may_fall_back_to_declared_count(&self) -> bool {
         matches!(
             self.config.dataset_type.as_deref().unwrap_or(""),
-            "sparse" | "h5-multi"
+            "sparse" | "multivector" | "h5-multi"
         )
     }
 
@@ -319,14 +336,17 @@ impl Dataset {
     /// corpus files are on disk (no download attempted).
     ///
     /// Measurable layouts always answer `false`: they have a row count, so they
-    /// must be measured rather than trusted. Only `sparse` (CSR) and `h5-multi`
-    /// (many part files) may fall back to the declared count, and only when the
-    /// files they need actually exist.
+    /// must be measured rather than trusted. Only `sparse` (CSR), `multivector`
+    /// (`.mvec` header), and `h5-multi` (many part files) may fall back to the
+    /// declared count, and only when the files they need actually exist.
     fn unmeasurable_corpus_is_present(&self) -> bool {
         match self.config.dataset_type.as_deref().unwrap_or("") {
             "sparse" => self
                 .local_path()
                 .is_some_and(|p| p.join("data.csr").exists()),
+            "multivector" => self
+                .local_path()
+                .is_some_and(|p| p.join("data.mvec").exists()),
             "h5-multi" => self
                 .config
                 .path
@@ -672,6 +692,88 @@ impl Dataset {
         Ok((dense_queries, sparse_queries, neighbours))
     }
 
+    /// Whether this is a multi-vector (ColBERT-style / late-interaction) dataset
+    /// (`dataset_type: "multivector"`).
+    ///
+    /// Each row is a ragged list of token embeddings rather than one vector,
+    /// scored via MaxSim (sum over query tokens of the max dot product against
+    /// any document token) rather than a single-vector distance. Stored as
+    /// `data.mvec` / `queries.mvec` (see `readers::multivector_reader`), with
+    /// ground truth shared with the other layouts via `neighbours.jsonl`.
+    pub fn is_multivector(&self) -> bool {
+        self.config.dataset_type.as_deref() == Some("multivector")
+    }
+
+    /// Refuse a multivector dataset whose distance requires per-token
+    /// normalization, since neither `read_multivector_data`/
+    /// `read_multivector_queries` nor `generate_multivector`'s brute-force
+    /// ground truth apply it — silently proceeding would score
+    /// normalized-in-engine vectors against un-normalized ground truth, a
+    /// silent-wrong-result bug rather than a missing feature.
+    ///
+    /// Called from BOTH `read_multivector_data` and `read_multivector_queries`
+    /// (not just the Qdrant `configure` path) because `--skip-upload` skips
+    /// `configure`/`upload` entirely — an engine-side-only guard would leave
+    /// the search and ground-truth-profiling paths unprotected, which is
+    /// exactly the entry point `--skip-upload` exists to use (#238).
+    pub fn ensure_multivector_normalized(&self) -> Result<(), String> {
+        if !self.needs_normalization() {
+            return Ok(());
+        }
+        let declared = match self.config.distance.as_deref() {
+            Some(d) => format!("declares distance '{}'", d),
+            None => "declares no distance (defaults to 'cosine')".to_string(),
+        };
+        Err(format!(
+            "multivector dataset '{}' {}, which requires per-token normalization \
+             that read_multivector_data/read_multivector_queries do not yet apply — \
+             refusing rather than silently scoring against un-normalized ground truth",
+            self.config.name, declared
+        ))
+    }
+
+    /// Read multi-vector upload data from `<dir>/data.mvec`. Ids are the row indices.
+    pub fn read_multivector_data(&self) -> Result<(Vec<i64>, Vec<MultiVector>), String> {
+        self.ensure_multivector_normalized()?;
+        let dir = self.get_path()?;
+        // Same declared-vs-actual cross-check as read_vectors/read_hybrid_data (#224).
+        self.validate_vector_count()?;
+        let vectors = read_multivector_matrix(
+            dir.join("data.mvec")
+                .to_str()
+                .ok_or("Invalid data.mvec path")?,
+        )?;
+        let ids: Vec<i64> = (0..vectors.len() as i64).collect();
+        Ok((ids, vectors))
+    }
+
+    /// Read multi-vector queries from `<dir>/queries.mvec` plus ground-truth
+    /// neighbours from `<dir>/neighbours.jsonl`. Mirrors `read_hybrid_queries`'s
+    /// row-alignment guard: a short or misaligned ground truth must fail loudly
+    /// rather than index out of bounds or score the wrong query.
+    pub fn read_multivector_queries(&self) -> Result<(Vec<MultiVector>, Vec<Vec<i64>>), String> {
+        self.ensure_multivector_normalized()?;
+        let dir = self.get_path()?;
+        let queries = read_multivector_matrix(
+            dir.join("queries.mvec")
+                .to_str()
+                .ok_or("Invalid queries.mvec path")?,
+        )?;
+
+        let gt_path = dir.join("neighbours.jsonl");
+        let neighbours = read_neighbours_strict(&gt_path)?;
+
+        if neighbours.len() != queries.len() {
+            return Err(format!(
+                "multivector ground-truth row mismatch in {}: {} queries vs {} neighbour rows",
+                dir.display(),
+                queries.len(),
+                neighbours.len()
+            ));
+        }
+        Ok((queries, neighbours))
+    }
+
     /// Read queries from HDF5 file (test + neighbors datasets).
     #[allow(clippy::type_complexity)]
     fn read_hdf5_queries(&self, path_str: &str) -> Result<(Vec<Vec<f32>>, Vec<Vec<i64>>), String> {
@@ -772,7 +874,7 @@ mod tests {
     use super::*;
     use crate::config::DatasetConfig;
     use vector_db_benchmark::readers::{
-        write_gt_neighbours, write_npy_vectors, write_sparse_matrix,
+        write_gt_neighbours, write_multivector_matrix, write_npy_vectors, write_sparse_matrix,
     };
 
     /// A dataset of the given `dataset_type` rooted at an absolute temp path.
@@ -1257,5 +1359,126 @@ mod tests {
         .unwrap();
         let ds = hybrid_dataset(p);
         assert!(ds.read_hybrid_data(false).is_err());
+    }
+
+    /// A multivector dataset rooted at `dir`, with a configurable (possibly
+    /// omitted) `distance` — the exact axis the normalization guard branches on.
+    fn multivector_dataset(dir: &std::path::Path, distance: Option<&str>) -> Dataset {
+        multivector_dataset_with_count(dir, distance, None)
+    }
+
+    /// Same as [`multivector_dataset`], but with a configurable declared
+    /// `vector_count` — the axis `validate_vector_count`'s declared-vs-measured
+    /// cross-check (#224) branches on.
+    fn multivector_dataset_with_count(
+        dir: &std::path::Path,
+        distance: Option<&str>,
+        vector_count: Option<i64>,
+    ) -> Dataset {
+        let mut cfg = hybrid_dataset(dir).config;
+        cfg.name = "multivector-unit".to_string();
+        cfg.dataset_type = Some("multivector".to_string());
+        cfg.distance = distance.map(|d| d.to_string());
+        cfg.vector_count = vector_count;
+        Dataset::new(cfg)
+    }
+
+    /// The normalization guard must fire from BOTH `read_multivector_data` and
+    /// `read_multivector_queries` — not just the Qdrant-side `configure` call —
+    /// because `--skip-upload` never calls `configure`/`upload` at all, yet
+    /// still reaches search and ground-truth profiling through these two
+    /// functions (#316 review round 2). Uses a nonexistent directory: the
+    /// guard must fire BEFORE any file access, so no fixture files are needed.
+    #[test]
+    fn multivector_normalization_guard_covers_both_read_paths() {
+        let dir = std::path::Path::new("/nonexistent/multivector-guard-test");
+        for distance in [Some("cosine"), Some("angular"), None] {
+            let ds = multivector_dataset(dir, distance);
+            let data_err = ds.read_multivector_data().unwrap_err();
+            assert!(
+                data_err.contains("per-token normalization"),
+                "distance={distance:?}: read_multivector_data got: {data_err}"
+            );
+            let queries_err = ds.read_multivector_queries().unwrap_err();
+            assert!(
+                queries_err.contains("per-token normalization"),
+                "distance={distance:?}: read_multivector_queries got: {queries_err}"
+            );
+        }
+    }
+
+    /// The error message must distinguish an EXPLICIT cosine/angular
+    /// declaration from an OMITTED `distance` (which defaults to cosine) —
+    /// `dataset.distance()` collapses both to `"cosine"`, so building the
+    /// message from it alone would claim a declaration that isn't there.
+    #[test]
+    fn multivector_normalization_error_distinguishes_declared_from_omitted_distance() {
+        let dir = std::path::Path::new("/nonexistent/multivector-guard-test");
+        let declared = multivector_dataset(dir, Some("cosine"))
+            .read_multivector_queries()
+            .unwrap_err();
+        assert!(
+            declared.contains("declares distance 'cosine'"),
+            "got: {declared}"
+        );
+        let omitted = multivector_dataset(dir, None)
+            .read_multivector_queries()
+            .unwrap_err();
+        assert!(omitted.contains("declares no distance"), "got: {omitted}");
+    }
+
+    /// A dataset that does NOT need normalization (dot/l2) must not trip the
+    /// guard — it should fail later, on the missing files, not on distance.
+    #[test]
+    fn multivector_dot_distance_does_not_trip_the_normalization_guard() {
+        let dir = std::path::Path::new("/nonexistent/multivector-guard-test");
+        let err = multivector_dataset(dir, Some("dot"))
+            .read_multivector_queries()
+            .unwrap_err();
+        assert!(
+            !err.contains("per-token normalization"),
+            "dot distance must not trip the normalization guard, got: {err}"
+        );
+    }
+
+    /// `validate_vector_count`'s declared-vs-measured cross-check (#224) must
+    /// cover `.mvec` too — round 1 added `mvec_row_count`/`measured_vector_count`
+    /// wiring specifically for this, but nothing exercised it end-to-end.
+    /// Mirrors `count_mismatch_is_fatal_only_when_the_corpus_is_bigger_than_declared`.
+    #[test]
+    fn multivector_count_mismatch_is_fatal_only_when_the_corpus_is_bigger_than_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<MultiVector> = (0..10)
+            .map(|i| MultiVector {
+                vectors: vec![vec![i as f32, 0.0, 0.0]],
+            })
+            .collect();
+        write_multivector_matrix(dir.path().join("data.mvec").to_str().unwrap(), &rows).unwrap();
+
+        let under = multivector_dataset_with_count(dir.path(), Some("dot"), Some(3));
+        let err = under
+            .validate_vector_count()
+            .expect_err("corpus larger than declared must be fatal");
+        // Substring match, not bare digits: `compare_counts` also interpolates
+        // the tempdir path (e.g. `/tmp/.tmpAB3xyz`), so `err.contains('3')`
+        // alone could spuriously pass on a random path digit ~9% of the time.
+        assert!(
+            err.contains("vector_count 3") && err.contains("holds 10 vectors"),
+            "{err}"
+        );
+        assert!(
+            under.read_multivector_data().is_err(),
+            "read_multivector_data must surface the mismatch rather than benchmark a lie"
+        );
+
+        let over = multivector_dataset_with_count(dir.path(), Some("dot"), Some(1_000));
+        over.validate_vector_count()
+            .expect("corpus smaller than declared only warns");
+        assert_eq!(over.read_multivector_data().unwrap().1.len(), 10);
+
+        // No declared count is unconstrained.
+        let silent = multivector_dataset_with_count(dir.path(), Some("dot"), None);
+        silent.validate_vector_count().unwrap();
+        assert_eq!(silent.measured_vector_count().unwrap(), Some(10));
     }
 }

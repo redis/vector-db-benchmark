@@ -1167,6 +1167,14 @@ fn run_single_experiment(
         );
         return Ok(());
     }
+    if dataset.is_multivector() && !engine.supports_multivector() {
+        println!(
+            "Skipping {} - {}: the dataset is multivector and this engine has no multivector path",
+            engine.name(),
+            dataset.config.name
+        );
+        return Ok(());
+    }
 
     // Check if we should skip
     if args.skip_if_exists {

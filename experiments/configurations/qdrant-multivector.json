@@ -1,0 +1,17 @@
+[
+  {
+    "name": "qdrant-multivector",
+    "engine": "qdrant",
+    "connection_params": { "timeout": 300 },
+    "collection_params": {
+      "timeout": 300,
+      "hnsw_config": { "m": 16, "ef_construct": 128 },
+      "optimizers_config": { "memmap_threshold": 25000000 }
+    },
+    "search_params": [
+      { "parallel": 1 },
+      { "parallel": 8 }
+    ],
+    "upload_params": { "parallel": 16, "batch_size": 1024 }
+  }
+]

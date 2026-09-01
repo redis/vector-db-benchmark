@@ -17,8 +17,13 @@ use std::path::{Path, PathBuf};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use vector_db_benchmark::readers::{write_gt_neighbours, write_npy_vectors, write_sparse_matrix};
-use vector_db_benchmark::synthetic::{generate_hybrid, generate_sparse, HybridData, SparseData};
+use vector_db_benchmark::readers::{
+    write_gt_neighbours, write_multivector_matrix, write_npy_vectors, write_sparse_matrix,
+};
+use vector_db_benchmark::synthetic::{
+    generate_hybrid, generate_multivector, generate_sparse, HybridData, MultiVectorGenData,
+    SparseData,
+};
 
 /// Keyword values assigned round-robin to documents by `id % 4`.
 ///
@@ -1699,6 +1704,92 @@ pub fn write_hybrid_project(dataset_name: &str, engine_configs_json: &str) -> Hy
         dataset_name: dataset_name.to_string(),
         dense_dataset_name,
         top: k,
+    }
+}
+
+// ── Multi-vector (ColBERT-style / MaxSim) fixture ───────────────────────────
+
+/// A built multivector-benchmark project.
+pub struct MultiVectorProject {
+    pub root: PathBuf,
+    pub dataset_name: String,
+    pub top: usize,
+    /// Per-token dimensionality — exposed so callers that need to re-register
+    /// this SAME corpus under a different `datasets.json` (e.g. to flip
+    /// `distance` while keeping the same `.mvec` files/collection) don't have
+    /// to hardcode a literal that can silently drift from `DIM`.
+    pub dim: usize,
+}
+
+/// Build a temp project with a deterministic random multi-vector dataset and
+/// its brute-force MaxSim (descending) ground truth. Shares
+/// `vector_db_benchmark::synthetic::generate_multivector` with the
+/// `generate-dataset` binary, so the fixture and the registered dataset are
+/// byte-identical.
+pub fn write_multivector_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+) -> MultiVectorProject {
+    write_multivector_project_with_distance(dataset_name, engine_configs_json, "dot")
+}
+
+/// Same fixture as [`write_multivector_project`], but with a caller-chosen
+/// `distance`. NOTE: as of #316, this parameter is only ever exercised with
+/// `"dot"` (via [`write_multivector_project`]) — the live cosine-guard
+/// integration test needs to re-register an ALREADY-UPLOADED corpus under a
+/// different distance mid-test, which this function can't do (it always
+/// allocates a fresh corpus/tempdir), so that test hand-writes its own
+/// second `datasets.json` instead of calling this with `"cosine"`.
+pub fn write_multivector_project_with_distance(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    distance: &str,
+) -> MultiVectorProject {
+    const DIM: usize = 16;
+    const MIN_TOKENS: usize = 4;
+    const MAX_TOKENS: usize = 8;
+    const N: usize = 150;
+    const Q: usize = 10;
+    const TOP: usize = 10;
+
+    let MultiVectorGenData {
+        data,
+        queries,
+        neighbours,
+    } = generate_multivector(0xC0FFEE, DIM, MIN_TOKENS, MAX_TOKENS, N, Q, TOP);
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    let ds_dir = root.join("datasets").join(dataset_name);
+    fs::create_dir_all(&ds_dir).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+    write_multivector_matrix(ds_dir.join("data.mvec").to_str().unwrap(), &data).unwrap();
+    write_multivector_matrix(ds_dir.join("queries.mvec").to_str().unwrap(), &queries).unwrap();
+    write_neighbours(&ds_dir, &neighbours);
+
+    let datasets_json = serde_json::json!([{
+        "name": dataset_name, "type": "multivector", "path": dataset_name,
+        "distance": distance, "vector_size": DIM,
+    }]);
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+
+    MultiVectorProject {
+        root,
+        dataset_name: dataset_name.to_string(),
+        top: TOP,
+        dim: DIM,
     }
 }
 
