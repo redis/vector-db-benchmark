@@ -874,7 +874,7 @@ mod tests {
     use super::*;
     use crate::config::DatasetConfig;
     use vector_db_benchmark::readers::{
-        write_gt_neighbours, write_npy_vectors, write_sparse_matrix,
+        write_gt_neighbours, write_multivector_matrix, write_npy_vectors, write_sparse_matrix,
     };
 
     /// A dataset of the given `dataset_type` rooted at an absolute temp path.
@@ -1364,11 +1364,22 @@ mod tests {
     /// A multivector dataset rooted at `dir`, with a configurable (possibly
     /// omitted) `distance` — the exact axis the normalization guard branches on.
     fn multivector_dataset(dir: &std::path::Path, distance: Option<&str>) -> Dataset {
+        multivector_dataset_with_count(dir, distance, None)
+    }
+
+    /// Same as [`multivector_dataset`], but with a configurable declared
+    /// `vector_count` — the axis `validate_vector_count`'s declared-vs-measured
+    /// cross-check (#224) branches on.
+    fn multivector_dataset_with_count(
+        dir: &std::path::Path,
+        distance: Option<&str>,
+        vector_count: Option<i64>,
+    ) -> Dataset {
         let mut cfg = hybrid_dataset(dir).config;
         cfg.name = "multivector-unit".to_string();
         cfg.dataset_type = Some("multivector".to_string());
         cfg.distance = distance.map(|d| d.to_string());
-        cfg.vector_count = None;
+        cfg.vector_count = vector_count;
         Dataset::new(cfg)
     }
 
@@ -1428,5 +1439,40 @@ mod tests {
             !err.contains("per-token normalization"),
             "dot distance must not trip the normalization guard, got: {err}"
         );
+    }
+
+    /// `validate_vector_count`'s declared-vs-measured cross-check (#224) must
+    /// cover `.mvec` too — round 1 added `mvec_row_count`/`measured_vector_count`
+    /// wiring specifically for this, but nothing exercised it end-to-end.
+    /// Mirrors `count_mismatch_is_fatal_only_when_the_corpus_is_bigger_than_declared`.
+    #[test]
+    fn multivector_count_mismatch_is_fatal_only_when_the_corpus_is_bigger_than_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<MultiVector> = (0..10)
+            .map(|i| MultiVector {
+                vectors: vec![vec![i as f32, 0.0, 0.0]],
+            })
+            .collect();
+        write_multivector_matrix(dir.path().join("data.mvec").to_str().unwrap(), &rows).unwrap();
+
+        let under = multivector_dataset_with_count(dir.path(), Some("dot"), Some(3));
+        let err = under
+            .validate_vector_count()
+            .expect_err("corpus larger than declared must be fatal");
+        assert!(err.contains('3') && err.contains("10"), "{err}");
+        assert!(
+            under.read_multivector_data().is_err(),
+            "read_multivector_data must surface the mismatch rather than benchmark a lie"
+        );
+
+        let over = multivector_dataset_with_count(dir.path(), Some("dot"), Some(1_000));
+        over.validate_vector_count()
+            .expect("corpus smaller than declared only warns");
+        assert_eq!(over.read_multivector_data().unwrap().1.len(), 10);
+
+        // No declared count is unconstrained.
+        let silent = multivector_dataset_with_count(dir.path(), Some("dot"), None);
+        silent.validate_vector_count().unwrap();
+        assert_eq!(silent.measured_vector_count().unwrap(), Some(10));
     }
 }
