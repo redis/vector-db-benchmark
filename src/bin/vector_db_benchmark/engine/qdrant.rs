@@ -618,9 +618,28 @@ impl QdrantEngine {
     /// no fusion: MaxSim scoring happens entirely server-side once
     /// `multivector_config` is set, so a plain nearest-neighbour query against
     /// this named vector is all a search needs (see `search`'s multivector
-    /// branch). Reuses `dense_vector_params` for on_disk/datatype/HNSW handling,
-    /// same as the dense and hybrid paths.
+    /// branch). Reuses `dense_vector_params` for on_disk/datatype handling;
+    /// HNSW is applied separately below via `hnsw_config_diff()`, same as the
+    /// dense and hybrid paths.
     fn create_multivector_collection(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // `read_multivector_data`/`read_multivector_queries` have no `normalize`
+        // parameter and `generate_multivector`'s brute-force ground truth scores
+        // raw (unnormalized) dot products unconditionally. Silently proceeding
+        // on a cosine (or omitted-distance, which defaults to cosine) dataset
+        // would score normalized-in-Qdrant vectors against un-normalized ground
+        // truth — a silent-wrong-result bug, not a missing feature. Refuse
+        // loudly until per-token normalization is actually threaded through.
+        if dataset.needs_normalization() {
+            return Err(format!(
+                "multivector dataset '{}' declares distance '{}', which requires \
+                 per-token normalization that read_multivector_data/read_multivector_queries \
+                 do not yet apply — refusing rather than silently scoring against \
+                 un-normalized ground truth",
+                dataset.config.name,
+                dataset.distance()
+            ));
+        }
+
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
         let qdrant_distance = map_qdrant_distance(distance)?;
@@ -2219,7 +2238,11 @@ impl Engine for QdrantEngine {
                             // No prefetch/fusion needed: MaxSim scoring happens
                             // entirely server-side once the "colbert" named
                             // vector's multivector_config is set (see
-                            // create_multivector_collection).
+                            // create_multivector_collection). Unlike the sparse
+                            // arm, this collection IS HNSW-backed (same
+                            // hnsw_config_diff() as the dense path), so hnsw_ef
+                            // and quantization search-time overrides are
+                            // meaningful here and must be forwarded too.
                             let mv = &multivector_queries[idx];
                             let mut qb = QueryPointsBuilder::new(collection_name.clone())
                                 .query(Query::new_nearest(VectorInput::new_multi(
@@ -2228,9 +2251,11 @@ impl Engine for QdrantEngine {
                                 .using("colbert")
                                 .limit(top as u64)
                                 .with_payload(with_payload);
-                            if indexed_only {
+                            if hnsw_ef.is_some() || quantization_params.is_some() || indexed_only {
                                 qb = qb.params(QdrantSearchParams {
-                                    indexed_only: Some(true),
+                                    hnsw_ef,
+                                    quantization: quantization_params,
+                                    indexed_only: Some(indexed_only),
                                     ..Default::default()
                                 });
                             }

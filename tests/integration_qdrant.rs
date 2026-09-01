@@ -643,8 +643,10 @@ fn test_binary_qdrant_sparse() {
 /// real engine (a "colbert" named vector with `multivector_config`/`MaxSim`,
 /// upsert of ragged per-doc token vectors, and a `query_points` search using
 /// that named vector), then assert recall against the brute-force MaxSim
-/// ranking. Recall is ANN (Qdrant's HNSW over the multivector index), so the
-/// floor is the same 0.9 convention as the other engine paths rather than 1.0.
+/// ranking. At this fixture's size (150 docs) Qdrant's collection stays well
+/// under the default HNSW `indexing_threshold` (20000), so no segment is ever
+/// indexed and the search is an exact full scan, not ANN — recall must
+/// therefore be exact, not merely above a tolerant floor.
 #[test]
 fn test_binary_qdrant_multivector() {
     wait_for_qdrant();
@@ -665,7 +667,12 @@ fn test_binary_qdrant_multivector() {
     );
     let recall = common::read_recall(&proj.root, "qdrant-multivector-cov");
     println!("qdrant multivector recall={:.3} (top={})", recall, proj.top);
-    assert!(recall >= 0.9, "multivector recall {:.3} < 0.9", recall);
+    assert!(
+        recall >= 0.999,
+        "multivector recall {:.3} < 0.999 — this fixture is small enough that Qdrant \
+         never builds an HNSW segment (exact full scan), so recall must be exact",
+        recall
+    );
 }
 
 /// End-to-end HYBRID (dense + sparse) coverage WITH a negative control.

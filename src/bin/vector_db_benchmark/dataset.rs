@@ -9,9 +9,10 @@ use crate::download;
 use vector_db_benchmark::query_filter::QueryConditions;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
-    csr_row_count, hdf5_train_row_count, npy_row_count, read_compound_data, read_compound_queries,
-    read_gt_neighbours, read_hdf5_vectors, read_jsonl_queries, read_jsonl_vectors,
-    read_multivector_matrix, read_npy_vectors, read_sparse_matrix, MultiVector, SparseVector,
+    csr_row_count, hdf5_train_row_count, mvec_row_count, npy_row_count, read_compound_data,
+    read_compound_queries, read_gt_neighbours, read_hdf5_vectors, read_jsonl_queries,
+    read_jsonl_vectors, read_multivector_matrix, read_npy_vectors, read_sparse_matrix, MultiVector,
+    SparseVector,
 };
 
 /// Dataset wrapper that provides access to vectors and metadata
@@ -137,6 +138,9 @@ impl Dataset {
             // `msmarco-sparse-100K`/`-1M` share one query set, so a correct
             // count paired with the WRONG `data.csr` used to pass.
             "sparse" => "csr",
+            // "multivector" (.mvec) is measurable the same way: its 8-byte
+            // header's first u32 is num_rows (see multivector_reader.rs).
+            "multivector" => "mvec",
             // "h5-multi" (many part files) is the one layout left with no cheap
             // row count: the total is the sum of 100 part headers and the parts
             // are not all present. It still falls back to the declared count.
@@ -171,6 +175,17 @@ impl Dataset {
                 }
                 let s = csr.to_str().ok_or("Invalid data.csr path encoding")?;
                 csr_row_count(s).map(Some)
+            }
+            "mvec" => {
+                // Mirrors the "csr" case: the corpus lives in <dir>/data.mvec,
+                // queries.mvec is separate, and an absent data.mvec is the
+                // --skip-upload case, not zero.
+                let mvec = path.join("data.mvec");
+                if !mvec.exists() {
+                    return Ok(None);
+                }
+                let s = mvec.to_str().ok_or("Invalid data.mvec path encoding")?;
+                mvec_row_count(s).map(Some)
             }
             _ => {
                 let file = if path.is_dir() {
@@ -300,9 +315,11 @@ impl Dataset {
     ///
     /// `sparse` IS measurable now — [`csr_row_count`] reads `n_row` out of
     /// `data.csr`'s 24-byte header — but only when that file is on this machine,
-    /// which under `--skip-upload` it often is not. `h5-multi` is the one layout
-    /// with no cheap count at all: the total is the sum of 100 part headers.
-    /// Everything else must be MEASURED and is never allowed to fall back (#224).
+    /// which under `--skip-upload` it often is not. `multivector` is measurable
+    /// the same way ([`mvec_row_count`]), for the same reason. `h5-multi` is the
+    /// one layout with no cheap count at all: the total is the sum of 100 part
+    /// headers. Everything else must be MEASURED and is never allowed to fall
+    /// back (#224).
     ///
     /// Deliberately says nothing about whether the files are present: callers
     /// that must not skip an upload want [`Self::unmeasurable_corpus_is_present`]
@@ -311,7 +328,7 @@ impl Dataset {
     pub fn may_fall_back_to_declared_count(&self) -> bool {
         matches!(
             self.config.dataset_type.as_deref().unwrap_or(""),
-            "sparse" | "h5-multi"
+            "sparse" | "multivector" | "h5-multi"
         )
     }
 
@@ -327,6 +344,9 @@ impl Dataset {
             "sparse" => self
                 .local_path()
                 .is_some_and(|p| p.join("data.csr").exists()),
+            "multivector" => self
+                .local_path()
+                .is_some_and(|p| p.join("data.mvec").exists()),
             "h5-multi" => self
                 .config
                 .path
@@ -687,6 +707,8 @@ impl Dataset {
     /// Read multi-vector upload data from `<dir>/data.mvec`. Ids are the row indices.
     pub fn read_multivector_data(&self) -> Result<(Vec<i64>, Vec<MultiVector>), String> {
         let dir = self.get_path()?;
+        // Same declared-vs-actual cross-check as read_vectors/read_hybrid_data (#224).
+        self.validate_vector_count()?;
         let vectors = read_multivector_matrix(
             dir.join("data.mvec")
                 .to_str()

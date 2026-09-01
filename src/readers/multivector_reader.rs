@@ -79,6 +79,25 @@ fn read_f32_array(r: &mut impl Read, n: usize, max_bytes: u64) -> Result<Vec<f32
         .collect())
 }
 
+/// Number of rows a multivector file declares, read from its 8-byte header
+/// WITHOUT parsing the matrix — the sibling of
+/// [`crate::readers::csr_row_count`] and [`crate::readers::npy_row_count`],
+/// for the same reason: it lets the corpus itself, not `datasets.json`, answer
+/// how many rows exist, cheaply enough to call on a multi-GB `data.mvec`.
+pub fn mvec_row_count(path: &str) -> Result<u64, String> {
+    let file = File::open(Path::new(path)).map_err(|e| format!("open {}: {}", path, e))?;
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_len < 8 {
+        return Err(format!(
+            "{}: not a readable multivector file ({} bytes, header needs 8)",
+            path, file_len
+        ));
+    }
+    let mut r = BufReader::new(file);
+    let num_rows = read_u32(&mut r)?;
+    Ok(num_rows as u64)
+}
+
 /// Parse a multivector file into a list of `MultiVector` rows.
 pub fn read_multivector_matrix(path: &str) -> Result<Vec<MultiVector>, String> {
     let file = File::open(Path::new(path)).map_err(|e| format!("open {}: {}", path, e))?;
@@ -205,8 +224,34 @@ mod tests {
             .to_string();
         write_multivector_matrix(&path, &rows).unwrap();
         let read = read_multivector_matrix(&path).unwrap();
+        assert_eq!(mvec_row_count(&path).unwrap(), rows.len() as u64);
         let _ = std::fs::remove_file(&path);
         assert_eq!(read, rows);
+    }
+
+    #[test]
+    fn mvec_row_count_agrees_with_a_full_parse() {
+        for n in [0usize, 1, 150] {
+            let rows: Vec<MultiVector> = (0..n)
+                .map(|i| MultiVector {
+                    vectors: vec![vec![i as f32]],
+                })
+                .collect();
+            let path = std::env::temp_dir()
+                .join(format!("vdb_mvec_count_{}_{n}.mvec", std::process::id()))
+                .to_str()
+                .unwrap()
+                .to_string();
+            write_multivector_matrix(&path, &rows).unwrap();
+            assert_eq!(mvec_row_count(&path).unwrap(), n as u64, "n = {n}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn mvec_row_count_rejects_a_truncated_header() {
+        let short = write_tmp(&[0u8; 7]);
+        assert!(mvec_row_count(short.path().to_str().unwrap()).is_err());
     }
 
     #[test]

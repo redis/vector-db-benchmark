@@ -1429,6 +1429,7 @@
   {
     "name": "synthetic-multivector-16",
     "vector_size": 16,
+    "vector_count": 150,
     "distance": "dot",
     "type": "multivector",
     "path": "synthetic-multivector-16",
