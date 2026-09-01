@@ -175,6 +175,11 @@ jobs:
               - pr_diff.txt        (the full diff -- from `gh pr diff`)
               - author_history.json (the author's merged PRs on this repo, for trust calibration)
 
+            The checked-out working tree is the BASE branch only, not the PR's
+            proposed state -- pr_diff.txt is your only view of what this PR
+            actually changes. Don't reason about other files you can Read in
+            this tree as if they already reflected the PR's changes.
+
             You do NOT post the comment yourself -- you have no tool that can. Instead,
             return your answer as the structured JSON output described below. A
             separate step will post it (or not) after a safety check.
