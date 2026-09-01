@@ -675,6 +675,96 @@ fn test_binary_qdrant_multivector() {
     );
 }
 
+/// The normalization guard must survive `--skip-upload`, which skips
+/// `configure`/`upload` entirely and so never reaches the Qdrant-side check
+/// inside `create_multivector_collection` — yet search still reads via
+/// `Dataset::read_multivector_queries`, which is where the guard now also
+/// lives (#316 review round 2: the guard was originally placed ONLY in
+/// `create_multivector_collection`, leaving this exact entry point open).
+///
+/// Reproduces the reviewer's scenario precisely: upload once under a
+/// `dot`-distance registration (the guard doesn't fire, so a real 150-point
+/// corpus lands in Qdrant), then re-register the SAME corpus under `cosine`
+/// and rerun with `--skip-upload` — corpus reuse succeeds (the collection
+/// genuinely holds all 150 points), so the run reaches search, which must now
+/// fail on the normalization guard rather than publish a wrong recall number.
+#[test]
+fn test_binary_qdrant_multivector_skip_upload_rejects_cosine() {
+    wait_for_qdrant();
+    delete_collection();
+
+    let configs = serde_json::json!([{
+        "name": "qdrant-multivector-cosine-guard", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1}], "upload_params": {"parallel": 1, "batch_size": 50}
+    }]);
+    let proj = common::write_multivector_project(
+        "multivector-cosine-guard",
+        &serde_json::to_string(&configs).unwrap(),
+    );
+
+    let run = |extra: &[&str]| -> std::process::Output {
+        let mut cmd = std::process::Command::new(binary_path());
+        cmd.args([
+            "--engines",
+            "qdrant-multivector-cosine-guard",
+            "--datasets",
+            &proj.dataset_name,
+            "--host",
+            "localhost",
+            "--skip-if-exists",
+            "false",
+        ])
+        .args(extra)
+        .env("QDRANT_GRPC_PORT", qdrant_grpc_port().to_string())
+        .env("QDRANT_REST_PORT", qdrant_rest_port().to_string())
+        .current_dir(&proj.root);
+        cmd.output().expect("run vector-db-benchmark")
+    };
+
+    // --keep-data: phase 2 needs the collection still present under
+    // --skip-upload — without it the normal end-of-run cleanup would delete
+    // it, and phase 2 would fail on "corpus is empty" instead of the guard.
+    let phase1 = run(&["--keep-data"]);
+    assert!(
+        phase1.status.success(),
+        "phase 1 (dot upload) failed:\n{}{}",
+        String::from_utf8_lossy(&phase1.stdout),
+        String::from_utf8_lossy(&phase1.stderr)
+    );
+
+    // Re-register the IDENTICAL corpus/collection under "cosine" — same
+    // dataset name and path, so data.mvec and the Qdrant collection are
+    // unchanged; only the declared distance flips.
+    let datasets_json = serde_json::json!([{
+        "name": proj.dataset_name, "type": "multivector", "path": proj.dataset_name,
+        "distance": "cosine", "vector_size": 16,
+    }]);
+    std::fs::write(
+        proj.root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+
+    let phase2 = run(&["--skip-upload", "--keep-data"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&phase2.stdout),
+        String::from_utf8_lossy(&phase2.stderr)
+    );
+    assert!(
+        !phase2.status.success(),
+        "--skip-upload against a cosine-declared multivector dataset must fail.\n{combined}"
+    );
+    assert!(
+        combined.contains("per-token normalization"),
+        "failure must be the normalization guard, not something else.\n{combined}"
+    );
+
+    delete_collection();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
 /// End-to-end HYBRID (dense + sparse) coverage WITH a negative control.
 ///
 /// The planted dataset's ground truth is recoverable ONLY by fusing both

@@ -1725,6 +1725,18 @@ pub fn write_multivector_project(
     dataset_name: &str,
     engine_configs_json: &str,
 ) -> MultiVectorProject {
+    write_multivector_project_with_distance(dataset_name, engine_configs_json, "dot")
+}
+
+/// Same fixture as [`write_multivector_project`], but with a caller-chosen
+/// `distance` — used to exercise the normalization guard against a
+/// cosine/angular (or omitted) multivector dataset, which this repo does not
+/// yet support (#316 review round 2).
+pub fn write_multivector_project_with_distance(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    distance: &str,
+) -> MultiVectorProject {
     const DIM: usize = 16;
     const MIN_TOKENS: usize = 4;
     const MAX_TOKENS: usize = 8;
@@ -1752,7 +1764,7 @@ pub fn write_multivector_project(
 
     let datasets_json = serde_json::json!([{
         "name": dataset_name, "type": "multivector", "path": dataset_name,
-        "distance": "dot", "vector_size": DIM,
+        "distance": distance, "vector_size": DIM,
     }]);
     fs::write(
         root.join("datasets/datasets.json"),

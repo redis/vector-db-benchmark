@@ -206,6 +206,55 @@ mod tests {
         f
     }
 
+    /// GOLDEN test: hand-written bytes, no writer involved — mirrors
+    /// `sparse_reader::csr_row_count_decodes_a_literal_little_endian_fixture`.
+    ///
+    /// Every other test here round-trips through `write_multivector_matrix`
+    /// then `read_multivector_matrix` / `mvec_row_count`. Since the writer and
+    /// reader live in this same file and share the same assumptions, a
+    /// COHERENT bug — an endianness flip, or swapping the relative order of
+    /// the token-count block and the value block — would leave every one of
+    /// those tests green, because every party to the comparison flipped
+    /// together. `num_rows` and `dim` are given distinct values, and the two
+    /// rows distinct token counts, so a field-order or block-order swap
+    /// decodes to a wrong shape rather than accidentally matching.
+    #[test]
+    fn mvec_decodes_a_literal_little_endian_fixture() {
+        #[rustfmt::skip]
+        let bytes: &[u8] = &[
+            // num_rows = 2
+            0x02, 0x00, 0x00, 0x00,
+            // dim = 1
+            0x01, 0x00, 0x00, 0x00,
+            // token_count[0] = 1, token_count[1] = 2
+            0x01, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+            // values, row-major: row0 = [10.0], row1 = [20.0, 30.0]
+            0x00, 0x00, 0x20, 0x41, // 10.0
+            0x00, 0x00, 0xA0, 0x41, // 20.0
+            0x00, 0x00, 0xF0, 0x41, // 30.0
+        ];
+        let f = write_tmp(bytes);
+        assert_eq!(
+            mvec_row_count(f.path().to_str().unwrap()).unwrap(),
+            2,
+            "num_rows must decode little-endian"
+        );
+        let rows = read_multivector_matrix(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                MultiVector {
+                    vectors: vec![vec![10.0]]
+                },
+                MultiVector {
+                    vectors: vec![vec![20.0], vec![30.0]]
+                },
+            ],
+            "header, token-count block, and value block must decode in the documented order"
+        );
+    }
+
     #[test]
     fn round_trips_multivector_matrix() {
         let rows = vec![
@@ -261,23 +310,38 @@ mod tests {
         assert!(err.contains("not a readable multivector file"), "{err}");
     }
 
+    /// `num_rows = u32::MAX` claims a token-count array far larger than the
+    /// 8-byte file could hold. `n.checked_mul(4)` itself cannot overflow here —
+    /// `u32::MAX * 4` fits comfortably in a 64-bit `usize` — so despite the
+    /// name this trips `read_u32_array`'s `max_bytes` cap, not an arithmetic
+    /// overflow. Asserting on the message (rather than bare `is_err()`) is
+    /// what makes that the test's actual claim.
     #[test]
-    fn rejects_token_count_size_overflow() {
+    fn rejects_a_declared_row_count_the_file_cannot_hold() {
         let mut b = Vec::new();
         b.extend_from_slice(&u32::MAX.to_le_bytes()); // num_rows
         b.extend_from_slice(&16u32.to_le_bytes()); // dim
         let f = write_tmp(&b);
-        assert!(read_multivector_matrix(f.path().to_str().unwrap()).is_err());
+        let err = read_multivector_matrix(f.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("token-count bytes but file is only"), "{err}");
     }
 
+    /// `total_tokens = dim = u32::MAX` makes `total_tokens.checked_mul(dim)` ≈
+    /// 1.8446744065×10^19, which — deliberately — does NOT overflow `u64`
+    /// (max ≈1.8446744074×10^19), so that guard and the `usize::MAX` check
+    /// right after it both pass. The `Err` this test relies on actually comes
+    /// one level down, from `read_f32_array`'s own `n.checked_mul(4)`
+    /// overflowing on that same huge count. Asserting on the message is what
+    /// pins the test to the branch it actually exercises.
     #[test]
-    fn rejects_total_value_count_overflow() {
+    fn rejects_value_block_byte_size_overflow() {
         let mut b = Vec::new();
         b.extend_from_slice(&1u32.to_le_bytes()); // num_rows = 1
         b.extend_from_slice(&u32::MAX.to_le_bytes()); // dim
         b.extend_from_slice(&u32::MAX.to_le_bytes()); // token_count[0]
         let f = write_tmp(&b);
-        assert!(read_multivector_matrix(f.path().to_str().unwrap()).is_err());
+        let err = read_multivector_matrix(f.path().to_str().unwrap()).unwrap_err();
+        assert!(err.contains("multivector value size overflow"), "{err}");
     }
 
     #[test]

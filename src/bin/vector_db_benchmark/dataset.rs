@@ -704,8 +704,37 @@ impl Dataset {
         self.config.dataset_type.as_deref() == Some("multivector")
     }
 
+    /// Refuse a multivector dataset whose distance requires per-token
+    /// normalization, since neither `read_multivector_data`/
+    /// `read_multivector_queries` nor `generate_multivector`'s brute-force
+    /// ground truth apply it — silently proceeding would score
+    /// normalized-in-engine vectors against un-normalized ground truth, a
+    /// silent-wrong-result bug rather than a missing feature.
+    ///
+    /// Called from BOTH `read_multivector_data` and `read_multivector_queries`
+    /// (not just the Qdrant `configure` path) because `--skip-upload` skips
+    /// `configure`/`upload` entirely — an engine-side-only guard would leave
+    /// the search and ground-truth-profiling paths unprotected, which is
+    /// exactly the entry point `--skip-upload` exists to use (#238).
+    pub fn ensure_multivector_normalized(&self) -> Result<(), String> {
+        if !self.needs_normalization() {
+            return Ok(());
+        }
+        let declared = match self.config.distance.as_deref() {
+            Some(d) => format!("declares distance '{}'", d),
+            None => "declares no distance (defaults to 'cosine')".to_string(),
+        };
+        Err(format!(
+            "multivector dataset '{}' {}, which requires per-token normalization \
+             that read_multivector_data/read_multivector_queries do not yet apply — \
+             refusing rather than silently scoring against un-normalized ground truth",
+            self.config.name, declared
+        ))
+    }
+
     /// Read multi-vector upload data from `<dir>/data.mvec`. Ids are the row indices.
     pub fn read_multivector_data(&self) -> Result<(Vec<i64>, Vec<MultiVector>), String> {
+        self.ensure_multivector_normalized()?;
         let dir = self.get_path()?;
         // Same declared-vs-actual cross-check as read_vectors/read_hybrid_data (#224).
         self.validate_vector_count()?;
@@ -723,6 +752,7 @@ impl Dataset {
     /// row-alignment guard: a short or misaligned ground truth must fail loudly
     /// rather than index out of bounds or score the wrong query.
     pub fn read_multivector_queries(&self) -> Result<(Vec<MultiVector>, Vec<Vec<i64>>), String> {
+        self.ensure_multivector_normalized()?;
         let dir = self.get_path()?;
         let queries = read_multivector_matrix(
             dir.join("queries.mvec")
@@ -1329,5 +1359,74 @@ mod tests {
         .unwrap();
         let ds = hybrid_dataset(p);
         assert!(ds.read_hybrid_data(false).is_err());
+    }
+
+    /// A multivector dataset rooted at `dir`, with a configurable (possibly
+    /// omitted) `distance` — the exact axis the normalization guard branches on.
+    fn multivector_dataset(dir: &std::path::Path, distance: Option<&str>) -> Dataset {
+        let mut cfg = hybrid_dataset(dir).config;
+        cfg.name = "multivector-unit".to_string();
+        cfg.dataset_type = Some("multivector".to_string());
+        cfg.distance = distance.map(|d| d.to_string());
+        cfg.vector_count = None;
+        Dataset::new(cfg)
+    }
+
+    /// The normalization guard must fire from BOTH `read_multivector_data` and
+    /// `read_multivector_queries` — not just the Qdrant-side `configure` call —
+    /// because `--skip-upload` never calls `configure`/`upload` at all, yet
+    /// still reaches search and ground-truth profiling through these two
+    /// functions (#316 review round 2). Uses a nonexistent directory: the
+    /// guard must fire BEFORE any file access, so no fixture files are needed.
+    #[test]
+    fn multivector_normalization_guard_covers_both_read_paths() {
+        let dir = std::path::Path::new("/nonexistent/multivector-guard-test");
+        for distance in [Some("cosine"), Some("angular"), None] {
+            let ds = multivector_dataset(dir, distance);
+            let data_err = ds.read_multivector_data().unwrap_err();
+            assert!(
+                data_err.contains("per-token normalization"),
+                "distance={distance:?}: read_multivector_data got: {data_err}"
+            );
+            let queries_err = ds.read_multivector_queries().unwrap_err();
+            assert!(
+                queries_err.contains("per-token normalization"),
+                "distance={distance:?}: read_multivector_queries got: {queries_err}"
+            );
+        }
+    }
+
+    /// The error message must distinguish an EXPLICIT cosine/angular
+    /// declaration from an OMITTED `distance` (which defaults to cosine) —
+    /// `dataset.distance()` collapses both to `"cosine"`, so building the
+    /// message from it alone would claim a declaration that isn't there.
+    #[test]
+    fn multivector_normalization_error_distinguishes_declared_from_omitted_distance() {
+        let dir = std::path::Path::new("/nonexistent/multivector-guard-test");
+        let declared = multivector_dataset(dir, Some("cosine"))
+            .read_multivector_queries()
+            .unwrap_err();
+        assert!(
+            declared.contains("declares distance 'cosine'"),
+            "got: {declared}"
+        );
+        let omitted = multivector_dataset(dir, None)
+            .read_multivector_queries()
+            .unwrap_err();
+        assert!(omitted.contains("declares no distance"), "got: {omitted}");
+    }
+
+    /// A dataset that does NOT need normalization (dot/l2) must not trip the
+    /// guard — it should fail later, on the missing files, not on distance.
+    #[test]
+    fn multivector_dot_distance_does_not_trip_the_normalization_guard() {
+        let dir = std::path::Path::new("/nonexistent/multivector-guard-test");
+        let err = multivector_dataset(dir, Some("dot"))
+            .read_multivector_queries()
+            .unwrap_err();
+        assert!(
+            !err.contains("per-token normalization"),
+            "dot distance must not trip the normalization guard, got: {err}"
+        );
     }
 }

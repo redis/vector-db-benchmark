@@ -622,23 +622,14 @@ impl QdrantEngine {
     /// HNSW is applied separately below via `hnsw_config_diff()`, same as the
     /// dense and hybrid paths.
     fn create_multivector_collection(&mut self, dataset: &Dataset) -> Result<(), String> {
-        // `read_multivector_data`/`read_multivector_queries` have no `normalize`
-        // parameter and `generate_multivector`'s brute-force ground truth scores
-        // raw (unnormalized) dot products unconditionally. Silently proceeding
-        // on a cosine (or omitted-distance, which defaults to cosine) dataset
-        // would score normalized-in-Qdrant vectors against un-normalized ground
-        // truth — a silent-wrong-result bug, not a missing feature. Refuse
-        // loudly until per-token normalization is actually threaded through.
-        if dataset.needs_normalization() {
-            return Err(format!(
-                "multivector dataset '{}' declares distance '{}', which requires \
-                 per-token normalization that read_multivector_data/read_multivector_queries \
-                 do not yet apply — refusing rather than silently scoring against \
-                 un-normalized ground truth",
-                dataset.config.name,
-                dataset.distance()
-            ));
-        }
+        // The authoritative check lives on `Dataset` (`ensure_multivector_normalized`)
+        // because it must also cover `read_multivector_data`/`read_multivector_queries`
+        // directly — `--skip-upload` never calls `configure` (and so never reaches
+        // this function), but search and ground-truth profiling still read via
+        // those two functions, so an engine-side-only guard would leave that path
+        // unprotected. This call is fail-fast belt-and-braces: it rejects before
+        // any Qdrant RPC, on the one path that DOES call `configure`.
+        dataset.ensure_multivector_normalized()?;
 
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
