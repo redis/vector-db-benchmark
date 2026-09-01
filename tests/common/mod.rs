@@ -1734,9 +1734,12 @@ pub fn write_multivector_project(
 }
 
 /// Same fixture as [`write_multivector_project`], but with a caller-chosen
-/// `distance` — used to exercise the normalization guard against a
-/// cosine/angular (or omitted) multivector dataset, which this repo does not
-/// yet support (#316 review round 2).
+/// `distance`. NOTE: as of #316, this parameter is only ever exercised with
+/// `"dot"` (via [`write_multivector_project`]) — the live cosine-guard
+/// integration test needs to re-register an ALREADY-UPLOADED corpus under a
+/// different distance mid-test, which this function can't do (it always
+/// allocates a fresh corpus/tempdir), so that test hand-writes its own
+/// second `datasets.json` instead of calling this with `"cosine"`.
 pub fn write_multivector_project_with_distance(
     dataset_name: &str,
     engine_configs_json: &str,

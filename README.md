@@ -918,14 +918,21 @@ neighbours.jsonl # ground truth: one JSON array of ids per query line
 
 Register it in `datasets/datasets.json` with `"type": "multivector"` and the
 per-token `vector_size`/`distance`. **Only `dot`/`l2` are accepted** (`ip`/
-`euclidean` also work, as synonyms) — `cosine`/`angular`/`euclid` (and an
-*omitted* `distance`, which defaults to `cosine`) hard-error at load, since
+`euclidean` also work, as synonyms). `cosine`/`angular` (and an *omitted*
+`distance`, which defaults to `cosine`) are rejected by a normalization guard
+that runs on every read path — including under `--skip-upload` — since
 neither the reader nor the generator apply per-token normalization yet; this
 is the most likely first-attempt failure, since omitting `distance` is common
-elsewhere in this file. Ground truth for a multivector dataset MUST
-be a genuine brute-force MaxSim ranking, not a heuristic — see
-`generate_multivector`'s doc comment in `src/synthetic.rs` for why the hybrid
-generator's "planted" shortcut does not carry over. The end-to-end path
+elsewhere in this file. Any other string (e.g. a typo'd `euclid`) is rejected
+only by Qdrant's collection creation, which `--skip-upload` bypasses entirely
+— such a value silently passes through unrejected in that mode. Ground truth
+for a multivector dataset MUST be a genuine brute-force MaxSim ranking, not a
+heuristic — see `generate_multivector`'s doc comment in `src/synthetic.rs` for
+why the hybrid generator's "planted" shortcut does not carry over. That ground
+truth is always scored with raw dot-product MaxSim regardless of the declared
+`distance` — correct for `dot` (what this repo ships) but silently wrong for
+`l2`, which would need its own Euclid-MaxSim ground truth that
+`generate_multivector` does not produce. The end-to-end path
 (collection creation, ragged upload, and a `query_points` search using the
 `"colbert"` vector) is covered by
 `tests/integration_qdrant.rs::test_binary_qdrant_multivector`, which also

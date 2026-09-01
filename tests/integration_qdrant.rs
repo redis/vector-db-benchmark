@@ -643,12 +643,13 @@ fn test_binary_qdrant_sparse() {
 /// real engine (a "colbert" named vector with `multivector_config`/`MaxSim`,
 /// upsert of ragged per-doc token vectors, and a `query_points` search using
 /// that named vector), then assert recall against the brute-force MaxSim
-/// ranking. `indexing_threshold` is a KB-of-vector-data size, not a doc count —
-/// at this fixture's size (150 docs of a handful of 16-dim token vectors each,
-/// well under a KB total) Qdrant's collection stays several orders of
-/// magnitude under the default HNSW `indexing_threshold` (20000 KB), so no
-/// segment is ever indexed and the search is an exact full scan, not ANN —
-/// recall must therefore be exact, not merely above a tolerant floor.
+/// ranking. `indexing_threshold` is a KB-of-vector-data size, not a doc count
+/// — at this fixture's size (150 docs, mean 6 tokens each of 16-dim f32
+/// vectors, ≈56 KB of vector data total) Qdrant's collection stays roughly
+/// 350x (~2.5 orders of magnitude) under the default HNSW `indexing_threshold`
+/// (20000 KB), so no segment is ever indexed and the search is an exact full
+/// scan, not ANN — recall must therefore be exact, not merely above a
+/// tolerant floor.
 #[test]
 fn test_binary_qdrant_multivector() {
     wait_for_qdrant();
