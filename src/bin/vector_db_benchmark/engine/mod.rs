@@ -697,6 +697,18 @@ pub trait Engine {
         false
     }
 
+    /// Whether this engine has a multi-vector (ColBERT-style / late-interaction,
+    /// MaxSim-scored) code path.
+    ///
+    /// Default `false`: only Qdrant implements one, via its native
+    /// `multivector_config`/`MaxSim` support. Same rationale and gate site as
+    /// [`Engine::supports_sparse`]: checked BEFORE resolving the dataset path,
+    /// so a multivector dataset pointed at an unsupporting engine is skipped
+    /// with a clear message instead of failing deep in the reader.
+    fn supports_multivector(&self) -> bool {
+        false
+    }
+
     fn get_memory_usage(&mut self) -> Option<serde_json::Value> {
         None
     }

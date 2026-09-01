@@ -1427,6 +1427,14 @@
     "description": "Locally-generated hybrid dense+sparse dataset (vectors.npy + queries.npy + data.csr + queries.csr + shared neighbours.jsonl). Ground truth is recoverable ONLY by fusing both modalities (RRF). NO public download — generate with `cargo run --release --bin generate-dataset`. Exercises the hybrid path, e.g. --engines qdrant-hybrid --datasets synthetic-hybrid-16."
   },
   {
+    "name": "synthetic-multivector-16",
+    "vector_size": 16,
+    "distance": "dot",
+    "type": "multivector",
+    "path": "synthetic-multivector-16",
+    "description": "Locally-generated ColBERT-style multi-vector dataset (data.mvec + queries.mvec + neighbours.jsonl), each row a ragged 4-8 token list of 16-dim vectors. Ground truth is a genuine brute-force MaxSim (late-interaction) ranking, NOT planted. NO public download — generate with `cargo run --release --bin generate-dataset`. Qdrant is the only engine with a multivector path, e.g. --engines qdrant-multivector --datasets synthetic-multivector-16."
+  },
+  {
     "name": "synthetic-filter-32",
     "vector_size": 32,
     "distance": "l2",

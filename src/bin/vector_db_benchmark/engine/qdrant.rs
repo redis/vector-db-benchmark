@@ -16,12 +16,12 @@ use qdrant_client::qdrant::{
     payload_index_params::IndexParams, BinaryQuantization, CompressionRatio, Condition,
     CreateCollectionBuilder, Datatype, DatetimeIndexParams, DatetimeRange, DeleteCollectionBuilder,
     Distance, FieldType, Filter, FloatIndexParams, Fusion, GeoIndexParams, HnswConfigDiff,
-    IntegerIndexParams, KeywordIndexParams, MaxOptimizationThreads, NamedVectors,
-    OptimizersConfigDiff, PointStruct, PrefetchQueryBuilder, ProductQuantization,
-    QuantizationSearchParams, QuantizationType, Query, QueryPointsBuilder, ScalarQuantization,
-    SearchParams as QdrantSearchParams, SparseIndexConfigBuilder, SparseVectorParamsBuilder,
-    SparseVectorsConfigBuilder, Timestamp, UuidIndexParams, Vector, VectorInput,
-    VectorParamsBuilder, VectorsConfig, VectorsConfigBuilder,
+    IntegerIndexParams, KeywordIndexParams, MaxOptimizationThreads, MultiVectorComparator,
+    MultiVectorConfigBuilder, NamedVectors, OptimizersConfigDiff, PointStruct,
+    PrefetchQueryBuilder, ProductQuantization, QuantizationSearchParams, QuantizationType, Query,
+    QueryPointsBuilder, ScalarQuantization, SearchParams as QdrantSearchParams,
+    SparseIndexConfigBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder, Timestamp,
+    UuidIndexParams, Vector, VectorInput, VectorParamsBuilder, VectorsConfig, VectorsConfigBuilder,
 };
 use qdrant_client::{Payload, Qdrant};
 use vector_db_benchmark::start_gate::WorkerPool;
@@ -31,6 +31,7 @@ use crate::dataset::Dataset;
 use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
+use vector_db_benchmark::readers::MultiVector;
 
 const DEFAULT_COLLECTION: &str = "benchmark";
 
@@ -188,6 +189,9 @@ impl QdrantEngine {
         }
         if dataset.is_sparse() {
             return self.create_sparse_collection(dataset);
+        }
+        if dataset.is_multivector() {
+            return self.create_multivector_collection(dataset);
         }
 
         let distance = dataset.distance();
@@ -609,6 +613,40 @@ impl QdrantEngine {
         Ok(())
     }
 
+    /// Create a MULTIVECTOR collection with a single named vector ("colbert")
+    /// configured for late-interaction (MaxSim) scoring. Unlike hybrid, there is
+    /// no fusion: MaxSim scoring happens entirely server-side once
+    /// `multivector_config` is set, so a plain nearest-neighbour query against
+    /// this named vector is all a search needs (see `search`'s multivector
+    /// branch). Reuses `dense_vector_params` for on_disk/datatype/HNSW handling,
+    /// same as the dense and hybrid paths.
+    fn create_multivector_collection(&mut self, dataset: &Dataset) -> Result<(), String> {
+        let distance = dataset.distance();
+        let vector_size = dataset.vector_size();
+        let qdrant_distance = map_qdrant_distance(distance)?;
+
+        let mut params = self
+            .dense_vector_params(vector_size, qdrant_distance)?
+            .multivector_config(MultiVectorConfigBuilder::new(MultiVectorComparator::MaxSim));
+        if let Some(hnsw_config) = self.hnsw_config_diff() {
+            params = params.hnsw_config(hnsw_config);
+        }
+        let mut vectors_cfg = VectorsConfigBuilder::default();
+        vectors_cfg.add_named_vector_params("colbert", params);
+
+        let mut create_builder =
+            CreateCollectionBuilder::new(&self.collection_name).vectors_config(vectors_cfg);
+        create_builder = self.apply_optimizers_and_quantization(create_builder)?;
+
+        self.rt
+            .block_on(self.client.create_collection(create_builder))
+            .map_err(|e| format!("Failed to create multivector collection: {}", e))?;
+
+        self.disable_indexing_optimizers();
+        self.create_payload_indexes(dataset)?;
+        Ok(())
+    }
+
     /// Upload points carrying BOTH named vectors ("dense" + "sparse"), batched.
     fn upload_hybrid(&mut self, dataset: &Dataset) -> Result<UploadStats, String> {
         let normalize = dataset.needs_normalization();
@@ -724,6 +762,70 @@ impl QdrantEngine {
             upload_time,
             total_time: read_time + upload_time + index_time,
             upload_count: vectors.len(),
+            parallel: 1,
+            batch_size: self.batch_size,
+            memory_usage: None,
+            index_coverage: None,
+        })
+    }
+
+    /// Upload points carrying a single named multivector ("colbert"), batched.
+    fn upload_multivector(&mut self, dataset: &Dataset) -> Result<UploadStats, String> {
+        let dataset_path = dataset.get_path()?;
+        println!(
+            "Reading multivector dataset from {}...",
+            dataset_path.display()
+        );
+        let read_start = Instant::now();
+        let (ids, vectors) = dataset.read_multivector_data()?;
+        let read_time = read_start.elapsed().as_secs_f64();
+        println!(
+            "Read {} multivector documents in {:.3}s",
+            vectors.len(),
+            read_time
+        );
+
+        println!(
+            "Starting multivector upload, batch size {}...",
+            self.batch_size
+        );
+        let upload_start = Instant::now();
+        let pb = self.create_progress_bar(ids.len());
+        for start in (0..ids.len()).step_by(self.batch_size) {
+            let end = (start + self.batch_size).min(ids.len());
+            let points: Vec<PointStruct> = (start..end)
+                .map(|i| {
+                    PointStruct::new(
+                        ids[i] as u64,
+                        NamedVectors::default()
+                            .add_vector("colbert", Vector::new_multi(vectors[i].vectors.clone())),
+                        Payload::new(),
+                    )
+                })
+                .collect();
+            self.rt
+                .block_on(
+                    self.client.upsert_points(
+                        qdrant_client::qdrant::UpsertPointsBuilder::new(
+                            &self.collection_name,
+                            points,
+                        )
+                        .wait(true),
+                    ),
+                )
+                .map_err(|e| format!("Multivector upsert failed: {}", e))?;
+            pb.inc((end - start) as u64);
+        }
+        pb.finish_with_message("Upload complete");
+        let upload_time = upload_start.elapsed().as_secs_f64();
+        let index_start = Instant::now();
+        self.wait_collection_green()?;
+        let index_time = index_start.elapsed().as_secs_f64();
+
+        Ok(UploadStats {
+            upload_time,
+            total_time: read_time + upload_time + index_time,
+            upload_count: ids.len(),
             parallel: 1,
             batch_size: self.batch_size,
             memory_usage: None,
@@ -1756,6 +1858,11 @@ impl Engine for QdrantEngine {
         true
     }
 
+    /// Qdrant is the only engine with a multivector (ColBERT/MaxSim) path.
+    fn supports_multivector(&self) -> bool {
+        true
+    }
+
     /// Report the config knobs this run could not honour, so they land in the
     /// saved result JSON. Without this the artifact is identical to a run where
     /// the knob DID apply — and the artifact, not a scrolled-past stderr line, is
@@ -1788,6 +1895,9 @@ impl Engine for QdrantEngine {
         }
         if dataset.is_sparse() {
             return self.upload_sparse(dataset);
+        }
+        if dataset.is_multivector() {
+            return self.upload_multivector(dataset);
         }
 
         let normalize = dataset.needs_normalization();
@@ -1924,18 +2034,36 @@ impl Engine for QdrantEngine {
         // quantization apply to the dense-only path.
         let is_sparse = dataset.is_sparse();
         let is_hybrid = dataset.is_hybrid();
+        let is_multivector = dataset.is_multivector();
         // Per-prefetch candidate depth for hybrid fusion: reuse the configured
         // search_params.prefetch.limit if present, else a generous default (>= any
         // sensible top-k). Larger = better fusion recall, more work.
         let hybrid_prefetch_limit = prefetch_limit.unwrap_or(50);
-        let (queries, sparse_queries, neighbors, parsed_filters) = if is_hybrid {
+        let (queries, sparse_queries, multivector_queries, neighbors, parsed_filters) = if is_hybrid
+        {
             let (dq, sq, nb) = dataset.read_hybrid_queries()?;
-            (dq, sq, nb, Vec::<QueryFilter<Filter>>::new())
+            (
+                dq,
+                sq,
+                Vec::<MultiVector>::new(),
+                nb,
+                Vec::<QueryFilter<Filter>>::new(),
+            )
         } else if is_sparse {
             let (sq, nb) = dataset.read_sparse_queries()?;
             (
                 Vec::<Vec<f32>>::new(),
                 sq,
+                Vec::<MultiVector>::new(),
+                nb,
+                Vec::<QueryFilter<Filter>>::new(),
+            )
+        } else if is_multivector {
+            let (mq, nb) = dataset.read_multivector_queries()?;
+            (
+                Vec::<Vec<f32>>::new(),
+                Vec::<vector_db_benchmark::readers::SparseVector>::new(),
+                mq,
                 nb,
                 Vec::<QueryFilter<Filter>>::new(),
             )
@@ -1950,6 +2078,7 @@ impl Engine for QdrantEngine {
             (
                 q,
                 Vec::<vector_db_benchmark::readers::SparseVector>::new(),
+                Vec::<MultiVector>::new(),
                 nb,
                 pf,
             )
@@ -1957,6 +2086,8 @@ impl Engine for QdrantEngine {
 
         let query_count = if is_sparse {
             sparse_queries.len()
+        } else if is_multivector {
+            multivector_queries.len()
         } else {
             queries.len()
         };
@@ -2003,6 +2134,7 @@ impl Engine for QdrantEngine {
                 let collection_name = collection_name.clone();
                 let queries = &queries;
                 let sparse_queries = &sparse_queries;
+                let multivector_queries = &multivector_queries;
                 let neighbors = &neighbors;
                 let parsed_filters = &parsed_filters;
                 let query_idx = Arc::clone(&query_idx);
@@ -2083,6 +2215,26 @@ impl Engine for QdrantEngine {
                                 });
                             }
                             qb
+                        } else if is_multivector {
+                            // No prefetch/fusion needed: MaxSim scoring happens
+                            // entirely server-side once the "colbert" named
+                            // vector's multivector_config is set (see
+                            // create_multivector_collection).
+                            let mv = &multivector_queries[idx];
+                            let mut qb = QueryPointsBuilder::new(collection_name.clone())
+                                .query(Query::new_nearest(VectorInput::new_multi(
+                                    mv.vectors.clone(),
+                                )))
+                                .using("colbert")
+                                .limit(top as u64)
+                                .with_payload(with_payload);
+                            if indexed_only {
+                                qb = qb.params(QdrantSearchParams {
+                                    indexed_only: Some(true),
+                                    ..Default::default()
+                                });
+                            }
+                            qb
                         } else {
                             let mut qb = QueryPointsBuilder::new(collection_name.clone())
                                 .query(queries[idx].clone())
@@ -2105,7 +2257,7 @@ impl Engine for QdrantEngine {
                             qb
                         };
 
-                        if !is_sparse && !is_hybrid && prefetch_enabled {
+                        if !is_sparse && !is_hybrid && !is_multivector && prefetch_enabled {
                             let mut pf =
                                 PrefetchQueryBuilder::default().query(queries[idx].clone());
                             if let Some(l) = prefetch_limit {

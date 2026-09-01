@@ -637,6 +637,37 @@ fn test_binary_qdrant_sparse() {
     assert!(precision >= 0.9, "sparse precision {:.3} < 0.9", precision);
 }
 
+/// End-to-end MULTIVECTOR (ColBERT-style / MaxSim) coverage: build a small
+/// multivector dataset (via the shared `write_multivector_project` fixture,
+/// genuinely brute-forced ground truth — see `generate_multivector`), run the
+/// real engine (a "colbert" named vector with `multivector_config`/`MaxSim`,
+/// upsert of ragged per-doc token vectors, and a `query_points` search using
+/// that named vector), then assert recall against the brute-force MaxSim
+/// ranking. Recall is ANN (Qdrant's HNSW over the multivector index), so the
+/// floor is the same 0.9 convention as the other engine paths rather than 1.0.
+#[test]
+fn test_binary_qdrant_multivector() {
+    wait_for_qdrant();
+
+    let configs = serde_json::json!([{
+        "name": "qdrant-multivector-cov", "engine": "qdrant",
+        "connection_params": {"timeout": 60}, "collection_params": {"timeout": 60},
+        "search_params": [{"parallel": 1}], "upload_params": {"parallel": 1, "batch_size": 50}
+    }]);
+    let proj = common::write_multivector_project(
+        "multivector-cov",
+        &serde_json::to_string(&configs).unwrap(),
+    );
+
+    assert!(
+        run_qdrant_binary(&proj.root, "qdrant-multivector-cov", "multivector-cov"),
+        "multivector run failed"
+    );
+    let recall = common::read_recall(&proj.root, "qdrant-multivector-cov");
+    println!("qdrant multivector recall={:.3} (top={})", recall, proj.top);
+    assert!(recall >= 0.9, "multivector recall {:.3} < 0.9", recall);
+}
+
 /// End-to-end HYBRID (dense + sparse) coverage WITH a negative control.
 ///
 /// The planted dataset's ground truth is recoverable ONLY by fusing both

@@ -11,7 +11,7 @@ use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
     csr_row_count, hdf5_train_row_count, npy_row_count, read_compound_data, read_compound_queries,
     read_gt_neighbours, read_hdf5_vectors, read_jsonl_queries, read_jsonl_vectors,
-    read_npy_vectors, read_sparse_matrix, SparseVector,
+    read_multivector_matrix, read_npy_vectors, read_sparse_matrix, MultiVector, SparseVector,
 };
 
 /// Dataset wrapper that provides access to vectors and metadata
@@ -670,6 +670,56 @@ impl Dataset {
             ));
         }
         Ok((dense_queries, sparse_queries, neighbours))
+    }
+
+    /// Whether this is a multi-vector (ColBERT-style / late-interaction) dataset
+    /// (`dataset_type: "multivector"`).
+    ///
+    /// Each row is a ragged list of token embeddings rather than one vector,
+    /// scored via MaxSim (sum over query tokens of the max dot product against
+    /// any document token) rather than a single-vector distance. Stored as
+    /// `data.mvec` / `queries.mvec` (see `readers::multivector_reader`), with
+    /// ground truth shared with the other layouts via `neighbours.jsonl`.
+    pub fn is_multivector(&self) -> bool {
+        self.config.dataset_type.as_deref() == Some("multivector")
+    }
+
+    /// Read multi-vector upload data from `<dir>/data.mvec`. Ids are the row indices.
+    pub fn read_multivector_data(&self) -> Result<(Vec<i64>, Vec<MultiVector>), String> {
+        let dir = self.get_path()?;
+        let vectors = read_multivector_matrix(
+            dir.join("data.mvec")
+                .to_str()
+                .ok_or("Invalid data.mvec path")?,
+        )?;
+        let ids: Vec<i64> = (0..vectors.len() as i64).collect();
+        Ok((ids, vectors))
+    }
+
+    /// Read multi-vector queries from `<dir>/queries.mvec` plus ground-truth
+    /// neighbours from `<dir>/neighbours.jsonl`. Mirrors `read_hybrid_queries`'s
+    /// row-alignment guard: a short or misaligned ground truth must fail loudly
+    /// rather than index out of bounds or score the wrong query.
+    pub fn read_multivector_queries(&self) -> Result<(Vec<MultiVector>, Vec<Vec<i64>>), String> {
+        let dir = self.get_path()?;
+        let queries = read_multivector_matrix(
+            dir.join("queries.mvec")
+                .to_str()
+                .ok_or("Invalid queries.mvec path")?,
+        )?;
+
+        let gt_path = dir.join("neighbours.jsonl");
+        let neighbours = read_neighbours_strict(&gt_path)?;
+
+        if neighbours.len() != queries.len() {
+            return Err(format!(
+                "multivector ground-truth row mismatch in {}: {} queries vs {} neighbour rows",
+                dir.display(),
+                queries.len(),
+                neighbours.len()
+            ));
+        }
+        Ok((queries, neighbours))
     }
 
     /// Read queries from HDF5 file (test + neighbors datasets).

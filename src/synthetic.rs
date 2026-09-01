@@ -18,7 +18,7 @@ use std::path::Path;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::readers::SparseVector;
+use crate::readers::{MultiVector, SparseVector};
 
 /// Write `neighbours.jsonl` (one JSON id-array per line) at `path`. This is the
 /// ground-truth layout the sparse/hybrid readers expect (see
@@ -282,6 +282,97 @@ pub fn generate_hybrid(seed: u64) -> HybridData {
     }
 }
 
+/// A generated multi-vector (ColBERT-style) dataset: `data` (corpus) +
+/// `queries`, with `neighbours` the top-`top` brute-force MaxSim
+/// (late-interaction, descending) ground truth.
+pub struct MultiVectorGenData {
+    pub data: Vec<MultiVector>,
+    pub queries: Vec<MultiVector>,
+    pub neighbours: Vec<Vec<i64>>,
+}
+
+/// Corpus size of the shipped `synthetic-multivector-16` dataset. Single
+/// source of truth, mirroring [`SYNTHETIC_SPARSE_ROWS`].
+pub const SYNTHETIC_MULTIVECTOR_ROWS: usize = 150;
+
+/// Per-token dimensionality of `synthetic-multivector-16` — the `16` in its name.
+pub const SYNTHETIC_MULTIVECTOR_DIM: usize = 16;
+
+/// Generate a deterministic random multi-vector dataset and its MaxSim
+/// (descending) ground truth, genuinely brute-forced — NOT planted like
+/// [`generate_hybrid`]'s ring construction, which only works because an
+/// RRF-fused rank can be built from two independent single-scalar rankings.
+/// MaxSim (`sum over query tokens of max over doc tokens of dot(q, d)`) has no
+/// such decomposition, so this mirrors [`generate_sparse`]'s real-brute-force
+/// pattern instead: every doc and query gets a random number of random token
+/// vectors, and ground truth is the actual top-`top` MaxSim ranking over the
+/// full corpus.
+///
+/// `seed` fixes the RNG; `dim` is the per-token dimensionality, `min_tokens`/
+/// `max_tokens` bound the (inclusive) random token count per row, `n` the
+/// corpus size, `q` the query count and `top` the number of ground-truth
+/// neighbours per query.
+pub fn generate_multivector(
+    seed: u64,
+    dim: usize,
+    min_tokens: usize,
+    max_tokens: usize,
+    n: usize,
+    q: usize,
+    top: usize,
+) -> MultiVectorGenData {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut make = |count: usize| -> Vec<MultiVector> {
+        (0..count)
+            .map(|_| {
+                let num_tokens = rng.gen_range(min_tokens..=max_tokens);
+                let vectors: Vec<Vec<f32>> = (0..num_tokens)
+                    .map(|_| (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect())
+                    .collect();
+                MultiVector { vectors }
+            })
+            .collect()
+    };
+    let data = make(n);
+    let queries = make(q);
+
+    let dot =
+        |a: &[f32], b: &[f32]| -> f64 { a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum() };
+    // MaxSim: for each query token, the best-matching doc token; sum across
+    // query tokens. Larger = more similar, so ground truth sorts DESCENDING.
+    let maxsim = |query: &MultiVector, doc: &MultiVector| -> f64 {
+        query
+            .vectors
+            .iter()
+            .map(|qv| {
+                doc.vectors
+                    .iter()
+                    .map(|dv| dot(qv, dv))
+                    .fold(f64::MIN, f64::max)
+            })
+            .sum()
+    };
+
+    let neighbours: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|qv| {
+            let mut scored: Vec<(i64, f64)> = data
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (i as i64, maxsim(qv, d)))
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            scored.iter().take(top).map(|(id, _)| *id).collect()
+        })
+        .collect();
+
+    MultiVectorGenData {
+        data,
+        queries,
+        neighbours,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +409,54 @@ mod tests {
         let h2 = generate_hybrid(0xB19_1DEA);
         assert_eq!(h.dense, h2.dense);
         assert_eq!(h.neighbours, h2.neighbours);
+    }
+
+    #[test]
+    fn multivector_generation_is_deterministic_and_shaped() {
+        let a = generate_multivector(0xC0FFEE, 16, 4, 8, 150, 10, 10);
+        let b = generate_multivector(0xC0FFEE, 16, 4, 8, 150, 10, 10);
+        assert_eq!(a.data.len(), 150);
+        assert_eq!(a.queries.len(), 10);
+        assert_eq!(a.neighbours.len(), 10);
+        assert!(a.neighbours.iter().all(|n| n.len() == 10));
+        for row in a.data.iter().chain(a.queries.iter()) {
+            assert!((4..=8).contains(&row.vectors.len()));
+            assert!(row.vectors.iter().all(|v| v.len() == 16));
+        }
+        // Deterministic across calls.
+        assert_eq!(a.data.len(), b.data.len());
+        assert_eq!(a.neighbours, b.neighbours);
+    }
+
+    /// Ground truth must be a REAL brute-force MaxSim ranking, not planted:
+    /// recompute MaxSim by hand for every corpus row against query 0 and check
+    /// the generator's top-K matches the hand-computed top-K exactly.
+    #[test]
+    fn multivector_ground_truth_is_genuinely_brute_forced() {
+        let g = generate_multivector(0xC0FFEE, 8, 3, 5, 60, 3, 5);
+        let dot = |a: &[f32], b: &[f32]| -> f64 {
+            a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum()
+        };
+        let maxsim = |q: &MultiVector, d: &MultiVector| -> f64 {
+            q.vectors
+                .iter()
+                .map(|qv| {
+                    d.vectors
+                        .iter()
+                        .map(|dv| dot(qv, dv))
+                        .fold(f64::MIN, f64::max)
+                })
+                .sum()
+        };
+        let query = &g.queries[0];
+        let mut scored: Vec<(i64, f64)> = g
+            .data
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i as i64, maxsim(query, d)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let expected: Vec<i64> = scored.iter().take(5).map(|(id, _)| *id).collect();
+        assert_eq!(g.neighbours[0], expected);
     }
 }

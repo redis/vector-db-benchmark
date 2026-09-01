@@ -24,6 +24,9 @@
 //!     (int `rank` field) + `tests.jsonl` sweeping a `rank < K` range filter
 //!     across a selectivity ladder (1%..90%), each row annotated with its
 //!     `selectivity`. `type: "tar"`.
+//!   * `synthetic-multivector-16/` — `data.mvec`/`queries.mvec` (ColBERT-style
+//!     ragged token-vector rows) + `neighbours.jsonl` (multivector,
+//!     brute-forced MaxSim ground truth). `type: "multivector"`.
 
 use std::path::{Path, PathBuf};
 
@@ -32,10 +35,13 @@ use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use vector_db_benchmark::readers::{write_npy_vectors, write_sparse_matrix};
+use vector_db_benchmark::readers::{
+    write_multivector_matrix, write_npy_vectors, write_sparse_matrix,
+};
 use vector_db_benchmark::synthetic::{
-    generate_hybrid, generate_sparse, write_neighbours_jsonl, SparseData, SYNTHETIC_SPARSE_DIM,
-    SYNTHETIC_SPARSE_ROWS,
+    generate_hybrid, generate_multivector, generate_sparse, write_neighbours_jsonl,
+    MultiVectorGenData, SparseData, SYNTHETIC_MULTIVECTOR_DIM, SYNTHETIC_MULTIVECTOR_ROWS,
+    SYNTHETIC_SPARSE_DIM, SYNTHETIC_SPARSE_ROWS,
 };
 
 /// Dataset names as registered in `datasets/datasets.json`.
@@ -43,6 +49,7 @@ const SPARSE_NAME: &str = "synthetic-sparse-300";
 const HYBRID_NAME: &str = "synthetic-hybrid-16";
 const FILTER_NAME: &str = "synthetic-filter-32";
 const SELECTIVITY_NAME: &str = "synthetic-selectivity-32";
+const MULTIVECTOR_NAME: &str = "synthetic-multivector-16";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -54,8 +61,8 @@ struct Args {
     #[arg(long, default_value = "datasets")]
     out_dir: PathBuf,
 
-    /// Generate only one dataset kind. Omit to generate all four.
-    #[arg(long, value_parser = ["sparse", "hybrid", "filter", "selectivity"])]
+    /// Generate only one dataset kind. Omit to generate all five.
+    #[arg(long, value_parser = ["sparse", "hybrid", "filter", "selectivity", "multivector"])]
     only: Option<String>,
 }
 
@@ -84,6 +91,9 @@ fn run(args: &Args) -> Result<(), String> {
     }
     if want("selectivity") {
         gen_selectivity(&args.out_dir)?;
+    }
+    if want("multivector") {
+        gen_multivector(&args.out_dir)?;
     }
     println!("\nDone. Register/select these datasets by the names printed above.");
     Ok(())
@@ -171,6 +181,48 @@ fn gen_hybrid(base: &Path) -> Result<(), String> {
     for p in [&vectors_npy, &queries_npy, &data_csr, &queries_csr, &nb] {
         note(p)?;
     }
+    Ok(())
+}
+
+// ── multivector (ColBERT-style / MaxSim) ────────────────────────────────────
+
+fn gen_multivector(base: &Path) -> Result<(), String> {
+    // 4-8 tokens/doc, 10 queries, top-10 GT, real brute-force MaxSim (see
+    // `generate_multivector`'s doc comment for why this is NOT planted like
+    // `generate_hybrid`). Corpus size and dim come from shared constants so a
+    // future `datasets.json` guard can check the declared vector_count.
+    let MultiVectorGenData {
+        data,
+        queries,
+        neighbours,
+    } = generate_multivector(
+        0xC0FFEE_u64,
+        SYNTHETIC_MULTIVECTOR_DIM,
+        4,
+        8,
+        SYNTHETIC_MULTIVECTOR_ROWS,
+        10,
+        10,
+    );
+
+    let dir = base.join(MULTIVECTOR_NAME);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    println!(
+        "[mvector] {MULTIVECTOR_NAME}/  ({} docs, {} queries, dim {})",
+        data.len(),
+        queries.len(),
+        SYNTHETIC_MULTIVECTOR_DIM
+    );
+
+    let data_mvec = dir.join("data.mvec");
+    let queries_mvec = dir.join("queries.mvec");
+    let nb = dir.join("neighbours.jsonl");
+    write_multivector_matrix(data_mvec.to_str().ok_or("bad path")?, &data)?;
+    write_multivector_matrix(queries_mvec.to_str().ok_or("bad path")?, &queries)?;
+    write_neighbours_jsonl(&nb, &neighbours)?;
+    note(&data_mvec)?;
+    note(&queries_mvec)?;
+    note(&nb)?;
     Ok(())
 }
 

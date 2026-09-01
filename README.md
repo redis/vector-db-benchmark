@@ -742,8 +742,9 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 
 ### Generating local datasets
 
-The sparse-vector, hybrid (dense+sparse fusion), and multi-datatype filter code
-paths ship with **locally-generated** synthetic datasets — small, deterministic
+The sparse-vector, hybrid (dense+sparse fusion), multi-vector (ColBERT-style
+MaxSim), and multi-datatype filter code paths ship with **locally-generated**
+synthetic datasets — small, deterministic
 (fixed-seed) fixtures with **no public download link**. (For sparse vectors at
 realistic scale, prefer the downloadable `msmarco-sparse-100K` / `-1M` in the
 table above; the synthetic fixture exists to exercise the code path fast. Both
@@ -758,15 +759,16 @@ cargo run --release --bin generate-dataset          # writes into ./datasets
 cargo run --release --bin generate-dataset -- --only sparse --out-dir /tmp/ds
 ```
 
-This writes four datasets under `datasets/` (each in the exact on-disk layout
+This writes five datasets under `datasets/` (each in the exact on-disk layout
 its reader expects), registered in [`datasets/datasets.json`](./datasets/datasets.json):
 
-| Dataset                     | Type     | Dims | Distance | Layout                                                                                  |
-| --------------------------- | -------- | ---: | -------- | --------------------------------------------------------------------------------------- |
-| `synthetic-sparse-300`      | `sparse` |  300 | dot      | `data.csr` + `queries.csr` + `neighbours.jsonl` (dot/MIPS ground truth)                 |
-| `synthetic-hybrid-16`       | `hybrid` |   16 | l2       | `vectors.npy` + `queries.npy` + `data.csr` + `queries.csr` + shared `neighbours.jsonl`  |
-| `synthetic-filter-32`       | `tar`    |   32 | l2       | `vectors.npy` + `payloads.jsonl` + `tests.jsonl` (per-query `conditions` + filtered GT) |
-| `synthetic-selectivity-32`  | `tar`    |   32 | l2       | `vectors.npy` + `payloads.jsonl` + `tests.jsonl` (one `rank < K` range query per selectivity rung) |
+| Dataset                     | Type          | Dims | Distance | Layout                                                                                  |
+| --------------------------- | ------------- | ---: | -------- | --------------------------------------------------------------------------------------- |
+| `synthetic-sparse-300`      | `sparse`      |  300 | dot      | `data.csr` + `queries.csr` + `neighbours.jsonl` (dot/MIPS ground truth)                 |
+| `synthetic-hybrid-16`       | `hybrid`      |   16 | l2       | `vectors.npy` + `queries.npy` + `data.csr` + `queries.csr` + shared `neighbours.jsonl`  |
+| `synthetic-multivector-16`  | `multivector` |   16 | dot      | `data.mvec` + `queries.mvec` + `neighbours.jsonl` (ragged 4-8 token rows, brute-forced MaxSim ground truth) |
+| `synthetic-filter-32`       | `tar`         |   32 | l2       | `vectors.npy` + `payloads.jsonl` + `tests.jsonl` (per-query `conditions` + filtered GT) |
+| `synthetic-selectivity-32`  | `tar`         |   32 | l2       | `vectors.npy` + `payloads.jsonl` + `tests.jsonl` (one `rank < K` range query per selectivity rung) |
 
 `synthetic-filter-32`'s per-query `conditions` rotate through **keyword**, **int**,
 **bool** and **datetime** filters (schema `color:keyword, size:int, flag:bool, ts:datetime`),
@@ -812,6 +814,9 @@ cargo run --release --bin vector-db-benchmark -- \
 # Hybrid dense+sparse fusion (Qdrant):
 cargo run --release --bin vector-db-benchmark -- \
   --engines qdrant-hybrid --datasets synthetic-hybrid-16
+# Multi-vector / ColBERT-style late interaction (Qdrant):
+cargo run --release --bin vector-db-benchmark -- \
+  --engines qdrant-multivector --datasets synthetic-multivector-16
 # Filter datatypes (Redis):
 cargo run --release --bin vector-db-benchmark -- \
   --engines redis-docker-test --datasets synthetic-filter-32
@@ -893,6 +898,33 @@ Register it in `datasets/datasets.json` with `"type": "hybrid"` and the dense
 `dense` + named `sparse` vector, dual-vector upsert, and RRF fusion) is covered
 by `tests/integration_qdrant.rs::test_binary_qdrant_hybrid`, which also
 generates a tiny hybrid fixture you can consult for the exact layout.
+
+### Qdrant multi-vector (ColBERT-style / MaxSim) search
+
+`experiments/configurations/qdrant-multivector.json` runs Qdrant's native
+multi-vector support: a single named vector (`"colbert"`) configured with
+`multivector_config`/`MultiVectorComparator::MaxSim`, so late-interaction
+scoring (one embedding per token, ranked by
+`sum over query tokens of max over doc tokens of dot(q, d)`) happens entirely
+server-side. It **requires a `type: "multivector"` dataset** — Qdrant is the
+only engine with a multivector path (`Engine::supports_multivector`), so any
+other engine skips it. A multivector dataset directory must contain all of:
+
+```
+data.mvec        # ragged per-document token vectors (see src/readers/multivector_reader.rs)
+queries.mvec     # ragged per-query token vectors, same format
+neighbours.jsonl # ground truth: one JSON array of ids per query line
+```
+
+Register it in `datasets/datasets.json` with `"type": "multivector"` and the
+per-token `vector_size`/`distance`. Ground truth for a multivector dataset MUST
+be a genuine brute-force MaxSim ranking, not a heuristic — see
+`generate_multivector`'s doc comment in `src/synthetic.rs` for why the hybrid
+generator's "planted" shortcut does not carry over. The end-to-end path
+(collection creation, ragged upload, and a `query_points` search using the
+`"colbert"` vector) is covered by
+`tests/integration_qdrant.rs::test_binary_qdrant_multivector`, which also
+generates a tiny multivector fixture you can consult for the exact layout.
 
 ## How to register a dataset?
 

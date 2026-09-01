@@ -64,6 +64,9 @@ impl GroundTruthProfile {
         } else if dataset.is_sparse() {
             let (_queries, neighbors) = dataset.read_sparse_queries()?;
             neighbors
+        } else if dataset.is_multivector() {
+            let (_queries, neighbors) = dataset.read_multivector_queries()?;
+            neighbors
         } else {
             let (_queries, neighbors, _conditions) = dataset.read_queries()?;
             neighbors
