@@ -264,8 +264,8 @@ impl Dataset {
     /// Prefers the MEASURED corpus size over the declared `vector_count`, so a
     /// wrong number in `datasets.json` can no longer authorise an early skip
     /// (#224). It falls back to the declared count ONLY for the layouts that
-    /// genuinely have no cheap row count (`sparse`, `h5-multi`) and whose corpus
-    /// files are all present; everything else must be measured or is reported as
+    /// genuinely have no cheap row count (`sparse`, `multivector`, `h5-multi`)
+    /// and whose corpus files are all present; everything else must be measured or is reported as
     /// `Ok(None)` — which callers must read as "cannot confirm completeness, do
     /// NOT skip".
     ///
@@ -336,9 +336,9 @@ impl Dataset {
     /// corpus files are on disk (no download attempted).
     ///
     /// Measurable layouts always answer `false`: they have a row count, so they
-    /// must be measured rather than trusted. Only `sparse` (CSR) and `h5-multi`
-    /// (many part files) may fall back to the declared count, and only when the
-    /// files they need actually exist.
+    /// must be measured rather than trusted. Only `sparse` (CSR), `multivector`
+    /// (`.mvec` header), and `h5-multi` (many part files) may fall back to the
+    /// declared count, and only when the files they need actually exist.
     fn unmeasurable_corpus_is_present(&self) -> bool {
         match self.config.dataset_type.as_deref().unwrap_or("") {
             "sparse" => self
@@ -1459,7 +1459,13 @@ mod tests {
         let err = under
             .validate_vector_count()
             .expect_err("corpus larger than declared must be fatal");
-        assert!(err.contains('3') && err.contains("10"), "{err}");
+        // Substring match, not bare digits: `compare_counts` also interpolates
+        // the tempdir path (e.g. `/tmp/.tmpAB3xyz`), so `err.contains('3')`
+        // alone could spuriously pass on a random path digit ~9% of the time.
+        assert!(
+            err.contains("vector_count 3") && err.contains("holds 10 vectors"),
+            "{err}"
+        );
         assert!(
             under.read_multivector_data().is_err(),
             "read_multivector_data must surface the mismatch rather than benchmark a lie"
