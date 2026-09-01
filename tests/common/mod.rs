@@ -1714,6 +1714,11 @@ pub struct MultiVectorProject {
     pub root: PathBuf,
     pub dataset_name: String,
     pub top: usize,
+    /// Per-token dimensionality — exposed so callers that need to re-register
+    /// this SAME corpus under a different `datasets.json` (e.g. to flip
+    /// `distance` while keeping the same `.mvec` files/collection) don't have
+    /// to hardcode a literal that can silently drift from `DIM`.
+    pub dim: usize,
 }
 
 /// Build a temp project with a deterministic random multi-vector dataset and
@@ -1781,6 +1786,7 @@ pub fn write_multivector_project_with_distance(
         root,
         dataset_name: dataset_name.to_string(),
         top: TOP,
+        dim: DIM,
     }
 }
 

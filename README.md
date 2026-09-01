@@ -917,11 +917,12 @@ neighbours.jsonl # ground truth: one JSON array of ids per query line
 ```
 
 Register it in `datasets/datasets.json` with `"type": "multivector"` and the
-per-token `vector_size`/`distance`. **Only `dot`/`euclid` are accepted** —
-`cosine`/`angular` (and an *omitted* `distance`, which defaults to `cosine`)
-hard-error at load, since neither the reader nor the generator apply per-token
-normalization yet; this is the most likely first-attempt failure, since
-omitting `distance` is common elsewhere in this file. Ground truth for a multivector dataset MUST
+per-token `vector_size`/`distance`. **Only `dot`/`l2` are accepted** (`ip`/
+`euclidean` also work, as synonyms) — `cosine`/`angular`/`euclid` (and an
+*omitted* `distance`, which defaults to `cosine`) hard-error at load, since
+neither the reader nor the generator apply per-token normalization yet; this
+is the most likely first-attempt failure, since omitting `distance` is common
+elsewhere in this file. Ground truth for a multivector dataset MUST
 be a genuine brute-force MaxSim ranking, not a heuristic — see
 `generate_multivector`'s doc comment in `src/synthetic.rs` for why the hybrid
 generator's "planted" shortcut does not carry over. The end-to-end path

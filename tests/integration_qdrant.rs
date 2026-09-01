@@ -643,10 +643,12 @@ fn test_binary_qdrant_sparse() {
 /// real engine (a "colbert" named vector with `multivector_config`/`MaxSim`,
 /// upsert of ragged per-doc token vectors, and a `query_points` search using
 /// that named vector), then assert recall against the brute-force MaxSim
-/// ranking. At this fixture's size (150 docs) Qdrant's collection stays well
-/// under the default HNSW `indexing_threshold` (20000), so no segment is ever
-/// indexed and the search is an exact full scan, not ANN — recall must
-/// therefore be exact, not merely above a tolerant floor.
+/// ranking. `indexing_threshold` is a KB-of-vector-data size, not a doc count —
+/// at this fixture's size (150 docs of a handful of 16-dim token vectors each,
+/// well under a KB total) Qdrant's collection stays several orders of
+/// magnitude under the default HNSW `indexing_threshold` (20000 KB), so no
+/// segment is ever indexed and the search is an exact full scan, not ANN —
+/// recall must therefore be exact, not merely above a tolerant floor.
 #[test]
 fn test_binary_qdrant_multivector() {
     wait_for_qdrant();
@@ -738,7 +740,7 @@ fn test_binary_qdrant_multivector_skip_upload_rejects_cosine() {
     // unchanged; only the declared distance flips.
     let datasets_json = serde_json::json!([{
         "name": proj.dataset_name, "type": "multivector", "path": proj.dataset_name,
-        "distance": "cosine", "vector_size": 16,
+        "distance": "cosine", "vector_size": proj.dim,
     }]);
     std::fs::write(
         proj.root.join("datasets/datasets.json"),
@@ -756,9 +758,22 @@ fn test_binary_qdrant_multivector_skip_upload_rejects_cosine() {
         !phase2.status.success(),
         "--skip-upload against a cosine-declared multivector dataset must fail.\n{combined}"
     );
+    // The guard's message also appears in the non-fatal ground-truth-profiling
+    // Note ("could not profile ground-truth widths"), which fires on every run
+    // of this dataset regardless of what (if anything) kills it later — so a
+    // bare substring match over the whole output can't tell the fatal
+    // search-phase guard from that harmless note. `main.rs` prints the
+    // top-level fatal error as its own "Error: ..." line, but wrapped in
+    // "[config=... dataset=...] search failed (all N repetition(s)): ..."
+    // context first, so "Error: multivector dataset" is NOT a contiguous
+    // substring — find the actual "Error:" line and check ITS content.
+    let error_line = combined
+        .lines()
+        .find(|l| l.starts_with("Error:"))
+        .unwrap_or_else(|| panic!("no top-level 'Error:' line in output.\n{combined}"));
     assert!(
-        combined.contains("per-token normalization"),
-        "failure must be the normalization guard, not something else.\n{combined}"
+        error_line.contains("per-token normalization"),
+        "the fatal Error: line must be the normalization guard, not something else.\n{error_line}"
     );
 
     delete_collection();

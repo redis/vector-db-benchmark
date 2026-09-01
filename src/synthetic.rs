@@ -312,6 +312,13 @@ pub const SYNTHETIC_MULTIVECTOR_DIM: usize = 16;
 /// `max_tokens` bound the (inclusive) random token count per row, `n` the
 /// corpus size, `q` the query count and `top` the number of ground-truth
 /// neighbours per query.
+///
+/// Ground truth is always scored with raw dot-product MaxSim, regardless of
+/// whatever `distance` the caller later registers the dataset under in
+/// `datasets.json` — correct for a `dot`-declared dataset (what this repo
+/// ships), but silently wrong for an `l2`-declared one: Qdrant would rank by
+/// Euclid-MaxSim while this ground truth is dot-MaxSim. An `l2` multivector
+/// dataset needs its own Euclid-MaxSim ground truth, not this function's.
 pub fn generate_multivector(
     seed: u64,
     dim: usize,
