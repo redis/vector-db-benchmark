@@ -2,10 +2,12 @@
 //! corpus (vectors **and** metadata) on disk in the compound layout the
 //! benchmark's `type: "tar"` reader expects.
 //!
-//! The upstream corpus is a 60-shard Hugging Face dataset of 113.5M passages —
-//! there is no tarball to point `datasets.json`'s `link` at, and no sane default
-//! size, so the registered entries have no download link and this binary builds
-//! them. Run:
+//! All six registered variants ship prepared tarballs in S3 and auto-download
+//! like any other dataset; this binary is what BUILT them, and what rebuilds
+//! them from upstream if you would rather re-derive than trust the artifact.
+//! Upstream itself is a 60-shard Hugging Face dataset of 113.5M passages with no
+//! tarball of its own and no sane default size, which is why a preparation step
+//! exists at all. Run:
 //!
 //! ```text
 //! cargo run --release --bin prepare-msmarco -- --dataset msmarco-cohere-1024-100K-cosine
@@ -140,9 +142,9 @@ struct Args {
     ///
     /// This is the discovery step for the uniformly-sampled variants: selection
     /// depends on `docid`, so the realized size of a threshold cannot be known
-    /// without reading every docid. Streams only `passages_jsonl` (~100 GB
-    /// gzipped) — never the embeddings — and one scan sizes every possible
-    /// threshold at once.
+    /// without reading every docid. Streams only `passages_jsonl` (26.9 GB
+    /// gzipped) — never the 232.5 GB of embeddings — and one scan sizes every
+    /// possible threshold at once.
     #[arg(long)]
     discover_crc32: bool,
 
@@ -215,12 +217,16 @@ fn run(args: &Args) -> Result<(), String> {
 
     let mut queries = load_queries(&client, &cache, args.hf_token.as_deref(), variant)?;
 
-    // Only the offsets some query's shipped top-1k actually names need their
-    // docid remembered for the alignment check — a few thousand strings, not a
-    // parallel copy of the whole corpus.
+    // WHICH offsets need a docid remembered depends on the sampling mode, and
+    // getting it wrong is not harmless: a prefix build handed offsets beyond its
+    // prefix fails its own completeness check on a correct corpus. The rule
+    // lives in `msmarco::offsets_to_track`, under test, rather than here.
     let wanted_offsets: std::collections::HashSet<u64> = queries
         .iter()
-        .flat_map(|q| q.shipped.iter().map(|(off, _, _)| *off as u64))
+        .flat_map(|q| {
+            let shipped: Vec<i64> = q.shipped.iter().map(|(off, _, _)| *off).collect();
+            msmarco::offsets_to_track(&shipped, variant.sampling, variant.limit)
+        })
         .collect();
 
     let mut plan: Vec<ShardTake> = Vec::new();
@@ -420,7 +426,7 @@ fn get(
 /// Stream every `passages_jsonl` shard and histogram the docid buckets.
 ///
 /// Reads metadata only — the embeddings are never touched, which is what keeps
-/// this to ~100 GB instead of ~330 GB. The result sizes every possible
+/// this to 26.9 GB instead of the full 259 GB. The result sizes every possible
 /// threshold, so the sampled variants' constants come from one scan.
 fn discover_crc32(args: &Args) -> Result<(), String> {
     let client = http_client()?;

@@ -799,8 +799,9 @@ carrying its source document's `docid`, `url`, `title`, `headings`, the passage
 in the table is vectors only, so this is what lets filtered and full-text search
 be measured over genuine documents instead of synthetic payloads.
 
-The 100K and 1M variants **auto-download** like any other dataset, from prepared
-tarballs in the usual `benchmarks.redislabs` bucket (288 MiB and 2.51 GiB). You
+All six variants **auto-download** like any other dataset, from prepared
+tarballs in the usual `benchmarks.redislabs` bucket (288 MiB / 2.5 GiB / 24.7 GiB
+for the prefix trio, 322 MiB / 2.8 GiB / 26.8 GiB for the uniform one). You
 only need the preparer below to build a variant that is not published yet, or to
 re-derive one yourself instead of trusting the artifact — the result is
 byte-identical, which is verified rather than asserted: the same SHA-256 for
@@ -879,7 +880,7 @@ metadata:
 | Selection | first N passages of the corpus order | `zlib.crc32(docid) % 1000000 < threshold` |
 | Thresholds | — | 886 / 8805 / 88075 (they nest) |
 | Realized size | exactly 100K / 1M / 10M | 99,964 / 1,000,044 / 9,999,959 |
-| Build cost | only the head of the corpus | the **whole** corpus, ~330 GB |
+| Build cost | only the head of the corpus | the **whole** corpus, 259 GB |
 | Metadata | alphabetically bounded | uniform |
 | Vector geometry | representative (measured, below) | uniform |
 
@@ -936,9 +937,13 @@ else that reads the payload distribution, that is the difference between a
 representative corpus and a slice of the As.
 
 `zlib.crc32(docid) % N` is also the selection the Redis Enterprise MS MARCO
-suite uses (at `% 100`), so the two benchmarks' corpora are comparable by
-construction. Our implementation is pinned bit-identical to `zlib.crc32` by
-tests using vectors taken from zlib itself.
+suite uses, at `% 100`. Same corpus, same hash, both uniform — but **not the
+same documents**: 100 divides 1,000,000 and buckets 0..885 span every residue
+mod 100, so our 886/1e6 sample and their 1/100 sample overlap in only ~1% of our
+passages, and neither nests in the other. What that buys is a shared, auditable
+selection rule, not a shared document set. (The nesting claim applies *within*
+this family: 886 < 8805 < 88075.) Our implementation is pinned bit-identical to
+`zlib.crc32` by tests using vectors taken from zlib itself.
 
 **The round number is only in the name.** A hash threshold cannot be made to
 land on exactly 1,000,000, so `vector_count` carries the realized count, measured
@@ -948,9 +953,9 @@ once by a scan over all 113,520,750 docids:
 cargo run --release --bin prepare-msmarco -- --discover-crc32
 ```
 
-That scan reads metadata only (never the embeddings) with 16 shards in flight —
-265 MB/s and 128 s on an i7i.metal-24xl, against ~12 MB/s for a single stream —
-and one pass sizes every possible threshold. Preparation hard-errors if the
+That scan reads metadata only — 26.9 GB of gzipped JSONL, never the 232.5 GB of
+embeddings — with 16 shards in flight: 128 s on an i7i.metal-24xl, against ~12 MB/s
+for a single stream. One pass sizes every possible threshold. Preparation hard-errors if the
 realized count ever stops matching the registry, which is how a changed upstream
 export would announce itself.
 

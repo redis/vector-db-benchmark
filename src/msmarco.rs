@@ -774,9 +774,12 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Per-query running top-k over the corpus, fed one block of passages at a time.
 ///
-/// Held as a sorted-descending `Vec` per query rather than a heap: `k` is 100 and
-/// the overwhelmingly common case is "this candidate loses to the current worst",
-/// which is one comparison here.
+/// Held as a sorted-descending `Vec` per query rather than a heap: the
+/// overwhelmingly common case is "this candidate loses to the current worst",
+/// which is one comparison here, and only a winner pays the insert. That still
+/// holds at [`NEIGHBOURS`] = 1000 — the measured cost of going from 100 to 1000
+/// was 29.7 s to 39.7 s on the 100K build — because the fast path's frequency
+/// rises with `k`, not its cost.
 pub struct TopK {
     k: usize,
     dim: usize,
@@ -1099,6 +1102,38 @@ pub fn check_coverage(
         ));
     }
     Ok(())
+}
+
+/// Which global offsets the corpus writer must remember a `docid` for.
+///
+/// This is selection logic, and it differs per sampling mode in a way that is
+/// easy to get wrong in exactly one direction:
+///
+/// * [`Sampling::Prefix`] — only offsets inside the prefix. The writer can only
+///   record a docid for a row it actually writes, so handing it an offset it
+///   will never reach makes its completeness check fail on a perfectly correct
+///   run. That is not hypothetical: passing the unfiltered shipped list here
+///   aborted every prefix build with "1592762 of the 1594767 offsets … were
+///   never given a docid … the offset arithmetic is wrong" — a confident and
+///   completely wrong diagnosis of a correct corpus.
+/// * [`Sampling::Crc32`] — all of them. Selection depends on `docid`, so which
+///   offsets end up in the sample is unknown until the corpus has been read;
+///   any shipped offset might turn out to be one of them.
+///
+/// Lives here rather than in the binary because it decides what gets verified,
+/// which is the kind of thing this crate keeps under test.
+pub fn offsets_to_track(shipped_offsets: &[i64], sampling: Sampling, limit: u64) -> Vec<u64> {
+    shipped_offsets
+        .iter()
+        .filter(|off| **off >= 0)
+        .map(|off| *off as u64)
+        .filter(|off| match sampling {
+            // `keeps` is the same predicate the writer applies, so the two
+            // cannot disagree about what a prefix contains.
+            Sampling::Prefix => sampling.keeps(*off, "", limit),
+            Sampling::Crc32 { .. } => true,
+        })
+        .collect()
 }
 
 /// Reject a block containing a non-finite value.
@@ -2107,6 +2142,43 @@ mod tests {
                 check_coverage_upper_bound(limit, q, p).is_ok()
             );
         }
+    }
+
+    /// The prefix writer can only record what it writes. Tracking an offset
+    /// beyond the prefix makes its completeness check fail on a correct corpus —
+    /// which is exactly what shipping the unfiltered shipped list did.
+    #[test]
+    fn prefix_tracks_only_offsets_it_will_actually_write() {
+        let shipped = vec![5i64, 99_999, 100_000, 100_001, 5_000_000, -1];
+        let got = offsets_to_track(&shipped, Sampling::Prefix, 100_000);
+        assert_eq!(got, vec![5, 99_999]);
+        assert!(
+            got.iter().all(|o| *o < 100_000),
+            "a tracked offset outside the prefix can never be satisfied"
+        );
+        // Negative offsets are not silently cast into enormous u64s.
+        assert!(!got.contains(&(u64::MAX)));
+    }
+
+    /// The sampled writer cannot know its selection in advance, so it must be
+    /// offered everything.
+    #[test]
+    fn crc32_tracks_every_shipped_offset_regardless_of_position() {
+        let shipped = vec![5i64, 99_999, 100_000, 113_520_749];
+        let got = offsets_to_track(&shipped, Sampling::Crc32 { threshold: 886 }, 100_000);
+        assert_eq!(got, vec![5, 99_999, 100_000, 113_520_749]);
+    }
+
+    /// The two modes must genuinely differ here — if they ever returned the same
+    /// thing, one of them is wrong.
+    #[test]
+    fn the_two_modes_track_different_offsets() {
+        let shipped: Vec<i64> = (0..2_000).map(|i| i * 137).collect();
+        let prefix = offsets_to_track(&shipped, Sampling::Prefix, 100_000);
+        let sampled = offsets_to_track(&shipped, Sampling::Crc32 { threshold: 886 }, 100_000);
+        assert!(prefix.len() < sampled.len());
+        assert_eq!(sampled.len(), shipped.len());
+        assert!(prefix.iter().all(|o| sampled.contains(o)));
     }
 
     #[test]

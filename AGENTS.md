@@ -74,12 +74,25 @@ Datasets are auto-downloaded from the `link` URL in `datasets.json` when not fou
 Entries with **no `link`** do not exist until a tool writes them:
 
 - `synthetic-*` — `cargo run --release --bin generate-dataset`
-- `msmarco-cohere-1024-{100K,1M,10M}-cosine` — `make prepare-msmarco` (or
-  `--bin prepare-msmarco --dataset <name>`). MS MARCO v2.1 passages + Cohere
-  embed-v3 vectors **and** real document metadata, streamed from Hugging Face.
-  Logic lives in `src/msmarco.rs` (unit-tested); the binary is I/O only. The size
-  is fixed by the dataset name, never a flag, and the brute-forced ground truth
-  is cross-checked against the upstream top-1k before anything is written.
+(The `msmarco-cohere-1024-*` entries used to be in this list. **All six now have
+`link`s** and auto-download like any other dataset — see below.)
+
+## MS MARCO datasets
+
+`msmarco-cohere-1024-{100K,1M,10M}-cosine` and their `-crc32-` twins: MS MARCO
+v2.1 passages + Cohere embed-v3 vectors **and** real document metadata. All six
+auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
+
+- Logic lives in `src/msmarco.rs` (unit-tested); the binary is I/O only. That
+  convention is load-bearing — the one regression in this area was
+  offset-selection logic that ended up in the binary and so had no test.
+- Size is fixed by the dataset name, never a flag. The `-crc32-` variants declare
+  their REALIZED count (99,964 / 1,000,044 / 9,999,959), since a hash threshold
+  cannot land on a round number.
+- Ground truth is brute-forced per corpus and cross-checked against the upstream
+  global top-1k before anything is written; `--verify` re-runs that check against
+  an already-prepared dataset.
+- `--discover-crc32` re-derives the sampling thresholds (26.9 GB metadata scan).
 
 ## Key Patterns
 
