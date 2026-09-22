@@ -278,6 +278,18 @@ fmt:
 	cargo fmt
 
 # ============================================================
+# DATASETS - Prepare the MS MARCO v2.1 + Cohere embed-v3 corpus
+# ============================================================
+
+# Size is chosen by name, not by a flag: msmarco-cohere-1024-{100K,1M,10M}-cosine.
+MSMARCO_DATASET ?= msmarco-cohere-1024-100K-cosine
+
+.PHONY: prepare-msmarco
+prepare-msmarco:
+	@echo "=== Preparing $(MSMARCO_DATASET) (vectors + metadata) ==="
+	cargo run --release --bin prepare-msmarco -- --dataset $(MSMARCO_DATASET)
+
+# ============================================================
 # V0-CHECK - Compare Rust vs Python v0 precision/QPS/latency
 # ============================================================
 
@@ -370,6 +382,11 @@ help:
 	@echo "  make docker-build                - Build Docker image (IMAGE_TAG=latest)"
 	@echo "  make docker-integration          - Run benchmark in Docker (h-and-m dataset)"
 	@echo "  make docker-integration-fast     - Run fast benchmark in Docker (random-100 dataset)"
+	@echo ""
+	@echo "  Datasets:"
+	@echo "  make prepare-msmarco   - Download+build the MS MARCO v2.1 / Cohere embed-v3 corpus"
+	@echo "                           (vectors + real document metadata). Size is picked by name:"
+	@echo "                           MSMARCO_DATASET=msmarco-cohere-1024-{100K,1M,10M}-cosine"
 	@echo ""
 	@echo "  Validation:"
 	@echo "  make v0-check          - Compare Rust vs Python v0 (precision, QPS, latency)"

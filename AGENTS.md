@@ -71,6 +71,16 @@ experiments/
 
 Datasets are auto-downloaded from the `link` URL in `datasets.json` when not found locally.
 
+Entries with **no `link`** do not exist until a tool writes them:
+
+- `synthetic-*` — `cargo run --release --bin generate-dataset`
+- `msmarco-cohere-1024-{100K,1M,10M}-cosine` — `make prepare-msmarco` (or
+  `--bin prepare-msmarco --dataset <name>`). MS MARCO v2.1 passages + Cohere
+  embed-v3 vectors **and** real document metadata, streamed from Hugging Face.
+  Logic lives in `src/msmarco.rs` (unit-tested); the binary is I/O only. The size
+  is fixed by the dataset name, never a flag, and the brute-forced ground truth
+  is cross-checked against the upstream top-1k before anything is written.
+
 ## Key Patterns
 
 - **Parallel upload/search**: `thread::scope` + `AtomicUsize` work-stealing across batches

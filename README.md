@@ -84,7 +84,7 @@ The filter path is **not** the shared RediSearch builder used by Redis/Valkey/Dr
 
 The first two are decidable from the dataset schema, so KiviDB rejects them in the **configure** phase — before the index is created and before the corpus is read — leaving no partial upload, no orphan result file and no populated keyspace behind.
 
-> **Which shipped datasets this excludes.** **3 of the 53** datasets in `datasets/datasets.json` cannot run on KiviDB at all and now abort instead of producing a result file: `random-geo-radius-100-angular-filters` and `random-geo-radius-2048-angular-filters` (geo), and `arxiv-titles-384-angular-filters` (multi-valued `labels` — the only shipped dataset that declares a `labels` field). Before this was fixed these three *did* run and published a recall near 0.0, which was visibly wrong; they now publish nothing at all, and no result file records the rejection, so `--plot` simply shows a gap for KiviDB on those datasets. If you are sweeping KiviDB across everything, either exclude the three from `--datasets` (`arxiv-titles-384-angular-no-filters` is the pure-KNN twin of the arxiv one) or pass `--exit-on-error false` so the rest of the sweep continues. Every other dataset — including all filtered ones — is unaffected.
+> **Which shipped datasets this excludes.** **3 of the 61** datasets in `datasets/datasets.json` cannot run on KiviDB at all and now abort instead of producing a result file: `random-geo-radius-100-angular-filters` and `random-geo-radius-2048-angular-filters` (geo), and `arxiv-titles-384-angular-filters` (multi-valued `labels` — the only shipped dataset that declares a `labels` field). Before this was fixed these three *did* run and published a recall near 0.0, which was visibly wrong; they now publish nothing at all, and no result file records the rejection, so `--plot` simply shows a gap for KiviDB on those datasets. If you are sweeping KiviDB across everything, either exclude the three from `--datasets` (`arxiv-titles-384-angular-no-filters` is the pure-KNN twin of the arxiv one) or pass `--exit-on-error false` so the rest of the sweep continues. Every other dataset — including all filtered ones — is unaffected.
 
 One real protocol difference worth knowing: KiviDB's `FT.INFO` does not expose RediSearch's `num_docs`/`percent_indexed` — it reports HNSW graph state directly instead (`hnsw_live_count`, `hnsw_compaction_in_progress`), because it builds each vector's HNSW entry synchronously inside the `HSET` that stores it (no async backfill phase exists to report progress on); `wait_for_indexing` polls those fields instead and returns immediately as a result. RESP2 only (no RESP3 opt-in). Set the host port with `KIVIDB_PORT` (default `6380` — KiviDB's own default listen port, **not** Redis's 6379).
 
@@ -704,6 +704,10 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | [DBpedia OpenAI-1M: Knowledge embeddings](https://www.dbpedia.org/)                                       |      1,536 |   1,000,000 |    10,000 |       100 | Cosine    |
 | [DBpedia OpenAI-100K: Knowledge embeddings](https://www.dbpedia.org/)                                     |      1,536 |     100,000 |     5,000 |        10 | Cosine    |
 | [LAION Small CLIP: Small CLIP embeddings](https://laion.ai/blog/laion-400-open-dataset/)                   |        512 |     100,000 |     1,000 |       100 | Cosine    |
+| **Text Retrieval with Real Document Metadata** (vectors **and** the source documents' fields — see [Preparing the MS MARCO corpus](#preparing-the-ms-marco-corpus-vectors--metadata)) |            |             |           |           |           |
+| [MS MARCO v2.1-100K: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |     100,000 |     1,677 |       100 | Cosine    |
+| [MS MARCO v2.1-1M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3)  |      1,024 |   1,000,000 |     1,677 |       100 | Cosine    |
+| [MS MARCO v2.1-10M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |  10,000,000 |     1,677 |       100 | Cosine    |
 | **Sparse Vectors** (learned/lexical sparse embeddings — Qdrant is the only engine with a sparse path)        |            |             |           |           |           |
 | [MS MARCO Sparse-100K: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                |   *sparse* |     100,000 |     6,980 |        10 | Dot       |
 | [MS MARCO Sparse-1M: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                  |   *sparse* |   1,000,000 |     6,980 |        10 | Dot       |
@@ -779,6 +783,68 @@ ladder** (1% / 2% / 5% / 10% / 25% / 50% / 90%), each row annotated with its
 `selectivity` / `n_matching`, so recall/latency can be reported as a function of
 filter selectivity. The generated files are git-ignored — regenerate them on any
 checkout with the command above.
+
+### Preparing the MS MARCO corpus (vectors + metadata)
+
+`msmarco-cohere-1024-{100K,1M,10M}-cosine` is the one corpus here that ships
+**real document metadata next to the vectors**: MS MARCO v2.1 / TREC-RAG 2024
+passages embedded with Cohere `embed-english-v3.0` (1024-dim, cosine), each
+carrying its source document's `docid`, `url`, `title`, `headings`, the passage
+`segment` text, and `start_char` / `end_char`. Every other text-embedding dataset
+in the table is vectors only, so this is what lets filtered and full-text search
+be measured over genuine documents instead of synthetic payloads.
+
+Upstream ([`CohereLabs/msmarco-v2.1-embed-english-v3`][msmarco-hf]) is a 60-shard
+Hugging Face dataset of 113,520,750 passages with no tarball to download, so
+these entries have **no `link`** and are built locally:
+
+```bash
+make prepare-msmarco                                        # the 100K variant
+make prepare-msmarco MSMARCO_DATASET=msmarco-cohere-1024-1M-cosine
+# or directly, e.g. to write somewhere other than ./datasets:
+cargo run --release --bin prepare-msmarco -- \
+  --dataset msmarco-cohere-1024-1M-cosine --out-dir /data/ds
+```
+
+[msmarco-hf]: https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3
+
+It writes the compound (`type: "tar"`) layout — `vectors.npy` (float32, converted
+from the upstream float16), `payloads.jsonl`, `tests.jsonl` — plus a
+`PREPARED.json` recording provenance, the shards consumed, the longest value per
+payload field, and the verification numbers below. Only the prefix each variant
+needs is fetched, so the 100K build is a ~200 MB ranged read and finishes in well
+under a minute; 1M is ~5.5 GB on disk (and ~8 GB RAM to *read* at benchmark time,
+since the NPY reader materialises the corpus twice), 10M is ~55 GB on disk and
+needs a ~80 GB-RAM machine to run.
+
+**There is deliberately no `--limit`.** The size is a property of the dataset
+name, so two runs that both report `msmarco-cohere-1024-1M-cosine` uploaded the
+same corpus. Each variant is the first N passages of the upstream global order.
+
+**Ground truth is brute-forced, not borrowed.** Upstream ships a top-1000 per
+query, but that ranks the *whole* 113.5M corpus: restricted to a 1M prefix it
+retains only ~9 hits per query and is plain wrong past them, because a passage
+ranked 1001st globally can sit in the prefix and outrank everything that
+survived truncation. So the 1677 TREC-DL 2021-2023 queries get a genuine
+brute-force top-100 over the prepared vectors, read back from the file that was
+just written.
+
+The shipped list is then used as an **independent oracle**, which is the part
+worth trusting the numbers over. Every in-prefix global-top-1k hit necessarily
+outranks every in-prefix passage that is *not* in the global top-1k, so our
+ranking's head must equal those hits, id for id and cosine for cosine, and the
+payload at each of those offsets must name the same passage the upstream list
+names. That single assertion covers the brute force, the npy-row-to-jsonl-line
+alignment (a one-row slip would give every passage its neighbour's metadata, and
+no recall number would show it), and the cross-shard offset arithmetic. It is not
+optional — a disagreement aborts preparation. On the 100K build it compares 2,134
+ranking positions across 562 queries and agrees to within 4.6e-5 cosine.
+
+Queries carry no `conditions`: these are pure-KNN TREC topics, and inventing a
+filter for them would make the ground truth a fiction. The metadata is indexed
+all the same, so it is there for full-text and filter work — on Redis the prepared
+100K corpus indexes `docid`/`url` as TAG, `title`/`headings`/`segment` as TEXT and
+`start_char`/`end_char` as NUMERIC, with zero indexing failures.
 
 ### Filter features
 

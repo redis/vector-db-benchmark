@@ -63,3 +63,7 @@ path = "src/bin/vector_db_benchmark/main.rs"
 [[bin]]
 name = "generate-dataset"
 path = "src/bin/generate_dataset.rs"
+
+[[bin]]
+name = "prepare-msmarco"
+path = "src/bin/prepare_msmarco.rs"

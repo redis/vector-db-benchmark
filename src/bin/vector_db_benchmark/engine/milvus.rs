@@ -33,6 +33,67 @@ struct MilvusFieldKind {
     index_type: Option<&'static str>,
 }
 
+/// `max_length` declared for every `VarChar` column, and for the elements of an
+/// `Array` of `VarChar`.
+///
+/// This is Milvus's own maximum for the parameter, and it is deliberately the
+/// maximum rather than a "sensible" smaller number. `VarChar` is
+/// variable-length — the declared cap is a validation bound, not an allocation —
+/// so a larger value costs nothing, while a smaller one costs correctness: it is
+/// the server-side length at which an insert is REJECTED, counted in UTF-8
+/// BYTES. The previous 500 rejected every MS MARCO passage
+/// (`msmarco-cohere-1024-*`), whose `segment` bodies reach ~28 600 bytes and
+/// whose `headings` reach ~25 800 — so Milvus could not run the one dataset we
+/// ship with real document text. Any cap below Milvus's own is a limit we
+/// invented, and it can only turn a dataset the engine supports into one it
+/// refuses. (The per-field maxima the preparer measured are recorded in that
+/// dataset's `PREPARED.json`.)
+const VARCHAR_MAX_LENGTH: &str = "65535";
+
+/// Build the collection-creation JSON for one schema field.
+///
+/// Extracted from `create_collection` so the declared `VarChar` cap — a
+/// server-side rejection threshold, not a hint — can be asserted without a live
+/// Milvus. See [`VARCHAR_MAX_LENGTH`].
+fn milvus_field_json(
+    field_name: &str,
+    schema_type: &str,
+    kind: &MilvusFieldKind,
+) -> serde_json::Value {
+    // A multi-valued keyword field (`labels`) is declared as an Array of VarChar
+    // so `array_contains_any` can match a single element; a scalar VarChar could
+    // only test whole-string equality against the joined value (issue #88).
+    if kind.data_type == "Array" {
+        return serde_json::json!({
+            "fieldName": field_name,
+            "dataType": "Array",
+            "elementDataType": "VarChar",
+            "elementTypeParams": {"max_length": VARCHAR_MAX_LENGTH, "max_capacity": "128"},
+        });
+    }
+
+    let milvus_type = kind.data_type;
+    let mut field = serde_json::json!({
+        "fieldName": field_name,
+        "dataType": milvus_type,
+    });
+    if milvus_type == "VarChar" {
+        let mut params = serde_json::json!({"max_length": VARCHAR_MAX_LENGTH});
+        if schema_type == "text" {
+            // Enable the analyzer + match inverted index so TEXT_MATCH full-text
+            // filtering works on this field.
+            let p = params.as_object_mut().unwrap();
+            p.insert("enable_analyzer".to_string(), serde_json::json!(true));
+            p.insert("enable_match".to_string(), serde_json::json!(true));
+        }
+        field
+            .as_object_mut()
+            .unwrap()
+            .insert("elementTypeParams".to_string(), params);
+    }
+    field
+}
+
 /// Map a dataset schema field to its Milvus column type AND its scalar index
 /// type, or `None` if the field is not materialised as a column at all.
 ///
@@ -473,40 +534,7 @@ impl MilvusEngine {
                     let Some(kind) = milvus_field_kind(field_name, ft) else {
                         continue;
                     };
-                    // A multi-valued keyword field (`labels`) is declared as an
-                    // Array of VarChar so `array_contains_any` can match a single
-                    // element; a scalar VarChar could only test whole-string
-                    // equality against the joined value (issue #88).
-                    let field = if kind.data_type == "Array" {
-                        serde_json::json!({
-                            "fieldName": field_name,
-                            "dataType": "Array",
-                            "elementDataType": "VarChar",
-                            "elementTypeParams": {"max_length": "500", "max_capacity": "128"},
-                        })
-                    } else {
-                        let milvus_type = kind.data_type;
-                        let mut field = serde_json::json!({
-                            "fieldName": field_name,
-                            "dataType": milvus_type,
-                        });
-                        if milvus_type == "VarChar" {
-                            let mut params = serde_json::json!({"max_length": "500"});
-                            if ft == "text" {
-                                // Enable the analyzer + match inverted index so
-                                // TEXT_MATCH full-text filtering works on this field.
-                                let p = params.as_object_mut().unwrap();
-                                p.insert("enable_analyzer".to_string(), serde_json::json!(true));
-                                p.insert("enable_match".to_string(), serde_json::json!(true));
-                            }
-                            field
-                                .as_object_mut()
-                                .unwrap()
-                                .insert("elementTypeParams".to_string(), params);
-                        }
-                        field
-                    };
-                    fields.push(field);
+                    fields.push(milvus_field_json(field_name, ft, &kind));
                 }
             }
         }
@@ -2135,6 +2163,55 @@ mod tests {
             .unwrap()
             .index_type
             .is_some());
+    }
+
+    /// The declared `VarChar` cap is a server-side REJECTION threshold, so it
+    /// must be Milvus's own maximum and nothing smaller. Pinned because the
+    /// failure mode is invisible from this file: a lower number does not break
+    /// any test here, it makes Milvus refuse inserts for whichever dataset
+    /// happens to carry long strings (`msmarco-cohere-1024-*`, whose `segment`
+    /// bodies reach ~28 600 UTF-8 bytes).
+    #[test]
+    fn varchar_columns_declare_milvus_own_maximum_length() {
+        assert_eq!(VARCHAR_MAX_LENGTH, "65535");
+        // Milvus accepts 1..=65535 for this parameter; anything outside is a
+        // schema error, anything below is a cap we invented.
+        assert_eq!(VARCHAR_MAX_LENGTH.parse::<u32>().unwrap(), 65535);
+
+        // And it is what the collection body actually sends — for the scalar
+        // VarChar column, for an analyzed `text` column, and for the element
+        // type of an Array(VarChar).
+        let kind = |ty: &str| milvus_field_kind("f", ty).unwrap();
+        let kw = milvus_field_json("url", "keyword", &kind("keyword"));
+        assert_eq!(kw["dataType"], "VarChar");
+        assert_eq!(kw["elementTypeParams"]["max_length"], VARCHAR_MAX_LENGTH);
+        assert!(kw["elementTypeParams"].get("enable_analyzer").is_none());
+
+        let txt = milvus_field_json("segment", "text", &kind("text"));
+        assert_eq!(txt["elementTypeParams"]["max_length"], VARCHAR_MAX_LENGTH);
+        assert_eq!(txt["elementTypeParams"]["enable_analyzer"], json!(true));
+        assert_eq!(txt["elementTypeParams"]["enable_match"], json!(true));
+
+        let arr = milvus_field_json(
+            "labels",
+            "keyword",
+            &milvus_field_kind("labels", "keyword").unwrap(),
+        );
+        assert_eq!(arr["dataType"], "Array");
+        assert_eq!(arr["elementTypeParams"]["max_length"], VARCHAR_MAX_LENGTH);
+
+        // Non-string columns must carry no length cap at all.
+        let n = milvus_field_json("size", "int", &kind("int"));
+        assert_eq!(n["dataType"], "Int64");
+        assert!(n.get("elementTypeParams").is_none());
+
+        // The longest values, in UTF-8 bytes, that the prepared MS MARCO 100K
+        // corpus actually holds (segment / headings / title / url / docid), as
+        // measured into its PREPARED.json. The old cap of 500 rejected the first
+        // three; the declared one admits all five.
+        for len in [28_581u32, 25_840, 588, 190, 41] {
+            assert!(len <= VARCHAR_MAX_LENGTH.parse::<u32>().unwrap());
+        }
     }
 
     /// The per-type index choice, verified live against milvusdb/milvus:v2.6.19
