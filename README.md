@@ -902,6 +902,25 @@ prefix variants are not geometrically skewed and their recall numbers stand.
 What is skewed is the payload distribution — which is exactly what the `-crc32-`
 twins fix, and why they exist rather than replacing the prefix variants.
 
+**Oracle coverage, measured on all six built corpora.** The cross-check can only
+speak for a query that retains at least one of its shipped global top-1k hits,
+so how many queries it reaches is a property worth comparing:
+
+| corpus | queries checked | ranking positions | max cosine delta |
+| --- | ---: | ---: | ---: |
+| prefix 100K | 562 / 1677 | 2,134 | 4.63e-5 |
+| prefix 1M | 1,505 / 1677 | 17,523 | 4.85e-5 |
+| prefix 10M | 1,675 / 1677 | 197,898 | 5.96e-5 |
+| uniform 100K | **1,005** / 1677 | 1,494 | 3.74e-5 |
+| uniform 1M | **1,676** / 1677 | 14,596 | 4.18e-5 |
+| uniform 10M | **1,677** / 1677 | 147,422 | 5.14e-5 |
+
+At equal size the uniform variants reach far more queries — 1,005 against 562 at
+100K — because their hits are spread across the corpus rather than concentrated
+in one stretch of the alphabet. They compare fewer positions in total but across
+more queries, which is the better trade for an oracle: the uniform 10M is the
+only variant where **no query goes unchecked**.
+
 **What the uniform sample actually buys**, measured on the built corpora:
 
 | | uniform 100K | prefix 100K | prefix 10M |
