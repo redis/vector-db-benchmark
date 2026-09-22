@@ -796,9 +796,19 @@ carrying its source document's `docid`, `url`, `title`, `headings`, the passage
 in the table is vectors only, so this is what lets filtered and full-text search
 be measured over genuine documents instead of synthetic payloads.
 
+The 100K and 1M variants **auto-download** like any other dataset, from prepared
+tarballs in the usual `benchmarks.redislabs` bucket (288 MiB and 2.51 GiB). You
+only need the preparer below to build a variant that is not published yet, or to
+re-derive one yourself instead of trusting the artifact — the result is
+byte-identical, which is verified rather than asserted: the same SHA-256 for
+`vectors.npy`, `payloads.jsonl` and `tests.jsonl` from a 16-core workstation and
+a 96-core metal host, and again after a full S3 round trip. That reproducibility
+is what the 8-lane dot product and the id tie-break in `TopK` are for — ground
+truth that does not depend on how many threads happened to run.
+
 Upstream ([`CohereLabs/msmarco-v2.1-embed-english-v3`][msmarco-hf]) is a 60-shard
-Hugging Face dataset of 113,520,750 passages with no tarball to download, so
-these entries have **no `link`** and are built locally:
+Hugging Face dataset of 113,520,750 passages with no tarball of its own, so the
+published artifacts were built with:
 
 ```bash
 make prepare-msmarco                                        # the 100K variant
@@ -865,6 +875,20 @@ variant but not the 1M or 10M ones**; it rejects those inserts. Every other
 engine takes the corpus unchanged. Preparation warns about this and records it
 under `engine_cap_violations` in `PREPARED.json`, so you know before the upload
 rather than partway through it.
+
+**Measured on the 1M variant** (Redis 8.8.0, `redis-msmarco.json`: M=32,
+EF_CONSTRUCTION=256, 8 search threads, on an i7i.metal-24xl — 96 cores):
+
+| top | EF | QPS | Recall | MRR | NDCG | p50 | p95 |
+| --: | --: | --: | --: | --: | --: | --: | --: |
+| 10 | 64 | 6081 | 0.9239 | 0.9922 | 0.9449 | 1.29 ms | 1.84 ms |
+| 10 | 128 | 4728 | 0.9572 | 0.9970 | 0.9696 | 1.67 ms | 2.21 ms |
+| 100 | 256 | 3080 | 0.9570 | 1.0000 | 0.9683 | — | — |
+
+Upload was 192.5 s for 1M passages (5,194 docs/s) including the 1.5 GB of
+payload text. `experiments/configurations/redis-msmarco.json` ships that
+configuration; note it sets `top` explicitly, for the reason in the previous
+paragraph.
 
 **Sizing note for the Redis family.** Redis declares a `text` schema field as
 `TEXT SORTABLE`, which keeps a copy of the value in the sorting table. This is

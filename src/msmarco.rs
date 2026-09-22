@@ -965,13 +965,24 @@ mod tests {
                 "{}",
                 v.dataset_name
             );
-            // No `link`: there is no tarball upstream, and a bogus one would send
-            // the auto-downloader after a URL that cannot exist.
-            assert!(
-                entry.get("link").is_none(),
-                "{} must have no download link",
-                v.dataset_name
-            );
+            // A `link`, when present, points at the prepared tarball published to
+            // S3. It must name THIS variant: an entry pointing at another size's
+            // artifact would fetch a corpus of the wrong length under this name.
+            // There is no upstream tarball to fall back on, so a bogus URL is
+            // equally fatal — it sends the auto-downloader somewhere that cannot
+            // exist.
+            if let Some(link) = entry.get("link").and_then(|l| l.as_str()) {
+                assert!(
+                    link.ends_with(&format!("/{}.tgz", v.dataset_name)),
+                    "{}: link {link:?} does not name this variant's tarball",
+                    v.dataset_name
+                );
+                assert!(
+                    link.contains("/vecsim/msmarco-cohere-1024/"),
+                    "{}: link {link:?} is outside the published prefix",
+                    v.dataset_name
+                );
+            }
 
             // The schema must name exactly the payload fields the preparer
             // writes, with the same types: a field in the payload but not the
