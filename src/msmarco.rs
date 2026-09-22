@@ -640,6 +640,57 @@ pub fn in_prefix_hits(
     Ok(InPrefixHits { hits })
 }
 
+/// How many rows to take from one shard, and where that shard's rows start in
+/// the global order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardTake {
+    pub shard: usize,
+    /// Rows the shard holds in total (from its NPY header).
+    pub shard_rows: u64,
+    /// Rows to consume, from row 0. Equal to `shard_rows` except on the last.
+    pub take: u64,
+    /// Global offset of this shard's row 0.
+    pub first_id: u64,
+}
+
+/// Work out which shards a `limit`-passage prefix spans, given each shard's row
+/// count in order.
+///
+/// Split out from the preparer's network loop and tested here because **no
+/// registered variant below 10M exercises it**: shard 00 alone holds 1,760,180
+/// passages, so the 100K and 1M builds never cross a shard boundary and a live
+/// run of either proves nothing about `first_id` accumulation. Getting that
+/// wrong would shift every id past the first shard — and since ids ARE the
+/// ground-truth keys, the shipped-top-1k cross-check would then fail loudly
+/// rather than silently, but only for whoever first runs the 10M build.
+///
+/// `shard_rows` is consulted lazily, so the caller only pays for the headers it
+/// actually needs: the returned plan names exactly the shards to fetch.
+pub fn plan_shards(shard_rows: &[u64], limit: u64) -> Result<Vec<ShardTake>, String> {
+    let mut plan = Vec::new();
+    let mut so_far = 0u64;
+    for (shard, &rows) in shard_rows.iter().enumerate() {
+        if so_far >= limit {
+            break;
+        }
+        let take = rows.min(limit - so_far);
+        plan.push(ShardTake {
+            shard,
+            shard_rows: rows,
+            take,
+            first_id: so_far,
+        });
+        so_far += take;
+    }
+    if so_far != limit {
+        return Err(format!(
+            "the available shards hold {so_far} passages, short of the {limit} this variant \
+             declares"
+        ));
+    }
+    Ok(plan)
+}
+
 /// Depth of the shipped per-query ranking (`top1k_*`). Distinct from
 /// [`NEIGHBOURS`], which is how deep OUR brute force goes: this one is fixed by
 /// the upstream export and is what the coverage floor below is derived from.
@@ -1268,6 +1319,79 @@ mod tests {
 
     /// The floor must sit BELOW what every registered variant actually reaches
     /// (or preparation could never succeed) and ABOVE a collapse.
+    /// The real shard-00 row count, which is why nothing below 10M crosses a
+    /// boundary.
+    const SHARD0_ROWS: u64 = 1_760_180;
+
+    #[test]
+    fn a_prefix_inside_one_shard_takes_only_that_shard() {
+        for limit in [100_000u64, 1_000_000] {
+            let plan = plan_shards(&[SHARD0_ROWS, SHARD0_ROWS], limit).unwrap();
+            assert_eq!(plan.len(), 1, "limit {limit}");
+            assert_eq!(plan[0].first_id, 0);
+            assert_eq!(plan[0].take, limit);
+            assert_eq!(plan[0].shard_rows, SHARD0_ROWS);
+        }
+    }
+
+    /// The path no registered build below 10M reaches: `first_id` must be the
+    /// running sum of what earlier shards CONTRIBUTED, and every shard before
+    /// the last must be consumed whole.
+    #[test]
+    fn a_prefix_spanning_shards_accumulates_the_global_offset() {
+        let rows = [100u64, 200, 300, 400];
+        let plan = plan_shards(&rows, 450).unwrap();
+        assert_eq!(plan.len(), 3);
+        assert_eq!(
+            plan.iter()
+                .map(|p| (p.shard, p.take, p.first_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 100, 0), (1, 200, 100), (2, 150, 300)]
+        );
+        // Every id in the prefix is covered exactly once, contiguously.
+        assert_eq!(plan.iter().map(|p| p.take).sum::<u64>(), 450);
+        for w in plan.windows(2) {
+            assert_eq!(w[0].first_id + w[0].take, w[1].first_id);
+        }
+        // Only the LAST shard may be partially consumed — the tail check in the
+        // preparer depends on that.
+        assert!(plan[..plan.len() - 1]
+            .iter()
+            .all(|p| p.take == p.shard_rows));
+    }
+
+    #[test]
+    fn a_prefix_ending_exactly_on_a_boundary_does_not_open_the_next_shard() {
+        let plan = plan_shards(&[100, 200, 300], 300).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().all(|p| p.take == p.shard_rows));
+        assert_eq!(
+            plan.last().unwrap().first_id + plan.last().unwrap().take,
+            300
+        );
+    }
+
+    #[test]
+    fn a_prefix_larger_than_the_corpus_is_an_error_not_a_short_corpus() {
+        let e = plan_shards(&[100, 200], 500).unwrap_err();
+        assert!(e.contains("short of the 500"), "{e}");
+        assert!(plan_shards(&[], 1).is_err());
+        // Zero rows requested is vacuously satisfiable and takes nothing.
+        assert!(plan_shards(&[100], 0).unwrap().is_empty());
+    }
+
+    /// The registered 10M variant really does span shards, so the untested path
+    /// is on the shipped list rather than hypothetical.
+    #[test]
+    fn the_ten_million_variant_is_the_one_that_crosses_a_boundary() {
+        let rows = vec![SHARD0_ROWS; SHARDS];
+        let big = variant("msmarco-cohere-1024-10M-cosine").unwrap();
+        assert!(plan_shards(&rows, big.limit).unwrap().len() > 1);
+        for v in VARIANTS.iter().filter(|v| v.limit <= SHARD0_ROWS) {
+            assert_eq!(plan_shards(&rows, v.limit).unwrap().len(), 1);
+        }
+    }
+
     #[test]
     fn coverage_floor_admits_the_real_variants_and_rejects_a_collapse() {
         // Measured on the real 100K build: 562 queries / 2134 positions.

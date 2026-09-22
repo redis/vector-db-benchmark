@@ -57,7 +57,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use vector_db_benchmark::msmarco::{
     self, in_prefix_hits, normalize_in_place, parse_f16_npy_header, payload_from_passage, test_row,
-    verify_head_against_shipped, NpyF32Writer, TopK, Variant,
+    verify_head_against_shipped, NpyF32Writer, ShardTake, TopK, Variant,
 };
 
 /// Passages converted / scored per block. 8192 x 1024 x 4 B = 32 MiB, small
@@ -439,25 +439,16 @@ fn f32_array(v: &serde_json::Value, key: &str, lineno: usize) -> Result<Vec<f32>
 // Shard plan
 // ---------------------------------------------------------------------------
 
-/// How many rows to take from one shard, and where that shard's rows start in
-/// the global order.
-#[derive(Debug, Clone)]
-struct ShardTake {
-    shard: usize,
-    /// Rows the shard holds in total (from its NPY header).
-    shard_rows: u64,
-    /// Rows to consume, from row 0. Equal to `shard_rows` except on the last.
-    take: u64,
-    /// Global offset of this shard's row 0.
-    first_id: u64,
-}
-
+/// Fetch each shard's row count (a 512-byte ranged GET, never the multi-GB
+/// payload) until the variant's prefix is covered, then hand the arithmetic to
+/// the library's [`msmarco::plan_shards`], which is unit-tested across shard
+/// boundaries — the case no build below 10M reaches.
 fn plan_shards(
     client: &reqwest::blocking::Client,
     token: Option<&str>,
     variant: &Variant,
 ) -> Result<Vec<ShardTake>, String> {
-    let mut plan = Vec::new();
+    let mut rows = Vec::new();
     let mut so_far = 0u64;
     for shard in 0..msmarco::SHARDS {
         if so_far >= variant.limit {
@@ -478,28 +469,15 @@ fn plan_shards(
                 msmarco::DIM
             ));
         }
-        let take = header.rows.min(variant.limit - so_far);
-        plan.push(ShardTake {
-            shard,
-            shard_rows: header.rows,
-            take,
-            first_id: so_far,
-        });
-        so_far += take;
+        rows.push(header.rows);
+        so_far += header.rows;
     }
 
-    if so_far != variant.limit {
-        return Err(format!(
-            "the {} shards hold {} passages, short of the {} this variant declares",
-            msmarco::SHARDS,
-            so_far,
-            variant.limit
-        ));
-    }
+    let plan = msmarco::plan_shards(&rows, variant.limit)?;
     println!(
         "Plan: {} shard(s), {} passages ({} from shard {} onwards)",
         plan.len(),
-        so_far,
+        variant.limit,
         plan.last().map(|p| p.take).unwrap_or(0),
         plan.last().map(|p| p.shard).unwrap_or(0)
     );
