@@ -856,6 +856,16 @@ reassuring number with nothing behind it. Every output is written to `.part` and
 renamed only once that passes, so a directory either holds a complete,
 cross-checked corpus or is untouched.
 
+**Engine support is not uniform above 100K.** MS MARCO carries real web-page
+`headings`, and a handful of pages have pathological ones: 40 of the first 1M
+passages exceed **65,535 bytes** in that field (largest 185,752 — a single
+document's table of contents). That number is Milvus' own hard ceiling for a
+`VarChar` column, not a setting we choose, so **Milvus can ingest the 100K
+variant but not the 1M or 10M ones**; it rejects those inserts. Every other
+engine takes the corpus unchanged. Preparation warns about this and records it
+under `engine_cap_violations` in `PREPARED.json`, so you know before the upload
+rather than partway through it.
+
 **Sizing note for the Redis family.** Redis declares a `text` schema field as
 `TEXT SORTABLE`, which keeps a copy of the value in the sorting table. This is
 the first corpus where that is expensive, because it is the first with real prose

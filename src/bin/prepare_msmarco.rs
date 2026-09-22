@@ -645,8 +645,16 @@ fn write_corpus(
         .flush()
         .map_err(|e| format!("flush {}: {}", payloads_path.display(), e))?;
 
-    for line in msmarco::cap_violations(&max_field_bytes) {
+    let violations = msmarco::cap_violations(&max_field_bytes);
+    for line in &violations {
         eprintln!("\t⚠ WARNING: {line}");
+    }
+    if !violations.is_empty() {
+        eprintln!(
+            "\t  The corpus is still correct and every other engine takes it; the cap is that \
+             engine's own hard ceiling, so no setting on our side admits these values. \
+             Recorded under `engine_cap_violations` in PREPARED.json."
+        );
     }
 
     let missing = wanted_docids.len() - docid_at.len();
@@ -865,6 +873,10 @@ fn write_manifest(
                 "tolerance": COSINE_TOLERANCE,
             },
         },
+        // Machine-readable, because the console warning scrolls away and this is
+        // what decides whether an engine can ingest the corpus at all. Empty on
+        // the 100K prefix; the 1M one exceeds Milvus' ceiling (see below).
+        "engine_cap_violations": msmarco::cap_violations(max_field_bytes),
         "payload_fields": msmarco::PAYLOAD_FIELDS
             .iter()
             .map(|(name, ty)| serde_json::json!({

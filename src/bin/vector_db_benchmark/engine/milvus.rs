@@ -48,6 +48,12 @@ struct MilvusFieldKind {
 /// invented, and it can only turn a dataset the engine supports into one it
 /// refuses. (The per-field maxima the preparer measured are recorded in that
 /// dataset's `PREPARED.json`.)
+///
+/// 65535 is Milvus' ceiling, not a number we picked, so it is also a limit we
+/// cannot raise further: the 1M and 10M MS MARCO prefixes carry `headings`
+/// values up to 185 752 bytes (40 documents in the first 1M), which no declared
+/// cap admits. Milvus therefore runs the 100K variant and rejects the larger
+/// two. `msmarco::cap_violations` reports that at preparation time.
 const VARCHAR_MAX_LENGTH: &str = "65535";
 
 /// Build the collection-creation JSON for one schema field.
