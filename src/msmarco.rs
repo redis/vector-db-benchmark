@@ -59,9 +59,20 @@ pub const SHARDS: usize = 60;
 /// Passages in the full corpus, per the dataset card.
 pub const TOTAL_PASSAGES: u64 = 113_520_750;
 
-/// Ground-truth width written into `tests.jsonl`, matching the 100 neighbours
-/// every other compound dataset we ship carries.
-pub const NEIGHBOURS: usize = 100;
+/// Ground-truth width written into `tests.jsonl`.
+///
+/// 1000, not the 100 the other compound datasets carry, so it matches the depth
+/// of the upstream `top1k_*` lists this corpus is built from: recall@k is then
+/// answerable for any k up to 1000 without re-preparing, and the full depth of
+/// the shipped oracle stays comparable against our own ranking.
+///
+/// Consequences worth knowing. It is what `metrics_schema.ground_truth` reports
+/// as the row width, and a config that sets `top` above its own ground truth's
+/// width can never reach recall 1.0 — at width 1000 that ceiling is simply far
+/// away. It also makes `tests.jsonl` roughly three times larger (~84 MB for the
+/// 1677 queries) and gives the brute force a 1000-deep list to maintain per
+/// query instead of 100.
+pub const NEIGHBOURS: usize = 1000;
 
 /// Queries in `queries_jsonl/queries.jsonl.gz` (TREC-DL 2021 + 2022 + 2023).
 pub const QUERY_COUNT: usize = 1677;
@@ -268,8 +279,10 @@ pub fn decode_f16_block(bytes: &[u8]) -> Result<Vec<f32>, String> {
         ));
     }
     Ok(bytes
-        .chunks_exact(2)
-        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::f16::from_le_bytes(*c).to_f32())
         .collect())
 }
 
@@ -422,15 +435,15 @@ impl<W: Write> NpyF32Writer<W> {
 /// (only [`TopK::add_block`]) have already checked both are `dim` wide.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
-    let mut ia = a.chunks_exact(8);
-    let mut ib = b.chunks_exact(8);
-    for (x, y) in ia.by_ref().zip(ib.by_ref()) {
+    let (a8, a_rest) = a.as_chunks::<8>();
+    let (b8, b_rest) = b.as_chunks::<8>();
+    for (x, y) in a8.iter().zip(b8) {
         for i in 0..8 {
             acc[i] += x[i] * y[i];
         }
     }
     let mut sum = acc.iter().sum::<f32>();
-    for (x, y) in ia.remainder().iter().zip(ib.remainder()) {
+    for (x, y) in a_rest.iter().zip(b_rest) {
         sum += x * y;
     }
     sum
@@ -448,6 +461,9 @@ pub struct TopK {
     queries: Vec<f32>,
     /// Per query, `(score, id)` sorted by descending score.
     best: Vec<Vec<(f32, i64)>>,
+    /// Lowest id the next block may start at; see the `debug_assert` in
+    /// [`TopK::add_block`].
+    next_expected_id: i64,
 }
 
 impl TopK {
@@ -467,6 +483,7 @@ impl TopK {
             dim,
             queries,
             best: vec![Vec::with_capacity(k + 1); n],
+            next_expected_id: i64::MIN,
         })
     }
 
@@ -480,6 +497,11 @@ impl TopK {
     /// `first_id`. Parallelised across queries, so each rayon task owns one
     /// query's `best` list exclusively and the block is read-shared.
     pub fn add_block(&mut self, block: &[f32], first_id: i64) -> Result<(), String> {
+        debug_assert!(
+            first_id >= self.next_expected_id,
+            "blocks must arrive in ascending id order; the tie-break depends on it"
+        );
+        self.next_expected_id = first_id + (block.len() / self.dim.max(1)) as i64;
         if !block.len().is_multiple_of(self.dim) {
             return Err(format!(
                 "passage block of {} values is not a multiple of dim {}",
@@ -503,7 +525,12 @@ impl TopK {
                     .binary_search_by(|probe| {
                         // Descending by score; ascending by id on a tie so
                         // the ranking is deterministic across runs and
-                        // thread counts.
+                        // thread counts. NOTE: the `score <= worst` fast path
+                        // above skips this comparison entirely, so the id
+                        // tie-break is only actually delivered because blocks
+                        // arrive in ascending id order. Parallelising pass B
+                        // over blocks would silently change published ground
+                        // truth, which is why `add_block` debug-asserts it.
                         score
                             .partial_cmp(&probe.0)
                             .unwrap_or(std::cmp::Ordering::Equal)
@@ -611,6 +638,123 @@ pub fn in_prefix_hits(
         }
     }
     Ok(InPrefixHits { hits })
+}
+
+/// Depth of the shipped per-query ranking (`top1k_*`). Distinct from
+/// [`NEIGHBOURS`], which is how deep OUR brute force goes: this one is fixed by
+/// the upstream export and is what the coverage floor below is derived from.
+pub const SHIPPED_TOP_DEPTH: u64 = 1000;
+
+/// The minimum cross-check coverage a prepared variant must reach, as
+/// `(queries, ranking positions)`.
+///
+/// Without a floor the verification degrades silently. `load_queries` only
+/// aborts when *no* query has an in-prefix hit, so a changed upstream export, a
+/// future smaller variant, or an off-by-one in [`in_prefix_hits`] that dropped
+/// most offsets would still print a reassuring "Verified N queries / M
+/// positions" and abort nothing — with the guard that IS the correctness
+/// argument for these datasets effectively gone.
+///
+/// The position floor is derived, not magic. The shipped list is 1000 deep per
+/// query over [`TOTAL_PASSAGES`], so a uniformly-distributed prefix of `limit`
+/// passages would retain
+/// `SHIPPED_TOP_DEPTH * QUERY_COUNT * limit / TOTAL_PASSAGES` of them. Real hits
+/// cluster well above uniform (the 100K prefix retains 2134 against a uniform
+/// 1477), so requiring a QUARTER of the uniform expectation leaves large
+/// headroom on every registered size while still catching a collapse. The
+/// absolute minimum of 100 stops a hypothetical tiny variant from passing on a
+/// trivially small expectation, and the query floor catches the case where
+/// coverage concentrates into a handful of queries.
+pub fn coverage_floor(limit: u64) -> (usize, usize) {
+    let uniform = SHIPPED_TOP_DEPTH
+        .saturating_mul(QUERY_COUNT as u64)
+        .saturating_mul(limit)
+        / TOTAL_PASSAGES.max(1);
+    let positions = ((uniform / 4) as usize).max(100);
+    let queries = QUERY_COUNT / 20; // 5%
+    (queries, positions)
+}
+
+/// Enforce [`coverage_floor`] on what the cross-check actually compared.
+pub fn check_coverage(
+    limit: u64,
+    queries_checked: usize,
+    positions_compared: usize,
+) -> Result<(), String> {
+    let (min_queries, min_positions) = coverage_floor(limit);
+    if queries_checked < min_queries || positions_compared < min_positions {
+        return Err(format!(
+            "ground-truth cross-check covered only {queries_checked} queries / \
+             {positions_compared} ranking positions, below the floor of {min_queries} / \
+             {min_positions} for a {limit}-passage prefix. The shipped top-1k is the only \
+             independent check on this ground truth, so publishing a corpus it barely \
+             touched would mean publishing an unverified one. Most likely the upstream \
+             top1k export changed shape, or the offsets are being mapped wrongly."
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a block containing a non-finite value.
+///
+/// A NaN defeats the `score <= worst` fast path in [`TopK::add_block`] (every
+/// comparison against NaN is false), so it always enters the insert path, where
+/// `partial_cmp(..).unwrap_or(Equal)` places it at an arbitrary rank. Queries
+/// that have in-prefix shipped hits would abort loudly on the mismatch, but a
+/// query with none has nothing checking it and would publish a polluted head in
+/// silence. One scan per block closes that off at the source.
+pub fn ensure_finite(block: &[f32], first_id: i64, dim: usize) -> Result<(), String> {
+    if let Some(pos) = block.iter().position(|v| !v.is_finite()) {
+        let row = pos.checked_div(dim).unwrap_or(0);
+        let component = pos.checked_rem(dim).unwrap_or(pos);
+        return Err(format!(
+            "passage {} holds a non-finite embedding value ({}) at component {} — the \
+             upstream float16 data is corrupt or was decoded with the wrong byte order",
+            first_id + row as i64,
+            block[pos],
+            component
+        ));
+    }
+    Ok(())
+}
+
+/// Engine-enforced caps on stored string length, in UTF-8 bytes, paired with the
+/// dataset schema types each applies to.
+///
+/// These are server-side REJECTION thresholds, so a payload above one does not
+/// degrade — that engine refuses the insert. `PREPARED.json` records the
+/// measured per-field maxima; [`cap_violations`] is what turns those numbers
+/// from a record into a warning at preparation time, rather than a surprise the
+/// next time someone points a new engine at a corpus with real prose in it.
+pub const ENGINE_STRING_CAPS: &[(&str, usize, &[&str])] = &[
+    // Milvus VarChar `max_length`, its own documented maximum.
+    ("Milvus VarChar", 65_535, &["keyword", "text", "uuid"]),
+    // Elasticsearch/OpenSearch refuse a `keyword` term above this; `text` is
+    // analyzed into terms and is not subject to it.
+    (
+        "Elasticsearch/OpenSearch keyword term",
+        32_766,
+        &["keyword"],
+    ),
+];
+
+/// Which measured field maxima exceed an engine's cap, as human-readable lines.
+pub fn cap_violations(max_field_bytes: &HashMap<String, usize>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (field, schema_type) in PAYLOAD_FIELDS {
+        let Some(&measured) = max_field_bytes.get(*field) else {
+            continue;
+        };
+        for (engine, cap, applies_to) in ENGINE_STRING_CAPS {
+            if applies_to.contains(schema_type) && measured > *cap {
+                out.push(format!(
+                    "{field} ({schema_type}) reaches {measured} bytes, above the {engine} \
+                     cap of {cap} — that engine will REJECT inserts for this dataset"
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Outcome of the cross-check for one query.
@@ -1120,6 +1264,103 @@ mod tests {
 
     fn docids(pairs: &[(i64, &str)]) -> HashMap<i64, String> {
         pairs.iter().map(|(i, s)| (*i, s.to_string())).collect()
+    }
+
+    /// The floor must sit BELOW what every registered variant actually reaches
+    /// (or preparation could never succeed) and ABOVE a collapse.
+    #[test]
+    fn coverage_floor_admits_the_real_variants_and_rejects_a_collapse() {
+        // Measured on the real 100K build: 562 queries / 2134 positions.
+        let (min_q, min_p) = coverage_floor(100_000);
+        assert!(
+            min_q <= 562,
+            "query floor {min_q} would fail the real 100K build"
+        );
+        assert!(
+            min_p <= 2134,
+            "position floor {min_p} would fail the real 100K build"
+        );
+        check_coverage(100_000, 562, 2134).unwrap();
+
+        // It must still be a real bar, not a formality: a collapse to a handful
+        // of positions has to fail.
+        let e = check_coverage(100_000, 562, 3).unwrap_err();
+        assert!(e.contains("below the floor"), "{e}");
+        // …and so does coverage concentrated into a few queries.
+        assert!(check_coverage(100_000, 4, 2134).is_err());
+
+        // The floor scales with the prefix, so a bigger variant cannot pass on
+        // the small variant's bar.
+        let (_, p_1m) = coverage_floor(1_000_000);
+        let (_, p_10m) = coverage_floor(10_000_000);
+        assert!(p_1m > min_p && p_10m > p_1m, "{min_p} {p_1m} {p_10m}");
+        assert!(check_coverage(10_000_000, 1677, 2134).is_err());
+
+        // Never below the absolute minimum, however tiny the prefix.
+        assert_eq!(coverage_floor(1).1, 100);
+        assert_eq!(coverage_floor(0).1, 100);
+    }
+
+    #[test]
+    fn non_finite_embeddings_are_rejected_with_the_offending_passage() {
+        let mut block = vec![0.5f32; 8];
+        assert!(ensure_finite(&block, 100, 4).is_ok());
+
+        block[5] = f32::NAN;
+        let e = ensure_finite(&block, 100, 4).unwrap_err();
+        // Row 1 of the block => id 101, component 1.
+        assert!(e.contains("passage 101"), "{e}");
+        assert!(e.contains("component 1"), "{e}");
+
+        block[5] = f32::INFINITY;
+        assert!(ensure_finite(&block, 100, 4).is_err());
+    }
+
+    /// A NaN would otherwise sail past the `score <= worst` fast path (every
+    /// comparison with NaN is false) and land at an arbitrary rank.
+    #[test]
+    fn a_nan_would_corrupt_the_ranking_if_it_reached_topk() {
+        let queries = flat(&[[1.0, 0.0]]);
+        let mut acc = TopK::new(queries, 2, 2).unwrap();
+        acc.add_block(&flat(&[[1.0, 0.0], [f32::NAN, 0.0]]), 0)
+            .unwrap();
+        let out = acc.finish();
+        // The NaN row is present in the published head — which is exactly why
+        // `ensure_finite` runs before any block reaches here.
+        assert!(out[0].iter().any(|(s, _)| s.is_nan()));
+    }
+
+    #[test]
+    fn cap_violations_flag_only_the_engines_whose_limit_applies() {
+        let m = |pairs: &[(&str, usize)]| -> HashMap<String, usize> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+
+        // The real 100K maxima: everything fits, so nothing is flagged.
+        let ok = m(&[
+            ("docid", 41),
+            ("url", 190),
+            ("title", 588),
+            ("headings", 25_840),
+            ("segment", 28_581),
+        ]);
+        assert!(cap_violations(&ok).is_empty(), "{:?}", cap_violations(&ok));
+
+        // `segment` is `text`: past Milvus' cap it is flagged, but the
+        // Elasticsearch `keyword` term limit does not apply to it.
+        let big_text = m(&[("segment", 70_000)]);
+        let v = cap_violations(&big_text);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("Milvus"), "{}", v[0]);
+
+        // `url` is `keyword`: a 40 KB one breaks Elasticsearch but not Milvus.
+        let big_kw = m(&[("url", 40_000)]);
+        let v = cap_violations(&big_kw);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("keyword term"), "{}", v[0]);
+
+        // An unmeasured field is skipped rather than assumed zero.
+        assert!(cap_violations(&HashMap::new()).is_empty());
     }
 
     #[test]

@@ -705,9 +705,9 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | [DBpedia OpenAI-100K: Knowledge embeddings](https://www.dbpedia.org/)                                     |      1,536 |     100,000 |     5,000 |        10 | Cosine    |
 | [LAION Small CLIP: Small CLIP embeddings](https://laion.ai/blog/laion-400-open-dataset/)                   |        512 |     100,000 |     1,000 |       100 | Cosine    |
 | **Text Retrieval with Real Document Metadata** (vectors **and** the source documents' fields — see [Preparing the MS MARCO corpus](#preparing-the-ms-marco-corpus-vectors--metadata)) |            |             |           |           |           |
-| [MS MARCO v2.1-100K: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |     100,000 |     1,677 |       100 | Cosine    |
-| [MS MARCO v2.1-1M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3)  |      1,024 |   1,000,000 |     1,677 |       100 | Cosine    |
-| [MS MARCO v2.1-10M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |  10,000,000 |     1,677 |       100 | Cosine    |
+| [MS MARCO v2.1-100K: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |     100,000 |     1,677 |   1,000 ‡ | Cosine    |
+| [MS MARCO v2.1-1M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3)  |      1,024 |   1,000,000 |     1,677 |   1,000 ‡ | Cosine    |
+| [MS MARCO v2.1-10M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |  10,000,000 |     1,677 |   1,000 ‡ | Cosine    |
 | **Sparse Vectors** (learned/lexical sparse embeddings — Qdrant is the only engine with a sparse path)        |            |             |           |           |           |
 | [MS MARCO Sparse-100K: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                |   *sparse* |     100,000 |     6,980 |        10 | Dot       |
 | [MS MARCO Sparse-1M: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                  |   *sparse* |   1,000,000 |     6,980 |        10 | Dot       |
@@ -741,6 +741,8 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | Random Match Keyword Small Vocab-256: Small vocabulary keyword matching (no filters)                       |        256 |   1,000,000 |    10,000 |       100 | Cosine    |
 | **Multi-Tenancy** (many tenants share one index; every query scoped to one tenant)                          |            |             |           |           |           |
 | Random-768-100-tenants: 100 tenants, per-tenant scoped queries (tenant field `a`)                          |        768 |   1,000,000 |       200 |        25 | Cosine    |
+
+‡ **The MS MARCO entries are the only ones with 1000-wide ground truth**, matching the depth of the upstream `top1k` lists they are built from, so recall@k is answerable for any k up to 1000 without re-preparing. The catch is that a search config which does not set `top` **derives it from the ground-truth width** — on these datasets that means it will search with `top: 1000`, not the 100 you may be used to. Set `top` explicitly for a conventional recall@10 / recall@100 run.
 
 † **The "Neighbors" column is the ground-truth width, and it bounds what recall can mean.** H&M-2048 (with filters) is not uniform: its 10,000 queries carry between **1 and 25** true neighbours (mean 23.4; 931 queries have fewer than 25), because a filtered query only has as many true neighbours as the filter admits. Our `mean_recall` divides by the neighbours that actually exist, so a 1-neighbour query can still score 1.0; upstream `qdrant/vector-db-benchmark` always divides by `top`, so the same query caps at `1/top`. A run's `metrics_schema.ground_truth` block reports the measured profile and the resulting ceiling — at `top: 100` H&M's ceiling is 0.233, so a `calibration_precision` above that is unreachable by construction. Configs that do not set `top` derive it from the ground-truth row width (25 here, 10 for the no-filters variant), which is why this matters mostly when `top` is set explicitly.
 
@@ -826,8 +828,14 @@ query, but that ranks the *whole* 113.5M corpus: restricted to a 1M prefix it
 retains only ~9 hits per query and is plain wrong past them, because a passage
 ranked 1001st globally can sit in the prefix and outrank everything that
 survived truncation. So the 1677 TREC-DL 2021-2023 queries get a genuine
-brute-force top-100 over the prepared vectors, read back from the file that was
-just written.
+brute-force **top-1000** over the prepared vectors, read back from the file that
+was just written — the same depth as the upstream lists, so recall@k is
+answerable for any k up to 1000.
+
+Two consequences of that depth. `tests.jsonl` is ~84 MB rather than ~39 MB. And
+because a config without an explicit `top` derives it from the ground-truth row
+width, these datasets will otherwise be searched at `top: 1000`; set `top` for a
+conventional recall@10 / recall@100 run.
 
 The shipped list is then used as an **independent oracle**, which is the part
 worth trusting the numbers over. Every in-prefix global-top-1k hit necessarily
@@ -839,6 +847,32 @@ alignment (a one-row slip would give every passage its neighbour's metadata, and
 no recall number would show it), and the cross-shard offset arithmetic. It is not
 optional — a disagreement aborts preparation. On the 100K build it compares 2,134
 ranking positions across 562 queries and agrees to within 4.6e-5 cosine.
+
+The coverage is a **floor, not just a report**: preparation aborts if the
+cross-check reaches fewer queries or positions than a prefix of that size should
+yield (a quarter of what a uniform distribution would retain), so a changed
+upstream export or a mis-mapped offset fails loudly instead of leaving a
+reassuring number with nothing behind it. Every output is written to `.part` and
+renamed only once that passes, so a directory either holds a complete,
+cross-checked corpus or is untouched.
+
+**Sizing note for the Redis family.** Redis declares a `text` schema field as
+`TEXT SORTABLE`, which keeps a copy of the value in the sorting table. This is
+the first corpus where that is expensive, because it is the first with real prose
+in it. Measured on the prepared 100K corpus (identical index, `SORTABLE` the only
+difference):
+
+| | shipped index (`TEXT SORTABLE`) | same index without `SORTABLE` |
+| --- | ---: | ---: |
+| `sortable_values_size_mb` | 170.4 | 0 |
+| `inverted_sz_mb` | 171.3 | 174.1 |
+| `vector_index_sz_mb` | 427.7 | 427.7 |
+
+So ~1.7 KB/document of purely additive overhead — about 40% of the vector index
+on top of it, and it scales linearly: roughly 1.7 GB at 1M and 17 GB at 10M,
+before the vector index's own 4.3 GB / 43 GB. Valkey maps `text` to a TAG and
+Dragonfly to a plain `TEXT`, so the three diverge on identical data; budget for
+this when sizing a Redis run on the larger variants.
 
 Queries carry no `conditions`: these are pure-KNN TREC topics, and inventing a
 filter for them would make the ground truth a fiction. The metadata is indexed

@@ -2169,8 +2169,13 @@ mod tests {
     /// must be Milvus's own maximum and nothing smaller. Pinned because the
     /// failure mode is invisible from this file: a lower number does not break
     /// any test here, it makes Milvus refuse inserts for whichever dataset
-    /// happens to carry long strings (`msmarco-cohere-1024-*`, whose `segment`
-    /// bodies reach ~28 600 UTF-8 bytes).
+    /// happens to carry long strings. The prepared MS MARCO 100K corpus measures
+    /// (into its own `PREPARED.json`) `segment` 28 581 B, `headings` 25 840 B,
+    /// `title` 588 B — three of its five string fields above the old 500. Those
+    /// are the 100K prefix's maxima, so the larger prefixes hold longer values
+    /// still; `msmarco::cap_violations` is what checks a prepared corpus against
+    /// this cap, rather than a hardcoded list here that could only ever go
+    /// stale.
     #[test]
     fn varchar_columns_declare_milvus_own_maximum_length() {
         assert_eq!(VARCHAR_MAX_LENGTH, "65535");
@@ -2204,14 +2209,6 @@ mod tests {
         let n = milvus_field_json("size", "int", &kind("int"));
         assert_eq!(n["dataType"], "Int64");
         assert!(n.get("elementTypeParams").is_none());
-
-        // The longest values, in UTF-8 bytes, that the prepared MS MARCO 100K
-        // corpus actually holds (segment / headings / title / url / docid), as
-        // measured into its PREPARED.json. The old cap of 500 rejected the first
-        // three; the declared one admits all five.
-        for len in [28_581u32, 25_840, 588, 190, 41] {
-            assert!(len <= VARCHAR_MAX_LENGTH.parse::<u32>().unwrap());
-        }
     }
 
     /// The per-type index choice, verified live against milvusdb/milvus:v2.6.19

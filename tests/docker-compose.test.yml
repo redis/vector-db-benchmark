@@ -94,7 +94,12 @@ services:
       retries: 10
 
   milvus-minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # quay.io, not Docker Hub: MinIO stopped publishing this release tag to
+    # `minio/minio`, so the Hub pull fails with a misleading "pull access denied
+    # ... repository does not exist or may require 'docker login'" and the whole
+    # Milvus job dies before a single test runs. The tag is still on quay.io,
+    # which is also where this file already gets etcd from. Same digest, same pin.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     environment:
       MINIO_ACCESS_KEY: "minioadmin"
       MINIO_SECRET_KEY: "minioadmin"

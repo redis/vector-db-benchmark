@@ -19,7 +19,7 @@
 //! * `payloads.jsonl` — one JSON object per vector: `docid`, `url`, `title`,
 //!   `headings`, `segment`, `start_char`, `end_char`.
 //! * `tests.jsonl`    — the 1677 TREC-DL 2021-2023 queries, each with its
-//!   embedding and a brute-forced top-100 over *this* prefix.
+//!   embedding and a brute-forced top-1000 over *this* prefix.
 //! * `PREPARED.json`  — provenance: source repo, sizes, and the verification
 //!   statistics from the pass described below.
 //!
@@ -133,6 +133,7 @@ fn run(args: &Args) -> Result<(), String> {
         return Ok(());
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
+    clear_staged(&dir);
 
     let cache = args
         .cache_dir
@@ -172,9 +173,10 @@ fn run(args: &Args) -> Result<(), String> {
     )?;
 
     let ranked = brute_force_ground_truth(&dir, variant, &queries)?;
-    let stats = verify(&queries, &ranked, &docid_at)?;
+    let stats = verify(variant.limit, &queries, &ranked, &docid_at)?;
     write_tests(&dir, &queries, &ranked)?;
     write_manifest(&dir, variant, &plan, &stats, &queries, &max_field_bytes)?;
+    publish(&dir)?;
 
     println!(
         "Done in {:.1}s. Register-ready at {} — run with --datasets {}",
@@ -183,6 +185,46 @@ fn run(args: &Args) -> Result<(), String> {
         variant.dataset_name
     );
     Ok(())
+}
+
+/// The four files a finished dataset directory holds. Every one is written to
+/// `<name>.part` first and renamed only once verification has passed, so a
+/// directory either holds a complete, cross-checked corpus or is untouched —
+/// which is what makes [`is_complete`]'s claim true rather than aspirational.
+/// (A `--force` rebuild that dies halfway now also leaves the previous good
+/// corpus intact instead of overwriting it with a partial one.)
+const OUTPUTS: [&str; 4] = [
+    "vectors.npy",
+    "payloads.jsonl",
+    "tests.jsonl",
+    "PREPARED.json",
+];
+
+/// Path a file is written to before it is published.
+fn staged(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.part"))
+}
+
+/// Publish every staged file, replacing whatever was there. Renames within one
+/// directory, so each is atomic; the set as a whole is not, which is why
+/// `vectors.npy` (the one [`is_complete`] measures) goes last.
+fn publish(dir: &Path) -> Result<(), String> {
+    for name in OUTPUTS.iter().rev() {
+        let from = staged(dir, name);
+        if !from.exists() {
+            return Err(format!("{} was never written", from.display()));
+        }
+        std::fs::rename(&from, dir.join(name))
+            .map_err(|e| format!("publish {}: {}", from.display(), e))?;
+    }
+    Ok(())
+}
+
+/// Remove any `.part` files left by an earlier interrupted run.
+fn clear_staged(dir: &Path) {
+    for name in OUTPUTS {
+        let _ = std::fs::remove_file(staged(dir, name));
+    }
 }
 
 /// A prepared directory is complete when all three files exist and `vectors.npy`
@@ -489,8 +531,8 @@ fn write_corpus(
     dir: &Path,
     wanted_docids: &std::collections::HashSet<i64>,
 ) -> Result<Corpus, String> {
-    let vectors_path = dir.join("vectors.npy");
-    let payloads_path = dir.join("payloads.jsonl");
+    let vectors_path = staged(dir, "vectors.npy");
+    let payloads_path = staged(dir, "payloads.jsonl");
     let mut npy = NpyF32Writer::create(&vectors_path, variant.limit, msmarco::DIM)?;
     let mut payloads = BufWriter::with_capacity(
         1 << 20,
@@ -552,6 +594,7 @@ fn write_corpus(
                 .read_exact(&mut raw[..want])
                 .map_err(|e| format!("{npy_url}: read rows at {}: {e}", row_in_shard))?;
             let block = msmarco::decode_f16_block(&raw[..want])?;
+            msmarco::ensure_finite(&block, (take.first_id + row_in_shard) as i64, msmarco::DIM)?;
 
             for r in 0..rows {
                 npy.write_row(&block[r * msmarco::DIM..(r + 1) * msmarco::DIM])?;
@@ -624,6 +667,10 @@ fn write_corpus(
         .flush()
         .map_err(|e| format!("flush {}: {}", payloads_path.display(), e))?;
 
+    for line in msmarco::cap_violations(&max_field_bytes) {
+        eprintln!("\t⚠ WARNING: {line}");
+    }
+
     let missing = wanted_docids.len() - docid_at.len();
     if missing > 0 {
         return Err(format!(
@@ -663,7 +710,7 @@ fn brute_force_ground_truth(
     variant: &Variant,
     queries: &[Query],
 ) -> Result<Vec<Vec<(f32, i64)>>, String> {
-    let path = dir.join("vectors.npy");
+    let path = staged(dir, "vectors.npy");
     let mut file = File::open(&path).map_err(|e| format!("open {}: {}", path.display(), e))?;
 
     let mut head = vec![0u8; 512];
@@ -689,12 +736,15 @@ fn brute_force_ground_truth(
             .map_err(|e| format!("read {} at row {}: {e}", path.display(), done))?;
 
         let mut block: Vec<f32> = raw[..want]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
+        msmarco::ensure_finite(&block, done as i64, msmarco::DIM)?;
         // The engines see normalized vectors (cosine distance), so the ranking
         // must be built from normalized vectors too.
-        for row in block.chunks_exact_mut(msmarco::DIM) {
+        for row in block.as_chunks_mut::<{ msmarco::DIM }>().0 {
             normalize_in_place(row);
         }
 
@@ -733,6 +783,7 @@ struct VerifyStats {
 }
 
 fn verify(
+    limit: u64,
     queries: &[Query],
     ranked: &[Vec<(f32, i64)>],
     docid_at: &HashMap<i64, String>,
@@ -754,16 +805,26 @@ fn verify(
         stats.tie_swaps += check.tie_swaps;
         stats.max_score_delta = stats.max_score_delta.max(check.max_score_delta);
     }
+    // The floor, not just the report: this cross-check IS the correctness
+    // argument for the corpus, so coverage that quietly collapsed must abort
+    // rather than print a reassuring number (review of #319, item 1).
+    msmarco::check_coverage(limit, stats.queries_checked, stats.positions_compared)?;
+    let (min_queries, min_positions) = msmarco::coverage_floor(limit);
     println!(
         "Verified {} queries / {} ranking positions against the shipped global top-1k: \
-         max cosine delta {:.2e}, {} tie reorderings.",
-        stats.queries_checked, stats.positions_compared, stats.max_score_delta, stats.tie_swaps
+         max cosine delta {:.2e}, {} tie reorderings (floor: {}/{}).",
+        stats.queries_checked,
+        stats.positions_compared,
+        stats.max_score_delta,
+        stats.tie_swaps,
+        min_queries,
+        min_positions
     );
     Ok(stats)
 }
 
 fn write_tests(dir: &Path, queries: &[Query], ranked: &[Vec<(f32, i64)>]) -> Result<(), String> {
-    let path = dir.join("tests.jsonl");
+    let path = staged(dir, "tests.jsonl");
     let mut out = BufWriter::with_capacity(
         1 << 20,
         File::create(&path).map_err(|e| format!("create {}: {}", path.display(), e))?,
@@ -776,7 +837,12 @@ fn write_tests(dir: &Path, queries: &[Query], ranked: &[Vec<(f32, i64)>]) -> Res
     }
     out.flush()
         .map_err(|e| format!("flush {}: {}", path.display(), e))?;
-    println!("Wrote {} queries to {}", queries.len(), path.display());
+    // Report the published name, not the `.part` it is staged under.
+    println!(
+        "Wrote {} queries to {}",
+        queries.len(),
+        dir.join("tests.jsonl").display()
+    );
     Ok(())
 }
 
@@ -831,7 +897,7 @@ fn write_manifest(
             .collect::<Vec<_>>(),
         "prepared_at": chrono::Utc::now().to_rfc3339(),
     });
-    let path = dir.join("PREPARED.json");
+    let path = staged(dir, "PREPARED.json");
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
