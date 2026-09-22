@@ -403,13 +403,9 @@ fn load_queries(
         variant.limit,
         total_hits
     );
-    if with_hits == 0 {
-        return Err(
-            "no query has a single shipped top-1k hit inside this prefix, so the brute-forced \
-             ground truth could not be verified against anything"
-                .to_string(),
-        );
-    }
+    // Fail here, not after the download and the brute force: these two numbers
+    // already bound what the cross-check can reach (review of #319, item 4).
+    msmarco::check_coverage_upper_bound(variant.limit, with_hits, total_hits)?;
     Ok(queries)
 }
 

@@ -50,6 +50,21 @@ use rayon::prelude::*;
 /// The Hugging Face repo the corpus is fetched from.
 pub const HF_REPO: &str = "CohereLabs/msmarco-v2.1-embed-english-v3";
 
+/// The exact upstream commit every file is fetched from.
+///
+/// **Not `main`.** The claim these datasets rest on is that two runs reporting
+/// `msmarco-cohere-1024-1M-cosine` uploaded the same corpus. Against a moving
+/// ref that holds for the passage *count* and nothing else: a re-export upstream
+/// would silently redefine what the name means, and no prepared directory would
+/// record which export it came from. Each directory is internally consistent
+/// either way — ground truth is brute-forced over whatever bytes arrived — so
+/// this is not a wrong-recall bug. It is a cross-run comparability bug, which is
+/// the thing this harness exists to prevent.
+///
+/// `write_corpus` already refuses a shard whose row count changed between
+/// planning and reading; this is the same guard stretched across runs.
+pub const HF_REVISION: &str = "e78737fe92ac1b783211b705c12207ca75fcc9b7";
+
 /// Embedding dimensionality of Cohere `embed-english-v3.0`.
 pub const DIM: usize = 1024;
 
@@ -139,8 +154,9 @@ pub fn shard_stem(shard: usize) -> String {
 /// URL of one embedding shard (float16 npy).
 pub fn npy_url(shard: usize) -> String {
     format!(
-        "https://huggingface.co/datasets/{}/resolve/main/passages_npy/{}.npy",
+        "https://huggingface.co/datasets/{}/resolve/{}/passages_npy/{}.npy",
         HF_REPO,
+        HF_REVISION,
         shard_stem(shard)
     )
 }
@@ -148,8 +164,9 @@ pub fn npy_url(shard: usize) -> String {
 /// URL of one metadata shard (gzipped JSONL).
 pub fn jsonl_url(shard: usize) -> String {
     format!(
-        "https://huggingface.co/datasets/{}/resolve/main/passages_jsonl/{}.json.gz",
+        "https://huggingface.co/datasets/{}/resolve/{}/passages_jsonl/{}.json.gz",
         HF_REPO,
+        HF_REVISION,
         shard_stem(shard)
     )
 }
@@ -157,8 +174,8 @@ pub fn jsonl_url(shard: usize) -> String {
 /// URL of the query file (gzipped JSONL, ~59 MB).
 pub fn queries_url() -> String {
     format!(
-        "https://huggingface.co/datasets/{}/resolve/main/queries_jsonl/queries.jsonl.gz",
-        HF_REPO
+        "https://huggingface.co/datasets/{}/resolve/{}/queries_jsonl/queries.jsonl.gz",
+        HF_REPO, HF_REVISION
     )
 }
 
@@ -497,10 +514,21 @@ impl TopK {
     /// `first_id`. Parallelised across queries, so each rayon task owns one
     /// query's `best` list exclusively and the block is read-shared.
     pub fn add_block(&mut self, block: &[f32], first_id: i64) -> Result<(), String> {
-        debug_assert!(
-            first_id >= self.next_expected_id,
-            "blocks must arrive in ascending id order; the tie-break depends on it"
-        );
+        // A returned error, NOT a debug_assert: every suite and the preparer itself
+        // run `--release`, where a debug assertion is compiled out — so the guard
+        // would have been absent from exactly the binary that writes published
+        // ground truth. The tie-break below only delivers its documented
+        // "ascending by id" ordering because blocks arrive in ascending id order,
+        // so parallelising pass B over blocks has to fail here rather than
+        // silently change what gets published.
+        if first_id < self.next_expected_id {
+            return Err(format!(
+                "blocks must arrive in ascending id order: got a block starting at {first_id} \
+                 after one ending at {}. The id tie-break depends on this, so accepting it \
+                 would change the published ranking without changing any recall number.",
+                self.next_expected_id
+            ));
+        }
         self.next_expected_id = first_id + (block.len() / self.dim.max(1)) as i64;
         if !block.len().is_multiple_of(self.dim) {
             return Err(format!(
@@ -530,7 +558,8 @@ impl TopK {
                         // tie-break is only actually delivered because blocks
                         // arrive in ascending id order. Parallelising pass B
                         // over blocks would silently change published ground
-                        // truth, which is why `add_block` debug-asserts it.
+                        // truth, which is why `add_block` rejects an
+                        // out-of-order block outright.
                         score
                             .partial_cmp(&probe.0)
                             .unwrap_or(std::cmp::Ordering::Equal)
@@ -724,6 +753,26 @@ pub fn coverage_floor(limit: u64) -> (usize, usize) {
     let positions = ((uniform / 4) as usize).max(100);
     let queries = QUERY_COUNT / 20; // 5%
     (queries, positions)
+}
+
+/// Check the floor against the coverage the query file makes POSSIBLE, before
+/// any corpus bytes are fetched.
+///
+/// `queries_checked` ends up exactly equal to the number of queries with at
+/// least one in-prefix hit, and `positions_compared` can never exceed the total
+/// number of in-prefix hits — both of which are known the moment the query file
+/// is parsed. So the same floor applies as an upper bound up front, and a run
+/// that cannot possibly clear it fails in seconds instead of after the download
+/// and the brute force. On the 10M variant that is the difference between
+/// failing immediately and failing after 54 GB and ~20 minutes.
+pub fn check_coverage_upper_bound(
+    limit: u64,
+    queries_with_hits: usize,
+    total_hits: usize,
+) -> Result<(), String> {
+    check_coverage(limit, queries_with_hits, total_hits).map_err(|e| {
+        format!("{e}\n(Checked up front from the query file — the corpus was not fetched.)")
+    })
 }
 
 /// Enforce [`coverage_floor`] on what the cross-check actually compared.
@@ -1018,6 +1067,36 @@ mod tests {
         assert!(npy_url(7).ends_with("passages_npy/msmarco_v2.1_doc_segmented_07.npy"));
         assert!(jsonl_url(7).ends_with("passages_jsonl/msmarco_v2.1_doc_segmented_07.json.gz"));
         assert!(queries_url().ends_with("queries_jsonl/queries.jsonl.gz"));
+    }
+
+    /// Every fetch must be pinned to one immutable commit. A `main` anywhere here
+    /// means the dataset name no longer identifies a fixed set of bytes.
+    #[test]
+    fn every_upstream_url_is_pinned_to_a_commit_not_a_branch() {
+        assert_eq!(HF_REVISION.len(), 40, "expected a full 40-char commit sha");
+        assert!(HF_REVISION.chars().all(|c| c.is_ascii_hexdigit()));
+        for url in [npy_url(0), npy_url(59), jsonl_url(0), queries_url()] {
+            assert!(
+                url.contains(&format!("/resolve/{HF_REVISION}/")),
+                "not pinned: {url}"
+            );
+            assert!(!url.contains("/resolve/main/"), "still on a branch: {url}");
+        }
+    }
+
+    /// The ordering guard has to be a real error: every suite and the preparer
+    /// run `--release`, where a `debug_assert!` does not exist.
+    #[test]
+    fn out_of_order_blocks_are_rejected_in_release_builds_too() {
+        let mut acc = TopK::new(flat(&[[1.0, 0.0]]), 2, 3).unwrap();
+        acc.add_block(&flat(&[[1.0, 0.0], [0.9, 0.1]]), 10).unwrap();
+        // Ascending is fine...
+        acc.add_block(&flat(&[[0.8, 0.2]]), 12).unwrap();
+        // ...going backwards is not.
+        let e = acc.add_block(&flat(&[[0.7, 0.3]]), 5).unwrap_err();
+        assert!(e.contains("ascending id order"), "{e}");
+        // Run this suite under `--release` as well as debug: that is what proves
+        // the guard is not compiled out in the profile the preparer uses.
     }
 
     /// The real shard-00 header, byte for byte.
@@ -1434,6 +1513,31 @@ mod tests {
         // Never below the absolute minimum, however tiny the prefix.
         assert_eq!(coverage_floor(1).1, 100);
         assert_eq!(coverage_floor(0).1, 100);
+    }
+
+    /// The up-front bound must agree with the after-the-fact check, or a run
+    /// could pass the cheap gate and fail the expensive one (or worse, vice
+    /// versa).
+    #[test]
+    fn the_upfront_bound_matches_the_after_the_fact_floor() {
+        // Real 100K numbers: 562 queries with hits, 2134 hits total.
+        check_coverage_upper_bound(100_000, 562, 2134).unwrap();
+        // Real 10M numbers.
+        check_coverage_upper_bound(10_000_000, 1675, 197_898).unwrap();
+
+        // A collapse is caught before any corpus byte is fetched, and the message
+        // says so.
+        let e = check_coverage_upper_bound(10_000_000, 1675, 100).unwrap_err();
+        assert!(e.contains("below the floor"), "{e}");
+        assert!(e.contains("corpus was not fetched"), "{e}");
+
+        // Identical verdict to the post-hoc check for the same inputs.
+        for (limit, q, p) in [(100_000u64, 562usize, 2134usize), (10_000_000, 5, 10)] {
+            assert_eq!(
+                check_coverage(limit, q, p).is_ok(),
+                check_coverage_upper_bound(limit, q, p).is_ok()
+            );
+        }
     }
 
     #[test]

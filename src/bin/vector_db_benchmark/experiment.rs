@@ -1310,6 +1310,45 @@ fn run_single_experiment(
                 }
             }
         };
+    // A derived `top` wide enough to swallow the declared `ef` makes a sweep
+    // measure one point N times (#319 review). Every engine derives `top` from
+    // the ground-truth row width when a config omits it, and HNSW
+    // implementations raise the effective search breadth to at least `k` because
+    // the result set has to hold `k` — so at width 1000 a declared `ef` below
+    // 1000 never takes effect. Measured on the prepared MS MARCO 100K corpus
+    // with `top` derived: ef 64 / 128 / 512 all returned recall 0.9419 at 45.1 /
+    // 42.8 / 43.2 QPS — three declared knobs, one measurement.
+    //
+    // Warn rather than abort: this is inferred from one engine's behaviour, and
+    // the run is not wrong, it is redundant. The shipped `redis-msmarco.json`
+    // sets `top` explicitly for this reason.
+    if let Some(gt) = ground_truth.as_ref() {
+        if let Some(width) = gt.first_row_len() {
+            let flattened: Vec<String> = engine
+                .search_params()
+                .iter()
+                .filter(|p| p.top.is_none())
+                .filter_map(|p| p.search_params.as_ref().and_then(|i| i.ef))
+                .filter(|ef| (*ef as usize) < width)
+                .map(|ef| ef.to_string())
+                .collect();
+            if !flattened.is_empty() {
+                eprintln!(
+                    "\tWARNING: this dataset's ground truth is {} wide, and {} search \
+                     config(s) do not set `top`, so they will run at k={}. HNSW raises the \
+                     effective search breadth to at least k, so the declared ef values [{}] \
+                     are all below it and will very likely produce the SAME recall — a sweep \
+                     that publishes one measurement under several names. Set `top` explicitly \
+                     (see experiments/configurations/redis-msmarco.json).",
+                    width,
+                    flattened.len(),
+                    width,
+                    flattened.join(", ")
+                );
+            }
+        }
+    }
+
     // Configs that lost queries, collected so --fail-on-dropped-queries can fail
     // the run *after* every result file is written rather than instead of it.
     let mut dropped_query_failures: Vec<String> = Vec::new();
