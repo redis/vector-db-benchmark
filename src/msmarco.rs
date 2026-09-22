@@ -105,6 +105,178 @@ pub const PAYLOAD_FIELDS: &[(&str, &str)] = &[
     ("end_char", "int"),
 ];
 
+/// Number of hash buckets the uniform sampler partitions the corpus into.
+///
+/// One million, not the 100 the Redis Enterprise MS MARCO suite uses, because
+/// the smallest variant here is 0.088% of the corpus — at 100 buckets the
+/// coarsest selectable fraction is 1%, which overshoots it by more than 11x.
+pub const CRC32_BUCKETS: u32 = 1_000_000;
+
+/// Which bucket a passage falls in, from its `docid`.
+///
+/// CRC-32 (ISO-HDLC), bit-identical to Python's `zlib.crc32` — the same function
+/// the Redis Enterprise MS MARCO suite samples its corpus with
+/// (`crc32(docid) % 100 < PCT`). Matching it exactly is deliberate: it makes the
+/// two benchmarks' corpora comparable by construction, and it means the
+/// selection can be reproduced from a three-line Python script by anyone
+/// checking our work.
+pub fn crc32_bucket(docid: &str) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(docid.as_bytes());
+    h.finalize() % CRC32_BUCKETS
+}
+
+/// Pull `docid` out of a `passages_jsonl` line without parsing the whole object.
+///
+/// The discovery scan reads every one of the 113,520,750 lines and needs nothing
+/// but this one field; a full `serde_json` parse of ~180 GB of JSON to reach the
+/// first key would dominate the run. Falls back to a real parse when the fast
+/// path does not match, so a change in upstream field order degrades to slow
+/// rather than to wrong.
+pub fn extract_docid(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("{\"docid\":") {
+        let rest = rest.trim_start();
+        if let Some(rest) = rest.strip_prefix('"') {
+            if let Some(end) = rest.find('"') {
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("docid")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// A count of passages per [`crc32_bucket`], over the whole corpus.
+///
+/// One scan produces the realized sample size for EVERY possible threshold (a
+/// prefix sum), so thresholds can be chosen without rescanning — which matters
+/// because the scan is ~100 GB of gzipped metadata.
+pub struct BucketHistogram {
+    counts: Vec<u64>,
+}
+
+impl Default for BucketHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BucketHistogram {
+    pub fn new() -> Self {
+        Self {
+            counts: vec![0; CRC32_BUCKETS as usize],
+        }
+    }
+
+    pub fn add(&mut self, docid: &str) {
+        self.counts[crc32_bucket(docid) as usize] += 1;
+    }
+
+    /// Fold another shard's counts in. Addition, so shards can be scanned in
+    /// any order or concurrently.
+    pub fn merge(&mut self, other: &BucketHistogram) {
+        for (a, b) in self.counts.iter_mut().zip(&other.counts) {
+            *a += b;
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.counts.iter().sum()
+    }
+
+    /// Exactly how many passages a threshold selects.
+    pub fn count_below(&self, threshold: u32) -> u64 {
+        self.counts[..(threshold as usize).min(self.counts.len())]
+            .iter()
+            .sum()
+    }
+
+    /// The threshold whose realized count is closest to `target`, with that
+    /// count. Searched by binary search over the prefix sums, which are
+    /// monotone.
+    pub fn threshold_for(&self, target: u64) -> (u32, u64) {
+        let (mut lo, mut hi) = (0u32, CRC32_BUCKETS);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.count_below(mid) < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // `lo` is the smallest threshold reaching `target`; the one below it may
+        // be closer from underneath.
+        let up = (lo, self.count_below(lo));
+        if lo == 0 {
+            return up;
+        }
+        let down = (lo - 1, self.count_below(lo - 1));
+        if target.abs_diff(down.1) <= target.abs_diff(up.1) {
+            down
+        } else {
+            up
+        }
+    }
+
+    pub fn to_json(&self, targets: &[u64]) -> serde_json::Value {
+        serde_json::json!({
+            "buckets": CRC32_BUCKETS,
+            "total_passages": self.total(),
+            "targets": targets.iter().map(|t| {
+                let (th, n) = self.threshold_for(*t);
+                serde_json::json!({"target": t, "threshold": th, "realized": n})
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// How a variant chooses its passages out of the 113.5M-passage corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sampling {
+    /// The first N passages in corpus order.
+    ///
+    /// Cheap — only the head of the corpus is fetched — and, measured, *not*
+    /// geometrically skewed: a 20k block from the head of shard 00 has mean
+    /// nearest-neighbour cosine 0.8825 and mean random-pair cosine 0.1442,
+    /// against 0.8759 / 0.1499 for a sample spread over all 60 shards. (Later
+    /// shards are the unusual ones: shard 59 measures 0.9316 / 0.3699, i.e.
+    /// markedly more topically concentrated.)
+    ///
+    /// What it *is* skewed in is metadata. The corpus is ordered by `docid`,
+    /// which tracks URL, so a prefix is an alphabetically bounded slice: the
+    /// 100K prefix spans `0-60.reviews` to `acqnotes.com` and the 1M prefix
+    /// reaches `canigivemybaby.com`. `url` contains "nih" zero times in the
+    /// 100K. Fine for pure-KNN recall, wrong for anything that reads the
+    /// payload distribution as representative.
+    Prefix,
+    /// Every passage whose [`crc32_bucket`] is below `threshold`, i.e. a uniform
+    /// `threshold / CRC32_BUCKETS` sample of the whole corpus.
+    ///
+    /// Representative in metadata as well as geometry, at the cost of having to
+    /// stream the entire corpus once — selection depends on `docid`, so there is
+    /// no prefix of the input that contains the answer.
+    Crc32 { threshold: u32 },
+}
+
+impl Sampling {
+    /// Whether this passage is in the sample. `offset` is its global position,
+    /// `docid` its id; each mode uses only what it needs.
+    pub fn keeps(&self, offset: u64, docid: &str, limit: u64) -> bool {
+        match self {
+            Sampling::Prefix => offset < limit,
+            Sampling::Crc32 { threshold } => crc32_bucket(docid) < *threshold,
+        }
+    }
+
+    /// Whether the whole corpus must be streamed to build the sample.
+    pub fn needs_full_scan(&self) -> bool {
+        matches!(self, Sampling::Crc32 { .. })
+    }
+}
+
 /// A registered size of the dataset. Each maps to one entry in
 /// `datasets/datasets.json`, and `limit` is that entry's `vector_count`.
 ///
@@ -116,27 +288,74 @@ pub struct Variant {
     /// Name in `datasets/datasets.json`.
     pub dataset_name: &'static str,
     /// Directory under `datasets/`, matching the entry's `path`.
+    ///
+    /// The sampled variants are named by THRESHOLD (`crc32-t8805`), not by a
+    /// round size. A path like `1M-crc32` would advertise 1,000,000 points that
+    /// the corpus does not have, which `config.rs`'s #224 guard rejects on
+    /// exactly the reasoning that makes it wrong: a path naming its own size is
+    /// treated as authoritative, and a subset must not borrow a size it is not.
     pub dir: &'static str,
-    /// How many passages (a prefix of the global order) the variant holds.
+    /// Exactly how many passages the variant holds.
+    ///
+    /// For [`Sampling::Prefix`] this is also the selection rule. For
+    /// [`Sampling::Crc32`] it is the REALIZED count of the threshold, measured
+    /// by the `--discover-crc32` scan over all 113,520,750 docids — a hash
+    /// threshold cannot be made to land on a round number, so the round number
+    /// is in the name and the true count is here.
     pub limit: u64,
+    /// How the passages are chosen.
+    pub sampling: Sampling,
 }
 
 /// Every registered size, smallest first.
+///
+/// Two families over the same corpus. The `Prefix` ones take the first N
+/// passages: cheap to build, geometrically representative (measured), but
+/// alphabetically bounded in metadata because the corpus is `docid`-ordered.
+/// The `-crc32-` ones keep every passage whose `docid` hashes below a threshold,
+/// which is uniform in metadata as well — the sampling the Redis Enterprise MS
+/// MARCO suite uses — at the cost of reading the whole corpus to build.
+///
+/// The crc32 thresholds nest (886 < 8805 < 88075), so each sampled variant is a
+/// strict subset of the larger ones.
 pub const VARIANTS: &[Variant] = &[
     Variant {
         dataset_name: "msmarco-cohere-1024-100K-cosine",
         dir: "msmarco-cohere-1024/100K",
         limit: 100_000,
+        sampling: Sampling::Prefix,
     },
     Variant {
         dataset_name: "msmarco-cohere-1024-1M-cosine",
         dir: "msmarco-cohere-1024/1M",
         limit: 1_000_000,
+        sampling: Sampling::Prefix,
     },
     Variant {
         dataset_name: "msmarco-cohere-1024-10M-cosine",
         dir: "msmarco-cohere-1024/10M",
         limit: 10_000_000,
+        sampling: Sampling::Prefix,
+    },
+    // Realized counts measured by `--discover-crc32` over all 113,520,750
+    // docids at revision e78737fe: 99,964 / 1,000,044 / 9,999,959.
+    Variant {
+        dataset_name: "msmarco-cohere-1024-100K-crc32-cosine",
+        dir: "msmarco-cohere-1024/crc32-t886",
+        limit: 99_964,
+        sampling: Sampling::Crc32 { threshold: 886 },
+    },
+    Variant {
+        dataset_name: "msmarco-cohere-1024-1M-crc32-cosine",
+        dir: "msmarco-cohere-1024/crc32-t8805",
+        limit: 1_000_044,
+        sampling: Sampling::Crc32 { threshold: 8_805 },
+    },
+    Variant {
+        dataset_name: "msmarco-cohere-1024-10M-crc32-cosine",
+        dir: "msmarco-cohere-1024/crc32-t88075",
+        limit: 9_999_959,
+        sampling: Sampling::Crc32 { threshold: 88_075 },
     },
 ];
 
@@ -364,6 +583,93 @@ pub fn npy_f32_header(rows: u64, cols: usize) -> Vec<u8> {
     out.extend(std::iter::repeat_n(b' ', padding));
     out.push(b'\n');
     out
+}
+
+/// Writes a 2-D `'<f4'` NPY whose row count is only known once the stream ends.
+///
+/// The uniform sampler cannot state its row count up front — selection depends
+/// on every `docid` in the corpus, so the total is not known until the last
+/// shard is read. Rather than buffer 40 GB or copy the file afterwards, this
+/// reserves a fixed-size header, streams the rows, then seeks back and writes
+/// the real one. The reservation is safe because the header is padded to a
+/// 64-byte boundary: every row count this corpus can produce renders to the same
+/// 128 bytes, which [`DeferredNpyF32Writer::finish`] asserts rather than assumes.
+pub struct DeferredNpyF32Writer {
+    file: std::fs::File,
+    cols: usize,
+    rows_written: u64,
+    header_len: usize,
+}
+
+impl DeferredNpyF32Writer {
+    pub fn create(path: &std::path::Path, cols: usize) -> Result<Self, String> {
+        use std::io::Write as _;
+        let mut file =
+            std::fs::File::create(path).map_err(|e| format!("create {}: {}", path.display(), e))?;
+        // Reserve exactly what a plausible final count will render to.
+        let header_len = npy_f32_header(1, cols).len();
+        file.write_all(&vec![0u8; header_len])
+            .map_err(|e| format!("reserve NPY header: {e}"))?;
+        Ok(Self {
+            file,
+            cols,
+            rows_written: 0,
+            header_len,
+        })
+    }
+
+    pub fn write_row(&mut self, row: &[f32]) -> Result<(), String> {
+        use std::io::Write as _;
+        if row.len() != self.cols {
+            return Err(format!(
+                "NPY row has {} values, expected {}",
+                row.len(),
+                self.cols
+            ));
+        }
+        let mut buf = Vec::with_capacity(row.len() * 4);
+        for v in row {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        self.file
+            .write_all(&buf)
+            .map_err(|e| format!("write NPY row: {e}"))?;
+        self.rows_written += 1;
+        Ok(())
+    }
+
+    pub fn rows_written(&self) -> u64 {
+        self.rows_written
+    }
+
+    /// Patch in the real header and return the row count.
+    ///
+    /// Errors if the real header is not the reserved size — which would mean the
+    /// data starts at the wrong offset, shifting every vector. That is the one
+    /// way this design can go wrong, so it is checked, not assumed.
+    pub fn finish(mut self) -> Result<u64, String> {
+        use std::io::{Seek, SeekFrom, Write as _};
+        let header = npy_f32_header(self.rows_written, self.cols);
+        if header.len() != self.header_len {
+            return Err(format!(
+                "NPY header for {} rows renders to {} bytes but {} were reserved — the payload \
+                 would start at the wrong offset",
+                self.rows_written,
+                header.len(),
+                self.header_len
+            ));
+        }
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("seek to NPY header: {e}"))?;
+        self.file
+            .write_all(&header)
+            .map_err(|e| format!("write NPY header: {e}"))?;
+        self.file
+            .flush()
+            .map_err(|e| format!("flush NPY file: {e}"))?;
+        Ok(self.rows_written)
+    }
 }
 
 impl NpyF32Writer<BufWriter<std::fs::File>> {
@@ -946,7 +1252,22 @@ mod tests {
 
     #[test]
     fn variants_are_registered_under_their_own_names_and_dirs() {
-        assert_eq!(VARIANTS.len(), 3);
+        assert_eq!(VARIANTS.len(), 6);
+        // Two families over the same corpus, three sizes each.
+        assert_eq!(
+            VARIANTS
+                .iter()
+                .filter(|v| v.sampling == Sampling::Prefix)
+                .count(),
+            3
+        );
+        assert_eq!(
+            VARIANTS
+                .iter()
+                .filter(|v| v.sampling.needs_full_scan())
+                .count(),
+            3
+        );
         for v in VARIANTS {
             assert_eq!(variant(v.dataset_name).map(|f| f.limit), Some(v.limit));
         }
@@ -959,6 +1280,38 @@ mod tests {
         assert_eq!(names.len(), VARIANTS.len());
         assert_eq!(dirs.len(), VARIANTS.len());
         assert_eq!(limits.len(), VARIANTS.len());
+        // The crc32 thresholds must nest, so each sampled variant is a strict
+        // subset of the larger ones and results stay comparable across sizes.
+        let mut thresholds: Vec<u32> = VARIANTS
+            .iter()
+            .filter_map(|v| match v.sampling {
+                Sampling::Crc32 { threshold } => Some(threshold),
+                Sampling::Prefix => None,
+            })
+            .collect();
+        let sorted = {
+            let mut t = thresholds.clone();
+            t.sort_unstable();
+            t
+        };
+        assert_eq!(
+            thresholds, sorted,
+            "crc32 variants must be listed ascending"
+        );
+        thresholds.dedup();
+        assert_eq!(thresholds.len(), 3, "thresholds must be distinct");
+        // A bigger threshold must mean a bigger realized count.
+        let mut sampled: Vec<(u32, u64)> = VARIANTS
+            .iter()
+            .filter_map(|v| match v.sampling {
+                Sampling::Crc32 { threshold } => Some((threshold, v.limit)),
+                Sampling::Prefix => None,
+            })
+            .collect();
+        sampled.sort_unstable();
+        for w in sampled.windows(2) {
+            assert!(w[0].1 < w[1].1, "{:?} then {:?}", w[0], w[1]);
+        }
         // No variant may claim more passages than the corpus has.
         assert!(VARIANTS.iter().all(|v| v.limit <= TOTAL_PASSAGES));
     }
@@ -1058,6 +1411,187 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The sampler must be bit-identical to Python's `zlib.crc32`, which is what
+    /// the Redis Enterprise MS MARCO suite selects with. Vectors taken from zlib
+    /// directly — if this ever drifts, the two corpora stop being comparable and
+    /// nothing else would notice.
+    #[test]
+    fn crc32_bucket_matches_python_zlib() {
+        for (docid, full, bucket) in [
+            ("hello", 907_060_870u32, 60_870u32),
+            ("msmarco_v2.1_doc_00_0#0_0", 3_951_548_037, 548_037),
+            (
+                "msmarco_v2.1_doc_09_894803720#6_1517223658",
+                1_891_268_743,
+                268_743,
+            ),
+            ("", 0, 0),
+        ] {
+            assert_eq!(
+                full % CRC32_BUCKETS,
+                bucket,
+                "test vector is self-consistent"
+            );
+            assert_eq!(crc32_bucket(docid), bucket, "docid {docid:?}");
+        }
+    }
+
+    #[test]
+    fn docid_extraction_handles_the_real_line_and_falls_back_safely() {
+        // The exact shape upstream emits, space after the colon included.
+        let real = r#"{"docid": "msmarco_v2.1_doc_00_0#0_0", "url": "http://x/", "title": "T"}"#;
+        assert_eq!(
+            extract_docid(real).as_deref(),
+            Some("msmarco_v2.1_doc_00_0#0_0")
+        );
+        // No space.
+        assert_eq!(
+            extract_docid(r#"{"docid":"abc","url":"u"}"#).as_deref(),
+            Some("abc")
+        );
+        // Field order changed: the fast path misses, the parser catches it.
+        assert_eq!(
+            extract_docid(r#"{"url": "u", "docid": "later"}"#).as_deref(),
+            Some("later")
+        );
+        // Genuinely absent, and malformed.
+        assert!(extract_docid(r#"{"url": "u"}"#).is_none());
+        assert!(extract_docid("not json").is_none());
+    }
+
+    #[test]
+    fn histogram_sizes_a_sample_for_any_threshold() {
+        let mut h = BucketHistogram::new();
+        // 60k synthetic docids, uniformly bucketed by construction of crc32.
+        let n = 60_000u32;
+        for i in 0..n {
+            h.add(&format!("msmarco_v2.1_doc_{:02}_{}#0_0", i % 60, i));
+        }
+        assert_eq!(h.total(), n as u64);
+        assert_eq!(h.count_below(0), 0);
+        assert_eq!(h.count_below(CRC32_BUCKETS), n as u64);
+        // Prefix sums are monotone.
+        let (a, b) = (h.count_below(1000), h.count_below(2000));
+        assert!(a <= b);
+
+        // threshold_for lands on the closest realized count, and it really is
+        // the closest — neither neighbour beats it.
+        for target in [100u64, 1_000, 30_000] {
+            let (th, got) = h.threshold_for(target);
+            let err = target.abs_diff(got);
+            if th > 0 {
+                assert!(
+                    target.abs_diff(h.count_below(th - 1)) >= err,
+                    "target {target}"
+                );
+            }
+            if th < CRC32_BUCKETS {
+                assert!(
+                    target.abs_diff(h.count_below(th + 1)) >= err,
+                    "target {target}"
+                );
+            }
+        }
+        // Asking for everything gives everything.
+        assert_eq!(h.threshold_for(n as u64).1, n as u64);
+    }
+
+    /// Merging must be exactly equivalent to one sequential scan — that is what
+    /// makes the concurrent discovery scan legitimate.
+    #[test]
+    fn merged_shard_histograms_equal_a_single_scan() {
+        let docids: Vec<String> = (0..5_000)
+            .map(|i| format!("msmarco_v2.1_doc_{:02}_{}#0_0", i % 60, i))
+            .collect();
+
+        let mut sequential = BucketHistogram::new();
+        for d in &docids {
+            sequential.add(d);
+        }
+
+        // Same docids, split across "shards" and merged in a different order.
+        let mut merged = BucketHistogram::new();
+        let mut parts: Vec<BucketHistogram> = Vec::new();
+        for chunk in docids.chunks(700) {
+            let mut h = BucketHistogram::new();
+            for d in chunk {
+                h.add(d);
+            }
+            parts.push(h);
+        }
+        parts.reverse();
+        for h in &parts {
+            merged.merge(h);
+        }
+
+        assert_eq!(merged.total(), sequential.total());
+        for t in [0u32, 1, 137, 9_999, CRC32_BUCKETS] {
+            assert_eq!(
+                merged.count_below(t),
+                sequential.count_below(t),
+                "threshold {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_and_crc32_select_on_different_things() {
+        let p = Sampling::Prefix;
+        // Prefix looks only at position.
+        assert!(p.keeps(0, "anything", 10));
+        assert!(p.keeps(9, "anything", 10));
+        assert!(!p.keeps(10, "anything", 10));
+        assert!(!p.needs_full_scan());
+
+        // crc32 looks only at the docid — position is irrelevant, which is
+        // exactly why it cannot be built from a prefix of the input.
+        let c = Sampling::Crc32 { threshold: 548_038 };
+        let doc = "msmarco_v2.1_doc_00_0#0_0"; // bucket 548_037
+        assert!(c.keeps(0, doc, 1));
+        assert!(c.keeps(999_999_999, doc, 1), "position must not matter");
+        let just_below = Sampling::Crc32 { threshold: 548_037 };
+        assert!(
+            !just_below.keeps(0, doc, u64::MAX),
+            "threshold is exclusive"
+        );
+        assert!(c.needs_full_scan());
+    }
+
+    /// Thresholds must nest, so a smaller variant is a strict subset of a larger
+    /// one — the property that makes results across sizes comparable.
+    #[test]
+    fn crc32_thresholds_nest() {
+        let small = Sampling::Crc32 { threshold: 881 };
+        let big = Sampling::Crc32 { threshold: 8_810 };
+        for i in 0..5_000u32 {
+            let docid = format!("msmarco_v2.1_doc_00_{i}#0_0");
+            if small.keeps(0, &docid, u64::MAX) {
+                assert!(
+                    big.keeps(0, &docid, u64::MAX),
+                    "{docid} is in the small sample but not the large one"
+                );
+            }
+        }
+    }
+
+    /// The bucket distribution has to be near-uniform or the threshold would not
+    /// predict the sample size.
+    #[test]
+    fn crc32_buckets_are_uniform_enough_to_size_a_sample() {
+        let n = 200_000u32;
+        let hits = (0..n)
+            .filter(|i| {
+                let docid = format!("msmarco_v2.1_doc_{:02}_{}#0_0", i % 60, i);
+                crc32_bucket(&docid) < CRC32_BUCKETS / 100 // nominal 1%
+            })
+            .count();
+        let rate = hits as f64 / n as f64;
+        assert!(
+            (0.008..0.012).contains(&rate),
+            "1% threshold selected {rate:.4} — not uniform enough to size a sample"
+        );
     }
 
     #[test]
@@ -1232,6 +1766,41 @@ mod tests {
         let (ids, read) = crate::readers::read_npy_vectors(path.to_str().unwrap(), false).unwrap();
         assert_eq!(ids, vec![0, 1, 2, 3, 4]);
         assert_eq!(read, rows);
+    }
+
+    /// The deferred writer's whole premise: patch the header afterwards and the
+    /// production reader still reads it.
+    #[test]
+    fn deferred_npy_round_trips_and_pins_the_header_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.npy");
+        let rows: Vec<Vec<f32>> = (0..7)
+            .map(|i| (0..3).map(|j| i as f32 * 2.0 + j as f32).collect())
+            .collect();
+
+        let mut w = DeferredNpyF32Writer::create(&path, 3).unwrap();
+        for r in &rows {
+            w.write_row(r).unwrap();
+        }
+        assert_eq!(w.finish().unwrap(), 7);
+
+        let (ids, read) = crate::readers::read_npy_vectors(path.to_str().unwrap(), false).unwrap();
+        assert_eq!(ids.len(), 7);
+        assert_eq!(read, rows);
+
+        // The reservation only works because every count the corpus can produce
+        // renders to the same header size. Pin that across the whole range.
+        let reserved = npy_f32_header(1, DIM).len();
+        for n in [0u64, 1, 99_999, 100_000, 1_000_000, 10_000_000, 113_520_750] {
+            assert_eq!(
+                npy_f32_header(n, DIM).len(),
+                reserved,
+                "row count {n} renders a different header size"
+            );
+        }
+        // A wrong-width row is still rejected.
+        let mut w = DeferredNpyF32Writer::create(&dir.path().join("b.npy"), 3).unwrap();
+        assert!(w.write_row(&[1.0, 2.0]).is_err());
     }
 
     #[test]

@@ -708,6 +708,9 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | [MS MARCO v2.1-100K: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |     100,000 |     1,677 |   1,000 ‡ | Cosine    |
 | [MS MARCO v2.1-1M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3)  |      1,024 |   1,000,000 |     1,677 |   1,000 ‡ | Cosine    |
 | [MS MARCO v2.1-10M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |  10,000,000 |     1,677 |   1,000 ‡ | Cosine    |
+| MS MARCO v2.1-100K **uniform** (crc32-sampled twin)                                                        |      1,024 |      99,964 |     1,677 |   1,000 ‡ | Cosine    |
+| MS MARCO v2.1-1M **uniform** (crc32-sampled twin)                                                          |      1,024 |   1,000,044 |     1,677 |   1,000 ‡ | Cosine    |
+| MS MARCO v2.1-10M **uniform** (crc32-sampled twin)                                                         |      1,024 |   9,999,959 |     1,677 |   1,000 ‡ | Cosine    |
 | **Sparse Vectors** (learned/lexical sparse embeddings — Qdrant is the only engine with a sparse path)        |            |             |           |           |           |
 | [MS MARCO Sparse-100K: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                |   *sparse* |     100,000 |     6,980 |        10 | Dot       |
 | [MS MARCO Sparse-1M: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                  |   *sparse* |   1,000,000 |     6,980 |        10 | Dot       |
@@ -865,6 +868,58 @@ upstream export or a mis-mapped offset fails loudly instead of leaving a
 reassuring number with nothing behind it. Every output is written to `.part` and
 renamed only once that passes, so a directory either holds a complete,
 cross-checked corpus or is untouched.
+
+### Two sampling families: prefix vs uniform
+
+The same corpus is registered twice, and the difference matters only for
+metadata:
+
+| | `msmarco-cohere-1024-{100K,1M,10M}-cosine` | `…-{100K,1M,10M}-crc32-cosine` |
+| --- | --- | --- |
+| Selection | first N passages of the corpus order | `zlib.crc32(docid) % 1000000 < threshold` |
+| Thresholds | — | 886 / 8805 / 88075 (they nest) |
+| Realized size | exactly 100K / 1M / 10M | 99,964 / 1,000,044 / 9,999,959 |
+| Build cost | only the head of the corpus | the **whole** corpus, ~330 GB |
+| Metadata | alphabetically bounded | uniform |
+| Vector geometry | representative (measured, below) | uniform |
+
+**Why the prefix variants are still fine for KNN.** The corpus is `docid`-ordered,
+which tracks URL, so a prefix is an alphabetically bounded slice — the 100K
+prefix spans `0-60.reviews` to `acqnotes.com`, and `url` contains "nih" zero
+times in it. That sounds alarming, so it was measured rather than assumed
+(20,000-row blocks, cosine on unit vectors):
+
+| block | mean NN cosine | mean random-pair cosine |
+| --- | ---: | ---: |
+| shard 00 head (what the prefix variants take) | 0.8825 | 0.1442 |
+| shard 29 middle | 0.9117 | 0.3090 |
+| shard 59 head | 0.9316 | 0.3699 |
+| spread across all 60 shards | 0.8759 | 0.1499 |
+
+The prefix is **indistinguishable from a corpus-wide spread sample**; the later
+shards are the outliers, being markedly more topically concentrated. So the
+prefix variants are not geometrically skewed and their recall numbers stand.
+What is skewed is the payload distribution — which is exactly what the `-crc32-`
+twins fix, and why they exist rather than replacing the prefix variants.
+
+`zlib.crc32(docid) % N` is also the selection the Redis Enterprise MS MARCO
+suite uses (at `% 100`), so the two benchmarks' corpora are comparable by
+construction. Our implementation is pinned bit-identical to `zlib.crc32` by
+tests using vectors taken from zlib itself.
+
+**The round number is only in the name.** A hash threshold cannot be made to
+land on exactly 1,000,000, so `vector_count` carries the realized count, measured
+once by a scan over all 113,520,750 docids:
+
+```bash
+cargo run --release --bin prepare-msmarco -- --discover-crc32
+```
+
+That scan reads metadata only (never the embeddings) with 16 shards in flight —
+265 MB/s and 128 s on an i7i.metal-24xl, against ~12 MB/s for a single stream —
+and one pass sizes every possible threshold. Preparation hard-errors if the
+realized count ever stops matching the registry, which is how a changed upstream
+export would announce itself.
 
 **Engine support is not uniform above 100K.** MS MARCO carries real web-page
 `headings`, and a handful of pages have pathological ones: 40 of the first 1M

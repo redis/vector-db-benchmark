@@ -42,6 +42,12 @@ rand = "0.8"
 # every structured value is now hashed instead of rendered. Version pinned to
 # the one already in the lock — "0.10" pulls in six extra crate versions.
 sha2 = "0.11"
+# CRC-32 (ISO-HDLC) for the uniform docid sampling of the MS MARCO variants. It
+# must be bit-identical to Python's `zlib.crc32`, which is what the Redis
+# Enterprise MS MARCO suite samples with — `crc32_bucket`'s tests pin that
+# against vectors taken from zlib itself. Version pinned to the one already in
+# the lock (pulled in transitively by flate2), so this adds no new crate.
+crc32fast = "1.5"
 hdrhistogram = "7.5"
 base64 = "0.22"
 

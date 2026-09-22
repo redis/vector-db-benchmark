@@ -54,6 +54,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use flate2::read::MultiGzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 
 use vector_db_benchmark::msmarco::{
     self, in_prefix_hits, normalize_in_place, parse_f16_npy_header, payload_from_passage, test_row,
@@ -72,6 +73,11 @@ const COSINE_TOLERANCE: f32 = 2e-3;
 /// HTTP read timeout. Generous: these are multi-GB streams over the public CDN.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Metadata shards read at once during `--discover-crc32`. A single stream from
+/// the CDN measured ~12 MB/s, so the scan is bandwidth-bound per connection, not
+/// CPU-bound; 16 keeps the host busy without hammering the origin.
+const DISCOVER_CONCURRENCY: usize = 16;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "prepare-msmarco",
@@ -79,8 +85,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 )]
 struct Args {
     /// Registered dataset name to build, e.g. `msmarco-cohere-1024-1M-cosine`.
-    #[arg(long)]
-    dataset: String,
+    /// Not needed with `--discover-crc32`.
+    #[arg(long, required_unless_present = "discover_crc32")]
+    dataset: Option<String>,
 
     /// Base directory holding datasets (the variant gets its registered subdir).
     #[arg(long, default_value = "datasets")]
@@ -94,6 +101,17 @@ struct Args {
     /// Rebuild even if the output directory already holds a complete dataset.
     #[arg(long)]
     force: bool,
+
+    /// Scan the whole corpus's metadata and report, for each target size, the
+    /// crc32 threshold that selects closest to it. Writes no dataset.
+    ///
+    /// This is the discovery step for the uniformly-sampled variants: selection
+    /// depends on `docid`, so the realized size of a threshold cannot be known
+    /// without reading every docid. Streams only `passages_jsonl` (~100 GB
+    /// gzipped) — never the embeddings — and one scan sizes every possible
+    /// threshold at once.
+    #[arg(long)]
+    discover_crc32: bool,
 
     /// Hugging Face token, for rate-limited or gated access. Also read from
     /// `HF_TOKEN`.
@@ -110,10 +128,17 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<(), String> {
-    let variant = msmarco::variant(&args.dataset).ok_or_else(|| {
+    if args.discover_crc32 {
+        return discover_crc32(args);
+    }
+    let dataset = args
+        .dataset
+        .as_deref()
+        .ok_or_else(|| "--dataset is required".to_string())?;
+    let variant = msmarco::variant(dataset).ok_or_else(|| {
         format!(
             "unknown dataset {:?}. Registered MS MARCO variants: {}",
-            args.dataset,
+            dataset,
             msmarco::VARIANTS
                 .iter()
                 .map(|v| v.dataset_name)
@@ -152,25 +177,74 @@ fn run(args: &Args) -> Result<(), String> {
         dir.display()
     );
 
-    let queries = load_queries(&client, &cache, args.hf_token.as_deref(), variant)?;
-    let plan = plan_shards(&client, args.hf_token.as_deref(), variant)?;
+    let mut queries = load_queries(&client, &cache, args.hf_token.as_deref(), variant)?;
 
     // Only the offsets some query's shipped top-1k actually names need their
     // docid remembered for the alignment check — a few thousand strings, not a
     // parallel copy of the whole corpus.
-    let wanted_docids: std::collections::HashSet<i64> = queries
+    let wanted_offsets: std::collections::HashSet<u64> = queries
         .iter()
-        .flat_map(|q| q.hits.hits.iter().map(|(off, _, _)| *off))
+        .flat_map(|q| q.shipped.iter().map(|(off, _, _)| *off as u64))
         .collect();
 
-    let (docid_at, max_field_bytes) = write_corpus(
-        &client,
-        args.hf_token.as_deref(),
-        variant,
-        &plan,
-        &dir,
-        &wanted_docids,
-    )?;
+    let mut plan: Vec<ShardTake> = Vec::new();
+    let (docid_at, max_field_bytes) = if variant.sampling.needs_full_scan() {
+        let shard_rows = all_shard_rows(&client, args.hf_token.as_deref())?;
+        let tmp = dir.join("parts.tmp");
+        let corpus = write_corpus_sampled(
+            &client,
+            args.hf_token.as_deref(),
+            variant.sampling,
+            &shard_rows,
+            &dir,
+            &tmp,
+            &wanted_offsets,
+        )?;
+        if corpus.count != variant.limit {
+            return Err(format!(
+                "{} selected {} passages but the registry declares {}. The threshold's realized \
+                 count is measured, not predicted, so a mismatch means the upstream export \
+                 changed — rerun --discover-crc32 and update the variant.",
+                variant.dataset_name, corpus.count, variant.limit
+            ));
+        }
+        // Ids are positions in the SAMPLE, not global offsets, so each query's
+        // shipped hits are remapped through the selection before they can act as
+        // an oracle. A shipped hit that was not selected simply drops out.
+        for q in queries.iter_mut() {
+            q.hits = msmarco::InPrefixHits {
+                hits: q
+                    .shipped
+                    .iter()
+                    .filter_map(|(off, pid, cos)| {
+                        corpus
+                            .offset_to_local
+                            .get(&(*off as u64))
+                            .map(|local| (*local, pid.clone(), *cos))
+                    })
+                    .collect(),
+            };
+        }
+        let with_hits = queries.iter().filter(|q| !q.hits.hits.is_empty()).count();
+        let total_hits: usize = queries.iter().map(|q| q.hits.hits.len()).sum();
+        println!(
+            "After sampling, {with_hits} queries retain {total_hits} of their shipped top-1k hits."
+        );
+        msmarco::check_coverage(variant.limit, with_hits, total_hits)?;
+        (corpus.docid_at, corpus.max_field_bytes)
+    } else {
+        plan = plan_shards(&client, args.hf_token.as_deref(), variant)?;
+        let wanted: std::collections::HashSet<i64> =
+            wanted_offsets.iter().map(|o| *o as i64).collect();
+        write_corpus(
+            &client,
+            args.hf_token.as_deref(),
+            variant,
+            &plan,
+            &dir,
+            &wanted,
+        )?
+    };
 
     let ranked = brute_force_ground_truth(&dir, variant, &queries)?;
     let stats = verify(variant.limit, &queries, &ranked, &docid_at)?;
@@ -286,6 +360,119 @@ fn get(
     Ok(resp)
 }
 
+/// Stream every `passages_jsonl` shard and histogram the docid buckets.
+///
+/// Reads metadata only — the embeddings are never touched, which is what keeps
+/// this to ~100 GB instead of ~330 GB. The result sizes every possible
+/// threshold, so the sampled variants' constants come from one scan.
+fn discover_crc32(args: &Args) -> Result<(), String> {
+    let client = http_client()?;
+    let token = args.hf_token.as_deref();
+    let mut hist = msmarco::BucketHistogram::new();
+    let started = Instant::now();
+
+    println!(
+        "Scanning {} metadata shards to size the crc32 thresholds (embeddings are NOT fetched), \
+         {} shards at a time...",
+        msmarco::SHARDS,
+        DISCOVER_CONCURRENCY
+    );
+    let bar = progress(msmarco::TOTAL_PASSAGES, "docids");
+
+    // One stream per shard tops out around 12 MB/s against the CDN, which would
+    // make a single-threaded scan of ~100 GB take hours. The histogram is
+    // order-independent — every shard's counts merge by addition — so the shards
+    // are read concurrently and merged at the end. The build path cannot do this
+    // so freely: there, ids are assigned in corpus order.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(DISCOVER_CONCURRENCY)
+        .build()
+        .map_err(|e| format!("build scan pool: {e}"))?;
+
+    let per_shard: Vec<Result<(usize, u64, msmarco::BucketHistogram), String>> =
+        pool.install(|| {
+            (0..msmarco::SHARDS)
+                .into_par_iter()
+                .map(|shard| {
+                    let url = msmarco::jsonl_url(shard);
+                    let mut reader = BufReader::with_capacity(
+                        1 << 22,
+                        MultiGzDecoder::new(BufReader::with_capacity(
+                            1 << 22,
+                            get(&client, &url, token, None)?,
+                        )),
+                    );
+                    let mut local = msmarco::BucketHistogram::new();
+                    let mut line = String::new();
+                    let mut in_shard: u64 = 0;
+                    loop {
+                        line.clear();
+                        let n = reader
+                            .read_line(&mut line)
+                            .map_err(|e| format!("{url}: line {in_shard}: {e}"))?;
+                        if n == 0 {
+                            break;
+                        }
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let docid = msmarco::extract_docid(line.trim_end())
+                            .ok_or_else(|| format!("{url}: line {in_shard} has no docid"))?;
+                        local.add(&docid);
+                        in_shard += 1;
+                        if in_shard.is_multiple_of(100_000) {
+                            bar.inc(100_000);
+                        }
+                    }
+                    Ok((shard, in_shard, local))
+                })
+                .collect()
+        });
+    bar.finish_and_clear();
+
+    let mut lines_total: u64 = 0;
+    let mut counts_by_shard = vec![0u64; msmarco::SHARDS];
+    for r in per_shard {
+        let (shard, n, local) = r?;
+        counts_by_shard[shard] = n;
+        lines_total += n;
+        hist.merge(&local);
+    }
+    for (shard, n) in counts_by_shard.iter().enumerate() {
+        println!("  shard {shard:02}: {n} passages");
+    }
+
+    if lines_total != msmarco::TOTAL_PASSAGES {
+        eprintln!(
+            "\tWARNING: counted {lines_total} passages, the dataset card says {} — the upstream \
+             export has changed, so any threshold derived here is for THIS corpus, not the one \
+             the pinned revision describes.",
+            msmarco::TOTAL_PASSAGES
+        );
+    }
+
+    let targets = [100_000u64, 1_000_000, 10_000_000];
+    let report = hist.to_json(&targets);
+    println!(
+        "\n{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+    println!(
+        "Scanned {} passages in {:.1}s.",
+        lines_total,
+        started.elapsed().as_secs_f64()
+    );
+    let out = args.out_dir.join("crc32-thresholds.json");
+    std::fs::create_dir_all(&args.out_dir).ok();
+    std::fs::write(
+        &out,
+        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    )
+    .map_err(|e| format!("write {}: {}", out.display(), e))?;
+    println!("Written to {}", out.display());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------
@@ -296,8 +483,12 @@ struct Query {
     trec_year: Option<i64>,
     /// Normalized, `DIM` long.
     emb: Vec<f32>,
-    /// The shipped global top-1k entries that land inside this variant's prefix.
+    /// The shipped global top-1k entries that land inside this variant's
+    /// selection. For a prefix this is fixed at load time; for a sample it is
+    /// rebuilt once the selection is known.
     hits: msmarco::InPrefixHits,
+    /// The full shipped top-1k, kept so a sampled variant can remap it.
+    shipped: Vec<(i64, String, f32)>,
 }
 
 fn load_queries(
@@ -366,6 +557,9 @@ fn load_queries(
         let hits = in_prefix_hits(&offsets, &passage_ids, &cossims, variant.limit)
             .map_err(|e| format!("query on line {}: {e}", lineno + 1))?;
 
+        let shipped: Vec<(i64, String, f32)> = (0..offsets.len())
+            .map(|i| (offsets[i], passage_ids[i].clone(), cossims[i]))
+            .collect();
         queries.push(Query {
             id: v
                 .get("_id")
@@ -379,6 +573,7 @@ fn load_queries(
             trec_year: v.get("trec-year").and_then(|x| x.as_i64()),
             emb,
             hits,
+            shipped,
         });
     }
 
@@ -394,18 +589,29 @@ fn load_queries(
 
     let with_hits = queries.iter().filter(|q| !q.hits.hits.is_empty()).count();
     let total_hits: usize = queries.iter().map(|q| q.hits.hits.len()).sum();
-    println!(
-        "Loaded {} queries. {} of them have at least one of their global top-1000 inside this \
-         {}-passage prefix ({} hits total) — those are what the ground truth is cross-checked \
-         against.",
-        queries.len(),
-        with_hits,
-        variant.limit,
-        total_hits
-    );
+    if variant.sampling.needs_full_scan() {
+        // `hits` is still the PREFIX mapping here — meaningless for a sampled
+        // variant, which cannot know its selection until the corpus is read. It
+        // is rebuilt, reported and gated after `write_corpus_sampled`, so say
+        // nothing about coverage yet rather than print a number that is not the
+        // one being used.
+        println!("Loaded {} queries.", queries.len());
+    } else {
+        println!(
+            "Loaded {} queries. {} of them have at least one of their global top-1000 inside this \
+             {}-passage prefix ({} hits total) — those are what the ground truth is cross-checked \
+             against.",
+            queries.len(),
+            with_hits,
+            variant.limit,
+            total_hits
+        );
+    }
     // Fail here, not after the download and the brute force: these two numbers
     // already bound what the cross-check can reach (review of #319, item 4).
-    msmarco::check_coverage_upper_bound(variant.limit, with_hits, total_hits)?;
+    if !variant.sampling.needs_full_scan() {
+        msmarco::check_coverage_upper_bound(variant.limit, with_hits, total_hits)?;
+    }
     Ok(queries)
 }
 
@@ -670,6 +876,358 @@ fn write_corpus(
     Ok((docid_at, max_field_bytes))
 }
 
+/// Row count of every shard, from its NPY header (a 512-byte ranged GET each,
+/// run concurrently). The sampled path needs all 60 to know where each shard
+/// starts in the global order.
+fn all_shard_rows(
+    client: &reqwest::blocking::Client,
+    token: Option<&str>,
+) -> Result<Vec<u64>, String> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(DISCOVER_CONCURRENCY)
+        .build()
+        .map_err(|e| format!("build header pool: {e}"))?;
+    let rows: Vec<Result<u64, String>> = pool.install(|| {
+        (0..msmarco::SHARDS)
+            .into_par_iter()
+            .map(|shard| {
+                let url = msmarco::npy_url(shard);
+                let mut resp = get(client, &url, token, Some((0, 511)))?;
+                let mut head = Vec::new();
+                resp.read_to_end(&mut head)
+                    .map_err(|e| format!("read header of {url}: {e}"))?;
+                let h = parse_f16_npy_header(&head).map_err(|e| format!("{url}: {e}"))?;
+                if h.cols != msmarco::DIM as u64 {
+                    return Err(format!("{url}: {}-dim vectors", h.cols));
+                }
+                Ok(h.rows)
+            })
+            .collect()
+    });
+    let mut out = Vec::with_capacity(msmarco::SHARDS);
+    for r in rows {
+        out.push(r?);
+    }
+    let total: u64 = out.iter().sum();
+    if total != msmarco::TOTAL_PASSAGES {
+        return Err(format!(
+            "the 60 shards hold {total} passages, the pinned revision should have {}",
+            msmarco::TOTAL_PASSAGES
+        ));
+    }
+    Ok(out)
+}
+
+/// Build a uniformly-sampled corpus: every passage whose `docid` hashes below
+/// the threshold, from the WHOLE corpus.
+///
+/// Unlike the prefix path there is no cheap answer — selection depends on every
+/// `docid`, so all 60 shards are read in full. Shards are processed
+/// concurrently (a single CDN stream measured ~12 MB/s against ~265 MB/s for 16
+/// of them) into per-shard temp files, then concatenated **in shard order** so
+/// local ids still follow corpus order. That ordering is load-bearing twice
+/// over: `TopK::add_block` requires ascending ids, and the ids are what the
+/// ground truth is keyed by.
+///
+/// Returns the realized row count alongside the usual verification maps. The
+/// count cannot be predicted, which is why `vectors.npy` is written through
+/// [`DeferredNpyF32Writer`].
+#[allow(clippy::too_many_arguments)]
+fn write_corpus_sampled(
+    client: &reqwest::blocking::Client,
+    token: Option<&str>,
+    sampling: msmarco::Sampling,
+    shard_rows: &[u64],
+    dir: &Path,
+    tmp: &Path,
+    wanted_offsets: &std::collections::HashSet<u64>,
+) -> Result<SampledCorpus, String> {
+    let first_id: Vec<u64> = shard_rows
+        .iter()
+        .scan(0u64, |acc, n| {
+            let base = *acc;
+            *acc += n;
+            Some(base)
+        })
+        .collect();
+
+    std::fs::create_dir_all(tmp).map_err(|e| format!("create {}: {}", tmp.display(), e))?;
+    let bar = progress(shard_rows.iter().sum::<u64>(), "scan+select");
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(DISCOVER_CONCURRENCY)
+        .build()
+        .map_err(|e| format!("build scan pool: {e}"))?;
+
+    let results: Vec<Result<ShardSelection, String>> = pool.install(|| {
+        (0..shard_rows.len())
+            .into_par_iter()
+            .map(|shard| {
+                select_from_shard(
+                    client,
+                    token,
+                    sampling,
+                    shard,
+                    shard_rows[shard],
+                    first_id[shard],
+                    tmp,
+                    wanted_offsets,
+                    &bar,
+                )
+            })
+            .collect()
+    });
+    bar.finish_and_clear();
+
+    let mut selections: Vec<ShardSelection> = Vec::with_capacity(shard_rows.len());
+    for r in results {
+        selections.push(r?);
+    }
+    selections.sort_by_key(|s| s.shard);
+
+    // Local ids are assigned by walking shards in order, so a shard's ids start
+    // after every earlier shard's selections.
+    let mut base = 0i64;
+    let mut offset_to_local: HashMap<u64, i64> = HashMap::new();
+    let mut docid_at: HashMap<i64, String> = HashMap::new();
+    let mut max_field_bytes: HashMap<String, usize> = HashMap::new();
+    for sel in &selections {
+        for (offset, within) in &sel.wanted {
+            let local = base + *within;
+            offset_to_local.insert(*offset, local);
+            if let Some(d) = sel.docids.get(offset) {
+                docid_at.insert(local, d.clone());
+            }
+        }
+        for (k, v) in &sel.max_field_bytes {
+            let e = max_field_bytes.entry(k.clone()).or_insert(0);
+            *e = (*e).max(*v);
+        }
+        base += sel.kept as i64;
+    }
+    let total = base as u64;
+    if total == 0 {
+        return Err("the sample selected no passages at all".to_string());
+    }
+
+    // Concatenate in shard order into the real outputs.
+    println!(
+        "Concatenating {} shard parts ({} passages)...",
+        selections.len(),
+        total
+    );
+    let mut npy = msmarco::DeferredNpyF32Writer::create(&staged(dir, "vectors.npy"), msmarco::DIM)?;
+    let payloads_path = staged(dir, "payloads.jsonl");
+    let mut payloads = BufWriter::with_capacity(
+        1 << 22,
+        File::create(&payloads_path)
+            .map_err(|e| format!("create {}: {}", payloads_path.display(), e))?,
+    );
+    let mut row = vec![0f32; msmarco::DIM];
+    for sel in &selections {
+        let vpath = tmp.join(format!("shard_{:02}.f32", sel.shard));
+        let mut vf = BufReader::with_capacity(
+            1 << 22,
+            File::open(&vpath).map_err(|e| format!("open {}: {}", vpath.display(), e))?,
+        );
+        let mut raw = vec![0u8; msmarco::DIM * 4];
+        for _ in 0..sel.kept {
+            vf.read_exact(&mut raw)
+                .map_err(|e| format!("{}: {e}", vpath.display()))?;
+            for (i, c) in raw.as_chunks::<4>().0.iter().enumerate() {
+                row[i] = f32::from_le_bytes(*c);
+            }
+            npy.write_row(&row)?;
+        }
+        let ppath = tmp.join(format!("shard_{:02}.jsonl", sel.shard));
+        let mut pf = File::open(&ppath).map_err(|e| format!("open {}: {}", ppath.display(), e))?;
+        std::io::copy(&mut pf, &mut payloads)
+            .map_err(|e| format!("concat {}: {e}", ppath.display()))?;
+        let _ = std::fs::remove_file(&vpath);
+        let _ = std::fs::remove_file(&ppath);
+    }
+    let written = npy.finish()?;
+    payloads
+        .flush()
+        .map_err(|e| format!("flush {}: {}", payloads_path.display(), e))?;
+    if written != total {
+        return Err(format!(
+            "wrote {written} vectors but the shard selections total {total}"
+        ));
+    }
+    let _ = std::fs::remove_dir(tmp);
+
+    for line in msmarco::cap_violations(&max_field_bytes) {
+        eprintln!("\t⚠ WARNING: {line}");
+    }
+    println!(
+        "Selected {} of {} passages ({:.4}%); captured {} docids for verification.",
+        total,
+        shard_rows.iter().sum::<u64>(),
+        total as f64 / shard_rows.iter().sum::<u64>() as f64 * 100.0,
+        docid_at.len()
+    );
+
+    Ok(SampledCorpus {
+        count: total,
+        offset_to_local,
+        docid_at,
+        max_field_bytes,
+    })
+}
+
+/// What [`write_corpus_sampled`] needs back from one shard.
+struct ShardSelection {
+    shard: usize,
+    /// Passages kept from this shard.
+    kept: u64,
+    /// For each wanted global offset that was kept, its index WITHIN this shard.
+    wanted: Vec<(u64, i64)>,
+    docids: HashMap<u64, String>,
+    max_field_bytes: HashMap<String, usize>,
+}
+
+struct SampledCorpus {
+    count: u64,
+    offset_to_local: HashMap<u64, i64>,
+    docid_at: HashMap<i64, String>,
+    max_field_bytes: HashMap<String, usize>,
+}
+
+/// Stream one shard's embeddings and metadata in lockstep, writing the selected
+/// rows to per-shard temp files.
+#[allow(clippy::too_many_arguments)]
+fn select_from_shard(
+    client: &reqwest::blocking::Client,
+    token: Option<&str>,
+    sampling: msmarco::Sampling,
+    shard: usize,
+    rows: u64,
+    first_id: u64,
+    tmp: &Path,
+    wanted_offsets: &std::collections::HashSet<u64>,
+    bar: &ProgressBar,
+) -> Result<ShardSelection, String> {
+    let npy_url = msmarco::npy_url(shard);
+    let header = {
+        let mut resp = get(client, &npy_url, token, Some((0, 511)))?;
+        let mut head = Vec::new();
+        resp.read_to_end(&mut head)
+            .map_err(|e| format!("read header of {npy_url}: {e}"))?;
+        parse_f16_npy_header(&head)?
+    };
+    if header.rows != rows {
+        return Err(format!(
+            "{npy_url}: row count changed between planning ({rows}) and reading ({})",
+            header.rows
+        ));
+    }
+
+    let row_bytes = (msmarco::DIM * 2) as u64;
+    let start = header.row_offset(0);
+    let end = start + rows * row_bytes - 1;
+    let mut vec_stream =
+        BufReader::with_capacity(1 << 22, get(client, &npy_url, token, Some((start, end)))?);
+    let meta_url = msmarco::jsonl_url(shard);
+    let mut meta_stream = BufReader::with_capacity(
+        1 << 22,
+        MultiGzDecoder::new(BufReader::with_capacity(
+            1 << 22,
+            get(client, &meta_url, token, None)?,
+        )),
+    );
+
+    let mut vout = BufWriter::with_capacity(
+        1 << 22,
+        File::create(tmp.join(format!("shard_{shard:02}.f32")))
+            .map_err(|e| format!("create shard {shard} vector part: {e}"))?,
+    );
+    let mut pout = BufWriter::with_capacity(
+        1 << 22,
+        File::create(tmp.join(format!("shard_{shard:02}.jsonl")))
+            .map_err(|e| format!("create shard {shard} payload part: {e}"))?,
+    );
+
+    let mut raw = vec![0u8; BLOCK_ROWS * msmarco::DIM * 2];
+    let mut line = String::new();
+    let mut done: u64 = 0;
+    let mut kept: i64 = 0;
+    let mut wanted = Vec::new();
+    let mut docids = HashMap::new();
+    let mut max_field_bytes: HashMap<String, usize> = HashMap::new();
+
+    while done < rows {
+        let n = ((rows - done) as usize).min(BLOCK_ROWS);
+        let want = n * msmarco::DIM * 2;
+        vec_stream
+            .read_exact(&mut raw[..want])
+            .map_err(|e| format!("{npy_url}: rows at {done}: {e}"))?;
+        let block = msmarco::decode_f16_block(&raw[..want])?;
+        msmarco::ensure_finite(&block, (first_id + done) as i64, msmarco::DIM)?;
+
+        for r in 0..n {
+            line.clear();
+            let got = meta_stream
+                .read_line(&mut line)
+                .map_err(|e| format!("{meta_url}: line {}: {e}", done + r as u64))?;
+            if got == 0 {
+                return Err(format!(
+                    "{meta_url} ran out of lines at row {} of shard {shard}, which the NPY says \
+                     has {rows} rows — the metadata is shorter than the embeddings",
+                    done + r as u64
+                ));
+            }
+            let record: serde_json::Value = serde_json::from_str(line.trim_end())
+                .map_err(|e| format!("{meta_url}: line {}: {e}", done + r as u64))?;
+            let payload = payload_from_passage(&record)?;
+            let docid = payload
+                .get("docid")
+                .and_then(|d| d.as_str())
+                .ok_or_else(|| format!("{meta_url}: row {} has no docid", done + r as u64))?;
+
+            let offset = first_id + done + r as u64;
+            if !sampling.keeps(offset, docid, u64::MAX) {
+                continue;
+            }
+
+            for v in &block[r * msmarco::DIM..(r + 1) * msmarco::DIM] {
+                vout.write_all(&v.to_le_bytes())
+                    .map_err(|e| format!("write shard {shard} vector: {e}"))?;
+            }
+            for (field, value) in payload.as_object().into_iter().flatten() {
+                if let Some(text) = value.as_str() {
+                    let e = max_field_bytes.entry(field.clone()).or_insert(0);
+                    *e = (*e).max(text.len());
+                }
+            }
+            if wanted_offsets.contains(&offset) {
+                wanted.push((offset, kept));
+                docids.insert(offset, docid.to_string());
+            }
+            serde_json::to_writer(&mut pout, &payload)
+                .map_err(|e| format!("write shard {shard} payload: {e}"))?;
+            pout.write_all(b"\n")
+                .map_err(|e| format!("write shard {shard} payload: {e}"))?;
+            kept += 1;
+        }
+        done += n as u64;
+        bar.inc(n as u64);
+    }
+
+    vout.flush()
+        .map_err(|e| format!("flush shard {shard} vectors: {e}"))?;
+    pout.flush()
+        .map_err(|e| format!("flush shard {shard} payloads: {e}"))?;
+
+    Ok(ShardSelection {
+        shard,
+        kept: kept as u64,
+        wanted,
+        docids,
+        max_field_bytes,
+    })
+}
+
 /// Read one newline-terminated line into `line`, returning bytes read (0 at
 /// EOF). Thin wrapper so the two error sites above read the same way.
 fn read_json_line<R: BufRead>(reader: &mut R, line: &mut String) -> Result<usize, std::io::Error> {
@@ -844,7 +1402,26 @@ fn write_manifest(
         "distance": "cosine",
         "neighbours": msmarco::NEIGHBOURS,
         "queries": queries.len(),
-        "prefix_of_global_order": true,
+        "sampling": match variant.sampling {
+            msmarco::Sampling::Prefix => serde_json::json!({
+                "mode": "prefix",
+                "rule": "the first N passages of the corpus order",
+                "note": "the corpus is docid-ordered, which tracks URL, so this is an \
+                         alphabetically bounded slice — representative geometrically \
+                         (measured), NOT representative in metadata",
+            }),
+            msmarco::Sampling::Crc32 { threshold } => serde_json::json!({
+                "mode": "crc32",
+                "rule": format!(
+                    "keep where zlib.crc32(docid) % {} < {}",
+                    msmarco::CRC32_BUCKETS, threshold
+                ),
+                "threshold": threshold,
+                "buckets": msmarco::CRC32_BUCKETS,
+                "note": "uniform over the whole corpus in metadata as well as geometry; \
+                         the same selection function the Redis Enterprise MS MARCO suite uses",
+            }),
+        },
         "shards_consumed": plan
             .iter()
             .map(|p| serde_json::json!({
