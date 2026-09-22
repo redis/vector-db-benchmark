@@ -983,6 +983,26 @@ payload text. `experiments/configurations/redis-msmarco.json` ships that
 configuration; note it sets `top` explicitly, for the reason in the previous
 paragraph.
 
+**And at 10M**, same configuration and host:
+
+| top | EF | QPS | Recall | MRR | NDCG |
+| --: | --: | --: | --: | --: | --: |
+| 10 | 64 | 5507 | 0.9073 | 0.9672 | 0.9245 |
+| 10 | 128 | 4242 | 0.9364 | 0.9773 | 0.9484 |
+| 10 | 256 | 2797 | 0.9437 | 0.9905 | 0.9556 |
+
+Upload was 3,399 s (2,942 docs/s — roughly half the 1M rate, as HNSW insert cost
+grows with graph size), and the whole run took 58.5 minutes.
+
+**Peak memory, measured rather than estimated** (`/usr/bin/time -v` on the 10M
+run): **80.5 GB** maximum resident set for the benchmark process, with Redis
+itself in a separate container on top. The reading worth keeping is *why*: the
+peak is the vector read alone, where `read_npy_vectors` holds the `Array2` and
+the `Vec<Vec<f32>>` it is being converted into at the same time — 2 x 40.96 GB.
+The payloads (17 GB on disk at 10M) are read *after* that `Array2` has been
+dropped, so the two peaks do not coincide and the payload side does not add to
+the high-water mark. Budget ~2x the vector bytes, plus Redis.
+
 **Sizing note for the Redis family.** Redis declares a `text` schema field as
 `TEXT SORTABLE`, which keeps a copy of the value in the sorting table. This is
 the first corpus where that is expensive, because it is the first with real prose
