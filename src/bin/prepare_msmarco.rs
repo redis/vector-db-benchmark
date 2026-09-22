@@ -65,10 +65,27 @@ use vector_db_benchmark::msmarco::{
 /// enough to keep preparation's peak RSS flat at any corpus size.
 const BLOCK_ROWS: usize = 8192;
 
-/// Tolerance when matching our cosines against HF's. The embeddings are stored
-/// as float16 (~3 decimal digits), and HF computed their cosines in float32, so
-/// a few 1e-4 of disagreement is expected; 1e-2 would hide a real error.
-const COSINE_TOLERANCE: f32 = 2e-3;
+/// Tolerance when matching our cosines against HF's, and the window inside which
+/// a differing id at the same rank is accepted as a tie rather than a wrong
+/// ranking.
+///
+/// 2e-4, not the 2e-3 this started at, because the looser value was ~40x the
+/// largest disagreement any real build produces and was doing double duty as the
+/// tie window. Measured with `--verify` over the three prepared corpora at
+/// decreasing tolerances:
+///
+/// | corpus | positions | max delta | ties @2e-3 | @2e-4 | @1e-4 | @5e-5 |
+/// |--------|-----------|-----------|-----------|-------|-------|-------|
+/// | 100K   | 2,134     | 4.63e-5   | 0         | 0     | 0     | 0     |
+/// | 1M     | 17,523    | 4.85e-5   | 82        | 82    | 82    | 82    |
+/// | 10M    | 197,898   | 5.96e-5   | 5,406     | 5,406 | 5,406 | —     |
+///
+/// Every tie is a genuine one: the counts do not move as the window shrinks by
+/// 40x, so nothing was being waved through by a loose bound. 2e-4 keeps ~3.4x
+/// headroom over the worst observed delta (5.96e-5 on the 10M) — enough for
+/// float rounding on another machine, while making the oracle 10x stricter than
+/// before.
+const COSINE_TOLERANCE: f32 = 2e-4;
 
 /// HTTP read timeout. Generous: these are multi-GB streams over the public CDN.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -102,6 +119,22 @@ struct Args {
     #[arg(long)]
     force: bool,
 
+    /// Re-run the shipped-top-1k cross-check against an ALREADY prepared
+    /// dataset, without rebuilding it.
+    ///
+    /// Everything the check needs is already on disk — `tests.jsonl` holds the
+    /// brute-forced ranking, `payloads.jsonl` holds the docids — so a corpus can
+    /// be re-validated after download, or re-validated at a different
+    /// `--tolerance`, in a couple of minutes instead of a full rebuild. Matches
+    /// shipped hits by DOCID rather than by offset, so it works for both
+    /// sampling modes.
+    #[arg(long)]
+    verify: bool,
+
+    /// Cosine tolerance for `--verify`. Defaults to the value preparation uses.
+    #[arg(long)]
+    tolerance: Option<f32>,
+
     /// Scan the whole corpus's metadata and report, for each target size, the
     /// crc32 threshold that selects closest to it. Writes no dataset.
     ///
@@ -130,6 +163,9 @@ fn main() {
 fn run(args: &Args) -> Result<(), String> {
     if args.discover_crc32 {
         return discover_crc32(args);
+    }
+    if args.verify {
+        return verify_prepared(args);
     }
     let dataset = args
         .dataset
@@ -267,6 +303,17 @@ fn run(args: &Args) -> Result<(), String> {
 /// which is what makes [`is_complete`]'s claim true rather than aspirational.
 /// (A `--force` rebuild that dies halfway now also leaves the previous good
 /// corpus intact instead of overwriting it with a partial one.)
+/// Written last, after every other file is in place, and required by
+/// [`is_complete`].
+///
+/// Four renames are four separate operations: dying between the second and the
+/// fourth leaves a new `PREPARED.json` and `tests.jsonl` over an old
+/// `payloads.jsonl` and `vectors.npy`, which the previous "do all three exist
+/// and does the row count match" check accepted. A single file that only exists
+/// once the set is whole turns "complete or untouched" from a description of the
+/// happy path into something the code enforces.
+const COMPLETE_MARKER: &str = "COMPLETE";
+
 const OUTPUTS: [&str; 4] = [
     "vectors.npy",
     "payloads.jsonl",
@@ -283,6 +330,10 @@ fn staged(dir: &Path, name: &str) -> PathBuf {
 /// directory, so each is atomic; the set as a whole is not, which is why
 /// `vectors.npy` (the one [`is_complete`] measures) goes last.
 fn publish(dir: &Path) -> Result<(), String> {
+    // Clear any previous marker FIRST: from here until the last rename the
+    // directory is a mix of old and new files and must not read as complete.
+    let marker = dir.join(COMPLETE_MARKER);
+    let _ = std::fs::remove_file(&marker);
     for name in OUTPUTS.iter().rev() {
         let from = staged(dir, name);
         if !from.exists() {
@@ -291,7 +342,7 @@ fn publish(dir: &Path) -> Result<(), String> {
         std::fs::rename(&from, dir.join(name))
             .map_err(|e| format!("publish {}: {}", from.display(), e))?;
     }
-    Ok(())
+    std::fs::write(&marker, "ok\n").map_err(|e| format!("write {}: {}", marker.display(), e))
 }
 
 /// Remove any `.part` files left by an earlier interrupted run.
@@ -299,6 +350,7 @@ fn clear_staged(dir: &Path) {
     for name in OUTPUTS {
         let _ = std::fs::remove_file(staged(dir, name));
     }
+    let _ = std::fs::remove_file(dir.join(COMPLETE_MARKER));
 }
 
 /// A prepared directory is complete when all three files exist and `vectors.npy`
@@ -310,6 +362,11 @@ fn is_complete(dir: &Path, variant: &Variant) -> bool {
         dir.join("payloads.jsonl"),
         dir.join("tests.jsonl"),
     );
+    // The marker is written only after all four renames land, so a run
+    // interrupted mid-publish leaves a directory that does NOT read as complete.
+    if !dir.join(COMPLETE_MARKER).exists() {
+        return false;
+    }
     if !(v.exists() && p.exists() && t.exists()) {
         return false;
     }
@@ -470,6 +527,146 @@ fn discover_crc32(args: &Args) -> Result<(), String> {
     )
     .map_err(|e| format!("write {}: {}", out.display(), e))?;
     println!("Written to {}", out.display());
+    Ok(())
+}
+
+/// Re-verify a prepared dataset in place.
+fn verify_prepared(args: &Args) -> Result<(), String> {
+    let dataset = args
+        .dataset
+        .as_deref()
+        .ok_or_else(|| "--dataset is required with --verify".to_string())?;
+    let variant =
+        msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
+    let dir = args.out_dir.join(variant.dir);
+    let tol = args.tolerance.unwrap_or(COSINE_TOLERANCE);
+
+    let client = http_client()?;
+    let cache = args
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| args.out_dir.join(".msmarco-cache"));
+    std::fs::create_dir_all(&cache).map_err(|e| format!("create {}: {}", cache.display(), e))?;
+    let queries = load_queries(&client, &cache, args.hf_token.as_deref(), variant)?;
+
+    // Only the passages some query's top-1k actually names need locating.
+    let wanted: std::collections::HashSet<&str> = queries
+        .iter()
+        .flat_map(|q| q.shipped.iter().map(|(_, pid, _)| pid.as_str()))
+        .collect();
+
+    // docid -> local id, by position in payloads.jsonl. That file is written in
+    // local-id order by construction, which is the same thing `vectors.npy`'s
+    // rows mean, so the position IS the id.
+    let payloads_path = dir.join("payloads.jsonl");
+    let pf = File::open(&payloads_path).map_err(|e| {
+        format!(
+            "open {}: {} (is the dataset prepared?)",
+            payloads_path.display(),
+            e
+        )
+    })?;
+    let mut local_of: HashMap<String, i64> = HashMap::new();
+    let mut docid_at: HashMap<i64, String> = HashMap::new();
+    let mut id: i64 = 0;
+    let bar = progress(variant.limit, "payloads");
+    for line in BufReader::with_capacity(1 << 22, pf).lines() {
+        let line = line.map_err(|e| format!("read {}: {e}", payloads_path.display()))?;
+        if let Some(docid) = msmarco::extract_docid(&line) {
+            if wanted.contains(docid.as_str()) {
+                local_of.insert(docid.clone(), id);
+                docid_at.insert(id, docid);
+            }
+        }
+        id += 1;
+        if id % 100_000 == 0 {
+            bar.inc(100_000);
+        }
+    }
+    bar.finish_and_clear();
+    if id as u64 != variant.limit {
+        return Err(format!(
+            "{} holds {} payload lines but the registry declares {}",
+            payloads_path.display(),
+            id,
+            variant.limit
+        ));
+    }
+
+    // The brute-forced ranking, straight out of tests.jsonl.
+    let tests_path = dir.join("tests.jsonl");
+    let tf =
+        File::open(&tests_path).map_err(|e| format!("open {}: {}", tests_path.display(), e))?;
+    let mut ranked: Vec<Vec<(f32, i64)>> = Vec::with_capacity(queries.len());
+    for line in BufReader::with_capacity(1 << 20, tf).lines() {
+        let line = line.map_err(|e| format!("read {}: {e}", tests_path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: serde_json::Value =
+            serde_json::from_str(&line).map_err(|e| format!("parse tests.jsonl: {e}"))?;
+        let ids = row["closest_ids"]
+            .as_array()
+            .ok_or("tests.jsonl: no closest_ids")?;
+        let scores = row["closest_scores"]
+            .as_array()
+            .ok_or("tests.jsonl: no closest_scores")?;
+        ranked.push(
+            ids.iter()
+                .zip(scores)
+                .filter_map(|(i, sc)| Some((sc.as_f64()? as f32, i.as_i64()?)))
+                .collect(),
+        );
+    }
+    if ranked.len() != queries.len() {
+        return Err(format!(
+            "{} holds {} rows but {} queries were loaded",
+            tests_path.display(),
+            ranked.len(),
+            queries.len()
+        ));
+    }
+
+    let mut stats = VerifyStats {
+        queries_checked: 0,
+        positions_compared: 0,
+        max_score_delta: 0.0,
+        tie_swaps: 0,
+    };
+    for (i, q) in queries.iter().enumerate() {
+        let hits = msmarco::InPrefixHits {
+            hits: q
+                .shipped
+                .iter()
+                .filter_map(|(_, pid, cos)| local_of.get(pid).map(|l| (*l, pid.clone(), *cos)))
+                .collect(),
+        };
+        if hits.hits.is_empty() {
+            continue;
+        }
+        let check = verify_head_against_shipped(&ranked[i], &hits, &docid_at, tol)
+            .map_err(|e| format!("query {} ({:?}): {e}", q.id, q.text))?;
+        stats.queries_checked += 1;
+        stats.positions_compared += check.compared;
+        stats.tie_swaps += check.tie_swaps;
+        stats.max_score_delta = stats.max_score_delta.max(check.max_score_delta);
+    }
+
+    msmarco::check_coverage(
+        variant.limit,
+        stats.queries_checked,
+        stats.positions_compared,
+    )?;
+    println!(
+        "{} verified at tolerance {:.0e}: {} queries / {} ranking positions, max cosine delta \
+         {:.2e}, {} tie reorderings.",
+        variant.dataset_name,
+        tol,
+        stats.queries_checked,
+        stats.positions_compared,
+        stats.max_score_delta,
+        stats.tie_swaps
+    );
     Ok(())
 }
 
