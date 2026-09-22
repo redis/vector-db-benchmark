@@ -902,6 +902,20 @@ prefix variants are not geometrically skewed and their recall numbers stand.
 What is skewed is the payload distribution — which is exactly what the `-crc32-`
 twins fix, and why they exist rather than replacing the prefix variants.
 
+**What the uniform sample actually buys**, measured on the built corpora:
+
+| | uniform 100K | prefix 100K | prefix 10M |
+| --- | ---: | ---: | ---: |
+| `url` contains "nih" | 173 | **0** | 10,249 |
+| `url` contains "wikipedia" | 6,401 | **0** | 150,403 |
+| distinct leading host characters | **35** (0-9, a-z) | 11 (0-9, a) | 34 (0-9, a-w) |
+| first / last URL | `1000naturalremedy.com` / `zyto.com` | `0-60.reviews` / `acqnotes.com` | `0-60.reviews` / `www.crf-usa.org` |
+
+A **100K uniform sample spans the whole alphabet; even the 10M prefix stops at
+"w"**. If you are measuring filter selectivity, full-text behaviour, or anything
+else that reads the payload distribution, that is the difference between a
+representative corpus and a slice of the As.
+
 `zlib.crc32(docid) % N` is also the selection the Redis Enterprise MS MARCO
 suite uses (at `% 100`), so the two benchmarks' corpora are comparable by
 construction. Our implementation is pinned bit-identical to `zlib.crc32` by
