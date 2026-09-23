@@ -321,6 +321,13 @@ lint:
 # that is compiled out of the binary that ships.
 #
 # Docker-backed engine suites are NOT included — run `make integration-test-*`.
+#
+# Deliberately contains NO model call, even though this repo has ANTHROPIC_API_KEY
+# wired up for the claude-pr-review / claude-issue-triage workflows. A gate has to
+# be deterministic, free, and runnable offline; every failure this was built to
+# catch (stale engine counts, missing make targets, renamed files, CI drift) is
+# caught by the plain tests in harness_invariants.rs. Model review belongs in the
+# advisory PR workflow, where a flaky or costly answer blocks nobody.
 .PHONY: agent-check
 agent-check: agent-check-lint agent-check-test
 	@echo ""
