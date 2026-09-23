@@ -1551,7 +1551,10 @@ fn every_source_filename_named_in_the_agent_docs_still_exists() {
             let name = e.file_name().to_string_lossy().to_string();
             if path.is_dir() {
                 // Skip build output, VCS and vendored trees.
-                if !matches!(name.as_str(), "target" | ".git" | "node_modules" | "v0" | ".claude") {
+                if !matches!(
+                    name.as_str(),
+                    "target" | ".git" | "node_modules" | "v0" | ".claude"
+                ) {
                     stack.push(path);
                 }
             } else {
@@ -1606,9 +1609,7 @@ fn every_repo_path_named_in_the_agent_docs_exists() {
                 // shed trailing sentence punctuation. Done in that order so
                 // `` `src/bin/`. `` reduces to `src/bin/` (a directory, skipped
                 // below) rather than to the literal "src/bin/`." .
-                let cand = raw
-                    .replace('`', "")
-                    .replace("**", "");
+                let cand = raw.replace('`', "").replace("**", "");
                 let cand = cand.trim_matches(|c: char| {
                     !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
                 });
