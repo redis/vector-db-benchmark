@@ -22,6 +22,11 @@ That is the entire no-Docker CI gate — fmt, clippy `-D warnings`, and the unit
 binary / invariant suites **in release** — in CI's order and profile. If it
 passes, the non-Docker CI jobs will pass.
 
+Run it on its own line and check the exit status. **Do not pipe it** —
+`make agent-check | tail -2 && git commit` takes the *pipeline's* status, which
+is `tail`'s, so it reports success over a failing gate. That has already
+happened once, in the commit that wired the gate up.
+
 ### Read this before trusting a green local run
 
 - **`make check` runs NO TESTS.** It is `fmt-check` + `lint` only. It is not a
