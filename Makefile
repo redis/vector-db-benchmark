@@ -307,20 +307,40 @@ lint:
 #
 # Docker-backed engine suites are NOT included — run `make integration-test-*`
 # for those.
+# `agent-check` is what CI RUNS, not a local imitation of it. `.github/workflows/ci.yml`
+# invokes `agent-check-lint` and `agent-check-test` directly, and
+# `harness_invariants.rs` fails if CI ever grows a raw `cargo` step again — so
+# "this passes => CI passes" is enforced rather than asserted. A hand-copied
+# duplicate of CI is precisely the thing that drifts and then lies.
+#
+# Split in two because CI runs them as separate parallel jobs; `agent-check`
+# is the local convenience that runs both.
+#
+# --release is not incidental: CI runs the suites in release, so a
+# `debug_assert!` does not exist there. Testing only in debug can pass a guard
+# that is compiled out of the binary that ships.
+#
+# Docker-backed engine suites are NOT included — run `make integration-test-*`.
 .PHONY: agent-check
-agent-check:
-	@echo "=== 1/4 formatting ==="
+agent-check: agent-check-lint agent-check-test
+	@echo ""
+	@echo "agent-check passed — this is the whole no-Docker CI gate."
+
+.PHONY: agent-check-lint
+agent-check-lint:
+	@echo "=== formatting ==="
 	cargo fmt --check
-	@echo "=== 2/4 clippy (warnings are errors, as in CI) ==="
+	@echo "=== clippy (warnings are errors, as in CI) ==="
 	cargo clippy --all-targets -- -D warnings
-	@echo "=== 3/4 unit + binary tests (RELEASE, as in CI) ==="
+
+.PHONY: agent-check-test
+agent-check-test:
+	@echo "=== unit + binary tests (RELEASE, as in CI) ==="
 	cargo test --lib --bins --release
-	@echo "=== 4/4 harness invariant suites ==="
+	@echo "=== harness invariant suites (no container) ==="
 	cargo test --test integration_cli --release
 	cargo test --test overhead_invariants --release
 	cargo test --test harness_invariants --release
-	@echo ""
-	@echo "agent-check passed — this is the whole no-Docker CI gate."
 
 .PHONY: check-strict
 check-strict: fmt-check lint-strict

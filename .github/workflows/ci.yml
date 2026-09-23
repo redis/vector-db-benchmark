@@ -33,11 +33,12 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
-    - name: Check formatting
-      run: cargo fmt --check
-
-    - name: Run clippy
-      run: cargo clippy --all-targets -- -D warnings
+    # Runs the Makefile target, NOT a copy of its commands. `make agent-check`
+    # is what contributors and agents run locally, so it has to BE this gate
+    # rather than resemble it; `harness_invariants.rs` fails if a raw `cargo
+    # fmt`/`clippy` step reappears here.
+    - name: Format + clippy (make agent-check-lint)
+      run: make agent-check-lint
 
     - name: Security audit (advisories)
       # Non-blocking: reports known-vulnerable/unmaintained crates without
@@ -58,30 +59,21 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
-    - name: Run unit tests
-      # --lib AND --bins: the bulk of the unit tests (engine filter builders,
-      # CLI/config parsing, per-engine helpers) live in the binary crate, so
-      # `--lib` alone never executed them in CI.
-      run: cargo test --lib --bins --release
+    # Same single-source-of-truth rule as the check job above. --lib AND
+    # --bins: the bulk of the unit tests (engine filter builders, CLI/config
+    # parsing, per-engine helpers) live in the binary crate, so `--lib` alone
+    # never executed them in CI.
+    - name: Unit + invariant suites (make agent-check-test)
+      run: make agent-check-test
 
-    - name: Run CLI smoke tests (no container)
-      # --help / --describe datasets|engines — the same paths the docker-build
-      # job smoke-tests, now in the blocking suite.
-      run: cargo test --test integration_cli --release
-
-    - name: Run measurement-overhead invariants (no container)
-      # `--lib --bins` does NOT build `tests/*.rs` integration targets, and no
-      # job named this one, so INV-2/INV-3 — the source-shape tripwires that
-      # keep the per-query timed loops lock-free and the percentiles unbiased —
-      # had never run in CI. INV-4/INV-4b (#214) join them here.
-      run: cargo test --test overhead_invariants --release
-
-    - name: Run test-harness invariants (no container)
-      # INV-P1..P6 (#292): each suite has exactly one source of truth for its
-      # port and it matches docker-compose.test.yml; every server-wiping suite
-      # claims its instance from inside `test_port()`; the claim decision fails
-      # closed; and no shared helper under tests/common/ can wipe a server.
-      run: cargo test --test harness_invariants --release
+    # The three container-free suites that used to have their own steps here
+    # (integration_cli, overhead_invariants, harness_invariants) are inside
+    # `agent-check-test` above. They are still run, and still blocking — they
+    # are just no longer a second copy of the command list:
+    #   * integration_cli       — --help / --describe smoke paths
+    #   * overhead_invariants   — INV-2/3/4 timed-loop and percentile tripwires
+    #   * harness_invariants    — INV-P1..P6 port/claim invariants, plus the
+    #                             AGENTS.md and CI-drift checks
 
   integration-redis:
     name: Integration tests (Redis)

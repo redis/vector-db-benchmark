@@ -1416,3 +1416,220 @@ fn info_field_reads_run_id_and_master_replid() {
     );
     assert_eq!(info_field("# Persistence\r\nloading:0\r\n", "loading"), "0");
 }
+
+// ---------------------------------------------------------------------------
+// INV-A1..A3 — the agent-facing contract (AGENTS.md / CLAUDE.md / Makefile / CI)
+//
+// `make agent-check` tells contributors and coding agents "if this passes, the
+// non-Docker CI jobs pass". That claim is only worth anything if the target IS
+// the gate rather than a hand-copied imitation of it, because a copy drifts the
+// moment someone edits one side — and then it reports success while measuring
+// something else, which is this repo's oldest failure shape.
+//
+// These read the files as TEXT, need no database, and run in the container-free
+// job alongside the other invariants.
+// ---------------------------------------------------------------------------
+
+fn repo_file(name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// INV-A1: CI must invoke the Makefile targets, never raw `cargo` lint/test
+/// commands. A raw command here is a second source of truth that `agent-check`
+/// cannot see, so the local gate would silently stop matching CI.
+#[test]
+fn ci_no_docker_jobs_run_the_make_targets_not_their_own_cargo_commands() {
+    let ci = repo_file(".github/workflows/ci.yml");
+    let (check_job, rest) = ci
+        .split_once("  test:")
+        .expect("ci.yml must have a `test:` job");
+    let check_job = check_job
+        .split_once("  check:")
+        .expect("ci.yml must have a `check:` job")
+        .1;
+    let test_job = rest
+        .split_once("  integration-redis:")
+        .expect("ci.yml must have an `integration-redis:` job")
+        .0;
+
+    assert!(
+        check_job.contains("make agent-check-lint"),
+        "the check job must run `make agent-check-lint`"
+    );
+    assert!(
+        test_job.contains("make agent-check-test"),
+        "the test job must run `make agent-check-test`"
+    );
+
+    // Raw commands that would bypass the Makefile. `cargo audit` is exempt: it
+    // is deliberately `continue-on-error` and is not part of the local gate.
+    for (job_name, job) in [("check", check_job), ("test", test_job)] {
+        for line in job.lines() {
+            let line = line.trim();
+            if !line.starts_with("run:") {
+                continue;
+            }
+            for banned in ["cargo fmt", "cargo clippy", "cargo test"] {
+                assert!(
+                    !line.contains(banned),
+                    "ci.yml `{job_name}` job runs `{banned}` directly:\n    {line}\n\
+                     Put it in the Makefile so `make agent-check` stays the same gate CI runs — \
+                     otherwise the local target silently stops matching CI (INV-A1)."
+                );
+            }
+        }
+    }
+}
+
+/// INV-A2: every `make <target>` named in the agent docs must exist. A doc that
+/// tells an agent to run a target that was renamed sends it looking for a
+/// workaround, usually by bypassing the Makefile entirely.
+#[test]
+fn every_make_target_named_in_the_agent_docs_exists() {
+    let makefile = repo_file("Makefile");
+    let declared: std::collections::HashSet<&str> = makefile
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+        .map(|(name, _)| name)
+        .collect();
+
+    for doc in ["AGENTS.md", "CLAUDE.md"] {
+        let text = repo_file(doc);
+        for (i, line) in text.lines().enumerate() {
+            for token in line.split("make ").skip(1) {
+                let target: String = token
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+                    .collect();
+                // Skip the two ways the docs name a FAMILY rather than one
+                // target: a brace set (`make integration-test-{a,b}`) and a
+                // placeholder (`make integration-test-<engine>`). Both leave a
+                // trailing `-` on the extracted prefix.
+                let next = token[target.len()..].chars().next();
+                if target.is_empty()
+                    || target.ends_with('-')
+                    || matches!(next, Some('{') | Some('<'))
+                {
+                    continue;
+                }
+                assert!(
+                    declared.contains(target.as_str()),
+                    "{doc}:{} names `make {target}`, which is not a target in the Makefile",
+                    i + 1
+                );
+            }
+        }
+    }
+}
+
+/// INV-A3b: every source FILENAME the docs name must still exist somewhere in
+/// the tree.
+///
+/// INV-A3 only sees fully-qualified paths, and the structure block writes bare
+/// filenames (`query_filter.rs`, not `src/query_filter.rs`) — so on its own it
+/// validated exactly two paths out of a page of them, and a rename anywhere in
+/// that block would have gone unnoticed. Checking by basename covers the whole
+/// block; a rename or deletion is the failure that actually happens.
+#[test]
+fn every_source_filename_named_in_the_agent_docs_still_exists() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                // Skip build output, VCS and vendored trees.
+                if !matches!(name.as_str(), "target" | ".git" | "node_modules" | "v0" | ".claude") {
+                    stack.push(path);
+                }
+            } else {
+                present.insert(name);
+            }
+        }
+    }
+
+    let mut checked = 0;
+    for doc in ["AGENTS.md", "CLAUDE.md"] {
+        let text = repo_file(doc);
+        for (i, line) in text.lines().enumerate() {
+            for raw in line.split(|c: char| c.is_whitespace() || c == '`' || c == '(' || c == ')') {
+                let tok = raw.trim_end_matches(['.', ',', ';', ':']);
+                let Some((stem, ext)) = tok.rsplit_once('.') else {
+                    continue;
+                };
+                if !matches!(ext, "rs" | "toml") || stem.is_empty() {
+                    continue;
+                }
+                // Only plain basenames; qualified paths are INV-A3's job.
+                if tok.contains('/') || !stem.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    present.contains(tok),
+                    "{doc}:{} names `{tok}`, which no longer exists anywhere in the tree \
+                     (renamed or deleted?)",
+                    i + 1
+                );
+            }
+        }
+    }
+    assert!(
+        checked >= 15,
+        "expected the agent docs to name many source files; only {checked} were checked — \
+         the extractor has probably stopped matching (INV-A3b)"
+    );
+}
+
+/// INV-A3: every repo path named in the agent docs must exist. Stale paths are
+/// how an agent's model of the tree goes wrong before it writes a line.
+#[test]
+fn every_repo_path_named_in_the_agent_docs_exists() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for doc in ["AGENTS.md", "CLAUDE.md"] {
+        let text = repo_file(doc);
+        for (i, line) in text.lines().enumerate() {
+            for raw in line.split_whitespace() {
+                // These docs mark code with backticks; strip them first, then
+                // shed trailing sentence punctuation. Done in that order so
+                // `` `src/bin/`. `` reduces to `src/bin/` (a directory, skipped
+                // below) rather than to the literal "src/bin/`." .
+                let cand = raw
+                    .replace('`', "")
+                    .replace("**", "");
+                let cand = cand.trim_matches(|c: char| {
+                    !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+                });
+                let cand = cand.trim_end_matches(['.', ',', ';', ':']);
+                if !cand.starts_with("src/")
+                    && !cand.starts_with("tests/")
+                    && !cand.starts_with("datasets/")
+                    && !cand.starts_with("experiments/")
+                {
+                    continue;
+                }
+                // Globs and brace sets describe a family, not one file.
+                if cand.contains('*') || cand.contains('{') || cand.ends_with('/') {
+                    continue;
+                }
+                assert!(
+                    root.join(cand).exists(),
+                    "{doc}:{} names `{cand}`, which does not exist",
+                    i + 1
+                );
+            }
+        }
+    }
+}
