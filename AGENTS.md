@@ -2,102 +2,65 @@
 
 ## Project Overview
 
-Rust implementation of a vector database benchmarking tool. **15 engines**:
-Redis (RediSearch), VectorSets, Valkey, Dragonfly, KiviDB, Elasticsearch,
-OpenSearch, Qdrant, pgvector, Weaviate, Milvus, MongoDB, Chroma, Turbopuffer,
-Vertex AI.
+Rust implementation of a vector database benchmarking tool. Supports Redis (RediSearch) and VectorSets engines.
 
-The thing this repo optimises for is **not being wrong**. Its dominant historical
-bug class is a run that completes, reports a plausible number, and measured
-something other than what its config name claims. Most of the unusual-looking
-rigour below exists because of a specific incident.
+## Build & Test Commands
 
-## Verify your change with ONE command
+All commands go through the Makefile:
 
 ```bash
-make agent-check
-```
-
-That is the entire no-Docker CI gate — fmt, clippy `-D warnings`, and the unit /
-binary / invariant suites **in release** — in CI's order and profile. If it
-passes, the non-Docker CI jobs will pass.
-
-### Read this before trusting a green local run
-
-- **`make check` runs NO TESTS.** It is `fmt-check` + `lint` only. It is not a
-  sufficient gate; `make agent-check` is.
-- **CI runs the test suites with `--release`.** A `debug_assert!` therefore does
-  not exist in CI, or in the binaries this repo ships. If you write a guard, make
-  it a returned `Err` or a real `assert!`, and run the suite under both profiles.
-- **Match CI's Rust toolchain.** CI uses default `stable`. A newer stable adds
-  clippy lints your local version does not have, so `make check` can be clean
-  locally and fail CI on `-D warnings`. `rustup update stable` before concluding
-  a lint failure is spurious.
-- **Rebuild `--release` before copying a binary anywhere.** `cargo test` builds
-  debug; `scp target/release/<bin>` after it ships the *previous* build.
-
-## Other Make targets
-
-```bash
-make vector-db-benchmark # Build the main CLI binary (release)
-make build               # Build all binaries (release)
-make test                # Unit tests only, debug profile (no Docker)
-make check               # fmt + clippy ONLY — see the warning above
-make fmt                 # Auto-format
-make prepare-msmarco     # Build an MS MARCO corpus (see below)
-make v0-check            # Compare Rust vs Python v0 (precision, QPS, latency)
-make clean
-```
-
-Per-engine integration tests, each starts and stops its own containers:
-
-```bash
-make integration-test                 # Redis
-make integration-test-{valkey,dragonfly,kividb,chroma}
-make integration-test-{pgvector,qdrant,elasticsearch,opensearch}
-make integration-test-{weaviate,milvus,mongodb}
-make integration-test-vertex          # cloud-only, needs real GCP credentials
-make integration-test-no-docker
+make check              # Run formatting (rustfmt) + linting (clippy) — MUST pass before any PR
+make vector-db-benchmark # Build the main CLI binary (release mode)
+make build              # Build all binaries (release mode)
+make test               # Run unit tests (no Docker needed)
+make integration-test   # Run integration tests (starts redis:8.8.0 Docker on port 6399)
+make v0-check           # Compare Rust vs Python v0 (precision, QPS, latency) — starts Docker
+make fmt                # Auto-format code
+make clean              # Clean build artifacts
 ```
 
 ## Workflow Rules
 
-1. **Run `make agent-check` after any code change.** Not `make check` alone.
-2. **Run the matching `make integration-test-<engine>`** after touching an
-   engine. Changing shared code under `engine/` (e.g. `redis_utils.rs`,
-   `filter_guard.rs`, `index_naming.rs`) affects several engines — run each.
-3. **Put logic in `src/` (the library), not in `src/bin/`.** The library is
-   unit-tested; the binaries are meant to be I/O only. The one regression in the
-   MS MARCO work was offset-selection logic that ended up in a binary and so had
-   no test to mutate.
-4. **Mutate your guard, not just your code.** Break the thing the guard is named
-   after and confirm the suite goes red. A guard that passes either way is
-   decoration — this is the repo's most common review finding.
-5. **Never bypass `make` targets** for build/test/check.
+1. **Always run `make check` after code changes** — formatting and clippy must pass
+2. **Always run `make vector-db-benchmark`** to verify the binary builds
+3. **Run `make test` after any change to readers, config, or dataset code**
+4. **Run `make integration-test` after changes to engine code** (redis, vectorsets)
+5. **Never bypass `make` targets** — use them for all build/test/check operations
 
 ## Project Structure
 
 ```
 src/
-  lib.rs              # Library root — put LOGIC here, it is what gets unit-tested
-  readers/            # hdf5, jsonl, npy, compound(tar), sparse, multivector, metadata
-  msmarco.rs          # MS MARCO corpus prep: sampling, oracle, NPY writers (unit-tested)
-  synthetic.rs        # Generators for the synthetic-* fixtures
-  query_filter.rs     # The ONE door from a dataset's `conditions` JSON to a filter (#219)
-  metrics.rs          # recall / precision / MRR / NDCG — see the metric-naming note below
-  start_gate.rs       # Worker barrier for parallel search
-  config.rs, redis_client.rs, parsers.rs
+  lib.rs                          # Library: readers, config, redis_client
+  readers/
+    mod.rs                        # Reader exports + unit tests
+    hdf5_reader.rs                # HDF5 format (.hdf5, .h5)
+    jsonl_reader.rs               # JSONL format (vectors.jsonl, queries.jsonl, neighbours.jsonl)
+    npy_reader.rs                 # NPY format (vectors.npy)
+    compound_reader.rs            # Compound/TAR format (vectors.npy + payloads.jsonl + tests.jsonl)
+    metadata.rs                   # Metadata types (MetadataItem, MetadataValue)
+  config.rs                       # RedisConfig from environment
+  redis_client.rs                 # Redis connection management
   bin/
     vector_db_benchmark/
-      main.rs cli.rs config.rs dataset.rs download.rs experiment.rs ground_truth.rs
-      engine/         # 15 engines + shared: mod.rs redis_utils.rs filter_guard.rs
-                      #   index_naming.rs geo.rs
-    generate_dataset.rs   # -> `generate-dataset`, writes the synthetic-* fixtures
-    prepare_msmarco.rs    # -> `prepare-msmarco`, builds/verifies MS MARCO corpora
-tests/                # integration_<engine>.rs, plus harness_invariants +
-                      #   overhead_invariants (both run in CI, no Docker)
-datasets/datasets.json        # Dataset registry
-experiments/configurations/   # Engine configs (HNSW params, search params)
+      main.rs                     # CLI entry point
+      cli.rs                      # Clap argument parsing
+      config.rs                   # Dataset/engine config loading from JSON
+      dataset.rs                  # Dataset wrapper (path resolution, reading, auto-download)
+      download.rs                 # HTTP download + tgz extraction
+      experiment.rs               # Experiment runner (upload + search loop)
+      engine/
+        mod.rs                    # Engine trait + SearchResults
+        redis.rs                  # Redis/RediSearch engine (FT.CREATE, HSET, FT.SEARCH)
+        valkey.rs                 # Valkey Search engine (RESP, uses redis crate)
+        vectorsets.rs             # VectorSets engine (VADD, VSIM)
+        redis_utils.rs            # Shared utils: commandstats validation
+tests/
+  integration_redis.rs            # Integration tests (requires redis:8.8.0 on port 6399)
+datasets/
+  datasets.json                   # Dataset registry (names, paths, download links)
+experiments/
+  configurations/*.json           # Engine configurations (HNSW params, search params)
 ```
 
 ## Dataset Formats
@@ -131,45 +94,6 @@ auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
   an already-prepared dataset.
 - `--discover-crc32` re-derives the sampling thresholds (26.9 GB metadata scan).
 
-## Traps that have actually cost time here
-
-Each of these produced a real incident, and none of them look wrong while you are
-doing them.
-
-- **A config key that is parsed and then never applied.** The run completes and
-  the result JSON names a tuning knob it did not use. Recall-based tests cannot
-  catch this — the numbers stay plausible. After adding a knob, assert the SERVER
-  reports it (`FT.INFO`, `indexes/describe`, …), not that the code read it.
-- **A guard written one dimension narrower than the bug it names**, so it passes
-  either way and its name convinces everyone the case is covered. Always mutate
-  the guard.
-- **Ground truth that is subtly for a different corpus.** Row counts match, ids
-  are in range, recall comes out "reasonable" and is meaningless. Ground truth
-  must be derived from, or cross-checked against, the exact bytes uploaded.
-- **`top` derived from the ground-truth width.** A search config without `top`
-  takes it from the dataset's neighbour count. On a 1000-wide dataset that runs
-  every point at k=1000, and HNSW raises effective breadth to at least k — so an
-  `ef` sweep publishes one measurement under several config names. Set `top`.
-- **Two agents on one branch or worktree** silently clobber each other's commits.
-  One nearly reverted an already-merged PR. Verify the SHA you push is the SHA
-  you gated, and check the tree contents, not just a green build.
-- **`--skip-upload` against a partially-loaded server** scores recall over a
-  fraction of the corpus without erroring. The completeness gate exists for this.
-
-## Datasets: what is generated vs downloaded
-
-Most entries in `datasets/datasets.json` auto-download from their `link`. Two
-families do not ship that way by default:
-
-- `synthetic-*` — `cargo run --release --bin generate-dataset`. Small,
-  fixed-seed, exist to exercise sparse / hybrid / multivector / filter code paths.
-- `msmarco-cohere-1024-*` — see the MS MARCO section below.
-
-A dataset whose `path` names its own size (`…/1M`) must declare a matching
-`vector_count`; `config.rs` enforces this, because a mismatch once made a sweep
-score recall over 0.01% of a corpus. A deliberate subset gets a path that does
-not claim a size it does not have.
-
 ## Key Patterns
 
 - **Parallel upload/search**: `thread::scope` + `AtomicUsize` work-stealing across batches
@@ -185,8 +109,7 @@ not claim a size it does not have.
 
 ## Migration from Python (v0/)
 
-The `v0/` directory contains the original Python implementation. The Rust port
-now covers more engines than `v0/` did; the table below is the mapping.
+The `v0/` directory contains the original Python implementation. The Rust version is a partial migration — only Redis (RediSearch) and Redis (VectorSets) engines are ported.
 
 ### Engine coverage
 
@@ -203,10 +126,6 @@ now covers more engines than `v0/` did; the table below is the mapping.
 | MongoDB | — | `mongodb` | `mongodb` 3 (sync) |
 | Valkey | — | `valkey` | `redis` 0.27 \* |
 | Turbopuffer | — | `turbopuffer` | `turbopuffer-client` 0.0.4 |
-| Dragonfly | — | `dragonfly` | `redis` 0.27 (RESP) |
-| KiviDB | — | `kividb` | `redis` 0.27 (RESP) |
-| Chroma | — | `chroma` | `reqwest` (REST v2) |
-| Vertex AI | — | `vertex` | `tonic`/`prost` (gRPC) + `reqwest` — cloud-only |
 
 \* Valkey GLIDE has no Rust crate ([valkey-io/valkey-glide#828](https://github.com/valkey-io/valkey-glide/issues/828), closed NOT_PLANNED). GLIDE maintainers recommend `redis-rs` for Rust.
 
