@@ -1410,6 +1410,120 @@
     "description": "1M-point variant of msmarco-sparse-100K, sharing the identical 6980-query set. Same layout (data.csr + queries.csr + results.gt), dot/MIPS scoring. Qdrant is the only engine with a sparse path. Same 'msmacro' link spelling as the 100K entry — the real object name, not a typo to fix. Because both sizes ship the SAME 6980 queries, a results.gt from the wrong size passes every row-count check; the reader guards this by rejecting ground-truth ids >= vector_count."
   },
   {
+    "name": "msmarco-cohere-1024-100K-cosine",
+    "vector_size": 1024,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "msmarco-cohere-1024/100K",
+    "link": "https://s3.amazonaws.com/benchmarks.redislabs/vecsim/msmarco-cohere-1024/msmarco-cohere-1024-100K-cosine.tgz",
+    "schema": {
+      "docid": "keyword",
+      "url": "keyword",
+      "title": "text",
+      "headings": "text",
+      "segment": "text",
+      "start_char": "int",
+      "end_char": "int"
+    },
+    "vector_count": 100000,
+    "description": "MS MARCO v2.1 (TREC-RAG 2024) passages embedded with Cohere embed-english-v3.0, carrying the REAL document metadata (docid/url/title/headings/segment text/start_char/end_char) alongside the 1024-dim vectors — the only text-retrieval corpus we ship where filtered and full-text search run over genuine documents rather than synthetic payloads. Compound layout (vectors.npy + payloads.jsonl + tests.jsonl). Auto-downloads from the prepared tarball in S3 (288 MiB); the upstream corpus is a 60-shard Hugging Face dataset (CohereLabs/msmarco-v2.1-embed-english-v3) with no tarball of its own, so that artifact was built with `cargo run --release --bin prepare-msmarco -- --dataset msmarco-cohere-1024-100K-cosine` and published. Rebuild it yourself with that same command to re-derive rather than trust it. The corpus is the first 100,000 passages of the global order and the 1677 TREC-DL 2021-2023 queries carry ground truth BRUTE-FORCED over that prefix to a depth of 1000 — the shipped top1k_offsets rank the full 113.5M corpus and are neither complete nor correctly ordered once restricted to a prefix. Preparation cross-checks every brute-forced head position against those shipped hits and aborts on disagreement, and on coverage below a derived floor; see PREPARED.json in the dataset directory for the numbers. NOTE the ground truth is 1000 wide, matching the upstream top1k depth, so recall@k is answerable for any k up to 1000 — but a search config that does not set `top` explicitly derives it from that width and will therefore search with top=1000. Set `top` for a conventional recall@10/@100 run. ~0.6 GB on disk; prepares in well under a minute. Milvus CAN ingest this size (its VarChar ceiling is 65535 bytes and this prefix's longest value is 28581), unlike the 1M/10M variants."
+  },
+  {
+    "name": "msmarco-cohere-1024-1M-cosine",
+    "vector_size": 1024,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "msmarco-cohere-1024/1M",
+    "link": "https://s3.amazonaws.com/benchmarks.redislabs/vecsim/msmarco-cohere-1024/msmarco-cohere-1024-1M-cosine.tgz",
+    "schema": {
+      "docid": "keyword",
+      "url": "keyword",
+      "title": "text",
+      "headings": "text",
+      "segment": "text",
+      "start_char": "int",
+      "end_char": "int"
+    },
+    "vector_count": 1000000,
+    "description": "MS MARCO v2.1 (TREC-RAG 2024) passages embedded with Cohere embed-english-v3.0, carrying the REAL document metadata (docid/url/title/headings/segment text/start_char/end_char) alongside the 1024-dim vectors — the only text-retrieval corpus we ship where filtered and full-text search run over genuine documents rather than synthetic payloads. Compound layout (vectors.npy + payloads.jsonl + tests.jsonl). Auto-downloads from the prepared tarball in S3 (2.51 GiB); the upstream corpus is a 60-shard Hugging Face dataset (CohereLabs/msmarco-v2.1-embed-english-v3) with no tarball of its own, so that artifact was built with `cargo run --release --bin prepare-msmarco -- --dataset msmarco-cohere-1024-1M-cosine` and published. Rebuild it yourself with that same command if you want to re-derive rather than trust it — the result is byte-identical (verified: the same SHA-256 for vectors.npy, payloads.jsonl and tests.jsonl from two machines with different core counts). The corpus is the first 1,000,000 passages of the global order and the 1677 TREC-DL 2021-2023 queries carry ground truth BRUTE-FORCED over that prefix to a depth of 1000 — the shipped top1k_offsets rank the full 113.5M corpus and are neither complete nor correctly ordered once restricted to a prefix. Preparation cross-checks every brute-forced head position against those shipped hits and aborts on disagreement, and on coverage below a derived floor; see PREPARED.json in the dataset directory for the numbers. NOTE the ground truth is 1000 wide, matching the upstream top1k depth, so recall@k is answerable for any k up to 1000 — but a search config that does not set `top` explicitly derives it from that width and will therefore search with top=1000. Set `top` for a conventional recall@10/@100 run. ~5.5 GB on disk. Reading it costs ~8 GB RAM (the NPY reader materialises the corpus twice). MILVUS CANNOT INGEST THIS SIZE: 40 of the first 1M passages carry a `headings` value above 65535 bytes (largest 185752), which is Milvus' own hard ceiling for VarChar — no setting on our side admits them, so Milvus will reject those inserts. Every other engine takes the corpus unchanged. Preparation warns and records the detail under `engine_cap_violations` in PREPARED.json."
+  },
+  {
+    "name": "msmarco-cohere-1024-10M-cosine",
+    "vector_size": 1024,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "msmarco-cohere-1024/10M",
+    "link": "https://s3.amazonaws.com/benchmarks.redislabs/vecsim/msmarco-cohere-1024/msmarco-cohere-1024-10M-cosine.tgz",
+    "schema": {
+      "docid": "keyword",
+      "url": "keyword",
+      "title": "text",
+      "headings": "text",
+      "segment": "text",
+      "start_char": "int",
+      "end_char": "int"
+    },
+    "vector_count": 10000000,
+    "description": "MS MARCO v2.1 (TREC-RAG 2024) passages embedded with Cohere embed-english-v3.0, carrying the REAL document metadata (docid/url/title/headings/segment text/start_char/end_char) alongside the 1024-dim vectors — the only text-retrieval corpus we ship where filtered and full-text search run over genuine documents rather than synthetic payloads. Compound layout (vectors.npy + payloads.jsonl + tests.jsonl). Auto-downloads from the prepared tarball in S3 (24.7 GiB); the upstream corpus is a 60-shard Hugging Face dataset (CohereLabs/msmarco-v2.1-embed-english-v3) with no tarball of its own, so that artifact was built with `cargo run --release --bin prepare-msmarco -- --dataset msmarco-cohere-1024-10M-cosine` and published. This is the only variant that spans MULTIPLE upstream shards (6 of them, 488,132 rows taken from shard 5), so it is the one that exercises the cross-shard offset arithmetic; its cross-check covered 1675 queries / 197,898 ranking positions. The corpus is the first 10,000,000 passages of the global order and the 1677 TREC-DL 2021-2023 queries carry ground truth BRUTE-FORCED over that prefix to a depth of 1000 — the shipped top1k_offsets rank the full 113.5M corpus and are neither complete nor correctly ordered once restricted to a prefix. Preparation cross-checks every brute-forced head position against those shipped hits and aborts on disagreement, and on coverage below a derived floor; see PREPARED.json in the dataset directory for the numbers. NOTE the ground truth is 1000 wide, matching the upstream top1k depth, so recall@k is answerable for any k up to 1000 — but a search config that does not set `top` explicitly derives it from that width and will therefore search with top=1000. Set `top` for a conventional recall@10/@100 run. ~55 GB on disk, and the in-memory NPY reader peaks at a MEASURED 80.5 GB RSS to load it (/usr/bin/time -v on a real run) — that is ~2x the vector bytes, because read_npy_vectors holds the Array2 and the Vec<Vec<f32>> it is converting into simultaneously; the 16 GB of payloads are read after that copy is dropped, so they do not add to the high-water mark. Redis sits on top of that. A big-machine dataset, registered for scale runs rather than everyday use. MILVUS CANNOT INGEST THIS SIZE: 40 of the first 1M passages carry a `headings` value above 65535 bytes (largest 185752), which is Milvus' own hard ceiling for VarChar — no setting on our side admits them, so Milvus will reject those inserts. Every other engine takes the corpus unchanged. Preparation warns and records the detail under `engine_cap_violations` in PREPARED.json."
+  },
+  {
+    "name": "msmarco-cohere-1024-100K-crc32-cosine",
+    "vector_size": 1024,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "msmarco-cohere-1024/crc32-t886",
+    "link": "https://s3.amazonaws.com/benchmarks.redislabs/vecsim/msmarco-cohere-1024/msmarco-cohere-1024-100K-crc32-cosine.tgz",
+    "schema": {
+      "docid": "keyword",
+      "url": "keyword",
+      "title": "text",
+      "headings": "text",
+      "segment": "text",
+      "start_char": "int",
+      "end_char": "int"
+    },
+    "vector_count": 99964,
+    "description": "UNIFORMLY SAMPLED twin of msmarco-cohere-1024-100K-cosine: same corpus (MS MARCO v2.1 / TREC-RAG 2024 passages, Cohere embed-english-v3.0, 1024-dim cosine, same metadata fields), but the passages are chosen by `zlib.crc32(docid) % 1000000 < 886` over ALL 113,520,750 passages instead of taking the first N. That is the same selection FUNCTION the Redis Enterprise MS MARCO suite samples with (it uses `% 100`), so both are uniform samples of the same corpus drawn with the same hash — but NOT the same documents: 100 divides 1,000,000 and buckets 0..885 span every residue mod 100, so our 886/1e6 sample and their 1/100 sample overlap in only ~1% of our passages, and neither nests in the other. The nesting claim applies within this family (886 < 8805 < 88075), not across the two benchmarks. vector_count is the REALIZED count of that threshold (99,964), measured by `prepare-msmarco --discover-crc32` over every docid at the pinned upstream revision — a hash threshold cannot be made to land on a round number, so the round number is only in the name. Thresholds nest (886 < 8805 < 88075), so each sampled variant is a strict subset of the larger ones. WHY IT EXISTS: the corpus is docid-ordered, which tracks URL, so the prefix variants are alphabetically bounded — the 100K prefix spans `0-60.reviews` to `acqnotes.com` and `url` contains \"nih\" zero times in it. That does NOT distort the vector geometry (measured: a 20k block at the head of shard 00 has mean nearest-neighbour cosine 0.8825 and mean random-pair cosine 0.1442, against 0.8759 / 0.1499 for a sample spread over all 60 shards), so the prefix variants remain correct for pure-KNN recall. It does distort the metadata distribution, which is what this variant fixes — use it for filter-selectivity or full-text work. COST: building it streams the entire corpus (259 GB: 232.5 GB of embeddings + 26.9 GB of gzipped metadata), because selection depends on every docid; there is no prefix of the input that contains the answer. Auto-downloads from the prepared tarball in S3 (322 MiB). Rebuild with `cargo run --release --bin prepare-msmarco -- --dataset msmarco-cohere-1024-100K-crc32-cosine` to re-derive rather than trust it — that costs a full 259 GB corpus scan (about 17 minutes on a 96-core host at 325 MB/s), because selection depends on every docid."
+  },
+  {
+    "name": "msmarco-cohere-1024-1M-crc32-cosine",
+    "vector_size": 1024,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "msmarco-cohere-1024/crc32-t8805",
+    "link": "https://s3.amazonaws.com/benchmarks.redislabs/vecsim/msmarco-cohere-1024/msmarco-cohere-1024-1M-crc32-cosine.tgz",
+    "schema": {
+      "docid": "keyword",
+      "url": "keyword",
+      "title": "text",
+      "headings": "text",
+      "segment": "text",
+      "start_char": "int",
+      "end_char": "int"
+    },
+    "vector_count": 1000044,
+    "description": "UNIFORMLY SAMPLED twin of msmarco-cohere-1024-1M-cosine: same corpus (MS MARCO v2.1 / TREC-RAG 2024 passages, Cohere embed-english-v3.0, 1024-dim cosine, same metadata fields), but the passages are chosen by `zlib.crc32(docid) % 1000000 < 8805` over ALL 113,520,750 passages instead of taking the first N. That is the same selection FUNCTION the Redis Enterprise MS MARCO suite samples with (it uses `% 100`), so both are uniform samples of the same corpus drawn with the same hash — but NOT the same documents: 100 divides 1,000,000 and buckets 0..885 span every residue mod 100, so our 886/1e6 sample and their 1/100 sample overlap in only ~1% of our passages, and neither nests in the other. The nesting claim applies within this family (886 < 8805 < 88075), not across the two benchmarks. vector_count is the REALIZED count of that threshold (1,000,044), measured by `prepare-msmarco --discover-crc32` over every docid at the pinned upstream revision — a hash threshold cannot be made to land on a round number, so the round number is only in the name. Thresholds nest (886 < 8805 < 88075), so each sampled variant is a strict subset of the larger ones. WHY IT EXISTS: the corpus is docid-ordered, which tracks URL, so the prefix variants are alphabetically bounded — the 100K prefix spans `0-60.reviews` to `acqnotes.com` and `url` contains \"nih\" zero times in it. That does NOT distort the vector geometry (measured: a 20k block at the head of shard 00 has mean nearest-neighbour cosine 0.8825 and mean random-pair cosine 0.1442, against 0.8759 / 0.1499 for a sample spread over all 60 shards), so the prefix variants remain correct for pure-KNN recall. It does distort the metadata distribution, which is what this variant fixes — use it for filter-selectivity or full-text work. COST: building it streams the entire corpus (259 GB: 232.5 GB of embeddings + 26.9 GB of gzipped metadata), because selection depends on every docid; there is no prefix of the input that contains the answer. Auto-downloads from the prepared tarball in S3 (2.8 GiB). Rebuild with `cargo run --release --bin prepare-msmarco -- --dataset msmarco-cohere-1024-1M-crc32-cosine` to re-derive rather than trust it — that costs a full 259 GB corpus scan (about 16 minutes on a 96-core host), because selection depends on every docid."
+  },
+  {
+    "name": "msmarco-cohere-1024-10M-crc32-cosine",
+    "vector_size": 1024,
+    "distance": "cosine",
+    "type": "tar",
+    "path": "msmarco-cohere-1024/crc32-t88075",
+    "link": "https://s3.amazonaws.com/benchmarks.redislabs/vecsim/msmarco-cohere-1024/msmarco-cohere-1024-10M-crc32-cosine.tgz",
+    "schema": {
+      "docid": "keyword",
+      "url": "keyword",
+      "title": "text",
+      "headings": "text",
+      "segment": "text",
+      "start_char": "int",
+      "end_char": "int"
+    },
+    "vector_count": 9999959,
+    "description": "UNIFORMLY SAMPLED twin of msmarco-cohere-1024-10M-cosine: same corpus (MS MARCO v2.1 / TREC-RAG 2024 passages, Cohere embed-english-v3.0, 1024-dim cosine, same metadata fields), but the passages are chosen by `zlib.crc32(docid) % 1000000 < 88075` over ALL 113,520,750 passages instead of taking the first N. That is the same selection FUNCTION the Redis Enterprise MS MARCO suite samples with (it uses `% 100`), so both are uniform samples of the same corpus drawn with the same hash — but NOT the same documents: 100 divides 1,000,000 and buckets 0..885 span every residue mod 100, so our 886/1e6 sample and their 1/100 sample overlap in only ~1% of our passages, and neither nests in the other. The nesting claim applies within this family (886 < 8805 < 88075), not across the two benchmarks. vector_count is the REALIZED count of that threshold (9,999,959), measured by `prepare-msmarco --discover-crc32` over every docid at the pinned upstream revision — a hash threshold cannot be made to land on a round number, so the round number is only in the name. Thresholds nest (886 < 8805 < 88075), so each sampled variant is a strict subset of the larger ones. WHY IT EXISTS: the corpus is docid-ordered, which tracks URL, so the prefix variants are alphabetically bounded — the 100K prefix spans `0-60.reviews` to `acqnotes.com` and `url` contains \"nih\" zero times in it. That does NOT distort the vector geometry (measured: a 20k block at the head of shard 00 has mean nearest-neighbour cosine 0.8825 and mean random-pair cosine 0.1442, against 0.8759 / 0.1499 for a sample spread over all 60 shards), so the prefix variants remain correct for pure-KNN recall. It does distort the metadata distribution, which is what this variant fixes — use it for filter-selectivity or full-text work. COST: building it streams the entire corpus (259 GB: 232.5 GB of embeddings + 26.9 GB of gzipped metadata), because selection depends on every docid; there is no prefix of the input that contains the answer. Auto-downloads from the prepared tarball in S3. Rebuild with `cargo run --release --bin prepare-msmarco -- --dataset msmarco-cohere-1024-10M-crc32-cosine` to re-derive rather than trust it — that costs a full 259 GB corpus scan (about 20 minutes on a 96-core host), because selection depends on every docid. Its cross-check reached ALL 1,677 queries across 147,422 ranking positions, the broadest oracle coverage of any variant."
+  },
+  {
     "name": "synthetic-sparse-300",
     "vector_size": 300,
     "vector_count": 150,

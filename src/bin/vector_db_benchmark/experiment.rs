@@ -1310,6 +1310,72 @@ fn run_single_experiment(
                 }
             }
         };
+    // A derived `top` wide enough to swallow the declared search breadth makes a
+    // sweep measure one point N times (#319 review). Every engine derives `top`
+    // from the ground-truth row width when a config omits it, and HNSW
+    // implementations raise the effective breadth to at least `k` because the
+    // result set has to hold `k` — so at width 1000 a declared breadth below
+    // 1000 never takes effect. Measured on the prepared MS MARCO 100K corpus
+    // with `top` derived: ef 64 / 128 / 512 all returned recall 0.9419, against
+    // 0.9514 / 0.9794 / 0.9911 once `top` was set. (Two runs of that sweep gave
+    // 45.1 / 42.8 / 43.2 and 45.1 / 45.7 / 45.5 QPS — the throughput is noise at
+    // this k; the identical RECALL is the load-bearing observation.)
+    // Identical recall to four decimals across an 8x range is a sweep publishing
+    // one measurement under several names.
+    //
+    // The knob is spelled differently per engine family: `ef` is a typed field
+    // (redis, valkey, qdrant's `ef`), while pgvector and qdrant read `hnsw_ef`
+    // and elasticsearch / vertex / mongodb read `num_candidates` — both of which
+    // live in the untyped `extra` catch-all and are invisible to a typed-field
+    // read. Covering only `ef` would leave those families flattening silently,
+    // which is the state this warning exists to name.
+    //
+    // Fires only when TWO OR MORE DISTINCT sub-width values are present. With a
+    // single one there is nothing to collide: `redis-single-node.json` carries
+    // two `ef: 64` entries per config that differ in `parallel`, and against a
+    // 100-wide dataset only 64 is sub-width, so "several names, one measurement"
+    // would be false there.
+    if let Some(gt) = ground_truth.as_ref() {
+        if let Some(width) = gt.first_row_len() {
+            let breadth = |p: &crate::config::SearchParams| -> Option<i64> {
+                p.search_params
+                    .as_ref()
+                    .and_then(|i| i.ef)
+                    .or_else(|| p.knob("hnsw_ef").and_then(|v| v.as_i64()))
+                    .or_else(|| p.knob("num_candidates").and_then(|v| v.as_i64()))
+                    .or(p.num_candidates)
+            };
+            let mut sub_width: Vec<i64> = engine
+                .search_params()
+                .iter()
+                .filter(|p| p.top.is_none())
+                .filter_map(breadth)
+                .filter(|b| (*b as usize) < width)
+                .collect();
+            sub_width.sort_unstable();
+            let configs = sub_width.len();
+            sub_width.dedup();
+            if sub_width.len() >= 2 {
+                eprintln!(
+                    "\tWARNING: this dataset's ground truth is {} wide, and {} search config(s) \
+                     do not set `top`, so they will run at k={}. HNSW raises the effective search \
+                     breadth to at least k, so the declared values [{}] are all below it and will \
+                     very likely produce the SAME recall — a sweep that publishes one measurement \
+                     under several names. Set `top` explicitly (see \
+                     experiments/configurations/redis-msmarco.json).",
+                    width,
+                    configs,
+                    width,
+                    sub_width
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
+
     // Configs that lost queries, collected so --fail-on-dropped-queries can fail
     // the run *after* every result file is written rather than instead of it.
     let mut dropped_query_failures: Vec<String> = Vec::new();

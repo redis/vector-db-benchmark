@@ -3932,6 +3932,7 @@ dependencies = [
  "bzip2",
  "chrono",
  "clap",
+ "crc32fast",
  "elasticsearch",
  "flate2",
  "glob",

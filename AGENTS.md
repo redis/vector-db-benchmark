@@ -49,6 +49,7 @@ make build               # Build all binaries (release)
 make test                # Unit tests only, debug profile (no Docker)
 make check               # fmt + clippy ONLY — see the warning above
 make fmt                 # Auto-format
+make prepare-msmarco     # Build an MS MARCO corpus (see the MS MARCO section)
 make v0-check            # Compare Rust vs Python v0 (precision, QPS, latency)
 make clean
 ```
@@ -86,6 +87,7 @@ src/
   lib.rs              # Library root — put LOGIC here, it is what gets unit-tested
   readers/            # hdf5, jsonl, npy, compound(tar), sparse, multivector, metadata
   synthetic.rs        # Generators for the synthetic-* fixtures
+  msmarco.rs          # MS MARCO corpus prep: sampling, oracle, NPY writers (unit-tested)
   query_filter.rs     # The ONE door from a dataset's `conditions` JSON to a filter (#219)
   metrics.rs          # recall / precision / MRR / NDCG — see the metric-naming note below
   start_gate.rs       # Worker barrier for parallel search
@@ -96,6 +98,7 @@ src/
       engine/         # 15 engines + shared: mod.rs redis_utils.rs filter_guard.rs
                       #   index_naming.rs geo.rs
     generate_dataset.rs   # -> `generate-dataset`, writes the synthetic-* fixtures
+    prepare_msmarco.rs    # -> `prepare-msmarco`, builds/verifies MS MARCO corpora
 tests/                # integration_<engine>.rs, plus harness_invariants +
                       #   overhead_invariants (both run in CI, no Docker)
 datasets/datasets.json        # Dataset registry
@@ -143,10 +146,30 @@ Entries with **no `link`** do not exist until a tool writes them:
 - `synthetic-*` — `cargo run --release --bin generate-dataset`. Small,
   fixed-seed, exist to exercise sparse / hybrid / multivector / filter code paths.
 
+The `msmarco-cohere-1024-*` entries all DO have links and auto-download; they are
+rebuilt rather than generated, and have their own section below.
+
 A dataset whose `path` names its own size (`…/1M`) must declare a matching
 `vector_count`; `config.rs` enforces this, because a mismatch once made a sweep
 score recall over 0.01% of a corpus. A deliberate subset gets a path that does
 not claim a size it does not have.
+
+## MS MARCO datasets
+
+`msmarco-cohere-1024-{100K,1M,10M}-cosine` and their `-crc32-` twins: MS MARCO
+v2.1 passages + Cohere embed-v3 vectors **and** real document metadata. All six
+auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
+
+- Logic lives in `src/msmarco.rs` (unit-tested); the binary is I/O only. That
+  convention is load-bearing — the one regression in this area was
+  offset-selection logic that ended up in the binary and so had no test.
+- Size is fixed by the dataset name, never a flag. The `-crc32-` variants declare
+  their REALIZED count (99,964 / 1,000,044 / 9,999,959), since a hash threshold
+  cannot land on a round number.
+- Ground truth is brute-forced per corpus and cross-checked against the upstream
+  global top-1k before anything is written; `--verify` re-runs that check against
+  an already-prepared dataset.
+- `--discover-crc32` re-derives the sampling thresholds (26.9 GB metadata scan).
 
 ## Key Patterns
 

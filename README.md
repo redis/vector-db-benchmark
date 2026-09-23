@@ -84,7 +84,7 @@ The filter path is **not** the shared RediSearch builder used by Redis/Valkey/Dr
 
 The first two are decidable from the dataset schema, so KiviDB rejects them in the **configure** phase — before the index is created and before the corpus is read — leaving no partial upload, no orphan result file and no populated keyspace behind.
 
-> **Which shipped datasets this excludes.** **3 of the 53** datasets in `datasets/datasets.json` cannot run on KiviDB at all and now abort instead of producing a result file: `random-geo-radius-100-angular-filters` and `random-geo-radius-2048-angular-filters` (geo), and `arxiv-titles-384-angular-filters` (multi-valued `labels` — the only shipped dataset that declares a `labels` field). Before this was fixed these three *did* run and published a recall near 0.0, which was visibly wrong; they now publish nothing at all, and no result file records the rejection, so `--plot` simply shows a gap for KiviDB on those datasets. If you are sweeping KiviDB across everything, either exclude the three from `--datasets` (`arxiv-titles-384-angular-no-filters` is the pure-KNN twin of the arxiv one) or pass `--exit-on-error false` so the rest of the sweep continues. Every other dataset — including all filtered ones — is unaffected.
+> **Which shipped datasets this excludes.** **3 of the 61** datasets in `datasets/datasets.json` cannot run on KiviDB at all and now abort instead of producing a result file: `random-geo-radius-100-angular-filters` and `random-geo-radius-2048-angular-filters` (geo), and `arxiv-titles-384-angular-filters` (multi-valued `labels` — the only shipped dataset that declares a `labels` field). Before this was fixed these three *did* run and published a recall near 0.0, which was visibly wrong; they now publish nothing at all, and no result file records the rejection, so `--plot` simply shows a gap for KiviDB on those datasets. If you are sweeping KiviDB across everything, either exclude the three from `--datasets` (`arxiv-titles-384-angular-no-filters` is the pure-KNN twin of the arxiv one) or pass `--exit-on-error false` so the rest of the sweep continues. Every other dataset — including all filtered ones — is unaffected.
 
 One real protocol difference worth knowing: KiviDB's `FT.INFO` does not expose RediSearch's `num_docs`/`percent_indexed` — it reports HNSW graph state directly instead (`hnsw_live_count`, `hnsw_compaction_in_progress`), because it builds each vector's HNSW entry synchronously inside the `HSET` that stores it (no async backfill phase exists to report progress on); `wait_for_indexing` polls those fields instead and returns immediately as a result. RESP2 only (no RESP3 opt-in). Set the host port with `KIVIDB_PORT` (default `6380` — KiviDB's own default listen port, **not** Redis's 6379).
 
@@ -704,6 +704,13 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | [DBpedia OpenAI-1M: Knowledge embeddings](https://www.dbpedia.org/)                                       |      1,536 |   1,000,000 |    10,000 |       100 | Cosine    |
 | [DBpedia OpenAI-100K: Knowledge embeddings](https://www.dbpedia.org/)                                     |      1,536 |     100,000 |     5,000 |        10 | Cosine    |
 | [LAION Small CLIP: Small CLIP embeddings](https://laion.ai/blog/laion-400-open-dataset/)                   |        512 |     100,000 |     1,000 |       100 | Cosine    |
+| **Text Retrieval with Real Document Metadata** (vectors **and** the source documents' fields — see [Preparing the MS MARCO corpus](#preparing-the-ms-marco-corpus-vectors--metadata)) |            |             |           |           |           |
+| [MS MARCO v2.1-100K: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |     100,000 |     1,677 |   1,000 ‡ | Cosine    |
+| [MS MARCO v2.1-1M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3)  |      1,024 |   1,000,000 |     1,677 |   1,000 ‡ | Cosine    |
+| [MS MARCO v2.1-10M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |  10,000,000 |     1,677 |   1,000 ‡ | Cosine    |
+| MS MARCO v2.1-100K **uniform** (crc32-sampled twin)                                                        |      1,024 |      99,964 |     1,677 |   1,000 ‡ | Cosine    |
+| MS MARCO v2.1-1M **uniform** (crc32-sampled twin)                                                          |      1,024 |   1,000,044 |     1,677 |   1,000 ‡ | Cosine    |
+| MS MARCO v2.1-10M **uniform** (crc32-sampled twin)                                                         |      1,024 |   9,999,959 |     1,677 |   1,000 ‡ | Cosine    |
 | **Sparse Vectors** (learned/lexical sparse embeddings — Qdrant is the only engine with a sparse path)        |            |             |           |           |           |
 | [MS MARCO Sparse-100K: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                |   *sparse* |     100,000 |     6,980 |        10 | Dot       |
 | [MS MARCO Sparse-1M: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                  |   *sparse* |   1,000,000 |     6,980 |        10 | Dot       |
@@ -737,6 +744,8 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | Random Match Keyword Small Vocab-256: Small vocabulary keyword matching (no filters)                       |        256 |   1,000,000 |    10,000 |       100 | Cosine    |
 | **Multi-Tenancy** (many tenants share one index; every query scoped to one tenant)                          |            |             |           |           |           |
 | Random-768-100-tenants: 100 tenants, per-tenant scoped queries (tenant field `a`)                          |        768 |   1,000,000 |       200 |        25 | Cosine    |
+
+‡ **The MS MARCO entries are the only ones with 1000-wide ground truth**, matching the depth of the upstream `top1k` lists they are built from, so recall@k is answerable for any k up to 1000 without re-preparing. The catch is that a search config which does not set `top` **derives it from the ground-truth width** — on these datasets that means it will search with `top: 1000`, not the 100 you may be used to. Set `top` explicitly for a conventional recall@10 / recall@100 run.
 
 † **The "Neighbors" column is the ground-truth width, and it bounds what recall can mean.** H&M-2048 (with filters) is not uniform: its 10,000 queries carry between **1 and 25** true neighbours (mean 23.4; 931 queries have fewer than 25), because a filtered query only has as many true neighbours as the filter admits. Our `mean_recall` divides by the neighbours that actually exist, so a 1-neighbour query can still score 1.0; upstream `qdrant/vector-db-benchmark` always divides by `top`, so the same query caps at `1/top`. A run's `metrics_schema.ground_truth` block reports the measured profile and the resulting ceiling — at `top: 100` H&M's ceiling is 0.233, so a `calibration_precision` above that is unreachable by construction. Configs that do not set `top` derive it from the ground-truth row width (25 here, 10 for the no-filters variant), which is why this matters mostly when `top` is set explicitly.
 
@@ -779,6 +788,244 @@ ladder** (1% / 2% / 5% / 10% / 25% / 50% / 90%), each row annotated with its
 `selectivity` / `n_matching`, so recall/latency can be reported as a function of
 filter selectivity. The generated files are git-ignored — regenerate them on any
 checkout with the command above.
+
+### Preparing the MS MARCO corpus (vectors + metadata)
+
+`msmarco-cohere-1024-{100K,1M,10M}-cosine` is the one corpus here that ships
+**real document metadata next to the vectors**: MS MARCO v2.1 / TREC-RAG 2024
+passages embedded with Cohere `embed-english-v3.0` (1024-dim, cosine), each
+carrying its source document's `docid`, `url`, `title`, `headings`, the passage
+`segment` text, and `start_char` / `end_char`. Every other text-embedding dataset
+in the table is vectors only, so this is what lets filtered and full-text search
+be measured over genuine documents instead of synthetic payloads.
+
+All six variants **auto-download** like any other dataset, from prepared
+tarballs in the usual `benchmarks.redislabs` bucket (288 MiB / 2.5 GiB / 24.7 GiB
+for the prefix trio, 322 MiB / 2.8 GiB / 26.8 GiB for the uniform one). You
+only need the preparer below to build a variant that is not published yet, or to
+re-derive one yourself instead of trusting the artifact — the result is
+byte-identical, which is verified rather than asserted: the same SHA-256 for
+`vectors.npy`, `payloads.jsonl` and `tests.jsonl` from a 16-core workstation and
+a 96-core metal host, and again after a full S3 round trip. That reproducibility
+is what the 8-lane dot product and the id tie-break in `TopK` are for — ground
+truth that does not depend on how many threads happened to run.
+
+Upstream ([`CohereLabs/msmarco-v2.1-embed-english-v3`][msmarco-hf]) is a 60-shard
+Hugging Face dataset of 113,520,750 passages with no tarball of its own, so the
+published artifacts were built with:
+
+```bash
+make prepare-msmarco                                        # the 100K variant
+make prepare-msmarco MSMARCO_DATASET=msmarco-cohere-1024-1M-cosine
+# or directly, e.g. to write somewhere other than ./datasets:
+cargo run --release --bin prepare-msmarco -- \
+  --dataset msmarco-cohere-1024-1M-cosine --out-dir /data/ds
+```
+
+[msmarco-hf]: https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3
+
+It writes the compound (`type: "tar"`) layout — `vectors.npy` (float32, converted
+from the upstream float16), `payloads.jsonl`, `tests.jsonl` — plus a
+`PREPARED.json` recording provenance, the shards consumed, the longest value per
+payload field, and the verification numbers below. Only the prefix each variant
+needs is fetched, so the 100K build is a ~200 MB ranged read and finishes in well
+under a minute; 1M is ~5.5 GB on disk (and ~8 GB RAM to *read* at benchmark time,
+since the NPY reader materialises the corpus twice), 10M is ~55 GB on disk and
+needs a ~80 GB-RAM machine to run.
+
+**There is deliberately no `--limit`.** The size is a property of the dataset
+name, so two runs that both report `msmarco-cohere-1024-1M-cosine` uploaded the
+same corpus. Each variant is the first N passages of the upstream global order.
+
+**Ground truth is brute-forced, not borrowed.** Upstream ships a top-1000 per
+query, but that ranks the *whole* 113.5M corpus: restricted to a 1M prefix it
+retains only ~9 hits per query and is plain wrong past them, because a passage
+ranked 1001st globally can sit in the prefix and outrank everything that
+survived truncation. So the 1677 TREC-DL 2021-2023 queries get a genuine
+brute-force **top-1000** over the prepared vectors, read back from the file that
+was just written — the same depth as the upstream lists, so recall@k is
+answerable for any k up to 1000.
+
+Two consequences of that depth. `tests.jsonl` is ~84 MB rather than ~39 MB. And
+because a config without an explicit `top` derives it from the ground-truth row
+width, these datasets will otherwise be searched at `top: 1000`; set `top` for a
+conventional recall@10 / recall@100 run.
+
+The shipped list is then used as an **independent oracle**, which is the part
+worth trusting the numbers over. Every in-prefix global-top-1k hit necessarily
+outranks every in-prefix passage that is *not* in the global top-1k, so our
+ranking's head must equal those hits, id for id and cosine for cosine, and the
+payload at each of those offsets must name the same passage the upstream list
+names. That single assertion covers the brute force, the npy-row-to-jsonl-line
+alignment (a one-row slip would give every passage its neighbour's metadata, and
+no recall number would show it), and the cross-shard offset arithmetic. It is not
+optional — a disagreement aborts preparation. On the 100K build it compares 2,134
+ranking positions across 562 queries and agrees to within 4.6e-5 cosine.
+
+The coverage is a **floor, not just a report**: preparation aborts if the
+cross-check reaches fewer queries or positions than a prefix of that size should
+yield (a quarter of what a uniform distribution would retain), so a changed
+upstream export or a mis-mapped offset fails loudly instead of leaving a
+reassuring number with nothing behind it. Every output is written to `.part` and
+renamed only once that passes, so a directory either holds a complete,
+cross-checked corpus or is untouched.
+
+### Two sampling families: prefix vs uniform
+
+The same corpus is registered twice, and the difference matters only for
+metadata:
+
+| | `msmarco-cohere-1024-{100K,1M,10M}-cosine` | `…-{100K,1M,10M}-crc32-cosine` |
+| --- | --- | --- |
+| Selection | first N passages of the corpus order | `zlib.crc32(docid) % 1000000 < threshold` |
+| Thresholds | — | 886 / 8805 / 88075 (they nest) |
+| Realized size | exactly 100K / 1M / 10M | 99,964 / 1,000,044 / 9,999,959 |
+| Build cost | only the head of the corpus | the **whole** corpus, 259 GB |
+| Metadata | alphabetically bounded | uniform |
+| Vector geometry | representative (measured, below) | uniform |
+
+**Why the prefix variants are still fine for KNN.** The corpus is `docid`-ordered,
+which tracks URL, so a prefix is an alphabetically bounded slice — the 100K
+prefix spans `0-60.reviews` to `acqnotes.com`, and `url` contains "nih" zero
+times in it. That sounds alarming, so it was measured rather than assumed
+(20,000-row blocks, cosine on unit vectors):
+
+| block | mean NN cosine | mean random-pair cosine |
+| --- | ---: | ---: |
+| shard 00 head (what the prefix variants take) | 0.8825 | 0.1442 |
+| shard 29 middle | 0.9117 | 0.3090 |
+| shard 59 head | 0.9316 | 0.3699 |
+| spread across all 60 shards | 0.8759 | 0.1499 |
+
+The prefix is **indistinguishable from a corpus-wide spread sample**; the later
+shards are the outliers, being markedly more topically concentrated. So the
+prefix variants are not geometrically skewed and their recall numbers stand.
+What is skewed is the payload distribution — which is exactly what the `-crc32-`
+twins fix, and why they exist rather than replacing the prefix variants.
+
+**Oracle coverage, measured on all six built corpora.** The cross-check can only
+speak for a query that retains at least one of its shipped global top-1k hits,
+so how many queries it reaches is a property worth comparing:
+
+| corpus | queries checked | ranking positions | max cosine delta |
+| --- | ---: | ---: | ---: |
+| prefix 100K | 562 / 1677 | 2,134 | 4.63e-5 |
+| prefix 1M | 1,505 / 1677 | 17,523 | 4.85e-5 |
+| prefix 10M | 1,675 / 1677 | 197,898 | 5.96e-5 |
+| uniform 100K | **1,005** / 1677 | 1,494 | 3.74e-5 |
+| uniform 1M | **1,676** / 1677 | 14,596 | 4.18e-5 |
+| uniform 10M | **1,677** / 1677 | 147,422 | 5.14e-5 |
+
+At equal size the uniform variants reach far more queries — 1,005 against 562 at
+100K — because their hits are spread across the corpus rather than concentrated
+in one stretch of the alphabet. They compare fewer positions in total but across
+more queries, which is the better trade for an oracle: the uniform 10M is the
+only variant where **no query goes unchecked**.
+
+**What the uniform sample actually buys**, measured on the built corpora:
+
+| | uniform 100K | prefix 100K | prefix 10M |
+| --- | ---: | ---: | ---: |
+| `url` contains "nih" | 173 | **0** | 10,249 |
+| `url` contains "wikipedia" | 6,401 | **0** | 150,403 |
+| distinct leading host characters | **35** (0-9, a-z) | 11 (0-9, a) | 34 (0-9, a-w) |
+| first / last URL | `1000naturalremedy.com` / `zyto.com` | `0-60.reviews` / `acqnotes.com` | `0-60.reviews` / `www.crf-usa.org` |
+
+A **100K uniform sample spans the whole alphabet; even the 10M prefix stops at
+"w"**. If you are measuring filter selectivity, full-text behaviour, or anything
+else that reads the payload distribution, that is the difference between a
+representative corpus and a slice of the As.
+
+`zlib.crc32(docid) % N` is also the selection the Redis Enterprise MS MARCO
+suite uses, at `% 100`. Same corpus, same hash, both uniform — but **not the
+same documents**: 100 divides 1,000,000 and buckets 0..885 span every residue
+mod 100, so our 886/1e6 sample and their 1/100 sample overlap in only ~1% of our
+passages, and neither nests in the other. What that buys is a shared, auditable
+selection rule, not a shared document set. (The nesting claim applies *within*
+this family: 886 < 8805 < 88075.) Our implementation is pinned bit-identical to
+`zlib.crc32` by tests using vectors taken from zlib itself.
+
+**The round number is only in the name.** A hash threshold cannot be made to
+land on exactly 1,000,000, so `vector_count` carries the realized count, measured
+once by a scan over all 113,520,750 docids:
+
+```bash
+cargo run --release --bin prepare-msmarco -- --discover-crc32
+```
+
+That scan reads metadata only — 26.9 GB of gzipped JSONL, never the 232.5 GB of
+embeddings — with 16 shards in flight: 128 s on an i7i.metal-24xl, against ~12 MB/s
+for a single stream. One pass sizes every possible threshold. Preparation hard-errors if the
+realized count ever stops matching the registry, which is how a changed upstream
+export would announce itself.
+
+**Engine support is not uniform above 100K.** MS MARCO carries real web-page
+`headings`, and a handful of pages have pathological ones: 40 of the first 1M
+passages exceed **65,535 bytes** in that field (largest 185,752 — a single
+document's table of contents). That number is Milvus' own hard ceiling for a
+`VarChar` column, not a setting we choose, so **Milvus can ingest the 100K
+variant but not the 1M or 10M ones**; it rejects those inserts. Every other
+engine takes the corpus unchanged. Preparation warns about this and records it
+under `engine_cap_violations` in `PREPARED.json`, so you know before the upload
+rather than partway through it.
+
+**Measured on the 1M variant** (Redis 8.8.0, `redis-msmarco.json`: M=32,
+EF_CONSTRUCTION=256, 8 search threads, on an i7i.metal-24xl — 96 cores):
+
+| top | EF | QPS | Recall | MRR | NDCG | p50 | p95 |
+| --: | --: | --: | --: | --: | --: | --: | --: |
+| 10 | 64 | 6081 | 0.9239 | 0.9922 | 0.9449 | 1.29 ms | 1.84 ms |
+| 10 | 128 | 4728 | 0.9572 | 0.9970 | 0.9696 | 1.67 ms | 2.21 ms |
+| 100 | 256 | 3080 | 0.9570 | 1.0000 | 0.9683 | — | — |
+
+Upload was 192.5 s for 1M passages (5,194 docs/s) including the 1.5 GB of
+payload text. `experiments/configurations/redis-msmarco.json` ships that
+configuration; note it sets `top` explicitly, for the reason in the previous
+paragraph.
+
+**And at 10M**, same configuration and host:
+
+| top | EF | QPS | Recall | MRR | NDCG |
+| --: | --: | --: | --: | --: | --: |
+| 10 | 64 | 5507 | 0.9073 | 0.9672 | 0.9245 |
+| 10 | 128 | 4242 | 0.9364 | 0.9773 | 0.9484 |
+| 10 | 256 | 2797 | 0.9437 | 0.9905 | 0.9556 |
+
+Upload was 3,399 s (2,942 docs/s — roughly half the 1M rate, as HNSW insert cost
+grows with graph size), and the whole run took 58.5 minutes.
+
+**Peak memory, measured rather than estimated** (`/usr/bin/time -v` on the 10M
+run): **80.5 GB** maximum resident set for the benchmark process, with Redis
+itself in a separate container on top. The reading worth keeping is *why*: the
+peak is the vector read alone, where `read_npy_vectors` holds the `Array2` and
+the `Vec<Vec<f32>>` it is being converted into at the same time — 2 x 40.96 GB.
+The payloads (17 GB on disk at 10M) are read *after* that `Array2` has been
+dropped, so the two peaks do not coincide and the payload side does not add to
+the high-water mark. Budget ~2x the vector bytes, plus Redis.
+
+**Sizing note for the Redis family.** Redis declares a `text` schema field as
+`TEXT SORTABLE`, which keeps a copy of the value in the sorting table. This is
+the first corpus where that is expensive, because it is the first with real prose
+in it. Measured on the prepared 100K corpus (identical index, `SORTABLE` the only
+difference):
+
+| | shipped index (`TEXT SORTABLE`) | same index without `SORTABLE` |
+| --- | ---: | ---: |
+| `sortable_values_size_mb` | 170.4 | 0 |
+| `inverted_sz_mb` | 171.3 | 174.1 |
+| `vector_index_sz_mb` | 427.7 | 427.7 |
+
+So ~1.7 KB/document of purely additive overhead — about 40% of the vector index
+on top of it, and it scales linearly: roughly 1.7 GB at 1M and 17 GB at 10M,
+before the vector index's own 4.3 GB / 43 GB. Valkey maps `text` to a TAG and
+Dragonfly to a plain `TEXT`, so the three diverge on identical data; budget for
+this when sizing a Redis run on the larger variants.
+
+Queries carry no `conditions`: these are pure-KNN TREC topics, and inventing a
+filter for them would make the ground truth a fiction. The metadata is indexed
+all the same, so it is there for full-text and filter work — on Redis the prepared
+100K corpus indexes `docid`/`url` as TAG, `title`/`headings`/`segment` as TEXT and
+`start_char`/`end_char` as NUMERIC, with zero indexing failures.
 
 ### Filter features
 
