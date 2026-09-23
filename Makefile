@@ -213,6 +213,35 @@ integration-test-valkey:
 	docker compose -f tests/docker-compose.test.yml down ; \
 	exit $$EXIT_CODE
 
+.PHONY: integration-test-dragonfly
+integration-test-dragonfly:
+	@echo "=== Starting Dragonfly for integration tests ==="
+	docker compose -f tests/docker-compose.test.yml up -d dragonfly --wait
+	DRAGONFLY_PORT=6385 cargo test --test integration_dragonfly --release -- --test-threads=1; \
+	  status=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$status
+
+.PHONY: integration-test-kividb
+integration-test-kividb:
+	@echo "=== Starting KiviDB for integration tests ==="
+	docker compose -f tests/docker-compose.test.yml up -d kividb --wait
+	KIVIDB_PORT=6386 cargo test --test integration_kividb --release -- --test-threads=1; \
+	  status=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$status
+
+.PHONY: integration-test-chroma
+integration-test-chroma:
+	@echo "=== Starting Chroma for integration tests ==="
+	docker compose -f tests/docker-compose.test.yml up -d chroma --wait
+	CHROMA_PORT=8003 cargo test --test integration_chroma --release -- --test-threads=1; \
+	  status=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$status
+
+# Vertex AI is cloud-only — there is no container to start, and the suite needs
+# real GCP credentials. Listed so its absence from the Docker targets is a
+# documented fact rather than an oversight.
+.PHONY: integration-test-vertex
+integration-test-vertex:
+	@echo "=== Vertex AI integration tests (cloud-only, needs GCP credentials) ==="
+	cargo test --test integration_vertex --release -- --test-threads=1
+
 .PHONY: integration-test-no-docker
 integration-test-no-docker:
 	@echo "=== Running integration tests (assumes redis on port 6399) ==="
@@ -258,6 +287,40 @@ check: fmt-check lint
 lint:
 	@echo "=== Running Clippy (Rust linter) ==="
 	cargo clippy
+
+# ============================================================
+# AGENT-CHECK — the whole no-Docker CI gate in one command
+# ============================================================
+#
+# `make check` runs fmt + clippy and NO TESTS, which is the single most common
+# way a change looks green locally and fails CI. This target reproduces exactly
+# what CI's non-Docker jobs run, in the same order and the same profile:
+#
+#   cargo fmt --check                        (ci.yml "Check formatting")
+#   cargo clippy --all-targets -- -D warnings (ci.yml "Run clippy")
+#   cargo test --lib --bins --release         (ci.yml "Unit tests")
+#   cargo test --test {integration_cli,overhead_invariants,harness_invariants} --release
+#
+# --release is not incidental: CI runs the suites in release, so a
+# `debug_assert!` does not exist there. Testing only in debug can pass a guard
+# that is compiled out of the binary that ships.
+#
+# Docker-backed engine suites are NOT included — run `make integration-test-*`
+# for those.
+.PHONY: agent-check
+agent-check:
+	@echo "=== 1/4 formatting ==="
+	cargo fmt --check
+	@echo "=== 2/4 clippy (warnings are errors, as in CI) ==="
+	cargo clippy --all-targets -- -D warnings
+	@echo "=== 3/4 unit + binary tests (RELEASE, as in CI) ==="
+	cargo test --lib --bins --release
+	@echo "=== 4/4 harness invariant suites ==="
+	cargo test --test integration_cli --release
+	cargo test --test overhead_invariants --release
+	cargo test --test harness_invariants --release
+	@echo ""
+	@echo "agent-check passed — this is the whole no-Docker CI gate."
 
 .PHONY: check-strict
 check-strict: fmt-check lint-strict
@@ -359,10 +422,12 @@ help:
 	@echo "  make setup             - Install system deps (libhdf5, pkg-config) and Rust toolchain"
 	@echo ""
 	@echo "  Build & Test:"
+	@echo "  make agent-check       - THE no-Docker CI gate: fmt + clippy + tests (release)."
+	@echo "                           Use this, not 'make check' — 'check' runs NO tests."
 	@echo "  make build             - Build Rust code in release mode"
 	@echo "  make install           - Build and install binary to PREFIX (default: /usr/local)"
 	@echo "  make test              - Run Rust unit tests (no docker needed)"
-	@echo "  make check             - Run linting (clippy) and formatting checks"
+	@echo "  make check             - Linting + formatting ONLY (no tests; see agent-check)"
 	@echo "  make check-strict      - Run linting with warnings as errors"
 	@echo "  make fmt               - Auto-format Rust code"
 	@echo "  make benchmark         - Run Rust microbenchmarks (HDF5, NPY, JSONL)"
@@ -377,6 +442,10 @@ help:
 	@echo "  make integration-test-milvus          - Milvus 2.5.6"
 	@echo "  make integration-test-mongodb         - MongoDB Atlas Local 8.0.4"
 	@echo "  make integration-test-valkey          - Valkey Bundle (latest)"
+	@echo "  make integration-test-dragonfly       - Dragonfly"
+	@echo "  make integration-test-kividb          - KiviDB"
+	@echo "  make integration-test-chroma          - Chroma"
+	@echo "  make integration-test-vertex          - Vertex AI (cloud-only, needs GCP creds)"
 	@echo ""
 	@echo "  Docker:"
 	@echo "  make docker-build                - Build Docker image (IMAGE_TAG=latest)"
