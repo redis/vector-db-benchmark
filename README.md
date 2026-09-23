@@ -893,7 +893,51 @@ Upload was 291.6 s for 1,000,044 passages (3,430 docs/s) including the payload
 text; peak RSS 8.06 GB. `experiments/configurations/redis-msmarco.json` ships
 that configuration; note it sets `top` explicitly, for the reason above.
 
-<!-- MSMARCO_10M_RESULTS -->
+**And at 10M**, same configuration and host:
+
+| top | EF | QPS | Recall | MRR | NDCG |
+| --: | --: | --: | --: | --: | --: |
+| 10 | 64 | 5115 | 0.9407 | 0.9928 | 0.9562 |
+| 10 | 128 | 3949 | 0.9609 | 0.9982 | 0.9719 |
+| 100 | 256 | 2563 | 0.9590 | 1.0000 | 0.9697 |
+
+Upload was 4,324 s (2,313 docs/s — roughly two-thirds the 1M rate, as HNSW
+insert cost grows with graph size) and the whole run took 74 minutes.
+
+**Peak memory of the benchmark process** is **80.5 GB** at 10M
+(`/usr/bin/time -v`), and it is the vector read alone: `read_npy_vectors` holds
+the `Array2` and the `Vec<Vec<f32>>` it is converting into at once — 2 x 40 GB.
+The 17 GB of payloads are read *after* that copy is dropped, so the two peaks
+never coincide. Budget **2x the vector bytes**, plus Redis in its own process.
+
+### How much memory does Redis itself need?
+
+Measured from a live index at 3.56M documents (M=32, EF_CONSTRUCTION=256, all
+seven schema fields indexed) — **18.2 KB per document**, broken down per doc as:
+
+| component | per doc |
+| --- | ---: |
+| vector index (a copy of the vector + the HNSW graph) | 4.4 KB |
+| raw hash data (4 KB vector + ~1.7 KB payload text) | ~9.2 KB |
+| inverted index over the TEXT fields | 2.0 KB |
+| `sortable_values` — the `TEXT SORTABLE` copies | 1.8 KB |
+| offset vectors, doc table, key table | 0.4 KB |
+
+So, for planning:
+
+| dataset | documents | Redis `used_memory` |
+| --- | ---: | ---: |
+| 100K | 99,964 | ~1.8 GB |
+| 1M | 1,000,044 | ~18 GB |
+| 10M | 9,999,959 | ~182 GB |
+
+The 100K figure is corroborated by a direct measurement of 1.68 GB on a
+comparable corpus. The 1M and 10M are projections from the per-document cost
+rather than end-to-end measurements — HNSW's per-node cost is fixed by `M`, so
+the scaling is linear, but they are extrapolations and labelled as such.
+
+Note that ~1.8 KB/doc of this is `sortable_values`, which nothing in these
+datasets sorts on — see the sizing note below.
 
 **Sizing note for the Redis family.** Redis declares a `text` schema field as
 `TEXT SORTABLE`, which keeps a copy of the value in the sorting table. This is
