@@ -885,13 +885,35 @@ EF_CONSTRUCTION=256, 8 search threads, on an i7i.metal-24xl — 96 cores):
 
 | top | EF | QPS | Recall | MRR | NDCG |
 | --: | --: | --: | --: | --: | --: |
-| 10 | 64 | 5329 | 0.9519 | 0.9964 | 0.9661 |
-| 10 | 128 | 4096 | 0.9708 | 0.9988 | 0.9796 |
-| 100 | 256 | 2722 | 0.9694 | 1.0000 | 0.9776 |
+| 10 | 64 | 5370 | 0.9543 | 0.9988 | 0.9686 |
+| 10 | 128 | 4083 | 0.9729 | 1.0000 | 0.9817 |
+| 10 | 256 | 2903 | 0.9841 | 1.0000 | 0.9895 |
+| 100 | 256 | 2714 | 0.9695 | 1.0000 | 0.9777 |
+| 1000 | 1000 | 457 | 0.9633 | 1.0000 | 0.9699 |
+| 1000 | 2000 | 351 | 0.9855 | 1.0000 | 0.9881 |
 
 Upload was 291.6 s for 1,000,044 passages (3,430 docs/s) including the payload
 text; peak RSS 8.06 GB. `experiments/configurations/redis-msmarco.json` ships
-that configuration; note it sets `top` explicitly, for the reason above.
+that configuration.
+
+**Why the sweep goes to `top: 1000`, and why its `EF` values start there.**
+Recall@1000 is the number a first-stage retriever is judged on — whether the
+answer is anywhere in the candidate set a reranker will see — and TREC-RAG is a
+first-stage benchmark, which is why the ground truth is 1000 deep. Measuring
+only at 10 and 100 would leave the corpus's own operating point untested.
+
+The `EF` values at that depth are 1000 and 2000 rather than the 64/128/256 used
+above, because **HNSW clamps effective search breadth to at least `k`**: the
+result set has to hold `k` neighbours. Any declared `EF` below `top` therefore
+does nothing. That is not a guess — at a derived `top` of 1000, `EF` 64 / 128 /
+512 all returned *identical* recall (0.9419), while at `top: 1000` the two
+values above `k` separate cleanly (0.9633 → 0.9855). So `EF` is a live knob at
+depth, but only above `k`.
+
+This is also why a config that omits `top` is dangerous here: it derives `top`
+from the 1000-wide ground truth and silently clamps every `EF` in the sweep to
+the same effective value, publishing one measurement under several names. The
+harness warns when it sees that shape.
 
 **And at 10M**, same configuration and host:
 

@@ -3,13 +3,58 @@
     "name": "redis-msmarco",
     "engine": "redis",
     "connection_params": {},
-    "collection_params": { "hnsw_config": { "M": 32, "EF_CONSTRUCTION": 256 } },
+    "collection_params": {
+      "hnsw_config": {
+        "M": 32,
+        "EF_CONSTRUCTION": 256
+      }
+    },
     "search_params": [
-      { "parallel": 8, "top": 10, "search_params": { "EF": 64 } },
-      { "parallel": 8, "top": 10, "search_params": { "EF": 128 } },
-      { "parallel": 8, "top": 10, "search_params": { "EF": 256 } },
-      { "parallel": 8, "top": 100, "search_params": { "EF": 256 } }
+      {
+        "parallel": 8,
+        "top": 10,
+        "search_params": {
+          "EF": 64
+        }
+      },
+      {
+        "parallel": 8,
+        "top": 10,
+        "search_params": {
+          "EF": 128
+        }
+      },
+      {
+        "parallel": 8,
+        "top": 10,
+        "search_params": {
+          "EF": 256
+        }
+      },
+      {
+        "parallel": 8,
+        "top": 100,
+        "search_params": {
+          "EF": 256
+        }
+      },
+      {
+        "parallel": 8,
+        "top": 1000,
+        "search_params": {
+          "EF": 1000
+        }
+      },
+      {
+        "parallel": 8,
+        "top": 1000,
+        "search_params": {
+          "EF": 2000
+        }
+      }
     ],
-    "upload_params": { "parallel": 32 }
+    "upload_params": {
+      "parallel": 32
+    }
   }
 ]
