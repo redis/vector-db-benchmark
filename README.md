@@ -919,12 +919,21 @@ harness warns when it sees that shape.
 
 | top | EF | QPS | Recall | MRR | NDCG |
 | --: | --: | --: | --: | --: | --: |
-| 10 | 64 | 5115 | 0.9407 | 0.9928 | 0.9562 |
-| 10 | 128 | 3949 | 0.9609 | 0.9982 | 0.9719 |
-| 100 | 256 | 2563 | 0.9590 | 1.0000 | 0.9697 |
+| 10 | 64 | 5093 | 0.9447 | 0.9946 | 0.9595 |
+| 10 | 128 | 3953 | 0.9609 | 0.9976 | 0.9719 |
+| 10 | 256 | 2725 | 0.9760 | 0.9994 | 0.9833 |
+| 100 | 256 | 2531 | 0.9589 | 1.0000 | 0.9696 |
+| 1000 | 1000 | 419 | 0.9471 | 1.0000 | 0.9564 |
+| 1000 | 2000 | 313 | 0.9747 | 1.0000 | 0.9792 |
 
-Upload was 4,324 s (2,313 docs/s — roughly two-thirds the 1M rate, as HNSW
-insert cost grows with graph size) and the whole run took 74 minutes.
+Upload was 4,393 s (2,277 docs/s — roughly two-thirds the 1M rate, as HNSW
+insert cost grows with graph size).
+
+The `EF` clamping described above reproduces at this scale: 1000 → 2000 moves
+recall@1000 from 0.9471 to 0.9747. Note also how little recall degrades for a
+10x larger corpus — recall@10 at `EF` 256 goes 0.9841 → 0.9760, and recall@1000
+at `EF` 2000 goes 0.9855 → 0.9747 — which is the property that makes HNSW worth
+benchmarking at scale in the first place.
 
 **Peak memory of the benchmark process** is **80.5 GB** at 10M
 (`/usr/bin/time -v`), and it is the vector read alone: `read_npy_vectors` holds
