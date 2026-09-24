@@ -43,7 +43,6 @@
 //! alignment, and the cross-shard offset arithmetic.
 
 use std::collections::HashMap;
-use std::io::{BufWriter, Write};
 
 use rayon::prelude::*;
 
@@ -233,129 +232,79 @@ impl BucketHistogram {
     }
 }
 
-/// How a variant chooses its passages out of the 113.5M-passage corpus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sampling {
-    /// The first N passages in corpus order.
-    ///
-    /// Cheap — only the head of the corpus is fetched — and, measured, *not*
-    /// geometrically skewed: a 20k block from the head of shard 00 has mean
-    /// nearest-neighbour cosine 0.8825 and mean random-pair cosine 0.1442,
-    /// against 0.8759 / 0.1499 for a sample spread over all 60 shards. (Later
-    /// shards are the unusual ones: shard 59 measures 0.9316 / 0.3699, i.e.
-    /// markedly more topically concentrated.)
-    ///
-    /// What it *is* skewed in is metadata. The corpus is ordered by `docid`,
-    /// which tracks URL, so a prefix is an alphabetically bounded slice: the
-    /// 100K prefix spans `0-60.reviews` to `acqnotes.com` and the 1M prefix
-    /// reaches `canigivemybaby.com`. `url` contains "nih" zero times in the
-    /// 100K. Fine for pure-KNN recall, wrong for anything that reads the
-    /// payload distribution as representative.
-    Prefix,
-    /// Every passage whose [`crc32_bucket`] is below `threshold`, i.e. a uniform
-    /// `threshold / CRC32_BUCKETS` sample of the whole corpus.
-    ///
-    /// Representative in metadata as well as geometry, at the cost of having to
-    /// stream the entire corpus once — selection depends on `docid`, so there is
-    /// no prefix of the input that contains the answer.
-    Crc32 { threshold: u32 },
-}
-
-impl Sampling {
-    /// Whether this passage is in the sample. `offset` is its global position,
-    /// `docid` its id; each mode uses only what it needs.
-    pub fn keeps(&self, offset: u64, docid: &str, limit: u64) -> bool {
-        match self {
-            Sampling::Prefix => offset < limit,
-            Sampling::Crc32 { threshold } => crc32_bucket(docid) < *threshold,
-        }
-    }
-
-    /// Whether the whole corpus must be streamed to build the sample.
-    pub fn needs_full_scan(&self) -> bool {
-        matches!(self, Sampling::Crc32 { .. })
-    }
+/// Whether a passage is in the sample: its `docid` hashes below `threshold`.
+///
+/// Selection is by HASH, never by position. A position-based prefix was tried
+/// and removed: the corpus is ordered by `docid`, which tracks URL, so the first
+/// N passages are an alphabetically bounded slice — the first 100,000 span only
+/// `0-60.reviews` to `acqnotes.com`, and `url` contains "nih" zero times in
+/// them. That does not distort the vector geometry (a 20k block at the head of
+/// shard 00 measures mean nearest-neighbour cosine 0.8825 and mean random-pair
+/// cosine 0.1442, against 0.8759 / 0.1499 for a sample spread over all 60
+/// shards), so prefix recall numbers were not wrong — but this corpus exists
+/// for its metadata, and a default that skews the metadata is the wrong default.
+///
+/// It also means selection cannot be known from any prefix of the input: every
+/// build reads the whole corpus.
+pub fn keeps(docid: &str, threshold: u32) -> bool {
+    crc32_bucket(docid) < threshold
 }
 
 /// A registered size of the dataset. Each maps to one entry in
 /// `datasets/datasets.json`, and `limit` is that entry's `vector_count`.
 ///
 /// The size is a property of the NAME, not a command-line knob: two runs that
-/// both say `msmarco-cohere-1024-1M-cosine` must have uploaded byte-identical
-/// corpora, or the results are not comparable.
+/// both say `msmarco-cohere-1024-1M-cosine` must have uploaded
+/// byte-identical corpora, or the results are not comparable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Variant {
     /// Name in `datasets/datasets.json`.
     pub dataset_name: &'static str,
     /// Directory under `datasets/`, matching the entry's `path`.
     ///
-    /// The sampled variants are named by THRESHOLD (`crc32-t8805`), not by a
-    /// round size. A path like `1M-crc32` would advertise 1,000,000 points that
-    /// the corpus does not have, which `config.rs`'s #224 guard rejects on
-    /// exactly the reasoning that makes it wrong: a path naming its own size is
-    /// treated as authoritative, and a subset must not borrow a size it is not.
+    /// Named by THRESHOLD (`crc32-t8805`), not by a round size. A path like
+    /// `1M-crc32` would advertise 1,000,000 points the corpus does not have,
+    /// which `config.rs`'s #224 guard rejects on precisely the reasoning that
+    /// makes it wrong: a path naming its own size is treated as authoritative.
     pub dir: &'static str,
-    /// Exactly how many passages the variant holds.
-    ///
-    /// For [`Sampling::Prefix`] this is also the selection rule. For
-    /// [`Sampling::Crc32`] it is the REALIZED count of the threshold, measured
-    /// by the `--discover-crc32` scan over all 113,520,750 docids — a hash
-    /// threshold cannot be made to land on a round number, so the round number
-    /// is in the name and the true count is here.
+    /// Exactly how many passages the variant holds — the REALIZED count of its
+    /// threshold, measured by the `--discover-crc32` scan over all 113,520,750
+    /// docids. A hash threshold cannot be made to land on a round number, so the
+    /// round number is in the name and the true count is here.
     pub limit: u64,
-    /// How the passages are chosen.
-    pub sampling: Sampling,
+    /// `crc32_bucket(docid) < threshold` selects this variant's passages.
+    pub threshold: u32,
 }
 
 /// Every registered size, smallest first.
 ///
-/// Two families over the same corpus. The `Prefix` ones take the first N
-/// passages: cheap to build, geometrically representative (measured), but
-/// alphabetically bounded in metadata because the corpus is `docid`-ordered.
-/// The `-crc32-` ones keep every passage whose `docid` hashes below a threshold,
-/// which is uniform in metadata as well — the sampling the Redis Enterprise MS
-/// MARCO suite uses — at the cost of reading the whole corpus to build.
+/// One family: every passage whose `docid` hashes below a threshold, i.e. a
+/// uniform sample of the whole 113.5M-passage corpus. A prefix family existed
+/// briefly and was removed — see [`Sampling`] for why position-based selection
+/// is the wrong default for a corpus whose point is its metadata.
 ///
-/// The crc32 thresholds nest (886 < 8805 < 88075), so each sampled variant is a
-/// strict subset of the larger ones.
+/// The thresholds nest (886 < 8805 < 88075), so each variant is a strict subset
+/// of the larger ones and results stay comparable across sizes.
 pub const VARIANTS: &[Variant] = &[
-    Variant {
-        dataset_name: "msmarco-cohere-1024-100K-cosine",
-        dir: "msmarco-cohere-1024/100K",
-        limit: 100_000,
-        sampling: Sampling::Prefix,
-    },
-    Variant {
-        dataset_name: "msmarco-cohere-1024-1M-cosine",
-        dir: "msmarco-cohere-1024/1M",
-        limit: 1_000_000,
-        sampling: Sampling::Prefix,
-    },
-    Variant {
-        dataset_name: "msmarco-cohere-1024-10M-cosine",
-        dir: "msmarco-cohere-1024/10M",
-        limit: 10_000_000,
-        sampling: Sampling::Prefix,
-    },
     // Realized counts measured by `--discover-crc32` over all 113,520,750
     // docids at revision e78737fe: 99,964 / 1,000,044 / 9,999,959.
     Variant {
-        dataset_name: "msmarco-cohere-1024-100K-crc32-cosine",
+        dataset_name: "msmarco-cohere-1024-100K-cosine",
         dir: "msmarco-cohere-1024/crc32-t886",
         limit: 99_964,
-        sampling: Sampling::Crc32 { threshold: 886 },
+        threshold: 886,
     },
     Variant {
-        dataset_name: "msmarco-cohere-1024-1M-crc32-cosine",
+        dataset_name: "msmarco-cohere-1024-1M-cosine",
         dir: "msmarco-cohere-1024/crc32-t8805",
         limit: 1_000_044,
-        sampling: Sampling::Crc32 { threshold: 8_805 },
+        threshold: 8_805,
     },
     Variant {
-        dataset_name: "msmarco-cohere-1024-10M-crc32-cosine",
+        dataset_name: "msmarco-cohere-1024-10M-cosine",
         dir: "msmarco-cohere-1024/crc32-t88075",
         limit: 9_999_959,
-        sampling: Sampling::Crc32 { threshold: 88_075 },
+        threshold: 88_075,
     },
 ];
 
@@ -543,25 +492,6 @@ pub fn normalize_in_place(v: &mut [f32]) {
 // Streaming f32 NPY writer
 // ---------------------------------------------------------------------------
 
-/// Writes a 2-D `'<f4'` NPY file one row at a time.
-///
-/// [`crate::readers::write_npy_vectors`] flattens the whole corpus into a single
-/// `Vec<f32>` before writing, which for the 1M variant means ~8 GB resident (the
-/// `Vec<Vec<f32>>` plus its flattened copy) and for the 10M variant is simply not
-/// possible on a normal machine. This writer emits the header up front from the
-/// row count the variant already pins down, then streams — so preparation peaks
-/// at one block, not one corpus.
-///
-/// The output is byte-identical in layout to what `ndarray-npy` produces
-/// (version 1.0, header padded to a 64-byte boundary), so
-/// [`crate::readers::read_npy_vectors`] reads it back unchanged.
-pub struct NpyF32Writer<W: Write> {
-    inner: W,
-    cols: usize,
-    declared_rows: u64,
-    rows_written: u64,
-}
-
 /// Build the version-1.0 header for a C-order `'<f4'` array of `rows` x `cols`.
 pub fn npy_f32_header(rows: u64, cols: usize) -> Vec<u8> {
     let dict = format!(
@@ -669,75 +599,6 @@ impl DeferredNpyF32Writer {
             .flush()
             .map_err(|e| format!("flush NPY file: {e}"))?;
         Ok(self.rows_written)
-    }
-}
-
-impl NpyF32Writer<BufWriter<std::fs::File>> {
-    /// Create `path` and write the header for a `rows` x `cols` matrix.
-    pub fn create(path: &std::path::Path, rows: u64, cols: usize) -> Result<Self, String> {
-        let file =
-            std::fs::File::create(path).map_err(|e| format!("create {}: {}", path.display(), e))?;
-        Self::new(BufWriter::new(file), rows, cols)
-    }
-}
-
-impl<W: Write> NpyF32Writer<W> {
-    pub fn new(mut inner: W, rows: u64, cols: usize) -> Result<Self, String> {
-        inner
-            .write_all(&npy_f32_header(rows, cols))
-            .map_err(|e| format!("write NPY header: {}", e))?;
-        Ok(Self {
-            inner,
-            cols,
-            declared_rows: rows,
-            rows_written: 0,
-        })
-    }
-
-    /// Append one row. Rejects a wrong-width row and refuses to exceed the row
-    /// count already baked into the header.
-    pub fn write_row(&mut self, row: &[f32]) -> Result<(), String> {
-        if row.len() != self.cols {
-            return Err(format!(
-                "NPY row has {} values, header declares {}",
-                row.len(),
-                self.cols
-            ));
-        }
-        if self.rows_written >= self.declared_rows {
-            return Err(format!(
-                "NPY writer: refusing to write row {} — header declares only {} rows",
-                self.rows_written, self.declared_rows
-            ));
-        }
-        let mut buf = Vec::with_capacity(row.len() * 4);
-        for v in row {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        self.inner
-            .write_all(&buf)
-            .map_err(|e| format!("write NPY row: {}", e))?;
-        self.rows_written += 1;
-        Ok(())
-    }
-
-    pub fn rows_written(&self) -> u64 {
-        self.rows_written
-    }
-
-    /// Flush and assert the file holds exactly the number of rows its header
-    /// promises. A short file would otherwise parse fine as far as the header
-    /// goes and then fail — or worse, be silently accepted — downstream.
-    pub fn finish(mut self) -> Result<(), String> {
-        if self.rows_written != self.declared_rows {
-            return Err(format!(
-                "NPY writer: wrote {} rows but the header declares {}",
-                self.rows_written, self.declared_rows
-            ));
-        }
-        self.inner
-            .flush()
-            .map_err(|e| format!("flush NPY file: {}", e))
     }
 }
 
@@ -978,57 +839,6 @@ pub fn in_prefix_hits(
     Ok(InPrefixHits { hits })
 }
 
-/// How many rows to take from one shard, and where that shard's rows start in
-/// the global order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShardTake {
-    pub shard: usize,
-    /// Rows the shard holds in total (from its NPY header).
-    pub shard_rows: u64,
-    /// Rows to consume, from row 0. Equal to `shard_rows` except on the last.
-    pub take: u64,
-    /// Global offset of this shard's row 0.
-    pub first_id: u64,
-}
-
-/// Work out which shards a `limit`-passage prefix spans, given each shard's row
-/// count in order.
-///
-/// Split out from the preparer's network loop and tested here because **no
-/// registered variant below 10M exercises it**: shard 00 alone holds 1,760,180
-/// passages, so the 100K and 1M builds never cross a shard boundary and a live
-/// run of either proves nothing about `first_id` accumulation. Getting that
-/// wrong would shift every id past the first shard — and since ids ARE the
-/// ground-truth keys, the shipped-top-1k cross-check would then fail loudly
-/// rather than silently, but only for whoever first runs the 10M build.
-///
-/// `shard_rows` is consulted lazily, so the caller only pays for the headers it
-/// actually needs: the returned plan names exactly the shards to fetch.
-pub fn plan_shards(shard_rows: &[u64], limit: u64) -> Result<Vec<ShardTake>, String> {
-    let mut plan = Vec::new();
-    let mut so_far = 0u64;
-    for (shard, &rows) in shard_rows.iter().enumerate() {
-        if so_far >= limit {
-            break;
-        }
-        let take = rows.min(limit - so_far);
-        plan.push(ShardTake {
-            shard,
-            shard_rows: rows,
-            take,
-            first_id: so_far,
-        });
-        so_far += take;
-    }
-    if so_far != limit {
-        return Err(format!(
-            "the available shards hold {so_far} passages, short of the {limit} this variant \
-             declares"
-        ));
-    }
-    Ok(plan)
-}
-
 /// Depth of the shipped per-query ranking (`top1k_*`). Distinct from
 /// [`NEIGHBOURS`], which is how deep OUR brute force goes: this one is fixed by
 /// the upstream export and is what the coverage floor below is derived from.
@@ -1064,26 +874,6 @@ pub fn coverage_floor(limit: u64) -> (usize, usize) {
     (queries, positions)
 }
 
-/// Check the floor against the coverage the query file makes POSSIBLE, before
-/// any corpus bytes are fetched.
-///
-/// `queries_checked` ends up exactly equal to the number of queries with at
-/// least one in-prefix hit, and `positions_compared` can never exceed the total
-/// number of in-prefix hits — both of which are known the moment the query file
-/// is parsed. So the same floor applies as an upper bound up front, and a run
-/// that cannot possibly clear it fails in seconds instead of after the download
-/// and the brute force. On the 10M variant that is the difference between
-/// failing immediately and failing after 54 GB and ~20 minutes.
-pub fn check_coverage_upper_bound(
-    limit: u64,
-    queries_with_hits: usize,
-    total_hits: usize,
-) -> Result<(), String> {
-    check_coverage(limit, queries_with_hits, total_hits).map_err(|e| {
-        format!("{e}\n(Checked up front from the query file — the corpus was not fetched.)")
-    })
-}
-
 /// Enforce [`coverage_floor`] on what the cross-check actually compared.
 pub fn check_coverage(
     limit: u64,
@@ -1106,33 +896,15 @@ pub fn check_coverage(
 
 /// Which global offsets the corpus writer must remember a `docid` for.
 ///
-/// This is selection logic, and it differs per sampling mode in a way that is
-/// easy to get wrong in exactly one direction:
-///
-/// * [`Sampling::Prefix`] — only offsets inside the prefix. The writer can only
-///   record a docid for a row it actually writes, so handing it an offset it
-///   will never reach makes its completeness check fail on a perfectly correct
-///   run. That is not hypothetical: passing the unfiltered shipped list here
-///   aborted every prefix build with "1592762 of the 1594767 offsets … were
-///   never given a docid … the offset arithmetic is wrong" — a confident and
-///   completely wrong diagnosis of a correct corpus.
-/// * [`Sampling::Crc32`] — all of them. Selection depends on `docid`, so which
-///   offsets end up in the sample is unknown until the corpus has been read;
-///   any shipped offset might turn out to be one of them.
-///
-/// Lives here rather than in the binary because it decides what gets verified,
-/// which is the kind of thing this crate keeps under test.
-pub fn offsets_to_track(shipped_offsets: &[i64], sampling: Sampling, limit: u64) -> Vec<u64> {
+/// All of them: selection depends on `docid`, so which offsets end up in the
+/// sample is unknown until the corpus has been read, and any shipped offset
+/// might turn out to be one. Negative offsets are dropped rather than cast into
+/// enormous `u64`s.
+pub fn offsets_to_track(shipped_offsets: &[i64]) -> Vec<u64> {
     shipped_offsets
         .iter()
         .filter(|off| **off >= 0)
         .map(|off| *off as u64)
-        .filter(|off| match sampling {
-            // `keeps` is the same predicate the writer applies, so the two
-            // cannot disagree about what a prefix contains.
-            Sampling::Prefix => sampling.keeps(*off, "", limit),
-            Sampling::Crc32 { .. } => true,
-        })
         .collect()
 }
 
@@ -1287,22 +1059,11 @@ mod tests {
 
     #[test]
     fn variants_are_registered_under_their_own_names_and_dirs() {
-        assert_eq!(VARIANTS.len(), 6);
-        // Two families over the same corpus, three sizes each.
-        assert_eq!(
-            VARIANTS
-                .iter()
-                .filter(|v| v.sampling == Sampling::Prefix)
-                .count(),
-            3
-        );
-        assert_eq!(
-            VARIANTS
-                .iter()
-                .filter(|v| v.sampling.needs_full_scan())
-                .count(),
-            3
-        );
+        assert_eq!(VARIANTS.len(), 3);
+        // One family only. A position-based prefix family existed and was
+        // removed: selection must be by hash, or the metadata distribution is an
+        // artefact of how the corpus happens to be ordered.
+        assert!(VARIANTS.iter().all(|v| v.threshold > 0));
         for v in VARIANTS {
             assert_eq!(variant(v.dataset_name).map(|f| f.limit), Some(v.limit));
         }
@@ -1317,13 +1078,7 @@ mod tests {
         assert_eq!(limits.len(), VARIANTS.len());
         // The crc32 thresholds must nest, so each sampled variant is a strict
         // subset of the larger ones and results stay comparable across sizes.
-        let mut thresholds: Vec<u32> = VARIANTS
-            .iter()
-            .filter_map(|v| match v.sampling {
-                Sampling::Crc32 { threshold } => Some(threshold),
-                Sampling::Prefix => None,
-            })
-            .collect();
+        let mut thresholds: Vec<u32> = VARIANTS.iter().map(|v| v.threshold).collect();
         let sorted = {
             let mut t = thresholds.clone();
             t.sort_unstable();
@@ -1334,15 +1089,14 @@ mod tests {
             "crc32 variants must be listed ascending"
         );
         thresholds.dedup();
-        assert_eq!(thresholds.len(), 3, "thresholds must be distinct");
+        assert_eq!(
+            thresholds.len(),
+            VARIANTS.len(),
+            "thresholds must be distinct"
+        );
         // A bigger threshold must mean a bigger realized count.
-        let mut sampled: Vec<(u32, u64)> = VARIANTS
-            .iter()
-            .filter_map(|v| match v.sampling {
-                Sampling::Crc32 { threshold } => Some((threshold, v.limit)),
-                Sampling::Prefix => None,
-            })
-            .collect();
+        let mut sampled: Vec<(u32, u64)> =
+            VARIANTS.iter().map(|v| (v.threshold, v.limit)).collect();
         sampled.sort_unstable();
         for w in sampled.windows(2) {
             assert!(w[0].1 < w[1].1, "{:?} then {:?}", w[0], w[1]);
@@ -1571,40 +1325,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn prefix_and_crc32_select_on_different_things() {
-        let p = Sampling::Prefix;
-        // Prefix looks only at position.
-        assert!(p.keeps(0, "anything", 10));
-        assert!(p.keeps(9, "anything", 10));
-        assert!(!p.keeps(10, "anything", 10));
-        assert!(!p.needs_full_scan());
-
-        // crc32 looks only at the docid — position is irrelevant, which is
-        // exactly why it cannot be built from a prefix of the input.
-        let c = Sampling::Crc32 { threshold: 548_038 };
-        let doc = "msmarco_v2.1_doc_00_0#0_0"; // bucket 548_037
-        assert!(c.keeps(0, doc, 1));
-        assert!(c.keeps(999_999_999, doc, 1), "position must not matter");
-        let just_below = Sampling::Crc32 { threshold: 548_037 };
-        assert!(
-            !just_below.keeps(0, doc, u64::MAX),
-            "threshold is exclusive"
-        );
-        assert!(c.needs_full_scan());
-    }
-
     /// Thresholds must nest, so a smaller variant is a strict subset of a larger
     /// one — the property that makes results across sizes comparable.
     #[test]
     fn crc32_thresholds_nest() {
-        let small = Sampling::Crc32 { threshold: 881 };
-        let big = Sampling::Crc32 { threshold: 8_810 };
         for i in 0..5_000u32 {
             let docid = format!("msmarco_v2.1_doc_00_{i}#0_0");
-            if small.keeps(0, &docid, u64::MAX) {
+            if keeps(&docid, 881) {
                 assert!(
-                    big.keeps(0, &docid, u64::MAX),
+                    keeps(&docid, 8_810),
                     "{docid} is in the small sample but not the large one"
                 );
             }
@@ -1781,28 +1510,6 @@ mod tests {
         }
     }
 
-    /// The whole point of the streaming writer: what it emits must read back
-    /// through the same `read_npy_vectors` the benchmark uses.
-    #[test]
-    fn streamed_npy_round_trips_through_the_production_reader() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vectors.npy");
-        let rows: Vec<Vec<f32>> = (0..5)
-            .map(|i| (0..3).map(|j| i as f32 * 10.0 + j as f32).collect())
-            .collect();
-
-        let mut w = NpyF32Writer::create(&path, rows.len() as u64, 3).unwrap();
-        for r in &rows {
-            w.write_row(r).unwrap();
-        }
-        assert_eq!(w.rows_written(), 5);
-        w.finish().unwrap();
-
-        let (ids, read) = crate::readers::read_npy_vectors(path.to_str().unwrap(), false).unwrap();
-        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
-        assert_eq!(read, rows);
-    }
-
     /// The deferred writer's whole premise: patch the header afterwards and the
     /// production reader still reads it.
     #[test]
@@ -1836,28 +1543,6 @@ mod tests {
         // A wrong-width row is still rejected.
         let mut w = DeferredNpyF32Writer::create(&dir.path().join("b.npy"), 3).unwrap();
         assert!(w.write_row(&[1.0, 2.0]).is_err());
-    }
-
-    #[test]
-    fn npy_writer_rejects_wrong_widths_short_files_and_overruns() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let mut w = NpyF32Writer::create(&dir.path().join("a.npy"), 2, 3).unwrap();
-        let e = w.write_row(&[1.0, 2.0]).unwrap_err();
-        assert!(e.contains("2 values"), "{e}");
-
-        // Fewer rows than the header promises must not pass silently.
-        let mut w = NpyF32Writer::create(&dir.path().join("b.npy"), 2, 3).unwrap();
-        w.write_row(&[1.0, 2.0, 3.0]).unwrap();
-        let e = w.finish().unwrap_err();
-        assert!(e.contains("wrote 1 rows"), "{e}");
-
-        // Nor may it write past the declared count (that would append rows the
-        // header never mentions, which the reader would ignore).
-        let mut w = NpyF32Writer::create(&dir.path().join("c.npy"), 1, 3).unwrap();
-        w.write_row(&[1.0, 2.0, 3.0]).unwrap();
-        let e = w.write_row(&[4.0, 5.0, 6.0]).unwrap_err();
-        assert!(e.contains("refusing to write row 1"), "{e}");
     }
 
     fn flat(rows: &[[f32; 2]]) -> Vec<f32> {
@@ -2011,81 +1696,6 @@ mod tests {
         pairs.iter().map(|(i, s)| (*i, s.to_string())).collect()
     }
 
-    /// The floor must sit BELOW what every registered variant actually reaches
-    /// (or preparation could never succeed) and ABOVE a collapse.
-    /// The real shard-00 row count, which is why nothing below 10M crosses a
-    /// boundary.
-    const SHARD0_ROWS: u64 = 1_760_180;
-
-    #[test]
-    fn a_prefix_inside_one_shard_takes_only_that_shard() {
-        for limit in [100_000u64, 1_000_000] {
-            let plan = plan_shards(&[SHARD0_ROWS, SHARD0_ROWS], limit).unwrap();
-            assert_eq!(plan.len(), 1, "limit {limit}");
-            assert_eq!(plan[0].first_id, 0);
-            assert_eq!(plan[0].take, limit);
-            assert_eq!(plan[0].shard_rows, SHARD0_ROWS);
-        }
-    }
-
-    /// The path no registered build below 10M reaches: `first_id` must be the
-    /// running sum of what earlier shards CONTRIBUTED, and every shard before
-    /// the last must be consumed whole.
-    #[test]
-    fn a_prefix_spanning_shards_accumulates_the_global_offset() {
-        let rows = [100u64, 200, 300, 400];
-        let plan = plan_shards(&rows, 450).unwrap();
-        assert_eq!(plan.len(), 3);
-        assert_eq!(
-            plan.iter()
-                .map(|p| (p.shard, p.take, p.first_id))
-                .collect::<Vec<_>>(),
-            vec![(0, 100, 0), (1, 200, 100), (2, 150, 300)]
-        );
-        // Every id in the prefix is covered exactly once, contiguously.
-        assert_eq!(plan.iter().map(|p| p.take).sum::<u64>(), 450);
-        for w in plan.windows(2) {
-            assert_eq!(w[0].first_id + w[0].take, w[1].first_id);
-        }
-        // Only the LAST shard may be partially consumed — the tail check in the
-        // preparer depends on that.
-        assert!(plan[..plan.len() - 1]
-            .iter()
-            .all(|p| p.take == p.shard_rows));
-    }
-
-    #[test]
-    fn a_prefix_ending_exactly_on_a_boundary_does_not_open_the_next_shard() {
-        let plan = plan_shards(&[100, 200, 300], 300).unwrap();
-        assert_eq!(plan.len(), 2);
-        assert!(plan.iter().all(|p| p.take == p.shard_rows));
-        assert_eq!(
-            plan.last().unwrap().first_id + plan.last().unwrap().take,
-            300
-        );
-    }
-
-    #[test]
-    fn a_prefix_larger_than_the_corpus_is_an_error_not_a_short_corpus() {
-        let e = plan_shards(&[100, 200], 500).unwrap_err();
-        assert!(e.contains("short of the 500"), "{e}");
-        assert!(plan_shards(&[], 1).is_err());
-        // Zero rows requested is vacuously satisfiable and takes nothing.
-        assert!(plan_shards(&[100], 0).unwrap().is_empty());
-    }
-
-    /// The registered 10M variant really does span shards, so the untested path
-    /// is on the shipped list rather than hypothetical.
-    #[test]
-    fn the_ten_million_variant_is_the_one_that_crosses_a_boundary() {
-        let rows = vec![SHARD0_ROWS; SHARDS];
-        let big = variant("msmarco-cohere-1024-10M-cosine").unwrap();
-        assert!(plan_shards(&rows, big.limit).unwrap().len() > 1);
-        for v in VARIANTS.iter().filter(|v| v.limit <= SHARD0_ROWS) {
-            assert_eq!(plan_shards(&rows, v.limit).unwrap().len(), 1);
-        }
-    }
-
     #[test]
     fn coverage_floor_admits_the_real_variants_and_rejects_a_collapse() {
         // Measured on the real 100K build: 562 queries / 2134 positions.
@@ -2117,68 +1727,6 @@ mod tests {
         // Never below the absolute minimum, however tiny the prefix.
         assert_eq!(coverage_floor(1).1, 100);
         assert_eq!(coverage_floor(0).1, 100);
-    }
-
-    /// The up-front bound must agree with the after-the-fact check, or a run
-    /// could pass the cheap gate and fail the expensive one (or worse, vice
-    /// versa).
-    #[test]
-    fn the_upfront_bound_matches_the_after_the_fact_floor() {
-        // Real 100K numbers: 562 queries with hits, 2134 hits total.
-        check_coverage_upper_bound(100_000, 562, 2134).unwrap();
-        // Real 10M numbers.
-        check_coverage_upper_bound(10_000_000, 1675, 197_898).unwrap();
-
-        // A collapse is caught before any corpus byte is fetched, and the message
-        // says so.
-        let e = check_coverage_upper_bound(10_000_000, 1675, 100).unwrap_err();
-        assert!(e.contains("below the floor"), "{e}");
-        assert!(e.contains("corpus was not fetched"), "{e}");
-
-        // Identical verdict to the post-hoc check for the same inputs.
-        for (limit, q, p) in [(100_000u64, 562usize, 2134usize), (10_000_000, 5, 10)] {
-            assert_eq!(
-                check_coverage(limit, q, p).is_ok(),
-                check_coverage_upper_bound(limit, q, p).is_ok()
-            );
-        }
-    }
-
-    /// The prefix writer can only record what it writes. Tracking an offset
-    /// beyond the prefix makes its completeness check fail on a correct corpus —
-    /// which is exactly what shipping the unfiltered shipped list did.
-    #[test]
-    fn prefix_tracks_only_offsets_it_will_actually_write() {
-        let shipped = vec![5i64, 99_999, 100_000, 100_001, 5_000_000, -1];
-        let got = offsets_to_track(&shipped, Sampling::Prefix, 100_000);
-        assert_eq!(got, vec![5, 99_999]);
-        assert!(
-            got.iter().all(|o| *o < 100_000),
-            "a tracked offset outside the prefix can never be satisfied"
-        );
-        // Negative offsets are not silently cast into enormous u64s.
-        assert!(!got.contains(&(u64::MAX)));
-    }
-
-    /// The sampled writer cannot know its selection in advance, so it must be
-    /// offered everything.
-    #[test]
-    fn crc32_tracks_every_shipped_offset_regardless_of_position() {
-        let shipped = vec![5i64, 99_999, 100_000, 113_520_749];
-        let got = offsets_to_track(&shipped, Sampling::Crc32 { threshold: 886 }, 100_000);
-        assert_eq!(got, vec![5, 99_999, 100_000, 113_520_749]);
-    }
-
-    /// The two modes must genuinely differ here — if they ever returned the same
-    /// thing, one of them is wrong.
-    #[test]
-    fn the_two_modes_track_different_offsets() {
-        let shipped: Vec<i64> = (0..2_000).map(|i| i * 137).collect();
-        let prefix = offsets_to_track(&shipped, Sampling::Prefix, 100_000);
-        let sampled = offsets_to_track(&shipped, Sampling::Crc32 { threshold: 886 }, 100_000);
-        assert!(prefix.len() < sampled.len());
-        assert_eq!(sampled.len(), shipped.len());
-        assert!(prefix.iter().all(|o| sampled.contains(o)));
     }
 
     #[test]
