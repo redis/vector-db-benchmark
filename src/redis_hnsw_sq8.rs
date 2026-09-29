@@ -75,6 +75,7 @@ impl Sq8Options {
             .filter(|s| !s.is_empty());
         // A garbage env value is ignored when the config value for that field
         // wins, so only the env text that is actually used is validated.
+        let compression_from_env = config_compression.is_none() && env_compression.is_some();
         let compression = match (config_compression, env_compression) {
             (Some(c), _) => Some(c),
             (None, Some(e)) if e.eq_ignore_ascii_case("SQ8") => Some("SQ8"),
@@ -107,6 +108,13 @@ impl Sq8Options {
             data_type,
             skip_vector_index,
         )
+        .map_err(|e| {
+            if compression_from_env {
+                format!("{e} (from REDIS_HNSW_COMPRESSION)")
+            } else {
+                e
+            }
+        })
     }
 
     pub fn verify_ft_info(&self, info: &RedisValue) -> Result<(), String> {
@@ -272,6 +280,13 @@ mod tests {
         let e = resolve((Some("SQ8"), None), (None, Some("999999"))).unwrap_err();
         assert!(e.starts_with("REDIS_HNSW_TRAINING_THRESHOLD"), "{e}");
         assert!(resolve((Some("SQ8"), None), (None, Some("102400"))).is_ok());
+    }
+
+    #[test]
+    fn resolve_env_compression_dtype_error_names_the_variable() {
+        let e = Sq8Options::resolve(None, None, Some("SQ8".into()), None, "hnsw", "INT8", false)
+            .unwrap_err();
+        assert!(e.contains("REDIS_HNSW_COMPRESSION"), "{e}");
     }
 
     #[test]

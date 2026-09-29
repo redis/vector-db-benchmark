@@ -1963,10 +1963,11 @@ fn test_binary_redis_hnsw_sq8_reaches_server() {
             "false",
         ])
         .env("REDIS_PORT", test_port().to_string())
-        // Config wins over these for the first two engines; the third has no
-        // SQ8 config and must pick them up.
+        // redis-sq8-zero (config 0) and redis-sq8-trained (config 4) prove the
+        // config threshold wins over the env value 8; redis-sq8-env has no SQ8
+        // config and must pick up both env variables (threshold 8).
         .env("REDIS_HNSW_COMPRESSION", "SQ8")
-        .env("REDIS_HNSW_TRAINING_THRESHOLD", "4")
+        .env("REDIS_HNSW_TRAINING_THRESHOLD", "8")
         .current_dir(&root)
         .output()
         .expect("run SQ8 benchmark");
@@ -1979,7 +1980,7 @@ fn test_binary_redis_hnsw_sq8_reaches_server() {
     for (name, threshold) in [
         ("redis-sq8-zero", 0),
         ("redis-sq8-trained", 4),
-        ("redis-sq8-env", 4),
+        ("redis-sq8-env", 8),
     ] {
         let info: redis::Value = redis::cmd("FT.INFO")
             .arg(format!("idx:{name}"))

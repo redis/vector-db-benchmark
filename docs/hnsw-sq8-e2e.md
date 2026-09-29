@@ -39,12 +39,28 @@ integer from 0 to 102400. These variables apply only to HNSW configurations, not
 flat or SVS. Values in `collection_params.hnsw_config` (`COMPRESSION`,
 `TRAINING_THRESHOLD`) override the environment variables for each field.
 Whitespace is trimmed; an empty variable is treated as unset. An unparseable or
-out-of-range threshold value fails the run with an error naming the variable.
+out-of-range threshold value fails the run with an error naming the variable
+when the variable is actually used, that is when the configuration supplies no
+threshold; a config value wins and the variable is then not validated.
 Providing a threshold without compression from either source is an error.
 
 The resolved compression and threshold are recorded in result metadata as
-`hnsw_compression` and `hnsw_training_threshold`. The environment variables
-appear in the result's `env` record.
+`hnsw_compression` and `hnsw_training_threshold`. The raw environment variables
+appear in the result's `env` record, only for HNSW configurations that build a
+vector index (the variables are not read otherwise).
+
+The `verify_ft_info` read-back runs only when the index is created. This guide's
+workflow is two invocations (`--skip-search` upload, then `--skip-upload`
+search). Export identical values for both invocations; otherwise the search
+results record `hnsw_compression` for an index that was built differently, and
+nothing on the search path detects it.
+
+The variables apply to every HNSW configuration that lacks `COMPRESSION`,
+including the `-plain` baselines in `redis-hnsw-sq8-k10.json` and
+`redis-svs-sq8-comparison.json`. Do not export them while running the paired
+matrices: a plain baseline would silently become SQ8 under its plain name, and
+a threshold alone makes every plain case fail. Check `hnsw_compression` and
+`hnsw_training_threshold` in the result metadata before comparing runs.
 
 ## Execution
 
@@ -98,7 +114,7 @@ shared instance.
 
 ## Regenerating configurations
 
-Run `experiments/configurations/create-hnsw-sq8.py` to regenerate
+Run `python3 experiments/configurations/create-hnsw-sq8.py` to regenerate
 `redis-hnsw-sq8-k10.json` and `redis-svs-sq8-comparison.json`. Verify
 byte-for-byte identity with: `python3 experiments/configurations/create-hnsw-sq8.py
 && git diff --exit-code experiments/configurations`.
