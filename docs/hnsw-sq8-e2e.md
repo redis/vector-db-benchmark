@@ -32,6 +32,20 @@ For FLOAT16, report accuracy against the dataset's original ground truth as
 end-to-end quality including input conversion, and compare SQ8 with the FLOAT16
 baseline separately from FLOAT32.
 
+## Environment overrides
+
+Set `REDIS_HNSW_COMPRESSION` to `SQ8` and `REDIS_HNSW_TRAINING_THRESHOLD` to an
+integer from 0 to 102400. These variables apply only to HNSW configurations, not
+flat or SVS. Values in `collection_params.hnsw_config` (`COMPRESSION`,
+`TRAINING_THRESHOLD`) override the environment variables for each field.
+Whitespace is trimmed; an empty variable is treated as unset. An unparseable or
+out-of-range threshold value fails the run with an error naming the variable.
+Providing a threshold without compression from either source is an error.
+
+The resolved compression and threshold are recorded in result metadata as
+`hnsw_compression` and `hnsw_training_threshold`. The environment variables
+appear in the result's `env` record.
+
 ## Execution
 
 Run on a dedicated Redis instance. Pin the harness commit, Redis and Search
@@ -81,6 +95,13 @@ Set the dedicated server's `search-on-timeout` to `FAIL`. Drop the completed
 configuration's index with `FT.DROPINDEX idx:<config-name> DD` before the next
 configuration, after copying results and telemetry. Do not use `FLUSHALL` on a
 shared instance.
+
+## Regenerating configurations
+
+Run `experiments/configurations/create-hnsw-sq8.py` to regenerate
+`redis-hnsw-sq8-k10.json` and `redis-svs-sq8-comparison.json`. Verify
+byte-for-byte identity with: `python3 experiments/configurations/create-hnsw-sq8.py
+&& git diff --exit-code experiments/configurations`.
 
 ## Interpretation and regression checks
 
