@@ -35,7 +35,12 @@ and actual training threshold; the HNSW threshold field does not configure SVS.
 
 ## Dataset and workers
 
-Start with registered dataset `dbpedia-openai-1M-1536-angular-100neighbors`.
+Start with registered dataset `dbpedia-openai-975K-1536-angular-100neighbors`.
+This corrects the previous `dbpedia-openai-1M-1536-angular-100neighbors` entry:
+the archive contains 975,000 vectors, not 1,000,000. Its source URL is unchanged.
+Update saved commands to the corrected dataset name; existing downloads can be
+moved to `datasets/dbpedia-openai-975K-1536-angular-100neighbors/dbpedia_openai_975K`.
+
 Before measuring, verify the downloaded corpus count and that every measured
 query has at least 100 valid ground-truth neighbors. The registry name alone is
 not verification. The existing DBpedia 100K download has only 10 neighbors and
@@ -66,7 +71,7 @@ setting and `search-on-timeout=FAIL`.
 export REDIS_PORT=14960
 export REDIS_QUERY_TIMEOUT=90000
 CASE=redis-compare-float32-sq8-trained
-DATASET=dbpedia-openai-1M-1536-angular-100neighbors
+DATASET=dbpedia-openai-975K-1536-angular-100neighbors
 CONFIG=experiments/configurations/redis-svs-sq8-comparison.json
 
 ./target/release/vector-db-benchmark \
