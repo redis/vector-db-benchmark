@@ -1931,6 +1931,14 @@ fn test_binary_redis_hnsw_sq8_reaches_server() {
             }},
             "search_params": [{ "parallel": 1, "search_params": { "ef": 32 }, "top": 3 }],
             "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 32 }
+        },
+        {
+            "name": "redis-sq8-env",
+            "engine": "redis",
+            "algorithm": "hnsw",
+            "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 64 }},
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 32 }, "top": 3 }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 32 }
         }
     ]);
     let root = create_test_project(
@@ -1955,6 +1963,10 @@ fn test_binary_redis_hnsw_sq8_reaches_server() {
             "false",
         ])
         .env("REDIS_PORT", test_port().to_string())
+        // Config wins over these for the first two engines; the third has no
+        // SQ8 config and must pick them up.
+        .env("REDIS_HNSW_COMPRESSION", "SQ8")
+        .env("REDIS_HNSW_TRAINING_THRESHOLD", "4")
         .current_dir(&root)
         .output()
         .expect("run SQ8 benchmark");
@@ -1964,7 +1976,11 @@ fn test_binary_redis_hnsw_sq8_reaches_server() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    for (name, threshold) in [("redis-sq8-zero", 0), ("redis-sq8-trained", 4)] {
+    for (name, threshold) in [
+        ("redis-sq8-zero", 0),
+        ("redis-sq8-trained", 4),
+        ("redis-sq8-env", 4),
+    ] {
         let info: redis::Value = redis::cmd("FT.INFO")
             .arg(format!("idx:{name}"))
             .query(&mut conn)

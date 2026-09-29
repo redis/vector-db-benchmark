@@ -1422,6 +1422,16 @@ mod recorder_coverage_guard {
             "URL, used verbatim; userinfo stripped in `env`",
         ),
         (
+            "REDIS_HNSW_COMPRESSION",
+            "config takes precedence, then trim + empty-filter; resolved value \
+             recorded as `hnsw_compression`",
+        ),
+        (
+            "REDIS_HNSW_TRAINING_THRESHOLD",
+            "config takes precedence, then trim + integer parse (unparseable is \
+             fatal); resolved value recorded as `hnsw_training_threshold`",
+        ),
+        (
             "REDIS_KEY_PREFIX",
             "trimmed and `:`-suffixed before use, so the resolved namespace is \
              recorded as `shared_corpus_key_prefix`",

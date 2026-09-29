@@ -39,6 +39,10 @@ pub struct RedisEngineConfig {
     pub batch_size: usize,
     pub parallel: usize,
     pub skip_vector_index: bool,
+    /// HNSW SQ8 options, resolved once in `new()` with precedence
+    /// `collection_params.hnsw_config.{COMPRESSION,TRAINING_THRESHOLD}` > env
+    /// (`REDIS_HNSW_COMPRESSION` / `REDIS_HNSW_TRAINING_THRESHOLD`) > unset.
+    /// The env vars are read only for HNSW configs that build a vector index.
     pub hnsw_sq8: Sq8Options,
     /// SVS-VAMANA build params, resolved once in `new()` with precedence
     /// `collection_params.svs-vamana_config` > env (`REDIS_SVS_*`) > derived.
@@ -218,9 +222,19 @@ impl RedisEngine {
             .collection_params
             .as_ref()
             .and_then(|cp| cp.hnsw_config.as_ref());
-        let hnsw_sq8 = Sq8Options::from_hnsw_fields(
+        // Env fallback only for HNSW configs with a vector index, so a stray
+        // REDIS_HNSW_* variable never affects flat/SVS configs.
+        let read_sq8_env =
+            algorithm.eq_ignore_ascii_case("hnsw") && !engine_config.skip_vector_index;
+        let hnsw_sq8 = Sq8Options::resolve(
             hnsw_config.and_then(|h| h.compression.as_deref()),
             hnsw_config.and_then(|h| h.training_threshold),
+            read_sq8_env
+                .then(|| crate::effective_config::env_var("REDIS_HNSW_COMPRESSION").ok())
+                .flatten(),
+            read_sq8_env
+                .then(|| crate::effective_config::env_var("REDIS_HNSW_TRAINING_THRESHOLD").ok())
+                .flatten(),
             &algorithm,
             &data_type,
             engine_config.skip_vector_index,
