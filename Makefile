@@ -247,6 +247,13 @@ integration-test-no-docker:
 	@echo "=== Running integration tests (assumes redis on port 6399) ==="
 	cargo test --test integration_redis --release -- --nocapture --test-threads=1
 
+# Run only against a dedicated Redis Search build with HNSW SQ8 support.
+# REDIS_TEST_PORT selects the instance; the test claims it before any FLUSHALL.
+.PHONY: integration-test-redis-sq8
+integration-test-redis-sq8:
+	@test -n "$(REDIS_TEST_PORT)" || (echo "Set REDIS_TEST_PORT to a dedicated HNSW SQ8 Redis instance"; exit 1)
+	cargo test --test integration_redis --release test_binary_redis_hnsw_sq8_reaches_server -- --ignored --exact --nocapture --test-threads=1
+
 # ============================================================
 # BENCHMARK - Run Rust microbenchmarks
 # ============================================================

@@ -1894,6 +1894,110 @@ fn read_search_result_field(
 }
 
 #[test]
+#[ignore = "requires a Redis Search build with HNSW SQ8 support (merged #11330)"]
+fn test_binary_redis_hnsw_sq8_reaches_server() {
+    use vector_db_benchmark::redis_hnsw_sq8::Sq8Options;
+
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 16;
+    let (_, vectors) = generate_test_vectors(32, dim);
+    let queries = vectors[..4].to_vec();
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors(q, &vectors, 3))
+        .collect();
+    let engine_config = serde_json::json!([
+        {
+            "name": "redis-sq8-zero",
+            "engine": "redis",
+            "algorithm": "hnsw",
+            "collection_params": { "hnsw_config": {
+                "M": 16, "EF_CONSTRUCTION": 64,
+                "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 0
+            }},
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 32 }, "top": 3 }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 32 }
+        },
+        {
+            "name": "redis-sq8-trained",
+            "engine": "redis",
+            "algorithm": "hnsw",
+            "collection_params": { "hnsw_config": {
+                "M": 16, "EF_CONSTRUCTION": 64,
+                "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 4
+            }},
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 32 }, "top": 3 }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 32 }
+        },
+        {
+            "name": "redis-sq8-env",
+            "engine": "redis",
+            "algorithm": "hnsw",
+            "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 64 }},
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 32 }, "top": 3 }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 32 }
+        }
+    ]);
+    let root = create_test_project(
+        "test-sq8",
+        &serde_json::to_string_pretty(&engine_config).unwrap(),
+        &vectors,
+        &queries,
+        &neighbors,
+        "l2",
+        dim,
+    );
+    let output = Command::new(binary_path())
+        .args([
+            "--engines",
+            "redis-sq8-*",
+            "--datasets",
+            "test-sq8",
+            "--host",
+            "localhost",
+            "--keep-data",
+            "--skip-if-exists",
+            "false",
+        ])
+        .env("REDIS_PORT", test_port().to_string())
+        // redis-sq8-zero (config 0) and redis-sq8-trained (config 4) prove the
+        // config threshold wins over the env value 8; redis-sq8-env has no SQ8
+        // config and must pick up both env variables (threshold 8).
+        .env("REDIS_HNSW_COMPRESSION", "SQ8")
+        .env("REDIS_HNSW_TRAINING_THRESHOLD", "8")
+        .current_dir(&root)
+        .output()
+        .expect("run SQ8 benchmark");
+    assert!(
+        output.status.success(),
+        "SQ8 benchmark failed. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (name, threshold) in [
+        ("redis-sq8-zero", 0),
+        ("redis-sq8-trained", 4),
+        ("redis-sq8-env", 8),
+    ] {
+        let info: redis::Value = redis::cmd("FT.INFO")
+            .arg(format!("idx:{name}"))
+            .query(&mut conn)
+            .expect("FT.INFO for SQ8 index");
+        Sq8Options {
+            compression: Some("SQ8".into()),
+            training_threshold: Some(threshold),
+        }
+        .verify_ft_info(&info)
+        .unwrap_or_else(|error| panic!("{name}: {error}; server reply: {info:?}"));
+        assert_eq!(ft_info_num_docs(&mut conn, &format!("idx:{name}")), 32);
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn test_binary_redis_mixed_benchmark() {
     wait_for_redis();
     let mut conn = get_test_connection();
