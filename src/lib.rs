@@ -6,9 +6,11 @@
 //! - `msmarco` - MS MARCO v2.1 + Cohere embed-v3 corpus preparation (vectors + metadata)
 //! - `query_filter` - the one door from a dataset's `conditions` JSON to a filter
 //! - `config` - Redis configuration from environment
+//! - `kividb_caps` - version-gated KiviDB server capabilities
 //! - `redis_client` - Redis connection management
 
 pub mod config;
+pub mod kividb_caps;
 pub mod metrics;
 pub mod msmarco;
 pub mod parsers;

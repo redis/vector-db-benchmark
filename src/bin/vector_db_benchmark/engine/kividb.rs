@@ -39,7 +39,9 @@
 //!
 //! # RESP2 only
 //!
-//! KiviDB does not implement RESP3 — there is no protocol opt-in here (unlike
+//! KiviDB 1.0.2 (the version this engine was written against) did not
+//! implement RESP3; 1.0.5 does. There is no protocol opt-in here, so every
+//! version is served the same way (unlike
 //! dragonfly.rs's `DRAGONFLY_PROTOCOL=resp3`); every connection stays RESP2.
 //!
 //! # FT.INFO dialect: no `num_docs` / `percent_indexed`
@@ -71,6 +73,7 @@ use crate::dataset::Dataset;
 use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use crate::metrics::compute_metrics;
+use vector_db_benchmark::kividb_caps::{parse_kividb_version, supports_multivalued_tags};
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, doc_key_to_id, doc_key_to_id_opt};
 use vector_db_benchmark::readers::metadata::{is_multivalued_keyword_field, MetadataItem};
 use vector_db_benchmark::start_gate::WorkerPool;
@@ -222,7 +225,25 @@ impl KividbEngine {
         Ok(conn)
     }
 
-    fn create_index(&self, conn: &mut Connection, dataset: &Dataset) -> Result<(), String> {
+    /// Whether the connected server indexes a multi-valued keyword field
+    /// faithfully (`TAG SEPARATOR ;`), decided from the `kividb_version` it
+    /// reports — see `vector_db_benchmark::kividb_caps`. A server that does not
+    /// report a parseable version is treated as NOT supporting it, so the
+    /// dataset hard-errors instead of indexing a TAG that matches nothing.
+    fn server_supports_multivalued_tags(conn: &mut Connection) -> Result<bool, String> {
+        let info: String = redis::cmd("INFO")
+            .arg("server")
+            .query(conn)
+            .map_err(|e| format!("KiviDB: INFO server failed: {e}"))?;
+        Ok(supports_multivalued_tags(parse_kividb_version(&info)))
+    }
+
+    fn create_index(
+        &self,
+        conn: &mut Connection,
+        dataset: &Dataset,
+        multivalued_tags: bool,
+    ) -> Result<(), String> {
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
 
@@ -261,14 +282,15 @@ impl KividbEngine {
         //
         // Two KiviDB-specific departures from the RediSearch schema (both
         // verified live against the FT.CREATE parser):
-        //   * NO `SEPARATOR` modifier. KiviDB's FT.CREATE rejects it outright
-        //     ("unknown field type"), and a KiviDB TAG value is atomic — it is
-        //     never split on any separator (a query `@f:{b}` does not match a
-        //     stored `a;b;c`). So we declare a bare TAG (exact whole-string
-        //     match). Scalar keyword/uuid/bool filtering is unaffected; a
-        //     genuinely multi-valued `labels` array is caught and rejected at
-        //     upload time rather than indexed into a filter that silently
-        //     matches nothing (see `upload_batch_internal`).
+        //   * Scalar keyword/uuid/bool fields get a bare TAG (exact whole-string
+        //     match). A multi-valued keyword field (`labels`) gets
+        //     `TAG SEPARATOR ;` — the same declaration redis.rs uses, matching
+        //     the `;`-joined value `upload` stores — but ONLY on a server that
+        //     splits on it (KiviDB >= 1.0.5, see `kividb_caps`). Up to 1.0.4,
+        //     FT.CREATE rejected `SEPARATOR` outright ("unknown field type") and
+        //     TAG values were atomic (`@f:{b}` did not match a stored `a;b;c`),
+        //     so on those servers `validate_dataset_support` rejects the dataset
+        //     before this runs.
         //   * GEO is never declared: KiviDB's schema (`FieldType`) has no Geo
         //     variant at all, unlike Dragonfly's parser-level rejection of
         //     `$param` geo bounds — there is simply nothing to declare here.
@@ -277,6 +299,20 @@ impl KividbEngine {
         if let Some(schema) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) {
             for (field_name, field_type) in schema {
                 match field_type.as_str().unwrap_or("") {
+                    "keyword" if is_multivalued_keyword_field(field_name) => {
+                        // Unreachable when !multivalued_tags:
+                        // `validate_dataset_support` already rejected the
+                        // dataset. Asserted rather than assumed, so a future
+                        // caller that skips validation errors instead of
+                        // declaring an atomic TAG that matches nothing.
+                        if !multivalued_tags {
+                            return Err(format!(
+                                "KiviDB: refusing to declare multi-valued keyword field \
+                                 `{field_name}` on a server without TAG SEPARATOR support"
+                            ));
+                        }
+                        cmd.arg(field_name).arg("TAG").arg("SEPARATOR").arg(";");
+                    }
                     "keyword" | "uuid" | "bool" => {
                         cmd.arg(field_name).arg("TAG");
                     }
@@ -530,6 +566,11 @@ impl KividbEngine {
 /// list below is what was measured against a real `quay.io/kividbio/kividb:v1.0.2-full`
 /// server and is why KiviDB needs its own emitter. Every item was reproduced by
 /// hand with `FT.SEARCH` against a seeded index before being encoded here.
+///
+/// Re-measured on KiviDB 1.0.5 (README, "Re-measured on KiviDB 1.0.5"): items
+/// 1-7 and 9 no longer reproduce; 8 (no GEO field type) still does. The emitter
+/// is kept as-is because its literal, minimally-parenthesised output is correct
+/// on every version, including the 1.0.2 servers it was written against.
 ///
 /// 1. **`$param` placeholders are NOT substituted in a filter expression, in
 ///    ANY query form.** This is the root cause of issue #205. The failure is
@@ -1653,14 +1694,15 @@ fn upload_batch_internal(
                         hset_cmd.arg(k.as_str()).arg(f.to_string());
                     }
                     MetadataValue::Labels(labels) => {
-                        // A DECLARED multi-valued field never reaches this
-                        // point: `validate_dataset_support` rejects the dataset
-                        // in `configure()`, before the payload is even read,
-                        // because a KiviDB TAG value is atomic and could only
-                        // match the whole joined string.
+                        // Stored `;`-joined, as redis.rs does. A DECLARED
+                        // multi-valued field only reaches this point on a server
+                        // that splits TAG values on `;` (KiviDB >= 1.0.5);
+                        // `validate_dataset_support` rejects the dataset in
+                        // `configure()` on older servers, before the payload is
+                        // even read.
                         //
                         // An UNDECLARED labels field was never filterable on any
-                        // engine, so it is still stored joined — the HSET
+                        // engine, so it is stored joined either way — the HSET
                         // succeeds and a pure-KNN run over such a dataset keeps
                         // working, exactly as before.
                         hset_cmd.arg(k.as_str()).arg(labels.join(";"));
@@ -1684,8 +1726,9 @@ fn upload_batch_internal(
 /// Reject — BEFORE anything is created, read or uploaded — the dataset schema
 /// shapes KiviDB cannot index faithfully.
 ///
-/// Both rejections are decidable from `dataset.config.schema` alone, so they
-/// belong here and not deeper in the run. Doing them late is not merely slower,
+/// Both rejections are decidable from `dataset.config.schema` (plus, for
+/// `labels`, the server version) alone, so they belong here and not deeper in
+/// the run. Doing them late is not merely slower,
 /// it is actively harmful:
 ///
 /// * A geo condition can only be seen in `search()`, i.e. AFTER the whole corpus
@@ -1699,10 +1742,11 @@ fn upload_batch_internal(
 ///
 /// Failing in `configure()` makes both aborts instant and leaves nothing behind.
 ///
-/// Exactly three shipped datasets are affected: the two
-/// `random-geo-radius-*-angular-filters` (geo) and
-/// `arxiv-titles-384-angular-filters` (multi-valued `labels`).
-fn validate_dataset_support(dataset: &Dataset) -> Result<(), String> {
+/// Shipped datasets affected: the two `random-geo-radius-*-angular-filters`
+/// (geo, every KiviDB version) and `arxiv-titles-384-angular-filters`
+/// (multi-valued `labels`, only on servers older than 1.0.5 — `multivalued_tags`
+/// is false; from 1.0.5 the field is declared `TAG SEPARATOR ;` and filtered).
+fn validate_dataset_support(dataset: &Dataset, multivalued_tags: bool) -> Result<(), String> {
     let Some(schema) = dataset.config.schema.as_ref().and_then(|s| s.as_object()) else {
         return Ok(());
     };
@@ -1726,16 +1770,18 @@ fn validate_dataset_support(dataset: &Dataset) -> Result<(), String> {
                 ));
             }
             // Only `keyword` reaches `create_index`'s TAG arm, which is where the
-            // atomic-TAG limitation below bites.
-            "keyword" if is_multivalued_keyword_field(field_name) => {
+            // atomic-TAG limitation below bites — on servers older than 1.0.5.
+            "keyword" if is_multivalued_keyword_field(field_name) && !multivalued_tags => {
                 return Err(format!(
-                    "KiviDB cannot benchmark dataset `{dataset_name}`: its schema declares the \
-                     multi-valued keyword field `{field_name}`, and a KiviDB TAG value is ATOMIC \
-                     — `FT.CREATE` rejects the `SEPARATOR` modifier outright and `@{field_name}:\
-                     {{b}}` does not match a stored `a;b;c`. A `match_any` over `{field_name}` \
+                    "KiviDB cannot benchmark dataset `{dataset_name}` on this server: its schema \
+                     declares the multi-valued keyword field `{field_name}`, and before KiviDB \
+                     1.0.5 a TAG value is ATOMIC — `FT.CREATE` rejects the `SEPARATOR` modifier \
+                     outright and `@{field_name}:{{b}}` does not match a stored `a;b;c` (the \
+                     server did not report `kividb_version` >= 1.0.5). A `match_any` over `{field_name}` \
                      could therefore only ever match the whole joined string, i.e. zero documents, \
                      and the run would publish recall 0.0 for a filter that was never applied. \
-                     Per-run remedies: drop this dataset from `--datasets` and use its unfiltered \
+                     Per-run remedies: run against KiviDB >= 1.0.5, which splits TAG values on \
+                     `SEPARATOR`; drop this dataset from `--datasets` and use its unfiltered \
                      twin `arxiv-titles-384-angular-no-filters` for a pure-KNN KiviDB number, or \
                      keep the sweep going past it with `--exit-on-error false`. Do NOT edit the \
                      field out of `datasets/datasets.json` — that file is shared, and qdrant, \
@@ -2038,20 +2084,21 @@ impl Engine for KividbEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
-        // FIRST, before a connection is opened or an index dropped/created: a
-        // dataset whose schema KiviDB cannot index faithfully aborts here rather
-        // than after the corpus has been uploaded (geo) or parsed (labels). See
-        // `validate_dataset_support`.
-        validate_dataset_support(dataset)?;
-
+        // FIRST, before an index is dropped/created: a dataset whose schema
+        // KiviDB cannot index faithfully aborts here rather than after the corpus
+        // has been uploaded (geo) or parsed (labels). See
+        // `validate_dataset_support`. Whether `labels` is indexable depends on
+        // the server version, so the connection is opened first.
         let mut conn = self.get_connection()?;
+        let multivalued_tags = Self::server_supports_multivalued_tags(&mut conn)?;
+        validate_dataset_support(dataset, multivalued_tags)?;
 
         println!(
             "Using algorithm {} with config {{'M': {}, 'EF_CONSTRUCTION': {}}}",
             self.config.algorithm, self.config.m, self.config.ef_construction
         );
 
-        self.create_index(&mut conn, dataset)?;
+        self.create_index(&mut conn, dataset, multivalued_tags)?;
         // Best-effort; see check_commandstats note in upload()/search() below.
         self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
         self.commandstats_primed = true;
@@ -2158,8 +2205,13 @@ impl Engine for KividbEngine {
         self.prime_commandstats_if_needed()?;
 
         // Repeated for the `--skip-upload` path, which reaches `search()`
-        // without ever calling `configure()`. Schema-only, so it costs nothing.
-        validate_dataset_support(dataset)?;
+        // without ever calling `configure()`. One INFO round trip, outside every
+        // timed window.
+        {
+            let mut conn = self.get_connection()?;
+            let multivalued_tags = Self::server_supports_multivalued_tags(&mut conn)?;
+            validate_dataset_support(dataset, multivalued_tags)?;
+        }
 
         // Index-existence guard: on the --skip-upload path a missing or
         // mismatched index would otherwise write a silent recall-0.0 result file.
@@ -2441,6 +2493,47 @@ mod tests {
 
     fn bulk(s: &str) -> Value {
         Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    fn dataset_with_schema(schema: serde_json::Value) -> Dataset {
+        Dataset::new(crate::config::DatasetConfig {
+            name: "schema-test".to_string(),
+            dataset_type: None,
+            path: serde_json::Value::Null,
+            distance: Some("cosine".to_string()),
+            vector_size: Some(8),
+            vector_count: None,
+            link: None,
+            schema: Some(schema),
+            description: None,
+        })
+    }
+
+    #[test]
+    fn multivalued_labels_rejected_only_without_tag_separator_support() {
+        let ds = dataset_with_schema(serde_json::json!({"labels": "keyword"}));
+        let err = validate_dataset_support(&ds, false).unwrap_err();
+        assert!(err.contains("multi-valued keyword field `labels`"), "{err}");
+        assert!(err.contains("1.0.5"), "remedy must name the version: {err}");
+        validate_dataset_support(&ds, true)
+            .expect("a >= 1.0.5 server indexes `labels` as TAG SEPARATOR ;");
+    }
+
+    #[test]
+    fn geo_is_rejected_on_every_server_version() {
+        let ds = dataset_with_schema(serde_json::json!({"location": "geo"}));
+        for multivalued_tags in [false, true] {
+            let err = validate_dataset_support(&ds, multivalued_tags).unwrap_err();
+            assert!(err.contains("geo"), "{err}");
+        }
+    }
+
+    #[test]
+    fn scalar_keyword_is_accepted_on_every_server_version() {
+        let ds = dataset_with_schema(serde_json::json!({"color": "keyword", "n": "int"}));
+        for multivalued_tags in [false, true] {
+            validate_dataset_support(&ds, multivalued_tags).expect("scalar fields are fine");
+        }
     }
 
     #[test]

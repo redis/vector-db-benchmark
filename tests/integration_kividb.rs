@@ -566,14 +566,18 @@ fn test_binary_kividb_geo_is_rejected_not_silently_dropped() {
     );
 }
 
-/// Multi-valued `labels`: a KiviDB TAG value is atomic (never split on any
-/// separator), so a `match_any` over a labels array can only ever match the
-/// whole joined string — i.e. nothing. The run must abort rather than build an
-/// index that silently answers every such query with zero documents — and abort
-/// in `configure()`, before the payload file is parsed at all (3.6 GB for the
-/// shipped `arxiv-titles-384-angular-filters`).
+/// Multi-valued `labels`: from KiviDB 1.0.5 the field is declared
+/// `TAG SEPARATOR ;` (as redis.rs does) and a `match_any` over the array has
+/// contains-any semantics. The fixture's ground truth is filtered on that
+/// semantics, so an engine that indexes the joined string as one atomic TAG —
+/// what KiviDB <= 1.0.4 did, and what this engine still refuses to do on such a
+/// server (see `validate_dataset_support`) — scores ~0 recall and fails here.
+///
+/// CI pins a >= 1.0.5 image (`tests/docker-compose.test.yml`), so this asserts
+/// the filtered path. The pre-1.0.5 hard error is covered by the unit test
+/// `multivalued_labels_rejected_only_without_tag_separator_support`.
 #[test]
-fn test_binary_kividb_multivalued_labels_is_rejected_not_silently_mis_encoded() {
+fn test_binary_kividb_multivalued_labels_match_any() {
     wait_for_kividb();
     let mut conn = get_test_connection();
     flush_db(&mut conn);
@@ -592,20 +596,26 @@ fn test_binary_kividb_multivalued_labels_is_rejected_not_silently_mis_encoded() 
         common::GtMetric::L2,
     );
     assert!(
-        !common::run_binary(
+        proj.matching_docs >= proj.top,
+        "fixture must have >= top matching docs (got {})",
+        proj.matching_docs
+    );
+    assert!(
+        common::run_binary(
             &proj.root,
             "kividb-labels",
             "kividb-labels-test",
             TEST_HOST,
             &[("KIVIDB_PORT", test_port().to_string().as_str())],
         ),
-        "kividb must REJECT a multi-valued labels field, not index it as an atomic TAG"
+        "kividb multi-valued labels run failed (needs a KiviDB >= 1.0.5 server)"
     );
-    assert_no_results_written(&proj.root);
-    assert_eq!(
-        redis::cmd("DBSIZE").query::<i64>(&mut conn).unwrap_or(-1),
-        0,
-        "a multi-valued labels dataset must be rejected BEFORE the corpus is uploaded"
+    let recall = common::read_recall(&proj.root, "kividb-labels");
+    println!("kividb match_any labels recall={:.3}", recall);
+    assert!(
+        recall >= 0.9,
+        "kividb multi-valued labels match_any recall {:.3} < 0.9",
+        recall
     );
 }
 

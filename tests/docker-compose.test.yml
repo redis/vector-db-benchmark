@@ -194,7 +194,7 @@ services:
       retries: 10
 
   kividb:
-    image: quay.io/kividbio/kividb:v1.0.2-full
+    image: quay.io/kividbio/kividb:v1.0.5-full
     # KiviDB listens on 6380 internally (not 6379). The image ships no
     # redis-cli/valkey-cli, but it does include bash, so the healthcheck opens
     # a raw TCP connection to the server port to confirm readiness.
