@@ -35,6 +35,23 @@ pub fn disable_vector_index(properties: &mut Value, settings: &mut Value) {
     settings["knn"] = json!(false);
 }
 
+/// A scalar run renames configs to `<engine>-no-vector`; accepting more than
+/// one config for that engine would discard differences in limits or schema.
+/// Refuse the selection before any dataset download or engine connection.
+pub fn validate_engine_selection<'a>(
+    engines: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<(), String> {
+    let mut selected = std::collections::HashMap::new();
+    for (name, engine) in engines {
+        if let Some(previous) = selected.insert(engine, name) {
+            return Err(format!(
+                "--skip-vector-index requires one config per engine type: {engine:?} selected by {previous:?} and {name:?}; select a single config"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Pick only explicit predicates, preserving their order and cycling only when
 /// a positive query count is requested. Vector ground truth is irrelevant.
 pub fn query_indices(

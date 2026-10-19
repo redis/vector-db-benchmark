@@ -441,7 +441,9 @@ results do not describe a mixed write workload or vector retrieval.
 
 Only queries with explicit predicates run. `--queries N` cycles those queries,
 and the experiment is named `<engine>-no-vector`. Select one engine config
-with one point per client count. All `--skip-vector-index` engines reject
+with one point per client count. Selecting multiple configs for the same engine
+with `--skip-vector-index` fails before download or connection; the runner never
+silently keeps the first. All `--skip-vector-index` engines reject
 conflicting `top` values at the same client count instead of silently picking one.
 Only Redis/OpenSearch treat omitted `top` as 10; legacy Valkey/MongoDB derive
 it from ground truth, so mixing an omitted and explicit limit is rejected.
@@ -459,8 +461,10 @@ unequal category populations, exact numeric/tag values, floating-point range
 boundaries, AND/OR, and an empty result, and inspect the realized server schema.
 
 Redis filter-only workers require RESP3 and reject replies with any warning,
-including partial results from query timeouts. No server configuration changes
-are required, so the same guard works on Redis Cloud.
+including partial results from query timeouts. Replies must include the complete
+RESP3 warning metadata; missing metadata fails closed. No server configuration
+changes are required. Managed deployments must expose that response contract;
+the Redis Cloud benchmark has not yet validated it.
 
 The realized index schema is checked before timing, including index reuse:
 vector indexes are rejected, numeric fields retain double precision, and tags

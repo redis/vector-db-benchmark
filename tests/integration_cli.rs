@@ -68,3 +68,88 @@ fn describe_unknown_option_errors_out() {
         "expected a helpful error on stderr:\n{stderr}"
     );
 }
+
+/// Registry selection must fail before touching a missing corpus or a server.
+/// Exercise distinct configs whose differences the old first-config retain lost.
+#[test]
+fn scalar_duplicate_configs_fail_before_download_or_connection() {
+    use serde_json::json;
+    for (engine, first, second) in [
+        (
+            "redis",
+            json!({"search_params":[{"top":3}]}),
+            json!({"search_params":[{"top":10}]}),
+        ),
+        (
+            "opensearch",
+            json!({"collection_params":{"number_of_shards":1}}),
+            json!({"collection_params":{"number_of_shards":4}}),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let datasets = root.path().join("datasets");
+        std::fs::create_dir(&datasets).unwrap();
+        // A closed ephemeral loopback endpoint makes a broken guard fail quickly
+        // instead of contacting a real server or downloading a real dataset.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        drop(listener);
+        std::fs::write(
+            datasets.join("datasets.json"),
+            json!([{
+                "name":"scalar-selection-fixture", "type":"tar", "path":"missing-corpus",
+                "vector_size":1,"distance":"l2","schema":{"tag":"keyword"},
+                "link":format!("http://127.0.0.1:{port}/must-not-download.tar.gz")
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let configs: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut config)| {
+                config["name"] = json!(format!("candidate-{i}"));
+                config["engine"] = json!(engine);
+                config
+            })
+            .collect();
+        let engines_file = root.path().join("engines.json");
+        std::fs::write(&engines_file, json!(configs).to_string()).unwrap();
+        let output = Command::new(common::binary_path())
+            .current_dir(root.path())
+            .args([
+                "--skip-vector-index",
+                "--engines",
+                "candidate-*",
+                "--datasets",
+                "scalar-selection-fixture",
+                "--host",
+                "127.0.0.1",
+                "--engines-file",
+            ])
+            .arg(&engines_file)
+            .env("REDIS_PORT", &port)
+            .env("OPENSEARCH_PORT", &port)
+            .env("OPENSEARCH_TIMEOUT", "1")
+            .env("OPENSEARCH_INDEX_OP_MAX_RETRIES", "0")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success());
+        for detail in [
+            "one config per engine type",
+            engine,
+            "candidate-0",
+            "candidate-1",
+        ] {
+            assert!(
+                stderr.contains(detail),
+                "{engine}: missing {detail:?}: {stderr} / {stdout}"
+            );
+        }
+        assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+        assert!(!stdout.contains("Downloading"), "{stdout}");
+        assert!(!datasets.join("missing-corpus").exists());
+    }
+}

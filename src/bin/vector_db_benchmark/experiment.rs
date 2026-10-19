@@ -166,7 +166,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         "vertex",
         "chroma",
     ];
-    let mut engines: Vec<_> = engine_configs
+    let engines: Vec<_> = engine_configs
         .iter()
         .filter(|(name, config)| {
             let engine_type = config.engine.as_deref().unwrap_or("");
@@ -199,19 +199,14 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
     }
 
-    // --skip-vector-index: deduplicate engine configs by engine type.
-    // Multiple M/EF variants (e.g. redis-m-16-ef-64, redis-m-32-ef-128) collapse
-    // into a single "<engine_type>-no-vector" experiment.
+    // Scalar runs require one explicit config per engine; silently keeping the
+    // first would discard result-limit and index-setting differences.
     if args.skip_vector_index {
-        let mut seen_engine_types = std::collections::HashSet::new();
-        engines.retain(|(_, config)| {
-            let engine_type = config.engine.as_deref().unwrap_or("unknown");
-            seen_engine_types.insert(engine_type.to_string())
-        });
-        println!(
-            "--skip-vector-index: deduplicated to {} engine(s)",
-            engines.len()
-        );
+        vector_db_benchmark::filter_only::validate_engine_selection(
+            engines.iter().map(|(name, config)| {
+                (name.as_str(), config.engine.as_deref().unwrap_or("unknown"))
+            }),
+        )?;
     }
 
     // Collision guard (#151-4): among the selected configs, no two configs of the
@@ -220,7 +215,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     // and keyspace with another's (the exact bug this fix closes). Also fires when
     // an `*_EXACT` pin is set with >1 config for that engine (every
     // config then resolves to the same verbatim base). In --skip-vector-index mode
-    // the dedup above already leaves one config per engine, so this is a no-op.
+    // selection validation above guarantees one config per engine.
     {
         use crate::engine::index_naming::{derive_index_name, index_name_exact};
         let mut seen: std::collections::HashMap<(String, String), String> =

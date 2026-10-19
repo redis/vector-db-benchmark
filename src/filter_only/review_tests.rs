@@ -613,3 +613,17 @@ fn missing_numeric_schema_field_diagnostic_does_not_claim_tag() {
         .unwrap_err();
     assert_eq!(error, "filter-only missing indexed field price");
 }
+
+#[test]
+fn scalar_engine_selection_refuses_every_duplicate_type_before_collapsing_names() {
+    validate_engine_selection([]).unwrap();
+    validate_engine_selection([("r", "redis"), ("os", "opensearch"), ("v", "valkey")]).unwrap();
+    for engine in ["redis", "opensearch", "valkey", "mongodb"] {
+        let error =
+            validate_engine_selection([("first", engine), ("other", "qdrant"), ("second", engine)])
+                .unwrap_err();
+        for detail in ["one config per engine type", "first", "second", engine] {
+            assert!(error.contains(detail), "{error}");
+        }
+    }
+}
