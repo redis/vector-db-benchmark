@@ -2,7 +2,8 @@
 //!
 //! Redis TAG splits on `;` and trims edge whitespace, unlike an OpenSearch
 //! keyword. Reject those tokens (and empty tokens) instead of comparing different
-//! predicates. Redis NUMERIC uses binary64: integer data and operands must lie
+//! predicates. Floating-point keyword metadata is rejected because the adapters
+//! use different string encodings (especially scientific notation). Redis NUMERIC uses binary64: integer data and operands must lie
 //! within +/-2^53. Numeric query operands must be JSON numbers, and numeric
 //! `match.any` currently supports integer lists only, matching the Redis parser.
 //! These checks apply only to declared `keyword`, `int`, and `float` fields;
@@ -74,9 +75,12 @@ pub fn validate_metadata(
                             keyword(field, token)?;
                         }
                     }
-                    // Both upload paths coerce numeric keyword data to strings.
+                    // Integer formatting agrees across the two upload paths;
+                    // floating-point formatting does not (e.g. 1e30 and 1e-7).
                     MetadataValue::Int(_) => {}
-                    MetadataValue::Float(n) => finite(field, *n)?,
+                    MetadataValue::Float(_) => {
+                        return Err(error(field, "floating-point keyword metadata is outside the common domain; use an explicit string"));
+                    }
                     MetadataValue::Geo { .. } => {
                         return Err(error(field, "keyword metadata must be scalar or labels"));
                     }
@@ -269,7 +273,6 @@ mod tests {
         for (field, value) in [
             ("tag", MetadataValue::String("Mixed Case café".into())),
             ("tag", MetadataValue::Int(i64::MAX)),
-            ("tag", MetadataValue::Float(1.5)),
             (
                 "labels",
                 MetadataValue::Labels(vec!["a".into(), "B".into()]),
@@ -440,5 +443,47 @@ mod tests {
         let error = keyword(&field, &secret).unwrap_err();
         assert!(error.len() < 256);
         assert!(!error.contains("sensitive"));
+    }
+}
+
+#[cfg(test)]
+mod keyword_numeric_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn floating_keyword_data_is_rejected_at_format_boundaries_but_integer_tokens_survive() {
+        let schema = json!({"tag":"keyword"});
+        let check = |value| {
+            validate_metadata(
+                &[Some(MetadataItem {
+                    fields: vec![("tag".into(), value)],
+                })],
+                Some(&schema),
+            )
+        };
+        for value in [
+            1e30,
+            1e-7,
+            1e-6,
+            1.0,
+            1.5,
+            0.0,
+            -0.0,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::NAN,
+            f64::INFINITY,
+        ] {
+            let error = check(MetadataValue::Float(value)).unwrap_err();
+            assert!(error.contains("floating-point keyword"), "{error}");
+        }
+        for value in [i64::MIN, -1, 0, 1, i64::MAX] {
+            check(MetadataValue::Int(value)).unwrap();
+            check(MetadataValue::String(value.to_string())).unwrap();
+        }
+        for token in ["1e30", "1e-7", "0.0000001"] {
+            check(MetadataValue::String(token.into())).unwrap();
+        }
     }
 }

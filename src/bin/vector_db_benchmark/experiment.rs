@@ -1431,6 +1431,10 @@ fn run_single_experiment(
         let effective_search_params: Vec<(usize, SearchParams)> = if skip_vector_index {
             vector_db_benchmark::filter_only::search_param_indices(
                 all_search_params.iter().map(|sp| (sp.parallel, sp.top)),
+                // --skip-vector-index canonicalizes names to <engine>-no-vector.
+                // Legacy adapters still derive their default from ground truth.
+                matches!(engine.name(), "redis-no-vector" | "opensearch-no-vector")
+                    .then_some(vector_db_benchmark::filter_only::DEFAULT_LIMIT as i64),
             )?
             .into_iter()
             .map(|index| (index, all_search_params[index].clone()))

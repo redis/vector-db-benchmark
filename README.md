@@ -443,6 +443,8 @@ Only queries with explicit predicates run. `--queries N` cycles those queries,
 and the experiment is named `<engine>-no-vector`. Select one engine config
 with one point per client count. All `--skip-vector-index` engines reject
 conflicting `top` values at the same client count instead of silently picking one.
+Only Redis/OpenSearch treat omitted `top` as 10; legacy Valkey/MongoDB derive
+it from ground truth, so mixing an omitted and explicit limit is rejected.
 Use `--fail-on-dropped-queries --repetitions 1` for paired
 runs. Search and summary JSONs carry `workload: filter-only`, the result limit,
 and sums of exact match and returned-ID counts. The Redis and OpenSearch scalar
@@ -462,10 +464,13 @@ are required, so the same guard works on Redis Cloud.
 
 The realized index schema is checked before timing, including index reuse:
 vector indexes are rejected, numeric fields retain double precision, and tags
-are case-sensitive. OpenSearch does not require `_id` fielddata. The common
+are case-sensitive; reused OpenSearch keyword fields cannot set `ignore_above`.
+OpenSearch does not require `_id` fielddata. The common
 numeric/tag domain rejects empty tags, tags containing `;` or edge whitespace,
 integers outside +/-2^53, and negative floating-point zero (whose equality
-semantics differ between the engines). Numeric operands must be JSON numbers; numeric
+semantics differ between the engines). Floating-point keyword metadata is also
+rejected because the upload paths stringify it differently; provide explicit
+strings for those tokens. Integer keyword tokens remain supported. Numeric operands must be JSON numbers; numeric
 `match.any` accepts integer lists. These checks run before upload/search timing. On reuse, payloads are validated
 one row at a time and corpus size is checked from the NPY header; vector values
 are neither loaded nor decoded.

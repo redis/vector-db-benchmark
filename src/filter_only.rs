@@ -60,18 +60,22 @@ pub fn query_indices(
 /// Keep the first search config at each concurrency, ignoring vector-only EF
 /// differences. A different result limit changes the scalar workload, so refuse
 /// to silently drop it while collapsing redundant vector search configs.
+/// Only Redis/OpenSearch have the fixed scalar default of 10. Legacy adapters
+/// derive an omitted limit from the dataset, so None must remain distinct from
+/// every explicit limit when their default is unknown.
 pub fn search_param_indices(
     params: impl IntoIterator<Item = (Option<i64>, Option<i64>)>,
+    default_limit: Option<i64>,
 ) -> Result<Vec<usize>, String> {
     let mut limits = std::collections::HashMap::new();
     let mut selected = Vec::new();
     for (index, (parallel, top)) in params.into_iter().enumerate() {
         let parallel = parallel.unwrap_or(1);
-        let top = top.unwrap_or(DEFAULT_LIMIT as i64);
+        let top = top.or(default_limit);
         if let Some(previous) = limits.get(&parallel) {
             if *previous != top {
                 return Err(format!(
-                    "filter-only search configs for parallel={parallel} have conflicting result limits: top={previous} vs top={top}; use one result limit per parallel level"
+                    "filter-only search configs for parallel={parallel} have conflicting result limits: top={previous:?} vs top={top:?}; use one result limit per parallel level"
                 ));
             }
         } else {
@@ -114,6 +118,11 @@ pub fn validate_opensearch_schema(
             {
                 return Err(format!(
                     "filter-only requires case-sensitive keyword mapping for {field}"
+                ));
+            }
+            if kind == "keyword" && !properties[field]["ignore_above"].is_null() {
+                return Err(format!(
+                    "filter-only requires keyword mapping without ignore_above for {field}"
                 ));
             }
         }
@@ -169,7 +178,7 @@ pub fn validate_redis_schema(info: &Value, schema: Option<&Value>) -> Result<(),
             let attr = attributes
                 .iter()
                 .find(|a| field(a, "attribute").and_then(Value::as_str) == Some(name))
-                .ok_or_else(|| format!("filter-only missing TAG field {name}"))?;
+                .ok_or_else(|| format!("filter-only missing indexed field {name}"))?;
             let has_flag = |name: &str| {
                 entries(attr).any(|(key, value)| key == name && value.is_none())
                     || field(attr, "flags")

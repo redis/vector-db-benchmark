@@ -535,23 +535,26 @@ fn redis_schema_rejects_unindexed_scalar_attributes() {
 
 #[test]
 fn scalar_search_params_keep_first_config_per_parallel_with_effective_defaults() {
-    assert!(search_param_indices([]).unwrap().is_empty());
+    assert!(search_param_indices([], Some(10)).unwrap().is_empty());
     assert_eq!(
-        search_param_indices([
-            (None, None),
-            (Some(1), Some(10)),
-            (Some(100), Some(3)),
-            (Some(100), Some(3)),
-            (Some(2), None),
-            (Some(2), Some(10)),
-        ])
+        search_param_indices(
+            [
+                (None, None),
+                (Some(1), Some(10)),
+                (Some(100), Some(3)),
+                (Some(100), Some(3)),
+                (Some(2), None),
+                (Some(2), Some(10)),
+            ],
+            Some(10)
+        )
         .unwrap(),
         vec![0, 2, 4]
     );
     // Parallel levels may deliberately use different limits. Only a config
     // that would be silently discarded at the same level is conflicting.
     assert_eq!(
-        search_param_indices([(Some(100), Some(3)), (None, Some(20))]).unwrap(),
+        search_param_indices([(Some(100), Some(3)), (None, Some(20))], Some(10)).unwrap(),
         vec![0, 1]
     );
 }
@@ -563,9 +566,50 @@ fn scalar_search_params_reject_different_effective_limits_at_same_parallel() {
         vec![(Some(4), Some(3)), (Some(4), None)],
         vec![(Some(4), Some(3)), (Some(2), Some(3)), (Some(4), Some(4))],
     ] {
-        let error = search_param_indices(params).unwrap_err();
+        let error = search_param_indices(params, Some(10)).unwrap_err();
         assert!(error.contains("conflicting result limits"), "{error}");
         assert!(error.contains("parallel="), "{error}");
         assert!(error.contains("top="), "{error}");
     }
+}
+
+#[test]
+fn legacy_search_params_do_not_invent_a_ten_result_default() {
+    // Valkey/Mongo can derive 100 from ground truth; None is not Some(10).
+    for params in [
+        [(None, None), (Some(1), Some(10))],
+        [(None, Some(10)), (Some(1), None)],
+    ] {
+        assert!(search_param_indices(params, None).is_err());
+        assert_eq!(search_param_indices(params, Some(10)).unwrap(), vec![0]);
+    }
+    assert_eq!(
+        search_param_indices([(None, None), (Some(1), None), (Some(100), None)], None).unwrap(),
+        vec![0, 2]
+    );
+    assert_eq!(
+        search_param_indices([(None, Some(10)), (Some(1), Some(10))], None).unwrap(),
+        vec![0]
+    );
+}
+
+#[test]
+fn opensearch_keyword_reuse_rejects_length_truncation() {
+    let schema = scalar_schema();
+    let mut properties = os_properties();
+    for limit in [json!(0), json!(1), json!(256), json!(2147483647)] {
+        properties["tag"]["ignore_above"] = limit;
+        let error = validate_opensearch_schema(&properties, &json!({"knn":false}), Some(&schema))
+            .unwrap_err();
+        assert!(error.contains("ignore_above"), "{error}");
+    }
+    properties["tag"]["ignore_above"] = Value::Null;
+    validate_opensearch_schema(&properties, &json!({"knn":false}), Some(&schema)).unwrap();
+}
+
+#[test]
+fn missing_numeric_schema_field_diagnostic_does_not_claim_tag() {
+    let error = validate_redis_schema(&json!({"attributes":[]}), Some(&json!({"price":"float"})))
+        .unwrap_err();
+    assert_eq!(error, "filter-only missing indexed field price");
 }
