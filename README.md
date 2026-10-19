@@ -143,7 +143,7 @@ Avoid selecting by glob here: `--engines 'opensearch-m-*'` matches only 6 of the
 
 Force-merge needs its own two bounds because it is not sized like the other requests. It merges the index down to a single segment, which rewrites the whole corpus: measured at 1,077–1,312 s for 1.18M vectors, well past the 300 s client-wide `OPENSEARCH_TIMEOUT`. Sharing that bound would abort every attempt client-side while the merge kept running on the server, and spend the whole `OPENSEARCH_INDEX_OP_MAX_RETRIES` budget failing a merge that was always going to succeed — discarding a completed multi-hour ingest at the last step. The wall-clock budget then bounds the retrying itself, since a per-attempt bound of an hour and eleven attempts is otherwise an ~11 h worst case. Both reject a malformed value loudly rather than silently falling back to the default.
 
-Search retries are deliberately short and additionally bounded by a wall-clock budget, because a single transport attempt can block for `OPENSEARCH_TIMEOUT`. **Backoff is excluded from the reported latency**: a retried query is billed only for the attempt that produced its result, so the percentiles stay comparable with engines that do not retry. Queries that needed a retry are counted and reported separately (`⚠ N of M search queries succeeded only after a retry`), since clean latency figures would otherwise hide that the server was shedding load.
+In vector mode, search retries are deliberately short and additionally bounded by a wall-clock budget, because a single transport attempt can block for `OPENSEARCH_TIMEOUT`. **Backoff is excluded from the reported latency**: a retried query is billed only for the attempt that produced its result, so the percentiles stay comparable with engines that do not retry. Queries that needed a retry are counted and reported separately (`⚠ N of M search queries succeeded only after a retry`), since clean latency figures would otherwise hide that the server was shedding load.
 
 Dropped queries are handled uniformly across all engines, not here: `failed_queries` is recorded in the results JSON and warned about, and `--fail-on-dropped-queries` makes it fatal. See that flag's help for why it is off by default.
 
@@ -434,8 +434,8 @@ Redis uses `FT.SEARCH ... NOCONTENT DIALECT 2`; OpenSearch uses `bool.filter`,
 connection setup and one priming query from the timed window. OpenSearch scalar
 latency includes its bounded retries/backoff. Redis scalar queries use one attempt
 without reconnect/retry; a connection failure can fail subsequent queries on that
-worker. The paired workflow fails on any dropped query. This retry-policy
-difference must be considered when interpreting results under failures.
+worker. The downstream paired workflow fails on any dropped or retried query.
+This retry-policy difference must be considered when interpreting results under failures.
 This is a warm, immutable-corpus benchmark;
 results do not describe a mixed write workload or vector retrieval.
 
@@ -453,7 +453,11 @@ runs. Search and summary JSONs carry `workload: filter-only`, the result limit,
 and sums of exact match and returned-ID counts. The Redis and OpenSearch scalar
 contract also records `filter_only.retried_queries`: successful measured queries
 requiring retries, excluding priming queries. Redis always reports zero. A clean
-paired comparison requires zero dropped queries and zero retried queries.
+paired comparison requires zero dropped queries and zero retried queries. The
+driver records retries and warns, but `--fail-on-dropped-queries` checks dropped
+queries only. Retry rejection is enforced by the downstream
+[paired workflow validator](https://github.com/redis-performance/cloud-benchmarks-private/pull/76);
+a standalone driver invocation can succeed with a nonzero retry count.
 These two engines omit vector-quality fields; legacy filter-only engines keep
 their existing output format.
 The count sums let paired runs detect disagreement; they are not a substitute
