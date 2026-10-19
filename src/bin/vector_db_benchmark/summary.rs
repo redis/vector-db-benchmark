@@ -649,6 +649,36 @@ pub fn save_summary(
         "rejected_experiments": rejected_experiments(),
     });
 
+    if entries.iter().any(|e| e.results.filter_only.is_some()) {
+        summary["workload"] = json!("filter-only");
+        summary["metrics_definitions"] = json!({"vector_quality":"not applicable", "returned_fields":"IDs only", "total_count":"exact", "result_order":"unspecified"});
+        summary.as_object_mut().unwrap().remove("precision_summary");
+        for (row, entry) in summary["search_results"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(entries)
+        {
+            for key in [
+                "mean_precision_at_returned",
+                "mean_recall",
+                "recall_p10",
+                "mean_mrr",
+                "mean_ndcg",
+            ] {
+                row.as_object_mut().unwrap().remove(key);
+            }
+            row["filter_only"] = json!(entry.results.filter_only);
+            row["requested_queries"] = json!(entry.results.requested_queries);
+            row["failed_queries"] = json!(entry.results.failed_queries);
+        }
+        for curve in summary["concurrency_curve"].as_array_mut().unwrap() {
+            for point in curve["points"].as_array_mut().unwrap() {
+                point.as_object_mut().unwrap().remove("recall");
+            }
+        }
+    }
+
     if let Some(upload) = upload_json {
         summary
             .as_object_mut()

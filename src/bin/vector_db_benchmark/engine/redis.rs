@@ -812,169 +812,100 @@ impl RedisEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        // Index-existence guard (#151-4): hard-error on a missing/mismatched index
-        // instead of writing a silent recall-0.0 file on the --skip-upload path.
         {
             let mut conn = self.get_connection()?;
             redis_utils::ensure_index_exists(&mut conn, &self.config.index_name)?;
         }
-
         let parallel = params.parallel.unwrap_or(1) as usize;
         let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
-
-        // Read queries (we only need the filter conditions)
-        let query_path = dataset.get_path()?;
-        println!("\tReading queries from {}...", query_path.display());
-        let (_queries, neighbors, conditions) = dataset.read_queries()?;
-
-        // Parse all conditions up front
-        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
-            conditions.resolve_all("Redis", parse_conditions)?;
-
-        let explicit_top: Option<usize> = params.top.map(|t| t as usize);
-
-        // Only queries that have filter conditions
-        let runnable_indices: Vec<usize> = (0..parsed_filters.len())
-            .filter(|&i| parsed_filters[i].is_filtered())
+        let (_, _, conditions) = dataset.read_queries()?;
+        let parsed_filters = conditions.resolve_all("Redis", parse_conditions)?;
+        // A metadata result limit must not be derived from vector ground truth.
+        let top = params
+            .top
+            .map(|t| t as usize)
+            .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT);
+        let commands: Vec<redis::Cmd> = parsed_filters
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .map(|f| build_filter_only_command(&self.config.index_name, top, query_timeout, f))
             .collect();
-
-        if runnable_indices.is_empty() {
-            return Err("No queries with filter conditions for filter-only search".to_string());
+        if commands.is_empty() {
+            return Err("No queries with filter conditions for filter-only search".into());
         }
-
-        // Round-robin: if num_queries > available queries, cycle through them
         let num_to_run = if num_queries > 0 {
             num_queries as usize
         } else {
-            runnable_indices.len()
+            commands.len()
         };
-
-        // Each worker accumulates latencies into a thread-local buffer and returns
-        // it on join; the main thread concatenates. This keeps the timed hot loop
-        // free of the per-query cross-thread Mutex<Vec> push that serialized
-        // workers at high parallelism (matching the main search() path). The work
-        // counter uses Relaxed (only its own monotonicity matters). Progress is
-        // advanced in batches so the atomic isn't contended once per query.
-        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let query_idx = Arc::new(AtomicUsize::new(0));
-
-        // Resolve the index name once (env lookup) instead of per query.
-        let index_name = self.config.index_name.clone();
-
+        let query_idx = AtomicUsize::new(0);
+        let matched_sum = AtomicUsize::new(0);
+        let returned_sum = AtomicUsize::new(0);
+        let mut times = Vec::with_capacity(num_to_run);
         let pb = self.create_progress_bar(num_to_run);
-        let start_time = Instant::now();
-
-        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
-
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(parallel);
+        let measured_start = std::thread::scope(|scope| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(scope, "redis-filter-only", parallel);
             for _ in 0..parallel {
-                let redis_url = self.redis_url.clone();
-                let parsed_filters = &parsed_filters;
-                let runnable_indices = &runnable_indices;
-                let neighbors = &neighbors;
-                let errors = Arc::clone(&errors);
-                let query_idx = Arc::clone(&query_idx);
-                let index_name = index_name.as_str();
+                let redis_url = &self.redis_url;
+                let commands = &commands;
+                let query_idx = &query_idx;
+                let matched_sum = &matched_sum;
+                let returned_sum = &returned_sum;
                 let pb = &pb;
-
-                handles.push(s.spawn(move || {
-                    // Thread-local sample buffer — no cross-thread lock per query.
-                    let mut t: Vec<f64> = Vec::new();
-                    let mut local_errs: Vec<String> = Vec::new();
-                    let mut pb_pending: u64 = 0;
-
-                    let client = match redis::Client::open(redis_url.as_str()) {
+                pool.spawn(move |ticket| {
+                    let mut samples = Vec::new();
+                    let mut conn = match redis::Client::open(redis_url.as_str()).and_then(|c| {
+                        let info = c.get_connection_info();
+                        let settings = info
+                            .redis_settings()
+                            .clone()
+                            .set_protocol(redis::ProtocolVersion::RESP3);
+                        redis::Client::open(info.clone().set_redis_settings(settings))?
+                            .get_connection()
+                    }) {
                         Ok(c) => c,
-                        Err(_) => return t,
+                        Err(e) => {
+                            ticket.fail(format!("Redis filter-only connection failed: {e}"));
+                            return samples;
+                        }
                     };
-                    let mut conn = match client.get_connection() {
-                        Ok(c) => c,
-                        Err(_) => return t,
-                    };
-
+                    let _ = commands[0].query::<redis::Value>(&mut conn);
+                    if ticket.arrive_and_wait().is_none() {
+                        return samples;
+                    }
                     loop {
                         let seq = query_idx.fetch_add(1, Ordering::Relaxed);
                         if seq >= num_to_run {
                             break;
                         }
-                        // Round-robin over available filter queries
-                        let idx = runnable_indices[seq % runnable_indices.len()];
-
-                        let top = explicit_top.unwrap_or_else(|| {
-                            let n = neighbors[idx].len();
-                            if n > 0 {
-                                n
-                            } else {
-                                10
+                        let start = Instant::now();
+                        let response =
+                            commands[seq % commands.len()].query::<redis::Value>(&mut conn);
+                        let elapsed = start.elapsed().as_secs_f64();
+                        match response
+                            .map_err(|e| e.to_string())
+                            .and_then(|v| vector_db_benchmark::filter_only::redis_counts(&v, top))
+                        {
+                            Ok((total, returned)) => {
+                                samples.push(elapsed);
+                                matched_sum.fetch_add(total as usize, Ordering::Relaxed);
+                                returned_sum.fetch_add(returned, Ordering::Relaxed);
                             }
-                        });
-
-                        let query_start = Instant::now();
-                        let result = ft_search_filter_only(
-                            &mut conn,
-                            index_name,
-                            top,
-                            query_timeout,
-                            parsed_filters[idx].as_ref().unwrap(),
-                        );
-                        let query_time = query_start.elapsed().as_secs_f64();
-
-                        // Record a latency sample only for successful queries, so a
-                        // failed FT.SEARCH is counted as a failure (num_to_run minus
-                        // successes) rather than folded into RPS/percentiles — parity
-                        // with the main search() path.
-                        match result {
-                            Ok(_) => t.push(query_time),
-                            Err(e) => {
-                                if local_errs.len() < 3 {
-                                    local_errs.push(e);
-                                }
-                            }
+                            Err(e) => eprintln!("Filter-only query {seq} failed: {e}"),
                         }
-                        pb_pending += 1;
-                        if pb_pending >= 256 {
-                            pb.inc(pb_pending);
-                            pb_pending = 0;
-                        }
+                        pb.inc(1);
                     }
-                    if pb_pending > 0 {
-                        pb.inc(pb_pending);
-                    }
-                    if !local_errs.is_empty() {
-                        let mut errs = errors.lock().unwrap();
-                        for e in local_errs {
-                            if errs.len() < 3 {
-                                errs.push(e);
-                            }
-                        }
-                    }
-                    t
-                }));
+                    samples
+                })?;
             }
-
-            for h in handles {
-                times.extend(h.join().unwrap());
+            let (workers, start) = pool.start()?;
+            for samples in workers {
+                times.extend(samples);
             }
-        });
-
-        {
-            let logged_errors = errors.lock().unwrap();
-            if !logged_errors.is_empty() {
-                for e in logged_errors.iter() {
-                    eprintln!("\tFilter-only search error: {}", e);
-                }
-            }
-        }
-
+            Ok(start)
+        })?;
+        let total_time = measured_start.elapsed().as_secs_f64();
         pb.finish_and_clear();
-        let total_time = start_time.elapsed().as_secs_f64();
-
-        if times.is_empty() {
-            return Err("No filter-only searches completed".to_string());
-        }
-
-        // Verify no FT.SEARCH failures occurred
         let mut check_conn = self.get_connection()?;
         redis_utils::check_commandstats(
             &mut check_conn,
@@ -982,25 +913,24 @@ impl RedisEngine {
             "search",
             self.commandstats_baseline.as_ref(),
         )?;
-
-        // Route latency stats through the shared percentile path (linear
-        // interpolation) so filter-only is measured on the same footing as the
-        // main search(). Filter-only has no precision/recall: signal that with the
-        // mean_precision_at_returned == -1 sentinel, an empty precisions vec,
-        // and top == 0.
-        let mut results = crate::engine::compute_search_stats(
+        let mut result = crate::engine::compute_search_stats(
             &times,
             &[],
             &[],
             &[],
             &[],
             total_time,
-            0,
+            top,
             parallel,
             num_to_run,
         )?;
-        results.mean_precision_at_returned = -1.0;
-        Ok(results)
+        result.mean_precision_at_returned = -1.0;
+        result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
+            result_limit: top,
+            matched_documents_sum: matched_sum.load(Ordering::Relaxed) as u64,
+            returned_documents_sum: returned_sum.load(Ordering::Relaxed) as u64,
+        });
+        Ok(result)
     }
 
     fn create_progress_bar(&self, total: usize) -> ProgressBar {
@@ -1587,13 +1517,12 @@ fn build_condition(
 // ── FT.SEARCH ────────────────────────────────────────────────────────────
 
 /// Execute filter-only FT.SEARCH (no KNN vector query).
-fn ft_search_filter_only(
-    conn: &mut Connection,
+fn build_filter_only_command(
     index_name: &str,
     top: usize,
     query_timeout: i64,
     filter: &ParsedFilter,
-) -> Result<usize, String> {
+) -> redis::Cmd {
     let (filter_expr, params) = filter;
 
     let mut cmd = redis::cmd("FT.SEARCH");
@@ -1602,8 +1531,9 @@ fn ft_search_filter_only(
         .arg("LIMIT")
         .arg(0)
         .arg(top)
+        .arg("NOCONTENT")
         .arg("DIALECT")
-        .arg(4)
+        .arg(2)
         .arg("TIMEOUT")
         .arg(query_timeout);
 
@@ -1626,20 +1556,7 @@ fn ft_search_filter_only(
         }
     }
 
-    let response: Vec<redis::Value> = cmd
-        .query(conn)
-        .map_err(|e| format!("FT.SEARCH filter-only error: {}", e))?;
-
-    // First element is the total count
-    if let Some(first) = response.first() {
-        match first {
-            redis::Value::Int(n) => Ok(*n as usize),
-            redis::Value::BulkString(s) => Ok(String::from_utf8_lossy(s).parse().unwrap_or(0)),
-            _ => Ok(0),
-        }
-    } else {
-        Ok(0)
-    }
+    cmd
 }
 
 /// Build the FT.SEARCH KNN query string for the given filter.

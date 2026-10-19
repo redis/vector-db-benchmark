@@ -2085,7 +2085,7 @@ fn test_binary_redis_filter_only() {
 
     // --skip-vector-index renames the engine to "<type>-no-vector".
     let r = common::read_results_obj(&proj.root, "redis-no-vector");
-    let mp = r["mean_precision_at_returned"].as_f64().unwrap();
+    let mp = r.get("mean_precision_at_returned");
     let rps = r["rps"].as_f64().unwrap();
     let p50 = r["p50_time"].as_f64().unwrap();
     let p95 = r["p95_time"].as_f64().unwrap();
@@ -2094,10 +2094,11 @@ fn test_binary_redis_filter_only() {
     let succeeded = r["succeeded_queries"].as_u64().unwrap();
     let failed = r["failed_queries"].as_u64().unwrap();
     println!(
-        "redis filter-only: mean_precision_at_returned={mp} rps={rps:.1} p50={p50} p95={p95} p99={p99} \
+        "redis filter-only: mean_precision_at_returned={mp:?} rps={rps:.1} p50={p50} p95={p95} p99={p99} \
          requested={requested} succeeded={succeeded} failed={failed}"
     );
-    assert_eq!(mp, -1.0, "filter-only sentinel lost");
+    assert!(mp.is_none(), "filter-only must not emit vector precision");
+    assert_eq!(r["filter_only"]["result_limit"], 10);
     assert_eq!(requested, 1000, "requested_queries");
     assert_eq!(failed, 0, "healthy run must have no failed queries");
     assert_eq!(succeeded, 1000, "all queries should succeed");
@@ -4230,4 +4231,43 @@ fn test_binary_redis_mixed_update_onto_a_partially_populated_document_still_coun
 
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
+}
+
+#[test]
+fn test_binary_redis_filter_only_contract() {
+    let config = serde_json::json!([{"name":"scalar-redis","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":4,"top":3}]}]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-redis",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--skip-vector-index",
+            "--queries",
+            "80",
+            "--dump-raw-latencies",
+            "--keep-data",
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "redis-no-vector", total, returned);
+    let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+    let mut conn = client.get_connection().unwrap();
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("idx:redis-no-vector")
+        .query(&mut conn)
+        .unwrap();
+    assert!(
+        !format!("{info:?}").contains("VECTOR"),
+        "scalar index unexpectedly contains VECTOR"
+    );
+    let _: redis::Value = redis::cmd("FT.DROPINDEX")
+        .arg("idx:redis-no-vector")
+        .arg("DD")
+        .query(&mut conn)
+        .unwrap();
+    std::fs::remove_dir_all(proj.root).unwrap();
 }

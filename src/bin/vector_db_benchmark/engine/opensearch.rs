@@ -28,6 +28,7 @@ use vector_db_benchmark::readers::metadata::MetadataItem;
 
 #[derive(Clone)]
 struct OpenSearchConfig {
+    skip_vector_index: bool,
     m: i64,
     ef_construction: i64,
     batch_size: usize,
@@ -120,6 +121,7 @@ impl OpenSearchEngine {
             force_merge_deadline,
             force_merge_budget,
             config: OpenSearchConfig {
+                skip_vector_index: engine_config.skip_vector_index,
                 m,
                 ef_construction,
                 batch_size,
@@ -213,6 +215,7 @@ impl OpenSearchEngine {
                     let ft = field_type.as_str().unwrap_or("");
                     let os_type = match ft {
                         "int" => "long",
+                        "float" if self.config.skip_vector_index => "double",
                         "geo" => "geo_point",
                         // "bool"/"datetime" are not valid OS types; map to the real
                         // ones. OS coerces the reader's "true"/"false" string into a
@@ -240,7 +243,13 @@ impl OpenSearchEngine {
             }
         }
 
-        let index_settings = build_index_settings(self.config.number_of_shards);
+        let mut index_settings = build_index_settings(self.config.number_of_shards);
+        if self.config.skip_vector_index {
+            vector_db_benchmark::filter_only::disable_vector_index(
+                &mut properties,
+                &mut index_settings,
+            );
+        }
 
         let body = serde_json::json!({
             "settings": { "index": index_settings },
@@ -1940,16 +1949,50 @@ impl Engine for OpenSearchEngine {
         let parallel = params.parallel.unwrap_or(1) as usize;
 
         // Apply search-time settings (ef_search)
-        self.setup_search(params)?;
+        if !self.config.skip_vector_index {
+            self.setup_search(params)?;
+        }
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
-        let (queries, neighbors, conditions) = dataset.read_queries()?;
+        let (mut queries, mut neighbors, conditions) = dataset.read_queries()?;
 
-        let parsed_filters: Vec<QueryFilter<serde_json::Value>> =
+        let mut parsed_filters: Vec<QueryFilter<serde_json::Value>> =
             conditions.resolve_all("OpenSearch", parse_os_conditions)?;
 
-        let explicit_top: Option<usize> = params.top.map(|t| t as usize);
+        let filter_only = self.config.skip_vector_index;
+        if filter_only {
+            // Match Redis: only explicit predicates, cycle them for --queries N.
+            let selected: Vec<usize> = parsed_filters
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| f.is_filtered().then_some(i))
+                .collect();
+            if selected.is_empty() {
+                return Err("No queries with filter conditions for filter-only search".into());
+            }
+            let count = if num_queries > 0 {
+                num_queries as usize
+            } else {
+                selected.len()
+            };
+            let indices: Vec<usize> = (0..count).map(|i| selected[i % selected.len()]).collect();
+            queries = indices.iter().map(|&i| queries[i].clone()).collect();
+            neighbors = indices.iter().map(|&i| neighbors[i].clone()).collect();
+            parsed_filters = indices.iter().map(|&i| parsed_filters[i].clone()).collect();
+        }
+        let matched_sum = AtomicUsize::new(0);
+        let returned_sum = AtomicUsize::new(0);
+        let explicit_top: Option<usize> = if filter_only {
+            Some(
+                params
+                    .top
+                    .map(|n| n as usize)
+                    .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT),
+            )
+        } else {
+            params.top.map(|t| t as usize)
+        };
         let num_to_run = if num_queries > 0 {
             (num_queries as usize).min(queries.len())
         } else {
@@ -1976,7 +2019,14 @@ impl Engine for OpenSearchEngine {
             .collect();
         let raw_bodies: Vec<Box<serde_json::value::RawValue>> = (0..num_to_run)
             .map(|idx| {
-                let body = build_knn_body(&queries[idx], tops[idx], parsed_filters[idx].as_ref());
+                let body = if filter_only {
+                    vector_db_benchmark::filter_only::opensearch_body(
+                        parsed_filters[idx].as_ref().unwrap(),
+                        tops[idx],
+                    )
+                } else {
+                    build_knn_body(&queries[idx], tops[idx], parsed_filters[idx].as_ref())
+                };
                 serde_json::value::to_raw_value(&body).expect("serialize KNN search body")
             })
             .collect();
@@ -2020,6 +2070,8 @@ impl Engine for OpenSearchEngine {
                 let neighbors = &neighbors;
                 let tops = &tops;
                 let raw_bodies = &raw_bodies;
+                let matched_sum = &matched_sum;
+                let returned_sum = &returned_sum;
                 let query_idx = Arc::clone(&query_idx);
                 let retried_queries = Arc::clone(&retried_queries);
                 let pb = &pb;
@@ -2083,6 +2135,22 @@ impl Engine for OpenSearchEngine {
                         let response =
                             knn_send(&rt, &client, &index_name, &raw_bodies[idx], search_policy);
                         let elapsed = query_start.elapsed();
+
+                        if filter_only {
+                            match response.and_then(|(body, _cost)| {
+                                vector_db_benchmark::filter_only::opensearch_counts(&body, top)
+                            }) {
+                                Ok((total, returned)) => {
+                                    // End-to-end latency includes retries/backoff, like Redis.
+                                    t.push(elapsed.as_secs_f64());
+                                    matched_sum.fetch_add(total as usize, Ordering::Relaxed);
+                                    returned_sum.fetch_add(returned, Ordering::Relaxed);
+                                }
+                                Err(e) => eprintln!("Filter-only query {idx} failed: {e}"),
+                            }
+                            pb.inc(1);
+                            continue;
+                        }
 
                         match response.and_then(|(resp_body, cost)| {
                             extract_knn_hits(&resp_body).map(|hits| (hits, cost))
@@ -2166,9 +2234,18 @@ impl Engine for OpenSearchEngine {
         }
 
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
-        crate::engine::compute_search_stats(
+        let mut result = crate::engine::compute_search_stats(
             &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
-        )
+        )?;
+        if filter_only {
+            result.mean_precision_at_returned = -1.0;
+            result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
+                result_limit: top,
+                matched_documents_sum: matched_sum.load(Ordering::Relaxed) as u64,
+                returned_documents_sum: returned_sum.load(Ordering::Relaxed) as u64,
+            });
+        }
+        Ok(result)
     }
 
     fn delete(&mut self) -> Result<(), String> {

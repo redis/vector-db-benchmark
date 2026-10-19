@@ -665,11 +665,6 @@ fn fan_out_harnesses() -> Vec<FanOut> {
 const UNGATED_FANOUT_DEBT: &[(&str, &str, &str)] = &[
     (
         "redis.rs",
-        "search_filter_only",
-        "#266: --skip-vector-index path never converted to WorkerPool",
-    ),
-    (
-        "redis.rs",
         "search_mixed",
         "#266: --update-search-ratio path never converted to WorkerPool",
     ),

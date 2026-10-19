@@ -107,6 +107,8 @@ pub struct UpdateSearchRatio {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SearchResults {
+    /// Metadata-only result contract and count checksums; absent on KNN runs.
+    pub filter_only: Option<vector_db_benchmark::filter_only::Stats>,
     pub total_time: f64,
     pub mean_time: f64,
     /// Mean per-query precision, denominator = results the engine actually

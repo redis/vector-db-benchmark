@@ -9,6 +9,7 @@
 //! - `redis_client` - Redis connection management
 
 pub mod config;
+pub mod filter_only;
 pub mod metrics;
 pub mod msmarco;
 pub mod parsers;

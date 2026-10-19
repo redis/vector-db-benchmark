@@ -296,7 +296,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     );
     pb.enable_steady_tick(std::time::Duration::from_secs(1));
 
-    let skip_vector_engines = ["redis", "valkey", "mongodb"];
+    let skip_vector_engines = ["redis", "valkey", "mongodb", "opensearch"];
 
     // Soft wall-clock budget: once total elapsed reaches --timeout, stop launching
     // further experiments and finish cleanly. This bounds the overall run without
@@ -2403,6 +2403,29 @@ fn build_search_result_json(
     let gt_stats = ground_truth.and_then(|gt| gt.stats(results.top));
     result["metrics_schema"] = metrics_schema(gt_stats.as_ref());
 
+    if let Some(contract) = &results.filter_only {
+        result["params"]["workload"] = serde_json::json!("filter-only");
+        result["results"]["filter_only"] = serde_json::to_value(contract).unwrap();
+        result["metrics_schema"] = serde_json::json!({
+            "version": 2, "workload": "filter-only", "vector_quality": "not applicable",
+            "result_order": "unspecified", "returned_fields": "IDs only", "total_count": "exact",
+            "latency": "end-to-end including retry/backoff; connection setup and priming excluded"
+        });
+        for key in [
+            "mean_precision_at_returned",
+            "mean_recall",
+            "recall_p10",
+            "mean_mrr",
+            "mean_ndcg",
+            "precision_at_returned_dist",
+            "recall_dist",
+            "mrr_dist",
+            "ndcg_dist",
+        ] {
+            result["results"].as_object_mut().unwrap().remove(key);
+        }
+    }
+
     // How the swept parameter was chosen, and — crucially — whether the target
     // was actually reached. A calibration that converged on the maximum value
     // without reaching its target is not a calibration.
@@ -2446,13 +2469,15 @@ fn build_search_result_json(
         let results_obj = result["results"].as_object_mut().unwrap();
         // `precisions` is another upstream key name carrying upstream's per-query
         // recall@top values, so our array ships under an unambiguous name too.
-        results_obj.insert(
-            "precisions_at_returned".to_string(),
-            json!(results.precisions_at_returned),
-        );
-        results_obj.insert("recalls".to_string(), json!(results.recalls));
-        results_obj.insert("mrrs".to_string(), json!(results.mrrs));
-        results_obj.insert("ndcgs".to_string(), json!(results.ndcgs));
+        if results.filter_only.is_none() {
+            results_obj.insert(
+                "precisions_at_returned".to_string(),
+                json!(results.precisions_at_returned),
+            );
+            results_obj.insert("recalls".to_string(), json!(results.recalls));
+            results_obj.insert("mrrs".to_string(), json!(results.mrrs));
+            results_obj.insert("ndcgs".to_string(), json!(results.ndcgs));
+        }
         results_obj.insert("latencies".to_string(), json!(results.latencies));
     }
 

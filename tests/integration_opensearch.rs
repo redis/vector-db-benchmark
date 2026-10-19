@@ -1324,3 +1324,65 @@ fn read_params_obj(root: &std::path::Path, engine: &str) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     v["params"].clone()
 }
+
+#[test]
+fn test_binary_opensearch_filter_only_contract() {
+    wait_for_opensearch();
+    let config = serde_json::json!([{"name":"scalar-os","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":4,"top":3}]}]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "scalar-contract";
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-os",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &[
+            "--skip-vector-index",
+            "--queries",
+            "80",
+            "--keep-data",
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "opensearch-no-vector", total, returned);
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let vector = &mapping[index]["mappings"]["properties"]["vector"];
+    assert_eq!(vector["type"], "float");
+    assert_eq!(vector["index"], false);
+    assert_eq!(vector["doc_values"], false);
+    let settings: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_settings", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(settings[index]["settings"]["index"]["knn"], "false");
+    // The reuse path must keep the scalar schema and corpus intact.
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-os",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &[
+            "--skip-vector-index",
+            "--queries",
+            "80",
+            "--skip-upload",
+            "--keep-data",
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send()
+        .unwrap();
+    std::fs::remove_dir_all(proj.root).unwrap();
+}

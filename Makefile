@@ -117,7 +117,7 @@ test-verbose:
 .PHONY: integration-test
 integration-test:
 	@echo "=== Starting redis:8.6.0 for integration tests ==="
-	docker compose -f tests/docker-compose.test.yml up -d --wait
+	docker compose -f tests/docker-compose.test.yml up -d redis --wait
 	@echo "=== Running integration tests ==="
 	cargo test --test integration_redis --release -- --nocapture --test-threads=1; \
 	EXIT_CODE=$$?; \

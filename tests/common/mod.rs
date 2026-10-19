@@ -2560,3 +2560,109 @@ fn claim_outcome(
         }
     }
 }
+
+/// Pure scalar workload: exact keyword/int, strict/inclusive ranges, AND, OR,
+/// and an empty match. No vector ground truth is needed for these queries.
+pub fn write_filter_only_project(engine_configs_json: &str) -> (MatchAnyProject, u64, u64) {
+    let project = write_match_any_project("scalar-test", engine_configs_json, 4);
+    // Unequal bucket populations prevent a wrong equality value from passing
+    // merely because all categories happen to have the same cardinality.
+    let color = |id: usize| {
+        if id % 7 < 2 {
+            "red"
+        } else if id % 7 == 2 {
+            "green"
+        } else {
+            "blue"
+        }
+    };
+    let payloads = (0..N_DOCS)
+        .map(|id| {
+            serde_json::json!({"color":color(id),"size":id % 11 + 1,"price": ([0.1,0.2,0.3][id % 3])})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        project.root.join("datasets/scalar-test/payloads.jsonl"),
+        payloads,
+    )
+    .unwrap();
+    let registry_path = project.root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["schema"]["price"] = serde_json::json!("float");
+    fs::write(registry_path, registry.to_string()).unwrap();
+    let queries = [
+        serde_json::json!({"and":[{"color":{"match":{"value":"red"}}}]}),
+        serde_json::json!({"and":[{"size":{"match":{"value":2}}}]}),
+        serde_json::json!({"and":[{"size":{"range":{"gt":1,"lte":2}}}]}),
+        serde_json::json!({"and":[{"size":{"range":{"gte":1,"lt":3}}}]}),
+        serde_json::json!({"and":[{"color":{"match":{"value":"red"}}},{"size":{"range":{"gte":2}}}]}),
+        serde_json::json!({"or":[{"color":{"match":{"value":"red"}}},{"size":{"match":{"value":2}}}]}),
+        serde_json::json!({"and":[{"color":{"match":{"value":"absent"}}}]}),
+        serde_json::json!({"and":[{"price":{"range":{"gt":0.1,"lte":0.2}}}]}),
+    ];
+    let mut counts = [0u64; 8];
+    for id in 0..N_DOCS {
+        let red = color(id) == "red";
+        let size = id % 11 + 1;
+        let matches = [
+            red,
+            size == 2,
+            size > 1 && size <= 2,
+            (1..3).contains(&size),
+            red && size >= 2,
+            red || size == 2,
+            false,
+            id % 3 == 1,
+        ];
+        for (i, yes) in matches.iter().enumerate() {
+            counts[i] += u64::from(*yes);
+        }
+    }
+    let rows = queries
+        .iter()
+        .map(|condition| {
+            serde_json::json!({"query":[1.,0.,0.,0.],"conditions":condition,"closest_ids":[]})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(project.root.join("datasets/scalar-test/tests.jsonl"), rows).unwrap();
+    (
+        project,
+        counts.iter().sum(),
+        counts.iter().map(|n| (*n).min(3)).sum(),
+    )
+}
+
+pub fn assert_filter_only_results(root: &Path, engine: &str, total: u64, returned: u64) {
+    let doc = read_result_doc(root, engine);
+    let result = &doc["results"];
+    assert_eq!(doc["params"]["workload"], "filter-only");
+    assert_eq!(result["requested_queries"], 80);
+    assert_eq!(result["failed_queries"], 0);
+    assert_eq!(result["filter_only"]["result_limit"], 3);
+    assert_eq!(result["filter_only"]["matched_documents_sum"], total * 10);
+    assert_eq!(
+        result["filter_only"]["returned_documents_sum"],
+        returned * 10
+    );
+    assert!(result.get("mean_recall").is_none());
+    assert!(result.get("mean_precision_at_returned").is_none());
+    for key in ["precisions_at_returned", "recalls", "mrrs", "ndcgs"] {
+        assert!(result.get(key).is_none(), "scalar result contains {key}");
+    }
+    let summaries: Vec<_> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with("-summary.json"))
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(summaries[0].path()).unwrap()).unwrap();
+    assert_eq!(summary["workload"], "filter-only");
+    assert!(summary.get("precision_summary").is_none());
+    assert!(summary["search_results"][0].get("mean_recall").is_none());
+}

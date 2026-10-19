@@ -419,6 +419,38 @@ filter-only two-phase run must pass `--skip-vector-index` in **both** phases —
 the flag renames the config to `<engine>-no-vector`, so phase 1 writes exactly the
 schema-only index phase 2 reuses.
 
+### Redis / OpenSearch pure numeric and tag benchmarks
+
+`--skip-vector-index` also supports OpenSearch. On Redis and OpenSearch this
+mode measures metadata predicates with **IDs-only results, an exact total count,
+and unspecified result order**. `search_params.top` is the result limit (default
+10); it is independent of the vector ground-truth width. Vectors remain stored
+but are not indexed. OpenSearch maps scalar floats to `double` in this mode to
+preserve the precision of Redis NUMERIC values.
+
+Redis uses `FT.SEARCH ... NOCONTENT DIALECT 2`; OpenSearch uses `bool.filter`,
+`track_total_hits: true`, `_source: false`, and `_doc` order. Both exclude worker
+connection setup and one priming query from the timed window. Filter-only
+latency includes any retry/backoff. This is a warm, immutable-corpus benchmark;
+results do not describe a mixed write workload or vector retrieval.
+
+Only queries with explicit predicates run. `--queries N` cycles those queries,
+and the experiment is named `<engine>-no-vector`. Select one engine config
+with one point per client count. Use `--fail-on-dropped-queries --repetitions 1` for paired
+runs. Search and summary JSONs carry `workload: filter-only`, the result limit,
+and sums of exact match and returned-ID counts. They omit vector-quality fields.
+The count sums let paired runs detect disagreement; they are not a substitute
+for validating predicates against an independent oracle. Integration tests use
+unequal category populations, exact numeric/tag values, floating-point range
+boundaries, AND/OR, and an empty result, and inspect the realized server schema.
+
+Redis filter-only workers require RESP3 and reject replies with any warning,
+including partial results from query timeouts. No server configuration changes
+are required, so the same guard works on Redis Cloud.
+
+This changes Redis filter-only response shaping from full documents to IDs only;
+old filter-only timings are not directly comparable. KNN behavior is unchanged.
+
 ### Per-config index isolation (Redis / Valkey / Dragonfly / KiviDB / VectorSets)
 
 Each engine config gets its **own** RediSearch index and keyspace, derived from the
