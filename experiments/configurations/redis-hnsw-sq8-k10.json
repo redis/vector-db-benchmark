@@ -1,0 +1,140 @@
+[
+  {
+    "name": "redis-hnsw-float32-plain-k10",
+    "engine": "redis",
+    "collection_params": {"algorithm": "hnsw", "data_type": "FLOAT32", "hnsw_config": {"M": 32, "EF_CONSTRUCTION": 200}},
+    "upload_params": {"parallel": 8, "batch_size": 64, "data_type": "FLOAT32"},
+    "search_params": [
+      {"parallel": 1, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 1600}}
+    ]
+  },
+  {
+    "name": "redis-hnsw-float32-sq8-zero-k10",
+    "engine": "redis",
+    "collection_params": {"algorithm": "hnsw", "data_type": "FLOAT32", "hnsw_config": {"M": 32, "EF_CONSTRUCTION": 200, "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 0}},
+    "upload_params": {"parallel": 8, "batch_size": 64, "data_type": "FLOAT32"},
+    "search_params": [
+      {"parallel": 1, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 1600}}
+    ]
+  },
+  {
+    "name": "redis-hnsw-float32-sq8-trained-k10",
+    "engine": "redis",
+    "collection_params": {"algorithm": "hnsw", "data_type": "FLOAT32", "hnsw_config": {"M": 32, "EF_CONSTRUCTION": 200, "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 10240}},
+    "upload_params": {"parallel": 8, "batch_size": 64, "data_type": "FLOAT32"},
+    "search_params": [
+      {"parallel": 1, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 1600}}
+    ]
+  },
+  {
+    "name": "redis-hnsw-float16-plain-k10",
+    "engine": "redis",
+    "collection_params": {"algorithm": "hnsw", "data_type": "FLOAT16", "hnsw_config": {"M": 32, "EF_CONSTRUCTION": 200}},
+    "upload_params": {"parallel": 8, "batch_size": 64, "data_type": "FLOAT16"},
+    "search_params": [
+      {"parallel": 1, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 1600}}
+    ]
+  },
+  {
+    "name": "redis-hnsw-float16-sq8-zero-k10",
+    "engine": "redis",
+    "collection_params": {"algorithm": "hnsw", "data_type": "FLOAT16", "hnsw_config": {"M": 32, "EF_CONSTRUCTION": 200, "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 0}},
+    "upload_params": {"parallel": 8, "batch_size": 64, "data_type": "FLOAT16"},
+    "search_params": [
+      {"parallel": 1, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 1600}}
+    ]
+  },
+  {
+    "name": "redis-hnsw-float16-sq8-trained-k10",
+    "engine": "redis",
+    "collection_params": {"algorithm": "hnsw", "data_type": "FLOAT16", "hnsw_config": {"M": 32, "EF_CONSTRUCTION": 200, "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 10240}},
+    "upload_params": {"parallel": 8, "batch_size": 64, "data_type": "FLOAT16"},
+    "search_params": [
+      {"parallel": 1, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 1, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 8, "top": 10, "search_params": {"ef": 1600}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 100}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 200}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 400}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 800}},
+      {"parallel": 100, "top": 10, "search_params": {"ef": 1600}}
+    ]
+  }
+]

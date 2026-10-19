@@ -34,6 +34,22 @@ pub struct HnswConfig {
         alias = "ef_construction"
     )]
     pub ef_construction: Option<i64>,
+    /// Redis HNSW scalar compression. Serde rejects malformed and explicit null
+    /// values; the library validates SQ8 support against algorithm and type.
+    #[serde(
+        rename = "COMPRESSION",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "vector_db_benchmark::redis_hnsw_sq8::present_string"
+    )]
+    pub compression: Option<String>,
+    #[serde(
+        rename = "TRAINING_THRESHOLD",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "vector_db_benchmark::redis_hnsw_sq8::present_u64"
+    )]
+    pub training_threshold: Option<u64>,
     /// Qdrant: keep the HNSW graph on disk (mmap) instead of in RAM.
     pub on_disk: Option<bool>,
     /// Qdrant: per-payload-value graph links. `m: 0` + `payload_m: k` builds
@@ -861,6 +877,35 @@ pub fn describe_engines(verbose: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn redis_sq8_fields_are_typed_and_reject_malformed_values() {
+        let cfg: HnswConfig = serde_json::from_value(json!({
+            "M": 16, "COMPRESSION": "sq8", "TRAINING_THRESHOLD": 0
+        }))
+        .unwrap();
+        assert_eq!(cfg.compression.as_deref(), Some("sq8"));
+        assert_eq!(cfg.training_threshold, Some(0));
+        assert!(cfg.unsupported_keys().is_empty());
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(serialized["COMPRESSION"], "sq8");
+        assert_eq!(serialized["TRAINING_THRESHOLD"], 0);
+        let absent = serde_json::to_value(HnswConfig::default()).unwrap();
+        assert!(absent.get("COMPRESSION").is_none());
+        assert!(absent.get("TRAINING_THRESHOLD").is_none());
+        serde_json::from_value::<HnswConfig>(absent).unwrap();
+
+        for bad in [
+            json!({"COMPRESSION": null}),
+            json!({"COMPRESSION": 8}),
+            json!({"TRAINING_THRESHOLD": null}),
+            json!({"TRAINING_THRESHOLD": -1}),
+            json!({"TRAINING_THRESHOLD": "0"}),
+            json!({"TRAINING_THRESHOLD": 1.5}),
+        ] {
+            assert!(serde_json::from_value::<HnswConfig>(bad).is_err());
+        }
+    }
 
     /// Corpus size advertised by a dataset's own corpus filename, when the leaf
     /// path segment carries an unambiguous magnitude token — `random_keywords_1m`
@@ -2016,6 +2061,8 @@ mod shipped_config_knob_guard {
             &[
                 "m",
                 "ef_construction",
+                "compression",
+                "training_threshold",
                 "on_disk",
                 "payload_m",
                 "inline_storage",
@@ -2059,6 +2106,8 @@ mod shipped_config_knob_guard {
         match leaf {
             "M" => "m",
             "EF_CONSTRUCTION" | "ef_construct" => "ef_construction",
+            "COMPRESSION" => "compression",
+            "TRAINING_THRESHOLD" => "training_threshold",
             // #215 made `EF` an alias of the typed `ef` field.
             "EF" => "ef",
             other => other,
@@ -2590,6 +2639,8 @@ mod shipped_config_knob_guard {
             "M",
             "EF_CONSTRUCTION",
             "ef_construct",
+            "COMPRESSION",
+            "TRAINING_THRESHOLD",
             "on_disk",
             "payload_m",
             "inline_storage",

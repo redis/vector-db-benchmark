@@ -26,6 +26,7 @@ use crate::metrics::compute_metrics;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, parse_ft_search_response};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
+use vector_db_benchmark::redis_hnsw_sq8::Sq8Options;
 use vector_db_benchmark::start_gate::WorkerPool;
 
 /// Redis engine configuration
@@ -38,6 +39,11 @@ pub struct RedisEngineConfig {
     pub batch_size: usize,
     pub parallel: usize,
     pub skip_vector_index: bool,
+    /// HNSW SQ8 options, resolved once in `new()` with precedence
+    /// `collection_params.hnsw_config.{COMPRESSION,TRAINING_THRESHOLD}` > env
+    /// (`REDIS_HNSW_COMPRESSION` / `REDIS_HNSW_TRAINING_THRESHOLD`) > unset.
+    /// The env vars are read only for HNSW configs that build a vector index.
+    pub hnsw_sq8: Sq8Options,
     /// SVS-VAMANA build params, resolved once in `new()` with precedence
     /// `collection_params.svs-vamana_config` > env (`REDIS_SVS_*`) > derived.
     /// `None` graph/window → derive from `m`*2 / `ef_construction` at FT.CREATE.
@@ -212,6 +218,44 @@ impl RedisEngine {
             .or_else(|| cp_str("data_type"))
             .unwrap_or_else(|| "FLOAT32".to_string());
 
+        let hnsw_config = engine_config
+            .collection_params
+            .as_ref()
+            .and_then(|cp| cp.hnsw_config.as_ref());
+        // Env fallback only for HNSW configs with a vector index, so a stray
+        // REDIS_HNSW_* variable never affects flat/SVS configs.
+        let read_sq8_env =
+            algorithm.eq_ignore_ascii_case("hnsw") && !engine_config.skip_vector_index;
+        let hnsw_sq8 = Sq8Options::resolve(
+            hnsw_config.and_then(|h| h.compression.as_deref()),
+            hnsw_config.and_then(|h| h.training_threshold),
+            read_sq8_env
+                .then(|| crate::effective_config::env_var("REDIS_HNSW_COMPRESSION").ok())
+                .flatten(),
+            read_sq8_env
+                .then(|| crate::effective_config::env_var("REDIS_HNSW_TRAINING_THRESHOLD").ok())
+                .flatten(),
+            &algorithm,
+            &data_type,
+            engine_config.skip_vector_index,
+        )?;
+        crate::effective_config::record_effective(
+            "hnsw_compression",
+            hnsw_sq8
+                .compression
+                .clone()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        crate::effective_config::record_effective(
+            "hnsw_training_threshold",
+            hnsw_sq8
+                .compression
+                .as_ref()
+                .map(|_| serde_json::Value::from(hnsw_sq8.training_threshold.unwrap_or(10_240)))
+                .unwrap_or(serde_json::Value::Null),
+        );
+
         // SVS-VAMANA build params: `collection_params.svs-vamana_config` block
         // wins, else the REDIS_SVS_* env vars, else derived at FT.CREATE. Resolved
         // only for SVS algorithms so a non-SVS config can never pick up a stray
@@ -291,6 +335,7 @@ impl RedisEngine {
                 batch_size,
                 parallel,
                 skip_vector_index: engine_config.skip_vector_index,
+                hnsw_sq8,
                 svs_graph_max_degree,
                 svs_construction_window_size,
                 svs_compression,
@@ -420,13 +465,28 @@ impl RedisEngine {
                 }
             } else {
                 // HNSW (default): TYPE+DIM+DISTANCE_METRIC + M + EF_CONSTRUCTION.
-                let num_attrs = 6 + 2 + 2;
+                let num_attrs =
+                    10 + if self.config.hnsw_sq8.compression.is_some() {
+                        2
+                    } else {
+                        0
+                    } + if self.config.hnsw_sq8.training_threshold.is_some() {
+                        2
+                    } else {
+                        0
+                    };
                 cmd.arg(num_attrs);
                 cmd.arg("TYPE").arg(&self.config.data_type);
                 cmd.arg("DIM").arg(vector_size);
                 cmd.arg("DISTANCE_METRIC").arg(distance_metric);
                 cmd.arg("M").arg(self.config.m);
                 cmd.arg("EF_CONSTRUCTION").arg(self.config.ef_construction);
+                if let Some(compression) = &self.config.hnsw_sq8.compression {
+                    cmd.arg("COMPRESSION").arg(compression);
+                }
+                if let Some(threshold) = self.config.hnsw_sq8.training_threshold {
+                    cmd.arg("TRAINING_THRESHOLD").arg(threshold);
+                }
             }
         }
 
@@ -471,6 +531,14 @@ impl RedisEngine {
 
         cmd.query::<()>(conn)
             .map_err(|e| format!("Failed to create index: {}", e))?;
+
+        if self.config.hnsw_sq8.compression.is_some() {
+            let info: redis::Value = redis::cmd("FT.INFO")
+                .arg(&self.config.index_name)
+                .query(conn)
+                .map_err(|e| format!("Failed to verify HNSW SQ8 index: {e}"))?;
+            self.config.hnsw_sq8.verify_ft_info(&info)?;
+        }
 
         Ok(())
     }
@@ -3335,6 +3403,7 @@ mod tests {
             batch_size: 1,
             parallel: 1,
             skip_vector_index: false,
+            hnsw_sq8: vector_db_benchmark::redis_hnsw_sq8::Sq8Options::default(),
             svs_graph_max_degree: None,
             svs_construction_window_size: None,
             svs_compression: None,

@@ -1033,14 +1033,14 @@
     "description": "Knowledge embeddings"
   },
   {
-    "name": "dbpedia-openai-1M-1536-angular-100neighbors",
+    "name": "dbpedia-openai-975K-1536-angular-100neighbors",
     "vector_size": 1536,
     "distance": "cosine",
     "type": "tar",
-    "path": "dbpedia-openai-1M-1536-angular-100neighbors/dbpedia_openai_1M",
+    "path": "dbpedia-openai-975K-1536-angular-100neighbors/dbpedia_openai_975K",
     "link": "http://benchmarks.redislabs.s3.amazonaws.com/vecsim/laion400m/dbpedia_openai_1M.tgz",
-    "vector_count": 1000000,
-    "description": "Knowledge embeddings"
+    "vector_count": 975000,
+    "description": "Knowledge embeddings: full 975000-vector corpus with 100 neighbors per query; archive filename retains historical 1M label"
   },
   {
     "name": "h-and-m-2048-angular-filters",
