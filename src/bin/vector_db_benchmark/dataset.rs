@@ -365,6 +365,23 @@ impl Dataset {
         }
     }
 
+    /// Validate scalar metadata on reuse without loading vector values. Only
+    /// compound datasets carry metadata in the supported dense readers; other
+    /// formats yield no metadata on upload and therefore need no payload scan.
+    pub fn validate_scalar_metadata(&self) -> Result<(), String> {
+        if self.config.dataset_type.as_deref() != Some("tar") {
+            return Ok(());
+        }
+        let path = self.get_path()?;
+        self.validate_vector_count()?;
+        vector_db_benchmark::readers::visit_compound_metadata(&path, |item| {
+            vector_db_benchmark::filter_only::domain::validate_metadata(
+                std::slice::from_ref(&item),
+                self.config.schema.as_ref(),
+            )
+        })
+    }
+
     /// Read all vectors and metadata from the dataset
     #[allow(clippy::type_complexity)]
     pub fn read_vectors(
@@ -894,6 +911,32 @@ mod tests {
             schema: None,
             description: None,
         })
+    }
+
+    #[test]
+    fn scalar_reuse_validates_metadata_without_reading_vector_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors = dir.path().join("vectors.npy");
+        write_npy_vectors(vectors.to_str().unwrap(), &[vec![0.0; 3], vec![1.0; 3]]).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(vectors)
+            .unwrap();
+        file.set_len(file.metadata().unwrap().len() - 24).unwrap();
+        let mut dataset = dataset_at(dir.path(), "tar", Some(2));
+        dataset.config.schema = Some(serde_json::json!({"tag":"keyword"}));
+        let payloads = dir.path().join("payloads.jsonl");
+        std::fs::write(&payloads, "{\"tag\":\"red\"}\n{\"tag\":\"Red\"}\n").unwrap();
+        dataset.validate_scalar_metadata().unwrap();
+        assert!(
+            dataset.read_vectors(false).is_err(),
+            "fixture has no vector values"
+        );
+        std::fs::write(payloads, "{\"tag\":\"red\"}\n{\"tag\":\"bad;tag\"}\n").unwrap();
+        assert!(dataset
+            .validate_scalar_metadata()
+            .unwrap_err()
+            .contains("keyword tokens"));
     }
 
     /// The corpus, not `datasets.json`, is the authority on how many vectors

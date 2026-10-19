@@ -2002,11 +2002,7 @@ impl Engine for OpenSearchEngine {
         } else {
             self.validate_filter_only_schema(dataset)?;
             if !self.scalar_metadata_validated {
-                let (_, _, metadata) = dataset.read_vectors(false)?;
-                vector_db_benchmark::filter_only::domain::validate_metadata(
-                    &metadata,
-                    dataset.config.schema.as_ref(),
-                )?;
+                dataset.validate_scalar_metadata()?;
                 self.scalar_metadata_validated = true;
             }
         }

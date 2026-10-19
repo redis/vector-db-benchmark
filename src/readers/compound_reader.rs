@@ -4,30 +4,69 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 use super::metadata::{parse_metadata_from_json, MetadataItem};
-use super::npy_reader::read_npy_vectors;
+use super::npy_reader::{npy_row_count, read_npy_vectors};
 
 /// Read payloads from payloads.jsonl file, returning Vec<Option<MetadataItem>>.
 /// Each line is a JSON object with key-value pairs.
 pub fn read_payloads_jsonl(path: &str) -> Result<Vec<Option<MetadataItem>>, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open payloads file: {}", e))?;
-    let reader = BufReader::new(file);
+    let mut metadata = Vec::new();
+    visit_payloads_jsonl(std::path::Path::new(path), |item| {
+        metadata.push(item);
+        Ok(())
+    })?;
+    Ok(metadata)
+}
 
-    let mut all_metadata: Vec<Option<MetadataItem>> = Vec::new();
-
-    for line_result in reader.lines() {
-        let line = line_result.map_err(|e| format!("Failed to read line: {}", e))?;
-        if line.trim().is_empty() {
-            all_metadata.push(None);
-            continue;
+/// Visit one metadata row at a time, preserving blank rows as missing payloads.
+/// The callback may reject a row without reading the remainder of the file.
+fn visit_payloads_jsonl(
+    path: &std::path::Path,
+    mut visit: impl FnMut(Option<MetadataItem>) -> Result<(), String>,
+) -> Result<u64, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open payloads file: {e}"))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut rows = 0;
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed to read payload row: {e}"))?
+            == 0
+        {
+            return Ok(rows);
         }
-
-        let json_value: serde_json::Value =
-            serde_json::from_str(&line).map_err(|e| format!("Failed to parse JSON: {}", e))?;
-
-        all_metadata.push(parse_metadata_from_json(json_value));
+        let item = if line.trim().is_empty() {
+            None
+        } else {
+            let value = serde_json::from_str(&line)
+                .map_err(|e| format!("Failed to parse payload row {}: {e}", rows + 1))?;
+            parse_metadata_from_json(value)
+        };
+        visit(item)?;
+        rows += 1;
     }
+}
 
-    Ok(all_metadata)
+/// Visit compound metadata without reading or allocating the vector payload.
+/// The NPY header supplies the expected row count; absent payloads mean missing
+/// metadata, exactly as in `read_compound_data`. Memory is bounded by one row.
+pub fn visit_compound_metadata(
+    dir: &std::path::Path,
+    visit: impl FnMut(Option<MetadataItem>) -> Result<(), String>,
+) -> Result<(), String> {
+    let vectors = dir.join("vectors.npy");
+    let expected = npy_row_count(vectors.to_str().ok_or("Invalid vectors path")?)?;
+    let payloads = dir.join("payloads.jsonl");
+    if payloads.exists() {
+        let actual = visit_payloads_jsonl(&payloads, visit)?;
+        if actual != expected {
+            return Err(format!(
+                "Metadata count ({actual}) doesn't match vector count ({expected})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Read compound data from directory containing vectors.npy and optionally payloads.jsonl.
@@ -184,4 +223,73 @@ pub(crate) fn read_compound_queries_raw(
     }
 
     Ok((queries, neighbors, conditions))
+}
+
+#[cfg(test)]
+mod metadata_stream_tests {
+    use super::*;
+
+    fn metadata_only_fixture(rows: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.npy");
+        super::super::npy_reader::write_npy_vectors(
+            path.to_str().unwrap(),
+            &vec![vec![0.0; 3]; rows],
+        )
+        .unwrap();
+        // Leave the valid row-count header but remove every vector value. A
+        // vector decoder cannot read this fixture; metadata validation can.
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let header_len = file.metadata().unwrap().len() - (rows * 3 * 4) as u64;
+        file.set_len(header_len).unwrap();
+        dir
+    }
+
+    #[test]
+    fn metadata_visit_reads_no_vector_values_and_preserves_blank_rows() {
+        let dir = metadata_only_fixture(3);
+        std::fs::write(
+            dir.path().join("payloads.jsonl"),
+            "{\"tag\":\"red\"}\n\n{}\n",
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        visit_compound_metadata(dir.path(), |item| {
+            rows.push(item.is_some());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, vec![true, false, true]);
+        assert!(read_compound_data(dir.path().to_str().unwrap(), false).is_err());
+    }
+
+    #[test]
+    fn metadata_visit_stops_on_rejection_before_parsing_next_row() {
+        let dir = metadata_only_fixture(2);
+        std::fs::write(dir.path().join("payloads.jsonl"), "{}\nnot JSON\n").unwrap();
+        let error =
+            visit_compound_metadata(dir.path(), |_| Err("rejected first row".into())).unwrap_err();
+        assert_eq!(error, "rejected first row");
+    }
+
+    #[test]
+    fn metadata_visit_rejects_count_mismatch_and_bad_json() {
+        let dir = metadata_only_fixture(2);
+        let path = dir.path().join("payloads.jsonl");
+        for rows in ["{}\n", "{}\n{}\n{}\n"] {
+            std::fs::write(&path, rows).unwrap();
+            let error = visit_compound_metadata(dir.path(), |_| Ok(())).unwrap_err();
+            assert!(error.contains("doesn't match vector count"), "{error}");
+        }
+        std::fs::write(&path, "{}\nnot JSON\n").unwrap();
+        assert!(visit_compound_metadata(dir.path(), |_| Ok(()))
+            .unwrap_err()
+            .contains("Failed to parse payload row 2"));
+    }
+
+    #[test]
+    fn absent_payloads_preserve_missing_metadata_semantics() {
+        let dir = metadata_only_fixture(2);
+        visit_compound_metadata(dir.path(), |_| panic!("absent payloads have no rows")).unwrap();
+    }
 }

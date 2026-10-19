@@ -11,6 +11,7 @@ mod sparse_reader;
 
 pub use compound_reader::{
     read_compound_data, read_compound_queries, read_compound_vectors_only, read_payloads_jsonl,
+    visit_compound_metadata,
 };
 pub use hdf5_reader::{hdf5_train_row_count, read_hdf5_vectors};
 pub use jsonl_reader::{read_jsonl_queries, read_jsonl_vectors};
