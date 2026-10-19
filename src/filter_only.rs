@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub mod domain;
+
 pub const DEFAULT_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -67,6 +69,14 @@ pub fn validate_opensearch_schema(
     }
     if let Some(fields) = schema.and_then(Value::as_object) {
         for (field, kind) in fields {
+            if matches!(kind.as_str(), Some("int" | "float" | "keyword"))
+                && properties[field]["index"] == false
+            {
+                return Err(format!("filter-only requires indexed field {field}"));
+            }
+            if kind == "int" && properties[field]["type"] != "long" {
+                return Err(format!("filter-only requires long mapping for {field}"));
+            }
             if kind == "float" && properties[field]["type"] != "double" {
                 return Err(format!("filter-only requires double mapping for {field}"));
             }
@@ -107,13 +117,24 @@ pub fn validate_redis_schema(info: &Value, schema: Option<&Value>) -> Result<(),
     }
     if let Some(fields) = schema.and_then(Value::as_object) {
         for (name, kind) in fields {
-            if kind != "keyword" {
+            if !matches!(kind.as_str(), Some("int" | "float" | "keyword")) {
                 continue;
             }
             let attr = attributes
                 .iter()
                 .find(|a| field(a, "attribute").and_then(Value::as_str) == Some(name))
                 .ok_or_else(|| format!("filter-only missing TAG field {name}"))?;
+            if kind != "keyword" {
+                if field(attr, "type").and_then(Value::as_str) != Some("NUMERIC") {
+                    return Err(format!("filter-only requires NUMERIC field {name}"));
+                }
+                continue;
+            }
+            if field(attr, "SEPARATOR").and_then(Value::as_str) != Some(";") {
+                return Err(format!(
+                    "filter-only requires semicolon separator for {name}"
+                ));
+            }
             let case_sensitive = attr
                 .as_array()
                 .is_some_and(|a| a.iter().any(|v| v == "CASESENSITIVE"))
@@ -296,3 +317,7 @@ mod tests {
         assert_eq!(opensearch_counts(&empty, 10).unwrap(), (0, 0));
     }
 }
+
+#[cfg(test)]
+#[path = "filter_only/review_tests.rs"]
+mod review_tests;

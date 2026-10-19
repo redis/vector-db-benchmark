@@ -4,6 +4,7 @@ on:
   push:
     branches: [master]
     paths:
+      - 'Makefile'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
@@ -13,6 +14,7 @@ on:
       - '.github/workflows/ci.yml'
   pull_request:
     paths:
+      - 'Makefile'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'

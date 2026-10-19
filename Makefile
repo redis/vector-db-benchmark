@@ -492,3 +492,20 @@ help:
 	@echo "Environment variables:"
 	@echo "  HDF5_DIR          - Path to HDF5 library (default: /usr/lib/<arch>/hdf5/serial)"
 
+
+# Instrument the actual CLI used by the integration harness, as well as library
+# and binary unit tests. Requires cargo-llvm-cov and rustup llvm-tools-preview.
+# Keep coverage artifacts separate from normal builds and emit portable reports.
+COVERAGE_DIR ?= $(CURDIR)/target/filter-only-coverage
+.PHONY: coverage-filter-only
+coverage-filter-only:
+	@set -eu; \
+	export CARGO_TARGET_DIR="$(COVERAGE_DIR)"; \
+	eval "$$(cargo llvm-cov show-env --sh)"; \
+	cargo llvm-cov clean --workspace; \
+	$(MAKE) agent-check-test; \
+	$(MAKE) integration-test; \
+	$(MAKE) integration-test-opensearch; \
+	mkdir -p "$(COVERAGE_DIR)/reports"; \
+	cargo llvm-cov report --release --json --output-path "$(COVERAGE_DIR)/reports/coverage.json"; \
+	cargo llvm-cov report --release --lcov --output-path "$(COVERAGE_DIR)/reports/lcov.info"

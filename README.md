@@ -416,8 +416,9 @@ check uses `ANALYZE` + `reltuples` and can therefore only warn, never abort.
 Two-phase workflows are unchanged, and now provably non-destructive: upload with
 `--keep-data`, then re-run with `--skip-upload --skip-if-exists false`. A
 filter-only two-phase run must pass `--skip-vector-index` in **both** phases —
-the flag renames the config to `<engine>-no-vector`, so phase 1 writes exactly the
-schema-only index phase 2 reuses.
+the flag renames the config to `<engine>-no-vector`. Redis derives its default
+index name from that config. OpenSearch uses `OPENSEARCH_INDEX` (default `bench`);
+both engines validate the realized scalar schema before reusing an index.
 
 ### Redis / OpenSearch pure numeric and tag benchmarks
 
@@ -448,8 +449,22 @@ Redis filter-only workers require RESP3 and reject replies with any warning,
 including partial results from query timeouts. No server configuration changes
 are required, so the same guard works on Redis Cloud.
 
+The realized index schema is checked before timing, including index reuse:
+vector indexes are rejected, numeric fields retain double precision, and tags
+are case-sensitive. OpenSearch does not require `_id` fielddata. The common
+numeric/tag domain rejects empty tags, tags containing `;` or edge whitespace,
+and integers outside +/-2^53. Numeric operands must be JSON numbers; numeric
+`match.any` accepts integer lists. These checks run before upload/search timing.
+
 This changes Redis filter-only response shaping from full documents to IDs only;
-old filter-only timings are not directly comparable. KNN behavior is unchanged.
+old filter-only timings and Valkey's legacy filter-only path are not directly
+comparable. KNN behavior is unchanged.
+
+Run `make agent-check`, `make integration-test`, and
+`make integration-test-opensearch` to verify the contract. For instrumented
+library, CLI, and real-server coverage, install `cargo-llvm-cov` and the Rust
+`llvm-tools-preview` component, then run `make coverage-filter-only`. JSON and
+LCOV reports are written under `target/filter-only-coverage/reports/`.
 
 ### Per-config index isolation (Redis / Valkey / Dragonfly / KiviDB / VectorSets)
 

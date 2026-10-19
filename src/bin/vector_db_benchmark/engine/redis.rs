@@ -147,6 +147,7 @@ fn shared_corpus_is_complete(existing: usize, expected: u64) -> bool {
 }
 
 pub struct RedisEngine {
+    scalar_metadata_validated: bool,
     name: String,
     redis_url: String,
     config: RedisEngineConfig,
@@ -281,6 +282,7 @@ impl RedisEngine {
             .unwrap_or(64) as usize;
 
         Ok(Self {
+            scalar_metadata_validated: false,
             name: engine_config.name.clone(),
             redis_url,
             config: RedisEngineConfig {
@@ -441,15 +443,11 @@ impl RedisEngine {
                         // "true"/"false"); SEPARATOR ; + SORTABLE UNF matches the
                         // keyword treatment so exact TAG matching works.
                         "keyword" | "uuid" | "bool" => {
-                            cmd.arg(field_name)
-                                .arg("TAG")
-                                .arg("SEPARATOR")
-                                .arg(";")
-                                .arg("SORTABLE")
-                                .arg("UNF");
+                            cmd.arg(field_name).arg("TAG").arg("SEPARATOR").arg(";");
                             if self.config.skip_vector_index {
                                 cmd.arg("CASESENSITIVE");
                             }
+                            cmd.arg("SORTABLE").arg("UNF");
                         }
                         "int" | "float" => {
                             cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
@@ -826,10 +824,24 @@ impl RedisEngine {
                 dataset.config.schema.as_ref(),
             )?;
         }
+        if !self.scalar_metadata_validated {
+            let (_, _, metadata) = dataset.read_vectors(false)?;
+            vector_db_benchmark::filter_only::domain::validate_metadata(
+                &metadata,
+                dataset.config.schema.as_ref(),
+            )?;
+            self.scalar_metadata_validated = true;
+        }
         let parallel = params.parallel.unwrap_or(1) as usize;
         let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
         let (_, _, conditions) = dataset.read_queries()?;
-        let parsed_filters = conditions.resolve_all("Redis", parse_conditions)?;
+        let parsed_filters = conditions.try_resolve_all("Redis", |condition| {
+            vector_db_benchmark::filter_only::domain::validate_predicate(
+                condition,
+                dataset.config.schema.as_ref(),
+            )?;
+            Ok(parse_conditions(condition))
+        })?;
         // A metadata result limit must not be derived from vector ground truth.
         let top = params
             .top
@@ -849,8 +861,9 @@ impl RedisEngine {
             commands.len()
         };
         let query_idx = AtomicUsize::new(0);
-        let matched_sum = AtomicUsize::new(0);
-        let returned_sum = AtomicUsize::new(0);
+        let mut matched_sum = 0u64;
+        let mut returned_sum = 0u64;
+        let mut errors = Vec::new();
         let mut times = Vec::with_capacity(num_to_run);
         let pb = self.create_progress_bar(num_to_run);
         let measured_start = std::thread::scope(|scope| -> Result<Instant, String> {
@@ -859,11 +872,13 @@ impl RedisEngine {
                 let redis_url = &self.redis_url;
                 let commands = &commands;
                 let query_idx = &query_idx;
-                let matched_sum = &matched_sum;
-                let returned_sum = &returned_sum;
                 let pb = &pb;
                 pool.spawn(move |ticket| {
                     let mut samples = Vec::new();
+                    let mut matched = 0u64;
+                    let mut returned_count = 0u64;
+                    let mut errors = Vec::new();
+                    let mut pending = 0u64;
                     let mut conn = match redis::Client::open(redis_url.as_str()).and_then(|c| {
                         let info = c.get_connection_info();
                         let settings = info
@@ -876,12 +891,23 @@ impl RedisEngine {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("Redis filter-only connection failed: {e}"));
-                            return samples;
+                            return (samples, matched, returned_count, errors);
                         }
                     };
+                    let deadline =
+                        std::time::Duration::from_millis(query_timeout.max(0) as u64 + 30_000);
+                    if let Err(e) = conn
+                        .set_read_timeout(Some(deadline))
+                        .and_then(|_| conn.set_write_timeout(Some(deadline)))
+                    {
+                        ticket.fail(format!(
+                            "Redis filter-only socket deadline setup failed: {e}"
+                        ));
+                        return (samples, matched, returned_count, errors);
+                    }
                     let _ = commands[0].query::<redis::Value>(&mut conn);
                     if ticket.arrive_and_wait().is_none() {
-                        return samples;
+                        return (samples, matched, returned_count, errors);
                     }
                     loop {
                         let seq = query_idx.fetch_add(1, Ordering::Relaxed);
@@ -898,24 +924,39 @@ impl RedisEngine {
                         {
                             Ok((total, returned)) => {
                                 samples.push(elapsed);
-                                matched_sum.fetch_add(total as usize, Ordering::Relaxed);
-                                returned_sum.fetch_add(returned, Ordering::Relaxed);
+                                matched += total;
+                                returned_count += returned as u64;
                             }
-                            Err(e) => eprintln!("Filter-only query {seq} failed: {e}"),
+                            Err(e) => {
+                                if errors.len() < 3 {
+                                    errors.push(format!("Filter-only query {seq} failed: {e}"));
+                                }
+                            }
                         }
-                        pb.inc(1);
+                        pending += 1;
+                        if pending == 256 {
+                            pb.inc(pending);
+                            pending = 0;
+                        }
                     }
-                    samples
+                    pb.inc(pending);
+                    (samples, matched, returned_count, errors)
                 })?;
             }
             let (workers, start) = pool.start()?;
-            for samples in workers {
+            for (samples, matched, returned, worker_errors) in workers {
                 times.extend(samples);
+                matched_sum += matched;
+                returned_sum += returned;
+                errors.extend(worker_errors);
             }
             Ok(start)
         })?;
         let total_time = measured_start.elapsed().as_secs_f64();
         pb.finish_and_clear();
+        for error in errors.iter().take(3) {
+            eprintln!("{error}");
+        }
         let mut check_conn = self.get_connection()?;
         redis_utils::check_commandstats(
             &mut check_conn,
@@ -937,8 +978,8 @@ impl RedisEngine {
         result.mean_precision_at_returned = -1.0;
         result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
             result_limit: top,
-            matched_documents_sum: matched_sum.load(Ordering::Relaxed) as u64,
-            returned_documents_sum: returned_sum.load(Ordering::Relaxed) as u64,
+            matched_documents_sum: matched_sum,
+            returned_documents_sum: returned_sum,
         });
         Ok(result)
     }
@@ -1913,6 +1954,7 @@ impl Engine for RedisEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        self.scalar_metadata_validated = false;
         let mut conn = self.get_connection()?;
 
         // Record which schema fields are `datetime` so upload can convert their
@@ -1996,6 +2038,13 @@ impl Engine for RedisEngine {
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
         let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        if self.config.skip_vector_index {
+            vector_db_benchmark::filter_only::domain::validate_metadata(
+                &metadata,
+                dataset.config.schema.as_ref(),
+            )?;
+            self.scalar_metadata_validated = true;
+        }
         let read_time = read_start.elapsed().as_secs_f64();
 
         println!(

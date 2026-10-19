@@ -38,6 +38,7 @@ struct OpenSearchConfig {
 }
 
 pub struct OpenSearchEngine {
+    scalar_metadata_validated: bool,
     name: String,
     index_name: String,
     #[allow(dead_code)]
@@ -115,6 +116,7 @@ impl OpenSearchEngine {
         let client = create_os_client(&base_url, timeout)?;
 
         Ok(Self {
+            scalar_metadata_validated: false,
             name: engine_config.name.clone(),
             index_name,
             timeout,
@@ -1875,6 +1877,7 @@ impl Engine for OpenSearchEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        self.scalar_metadata_validated = false;
         // Shard count is printed alongside the HNSW knobs so a sweep point is
         // honestly labelled rather than silently measured at whatever the cluster
         // defaults to (same fairness gate as vertex.rs's effective-knob line).
@@ -1904,6 +1907,13 @@ impl Engine for OpenSearchEngine {
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
         let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        if self.config.skip_vector_index {
+            vector_db_benchmark::filter_only::domain::validate_metadata(
+                &metadata,
+                dataset.config.schema.as_ref(),
+            )?;
+            self.scalar_metadata_validated = true;
+        }
         let read_time = read_start.elapsed().as_secs_f64();
 
         println!(
@@ -1991,6 +2001,14 @@ impl Engine for OpenSearchEngine {
             self.setup_search(params)?;
         } else {
             self.validate_filter_only_schema(dataset)?;
+            if !self.scalar_metadata_validated {
+                let (_, _, metadata) = dataset.read_vectors(false)?;
+                vector_db_benchmark::filter_only::domain::validate_metadata(
+                    &metadata,
+                    dataset.config.schema.as_ref(),
+                )?;
+                self.scalar_metadata_validated = true;
+            }
         }
 
         let query_path = dataset.get_path()?;
@@ -1998,7 +2016,15 @@ impl Engine for OpenSearchEngine {
         let (mut queries, mut neighbors, conditions) = dataset.read_queries()?;
 
         let mut parsed_filters: Vec<QueryFilter<serde_json::Value>> =
-            conditions.resolve_all("OpenSearch", parse_os_conditions)?;
+            conditions.try_resolve_all("OpenSearch", |condition| {
+                if self.config.skip_vector_index {
+                    vector_db_benchmark::filter_only::domain::validate_predicate(
+                        condition,
+                        dataset.config.schema.as_ref(),
+                    )?;
+                }
+                Ok(parse_os_conditions(condition))
+            })?;
 
         let filter_only = self.config.skip_vector_index;
         if filter_only {
@@ -2011,8 +2037,9 @@ impl Engine for OpenSearchEngine {
             neighbors = indices.iter().map(|&i| neighbors[i].clone()).collect();
             parsed_filters = indices.iter().map(|&i| parsed_filters[i].clone()).collect();
         }
-        let matched_sum = AtomicUsize::new(0);
-        let returned_sum = AtomicUsize::new(0);
+        let mut matched_sum = 0u64;
+        let mut returned_sum = 0u64;
+        let mut scalar_errors = Vec::new();
         let explicit_top: Option<usize> = if filter_only {
             Some(
                 params
@@ -2100,8 +2127,6 @@ impl Engine for OpenSearchEngine {
                 let neighbors = &neighbors;
                 let tops = &tops;
                 let raw_bodies = &raw_bodies;
-                let matched_sum = &matched_sum;
-                let returned_sum = &returned_sum;
                 let query_idx = Arc::clone(&query_idx);
                 let retried_queries = Arc::clone(&retried_queries);
                 let pb = &pb;
@@ -2112,6 +2137,10 @@ impl Engine for OpenSearchEngine {
                     let mut r = Vec::new();
                     let mut mr = Vec::new();
                     let mut nd = Vec::new();
+                    let mut matched = 0u64;
+                    let mut returned_count = 0u64;
+                    let mut errors = Vec::new();
+                    let mut pending = 0u64;
 
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -2123,7 +2152,7 @@ impl Engine for OpenSearchEngine {
                             // lower real concurrency than the `parallel` it reports. Settle
                             // the ticket with the reason; the coordinator makes it an error.
                             ticket.fail(format!("opensearch-search worker setup failed: {e}"));
-                            return (t, p, r, mr, nd);
+                            return (t, p, r, mr, nd, matched, returned_count, errors);
                         }
                     };
                     let client = match create_os_client(&base_url, timeout) {
@@ -2133,7 +2162,7 @@ impl Engine for OpenSearchEngine {
                             // lower real concurrency than the `parallel` it reports. Settle
                             // the ticket with the reason; the coordinator makes it an error.
                             ticket.fail(format!("opensearch-search worker setup failed: {e}"));
-                            return (t, p, r, mr, nd);
+                            return (t, p, r, mr, nd, matched, returned_count, errors);
                         }
                     };
 
@@ -2147,7 +2176,7 @@ impl Engine for OpenSearchEngine {
                     // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
                     if ticket.arrive_and_wait().is_none() {
-                        return (t, p, r, mr, nd);
+                        return (t, p, r, mr, nd, matched, returned_count, errors);
                     }
 
                     loop {
@@ -2173,12 +2202,20 @@ impl Engine for OpenSearchEngine {
                                 Ok((total, returned)) => {
                                     // End-to-end latency includes retries/backoff, like Redis.
                                     t.push(elapsed.as_secs_f64());
-                                    matched_sum.fetch_add(total as usize, Ordering::Relaxed);
-                                    returned_sum.fetch_add(returned, Ordering::Relaxed);
+                                    matched += total;
+                                    returned_count += returned as u64;
                                 }
-                                Err(e) => eprintln!("Filter-only query {idx} failed: {e}"),
+                                Err(e) => {
+                                    if errors.len() < 3 {
+                                        errors.push(format!("Filter-only query {idx} failed: {e}"));
+                                    }
+                                }
                             }
-                            pb.inc(1);
+                            pending += 1;
+                            if pending == 256 {
+                                pb.inc(pending);
+                                pending = 0;
+                            }
                             continue;
                         }
 
@@ -2216,7 +2253,8 @@ impl Engine for OpenSearchEngine {
                         }
                         pb.inc(1);
                     }
-                    (t, p, r, mr, nd)
+                    pb.inc(pending);
+                    (t, p, r, mr, nd, matched, returned_count, errors)
                 })?;
             }
 
@@ -2224,7 +2262,10 @@ impl Engine for OpenSearchEngine {
             // Stamp the shared measurement start and release them together.
             let (per_worker, measured_start) = pool.start()?;
 
-            for (t, p, r, mr, nd) in per_worker {
+            for (t, p, r, mr, nd, matched, returned_count, errors) in per_worker {
+                matched_sum += matched;
+                returned_sum += returned_count;
+                scalar_errors.extend(errors);
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
@@ -2238,6 +2279,9 @@ impl Engine for OpenSearchEngine {
         // Measure from the post-gate start stamp (workers already primed), so
         // total_time excludes connection setup and the cold first query.
         let total_time = measured_start.elapsed().as_secs_f64();
+        for error in scalar_errors.iter().take(3) {
+            eprintln!("{error}");
+        }
 
         // Dropped queries are NOT refused here. `compute_search_stats` derives
         // `failed_queries` as `requested_queries - times.len()` for every engine,
@@ -2271,8 +2315,8 @@ impl Engine for OpenSearchEngine {
             result.mean_precision_at_returned = -1.0;
             result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
                 result_limit: top,
-                matched_documents_sum: matched_sum.load(Ordering::Relaxed) as u64,
-                returned_documents_sum: returned_sum.load(Ordering::Relaxed) as u64,
+                matched_documents_sum: matched_sum,
+                returned_documents_sum: returned_sum,
             });
         }
         Ok(result)
