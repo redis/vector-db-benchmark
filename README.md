@@ -443,7 +443,8 @@ Only queries with explicit predicates run. `--queries N` cycles those queries,
 and the experiment is named `<engine>-no-vector`. Select one engine config
 with one point per client count. Selecting multiple configs for the same engine
 with `--skip-vector-index` fails before download or connection; the runner never
-silently keeps the first. All `--skip-vector-index` engines reject
+silently keeps the first. Adapters without scalar support are warned about and
+skipped before duplicate-selection and namespace checks. All `--skip-vector-index` engines reject
 conflicting `top` values at the same client count instead of silently picking one.
 Only Redis/OpenSearch treat omitted `top` as 10; legacy Valkey/MongoDB derive
 it from ground truth, so mixing an omitted and explicit limit is rejected.
@@ -468,12 +469,17 @@ the Redis Cloud benchmark has not yet validated it.
 
 The realized index schema is checked before timing, including index reuse:
 vector indexes are rejected, numeric fields retain double precision, and tags
-are case-sensitive; reused OpenSearch keyword fields cannot set `ignore_above`.
+are case-sensitive; reused OpenSearch keyword fields cannot set `ignore_above`
+or enable `split_queries_on_whitespace`.
 OpenSearch does not require `_id` fielddata. The common
 numeric/tag mode accepts predicates only on explicitly declared `keyword`, `int`,
 or `float` fields. Unknown fields, missing schema declarations, and text, geo,
 datetime, or other field types are rejected in predicates, including inside
-boolean groups. Unqueried extra metadata may remain stored. KNN modes retain
+boolean groups. Groups must contain nonempty arrays of predicate objects and
+cannot have sibling field leaves; `and` and `or` may coexist. Match criteria
+must contain exactly one of `value` or `any`, and ranges allow at most one lower
+and one upper bound. Ambiguous or malformed clauses are rejected instead of
+silently dropped. Unqueried extra metadata may remain stored. KNN modes retain
 their existing predicate support.
 The common domain also rejects empty tags, tags containing `;` or edge whitespace,
 integers outside +/-2^53, and negative floating-point zero (whose equality

@@ -166,7 +166,8 @@ pub fn run(args: &Args) -> Result<(), String> {
         "vertex",
         "chroma",
     ];
-    let engines: Vec<_> = engine_configs
+    let skip_vector_engines = ["redis", "valkey", "mongodb", "opensearch"];
+    let mut engines: Vec<_> = engine_configs
         .iter()
         .filter(|(name, config)| {
             let engine_type = config.engine.as_deref().unwrap_or("");
@@ -181,6 +182,25 @@ pub fn run(args: &Args) -> Result<(), String> {
             args.engines.join(", "),
             supported_engines
         ));
+    }
+
+    // Exclude adapters without scalar support before any selection or namespace
+    // collision guard; skipped configs cannot collide with an executed workload.
+    if args.skip_vector_index {
+        engines.retain(|(_, config)| {
+            let engine_type = config.engine.as_deref().unwrap_or("unknown");
+            let supported = skip_vector_engines.contains(&engine_type);
+            if !supported {
+                eprintln!(
+                    "WARNING: --skip-vector-index not implemented for engine '{}', skipping",
+                    engine_type
+                );
+            }
+            supported
+        });
+        if engines.is_empty() {
+            return Err("No selected engines support --skip-vector-index".into());
+        }
     }
 
     if args.target_qps > 0.0 || args.search_duration > 0.0 {
@@ -291,8 +311,6 @@ pub fn run(args: &Args) -> Result<(), String> {
     );
     pb.enable_steady_tick(std::time::Duration::from_secs(1));
 
-    let skip_vector_engines = ["redis", "valkey", "mongodb", "opensearch"];
-
     // Soft wall-clock budget: once total elapsed reaches --timeout, stop launching
     // further experiments and finish cleanly. This bounds the overall run without
     // interrupting an in-flight experiment (the Rust runner is blocking, so a hard
@@ -330,13 +348,6 @@ pub fn run(args: &Args) -> Result<(), String> {
         let mut engine_config = (*engine_config).clone();
         if args.skip_vector_index {
             let engine_type = engine_config.engine.as_deref().unwrap_or("unknown");
-            if !skip_vector_engines.contains(&engine_type) {
-                eprintln!(
-                    "WARNING: --skip-vector-index not implemented for engine '{}', skipping",
-                    engine_type
-                );
-                continue;
-            }
             engine_config.name = format!("{}-no-vector", engine_type);
             engine_config.skip_vector_index = true;
         }

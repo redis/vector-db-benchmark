@@ -145,7 +145,16 @@ fn leaf(field: &str, filters: &Value, field_kind: &str) -> Result<(), String> {
     for (operation, criteria) in filters {
         match operation.as_str() {
             "match" => {
-                // Match the adapters' precedence: any, then text, then value.
+                let criteria = criteria
+                    .as_object()
+                    .ok_or_else(|| error(field, "match must be an object"))?;
+                if criteria.len() != 1
+                    || !criteria
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "any" | "value"))
+                {
+                    return Err(error(field, "match requires exactly one of value or any"));
+                }
                 if let Some(any) = criteria.get("any") {
                     let values = any
                         .as_array()
@@ -156,11 +165,6 @@ fn leaf(field: &str, filters: &Value, field_kind: &str) -> Result<(), String> {
                     for value in values {
                         operand(field, value, field_kind, true)?;
                     }
-                } else if criteria.get("text").is_some() {
-                    return Err(error(
-                        field,
-                        "text matching is outside the numeric/tag contract",
-                    ));
                 } else {
                     let value = criteria
                         .get("value")
@@ -180,6 +184,14 @@ fn leaf(field: &str, filters: &Value, field_kind: &str) -> Result<(), String> {
                     .ok_or_else(|| error(field, "range must be an object"))?;
                 if bounds.is_empty() {
                     return Err(error(field, "range requires a numeric bound"));
+                }
+                if (bounds.contains_key("gt") && bounds.contains_key("gte"))
+                    || (bounds.contains_key("lt") && bounds.contains_key("lte"))
+                {
+                    return Err(error(
+                        field,
+                        "range permits at most one lower and one upper bound",
+                    ));
                 }
                 for (bound, value) in bounds {
                     if !matches!(bound.as_str(), "gt" | "gte" | "lt" | "lte") {
@@ -209,15 +221,26 @@ fn leaf(field: &str, filters: &Value, field_kind: &str) -> Result<(), String> {
 /// Inspect boolean groups and field leaves, never arbitrary JSON inside an
 /// operand. Reject predicates outside the declared numeric/tag domain.
 pub fn validate_predicate(condition: &Value, schema: Option<&Value>) -> Result<(), String> {
-    let Some(object) = condition.as_object() else {
-        return Ok(());
-    };
+    let object = condition
+        .as_object()
+        .filter(|object| !object.is_empty())
+        .ok_or("filter-only predicate must be a nonempty object")?;
     if object.contains_key("and") || object.contains_key("or") {
-        for name in ["and", "or"] {
-            if let Some(entries) = object.get(name).and_then(Value::as_array) {
-                for entry in entries {
-                    validate_predicate(entry, schema)?;
-                }
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "and" | "or"))
+        {
+            return Err(
+                "filter-only cannot mix boolean groups and field leaves in one object".into(),
+            );
+        }
+        for (name, value) in object {
+            let entries = value
+                .as_array()
+                .filter(|entries| !entries.is_empty())
+                .ok_or_else(|| format!("filter-only {name} group must be a nonempty array"))?;
+            for entry in entries {
+                validate_predicate(entry, schema)?;
             }
         }
     } else {
@@ -419,7 +442,87 @@ mod tests {
     }
 
     #[test]
-    fn preserves_unqueried_metadata_and_respects_parser_precedence() {
+    fn accepts_combined_boolean_groups_and_multiple_leaf_operations() {
+        for condition in [
+            json!({"and":[{"tag":{"match":{"value":"safe"}}}],"or":[{"n":{"range":{"gte":1,"lt":10}}},{"n":{"match":{"value":42}}}]}),
+            json!({"tag":{"match":{"value":"safe"}},"n":{"match":{"value":3},"range":{"gt":1,"lte":4}}}),
+        ] {
+            validate_predicate(&condition, Some(&schema())).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_boolean_children_and_ignored_siblings() {
+        let valid = json!({"tag":{"match":{"value":"safe"}}});
+        for invalid in [json!(null), json!({}), json!([]), json!(1), json!("tag")] {
+            assert!(validate_predicate(&invalid, Some(&schema())).is_err());
+            for group in ["and", "or"] {
+                let condition = json!({group:[valid, invalid]});
+                assert!(
+                    validate_predicate(&condition, Some(&schema())).is_err(),
+                    "{condition}"
+                );
+            }
+        }
+        for group in ["and", "or"] {
+            for value in [
+                json!(null),
+                json!({}),
+                json!([]),
+                json!(true),
+                valid.clone(),
+            ] {
+                let condition = json!({group:value});
+                assert!(
+                    validate_predicate(&condition, Some(&schema())).is_err(),
+                    "{condition}"
+                );
+            }
+            for extra in ["tag", "unknown"] {
+                let condition = json!({group:[valid],extra:{"match":{"value":"safe"}}});
+                assert!(
+                    validate_predicate(&condition, Some(&schema())).is_err(),
+                    "{condition}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_match_and_range_operands() {
+        for criteria in [
+            json!({"any":["safe"],"value":"other"}),
+            json!({"any":["safe"],"text":"other"}),
+            json!({"value":"safe","text":"other"}),
+            json!({"value":"safe","unknown":true}),
+            json!({"text":"safe"}),
+            json!({"unknown":"safe"}),
+            json!({}),
+            json!(null),
+            json!([]),
+            json!("safe"),
+        ] {
+            let condition = json!({"tag":{"match":criteria}});
+            assert!(
+                validate_predicate(&condition, Some(&schema())).is_err(),
+                "{condition}"
+            );
+        }
+        for bounds in [
+            json!({"gt":1,"gte":2}),
+            json!({"lt":4,"lte":3}),
+            json!({"gt":1,"gte":2,"lt":4,"lte":3}),
+        ] {
+            let condition = json!({"n":{"range":bounds}});
+            assert!(
+                validate_predicate(&condition, Some(&schema())).is_err(),
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_unqueried_metadata_but_rejects_ignored_predicate_parts() {
         let condition = json!({"and":[{"body":{"match":{"text":" text; "}}},{"unknown":{"match":{"value":" x; "}}}]});
         assert!(validate_predicate(&condition, Some(&schema())).is_err());
         validate_metadata(
@@ -428,17 +531,17 @@ mod tests {
         )
         .unwrap();
         validate_metadata(&metadata("tag", MetadataValue::String(" x; ".into())), None).unwrap();
-        validate_predicate(
+        assert!(validate_predicate(
             &json!({"tag":{"match":{"any":["safe"],"value":" bad; ","text":"ignored"}}}),
             Some(&schema()),
         )
-        .unwrap();
-        validate_predicate(
+        .is_err());
+        assert!(validate_predicate(
             &json!({"and":[], "tag":{"match":{"value":"ignored;"}}}),
             Some(&schema()),
         )
-        .unwrap();
-        validate_predicate(&Value::Null, Some(&schema())).unwrap();
+        .is_err());
+        assert!(validate_predicate(&Value::Null, Some(&schema())).is_err());
     }
 
     #[test]

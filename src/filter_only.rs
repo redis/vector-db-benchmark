@@ -137,6 +137,14 @@ pub fn validate_opensearch_schema(
                     "filter-only requires case-sensitive keyword mapping for {field}"
                 ));
             }
+            if kind == "keyword"
+                && !properties[field]["split_queries_on_whitespace"].is_null()
+                && properties[field]["split_queries_on_whitespace"] != false
+            {
+                return Err(format!(
+                    "filter-only requires split_queries_on_whitespace=false for {field}"
+                ));
+            }
             if kind == "keyword" && !properties[field]["ignore_above"].is_null() {
                 return Err(format!(
                     "filter-only requires keyword mapping without ignore_above for {field}"

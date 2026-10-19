@@ -627,3 +627,21 @@ fn scalar_engine_selection_refuses_every_duplicate_type_before_collapsing_names(
         }
     }
 }
+
+#[test]
+fn opensearch_keyword_reuse_rejects_query_token_splitting() {
+    let schema = scalar_schema();
+    let mut properties = os_properties();
+    for bad in [json!(true), json!("true"), json!(0)] {
+        properties["tag"]["split_queries_on_whitespace"] = bad;
+        assert!(
+            validate_opensearch_schema(&properties, &json!({"knn":false}), Some(&schema))
+                .unwrap_err()
+                .contains("split_queries_on_whitespace")
+        );
+    }
+    for good in [json!(false), Value::Null] {
+        properties["tag"]["split_queries_on_whitespace"] = good;
+        validate_opensearch_schema(&properties, &json!({"knn":false}), Some(&schema)).unwrap();
+    }
+}
