@@ -105,6 +105,10 @@ test:
 	@echo "=== Running Rust unit tests ==="
 	cargo test --lib --release -- --nocapture
 
+.PHONY: test-filter-only-debug
+test-filter-only-debug:
+	cargo test --lib filter_only::
+
 .PHONY: test-verbose
 test-verbose:
 	@echo "=== Running Rust unit tests (verbose) ==="
