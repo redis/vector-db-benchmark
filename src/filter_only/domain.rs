@@ -6,8 +6,8 @@
 //! use different string encodings (especially scientific notation). Redis NUMERIC uses binary64: integer data and operands must lie
 //! within +/-2^53. Numeric query operands must be JSON numbers, and numeric
 //! `match.any` currently supports integer lists only, matching the Redis parser.
-//! These checks apply only to declared `keyword`, `int`, and `float` fields;
-//! they do not impose a new contract on text, geo, datetime, or untyped fields.
+//! Predicates may reference only declared `keyword`, `int`, and `float` fields.
+//! Other metadata may remain stored but cannot participate in this comparison.
 
 use crate::readers::metadata::{MetadataItem, MetadataValue};
 use serde_json::Value;
@@ -207,7 +207,7 @@ fn leaf(field: &str, filters: &Value, field_kind: &str) -> Result<(), String> {
 }
 
 /// Inspect boolean groups and field leaves, never arbitrary JSON inside an
-/// operand. Non-scalar schema fields remain the existing parser's responsibility.
+/// operand. Reject predicates outside the declared numeric/tag domain.
 pub fn validate_predicate(condition: &Value, schema: Option<&Value>) -> Result<(), String> {
     let Some(object) = condition.as_object() else {
         return Ok(());
@@ -224,6 +224,11 @@ pub fn validate_predicate(condition: &Value, schema: Option<&Value>) -> Result<(
         for (field, filters) in object {
             if let Some(field_kind @ ("keyword" | "int" | "float")) = kind(schema, field) {
                 leaf(field, filters, field_kind)?;
+            } else {
+                return Err(error(
+                    field,
+                    "predicate requires a declared keyword, int, or float field",
+                ));
             }
         }
     }
@@ -414,9 +419,9 @@ mod tests {
     }
 
     #[test]
-    fn ignores_unrelated_fields_and_respects_parser_precedence() {
+    fn preserves_unqueried_metadata_and_respects_parser_precedence() {
         let condition = json!({"and":[{"body":{"match":{"text":" text; "}}},{"unknown":{"match":{"value":" x; "}}}]});
-        validate_predicate(&condition, Some(&schema())).unwrap();
+        assert!(validate_predicate(&condition, Some(&schema())).is_err());
         validate_metadata(
             &metadata("body", MetadataValue::String(" x; ".into())),
             Some(&schema()),
@@ -434,6 +439,41 @@ mod tests {
         )
         .unwrap();
         validate_predicate(&Value::Null, Some(&schema())).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_and_non_numeric_tag_predicates_in_nested_groups() {
+        let schema = json!({"tag":"keyword", "n":"int", "body":"text", "loc":"geo", "when":"datetime", "enabled":"bool"});
+        for (field, predicate) in [
+            ("unknown", json!({"match":{"value":"x"}})),
+            ("body", json!({"match":{"text":"hello"}})),
+            ("loc", json!({"geo":{"lat":1.0,"lon":2.0,"radius":100}})),
+            ("when", json!({"range":{"gte":"2026-01-01"}})),
+            ("enabled", json!({"match":{"value":true}})),
+        ] {
+            let leaf = json!({field:predicate});
+            let nested = json!({"and":[{"tag":{"match":{"value":"safe"}}},{"or":[{"n":{"range":{"gte":0}}},leaf]}]});
+            for condition in [leaf, nested] {
+                let error = validate_predicate(&condition, Some(&schema)).unwrap_err();
+                assert!(error.contains("declared keyword, int, or float"), "{error}");
+                assert!(error.contains(field), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn predicates_require_a_schema_declaration_even_for_apparently_scalar_values() {
+        let predicate = json!({"tag":{"match":{"value":"safe"}}});
+        for schema in [
+            None,
+            Some(json!(null)),
+            Some(json!({})),
+            Some(json!([])),
+            Some(json!({"tag":null})),
+        ] {
+            assert!(validate_predicate(&predicate, schema.as_ref()).is_err());
+        }
+        validate_predicate(&predicate, Some(&json!({"tag":"keyword"}))).unwrap();
     }
 
     #[test]

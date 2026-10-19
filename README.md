@@ -470,7 +470,12 @@ The realized index schema is checked before timing, including index reuse:
 vector indexes are rejected, numeric fields retain double precision, and tags
 are case-sensitive; reused OpenSearch keyword fields cannot set `ignore_above`.
 OpenSearch does not require `_id` fielddata. The common
-numeric/tag domain rejects empty tags, tags containing `;` or edge whitespace,
+numeric/tag mode accepts predicates only on explicitly declared `keyword`, `int`,
+or `float` fields. Unknown fields, missing schema declarations, and text, geo,
+datetime, or other field types are rejected in predicates, including inside
+boolean groups. Unqueried extra metadata may remain stored. KNN modes retain
+their existing predicate support.
+The common domain also rejects empty tags, tags containing `;` or edge whitespace,
 integers outside +/-2^53, and negative floating-point zero (whose equality
 semantics differ between the engines). Floating-point keyword metadata is also
 rejected because the upload paths stringify it differently; provide explicit
