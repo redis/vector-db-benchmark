@@ -431,8 +431,12 @@ preserve the precision of Redis NUMERIC values.
 
 Redis uses `FT.SEARCH ... NOCONTENT DIALECT 2`; OpenSearch uses `bool.filter`,
 `track_total_hits: true`, `_source: false`, and `_doc` order. Both exclude worker
-connection setup and one priming query from the timed window. Filter-only
-latency includes any retry/backoff. This is a warm, immutable-corpus benchmark;
+connection setup and one priming query from the timed window. OpenSearch scalar
+latency includes its bounded retries/backoff. Redis scalar queries use one attempt
+without reconnect/retry; a connection failure can fail subsequent queries on that
+worker. The paired workflow fails on any dropped query. This retry-policy
+difference must be considered when interpreting results under failures.
+This is a warm, immutable-corpus benchmark;
 results do not describe a mixed write workload or vector retrieval.
 
 Only queries with explicit predicates run. `--queries N` cycles those queries,
@@ -459,7 +463,8 @@ semantics differ between the engines). Numeric operands must be JSON numbers; nu
 one row at a time and corpus size is checked from the NPY header; vector values
 are neither loaded nor decoded.
 
-This changes Redis filter-only response shaping from full documents to IDs only;
+This changes Redis filter-only response shaping from full documents to IDs only
+and uses DIALECT 2 instead of 4 to avoid optimizations that can skip exact counting;
 old filter-only timings and Valkey's legacy filter-only path are not directly
 comparable. KNN behavior is unchanged.
 

@@ -288,6 +288,11 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_keyword_tokens_in_strings_and_labels() {
+        assert!(validate_metadata(
+            &metadata("tag", MetadataValue::Geo { lon: 0.0, lat: 0.0 }),
+            Some(&schema())
+        )
+        .is_err());
         for token in ["", "a;b", " a", "a ", "\ta", "a\n", "\u{2003}a"] {
             for value in [
                 MetadataValue::String(token.into()),

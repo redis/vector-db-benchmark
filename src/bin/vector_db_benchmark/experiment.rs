@@ -2409,7 +2409,7 @@ fn build_search_result_json(
         result["metrics_schema"] = serde_json::json!({
             "version": 2, "workload": "filter-only", "vector_quality": "not applicable",
             "result_order": "unspecified", "returned_fields": "IDs only", "total_count": "exact",
-            "latency": "end-to-end including retry/backoff; connection setup and priming excluded"
+            "latency": "OpenSearch includes retry/backoff; Redis uses one attempt without reconnect/retry; connection setup and priming excluded"
         });
         for key in [
             "mean_precision_at_returned",
