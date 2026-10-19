@@ -454,7 +454,9 @@ vector indexes are rejected, numeric fields retain double precision, and tags
 are case-sensitive. OpenSearch does not require `_id` fielddata. The common
 numeric/tag domain rejects empty tags, tags containing `;` or edge whitespace,
 and integers outside +/-2^53. Numeric operands must be JSON numbers; numeric
-`match.any` accepts integer lists. These checks run before upload/search timing.
+`match.any` accepts integer lists. These checks run before upload/search timing. On reuse, payloads are validated
+one row at a time and corpus size is checked from the NPY header; vector values
+are neither loaded nor decoded.
 
 This changes Redis filter-only response shaping from full documents to IDs only;
 old filter-only timings and Valkey's legacy filter-only path are not directly
