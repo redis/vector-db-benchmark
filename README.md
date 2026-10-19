@@ -453,7 +453,8 @@ The realized index schema is checked before timing, including index reuse:
 vector indexes are rejected, numeric fields retain double precision, and tags
 are case-sensitive. OpenSearch does not require `_id` fielddata. The common
 numeric/tag domain rejects empty tags, tags containing `;` or edge whitespace,
-and integers outside +/-2^53. Numeric operands must be JSON numbers; numeric
+integers outside +/-2^53, and negative floating-point zero (whose equality
+semantics differ between the engines). Numeric operands must be JSON numbers; numeric
 `match.any` accepts integer lists. These checks run before upload/search timing. On reuse, payloads are validated
 one row at a time and corpus size is checked from the NPY header; vector values
 are neither loaded nor decoded.

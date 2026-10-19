@@ -499,3 +499,33 @@ fn redis_schema_does_not_confuse_values_with_field_names_or_flags() {
     )
     .is_err());
 }
+
+#[test]
+fn redis_schema_rejects_unindexed_scalar_attributes() {
+    for (name, kind, field_type) in [
+        ("tag", "keyword", "TAG"),
+        ("n", "int", "NUMERIC"),
+        ("f", "float", "NUMERIC"),
+    ] {
+        for attr in [
+            json!([
+                "attribute",
+                name,
+                "type",
+                field_type,
+                "SEPARATOR",
+                ";",
+                "CASESENSITIVE",
+                "NOINDEX"
+            ]),
+            json!({"attribute":name,"type":field_type,"SEPARATOR":";","flags":["CASESENSITIVE","NOINDEX"]}),
+        ] {
+            assert!(validate_redis_schema(
+                &json!({"attributes":[attr]}),
+                Some(&json!({name:kind}))
+            )
+            .unwrap_err()
+            .contains("indexed field"));
+        }
+    }
+}

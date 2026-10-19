@@ -142,6 +142,15 @@ pub fn validate_redis_schema(info: &Value, schema: Option<&Value>) -> Result<(),
                 .iter()
                 .find(|a| field(a, "attribute").and_then(Value::as_str) == Some(name))
                 .ok_or_else(|| format!("filter-only missing TAG field {name}"))?;
+            let has_flag = |name: &str| {
+                entries(attr).any(|(key, value)| key == name && value.is_none())
+                    || field(attr, "flags")
+                        .and_then(Value::as_array)
+                        .is_some_and(|flags| flags.iter().any(|flag| flag == name))
+            };
+            if has_flag("NOINDEX") {
+                return Err(format!("filter-only requires indexed field {name}"));
+            }
             if kind != "keyword" {
                 if field(attr, "type").and_then(Value::as_str) != Some("NUMERIC") {
                     return Err(format!("filter-only requires NUMERIC field {name}"));
@@ -153,11 +162,7 @@ pub fn validate_redis_schema(info: &Value, schema: Option<&Value>) -> Result<(),
                     "filter-only requires semicolon separator for {name}"
                 ));
             }
-            let case_sensitive = entries(attr)
-                .any(|(key, value)| key == "CASESENSITIVE" && value.is_none())
-                || field(attr, "flags")
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| a.iter().any(|v| v == "CASESENSITIVE"));
+            let case_sensitive = has_flag("CASESENSITIVE");
             if field(attr, "type").and_then(Value::as_str) != Some("TAG") || !case_sensitive {
                 return Err(format!("filter-only requires CASESENSITIVE TAG for {name}"));
             }

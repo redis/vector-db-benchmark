@@ -43,6 +43,14 @@ fn finite(field: &str, value: f64) -> Result<(), String> {
     if !value.is_finite() {
         return Err(error(field, "numeric values must be finite"));
     }
+    // OpenSearch double terms distinguish -0.0 from +0.0; Redis NUMERIC
+    // compares them equally. Refuse the ambiguous value in the shared domain.
+    if value == 0.0 && value.is_sign_negative() {
+        return Err(error(
+            field,
+            "negative zero is outside the common numeric domain",
+        ));
+    }
     Ok(())
 }
 
@@ -234,6 +242,26 @@ mod tests {
                 fields: vec![(field.into(), value)],
             }),
         ]
+    }
+
+    #[test]
+    fn rejects_negative_zero_but_accepts_positive_zero() {
+        for n in [-0.0_f64, 0.0] {
+            let expected = !n.is_sign_negative();
+            assert_eq!(
+                validate_metadata(&metadata("f", MetadataValue::Float(n)), Some(&schema())).is_ok(),
+                expected
+            );
+            for condition in [
+                json!({"f":{"match":{"value":n}}}),
+                json!({"f":{"range":{"gte":n}}}),
+            ] {
+                assert_eq!(
+                    validate_predicate(&condition, Some(&schema())).is_ok(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
