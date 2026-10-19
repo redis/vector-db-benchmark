@@ -447,6 +447,9 @@ impl RedisEngine {
                                 .arg(";")
                                 .arg("SORTABLE")
                                 .arg("UNF");
+                            if self.config.skip_vector_index {
+                                cmd.arg("CASESENSITIVE");
+                            }
                         }
                         "int" | "float" => {
                             cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
@@ -814,7 +817,14 @@ impl RedisEngine {
     ) -> Result<SearchResults, String> {
         {
             let mut conn = self.get_connection()?;
-            redis_utils::ensure_index_exists(&mut conn, &self.config.index_name)?;
+            let info: redis::Value = redis::cmd("FT.INFO")
+                .arg(&self.config.index_name)
+                .query(&mut conn)
+                .map_err(|e| format!("filter-only schema check failed: {e}"))?;
+            vector_db_benchmark::filter_only::validate_redis_schema(
+                &redis_value_to_json(&info),
+                dataset.config.schema.as_ref(),
+            )?;
         }
         let parallel = params.parallel.unwrap_or(1) as usize;
         let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);

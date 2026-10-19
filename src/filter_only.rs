@@ -21,8 +21,6 @@ pub fn opensearch_body(filter: &Value, limit: usize) -> Value {
         "track_total_hits": true,
         "sort": ["_doc"],
         "_source": false,
-        "stored_fields": "_none_",
-        "docvalue_fields": ["_id"],
     })
 }
 
@@ -30,6 +28,104 @@ pub fn opensearch_body(filter: &Value, limit: usize) -> Value {
 pub fn disable_vector_index(properties: &mut Value, settings: &mut Value) {
     properties["vector"] = json!({"type": "float", "index": false, "doc_values": false});
     settings["knn"] = json!(false);
+}
+
+/// Pick only explicit predicates, preserving their order and cycling only when
+/// a positive query count is requested. Vector ground truth is irrelevant.
+pub fn query_indices(
+    filtered: impl IntoIterator<Item = bool>,
+    requested: i64,
+) -> Result<Vec<usize>, String> {
+    let selected: Vec<_> = filtered
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, yes)| yes.then_some(i))
+        .collect();
+    if selected.is_empty() {
+        return Err("No queries with filter conditions for filter-only search".into());
+    }
+    let count = if requested > 0 {
+        requested as usize
+    } else {
+        selected.len()
+    };
+    Ok((0..count).map(|i| selected[i % selected.len()]).collect())
+}
+
+/// Validate realized schema before timing, including when reusing an index.
+pub fn validate_opensearch_schema(
+    properties: &Value,
+    index: &Value,
+    schema: Option<&Value>,
+) -> Result<(), String> {
+    let vector = &properties["vector"];
+    if !matches!(&index["knn"], Value::Bool(false)) && index["knn"] != "false" {
+        return Err("filter-only requires index.knn=false".into());
+    }
+    if vector["type"] != "float" || vector["index"] != false || vector["doc_values"] != false {
+        return Err("filter-only requires an unindexed vector field without doc values".into());
+    }
+    if let Some(fields) = schema.and_then(Value::as_object) {
+        for (field, kind) in fields {
+            if kind == "float" && properties[field]["type"] != "double" {
+                return Err(format!("filter-only requires double mapping for {field}"));
+            }
+            if kind == "keyword"
+                && (properties[field]["type"] != "keyword"
+                    || !properties[field]["normalizer"].is_null())
+            {
+                return Err(format!(
+                    "filter-only requires case-sensitive keyword mapping for {field}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// FT.INFO can arrive as RESP2 pairs or a RESP3 map; attributes also contain
+/// standalone flags, so do not deserialize them as key/value maps.
+pub fn validate_redis_schema(info: &Value, schema: Option<&Value>) -> Result<(), String> {
+    fn field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
+        if let Some(map) = v.as_object() {
+            return map.get(name);
+        }
+        v.as_array()?
+            .windows(2)
+            .find_map(|p| (p[0] == name).then_some(&p[1]))
+    }
+    let attributes = field(info, "attributes")
+        .and_then(Value::as_array)
+        .ok_or("filter-only missing FT.INFO attributes")?;
+    for attr in attributes {
+        let kind = field(attr, "type")
+            .and_then(Value::as_str)
+            .ok_or("filter-only missing FT.INFO attribute type")?;
+        if kind.eq_ignore_ascii_case("VECTOR") {
+            return Err("filter-only cannot reuse an index containing VECTOR".into());
+        }
+    }
+    if let Some(fields) = schema.and_then(Value::as_object) {
+        for (name, kind) in fields {
+            if kind != "keyword" {
+                continue;
+            }
+            let attr = attributes
+                .iter()
+                .find(|a| field(a, "attribute").and_then(Value::as_str) == Some(name))
+                .ok_or_else(|| format!("filter-only missing TAG field {name}"))?;
+            let case_sensitive = attr
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v == "CASESENSITIVE"))
+                || field(attr, "flags")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| a.iter().any(|v| v == "CASESENSITIVE"));
+            if field(attr, "type").and_then(Value::as_str) != Some("TAG") || !case_sensitive {
+                return Err(format!("filter-only requires CASESENSITIVE TAG for {name}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_page(total: u64, returned: usize, limit: usize) -> Result<(), String> {

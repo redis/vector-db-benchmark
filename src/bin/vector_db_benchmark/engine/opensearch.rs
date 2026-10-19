@@ -12,8 +12,8 @@ use opensearch::cluster::ClusterHealthParts;
 use opensearch::http::request::JsonBody;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::indices::{
-    IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts, IndicesPutSettingsParts,
-    IndicesRefreshParts,
+    IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts, IndicesGetMappingParts,
+    IndicesGetSettingsParts, IndicesPutSettingsParts, IndicesRefreshParts,
 };
 use opensearch::params::WaitForStatus;
 use opensearch::{BulkParts, CountParts, OpenSearch, SearchParts};
@@ -183,12 +183,50 @@ impl OpenSearchEngine {
         )
     }
 
+    fn validate_filter_only_schema(&self, dataset: &Dataset) -> Result<(), String> {
+        let mapping = self
+            .rt
+            .block_on(async {
+                self.client
+                    .indices()
+                    .get_mapping(IndicesGetMappingParts::Index(&[&self.index_name]))
+                    .send()
+                    .await?
+                    .error_for_status_code()?
+                    .json::<serde_json::Value>()
+                    .await
+            })
+            .map_err(|e| format!("filter-only mapping check failed: {e}"))?;
+        let settings = self
+            .rt
+            .block_on(async {
+                self.client
+                    .indices()
+                    .get_settings(IndicesGetSettingsParts::Index(&[&self.index_name]))
+                    .send()
+                    .await?
+                    .error_for_status_code()?
+                    .json::<serde_json::Value>()
+                    .await
+            })
+            .map_err(|e| format!("filter-only settings check failed: {e}"))?;
+        vector_db_benchmark::filter_only::validate_opensearch_schema(
+            &mapping[&self.index_name]["mappings"]["properties"],
+            &settings[&self.index_name]["settings"]["index"],
+            dataset.config.schema.as_ref(),
+        )
+    }
+
     fn create_index(&self, dataset: &Dataset) -> Result<(), String> {
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
 
         let dist_lower = distance.to_lowercase();
-        let space_type = resolve_index_space_type(&dist_lower, vector_size)?;
+        let space_type = if self.config.skip_vector_index {
+            "l2"
+        } else {
+            resolve_index_space_type(&dist_lower, vector_size)?
+        };
 
         // Build properties with knn_vector type
         let mut properties = serde_json::json!({
@@ -1951,6 +1989,8 @@ impl Engine for OpenSearchEngine {
         // Apply search-time settings (ef_search)
         if !self.config.skip_vector_index {
             self.setup_search(params)?;
+        } else {
+            self.validate_filter_only_schema(dataset)?;
         }
 
         let query_path = dataset.get_path()?;
@@ -1963,20 +2003,10 @@ impl Engine for OpenSearchEngine {
         let filter_only = self.config.skip_vector_index;
         if filter_only {
             // Match Redis: only explicit predicates, cycle them for --queries N.
-            let selected: Vec<usize> = parsed_filters
-                .iter()
-                .enumerate()
-                .filter_map(|(i, f)| f.is_filtered().then_some(i))
-                .collect();
-            if selected.is_empty() {
-                return Err("No queries with filter conditions for filter-only search".into());
-            }
-            let count = if num_queries > 0 {
-                num_queries as usize
-            } else {
-                selected.len()
-            };
-            let indices: Vec<usize> = (0..count).map(|i| selected[i % selected.len()]).collect();
+            let indices = vector_db_benchmark::filter_only::query_indices(
+                parsed_filters.iter().map(|f| f.is_filtered()),
+                num_queries,
+            )?;
             queries = indices.iter().map(|&i| queries[i].clone()).collect();
             neighbors = indices.iter().map(|&i| neighbors[i].clone()).collect();
             parsed_filters = indices.iter().map(|&i| parsed_filters[i].clone()).collect();
