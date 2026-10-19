@@ -529,3 +529,40 @@ fn redis_schema_rejects_unindexed_scalar_attributes() {
         }
     }
 }
+
+#[test]
+fn scalar_search_params_keep_first_config_per_parallel_with_effective_defaults() {
+    assert!(search_param_indices([]).unwrap().is_empty());
+    assert_eq!(
+        search_param_indices([
+            (None, None),
+            (Some(1), Some(10)),
+            (Some(100), Some(3)),
+            (Some(100), Some(3)),
+            (Some(2), None),
+            (Some(2), Some(10)),
+        ])
+        .unwrap(),
+        vec![0, 2, 4]
+    );
+    // Parallel levels may deliberately use different limits. Only a config
+    // that would be silently discarded at the same level is conflicting.
+    assert_eq!(
+        search_param_indices([(Some(100), Some(3)), (None, Some(20))]).unwrap(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn scalar_search_params_reject_different_effective_limits_at_same_parallel() {
+    for params in [
+        vec![(None, None), (Some(1), Some(3))],
+        vec![(Some(4), Some(3)), (Some(4), None)],
+        vec![(Some(4), Some(3)), (Some(2), Some(3)), (Some(4), Some(4))],
+    ] {
+        let error = search_param_indices(params).unwrap_err();
+        assert!(error.contains("conflicting result limits"), "{error}");
+        assert!(error.contains("parallel="), "{error}");
+        assert!(error.contains("top="), "{error}");
+    }
+}

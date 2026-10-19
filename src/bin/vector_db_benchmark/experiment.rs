@@ -1426,18 +1426,15 @@ fn run_single_experiment(
         // Clone search params to avoid borrow conflict
         let all_search_params: Vec<_> = engine.search_params().to_vec();
 
-        // --skip-vector-index: dedup search params by parallel level only
-        // (ef values are irrelevant for filter-only queries)
+        // Collapse redundant EF configs, but never silently discard a different
+        // scalar result limit at the same concurrency.
         let effective_search_params: Vec<(usize, SearchParams)> = if skip_vector_index {
-            let mut seen_parallels = std::collections::HashSet::new();
-            all_search_params
-                .into_iter()
-                .enumerate()
-                .filter(|(_, sp)| {
-                    let p = sp.parallel.unwrap_or(1);
-                    seen_parallels.insert(p)
-                })
-                .collect()
+            vector_db_benchmark::filter_only::search_param_indices(
+                all_search_params.iter().map(|sp| (sp.parallel, sp.top)),
+            )?
+            .into_iter()
+            .map(|index| (index, all_search_params[index].clone()))
+            .collect()
         } else {
             all_search_params.into_iter().enumerate().collect()
         };
