@@ -457,3 +457,45 @@ fn scalar_stats_roundtrip_keeps_exact_integer_counts() {
     assert_eq!(decoded.returned_documents_sum, 0);
     assert_eq!(Stats::default().matched_documents_sum, 0);
 }
+
+#[test]
+fn redis_schema_does_not_confuse_values_with_field_names_or_flags() {
+    for name in ["type", "attribute", "CASESENSITIVE", "SEPARATOR"] {
+        let attr = json!([
+            "identifier",
+            name,
+            "attribute",
+            name,
+            "type",
+            "TAG",
+            "SEPARATOR",
+            ";",
+            "SORTABLE",
+            "UNF",
+            "CASESENSITIVE"
+        ]);
+        let schema = json!({name:"keyword"});
+        validate_redis_schema(
+            &json!(["index_name", "attributes", "attributes", [attr]]),
+            Some(&schema),
+        )
+        .unwrap();
+    }
+    let attr = json!([
+        "identifier",
+        "CASESENSITIVE",
+        "attribute",
+        "CASESENSITIVE",
+        "type",
+        "TAG",
+        "SEPARATOR",
+        ";",
+        "SORTABLE",
+        "UNF"
+    ]);
+    assert!(validate_redis_schema(
+        &json!({"attributes":[attr]}),
+        Some(&json!({"CASESENSITIVE":"keyword"}))
+    )
+    .is_err());
+}

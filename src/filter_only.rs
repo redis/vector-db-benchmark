@@ -96,13 +96,31 @@ pub fn validate_opensearch_schema(
 /// FT.INFO can arrive as RESP2 pairs or a RESP3 map; attributes also contain
 /// standalone flags, so do not deserialize them as key/value maps.
 pub fn validate_redis_schema(info: &Value, schema: Option<&Value>) -> Result<(), String> {
+    fn entries(v: &Value) -> impl Iterator<Item = (&Value, Option<&Value>)> {
+        let mut items = v.as_array().into_iter().flatten();
+        std::iter::from_fn(move || {
+            let key = items.next()?;
+            let standalone = matches!(
+                key.as_str(),
+                Some(
+                    "CASESENSITIVE"
+                        | "SORTABLE"
+                        | "UNF"
+                        | "NOINDEX"
+                        | "NOSTEM"
+                        | "WITHSUFFIXTRIE"
+                        | "INDEXEMPTY"
+                        | "INDEXMISSING"
+                )
+            );
+            Some((key, if standalone { None } else { items.next() }))
+        })
+    }
     fn field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
         if let Some(map) = v.as_object() {
             return map.get(name);
         }
-        v.as_array()?
-            .windows(2)
-            .find_map(|p| (p[0] == name).then_some(&p[1]))
+        entries(v).find_map(|(key, value)| (key == name).then_some(value).flatten())
     }
     let attributes = field(info, "attributes")
         .and_then(Value::as_array)
@@ -135,9 +153,8 @@ pub fn validate_redis_schema(info: &Value, schema: Option<&Value>) -> Result<(),
                     "filter-only requires semicolon separator for {name}"
                 ));
             }
-            let case_sensitive = attr
-                .as_array()
-                .is_some_and(|a| a.iter().any(|v| v == "CASESENSITIVE"))
+            let case_sensitive = entries(attr)
+                .any(|(key, value)| key == "CASESENSITIVE" && value.is_none())
                 || field(attr, "flags")
                     .and_then(Value::as_array)
                     .is_some_and(|a| a.iter().any(|v| v == "CASESENSITIVE"));
