@@ -796,6 +796,7 @@ mod tests {
                     result_limit: 10,
                     matched_documents_sum: 123,
                     returned_documents_sum: 80,
+                    retried_queries: 0,
                 });
                 e
             })
@@ -825,7 +826,7 @@ mod tests {
             assert_eq!(row["failed_queries"], 0);
             assert_eq!(
                 row["filter_only"],
-                json!({"result_limit":10,"matched_documents_sum":123,"returned_documents_sum":80})
+                json!({"result_limit":10,"matched_documents_sum":123,"returned_documents_sum":80,"retried_queries":0})
             );
             assert!(row["rps"].as_f64().unwrap() > 0.0);
             assert_eq!(row["p95_time"], 0.002);

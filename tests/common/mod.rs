@@ -2625,6 +2625,7 @@ pub fn assert_filter_only_results(root: &Path, engine: &str, total: u64, returne
     assert_eq!(result["requested_queries"], 90);
     assert_eq!(result["failed_queries"], 0);
     assert_eq!(result["filter_only"]["result_limit"], 3);
+    assert_eq!(result["filter_only"]["retried_queries"], 0);
     assert_eq!(result["filter_only"]["matched_documents_sum"], total * 10);
     assert_eq!(
         result["filter_only"]["returned_documents_sum"],

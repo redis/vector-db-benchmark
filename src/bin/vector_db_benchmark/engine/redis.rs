@@ -976,6 +976,7 @@ impl RedisEngine {
             result_limit: top,
             matched_documents_sum: matched_sum,
             returned_documents_sum: returned_sum,
+            retried_queries: 0,
         });
         Ok(result)
     }

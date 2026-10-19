@@ -4321,6 +4321,7 @@ mod filter_only_serialization_tests {
                         result_limit: 3,
                         matched_documents_sum: 17,
                         returned_documents_sum: 6,
+                        retried_queries: 0,
                     }),
                     ..Default::default()
                 };
@@ -4380,7 +4381,7 @@ mod filter_only_serialization_tests {
                     assert_eq!(doc["metrics_schema"]["returned_fields"], "IDs only");
                     assert_eq!(
                         result["filter_only"],
-                        json!({"result_limit":3,"matched_documents_sum":17,"returned_documents_sum":6})
+                        json!({"result_limit":3,"matched_documents_sum":17,"returned_documents_sum":6,"retried_queries":0})
                     );
                     assert!(doc["metrics_schema"].get("ground_truth").is_none());
                 } else {

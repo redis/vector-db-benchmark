@@ -449,12 +449,15 @@ fn scalar_stats_roundtrip_keeps_exact_integer_counts() {
         result_limit: 0,
         matched_documents_sum: u64::MAX,
         returned_documents_sum: 0,
+        retried_queries: 7,
     };
     let encoded = serde_json::to_value(&stats).unwrap();
     let decoded: Stats = serde_json::from_value(encoded).unwrap();
     assert_eq!(decoded.result_limit, 0);
     assert_eq!(decoded.matched_documents_sum, u64::MAX);
     assert_eq!(decoded.returned_documents_sum, 0);
+    assert_eq!(decoded.retried_queries, 7);
+    assert_eq!(Stats::default().retried_queries, 0);
     assert_eq!(Stats::default().matched_documents_sum, 0);
 }
 

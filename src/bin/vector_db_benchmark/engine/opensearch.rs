@@ -2088,10 +2088,9 @@ impl Engine for OpenSearchEngine {
         // contention in the timed loop (see redis.rs::search). Metrics are
         // order-independent so results are unchanged; work counter uses Relaxed.
         let query_idx = Arc::new(AtomicUsize::new(0));
-        // Queries that needed more than one attempt. Their backoff is excluded from
-        // the latency samples (see `knn_send`), so without this the reported figures
-        // would look clean with no trace that the server was shedding load.
-        let retried_queries = Arc::new(AtomicUsize::new(0));
+        // Successful measured queries needing more than one attempt. Merge local
+        // worker counters after joining, avoiding a shared hot-path atomic.
+        let mut retried_queries = 0u64;
         // Resolved here rather than per query: `knn_send` runs inside the measured
         // window, where an env lookup is avoidable client CPU work.
         let search_policy = SearchRetryPolicy::from_env();
@@ -2124,7 +2123,6 @@ impl Engine for OpenSearchEngine {
                 let tops = &tops;
                 let raw_bodies = &raw_bodies;
                 let query_idx = Arc::clone(&query_idx);
-                let retried_queries = Arc::clone(&retried_queries);
                 let pb = &pb;
 
                 pool.spawn(move |ticket| {
@@ -2137,6 +2135,7 @@ impl Engine for OpenSearchEngine {
                     let mut returned_count = 0u64;
                     let mut errors = Vec::new();
                     let mut pending = 0u64;
+                    let mut retried = 0u64;
 
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -2148,7 +2147,7 @@ impl Engine for OpenSearchEngine {
                             // lower real concurrency than the `parallel` it reports. Settle
                             // the ticket with the reason; the coordinator makes it an error.
                             ticket.fail(format!("opensearch-search worker setup failed: {e}"));
-                            return (t, p, r, mr, nd, matched, returned_count, errors);
+                            return (t, p, r, mr, nd, matched, returned_count, errors, retried);
                         }
                     };
                     let client = match create_os_client(&base_url, timeout) {
@@ -2158,7 +2157,7 @@ impl Engine for OpenSearchEngine {
                             // lower real concurrency than the `parallel` it reports. Settle
                             // the ticket with the reason; the coordinator makes it an error.
                             ticket.fail(format!("opensearch-search worker setup failed: {e}"));
-                            return (t, p, r, mr, nd, matched, returned_count, errors);
+                            return (t, p, r, mr, nd, matched, returned_count, errors, retried);
                         }
                     };
 
@@ -2172,7 +2171,7 @@ impl Engine for OpenSearchEngine {
                     // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
                     if ticket.arrive_and_wait().is_none() {
-                        return (t, p, r, mr, nd, matched, returned_count, errors);
+                        return (t, p, r, mr, nd, matched, returned_count, errors, retried);
                     }
 
                     loop {
@@ -2192,11 +2191,14 @@ impl Engine for OpenSearchEngine {
                         let elapsed = query_start.elapsed();
 
                         if filter_only {
-                            match response.and_then(|(body, _cost)| {
+                            match response.and_then(|(body, cost)| {
                                 vector_db_benchmark::filter_only::opensearch_counts(&body, top)
+                                    .map(|counts| (counts, cost))
                             }) {
-                                Ok((total, returned)) => {
-                                    // End-to-end latency includes retries/backoff, like Redis.
+                                Ok(((total, returned), cost)) => {
+                                    retried += u64::from(cost.retried);
+                                    // Scalar latency includes every attempt and backoff;
+                                    // Redis's scalar path makes a single attempt.
                                     t.push(elapsed.as_secs_f64());
                                     matched += total;
                                     returned_count += returned as u64;
@@ -2225,7 +2227,7 @@ impl Engine for OpenSearchEngine {
                                 let query_time =
                                     elapsed.saturating_sub(cost.overhead).as_secs_f64();
                                 if cost.retried {
-                                    retried_queries.fetch_add(1, Ordering::Relaxed);
+                                    retried += 1;
                                 }
                                 let ordered_ids: Vec<i64> =
                                     result_ids.iter().map(|(id, _)| *id).collect();
@@ -2250,7 +2252,7 @@ impl Engine for OpenSearchEngine {
                         pb.inc(1);
                     }
                     pb.inc(pending);
-                    (t, p, r, mr, nd, matched, returned_count, errors)
+                    (t, p, r, mr, nd, matched, returned_count, errors, retried)
                 })?;
             }
 
@@ -2258,7 +2260,8 @@ impl Engine for OpenSearchEngine {
             // Stamp the shared measurement start and release them together.
             let (per_worker, measured_start) = pool.start()?;
 
-            for (t, p, r, mr, nd, matched, returned_count, errors) in per_worker {
+            for (t, p, r, mr, nd, matched, returned_count, errors, retried) in per_worker {
+                retried_queries += retried;
                 matched_sum += matched;
                 returned_sum += returned_count;
                 scalar_errors.extend(errors);
@@ -2290,16 +2293,21 @@ impl Engine for OpenSearchEngine {
         // select the rep that happened not to hit back-pressure.
         //
         // Queries that succeeded only after a retry are surfaced separately: they
-        // are not losses, but they mean the server was shedding, which the clean
-        // latency figures no longer show now that the backoff is subtracted out.
-        let retried = retried_queries.load(Ordering::Relaxed);
+        // are not losses, but they identify load shedding. Scalar latency includes
+        // backoff; the existing KNN contract excludes it.
+        let retried = retried_queries;
         if retried > 0 {
             eprintln!(
                 "⚠  {} of {} search queries succeeded only after a retry ({:.2}%) — the server \
-                 was shedding load; backoff is excluded from the reported latency",
+                 was shedding load; backoff is {} the reported latency",
                 retried,
                 num_to_run,
-                100.0 * retried as f64 / num_to_run.max(1) as f64
+                100.0 * retried as f64 / num_to_run.max(1) as f64,
+                if filter_only {
+                    "included in"
+                } else {
+                    "excluded from"
+                }
             );
         }
 
@@ -2313,6 +2321,7 @@ impl Engine for OpenSearchEngine {
                 result_limit: top,
                 matched_documents_sum: matched_sum,
                 returned_documents_sum: returned_sum,
+                retried_queries: retried,
             });
         }
         Ok(result)
@@ -3658,3 +3667,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "opensearch_retry_tests.rs"]
+mod scalar_retry_tests;

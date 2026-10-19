@@ -441,9 +441,16 @@ results do not describe a mixed write workload or vector retrieval.
 
 Only queries with explicit predicates run. `--queries N` cycles those queries,
 and the experiment is named `<engine>-no-vector`. Select one engine config
-with one point per client count. Use `--fail-on-dropped-queries --repetitions 1` for paired
+with one point per client count. All `--skip-vector-index` engines reject
+conflicting `top` values at the same client count instead of silently picking one.
+Use `--fail-on-dropped-queries --repetitions 1` for paired
 runs. Search and summary JSONs carry `workload: filter-only`, the result limit,
-and sums of exact match and returned-ID counts. They omit vector-quality fields.
+and sums of exact match and returned-ID counts. The Redis and OpenSearch scalar
+contract also records `filter_only.retried_queries`: successful measured queries
+requiring retries, excluding priming queries. Redis always reports zero. A clean
+paired comparison requires zero dropped queries and zero retried queries.
+These two engines omit vector-quality fields; legacy filter-only engines keep
+their existing output format.
 The count sums let paired runs detect disagreement; they are not a substitute
 for validating predicates against an independent oracle. Integration tests use
 unequal category populations, exact numeric/tag values, floating-point range

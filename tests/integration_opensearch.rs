@@ -1400,8 +1400,9 @@ fn test_binary_opensearch_filter_only_contract() {
     std::fs::remove_dir_all(proj.root).unwrap();
 }
 
-/// Keep the ordinary cluster default that forbids loading _id fielddata even
-/// when another integration test or a developer enabled it earlier.
+/// Temporarily forbid loading _id fielddata and restore the previous setting.
+/// This suite is destructive and requires the dedicated disposable compose
+/// cluster; OPENSEARCH_PORT must never point at a shared or production cluster.
 struct DisabledIdFielddata(serde_json::Value);
 impl DisabledIdFielddata {
     fn new() -> Self {

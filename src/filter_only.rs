@@ -14,6 +14,9 @@ pub struct Stats {
     pub result_limit: usize,
     pub matched_documents_sum: u64,
     pub returned_documents_sum: u64,
+    /// Successful measured queries requiring retries; priming is excluded.
+    #[serde(default)]
+    pub retried_queries: u64,
 }
 
 pub fn opensearch_body(filter: &Value, limit: usize) -> Value {
