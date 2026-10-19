@@ -1328,6 +1328,7 @@ fn read_params_obj(root: &std::path::Path, engine: &str) -> serde_json::Value {
 #[test]
 fn test_binary_opensearch_filter_only_contract() {
     wait_for_opensearch();
+    let _fielddata = DisabledIdFielddata::new();
     let config = serde_json::json!([{"name":"scalar-os","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":4,"top":3}]}]);
     let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
     let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
@@ -1341,7 +1342,7 @@ fn test_binary_opensearch_filter_only_contract() {
         &[
             "--skip-vector-index",
             "--queries",
-            "80",
+            "90",
             "--keep-data",
             "--fail-on-dropped-queries"
         ]
@@ -1353,6 +1354,10 @@ fn test_binary_opensearch_filter_only_contract() {
         .unwrap()
         .json()
         .unwrap();
+    assert_eq!(
+        mapping[index]["mappings"]["properties"]["price"]["type"],
+        "double"
+    );
     let vector = &mapping[index]["mappings"]["properties"]["vector"];
     assert_eq!(vector["type"], "float");
     assert_eq!(vector["index"], false);
@@ -1364,6 +1369,13 @@ fn test_binary_opensearch_filter_only_contract() {
         .json()
         .unwrap();
     assert_eq!(settings[index]["settings"]["index"]["knn"], "false");
+    common::assert_filter_only_predicates(
+        &proj.root,
+        "scalar-os",
+        "opensearch-no-vector",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+    );
     // The reuse path must keep the scalar schema and corpus intact.
     assert!(common::run_binary_extra(
         &proj.root,
@@ -1374,15 +1386,144 @@ fn test_binary_opensearch_filter_only_contract() {
         &[
             "--skip-vector-index",
             "--queries",
-            "80",
+            "90",
             "--skip-upload",
             "--keep-data",
             "--fail-on-dropped-queries"
         ]
     ));
+    common::assert_filter_only_results(&proj.root, "opensearch-no-vector", total, returned);
     os_client()
         .delete(format!("{}/{index}", os_base_url()))
         .send()
+        .unwrap();
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+/// Keep the ordinary cluster default that forbids loading _id fielddata even
+/// when another integration test or a developer enabled it earlier.
+struct DisabledIdFielddata(serde_json::Value);
+impl DisabledIdFielddata {
+    fn new() -> Self {
+        let old: serde_json::Value = os_client()
+            .get(format!("{}/_cluster/settings", os_base_url()))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        let previous = old["transient"]["indices"]["id_field_data"]["enabled"].clone();
+        os_client()
+            .put(format!("{}/_cluster/settings", os_base_url()))
+            .json(&serde_json::json!({"transient":{"indices.id_field_data.enabled":false}}))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        Self(previous)
+    }
+}
+impl Drop for DisabledIdFielddata {
+    fn drop(&mut self) {
+        let _ = os_client()
+            .put(format!("{}/_cluster/settings", os_base_url()))
+            .json(&serde_json::json!({"transient":{"indices.id_field_data.enabled":self.0}}))
+            .send();
+    }
+}
+
+#[test]
+fn test_binary_opensearch_filter_only_dot_high_dimension_and_default_limit() {
+    wait_for_opensearch();
+    let config = serde_json::json!([{"name":"scalar-wide","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":1}]}]);
+    let (proj, total, _) = common::write_filter_only_project(&config.to_string());
+    common::resize_filter_only_vectors(&proj.root, 4096, "dot");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-wide",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "scalar-wide")
+        ],
+        &["--skip-vector-index", "--fail-on-dropped-queries"]
+    ));
+    let doc = common::read_result_doc(&proj.root, "opensearch-no-vector");
+    assert_eq!(doc["results"]["requested_queries"], 9);
+    assert_eq!(doc["results"]["filter_only"]["result_limit"], 10);
+    assert_eq!(
+        doc["results"]["filter_only"]["matched_documents_sum"],
+        total
+    );
+    assert_eq!(
+        doc["results"]["filter_only"]["returned_documents_sum"],
+        common::filter_only_expected_counts()
+            .iter()
+            .map(|n| (*n).min(10))
+            .sum::<u64>()
+    );
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+#[test]
+fn test_binary_opensearch_filter_only_rejects_vector_index_reuse() {
+    wait_for_opensearch();
+    let config = serde_json::json!([{"name":"scalar-reuse","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":3}]}]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "scalar-vector-reuse";
+    let envs = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", index),
+    ];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-reuse",
+        "scalar-test",
+        "http://127.0.0.1",
+        &envs,
+        &["--skip-search", "--keep-data"]
+    ));
+    common::clear_result_files(&proj.root);
+    let out = std::process::Command::new(common::binary_path())
+        .current_dir(&proj.root)
+        .envs(envs)
+        .args([
+            "--engines",
+            "scalar-reuse",
+            "--datasets",
+            "scalar-test",
+            "--host",
+            "http://127.0.0.1",
+            "--skip-vector-index",
+            "--skip-upload",
+            "--queries",
+            "1",
+            "--fail-on-dropped-queries",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("filter-only requires index.knn=false"),
+        "{stderr}"
+    );
+    assert!(std::fs::read_dir(proj.root.join("results"))
+        .unwrap()
+        .all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("-search-")));
+    os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send()
+        .unwrap()
+        .error_for_status()
         .unwrap();
     std::fs::remove_dir_all(proj.root).unwrap();
 }

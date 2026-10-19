@@ -1812,10 +1812,7 @@ fn write_neighbours(ds_dir: &Path, neighbours: &[Vec<i64>]) {
 /// Path to the compiled binary under test. Cargo exports
 /// `CARGO_BIN_EXE_vector-db-benchmark` to integration tests automatically.
 pub fn binary_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_vector-db-benchmark") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/vector-db-benchmark")
+    PathBuf::from(env!("CARGO_BIN_EXE_vector-db-benchmark"))
 }
 
 /// Run the benchmark binary once for `engine`/`dataset`, with extra env vars
@@ -2571,14 +2568,14 @@ pub fn write_filter_only_project(engine_configs_json: &str) -> (MatchAnyProject,
         if id % 7 < 2 {
             "red"
         } else if id % 7 == 2 {
-            "green"
+            "Red"
         } else {
             "blue"
         }
     };
     let payloads = (0..N_DOCS)
         .map(|id| {
-            serde_json::json!({"color":color(id),"size":id % 11 + 1,"price": ([0.1,0.2,0.3][id % 3])})
+            serde_json::json!({"color":color(id),"size":id % 11 + 1,"price": ([1.0,1.00000001,1.00000002][id % 3])})
                 .to_string()
         })
         .collect::<Vec<_>>()
@@ -2601,26 +2598,10 @@ pub fn write_filter_only_project(engine_configs_json: &str) -> (MatchAnyProject,
         serde_json::json!({"and":[{"color":{"match":{"value":"red"}}},{"size":{"range":{"gte":2}}}]}),
         serde_json::json!({"or":[{"color":{"match":{"value":"red"}}},{"size":{"match":{"value":2}}}]}),
         serde_json::json!({"and":[{"color":{"match":{"value":"absent"}}}]}),
-        serde_json::json!({"and":[{"price":{"range":{"gt":0.1,"lte":0.2}}}]}),
+        serde_json::json!({"and":[{"price":{"range":{"gt":1.0,"lte":1.000000015}}}]}),
+        serde_json::json!({"and":[{"color":{"match":{"value":"Red"}}}]}),
     ];
-    let mut counts = [0u64; 8];
-    for id in 0..N_DOCS {
-        let red = color(id) == "red";
-        let size = id % 11 + 1;
-        let matches = [
-            red,
-            size == 2,
-            size > 1 && size <= 2,
-            (1..3).contains(&size),
-            red && size >= 2,
-            red || size == 2,
-            false,
-            id % 3 == 1,
-        ];
-        for (i, yes) in matches.iter().enumerate() {
-            counts[i] += u64::from(*yes);
-        }
-    }
+    let counts = filter_only_expected_counts();
     let rows = queries
         .iter()
         .map(|condition| {
@@ -2641,7 +2622,7 @@ pub fn assert_filter_only_results(root: &Path, engine: &str, total: u64, returne
     let doc = read_result_doc(root, engine);
     let result = &doc["results"];
     assert_eq!(doc["params"]["workload"], "filter-only");
-    assert_eq!(result["requested_queries"], 80);
+    assert_eq!(result["requested_queries"], 90);
     assert_eq!(result["failed_queries"], 0);
     assert_eq!(result["filter_only"]["result_limit"], 3);
     assert_eq!(result["filter_only"]["matched_documents_sum"], total * 10);
@@ -2665,4 +2646,115 @@ pub fn assert_filter_only_results(root: &Path, engine: &str, total: u64, returne
     assert_eq!(summary["workload"], "filter-only");
     assert!(summary.get("precision_summary").is_none());
     assert!(summary["search_results"][0].get("mean_recall").is_none());
+}
+
+/// Independent oracle, using the fixture's document ids rather than the query
+/// translators. Each predicate is checked alone to prevent cancellation between
+/// wrong predicates from preserving the aggregate count.
+pub fn filter_only_expected_counts() -> [u64; 9] {
+    let mut counts = [0; 9];
+    for id in 0..N_DOCS {
+        let red = id % 7 < 2;
+        let size = id % 11 + 1;
+        let matches = [
+            red,
+            size == 2,
+            size > 1 && size <= 2,
+            (1..3).contains(&size),
+            red && size >= 2,
+            red || size == 2,
+            false,
+            id % 3 == 1,
+            id % 7 == 2,
+        ];
+        for (count, yes) in counts.iter_mut().zip(matches) {
+            *count += u64::from(yes);
+        }
+    }
+    counts
+}
+
+pub fn clear_result_files(root: &Path) {
+    for entry in fs::read_dir(root.join("results")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+pub fn assert_filter_only_predicates(
+    root: &Path,
+    config: &str,
+    engine: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+) {
+    let path = root.join("datasets/scalar-test/tests.jsonl");
+    let original = fs::read_to_string(&path).unwrap();
+    let rows: Vec<_> = original.lines().collect();
+    let counts = filter_only_expected_counts();
+    assert_eq!(rows.len(), counts.len());
+    for (predicate, (row, expected)) in rows.iter().zip(counts).enumerate() {
+        fs::write(&path, row).unwrap();
+        clear_result_files(root);
+        assert!(
+            run_binary_extra(
+                root,
+                config,
+                "scalar-test",
+                host,
+                envs,
+                &[
+                    "--skip-vector-index",
+                    "--skip-upload",
+                    "--queries",
+                    "1",
+                    "--keep-data",
+                    "--fail-on-dropped-queries"
+                ]
+            ),
+            "predicate {predicate}"
+        );
+        let doc = read_result_doc(root, engine);
+        assert_eq!(doc["results"]["requested_queries"], 1);
+        assert_eq!(doc["results"]["failed_queries"], 0);
+        assert_eq!(
+            doc["results"]["filter_only"]["matched_documents_sum"], expected,
+            "predicate {predicate}: {row}"
+        );
+        assert_eq!(
+            doc["results"]["filter_only"]["returned_documents_sum"],
+            expected.min(3),
+            "predicate {predicate}: {row}"
+        );
+    }
+    fs::write(path, original).unwrap();
+    clear_result_files(root);
+}
+
+/// Resize both corpus and query vectors so the scalar high-dimensional test
+/// remains a valid dataset; merely changing registry metadata would not do so.
+pub fn resize_filter_only_vectors(root: &Path, dimension: usize, distance: &str) {
+    let ds_dir = root.join("datasets/scalar-test");
+    let vectors = vec![vec![0.5f32; dimension]; N_DOCS];
+    write_npy_vectors(ds_dir.join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+    let path = ds_dir.join("tests.jsonl");
+    let rows = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            row["query"] = serde_json::json!(vec![0.5f32; dimension]);
+            row.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, rows).unwrap();
+    let registry_path = root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["vector_size"] = serde_json::json!(dimension);
+    registry[0]["distance"] = serde_json::json!(distance);
+    fs::write(registry_path, registry.to_string()).unwrap();
 }

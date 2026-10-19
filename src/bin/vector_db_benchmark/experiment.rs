@@ -4288,3 +4288,109 @@ mod reuse_handler_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod filter_only_serialization_tests {
+    use super::build_search_result_json;
+    use crate::{config::SearchParams, engine::SearchResults};
+    use serde_json::json;
+
+    #[test]
+    fn scalar_documents_omit_all_vector_quality_with_and_without_raw_arrays() {
+        let params: SearchParams = serde_json::from_value(json!({"parallel":1,"top":3})).unwrap();
+        for scalar in [false, true] {
+            for raw in [false, true] {
+                // Deliberately nonempty quality data makes accidental leakage
+                // visible; callers need not pre-clear values for serialization.
+                let results = SearchResults {
+                    top: 3,
+                    parallel: 1,
+                    requested_queries: 2,
+                    num_queries: 2,
+                    rps: 123.0,
+                    mean_time: 0.0015,
+                    p50_time: 0.0015,
+                    mean_precision_at_returned: 0.75,
+                    mean_recall: 0.5,
+                    mean_mrr: 0.5,
+                    mean_ndcg: 0.5,
+                    recall_p10: 0.5,
+                    precisions_at_returned: vec![0.5, 1.0],
+                    recalls: vec![0.5, 0.5],
+                    mrrs: vec![0.5, 0.5],
+                    ndcgs: vec![0.5, 0.5],
+                    latencies: vec![0.001, 0.002],
+                    filter_only: scalar.then_some(vector_db_benchmark::filter_only::Stats {
+                        result_limit: 3,
+                        matched_documents_sum: 17,
+                        returned_documents_sum: 6,
+                    }),
+                    ..Default::default()
+                };
+                let doc = build_search_result_json(
+                    "test",
+                    "fixture",
+                    &params,
+                    &results,
+                    None,
+                    None,
+                    raw,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &json!({}),
+                );
+                let result = &doc["results"];
+                for key in [
+                    "mean_precision_at_returned",
+                    "mean_recall",
+                    "recall_p10",
+                    "mean_mrr",
+                    "mean_ndcg",
+                    "precision_at_returned_dist",
+                    "recall_dist",
+                    "mrr_dist",
+                    "ndcg_dist",
+                ] {
+                    assert_eq!(
+                        result.get(key).is_some(),
+                        !scalar,
+                        "{key}: scalar={scalar}, raw={raw}"
+                    );
+                }
+                for key in ["precisions_at_returned", "recalls", "mrrs", "ndcgs"] {
+                    assert_eq!(
+                        result.get(key).is_some(),
+                        !scalar && raw,
+                        "{key}: scalar={scalar}, raw={raw}"
+                    );
+                }
+                assert_eq!(result.get("latencies").is_some(), raw);
+                if raw {
+                    assert_eq!(result["latencies"], json!([0.001, 0.002]));
+                }
+                assert!(result["latency_hdr"].is_object());
+                assert_eq!(result["rps"], 123.0);
+                assert_eq!(result["p50_time"], 0.0015);
+                assert_eq!(result["requested_queries"], 2);
+                assert_eq!(result["succeeded_queries"], 2);
+                assert_eq!(result["failed_queries"], 0);
+                assert_eq!(result.get("filter_only").is_some(), scalar);
+                if scalar {
+                    assert_eq!(doc["params"]["workload"], "filter-only");
+                    assert_eq!(doc["metrics_schema"]["total_count"], "exact");
+                    assert_eq!(doc["metrics_schema"]["returned_fields"], "IDs only");
+                    assert_eq!(
+                        result["filter_only"],
+                        json!({"result_limit":3,"matched_documents_sum":17,"returned_documents_sum":6})
+                    );
+                    assert!(doc["metrics_schema"].get("ground_truth").is_none());
+                } else {
+                    assert!(doc["params"].get("workload").is_none());
+                    assert_eq!(result["mean_recall"], 0.5);
+                }
+            }
+        }
+    }
+}

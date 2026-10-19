@@ -1441,19 +1441,7 @@ fn create_test_project(
 
 /// Find the release binary path
 fn binary_path() -> PathBuf {
-    let mut path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    path.push("vector-db-benchmark");
-    if path.exists() {
-        return path;
-    }
-    // Fallback: look relative to manifest dir
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/vector-db-benchmark")
+    common::binary_path()
 }
 
 /// Parse the search result JSON and return mean_precision_at_returned
@@ -4247,7 +4235,7 @@ fn test_binary_redis_filter_only_contract() {
         &[
             "--skip-vector-index",
             "--queries",
-            "80",
+            "90",
             "--dump-raw-latencies",
             "--keep-data",
             "--fail-on-dropped-queries"
@@ -4264,10 +4252,78 @@ fn test_binary_redis_filter_only_contract() {
         !format!("{info:?}").contains("VECTOR"),
         "scalar index unexpectedly contains VECTOR"
     );
+    common::assert_filter_only_predicates(
+        &proj.root,
+        "scalar-redis",
+        "redis-no-vector",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+    );
     let _: redis::Value = redis::cmd("FT.DROPINDEX")
         .arg("idx:redis-no-vector")
         .arg("DD")
         .query(&mut conn)
         .unwrap();
     std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+#[test]
+fn test_binary_redis_filter_only_rejects_vector_index_reuse() {
+    let config = serde_json::json!([{"name":"scalar-reuse","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":3}]}]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let port = test_port().to_string();
+    let index = "scalar-reuse-exact";
+    let envs = [
+        ("REDIS_PORT", port.as_str()),
+        ("REDIS_INDEX_NAME", index),
+        ("REDIS_INDEX_NAME_EXACT", "1"),
+    ];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-reuse",
+        "scalar-test",
+        "localhost",
+        &envs,
+        &["--skip-search", "--keep-data"]
+    ));
+    common::clear_result_files(&proj.root);
+    let out = Command::new(binary_path())
+        .current_dir(&proj.root)
+        .envs(envs)
+        .args([
+            "--engines",
+            "scalar-reuse",
+            "--datasets",
+            "scalar-test",
+            "--host",
+            "localhost",
+            "--skip-vector-index",
+            "--skip-upload",
+            "--queries",
+            "1",
+            "--fail-on-dropped-queries",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("filter-only cannot reuse an index containing VECTOR"),
+        "{stderr}"
+    );
+    assert!(fs::read_dir(proj.root.join("results")).unwrap().all(|e| !e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("-search-")));
+    let mut conn = redis::Client::open(format!("redis://127.0.0.1:{port}"))
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let _: redis::Value = redis::cmd("FT.DROPINDEX")
+        .arg(index)
+        .arg("DD")
+        .query(&mut conn)
+        .unwrap();
+    fs::remove_dir_all(proj.root).unwrap();
 }

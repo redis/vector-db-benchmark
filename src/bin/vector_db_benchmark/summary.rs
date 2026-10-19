@@ -779,6 +779,81 @@ fn create_ascii_scatter_plot(engine_name: &str, dataset_name: &str, buckets: &[P
 mod tests {
     use super::*;
 
+    #[test]
+    fn scalar_summary_keeps_two_clients_and_exact_counts_without_quality_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries: Vec<_> = [1, 100]
+            .into_iter()
+            .enumerate()
+            .map(|(id, parallel)| {
+                let mut e = entry("n/a", parallel, 100.0 * parallel as f64, 0.002, "");
+                e.search_id = id;
+                e.results.mean_precision_at_returned = -1.0;
+                e.results.mean_recall = 0.5;
+                e.results.requested_queries = 9;
+                e.results.num_queries = 9;
+                e.results.filter_only = Some(vector_db_benchmark::filter_only::Stats {
+                    result_limit: 10,
+                    matched_documents_sum: 123,
+                    returned_documents_sum: 80,
+                });
+                e
+            })
+            .collect();
+        save_summary(
+            "scalar",
+            "fixture",
+            &entries,
+            None,
+            dir.path(),
+            &json!({"test":true}),
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("scalar-fixture-summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc["workload"], "filter-only");
+        assert_eq!(doc["metrics_definitions"]["total_count"], "exact");
+        assert_eq!(doc["engine_params"], json!({"test":true}));
+        assert!(doc.get("precision_summary").is_none());
+        let rows = doc["search_results"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, expected_parallel) in rows.iter().zip([1, 100]) {
+            assert_eq!(row["parallel"], expected_parallel);
+            assert_eq!(row["requested_queries"], 9);
+            assert_eq!(row["failed_queries"], 0);
+            assert_eq!(
+                row["filter_only"],
+                json!({"result_limit":10,"matched_documents_sum":123,"returned_documents_sum":80})
+            );
+            assert!(row["rps"].as_f64().unwrap() > 0.0);
+            assert_eq!(row["p95_time"], 0.002);
+            for key in [
+                "mean_precision_at_returned",
+                "mean_recall",
+                "recall_p10",
+                "mean_mrr",
+                "mean_ndcg",
+                "precision_at_returned_dist",
+                "recall_dist",
+                "mrr_dist",
+                "ndcg_dist",
+                "precisions_at_returned",
+                "recalls",
+                "mrrs",
+                "ndcgs",
+            ] {
+                assert!(
+                    row.get(key).is_none(),
+                    "unexpected scalar quality field {key}"
+                );
+            }
+        }
+        // Scalar workloads deliberately do not participate in recall curves.
+        assert_eq!(doc["concurrency_curve"], json!([]));
+    }
+
     /// The summary is what `--chart` and external dashboards read, so the #217
     /// definitions have to travel with it too: no upstream key name, an explicit
     /// schema version, and any calibration that never reached its target.
