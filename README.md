@@ -127,21 +127,21 @@ Pick one file per run — they are exact and survive future renames:
 
 Avoid selecting by glob here: `--engines 'opensearch-m-*'` matches only 6 of the 7 sweep points — it silently drops the `opensearch-default` (m=16, ef_construction=100) baseline, whose name lacks the `opensearch-m-` prefix — and a bare `--engines 'opensearch-*'` matches both files, sweeping two different shard counts into one report.
 
-**Retries against a managed domain.** Amazon OpenSearch Service returns states an open-source single-node cluster never produces: HTTP 429 on bulk (its `knn.algo_param.index_thread_qty` defaults to 1, so HNSW graph building is single-threaded and cannot drain as fast as a parallel uploader pushes), 400 `snapshot_in_progress_exception` on delete (automated snapshots cannot be disabled), 503 `process_cluster_event_timeout_exception` on create, and 502/504 from the front door on force-merge. All four paths retry with jittered exponential backoff, tunable with:
+**Retries against a managed domain.** Amazon OpenSearch Service can return HTTP 429 on bulk, `snapshot_in_progress_exception` on delete, and transient cluster-state errors on create. These paths retry with jittered exponential backoff. Force merge uses `wait_for_completion=false` and polls the Tasks API, so a long merge does not hold one HTTP request open through the managed gateway. Submission is attempted once: an ambiguous error can mean the server started the merge, so we fail rather than queue duplicate work. Transient task GET failures retry with capped exponential backoff; healthy unfinished tasks do not consume retries. Missing tasks, denied task access, task errors, malformed responses and partial shard success fail the benchmark before search. This requires an OpenSearch version supporting asynchronous force merge (2.7+) and permission to read its tasks.
 
 | Variable | Default | Applies to |
 |---|---|---|
 | `OPENSEARCH_BULK_MAX_RETRIES` | `8` | bulk upload |
 | `OPENSEARCH_BULK_RETRY_BASE_MS` | `500` | bulk upload |
-| `OPENSEARCH_INDEX_OP_MAX_RETRIES` | `10` | create / delete / refresh / force-merge |
-| `OPENSEARCH_INDEX_OP_RETRY_BASE_MS` | `2000` | create / delete / refresh / force-merge |
+| `OPENSEARCH_INDEX_OP_MAX_RETRIES` | `10` | create / delete / refresh / force-merge task polling |
+| `OPENSEARCH_INDEX_OP_RETRY_BASE_MS` | `2000` | create / delete / refresh / force-merge task polling |
 | `OPENSEARCH_SEARCH_MAX_RETRIES` | `5` | search |
 | `OPENSEARCH_SEARCH_RETRY_BASE_MS` | `50` | search |
 | `OPENSEARCH_SEARCH_RETRY_BUDGET_MS` | `2000` | search (total wall-clock ceiling per query) |
-| `OPENSEARCH_FORCE_MERGE_TIMEOUT` | `max(OPENSEARCH_TIMEOUT, 3600)` | force-merge (seconds, per attempt; `0` = no client-side deadline) |
-| `OPENSEARCH_FORCE_MERGE_BUDGET` | `2x OPENSEARCH_FORCE_MERGE_TIMEOUT` | force-merge (seconds, total wall-clock ceiling across all attempts; `0` = unlimited) |
+| `OPENSEARCH_FORCE_MERGE_TIMEOUT` | `max(OPENSEARCH_TIMEOUT, 3600)` | force-merge (seconds, per HTTP request; `0` = no client-side deadline) |
+| `OPENSEARCH_FORCE_MERGE_BUDGET` | `2x OPENSEARCH_FORCE_MERGE_TIMEOUT` | force-merge (seconds, total wall-clock ceiling across submission and task polling; `0` = unlimited) |
 
-Force-merge needs its own two bounds because it is not sized like the other requests. It merges the index down to a single segment, which rewrites the whole corpus: measured at 1,077–1,312 s for 1.18M vectors, well past the 300 s client-wide `OPENSEARCH_TIMEOUT`. Sharing that bound would abort every attempt client-side while the merge kept running on the server, and spend the whole `OPENSEARCH_INDEX_OP_MAX_RETRIES` budget failing a merge that was always going to succeed — discarding a completed multi-hour ingest at the last step. The wall-clock budget then bounds the retrying itself, since a per-attempt bound of an hour and eleven attempts is otherwise an ~11 h worst case. Both reject a malformed value loudly rather than silently falling back to the default.
+Force merge pins the read-only benchmark to one Lucene segment per shard, avoiding segment-count variation from ingestion timing. It is preparation for an optimized static-index measurement, not a requirement for query correctness or a simulation of concurrent updates. The adapter refreshes after merge so queries use the merged segment. The total `OPENSEARCH_FORCE_MERGE_BUDGET` includes HTTP calls, body reads, retries and poll sleeps; exceeding it fails the run but cannot cancel the server-side merge. Both timeout variables reject malformed values before ingest. Task IDs and progress are printed for diagnosis.
 
 In vector mode, search retries are deliberately short and additionally bounded by a wall-clock budget, because a single transport attempt can block for `OPENSEARCH_TIMEOUT`. **Backoff is excluded from the reported latency**: a retried query is billed only for the attempt that produced its result, so the percentiles stay comparable with engines that do not retry. Queries that needed a retry are counted and reported separately (`⚠ N of M search queries succeeded only after a retry`), since clean latency figures would otherwise hide that the server was shedding load.
 

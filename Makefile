@@ -109,6 +109,11 @@ test:
 test-filter-only-debug:
 	cargo test --lib filter_only::
 
+.PHONY: test-opensearch-maintenance
+test-opensearch-maintenance:
+	cargo test --lib opensearch_maintenance:: --release
+	cargo test --lib opensearch_maintenance::
+
 .PHONY: test-verbose
 test-verbose:
 	@echo "=== Running Rust unit tests (verbose) ==="

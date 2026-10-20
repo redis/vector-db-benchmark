@@ -12,8 +12,8 @@ use opensearch::cluster::ClusterHealthParts;
 use opensearch::http::request::JsonBody;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::indices::{
-    IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts, IndicesGetMappingParts,
-    IndicesGetSettingsParts, IndicesPutSettingsParts, IndicesRefreshParts,
+    IndicesCreateParts, IndicesDeleteParts, IndicesGetMappingParts, IndicesGetSettingsParts,
+    IndicesPutSettingsParts, IndicesRefreshParts,
 };
 use opensearch::params::WaitForStatus;
 use opensearch::{BulkParts, CountParts, OpenSearch, SearchParts};
@@ -45,8 +45,8 @@ pub struct OpenSearchEngine {
     timeout: u64,
     config: OpenSearchConfig,
     search_params: Vec<SearchParams>,
-    /// Per-attempt deadline for a force merge, and the wall-clock ceiling across
-    /// all its attempts. Both resolved in [`Self::new`] rather than inside
+    /// Per-request deadline for force merge, and the wall-clock ceiling across
+    /// asynchronous submission and task polling. Both resolved in [`Self::new`] rather than inside
     /// `force_merge`, because `force_merge` runs AFTER the whole upload: a
     /// malformed `OPENSEARCH_FORCE_MERGE_BUDGET=2h` parsed there would throw away
     /// a multi-hour ingest at the last step, which is the opposite of what
@@ -447,43 +447,26 @@ impl OpenSearchEngine {
     /// policy's answer depends on ingest timing, batch size and thread count, so
     /// two runs of the *same* config can land on different segment counts. (#210)
     ///
-    /// Retried on the same transient states as the other index ops. This is the op
-    /// that most needs them: it is the longest-running of the four, it is what a
-    /// managed front door most often answers with 504, and it runs *after* the
-    /// whole ingest (see `upload`). Failing it un-retried discards a multi-hour
-    /// upload at the very last step — so the bulk-upload retries above would buy
-    /// nothing on the runs they were written for. `elasticsearch.rs` already
-    /// retries force-merge for exactly this reason.
-    ///
-    /// Merging to one segment makes this call substantially longer, which makes
-    /// the retry budget and the request timeout load-bearing together — see
-    /// [`resolve_force_merge_timeout`] for why the shared `OPENSEARCH_TIMEOUT` is
-    /// not the right bound here.
+    /// Submit an asynchronous merge and poll its task. A synchronous request can
+    /// receive a gateway 504 while the merge keeps running; retrying that POST
+    /// only waits on the same work. Poll failures retry, unfinished tasks do not
+    /// consume retries, and the total wall-clock budget bounds the entire wait.
     fn force_merge(&self) -> Result<(), String> {
         println!("Forcing merge into 1 segment...");
 
-        // Named for what it is rather than after the transport setter: a local
-        // called `request_timeout` is indistinguishable, to the shipped-config
-        // knob guard's token search, from an engine reading
-        // `connection_params.request_timeout` — which this does not do.
-        let merge_deadline = self.force_merge_deadline;
-        retry_index_op(
-            &self.rt,
-            "Force merge",
-            index_op_policy().with_budget(self.force_merge_budget),
-            |status| (200..300).contains(&status),
-            index_maintenance_retryable,
-            || {
-                self.rt.block_on(
-                    self.client
-                        .indices()
-                        .forcemerge(IndicesForcemergeParts::Index(&[&self.index_name]))
-                        .max_num_segments(1)
-                        .request_timeout(merge_deadline)
-                        .send(),
-                )
-            },
-        )?;
+        let policy = index_op_policy();
+        self.rt
+            .block_on(vector_db_benchmark::opensearch_maintenance::force_merge(
+                &self.client,
+                &self.index_name,
+                &vector_db_benchmark::opensearch_maintenance::MergeOptions {
+                    http_deadline: self.force_merge_deadline,
+                    budget: self.force_merge_budget,
+                    max_poll_retries: policy.max_retries,
+                    retry_base: std::time::Duration::from_millis(policy.base_delay_ms),
+                    poll_interval: std::time::Duration::from_secs(2),
+                },
+            ))?;
 
         // A force merge alone does NOT change what queries search — without this
         // refresh the whole merge is a no-op that costs 20 minutes and 2x disk.
@@ -1155,6 +1138,7 @@ impl RetryPolicy {
         }
     }
 
+    #[cfg(test)]
     fn with_budget(self, budget: Option<std::time::Duration>) -> Self {
         Self { budget, ..self }
     }
@@ -1387,25 +1371,9 @@ fn parse_env_secs(var: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// How long one force-merge attempt may block before the transport gives up.
-///
-/// `OPENSEARCH_TIMEOUT` (300 s) is the *client-wide* transport timeout, sized for
-/// queries and bulk requests. Applying it to a merge-to-one-segment of a large
-/// corpus guarantees a self-inflicted failure loop: every attempt aborts
-/// client-side at 300 s while the merge is still running server-side, the retry
-/// re-issues it, and all 11 attempts (10 retries) are spent on a merge that was
-/// always going to succeed — discarding the ingest the retries exist to protect.
-/// So force-merge gets its own, much larger bound.
-///
-/// Retrying is cheap when it does happen, measured rather than assumed: the
-/// client aborted at 3.0 s, the server kept merging for 108 s (`force_merge` pool
-/// `active=1` across 36 consecutive samples), and the re-issued request returned
-/// in 0.0 s. The pool is `fixed, size=1, queue_size=-1`, so a retry queues behind
-/// the running merge rather than being rejected, and then finds nothing left to
-/// do. Retries are therefore not N× the merge cost.
-///
-/// A free function so the rule is testable without an engine, a cluster, or
-/// environment mutation; the value is resolved once in `OpenSearchEngine::new`.
+/// Per-HTTP-request timeout for asynchronous merge submission and task polling.
+/// Retains the existing environment knob and default; the total operation is
+/// separately bounded by `resolve_force_merge_budget`.
 fn resolve_force_merge_timeout(
     client_timeout_secs: u64,
     override_secs: Option<u64>,
@@ -1422,22 +1390,9 @@ fn resolve_force_merge_timeout(
     }
 }
 
-/// Wall-clock ceiling on `force_merge` *including* its retries.
-///
-/// Per-attempt bounds stop bounding anything once the per-attempt bound is an
-/// hour: `retry_index_op` treats every transport error as retryable, so 11
-/// attempts × 3600 s is an ~11 h worst case for a single call. The search path
-/// has carried a wall-clock budget for exactly this reason (`SearchRetryPolicy`);
-/// raising the index path's per-attempt bound 12× without one would have left
-/// force-merge as the only unbounded operation in the engine.
-///
-/// Default: twice the per-attempt deadline — room for one full-length attempt
-/// plus one full-length retry, and no more. `OPENSEARCH_FORCE_MERGE_BUDGET`
-/// overrides it, with `0` meaning unlimited (the same convention as
-/// `OPENSEARCH_FORCE_MERGE_TIMEOUT`).
-///
-/// A free function, like [`resolve_force_merge_timeout`], so the knob has
-/// coverage that does not need an engine or a cluster.
+/// Wall-clock ceiling across asynchronous submission, polling and sleeps.
+/// Defaults to twice the per-request deadline for compatibility. Zero explicitly
+/// disables the total limit; malformed environment values fail before upload.
 fn resolve_force_merge_budget(
     per_attempt: std::time::Duration,
     override_secs: Option<u64>,

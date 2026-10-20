@@ -33,7 +33,7 @@ prost = "0.13"
 prost-types = "0.13"
 qdrant-client = "1.17"
 elasticsearch = "8.15.0-alpha.1"
-opensearch = "2.3.0"
+opensearch = { version = "2.3.0", features = ["experimental-apis"] }
 mongodb = { version = "3", features = ["sync"] }
 turbopuffer-client = "0.0.4"
 rand = "0.8"
