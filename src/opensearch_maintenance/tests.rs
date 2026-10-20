@@ -219,17 +219,19 @@ fn poll_errors_fail_closed() {
         ),
     ] {
         let status = response.status;
+        let expected = if status == 403 || status == 404 {
+            format!("Force merge task node:42 HTTP {status}:")
+        } else if response.body.get("error").is_some() {
+            "Force merge task failed".to_owned()
+        } else {
+            "Force merge task did not succeed on every shard".to_owned()
+        };
         let err = run(
             vec![submit(200, json!({"task":"node:42"})), response],
             options(),
         )
         .unwrap_err();
-        if status == 403 || status == 404 {
-            assert!(
-                err.starts_with(&format!("Force merge task node:42 HTTP {status}:")),
-                "{err}"
-            );
-        }
+        assert!(err.starts_with(&expected), "{err}");
     }
     let err = run(
         vec![
