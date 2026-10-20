@@ -27,6 +27,26 @@ fn completion_requires_all_shards_and_no_task_error() {
     }
 }
 
+#[test]
+fn resolved_options_preserve_budget_and_cap_requests() {
+    for budget in [None, Some(Duration::from_secs(7_200))] {
+        for (ordinary, merge, expected) in [(300, 3_600, 300), (300, 120, 120)] {
+            let options = MergeOptions::from_resolved(
+                Duration::from_secs(ordinary),
+                Duration::from_secs(merge),
+                budget,
+                7,
+                Duration::from_millis(123),
+            );
+            assert_eq!(options.budget, budget);
+            assert_eq!(options.http_deadline, Duration::from_secs(expected));
+            assert_eq!(options.max_retries, 7);
+            assert_eq!(options.retry_base, Duration::from_millis(123));
+            assert_eq!(options.poll_interval, Duration::from_secs(2));
+        }
+    }
+}
+
 struct Reply {
     method: &'static str,
     status: u16,

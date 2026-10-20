@@ -15,6 +15,25 @@ pub struct MergeOptions {
     pub poll_interval: Duration,
 }
 
+impl MergeOptions {
+    /// Build the production policy from values already validated before ingest.
+    pub fn from_resolved(
+        ordinary_deadline: Duration,
+        merge_deadline: Duration,
+        budget: Option<Duration>,
+        max_retries: u32,
+        retry_base: Duration,
+    ) -> Self {
+        Self {
+            http_deadline: merge_deadline.min(ordinary_deadline),
+            budget,
+            max_retries,
+            retry_base,
+            poll_interval: Duration::from_secs(2),
+        }
+    }
+}
+
 /// Submit an asynchronous merge, then poll its task. Transient failures retry
 /// within the budget. A lost submission reply may leave an earlier merge running;
 /// on this read-only index, a repeated merge queues behind it and finds no extra

@@ -138,7 +138,7 @@ Avoid selecting by glob here: `--engines 'opensearch-m-*'` matches only 6 of the
 | `OPENSEARCH_SEARCH_MAX_RETRIES` | `5` | search |
 | `OPENSEARCH_SEARCH_RETRY_BASE_MS` | `50` | search |
 | `OPENSEARCH_SEARCH_RETRY_BUDGET_MS` | `2000` | search (total wall-clock ceiling per query) |
-| `OPENSEARCH_FORCE_MERGE_TIMEOUT` | `max(OPENSEARCH_TIMEOUT, 3600)` | force-merge (seconds, per HTTP request ceiling, also capped by `OPENSEARCH_TIMEOUT`; `0` = no merge-specific ceiling) |
+| `OPENSEARCH_FORCE_MERGE_TIMEOUT` | `max(OPENSEARCH_TIMEOUT, 3600)` | force-merge (seconds, per HTTP request ceiling, also capped by `OPENSEARCH_TIMEOUT`; also determines the default total budget at twice this value; `0` = no merge-specific ceiling) |
 | `OPENSEARCH_FORCE_MERGE_BUDGET` | `2x OPENSEARCH_FORCE_MERGE_TIMEOUT` | force-merge (seconds, total wall-clock ceiling across submission and task polling; `0` = unlimited) |
 
 Force merge pins the read-only benchmark to one Lucene segment per shard, avoiding segment-count variation from ingestion timing. It is preparation for an optimized static-index measurement, not a requirement for query correctness or a simulation of concurrent updates. The adapter refreshes after merge so queries use the merged segment. The total `OPENSEARCH_FORCE_MERGE_BUDGET` includes HTTP calls, body reads, retries and poll sleeps; exceeding it fails the run but cannot cancel the server-side merge. Both timeout variables reject malformed values before ingest. Task IDs and progress are printed for diagnosis.

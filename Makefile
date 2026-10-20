@@ -111,6 +111,7 @@ test-filter-only-debug:
 
 .PHONY: test-opensearch-maintenance
 test-opensearch-maintenance:
+	cargo test --bin vector-db-benchmark merge_bounds_are_resolved_when_the_engine_is_constructed --release
 	cargo test --lib opensearch_maintenance:: --release
 	cargo test --lib opensearch_maintenance::
 
