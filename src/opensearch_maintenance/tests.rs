@@ -53,7 +53,7 @@ fn options() -> MergeOptions {
     MergeOptions {
         http_deadline: Duration::from_secs(1),
         budget: Some(Duration::from_secs(5)),
-        max_poll_retries: 1,
+        max_retries: 1,
         retry_base: Duration::from_millis(1),
         poll_interval: Duration::from_millis(1),
     }
@@ -143,13 +143,44 @@ fn pending_tasks_outlive_retry_count_and_gateway_errors_retry_only_get() {
 }
 
 #[test]
-fn ambiguous_submission_is_not_reposted_and_requires_task_id() {
-    for (status, body) in [
-        (504, json!({"error":"gateway timeout"})),
-        (200, json!({})),
-        (200, json!({"task":""})),
-    ] {
-        assert!(run(vec![submit(status, body)], options()).is_err());
+fn submission_retries_transient_errors_and_requires_task_id() {
+    for status in [429, 502, 503, 504] {
+        run(
+            vec![
+                submit(status, json!({"error":"busy"})),
+                submit(200, json!({"task":"node:42"})),
+                poll(200, done()),
+            ],
+            options(),
+        )
+        .unwrap();
+    }
+    let err = run(
+        vec![submit(504, json!({})), submit(504, json!({}))],
+        options(),
+    )
+    .unwrap_err();
+    assert!(
+        err.starts_with("Force merge submission failed after 1 retries: HTTP 504"),
+        "{err}"
+    );
+    for body in [json!({}), json!({"task":""})] {
+        let err = run(vec![submit(200, body)], options()).unwrap_err();
+        assert!(
+            err.starts_with("Force merge did not return an asynchronous task ID"),
+            "{err}"
+        );
+    }
+    for status in [400, 401, 403, 404] {
+        let err = run(
+            vec![submit(status, json!({"error":"permanent"}))],
+            options(),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with(&format!("Force merge submission HTTP {status}:")),
+            "{err}"
+        );
     }
 }
 
@@ -167,11 +198,18 @@ fn poll_errors_fail_closed() {
             json!({"completed":true,"response":{"_shards":{"total":1,"successful":0,"failed":1}}}),
         ),
     ] {
-        assert!(run(
+        let status = response.status;
+        let err = run(
             vec![submit(200, json!({"task":"node:42"})), response],
-            options()
+            options(),
         )
-        .is_err());
+        .unwrap_err();
+        if status == 403 || status == 404 {
+            assert!(
+                err.starts_with(&format!("Force merge task node:42 HTTP {status}:")),
+                "{err}"
+            );
+        }
     }
     let err = run(
         vec![

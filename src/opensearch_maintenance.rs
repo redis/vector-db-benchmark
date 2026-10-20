@@ -10,16 +10,17 @@ use serde_json::Value;
 pub struct MergeOptions {
     pub http_deadline: Duration,
     pub budget: Option<Duration>,
-    pub max_poll_retries: u32,
+    pub max_retries: u32,
     pub retry_base: Duration,
     pub poll_interval: Duration,
 }
 
-/// Submit exactly once, then poll the returned task. Retrying a timed-out POST
-/// can queue another merge while the original keeps running behind the gateway.
-/// A failed/ambiguous submission therefore fails closed; only GETs are retried.
-/// The budget covers submission, response bodies, polling and sleeps. Timing out
-/// the client does not cancel the server task (force merge is not cancellable).
+/// Submit an asynchronous merge, then poll its task. Transient failures retry
+/// within the budget. A lost submission reply may leave an earlier merge running;
+/// on this read-only index, a repeated merge queues behind it and finds no extra
+/// work once the first finishes. Healthy unfinished tasks consume no retries.
+/// The budget includes HTTP bodies and sleeps. Client expiry cannot cancel the
+/// server task (force merge is not cancellable).
 pub async fn force_merge(
     client: &OpenSearch,
     index: &str,
@@ -44,37 +45,50 @@ async fn merge_task(
     let indices = [index];
     let path = IndicesForcemergeParts::Index(&indices).url();
     let query = [("max_num_segments", "1"), ("wait_for_completion", "false")];
-    let response = client
-        .transport()
-        .send(
-            Method::Post,
-            path.as_ref(),
-            HeaderMap::new(),
-            Some(&query),
-            None::<JsonBody<Value>>,
-            Some(options.http_deadline),
-        )
-        .await
-        .map_err(|e| {
-            format!("Force merge submission failed (not resubmitting an ambiguous request): {e}")
-        })?;
-    let status = response.status_code().as_u16();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Force merge submission body: {e}"))?;
-    if !(200..300).contains(&status) {
-        return Err(format!(
-            "Force merge submission HTTP {status} (not resubmitting): {text}"
-        ));
-    }
-    let body: Value =
-        serde_json::from_str(&text).map_err(|e| format!("Force merge submission JSON: {e}"))?;
-    let task = body
-        .get("task")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("Force merge did not return an asynchronous task ID: {body}"))?;
+    let mut retries = 0;
+    let task = loop {
+        let response = client
+            .transport()
+            .send(
+                Method::Post,
+                path.as_ref(),
+                HeaderMap::new(),
+                Some(&query),
+                None::<JsonBody<Value>>,
+                Some(options.http_deadline),
+            )
+            .await;
+        let failure = match response {
+            Ok(response) => {
+                let status = response.status_code().as_u16();
+                match response.text().await {
+                    Ok(text) if (200..300).contains(&status) => {
+                        let body: Value = serde_json::from_str(&text)
+                            .map_err(|e| format!("Force merge submission JSON: {e}"))?;
+                        break body
+                            .get("task")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                format!(
+                                    "Force merge did not return an asynchronous task ID: {body}"
+                                )
+                            })?
+                            .to_owned();
+                    }
+                    Ok(text) if matches!(status, 429 | 502 | 503 | 504) => {
+                        format!("HTTP {status}: {text}")
+                    }
+                    Ok(text) => {
+                        return Err(format!("Force merge submission HTTP {status}: {text}"))
+                    }
+                    Err(e) => format!("response body: {e}"),
+                }
+            }
+            Err(e) => e.to_string(),
+        };
+        retry_wait("Force merge submission", options, &mut retries, &failure).await?;
+    };
     println!("Force merge task {task} submitted; polling until all shards complete...");
     let started = Instant::now();
     let mut last_report = Instant::now();
@@ -82,7 +96,7 @@ async fn merge_task(
     loop {
         let result = client
             .tasks()
-            .get(TasksGetParts::TaskId(task))
+            .get(TasksGetParts::TaskId(&task))
             .wait_for_completion(false)
             .request_timeout(options.http_deadline)
             .send()
@@ -124,22 +138,33 @@ async fn merge_task(
             }
             Err(e) => e.to_string(),
         };
-        if retries >= options.max_poll_retries {
-            return Err(format!(
-                "Force merge task {task} polling failed after {retries} retries: {failure}"
-            ));
-        }
-        let delay = options
-            .retry_base
-            .saturating_mul(1u32 << retries.min(16))
-            .min(Duration::from_secs(30));
-        eprintln!(
-            "Force merge task {task} poll retry {}: {failure}",
-            retries + 1
-        );
-        tokio::time::sleep(delay).await;
-        retries += 1;
+        retry_wait(
+            &format!("Force merge task {task} polling"),
+            options,
+            &mut retries,
+            &failure,
+        )
+        .await?;
     }
+}
+
+async fn retry_wait(
+    stage: &str,
+    options: &MergeOptions,
+    retries: &mut u32,
+    failure: &str,
+) -> Result<(), String> {
+    if *retries >= options.max_retries {
+        return Err(format!("{stage} failed after {retries} retries: {failure}"));
+    }
+    let delay = options
+        .retry_base
+        .saturating_mul(1u32 << (*retries).min(16))
+        .min(Duration::from_secs(30));
+    eprintln!("{stage} retry {}: {failure}", *retries + 1);
+    tokio::time::sleep(delay).await;
+    *retries += 1;
+    Ok(())
 }
 
 fn task_complete(body: &Value) -> Result<bool, String> {
