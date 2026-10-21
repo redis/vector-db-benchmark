@@ -126,3 +126,64 @@ fn scalar_search_reports_measured_retries_but_not_priming_retries() {
         }
     }
 }
+
+#[test]
+fn unsupported_query_effort_server_fails_before_index_mutation() {
+    let _lock = crate::effective_config::test_lock();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no version preflight request");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("mock accept: {e}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(&mut socket);
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let (status, body) = if request.starts_with("GET / HTTP/") {
+            (200, json!({"version":{"number":"2.15.0"}}))
+        } else {
+            (
+                400,
+                json!({"error":"unexpected index mutation before version check"}),
+            )
+        };
+        let body = body.to_string();
+        write!(socket, "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        request
+    });
+    let config = serde_json::from_value(json!({"name":"version-test","engine":"opensearch",
+        "search_params":[{"search_params":{"ef":128}}]}))
+    .unwrap();
+    let mut engine = OpenSearchEngine::new(&config, "http://127.0.0.1").unwrap();
+    engine.client = Arc::new(create_os_client(&url, 5).unwrap());
+    engine.base_url = url;
+    let dataset = Dataset::new(
+        serde_json::from_value(json!({"name":"unread-fixture",
+        "path":"must-not-read","type":"tar","distance":"cosine","vector_size":100}))
+        .unwrap(),
+    );
+    let error = engine.configure(&dataset).unwrap_err();
+    let request = server.join().unwrap();
+    assert!(error.contains("requires OpenSearch 2.16+"), "{error}");
+    assert!(request.starts_with("GET / HTTP/"), "{request}");
+}

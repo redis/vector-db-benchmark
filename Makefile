@@ -522,6 +522,6 @@ coverage-filter-only:
 
 .PHONY: test-opensearch-query
 test-opensearch-query:
-	cargo test --bin vector-db-benchmark engine::opensearch::tests --release
+	cargo test --bin vector-db-benchmark engine::opensearch:: --release
 	cargo test --lib opensearch_query:: --release
 	cargo test --lib opensearch_query::

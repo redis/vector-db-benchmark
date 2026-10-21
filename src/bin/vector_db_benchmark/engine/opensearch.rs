@@ -1754,6 +1754,33 @@ impl Engine for OpenSearchEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // Probe before any index deletion, creation, upload, or force merge.
+        if !self.config.skip_vector_index
+            && self
+                .search_params
+                .iter()
+                .any(|p| p.search_params.as_ref().and_then(|p| p.ef).is_some())
+        {
+            let response = self
+                .rt
+                .block_on(self.client.info().send())
+                .map_err(|e| format!("Unable to verify OpenSearch query-effort support: {e}"))?;
+            if !response.status_code().is_success() {
+                return Err(format!(
+                    "Unable to verify OpenSearch query-effort support: HTTP {}",
+                    response.status_code()
+                ));
+            }
+            let info: serde_json::Value = self
+                .rt
+                .block_on(response.json())
+                .map_err(|e| format!("Unable to parse OpenSearch version response: {e}"))?;
+            let version = info
+                .pointer("/version/number")
+                .and_then(|v| v.as_str())
+                .ok_or("OpenSearch version response is missing version.number")?;
+            vector_db_benchmark::opensearch_query::validate_server_version(version)?;
+        }
         self.scalar_metadata_validated = false;
         // Shard count is printed alongside the HNSW knobs so a sweep point is
         // honestly labelled rather than silently measured at whatever the cluster

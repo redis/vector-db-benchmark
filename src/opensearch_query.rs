@@ -8,6 +8,19 @@ pub fn validate_ef(ef: Option<i64>) -> Result<(), String> {
     Ok(())
 }
 
+/// Query-level Lucene method parameters require OpenSearch 2.16 or newer.
+pub fn validate_server_version(version: &str) -> Result<(), String> {
+    let mut pieces = version.split('.');
+    let major = pieces.next().and_then(|v| v.parse::<u64>().ok());
+    let minor = pieces.next().and_then(|v| v.parse::<u64>().ok());
+    match (major, minor) {
+        (Some(major), Some(minor)) if major > 2 || (major == 2 && minor >= 16) => Ok(()),
+        _ => Err(format!(
+            "OpenSearch query-level ef requires OpenSearch 2.16+; server reports {version:?}"
+        )),
+    }
+}
+
 /// OpenSearch KNN search (different format from Elasticsearch).
 /// Uses {"query": {"knn": {"vector": {"vector": [...], "k": top}}}} format.
 /// Build the OpenSearch kNN search body.
@@ -56,6 +69,16 @@ pub fn build_knn_body(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn query_effort_requires_a_supported_parseable_server_version() {
+        for version in ["2.16.0", "2.19.2", "3.7.0", "3.0.0-SNAPSHOT"] {
+            assert!(validate_server_version(version).is_ok(), "{version}");
+        }
+        for version in ["1.3.0", "2.15.9", "2.7.0", "", "3", "unknown", "3.x.0"] {
+            assert!(validate_server_version(version).is_err(), "{version}");
+        }
+    }
 
     #[test]
     fn effort_is_explicit_and_does_not_change_returned_k() {
