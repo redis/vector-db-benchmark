@@ -13,7 +13,7 @@ use opensearch::http::request::JsonBody;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::indices::{
     IndicesCreateParts, IndicesDeleteParts, IndicesGetMappingParts, IndicesGetSettingsParts,
-    IndicesPutSettingsParts, IndicesRefreshParts,
+    IndicesRefreshParts,
 };
 use opensearch::params::WaitForStatus;
 use opensearch::{BulkParts, CountParts, OpenSearch, SearchParts};
@@ -65,6 +65,9 @@ pub struct OpenSearchEngine {
 impl OpenSearchEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
         for params in engine_config.search_params.iter().flatten() {
+            if params.knob("knn.algo_param.ef_search").is_some() {
+                return Err("OpenSearch Lucene ignores knn.algo_param.ef_search; use search_params.ef for query-level effort".into());
+            }
             vector_db_benchmark::opensearch_query::validate_ef(
                 params.search_params.as_ref().and_then(|p| p.ef),
             )?;
@@ -624,44 +627,6 @@ impl OpenSearchEngine {
             backoff_sleep(policy.base_delay_ms, attempt);
             attempt += 1;
         }
-    }
-
-    /// Apply search-time settings (e.g., knn.algo_param.ef_search)
-    fn setup_search(&self, params: &SearchParams) -> Result<(), String> {
-        // Cold-cache graph loading is warmed uniformly by the per-worker prime
-        // query in `search` (mirrors redis/vertex), so no engine-specific
-        // server-side `_knn/warmup` call is needed here.
-        // Accepted flat (our configs) or nested under `search_params`/`config`
-        // (upstream's) — see SearchParams::knob.
-        let ef_search = params
-            .knob("knn.algo_param.ef_search")
-            .and_then(|v| v.as_i64());
-
-        if let Some(ef) = ef_search {
-            eprintln!("Warning: Lucene ignores index-level knn.algo_param.ef_search={ef}; use search_params.ef for query-level effort");
-            let body = serde_json::json!({
-                "index": {
-                    "knn.algo_param.ef_search": ef,
-                }
-            });
-
-            let resp = self
-                .rt
-                .block_on(
-                    self.client
-                        .indices()
-                        .put_settings(IndicesPutSettingsParts::Index(&[&self.index_name]))
-                        .body(body)
-                        .send(),
-                )
-                .map_err(|e| format!("Failed to apply search settings: {}", e))?;
-
-            if !resp.status_code().is_success() {
-                let text = self.rt.block_on(resp.text()).unwrap_or_default();
-                eprintln!("Warning: failed to set ef_search={}: {}", ef, text);
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1908,10 +1873,7 @@ impl Engine for OpenSearchEngine {
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
 
-        // Apply search-time settings (ef_search)
-        if !self.config.skip_vector_index {
-            self.setup_search(params)?;
-        } else {
+        if self.config.skip_vector_index {
             self.validate_filter_only_schema(dataset)?;
             if !self.scalar_metadata_validated {
                 dataset.validate_scalar_metadata()?;
@@ -2276,6 +2238,25 @@ mod tests {
             raw_nf.get().as_bytes(),
             serde_json::to_vec(&body_nf).unwrap().as_slice()
         );
+    }
+
+    #[test]
+    fn legacy_query_effort_is_rejected_before_client_or_upload() {
+        for entry in [
+            json!({"knn.algo_param.ef_search": 128}),
+            json!({"search_params": {"knn.algo_param.ef_search": 128}}),
+            json!({"config": {"knn.algo_param.ef_search": 128}}),
+        ] {
+            let config: EngineConfig = serde_json::from_value(json!({
+                "name": "legacy-effort", "engine": "opensearch",
+                "search_params": [{"search_params": {"ef": 128}}, entry]
+            }))
+            .unwrap();
+            let error = OpenSearchEngine::new(&config, "invalid host")
+                .err()
+                .unwrap();
+            assert!(error.contains("use search_params.ef"), "{error}");
+        }
     }
 
     #[test]

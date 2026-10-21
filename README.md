@@ -1428,7 +1428,7 @@ For Lucene indexes on OpenSearch 2.16+, use `"search_params": {"ef": 512}`
 at the requested `top`, so recall remains recall@K. `ef` must be a positive
 32-bit integer, validated for every search entry before upload. Omitting it preserves the existing request body. OpenSearch Lucene uses `max(k, ef_search)` as its candidate budget; values below K do not represent distinct effective effort settings. The bundled OpenSearch sweeps now use the query-level control.
 
-The legacy `knn.algo_param.ef_search` knob still writes the index setting;
-Lucene ignores that setting. It must not be described as an effective Lucene
-effort sweep. Use the query-level knob for recall comparisons. See the
+The legacy `knn.algo_param.ef_search` knob is rejected before client setup or
+upload because Lucene ignores it. Migrate custom configs to `search_params.ef`
+to avoid measuring identical requests under different effort settings. See the
 [OpenSearch k-NN query documentation](https://docs.opensearch.org/latest/query-dsl/specialized/k-nn/index/).
