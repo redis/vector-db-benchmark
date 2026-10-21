@@ -1,5 +1,13 @@
 //! OpenSearch query-level effort, independent of the returned K.
 
+/// Reject invalid requested effort before indexing or sending any query.
+pub fn validate_ef(ef: Option<i64>) -> Result<(), String> {
+    if ef.is_some_and(|v| v <= 0 || v > i32::MAX as i64) {
+        return Err("OpenSearch query ef must be a positive 32-bit integer".into());
+    }
+    Ok(())
+}
+
 /// OpenSearch KNN search (different format from Elasticsearch).
 /// Uses {"query": {"knn": {"vector": {"vector": [...], "k": top}}}} format.
 /// Build the OpenSearch kNN search body.
@@ -15,9 +23,7 @@ pub fn build_knn_body(
     filter: Option<&serde_json::Value>,
     ef: Option<i64>,
 ) -> Result<serde_json::Value, String> {
-    if ef.is_some_and(|v| v <= 0 || v > i32::MAX as i64) {
-        return Err("OpenSearch query ef must be a positive 32-bit integer".into());
-    }
+    validate_ef(ef)?;
     let mut query = serde_json::json!({
         "knn": {
             "vector": {

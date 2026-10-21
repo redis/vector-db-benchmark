@@ -64,6 +64,11 @@ pub struct OpenSearchEngine {
 
 impl OpenSearchEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
+        for params in engine_config.search_params.iter().flatten() {
+            vector_db_benchmark::opensearch_query::validate_ef(
+                params.search_params.as_ref().and_then(|p| p.ef),
+            )?;
+        }
         let port: u16 = crate::effective_config::env_parsed("OPENSEARCH_PORT", 9200);
 
         let index_name = crate::effective_config::env_or("OPENSEARCH_INDEX", "bench");
@@ -633,6 +638,7 @@ impl OpenSearchEngine {
             .and_then(|v| v.as_i64());
 
         if let Some(ef) = ef_search {
+            eprintln!("Warning: Lucene ignores index-level knn.algo_param.ef_search={ef}; use search_params.ef for query-level effort");
             let body = serde_json::json!({
                 "index": {
                     "knn.algo_param.ef_search": ef,
@@ -2270,6 +2276,45 @@ mod tests {
             raw_nf.get().as_bytes(),
             serde_json::to_vec(&body_nf).unwrap().as_slice()
         );
+    }
+
+    #[test]
+    fn invalid_query_effort_is_rejected_before_client_or_upload() {
+        let config: EngineConfig = serde_json::from_value(json!({
+            "name": "invalid-effort", "engine": "opensearch",
+            "search_params": [{"search_params": {"ef": 128}}, {"search_params": {"ef": 0}}]
+        }))
+        .unwrap();
+        let error = OpenSearchEngine::new(&config, "invalid host")
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("query ef must be a positive 32-bit integer"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shipped_sweeps_send_query_effort_instead_of_ignored_index_settings() {
+        for file in ["opensearch-single-node.json", "opensearch-5-shard.json"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("experiments/configurations")
+                .join(file);
+            let configs: Vec<EngineConfig> =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert!(!configs.is_empty());
+            for config in configs {
+                for params in config.search_params.unwrap() {
+                    assert!(params.knob("knn.algo_param.ef_search").is_none());
+                    let ef = params.search_params.as_ref().and_then(|p| p.ef).unwrap();
+                    let body = build_knn_body(&[0.1], 25, None, &params).unwrap();
+                    assert_eq!(
+                        body["query"]["knn"]["vector"]["method_parameters"]["ef_search"],
+                        ef
+                    );
+                }
+            }
+        }
     }
 
     #[test]

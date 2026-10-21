@@ -1426,7 +1426,7 @@ For Lucene indexes on OpenSearch 2.16+, use `"search_params": {"ef": 512}`
 (or the accepted `config` / `EF` aliases) in a search entry. The driver sends
 `query.knn.vector.method_parameters.ef_search` while keeping both `k` and `size`
 at the requested `top`, so recall remains recall@K. `ef` must be a positive
-32-bit integer. Omitting it preserves the existing request body.
+32-bit integer, validated for every search entry before upload. Omitting it preserves the existing request body. OpenSearch Lucene uses `max(k, ef_search)` as its candidate budget; values below K do not represent distinct effective effort settings. The bundled OpenSearch sweeps now use the query-level control.
 
 The legacy `knn.algo_param.ef_search` knob still writes the index setting;
 Lucene ignores that setting. It must not be described as an effective Lucene
