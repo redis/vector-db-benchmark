@@ -519,3 +519,9 @@ coverage-filter-only:
 	mkdir -p "$(COVERAGE_DIR)/reports"; \
 	cargo llvm-cov report --release --json --output-path "$(COVERAGE_DIR)/reports/coverage.json"; \
 	cargo llvm-cov report --release --lcov --output-path "$(COVERAGE_DIR)/reports/lcov.info"
+
+.PHONY: test-opensearch-query
+test-opensearch-query:
+	cargo test --bin vector-db-benchmark query_effort_reaches_the_request --release
+	cargo test --lib opensearch_query:: --release
+	cargo test --lib opensearch_query::

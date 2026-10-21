@@ -13,6 +13,7 @@ pub mod filter_only;
 pub mod metrics;
 pub mod msmarco;
 pub mod opensearch_maintenance;
+pub mod opensearch_query;
 pub mod parsers;
 pub mod query_filter;
 pub mod readers;

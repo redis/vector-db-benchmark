@@ -1566,43 +1566,19 @@ fn item_is_retryable(item: &serde_json::Value) -> bool {
     )
 }
 
-/// OpenSearch KNN search (different format from Elasticsearch).
-/// Uses {"query": {"knn": {"vector": {"vector": [...], "k": top}}}} format.
-/// Build the OpenSearch kNN search body.
-///
-/// Efficient (pre-)filtering: the filter is pushed *inside* the kNN clause so the
-/// Lucene engine applies it during graph traversal. Wrapping the kNN query in an
-/// outer `bool.must` + `filter` instead performs post-filtering, which collapses
-/// recall on filtered datasets (see qdrant/vector-db-benchmark#167). Requires the
-/// `lucene` engine, which our index mapping uses (see `configure`).
+/// Resolve the typed search knob on the actual request construction path.
 fn build_knn_body(
     query_vector: &[f32],
     top: usize,
     filter: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let mut query = serde_json::json!({
-        "knn": {
-            "vector": {
-                "vector": query_vector,
-                "k": top,
-            }
-        }
-    });
-
-    if let Some(f) = filter {
-        query["knn"]["vector"]["filter"] = f.clone();
-    }
-
-    // Response trimming: the benchmark only needs each hit's id, so skip loading
-    // `_source` and stored fields and return `_id` via a doc-value field. This
-    // trims the response payload for a fairer QPS/latency measurement.
-    serde_json::json!({
-        "query": query,
-        "size": top,
-        "_source": false,
-        "docvalue_fields": ["_id"],
-        "stored_fields": "_none_",
-    })
+    params: &SearchParams,
+) -> Result<serde_json::Value, String> {
+    vector_db_benchmark::opensearch_query::build_knn_body(
+        query_vector,
+        top,
+        filter,
+        params.search_params.as_ref().and_then(|p| p.ef),
+    )
 }
 
 /// Extract the document id from a search hit. With response trimming the id is
@@ -2008,11 +1984,16 @@ impl Engine for OpenSearchEngine {
                         tops[idx],
                     )
                 } else {
-                    build_knn_body(&queries[idx], tops[idx], parsed_filters[idx].as_ref())
+                    build_knn_body(
+                        &queries[idx],
+                        tops[idx],
+                        parsed_filters[idx].as_ref(),
+                        params,
+                    )?
                 };
-                serde_json::value::to_raw_value(&body).expect("serialize KNN search body")
+                serde_json::value::to_raw_value(&body).map_err(|e| e.to_string())
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
 
         // Per-thread sample buffers merged on join — no per-query Mutex<Vec>
         // contention in the timed loop (see redis.rs::search). Metrics are
@@ -2276,18 +2257,40 @@ mod tests {
         let top = 2usize;
         let filter = json!({"term": {"color": "red"}});
 
-        let body = build_knn_body(&vec, top, Some(&filter));
+        let params = serde_json::from_value(json!({})).unwrap();
+        let body = build_knn_body(&vec, top, Some(&filter), &params).unwrap();
         let to_vec_bytes = serde_json::to_vec(&body).unwrap();
         let raw = serde_json::value::to_raw_value(&body).unwrap();
         assert_eq!(raw.get().as_bytes(), to_vec_bytes.as_slice());
 
         // Unfiltered variant.
-        let body_nf = build_knn_body(&vec, top, None);
+        let body_nf = build_knn_body(&vec, top, None, &params).unwrap();
         let raw_nf = serde_json::value::to_raw_value(&body_nf).unwrap();
         assert_eq!(
             raw_nf.get().as_bytes(),
             serde_json::to_vec(&body_nf).unwrap().as_slice()
         );
+    }
+
+    #[test]
+    fn query_effort_reaches_the_request_without_changing_k_or_filter() {
+        let filter = json!({"range": {"price": {"gte": 3, "lte": 7}}});
+        for key in ["search_params", "config"] {
+            for ef_key in ["ef", "EF"] {
+                let params: SearchParams = serde_json::from_value(json!({
+                    "top": 25, key: {ef_key: 512}
+                }))
+                .unwrap();
+                let body = build_knn_body(&[0.1, 0.2], 25, Some(&filter), &params).unwrap();
+                assert_eq!(
+                    body["query"]["knn"]["vector"]["method_parameters"]["ef_search"],
+                    512
+                );
+                assert_eq!(body["query"]["knn"]["vector"]["k"], 25);
+                assert_eq!(body["size"], 25);
+                assert_eq!(body["query"]["knn"]["vector"]["filter"], filter);
+            }
+        }
     }
 
     #[test]
@@ -2361,7 +2364,13 @@ mod tests {
     #[test]
     fn knn_filter_is_pushed_inside_knn_clause() {
         let filter = json!({"bool": {"must": [{"match": {"a": 1}}]}});
-        let body = build_knn_body(&[0.1, 0.2, 0.3], 10, Some(&filter));
+        let body = build_knn_body(
+            &[0.1, 0.2, 0.3],
+            10,
+            Some(&filter),
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
 
         // Filter lives at query.knn.vector.filter ...
         assert_eq!(body["query"]["knn"]["vector"]["filter"], filter);
@@ -2376,14 +2385,26 @@ mod tests {
 
     #[test]
     fn knn_body_without_filter_has_no_filter_key() {
-        let body = build_knn_body(&[0.1, 0.2], 5, None);
+        let body = build_knn_body(
+            &[0.1, 0.2],
+            5,
+            None,
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
         assert!(body["query"]["knn"]["vector"].get("filter").is_none());
     }
 
     #[test]
     fn knn_body_trims_the_response() {
         // Response trimming: no _source, ids via doc-value, no stored fields.
-        let body = build_knn_body(&[0.1, 0.2], 5, None);
+        let body = build_knn_body(
+            &[0.1, 0.2],
+            5,
+            None,
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["_source"], serde_json::json!(false));
         assert_eq!(body["docvalue_fields"], serde_json::json!(["_id"]));
         assert_eq!(body["stored_fields"], serde_json::json!("_none_"));

@@ -283,6 +283,32 @@ fn test_opensearch_knn_search() {
     let hits = body["hits"]["hits"].as_array().unwrap();
     assert!(!hits.is_empty(), "Expected search results");
 
+    // Query-level effort must be accepted by the real Lucene engine while
+    // the returned result count stays at K, not the larger candidate budget.
+    let tuned = vector_db_benchmark::opensearch_query::build_knn_body(
+        &[1.0, 0.0, 0.0, 0.0],
+        3,
+        None,
+        Some(128),
+    )
+    .unwrap();
+    let response = client
+        .post(format!("{}/{}/_search", os_base_url(), OS_INDEX))
+        .json(&tuned)
+        .send()
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().unwrap_or_default()
+    );
+    let tuned_body: serde_json::Value = response.json().unwrap();
+    assert_eq!(tuned_body["hits"]["hits"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        tuned_body["hits"]["hits"][0]["fields"]["_id"][0],
+        id_to_uuid_hex(0)
+    );
+
     // First result should be id=0 (exact match)
     let first_id = hits[0]["_id"].as_str().unwrap();
     let expected_id = id_to_uuid_hex(0);

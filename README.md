@@ -1419,3 +1419,16 @@ tests/
   integration_mongodb.rs              # MongoDB integration tests
   integration_valkey.rs               # Valkey integration tests
 ```
+
+### OpenSearch query-level search effort
+
+For Lucene indexes on OpenSearch 2.16+, use `"search_params": {"ef": 512}`
+(or the accepted `config` / `EF` aliases) in a search entry. The driver sends
+`query.knn.vector.method_parameters.ef_search` while keeping both `k` and `size`
+at the requested `top`, so recall remains recall@K. `ef` must be a positive
+32-bit integer. Omitting it preserves the existing request body.
+
+The legacy `knn.algo_param.ef_search` knob still writes the index setting;
+Lucene ignores that setting. It must not be described as an effective Lucene
+effort sweep. Use the query-level knob for recall comparisons. See the
+[OpenSearch k-NN query documentation](https://docs.opensearch.org/latest/query-dsl/specialized/k-nn/index/).
