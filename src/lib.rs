@@ -18,6 +18,7 @@ pub mod parsers;
 pub mod query_filter;
 pub mod readers;
 pub mod redis_client;
+pub mod redis_numeric_range;
 pub mod start_gate;
 pub mod synthetic;
 

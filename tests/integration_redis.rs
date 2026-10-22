@@ -4327,3 +4327,275 @@ fn test_binary_redis_filter_only_rejects_vector_index_reuse() {
         .unwrap();
     fs::remove_dir_all(proj.root).unwrap();
 }
+
+/// Inspect what the CLI actually sent, not a separately hand-written range.
+/// Restoring logging before any assertions prevents a failed regression from
+/// changing how subsequent tests exercise the isolated Redis instance.
+fn capture_bounded_range_search(conn: &mut Connection, run: impl FnOnce() -> bool) -> Vec<Vec<u8>> {
+    let old: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("slowlog-log-slower-than")
+        .arg("slowlog-max-len")
+        .query(conn)
+        .unwrap();
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("slowlog-log-slower-than")
+        .arg(0)
+        .arg("slowlog-max-len")
+        .arg(256)
+        .query::<()>(conn)
+        .unwrap();
+    redis::cmd("SLOWLOG")
+        .arg("RESET")
+        .query::<()>(conn)
+        .unwrap();
+    let succeeded = run();
+    let entries = redis::cmd("SLOWLOG")
+        .arg("GET")
+        .arg(256)
+        .query::<Vec<redis::Value>>(conn);
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg(&old)
+        .query::<()>(conn)
+        .unwrap();
+    assert!(succeeded, "bounded range CLI query failed");
+    let searches: Vec<Vec<Vec<u8>>> = entries
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| {
+            let redis::Value::Array(fields) = entry else {
+                panic!("unexpected SLOWLOG entry: {entry:?}");
+            };
+            let args: Vec<Vec<u8>> = redis::from_redis_value(fields[3].clone()).unwrap();
+            // Upload/reuse validation also sends FT.SEARCH * LIMIT 0 0.
+            // Select the driver's parameterized numeric predicate, captured
+            // before this test sends any replay or EXPLAIN request of its own.
+            let is_range_search = args
+                .first()
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"FT.SEARCH"))
+                && args
+                    .get(2)
+                    .is_some_and(|query| String::from_utf8_lossy(query).contains("@price:["))
+                && args.iter().any(|arg| arg.eq_ignore_ascii_case(b"PARAMS"));
+            is_range_search.then_some(args)
+        })
+        .collect();
+    assert!(
+        !searches.is_empty(),
+        "CLI did not execute the price range query"
+    );
+    // Warmups/repeats use the same request, but HashMap iteration may reorder
+    // PARAMS pairs between searches. Compare their contents, preserving each
+    // original command for byte-for-byte replay below.
+    let normalized = |args: &Vec<Vec<u8>>| {
+        let at = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case(b"PARAMS"))
+            .unwrap();
+        let count = std::str::from_utf8(&args[at + 1])
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(count % 2, 0);
+        let mut pairs: Vec<_> = args[at + 2..at + 2 + count]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .collect();
+        pairs.sort();
+        let mut result = args[..at + 2].to_vec();
+        result.extend(pairs.into_iter().flatten().cloned());
+        result.extend_from_slice(&args[at + 2 + count..]);
+        result
+    };
+    assert!(searches
+        .iter()
+        .all(|args| normalized(args) == normalized(&searches[0])));
+    searches[0].clone()
+}
+
+#[test]
+fn test_binary_redis_bounded_ranges_use_single_numeric_iterator() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ds = root.join("datasets/bounded-test");
+    fs::create_dir_all(&ds).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+    // Values at and on both sides of zero make each endpoint inclusion visible.
+    // The ID oracle below is literal and independent of the renderer/parser.
+    let values = [-2, -1, 0, 1, 2, 3, 4, 5];
+    let vectors: Vec<Vec<f32>> = (0..values.len())
+        .map(|id| vec![1.0, id as f32 / 10.0])
+        .collect();
+    vector_db_benchmark::readers::write_npy_vectors(
+        ds.join("vectors.npy").to_str().unwrap(),
+        &vectors,
+    )
+    .unwrap();
+    fs::write(
+        ds.join("payloads.jsonl"),
+        values
+            .iter()
+            .map(|price| serde_json::json!({"price":price}).to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::json!([{
+            "name":"bounded-test", "type":"tar", "path":"bounded-test/",
+            "distance":"angular", "vector_size":2, "vector_count":values.len(),
+            "schema":{"price":"int"}
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        serde_json::json!([{
+            "name":"bounded-redis", "engine":"redis",
+            "upload_params":{"parallel":1},
+            "search_params":[{"parallel":1,"top":8,"search_params":{"ef":100}}]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let cases: Vec<(serde_json::Value, Vec<i64>)> = vec![
+        (serde_json::json!({"gte":0,"lte":3}), vec![2, 3, 4, 5]),
+        (serde_json::json!({"gt":0,"lte":3}), vec![3, 4, 5]),
+        (serde_json::json!({"gte":0,"lt":3}), vec![2, 3, 4]),
+        (serde_json::json!({"gt":0,"lt":3}), vec![3, 4]),
+        (serde_json::json!({"gte":0,"lte":0}), vec![2]),
+        (serde_json::json!({"gt":0,"lte":0}), vec![]),
+        (serde_json::json!({"gte":0,"lt":0}), vec![]),
+        (serde_json::json!({"gt":0,"lt":0}), vec![]),
+        (serde_json::json!({"gte":3,"lte":0}), vec![]),
+        (serde_json::json!({"gte":0}), vec![2, 3, 4, 5, 6, 7]),
+        (serde_json::json!({"gt":0}), vec![3, 4, 5, 6, 7]),
+        (serde_json::json!({"lte":0}), vec![0, 1, 2]),
+        (serde_json::json!({"lt":0}), vec![0, 1]),
+    ];
+    let port = test_port().to_string();
+    for scalar in [true, false] {
+        flush_db(&mut conn);
+        for (case, (bounds, expected)) in cases.iter().enumerate() {
+            fs::write(
+                ds.join("tests.jsonl"),
+                serde_json::json!({
+                    "query":[1.0,0.0], "closest_ids":expected,
+                    "conditions":{"and":[{"price":{"range":bounds}}]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            common::clear_result_files(root);
+            let mut extra = vec![
+                "--queries",
+                "1",
+                "--keep-data",
+                "--dump-raw-latencies",
+                "--fail-on-dropped-queries",
+            ];
+            if scalar {
+                extra.push("--skip-vector-index");
+            }
+            if case != 0 {
+                extra.push("--skip-upload");
+            }
+            let args = capture_bounded_range_search(&mut conn, || {
+                common::run_binary_extra(
+                    root,
+                    "bounded-redis",
+                    "bounded-test",
+                    "localhost",
+                    &[("REDIS_PORT", &port)],
+                    &extra,
+                )
+            });
+            let query = String::from_utf8(args[2].clone()).unwrap();
+            let label = format!("scalar={scalar}, bounds={bounds}, actual query={query}");
+            // Replay the captured request byte-for-byte, including vector and
+            // numeric PARAMS. This detects wrong IDs even for empty ground truth,
+            // and avoids aggregate-count cancellation between predicates.
+            let response: Vec<redis::Value> = redis::cmd("FT.SEARCH")
+                .arg(&args[1..])
+                .query(&mut conn)
+                .unwrap();
+            let total: usize = redis::from_redis_value(response[0].clone()).unwrap();
+            assert_eq!(total, expected.len(), "{label}");
+            let stride = if scalar { 1 } else { 2 };
+            assert_eq!(response.len(), 1 + expected.len() * stride, "{label}");
+            let mut ids: Vec<i64> = response[1..]
+                .iter()
+                .step_by(stride)
+                .map(|value| {
+                    let key: String = redis::from_redis_value(value.clone()).unwrap();
+                    key.rsplit(':').next().unwrap().parse().unwrap()
+                })
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(&ids, expected, "{label}");
+            let engine = if scalar {
+                "redis-no-vector"
+            } else {
+                "bounded-redis"
+            };
+            let document = common::read_result_doc(root, engine);
+            assert_eq!(
+                document["params"]["engine_params"]["effective"]["numeric_range_encoding"],
+                "bounded_leaf_v1",
+                "{label}"
+            );
+            let result = &document["results"];
+            assert_eq!(result["failed_queries"], 0, "{label}");
+            if scalar {
+                assert_eq!(
+                    result["filter_only"]["matched_documents_sum"],
+                    expected.len(),
+                    "{label}"
+                );
+                assert_eq!(
+                    result["filter_only"]["returned_documents_sum"],
+                    expected.len(),
+                    "{label}"
+                );
+            } else if !expected.is_empty() {
+                assert_eq!(result["mean_recall"], 1.0, "{label}");
+            }
+            let params_at = args
+                .iter()
+                .position(|arg| arg.eq_ignore_ascii_case(b"PARAMS"))
+                .unwrap();
+            let count = std::str::from_utf8(&args[params_at + 1])
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut explain = redis::cmd("FT.EXPLAIN");
+            explain
+                .arg(&args[1])
+                .arg(&args[2])
+                .arg(&args[params_at..params_at + 2 + count]);
+            explain.arg("DIALECT").arg(if scalar { 2 } else { 4 });
+            let plan: String = explain.query(&mut conn).unwrap();
+            assert!(
+                !plan.contains("INTERSECT"),
+                "redundant range scans: {label}\n{plan}"
+            );
+            if !expected.is_empty() {
+                assert_eq!(
+                    plan.matches("NUMERIC").count(),
+                    1,
+                    "expected one bounded numeric iterator: {label}\n{plan}"
+                );
+            }
+        }
+    }
+    flush_db(&mut conn);
+}

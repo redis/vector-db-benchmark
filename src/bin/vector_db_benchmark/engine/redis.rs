@@ -838,6 +838,7 @@ impl RedisEngine {
             )?;
             Ok(parse_conditions(condition))
         })?;
+        record_numeric_range_encoding(&parsed_filters);
         // A metadata result limit must not be derived from vector ground truth.
         let top = params
             .top
@@ -1208,6 +1209,28 @@ pub(crate) fn parse_conditions(conditions: &serde_json::Value) -> Option<ParsedF
     build_group(obj, &mut counter)
 }
 
+/// Record only after successful resolution and before any timed search work.
+/// Range PARAMS names are distinct from match/geo names; the library recognizes
+/// that convention without making pure filter parsing mutate global telemetry.
+fn record_numeric_range_encoding(filters: &[QueryFilter<ParsedFilter>]) {
+    use vector_db_benchmark::redis_numeric_range;
+
+    if filters
+        .iter()
+        .filter_map(QueryFilter::as_ref)
+        .any(|(_, params)| {
+            params
+                .keys()
+                .any(|name| redis_numeric_range::is_bound_parameter(name))
+        })
+    {
+        crate::effective_config::record_effective(
+            "numeric_range_encoding",
+            redis_numeric_range::ENCODING,
+        );
+    }
+}
+
 /// Build one boolean GROUP (a `{and:[...], or:[...]}` object) into a parenthesised
 /// RediSearch clause. Recursive: an entry inside `and`/`or` may itself be a nested
 /// group, so this and [`build_subfilters`] call each other. Shares `counter`
@@ -1426,44 +1449,44 @@ fn build_text_filter(field_name: &str, text: &str, counter: &mut usize) -> Parse
     (format!("@{}:(${})", field_name, param_name), params)
 }
 
-/// Build range filter: @field:[-inf ($param_lt], @field:[($param_gt +inf], etc.
+/// Render each range leaf as bounded intervals, retaining its parameter names.
 fn build_range_filter(
     field_name: &str,
     criteria: &serde_json::Value,
     counter: &mut usize,
 ) -> Option<ParsedFilter> {
+    use vector_db_benchmark::redis_numeric_range::{self, Bound, Operator};
+
     let param_prefix = format!("{}_{}", field_name, counter);
     *counter += 1;
 
     let mut params = HashMap::new();
-    let mut clauses = Vec::new();
-
-    // (suffix, condition key, clause template). `gt` is EXCLUSIVE (`[($p +inf]`),
-    // `gte` inclusive; `lt` exclusive, `lte` inclusive.
-    let bounds = [
-        ("lt", "lt", "@{f}:[-inf (${p}]"),
-        ("gt", "gt", "@{f}:[(${p} +inf]"),
-        ("lte", "lte", "@{f}:[-inf ${p}]"),
-        ("gte", "gte", "@{f}:[${p} +inf]"),
-    ];
-    for (key, suffix, tmpl) in bounds {
+    let mut parsed = Vec::new();
+    // Keep conversion order and names stable; only the query encoding changes.
+    for (key, operator) in [
+        ("lt", Operator::Lt),
+        ("gt", Operator::Gt),
+        ("lte", Operator::Lte),
+        ("gte", Operator::Gte),
+    ] {
         if let Some(v) = criteria.get(key) {
-            let pname = format!("{}_{}", param_prefix, suffix);
+            let pname = format!("{}_{}", param_prefix, key);
             insert_number_param(&mut params, &pname, v);
-            // Only emit the clause when the bound actually parsed into a param —
-            // otherwise a `$param` with no PARAMS entry makes FT.SEARCH
-            // hard-error ("Parameter not found").
+            // A rejected bound must not leave an unbound query parameter.
             if params.contains_key(&pname) {
-                clauses.push(tmpl.replace("{f}", field_name).replace("{p}", &pname));
+                parsed.push((operator, pname));
             }
         }
     }
-
-    if clauses.is_empty() {
-        return None;
-    }
-
-    Some((clauses.join(" "), params))
+    let bounds: Vec<_> = parsed
+        .iter()
+        .map(|(operator, parameter)| Bound {
+            operator: *operator,
+            parameter,
+        })
+        .collect();
+    let query = redis_numeric_range::render(field_name, &bounds)?;
+    Some((query, params))
 }
 
 /// Build geo filter: @field:[$lon $lat $radius m]
@@ -2156,6 +2179,7 @@ impl Engine for RedisEngine {
         // Parse all conditions up front (before timing begins)
         let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
             conditions.resolve_all("Redis", parse_conditions)?;
+        record_numeric_range_encoding(&parsed_filters);
 
         // When top is explicitly set, use it for all queries.
         // When not set, use per-query ground truth count (matches Python v0 behavior
@@ -2559,6 +2583,7 @@ impl Engine for RedisEngine {
 
         let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
             conditions.resolve_all("Redis", parse_conditions)?;
+        record_numeric_range_encoding(&parsed_filters);
 
         // Read vectors for updates
         let normalize = dataset.needs_normalization();
@@ -3210,8 +3235,7 @@ mod tests {
             "lt":  "2022-01-01T00:00:00Z"
         }}}]});
         let (q, params) = parse_conditions(&cond).unwrap();
-        assert!(q.contains("@ts:[$ts_0_gte +inf]"), "q={}", q);
-        assert!(q.contains("@ts:[-inf ($ts_0_lt]"), "q={}", q);
+        assert!(q.contains("@ts:[$ts_0_gte ($ts_0_lt]"), "q={}", q);
         // 2021-01-01T00:00:00Z == 1609459200, 2022-01-01T00:00:00Z == 1640995200.
         // Emitted as integer epoch params.
         assert!(matches!(
@@ -3222,6 +3246,78 @@ mod tests {
             params.get("ts_0_lt"),
             Some(FilterParamValue::Int(1640995200))
         ));
+    }
+
+    #[test]
+    fn range_encoding_preserves_parameters() {
+        let mut counter = 7;
+        let (query, params) = super::build_range_filter(
+            "n",
+            &serde_json::json!({"gte": "1.25", "lt": 9, "gt": "invalid"}),
+            &mut counter,
+        )
+        .unwrap();
+        assert_eq!(query, "@n:[$n_7_gte ($n_7_lt]");
+        assert_eq!(counter, 8);
+        assert_eq!(params.len(), 2);
+        assert!(matches!(params.get("n_7_gte"), Some(FilterParamValue::Float(v)) if *v == 1.25));
+        assert!(matches!(
+            params.get("n_7_lt"),
+            Some(FilterParamValue::Int(9))
+        ));
+    }
+
+    #[test]
+    fn only_emitted_range_parameters_identify_range_encoding() {
+        use vector_db_benchmark::redis_numeric_range::is_bound_parameter;
+
+        for (condition, expected) in [
+            (
+                serde_json::json!({"and": [{"n": {"range": {"gte": 1}}}]}),
+                true,
+            ),
+            (
+                serde_json::json!({"and": [{"n": {"range": {"gte": "invalid"}}}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"and": [{"n_lt": {"match": {"value": 1}}}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"and": [{"n_gte": {"match": {"value": "tag"}}}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"and": [
+                    {"n": {"range": {"gt": "invalid"}}},
+                    {"n_gt": {"match": {"value": 1}}}
+                ]}),
+                false,
+            ),
+            (
+                serde_json::json!({"and": [{"loc_lt": {"geo": {"lon": 0, "lat": 0, "radius": 1}}}]}),
+                false,
+            ),
+            (serde_json::json!({}), false),
+        ] {
+            let parsed = parse_conditions(&condition);
+            let has_range = parsed
+                .as_ref()
+                .is_some_and(|(_, params)| params.keys().any(|name| is_bound_parameter(name)));
+            assert_eq!(has_range, expected, "{condition}");
+        }
+    }
+
+    #[test]
+    fn ranges_on_separate_leaves_remain_separate() {
+        let (query, params) = parse_conditions(&serde_json::json!({"and": [
+            {"n": {"range": {"gte": 10}}},
+            {"n": {"range": {"lt": 20}}}
+        ]}))
+        .unwrap();
+        assert_eq!(query, "(@n:[$n_0_gte +inf] @n:[-inf ($n_1_lt])");
+        assert_eq!(params.len(), 2);
     }
 
     #[test]
@@ -3857,10 +3953,10 @@ mod tests {
 
     #[test]
     fn range_two_sided_gte_lt() {
-        // Bounds are emitted in the fixed order lt, gt, lte, gte (space-joined).
+        // A single range leaf uses a single bounded iterator.
         assert_eq!(
             range_q(serde_json::json!({"gte":10,"lt":20})).unwrap(),
-            "@n:[-inf ($n_0_lt] @n:[$n_0_gte +inf]"
+            "@n:[$n_0_gte ($n_0_lt]"
         );
     }
 

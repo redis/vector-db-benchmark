@@ -109,6 +109,11 @@ test:
 test-filter-only-debug:
 	cargo test --lib filter_only::
 
+.PHONY: test-redis-numeric-range
+test-redis-numeric-range:
+	cargo test --lib redis_numeric_range:: --release
+	cargo test --lib redis_numeric_range::
+
 .PHONY: test-opensearch-maintenance
 test-opensearch-maintenance:
 	cargo test --bin vector-db-benchmark merge_bounds_are_resolved_when_the_engine_is_constructed --release
