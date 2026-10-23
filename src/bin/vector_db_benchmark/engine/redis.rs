@@ -1212,7 +1212,7 @@ pub(crate) fn parse_conditions(conditions: &serde_json::Value) -> Option<ParsedF
 /// Record only after successful resolution and before any timed search work.
 /// Range PARAMS names are distinct from match/geo names; the library recognizes
 /// that convention without making pure filter parsing mutate global telemetry.
-fn record_numeric_range_encoding(filters: &[QueryFilter<ParsedFilter>]) {
+pub(crate) fn record_numeric_range_encoding(filters: &[QueryFilter<ParsedFilter>]) {
     use vector_db_benchmark::redis_numeric_range;
 
     if filters

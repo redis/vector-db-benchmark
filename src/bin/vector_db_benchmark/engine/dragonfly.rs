@@ -1054,7 +1054,6 @@ impl Engine for DragonflyEngine {
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
-        // KNN-only: filter conditions are ignored (never built into the query).
         let (queries, neighbors, conditions) = dataset.read_queries()?;
 
         // Per-query prefilters, reusing redis's RediSearch filter builder (same
@@ -1062,6 +1061,7 @@ impl Engine for DragonflyEngine {
         // query with `conditions` runs `(prefilter)=>[KNN...]` instead of `*`.
         let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
             conditions.resolve_all("Dragonfly", parse_conditions)?;
+        super::redis::record_numeric_range_encoding(&parsed_filters);
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let num_to_run = if num_queries > 0 {
