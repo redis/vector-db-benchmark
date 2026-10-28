@@ -2383,44 +2383,31 @@ fn metrics_schema(gt: Option<&crate::ground_truth::GroundTruthStats>) -> serde_j
     schema
 }
 
-/// Row id -> external id for a dataset's per-query dumps: the `docid` payload
-/// field when the schema declares it (MS MARCO), else the row id itself.
+/// Row id -> external id for a dataset's per-query dumps (logic and tests in
+/// `results_dump::external_ids_for_dataset`). Cached for the most recent
+/// dataset: a sweep dumps every config against the same corpus, and the
+/// `docid` scan reads the whole `payloads.jsonl`. Outside every timed window.
 fn external_ids(
     dataset: &Dataset,
-) -> Result<vector_db_benchmark::results_dump::ExternalIds, String> {
-    use vector_db_benchmark::readers::metadata::MetadataValue;
-    use vector_db_benchmark::results_dump::{ExternalIds, EXTERNAL_ID_FIELD};
-    let declared = dataset
-        .config
-        .schema
-        .as_ref()
-        .and_then(|s| s.get(EXTERNAL_ID_FIELD))
-        .is_some();
-    if !declared {
-        return Ok(ExternalIds::Row);
+) -> Result<std::sync::Arc<vector_db_benchmark::results_dump::ExternalIds>, String> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<Option<(String, Arc<vector_db_benchmark::results_dump::ExternalIds>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut slot = cache.lock().map_err(|_| "external id cache poisoned")?;
+    if let Some((name, ids)) = slot.as_ref() {
+        if *name == dataset.config.name {
+            return Ok(Arc::clone(ids));
+        }
     }
-    if dataset.config.dataset_type.as_deref() != Some("tar") {
-        return Err(format!(
-            "dataset '{}' declares '{EXTERNAL_ID_FIELD}' but is not a compound (tar) dataset, \
-             the only layout whose payloads are read for external ids",
-            dataset.config.name
-        ));
-    }
-    let mut values = Vec::new();
-    vector_db_benchmark::readers::visit_compound_metadata(&dataset.get_path()?, |item| {
-        values.push(item.and_then(|m| {
-            m.fields
-                .into_iter()
-                .find(|(k, _)| k == EXTERNAL_ID_FIELD)
-                .and_then(|(_, v)| match v {
-                    MetadataValue::String(s) => Some(s),
-                    MetadataValue::Int(i) => Some(i.to_string()),
-                    _ => None,
-                })
-        }));
-        Ok(())
-    })?;
-    ExternalIds::from_field(EXTERNAL_ID_FIELD, values)
+    let ids = Arc::new(vector_db_benchmark::results_dump::external_ids_for_dataset(
+        &dataset.config.name,
+        dataset.config.dataset_type.as_deref(),
+        dataset.config.schema.as_ref(),
+        || dataset.get_path(),
+    )?);
+    *slot = Some((dataset.config.name.clone(), Arc::clone(&ids)));
+    Ok(ids)
 }
 
 /// Write one JSONL per completed search point that captured per-query results

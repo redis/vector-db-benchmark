@@ -2878,3 +2878,68 @@ pub fn assert_vector_dump_matches_run(root: &Path, dir: &Path, engine: &str, res
         "dump recall {recall} != published mean_recall {published}"
     );
 }
+
+/// Give every corpus row of a [`write_filter_only_project`] fixture a `docid`
+/// payload field (`doc-<row*3+7>`, deliberately not the row id) and declare it
+/// in the schema, so `--dump-results` resolves rows through the docid id space.
+/// Returns the row -> docid function the dump must agree with.
+pub fn add_docids(root: &Path) -> fn(usize) -> String {
+    fn docid(row: usize) -> String {
+        format!("doc-{}", row * 3 + 7)
+    }
+    let path = root.join("datasets/scalar-test/payloads.jsonl");
+    let lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(row, line)| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["docid"] = serde_json::json!(docid(row));
+            v.to_string()
+        })
+        .collect();
+    assert_eq!(lines.len(), N_DOCS);
+    fs::write(&path, lines.join("\n")).unwrap();
+    let registry_path = root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["schema"]["docid"] = serde_json::json!("keyword");
+    fs::write(registry_path, registry.to_string()).unwrap();
+    docid
+}
+
+/// The docid-space dump of a filter-only run over [`add_docids`]: header says
+/// `docid`, every id is the docid of a row that satisfies the predicate (for
+/// the `color == "red"` query, oracle `row % 7 < 2`), and totals match.
+pub fn assert_filter_only_docid_dump(dir: &Path, docid: fn(usize) -> String) {
+    use vector_db_benchmark::results_dump::IdSpace;
+    let dumps = read_dumps(dir);
+    assert_eq!(dumps.len(), 1);
+    let d = &dumps[0];
+    assert_eq!(
+        d.header.id_space,
+        IdSpace::Field {
+            field: "docid".into()
+        }
+    );
+    let red: std::collections::HashSet<String> =
+        (0..N_DOCS).filter(|r| r % 7 < 2).map(docid).collect();
+    let all: std::collections::HashSet<String> = (0..N_DOCS).map(docid).collect();
+    let expected = filter_only_expected_counts();
+    for r in &d.records {
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.total, Some(expected[r.query_id]));
+        for id in &r.ids {
+            assert!(all.contains(id), "{id} is not a corpus docid");
+            if r.query_id == 0 {
+                assert!(red.contains(id), "{id} is not the docid of a red row");
+            }
+        }
+    }
+    assert!(
+        d.records
+            .iter()
+            .any(|r| r.query_id == 0 && !r.ids.is_empty()),
+        "the red query must return ids for this check to mean anything"
+    );
+}

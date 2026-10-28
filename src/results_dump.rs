@@ -113,6 +113,59 @@ pub enum ExternalIds {
 /// Payload field used as the external id when a dataset's schema declares it.
 pub const EXTERNAL_ID_FIELD: &str = "docid";
 
+/// Row id -> external id for one dataset: the [`EXTERNAL_ID_FIELD`] payload
+/// field when `schema` declares it (MS MARCO), else [`ExternalIds::Row`].
+///
+/// Only compound (`tar`) datasets carry payloads, so declaring the field on any
+/// other layout is an error. `dir` is only resolved when the payloads are read.
+/// Payload line `i` is corpus row `i` — the same order the uploaders assign row
+/// ids in (`read_compound_data`), and `visit_compound_metadata` refuses a
+/// payload file whose line count differs from `vectors.npy`'s row count.
+pub fn external_ids_for_dataset(
+    dataset_name: &str,
+    dataset_type: Option<&str>,
+    schema: Option<&serde_json::Value>,
+    dir: impl FnOnce() -> Result<std::path::PathBuf, String>,
+) -> Result<ExternalIds, String> {
+    if schema.and_then(|s| s.get(EXTERNAL_ID_FIELD)).is_none() {
+        return Ok(ExternalIds::Row);
+    }
+    if dataset_type != Some("tar") {
+        return Err(format!(
+            "dataset '{dataset_name}' declares '{EXTERNAL_ID_FIELD}' but is not a compound (tar) \
+             dataset, the only layout whose payloads are read for external ids"
+        ));
+    }
+    external_ids_from_compound(&dir()?)
+}
+
+/// Read [`EXTERNAL_ID_FIELD`] for every corpus row of a compound dataset
+/// directory (`vectors.npy` + `payloads.jsonl`), in row order.
+pub fn external_ids_from_compound(dir: &std::path::Path) -> Result<ExternalIds, String> {
+    use crate::readers::metadata::MetadataValue;
+    let mut values = Vec::new();
+    crate::readers::visit_compound_metadata(dir, |item| {
+        values.push(item.and_then(|m| {
+            m.fields
+                .into_iter()
+                .find(|(k, _)| k == EXTERNAL_ID_FIELD)
+                .and_then(|(_, v)| match v {
+                    MetadataValue::String(s) => Some(s),
+                    MetadataValue::Int(i) => Some(i.to_string()),
+                    _ => None,
+                })
+        }));
+        Ok(())
+    })?;
+    if values.is_empty() {
+        return Err(format!(
+            "{}: no payload rows to read '{EXTERNAL_ID_FIELD}' from",
+            dir.display()
+        ));
+    }
+    ExternalIds::from_field(EXTERNAL_ID_FIELD, values)
+}
+
 impl ExternalIds {
     /// Build a field map from per-row values. A row without the field is an
     /// error: silently falling back to the row id for some rows would mix two
@@ -508,6 +561,99 @@ mod tests {
         assert_eq!(recs[0].scores, None);
         assert_eq!(recs[0].expected, None);
         assert_eq!(recs[0].shape.as_deref(), Some("tag"));
+    }
+
+    /// A tiny compound fixture whose `docid`s are NOT the row ids, so an
+    /// off-by-one in the row -> docid mapping cannot pass by coincidence.
+    fn compound_fixture(docids: &[Option<&str>]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors: Vec<Vec<f32>> = (0..docids.len()).map(|i| vec![i as f32, 1.0]).collect();
+        crate::readers::write_npy_vectors(
+            dir.path().join("vectors.npy").to_str().unwrap(),
+            &vectors,
+        )
+        .unwrap();
+        let payloads: Vec<String> = docids
+            .iter()
+            .map(|d| match d {
+                Some(d) => serde_json::json!({"docid": d, "tag": "x"}).to_string(),
+                None => serde_json::json!({"tag": "x"}).to_string(),
+            })
+            .collect();
+        std::fs::write(dir.path().join("payloads.jsonl"), payloads.join("\n")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn docid_external_ids_follow_corpus_row_order() {
+        let fx = compound_fixture(&[Some("doc-c"), Some("doc-a"), Some("doc-b")]);
+        let schema = serde_json::json!({"docid": "keyword", "tag": "keyword"});
+        let ids = external_ids_for_dataset("fx", Some("tar"), Some(&schema), || {
+            Ok(fx.path().to_path_buf())
+        })
+        .unwrap();
+        assert_eq!(
+            ids.space(),
+            IdSpace::Field {
+                field: "docid".into()
+            }
+        );
+        // Row i is payload line i — exactly, not shifted by one either way.
+        assert_eq!(ids.resolve(0).unwrap(), "doc-c");
+        assert_eq!(ids.resolve(1).unwrap(), "doc-a");
+        assert_eq!(ids.resolve(2).unwrap(), "doc-b");
+        assert!(ids.resolve(3).is_err());
+        // End to end through resolve_records: ids and ground truth both map.
+        let raw = vec![RawQueryResult::ok(
+            0,
+            0,
+            vec![
+                RawHit {
+                    row: 2,
+                    score: Some(0.1),
+                },
+                RawHit {
+                    row: 0,
+                    score: Some(0.2),
+                },
+            ],
+            None,
+            0.001,
+        )];
+        let gt = vec![vec![1, 2]];
+        let recs = resolve_records(&raw, &ids, Some(&gt), 2, &|_| None).unwrap();
+        assert_eq!(recs[0].ids, vec!["doc-b", "doc-c"]);
+        assert_eq!(recs[0].expected, Some(vec!["doc-a".into(), "doc-b".into()]));
+    }
+
+    #[test]
+    fn docid_external_ids_fail_closed() {
+        let schema = serde_json::json!({"docid": "keyword"});
+        // A row without a docid is an error, never a fallback to its row id.
+        let fx = compound_fixture(&[Some("d0"), None]);
+        assert!(
+            external_ids_for_dataset("fx", Some("tar"), Some(&schema), || {
+                Ok(fx.path().to_path_buf())
+            })
+            .is_err()
+        );
+        // Declared on a layout without payloads.
+        assert!(
+            external_ids_for_dataset("fx", Some("hdf5"), Some(&schema), || unreachable!()).is_err()
+        );
+        // Not declared: row ids, and the corpus is never read.
+        let ids = external_ids_for_dataset(
+            "fx",
+            Some("tar"),
+            Some(&serde_json::json!({"tag": "keyword"})),
+            || unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(ids.space(), IdSpace::Row);
+        // Payload count must match the vector rows (no silent shift).
+        let fx = compound_fixture(&[Some("d0"), Some("d1")]);
+        std::fs::write(fx.path().join("payloads.jsonl"), "{\"docid\":\"d0\"}").unwrap();
+        assert!(external_ids_from_compound(fx.path()).is_err());
     }
 
     #[test]

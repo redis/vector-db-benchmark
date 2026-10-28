@@ -4719,3 +4719,36 @@ fn test_binary_redis_dump_results_open_loop_with_dropped_requests() {
     assert_eq!(records + dropped, offered, "records + drops = offered");
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #343 review: end-to-end coverage of the `docid` id space. Rows carry a
+/// `docid` that is not their row id; the dump must name each returned
+/// document by the docid of the row Redis returned — an off-by-one in the
+/// row -> docid mapping gives valid docids of rows that do not match.
+#[test]
+fn test_binary_redis_dump_results_docid_id_space() {
+    wait_for_redis();
+    let config = serde_json::json!([{
+        "name": "dump-docid-redis", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": [{"parallel": 2, "top": 3, "workload": "filter-only"}]
+    }]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let docid = common::add_docids(&proj.root);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "dump-docid-redis",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--queries",
+            "18",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_docid_dump(&dump, docid);
+    fs::remove_dir_all(&proj.root).ok();
+}
