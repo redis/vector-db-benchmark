@@ -18,6 +18,7 @@ use opensearch::indices::{
 use opensearch::params::WaitForStatus;
 use opensearch::{BulkParts, CountParts, OpenSearch, SearchParts};
 use uuid::Uuid;
+use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
 
 use crate::config::{EngineConfig, SearchParams};
@@ -1693,6 +1694,479 @@ fn extract_knn_hits(resp_body: &serde_json::Value) -> Result<Vec<(i64, f64)>, St
 
 // ── Engine trait implementation ──────────────────────────────────────────
 
+impl OpenSearchEngine {
+    /// The KNN and filter-only search loop. One loop for both so the two
+    /// workloads share the timing boundary, priming and retry accounting.
+    fn search_impl(
+        &mut self,
+        filter_only: bool,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        let parallel = params.parallel.unwrap_or(1) as usize;
+
+        if filter_only {
+            self.validate_filter_only_schema(dataset)?;
+            if !self.scalar_metadata_validated {
+                dataset.validate_scalar_metadata()?;
+                self.scalar_metadata_validated = true;
+            }
+        }
+
+        let query_path = dataset.get_path()?;
+        println!("\tReading queries from {}...", query_path.display());
+        let (mut queries, mut neighbors, conditions) = dataset.read_queries()?;
+
+        let mut parsed_filters: Vec<QueryFilter<serde_json::Value>> =
+            conditions.try_resolve_all("OpenSearch", |condition| {
+                if filter_only {
+                    vector_db_benchmark::filter_only::domain::validate_predicate(
+                        condition,
+                        dataset.config.schema.as_ref(),
+                    )?;
+                }
+                Ok(parse_os_conditions(condition))
+            })?;
+
+        // Dataset query index of each position below (identity for KNN; the
+        // selected, cycled predicates for filter-only), so per-query records name
+        // the query rather than its position.
+        let mut query_ids: Vec<usize> = (0..queries.len()).collect();
+        if filter_only {
+            // Match Redis: only explicit predicates, cycle them for --queries N.
+            let indices = vector_db_benchmark::filter_only::query_indices(
+                parsed_filters.iter().map(|f| f.is_filtered()),
+                num_queries,
+            )?;
+            query_ids = indices.clone();
+            queries = indices.iter().map(|&i| queries[i].clone()).collect();
+            neighbors = indices.iter().map(|&i| neighbors[i].clone()).collect();
+            parsed_filters = indices.iter().map(|&i| parsed_filters[i].clone()).collect();
+        }
+        let mut matched_sum = 0u64;
+        let mut returned_sum = 0u64;
+        let mut scalar_errors = Vec::new();
+        let explicit_top: Option<usize> = if filter_only {
+            Some(
+                params
+                    .top
+                    .map(|n| n as usize)
+                    .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT),
+            )
+        } else {
+            params.top.map(|t| t as usize)
+        };
+        let num_to_run = if num_queries > 0 {
+            (num_queries as usize).min(queries.len())
+        } else {
+            queries.len()
+        };
+
+        // Precompute per-query `top` and the fully serialized request bodies
+        // BEFORE the parallel region so the timed window wraps only the RPC
+        // round-trip. `build_knn_body` builds the DOM and `to_raw_value`
+        // performs the vector-to-JSON ryu formatting (client CPU work) once here;
+        // the timed send only copies the already-formatted bytes. `tops[idx]`
+        // reproduces the same k the request embeds, so recall is unchanged.
+        let tops: Vec<usize> = (0..num_to_run)
+            .map(|idx| {
+                explicit_top.unwrap_or_else(|| {
+                    let n = neighbors[idx].len();
+                    if n > 0 {
+                        n
+                    } else {
+                        10
+                    }
+                })
+            })
+            .collect();
+        let raw_bodies: Vec<Box<serde_json::value::RawValue>> = (0..num_to_run)
+            .map(|idx| {
+                let body = if filter_only {
+                    vector_db_benchmark::filter_only::opensearch_body(
+                        parsed_filters[idx].as_ref().unwrap(),
+                        tops[idx],
+                    )
+                } else {
+                    build_knn_body(
+                        &queries[idx],
+                        tops[idx],
+                        parsed_filters[idx].as_ref(),
+                        params,
+                    )?
+                };
+                serde_json::value::to_raw_value(&body).map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        // Per-thread sample buffers merged on join — no per-query Mutex<Vec>
+        // contention in the timed loop (see redis.rs::search). Metrics are
+        // order-independent so results are unchanged; work counter uses Relaxed.
+        let query_idx = Arc::new(AtomicUsize::new(0));
+        // Successful measured queries needing more than one attempt. Merge local
+        // worker counters after joining, avoiding a shared hot-path atomic.
+        let mut retried_queries = 0u64;
+        // Resolved here rather than per query: `knn_send` runs inside the measured
+        // window, where an env lookup is avoidable client CPU work.
+        let search_policy = SearchRetryPolicy::from_env();
+
+        let pb = self.create_progress_bar(num_to_run);
+        let base_url = self.base_url.clone();
+        let timeout = self.timeout;
+        let index_name = self.index_name.clone();
+
+        // Gate-synchronized start so connection setup AND the cold first query
+        // fall OUTSIDE the measured window. Every worker connects + primes, then
+        // parks at the gate; `WorkerPool::start` stamps the shared start instant and
+        // releases everyone, so the measurement clock starts only once all workers
+        // are warm and poised. The gate is count-agnostic: a worker that fails to
+        // set up, panics, or is never started by the OS settles its ticket and turns
+        // the run into a hard error instead of a hang (#214).
+
+        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
+        let capture = params.capture_query_results;
+        let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
+        let mut capture_failure: Option<String> = None;
+
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "opensearch-search", parallel);
+            for _ in 0..parallel {
+                let base_url = base_url.clone();
+                let index_name = index_name.clone();
+                let neighbors = &neighbors;
+                let tops = &tops;
+                let raw_bodies = &raw_bodies;
+                let query_ids = &query_ids;
+                let query_idx = Arc::clone(&query_idx);
+                let pb = &pb;
+
+                pool.spawn(move |ticket| {
+                    let mut t = Vec::new();
+                    let mut p = Vec::new();
+                    let mut r = Vec::new();
+                    let mut mr = Vec::new();
+                    let mut nd = Vec::new();
+                    let mut matched = 0u64;
+                    let mut returned_count = 0u64;
+                    let mut errors = Vec::new();
+                    let mut pending = 0u64;
+                    let mut retried = 0u64;
+                    let mut cap: Vec<RawQueryResult> = Vec::new();
+                    let mut capture_error: Option<String> = None;
+
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
+                            return (
+                                t,
+                                p,
+                                r,
+                                mr,
+                                nd,
+                                matched,
+                                returned_count,
+                                errors,
+                                retried,
+                                cap,
+                                capture_error,
+                            );
+                        }
+                    };
+                    let client = match create_os_client(&base_url, timeout) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
+                            return (
+                                t,
+                                p,
+                                r,
+                                mr,
+                                nd,
+                                matched,
+                                returned_count,
+                                errors,
+                                retried,
+                                cap,
+                                capture_error,
+                            );
+                        }
+                    };
+
+                    // Prime this connection with ONE discarded query so the cold
+                    // first round-trip is not inside the measured window. Best
+                    // effort: errors are ignored and its sample is NOT recorded.
+                    if num_to_run > 0 {
+                        let _ = knn_send(&rt, &client, &index_name, &raw_bodies[0], search_policy);
+                    }
+
+                    // Signal "connected + primed", then block until the coordinator
+                    // stamps the shared measurement start and releases everyone.
+                    if ticket.arrive_and_wait().is_none() {
+                        return (
+                            t,
+                            p,
+                            r,
+                            mr,
+                            nd,
+                            matched,
+                            returned_count,
+                            errors,
+                            retried,
+                            cap,
+                            capture_error,
+                        );
+                    }
+
+                    loop {
+                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= num_to_run {
+                            break;
+                        }
+
+                        let top = tops[idx];
+                        let query_id = query_ids[idx];
+
+                        // Timed window: network send + receive + decode of the
+                        // response into a structured value. Body is pre-serialized
+                        // (out); id/score extraction runs after `elapsed` (out).
+                        let query_start = Instant::now();
+                        let response =
+                            knn_send(&rt, &client, &index_name, &raw_bodies[idx], search_policy);
+                        let elapsed = query_start.elapsed();
+
+                        if filter_only {
+                            match response.and_then(|(body, cost)| {
+                                vector_db_benchmark::filter_only::opensearch_page(&body, top)
+                                    .map(|page| (page, cost))
+                            }) {
+                                Ok((page, cost)) => {
+                                    retried += u64::from(cost.retried);
+                                    // Scalar latency includes every attempt and backoff;
+                                    // Redis's scalar path makes a single attempt.
+                                    t.push(elapsed.as_secs_f64());
+                                    matched += page.total;
+                                    returned_count += page.ids.len() as u64;
+                                    if capture {
+                                        // An `_id` that is not a corpus row is a
+                                        // harness bug: fail the run, never guess.
+                                        let hits = page
+                                            .ids
+                                            .iter()
+                                            .map(|id| {
+                                                uuid_hex_to_int(id)
+                                                    .map(|row| RawHit { row, score: None })
+                                            })
+                                            .collect::<Result<Vec<_>, _>>();
+                                        match hits {
+                                            Ok(hits) => cap.push(RawQueryResult::ok(
+                                                query_id,
+                                                idx,
+                                                hits,
+                                                Some(page.total),
+                                                elapsed.as_secs_f64(),
+                                            )),
+                                            Err(e) => {
+                                                capture_error = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if capture {
+                                        cap.push(RawQueryResult::failed(
+                                            query_id,
+                                            idx,
+                                            elapsed.as_secs_f64(),
+                                            &e,
+                                        ));
+                                    }
+                                    if errors.len() < 3 {
+                                        errors.push(format!("Filter-only query {idx} failed: {e}"));
+                                    }
+                                }
+                            }
+                            pending += 1;
+                            if pending == 256 {
+                                pb.inc(pending);
+                                pending = 0;
+                            }
+                            continue;
+                        }
+
+                        match response.and_then(|(resp_body, cost)| {
+                            extract_knn_hits(&resp_body).map(|hits| (hits, cost))
+                        }) {
+                            Ok((result_ids, cost)) => {
+                                // Bill only the attempt that produced the result:
+                                // discarded round-trips and backoff sleeps are
+                                // client-side cost, not OpenSearch latency.
+                                let query_time =
+                                    elapsed.saturating_sub(cost.overhead).as_secs_f64();
+                                if cost.retried {
+                                    retried += 1;
+                                }
+                                let ordered_ids: Vec<i64> =
+                                    result_ids.iter().map(|(id, _)| *id).collect();
+                                let m = crate::metrics::compute_metrics(
+                                    &ordered_ids,
+                                    &neighbors[idx],
+                                    top,
+                                );
+                                t.push(query_time);
+                                p.push(m.precision);
+                                r.push(m.recall);
+                                mr.push(m.mrr);
+                                nd.push(m.ndcg);
+                                if capture {
+                                    cap.push(RawQueryResult::ok(
+                                        query_id,
+                                        idx,
+                                        result_ids
+                                            .iter()
+                                            .map(|&(row, score)| RawHit {
+                                                row,
+                                                score: Some(score),
+                                            })
+                                            .collect(),
+                                        None,
+                                        query_time,
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                // Not counted here: `compute_search_stats` derives
+                                // failed_queries as requested - succeeded, uniformly
+                                // for every engine.
+                                eprintln!("Search query {} failed: {}", idx, e);
+                                if capture {
+                                    cap.push(RawQueryResult::failed(
+                                        query_id,
+                                        idx,
+                                        elapsed.as_secs_f64(),
+                                        e,
+                                    ));
+                                }
+                            }
+                        }
+                        pb.inc(1);
+                    }
+                    pb.inc(pending);
+                    (
+                        t,
+                        p,
+                        r,
+                        mr,
+                        nd,
+                        matched,
+                        returned_count,
+                        errors,
+                        retried,
+                        cap,
+                        capture_error,
+                    )
+                })?;
+            }
+
+            // Every worker is connected + primed and parked at the gate.
+            // Stamp the shared measurement start and release them together.
+            let (per_worker, measured_start) = pool.start()?;
+
+            for (t, p, r, mr, nd, matched, returned_count, errors, retried, cap, capture_error) in
+                per_worker
+            {
+                if let Some(records) = captured.as_mut() {
+                    records.extend(cap);
+                }
+                if let Some(e) = capture_error {
+                    capture_failure.get_or_insert(e);
+                }
+                retried_queries += retried;
+                matched_sum += matched;
+                returned_sum += returned_count;
+                scalar_errors.extend(errors);
+                times.extend(t);
+                precs.extend(p);
+                recs.extend(r);
+                mrr_vals.extend(mr);
+                ndcg_vals.extend(nd);
+            }
+            Ok(measured_start)
+        })?;
+
+        pb.finish_and_clear();
+        // Measure from the post-gate start stamp (workers already primed), so
+        // total_time excludes connection setup and the cold first query.
+        let total_time = measured_start.elapsed().as_secs_f64();
+        for error in scalar_errors.iter().take(3) {
+            eprintln!("{error}");
+        }
+
+        // Dropped queries are NOT refused here. `compute_search_stats` derives
+        // `failed_queries` as `requested_queries - times.len()` for every engine,
+        // experiment.rs prints the ⚠ warning and persists the count to the results
+        // JSON, and `--fail-on-dropped-queries` makes it fatal across all engines
+        // at once. An engine-local refusal would be redundant with that, would make
+        // OpenSearch the only one of 15 engines that reports nothing instead of
+        // reporting a partial run with its overload signal intact, and — because a
+        // refused rep is skipped by the `--repetitions` loop — would silently
+        // select the rep that happened not to hit back-pressure.
+        //
+        // Queries that succeeded only after a retry are surfaced separately: they
+        // are not losses, but they identify load shedding. Scalar latency includes
+        // backoff; the existing KNN contract excludes it.
+        let retried = retried_queries;
+        if retried > 0 {
+            eprintln!(
+                "⚠  {} of {} search queries succeeded only after a retry ({:.2}%) — the server \
+                 was shedding load; backoff is {} the reported latency",
+                retried,
+                num_to_run,
+                100.0 * retried as f64 / num_to_run.max(1) as f64,
+                if filter_only {
+                    "included in"
+                } else {
+                    "excluded from"
+                }
+            );
+        }
+
+        let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
+        if let Some(e) = capture_failure {
+            return Err(format!("--dump-results: {e}"));
+        }
+        let mut result = crate::engine::compute_search_stats(
+            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
+        )?;
+        result.query_records = captured;
+        if filter_only {
+            result.mean_precision_at_returned = -1.0;
+            result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
+                result_limit: top,
+                matched_documents_sum: matched_sum,
+                returned_documents_sum: returned_sum,
+                retried_queries: retried,
+            });
+        }
+        Ok(result)
+    }
+}
+
 impl Engine for OpenSearchEngine {
     /// Server-side corpus size, for the `--skip-upload` reuse precondition
     /// (issue #238). `GET /<index>/_count`; a missing index (404) answers 0.
@@ -1898,339 +2372,33 @@ impl Engine for OpenSearchEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        let parallel = params.parallel.unwrap_or(1) as usize;
-
+        // `engine::search_workload` routes filter-only configs to
+        // `search_filter_only`; a vector search against an index whose vector
+        // field is unindexed would measure nothing, so arriving here is a bug.
         if self.config.skip_vector_index {
-            self.validate_filter_only_schema(dataset)?;
-            if !self.scalar_metadata_validated {
-                dataset.validate_scalar_metadata()?;
-                self.scalar_metadata_validated = true;
-            }
-        }
-
-        let query_path = dataset.get_path()?;
-        println!("\tReading queries from {}...", query_path.display());
-        let (mut queries, mut neighbors, conditions) = dataset.read_queries()?;
-
-        let mut parsed_filters: Vec<QueryFilter<serde_json::Value>> =
-            conditions.try_resolve_all("OpenSearch", |condition| {
-                if self.config.skip_vector_index {
-                    vector_db_benchmark::filter_only::domain::validate_predicate(
-                        condition,
-                        dataset.config.schema.as_ref(),
-                    )?;
-                }
-                Ok(parse_os_conditions(condition))
-            })?;
-
-        let filter_only = self.config.skip_vector_index;
-        if filter_only {
-            // Match Redis: only explicit predicates, cycle them for --queries N.
-            let indices = vector_db_benchmark::filter_only::query_indices(
-                parsed_filters.iter().map(|f| f.is_filtered()),
-                num_queries,
-            )?;
-            queries = indices.iter().map(|&i| queries[i].clone()).collect();
-            neighbors = indices.iter().map(|&i| neighbors[i].clone()).collect();
-            parsed_filters = indices.iter().map(|&i| parsed_filters[i].clone()).collect();
-        }
-        let mut matched_sum = 0u64;
-        let mut returned_sum = 0u64;
-        let mut scalar_errors = Vec::new();
-        let explicit_top: Option<usize> = if filter_only {
-            Some(
-                params
-                    .top
-                    .map(|n| n as usize)
-                    .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT),
-            )
-        } else {
-            params.top.map(|t| t as usize)
-        };
-        let num_to_run = if num_queries > 0 {
-            (num_queries as usize).min(queries.len())
-        } else {
-            queries.len()
-        };
-
-        // Precompute per-query `top` and the fully serialized request bodies
-        // BEFORE the parallel region so the timed window wraps only the RPC
-        // round-trip. `build_knn_body` builds the DOM and `to_raw_value`
-        // performs the vector-to-JSON ryu formatting (client CPU work) once here;
-        // the timed send only copies the already-formatted bytes. `tops[idx]`
-        // reproduces the same k the request embeds, so recall is unchanged.
-        let tops: Vec<usize> = (0..num_to_run)
-            .map(|idx| {
-                explicit_top.unwrap_or_else(|| {
-                    let n = neighbors[idx].len();
-                    if n > 0 {
-                        n
-                    } else {
-                        10
-                    }
-                })
-            })
-            .collect();
-        let raw_bodies: Vec<Box<serde_json::value::RawValue>> = (0..num_to_run)
-            .map(|idx| {
-                let body = if filter_only {
-                    vector_db_benchmark::filter_only::opensearch_body(
-                        parsed_filters[idx].as_ref().unwrap(),
-                        tops[idx],
-                    )
-                } else {
-                    build_knn_body(
-                        &queries[idx],
-                        tops[idx],
-                        parsed_filters[idx].as_ref(),
-                        params,
-                    )?
-                };
-                serde_json::value::to_raw_value(&body).map_err(|e| e.to_string())
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-
-        // Per-thread sample buffers merged on join — no per-query Mutex<Vec>
-        // contention in the timed loop (see redis.rs::search). Metrics are
-        // order-independent so results are unchanged; work counter uses Relaxed.
-        let query_idx = Arc::new(AtomicUsize::new(0));
-        // Successful measured queries needing more than one attempt. Merge local
-        // worker counters after joining, avoiding a shared hot-path atomic.
-        let mut retried_queries = 0u64;
-        // Resolved here rather than per query: `knn_send` runs inside the measured
-        // window, where an env lookup is avoidable client CPU work.
-        let search_policy = SearchRetryPolicy::from_env();
-
-        let pb = self.create_progress_bar(num_to_run);
-        let base_url = self.base_url.clone();
-        let timeout = self.timeout;
-        let index_name = self.index_name.clone();
-
-        // Gate-synchronized start so connection setup AND the cold first query
-        // fall OUTSIDE the measured window. Every worker connects + primes, then
-        // parks at the gate; `WorkerPool::start` stamps the shared start instant and
-        // releases everyone, so the measurement clock starts only once all workers
-        // are warm and poised. The gate is count-agnostic: a worker that fails to
-        // set up, panics, or is never started by the OS settles its ticket and turns
-        // the run into a hard error instead of a hang (#214).
-
-        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-
-        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "opensearch-search", parallel);
-            for _ in 0..parallel {
-                let base_url = base_url.clone();
-                let index_name = index_name.clone();
-                let neighbors = &neighbors;
-                let tops = &tops;
-                let raw_bodies = &raw_bodies;
-                let query_idx = Arc::clone(&query_idx);
-                let pb = &pb;
-
-                pool.spawn(move |ticket| {
-                    let mut t = Vec::new();
-                    let mut p = Vec::new();
-                    let mut r = Vec::new();
-                    let mut mr = Vec::new();
-                    let mut nd = Vec::new();
-                    let mut matched = 0u64;
-                    let mut returned_count = 0u64;
-                    let mut errors = Vec::new();
-                    let mut pending = 0u64;
-                    let mut retried = 0u64;
-
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            // A worker that cannot set itself up would leave the run at a
-                            // lower real concurrency than the `parallel` it reports. Settle
-                            // the ticket with the reason; the coordinator makes it an error.
-                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
-                            return (t, p, r, mr, nd, matched, returned_count, errors, retried);
-                        }
-                    };
-                    let client = match create_os_client(&base_url, timeout) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            // A worker that cannot set itself up would leave the run at a
-                            // lower real concurrency than the `parallel` it reports. Settle
-                            // the ticket with the reason; the coordinator makes it an error.
-                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
-                            return (t, p, r, mr, nd, matched, returned_count, errors, retried);
-                        }
-                    };
-
-                    // Prime this connection with ONE discarded query so the cold
-                    // first round-trip is not inside the measured window. Best
-                    // effort: errors are ignored and its sample is NOT recorded.
-                    if num_to_run > 0 {
-                        let _ = knn_send(&rt, &client, &index_name, &raw_bodies[0], search_policy);
-                    }
-
-                    // Signal "connected + primed", then block until the coordinator
-                    // stamps the shared measurement start and releases everyone.
-                    if ticket.arrive_and_wait().is_none() {
-                        return (t, p, r, mr, nd, matched, returned_count, errors, retried);
-                    }
-
-                    loop {
-                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= num_to_run {
-                            break;
-                        }
-
-                        let top = tops[idx];
-
-                        // Timed window: network send + receive + decode of the
-                        // response into a structured value. Body is pre-serialized
-                        // (out); id/score extraction runs after `elapsed` (out).
-                        let query_start = Instant::now();
-                        let response =
-                            knn_send(&rt, &client, &index_name, &raw_bodies[idx], search_policy);
-                        let elapsed = query_start.elapsed();
-
-                        if filter_only {
-                            match response.and_then(|(body, cost)| {
-                                vector_db_benchmark::filter_only::opensearch_counts(&body, top)
-                                    .map(|counts| (counts, cost))
-                            }) {
-                                Ok(((total, returned), cost)) => {
-                                    retried += u64::from(cost.retried);
-                                    // Scalar latency includes every attempt and backoff;
-                                    // Redis's scalar path makes a single attempt.
-                                    t.push(elapsed.as_secs_f64());
-                                    matched += total;
-                                    returned_count += returned as u64;
-                                }
-                                Err(e) => {
-                                    if errors.len() < 3 {
-                                        errors.push(format!("Filter-only query {idx} failed: {e}"));
-                                    }
-                                }
-                            }
-                            pending += 1;
-                            if pending == 256 {
-                                pb.inc(pending);
-                                pending = 0;
-                            }
-                            continue;
-                        }
-
-                        match response.and_then(|(resp_body, cost)| {
-                            extract_knn_hits(&resp_body).map(|hits| (hits, cost))
-                        }) {
-                            Ok((result_ids, cost)) => {
-                                // Bill only the attempt that produced the result:
-                                // discarded round-trips and backoff sleeps are
-                                // client-side cost, not OpenSearch latency.
-                                let query_time =
-                                    elapsed.saturating_sub(cost.overhead).as_secs_f64();
-                                if cost.retried {
-                                    retried += 1;
-                                }
-                                let ordered_ids: Vec<i64> =
-                                    result_ids.iter().map(|(id, _)| *id).collect();
-                                let m = crate::metrics::compute_metrics(
-                                    &ordered_ids,
-                                    &neighbors[idx],
-                                    top,
-                                );
-                                t.push(query_time);
-                                p.push(m.precision);
-                                r.push(m.recall);
-                                mr.push(m.mrr);
-                                nd.push(m.ndcg);
-                            }
-                            Err(e) => {
-                                // Not counted here: `compute_search_stats` derives
-                                // failed_queries as requested - succeeded, uniformly
-                                // for every engine.
-                                eprintln!("Search query {} failed: {}", idx, e);
-                            }
-                        }
-                        pb.inc(1);
-                    }
-                    pb.inc(pending);
-                    (t, p, r, mr, nd, matched, returned_count, errors, retried)
-                })?;
-            }
-
-            // Every worker is connected + primed and parked at the gate.
-            // Stamp the shared measurement start and release them together.
-            let (per_worker, measured_start) = pool.start()?;
-
-            for (t, p, r, mr, nd, matched, returned_count, errors, retried) in per_worker {
-                retried_queries += retried;
-                matched_sum += matched;
-                returned_sum += returned_count;
-                scalar_errors.extend(errors);
-                times.extend(t);
-                precs.extend(p);
-                recs.extend(r);
-                mrr_vals.extend(mr);
-                ndcg_vals.extend(nd);
-            }
-            Ok(measured_start)
-        })?;
-
-        pb.finish_and_clear();
-        // Measure from the post-gate start stamp (workers already primed), so
-        // total_time excludes connection setup and the cold first query.
-        let total_time = measured_start.elapsed().as_secs_f64();
-        for error in scalar_errors.iter().take(3) {
-            eprintln!("{error}");
-        }
-
-        // Dropped queries are NOT refused here. `compute_search_stats` derives
-        // `failed_queries` as `requested_queries - times.len()` for every engine,
-        // experiment.rs prints the ⚠ warning and persists the count to the results
-        // JSON, and `--fail-on-dropped-queries` makes it fatal across all engines
-        // at once. An engine-local refusal would be redundant with that, would make
-        // OpenSearch the only one of 15 engines that reports nothing instead of
-        // reporting a partial run with its overload signal intact, and — because a
-        // refused rep is skipped by the `--repetitions` loop — would silently
-        // select the rep that happened not to hit back-pressure.
-        //
-        // Queries that succeeded only after a retry are surfaced separately: they
-        // are not losses, but they identify load shedding. Scalar latency includes
-        // backoff; the existing KNN contract excludes it.
-        let retried = retried_queries;
-        if retried > 0 {
-            eprintln!(
-                "⚠  {} of {} search queries succeeded only after a retry ({:.2}%) — the server \
-                 was shedding load; backoff is {} the reported latency",
-                retried,
-                num_to_run,
-                100.0 * retried as f64 / num_to_run.max(1) as f64,
-                if filter_only {
-                    "included in"
-                } else {
-                    "excluded from"
-                }
+            return Err(
+                "vector search requested on an index built without a vector field \
+                 (skip_vector_index); filter-only configs must go through search_filter_only"
+                    .into(),
             );
         }
+        self.search_impl(false, dataset, params, num_queries)
+    }
 
-        let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
-        let mut result = crate::engine::compute_search_stats(
-            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
-        )?;
-        if filter_only {
-            result.mean_precision_at_returned = -1.0;
-            result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
-                result_limit: top,
-                matched_documents_sum: matched_sum,
-                returned_documents_sum: returned_sum,
-                retried_queries: retried,
-            });
+    fn search_filter_only(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        if !self.config.skip_vector_index {
+            return Err(
+                "filter-only search requested on an index built with a vector field; the \
+                 filter-only workload needs the no-vector layout (shared `full` schema is #344)"
+                    .into(),
+            );
         }
-        Ok(result)
+        self.search_impl(true, dataset, params, num_queries)
     }
 
     fn delete(&mut self) -> Result<(), String> {

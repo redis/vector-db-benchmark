@@ -4599,3 +4599,72 @@ fn test_binary_redis_bounded_ranges_use_single_numeric_iterator() {
     }
     flush_db(&mut conn);
 }
+
+/// #343: `--dump-results` on the vector path writes one record per timed query
+/// naming corpus rows, and the recall `compare-results` derives from the dump
+/// equals the `mean_recall` the run published. Self-comparison passes with
+/// overlap 1.0.
+#[test]
+fn test_binary_redis_dump_results_vector() {
+    wait_for_redis();
+    let configs = serde_json::json!([{
+        "name": "redis-dump-vec", "engine": "redis",
+        "search_params": [{"parallel": 2, "search_params": {"ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dump-vec-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-dump-vec",
+        "dump-vec-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_vector_dump_matches_run(&proj.root, &dump, "redis", "redis-dump-vec");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #343 + #344: a config that DECLARES `"workload": "filter-only"` (no
+/// `--skip-vector-index`) builds the no-vector layout, keeps its own name,
+/// publishes the filter-only contract, and dumps exact per-query totals and
+/// row ids that `compare-results` agrees with itself on.
+#[test]
+fn test_binary_redis_dump_results_declared_filter_only() {
+    wait_for_redis();
+    let config = serde_json::json!([{
+        "name": "dump-fo-redis", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": [{"parallel": 2, "top": 3, "workload": "filter-only"}]
+    }]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "dump-fo-redis",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--queries",
+            "90",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "dump-fo-redis", total, returned);
+    common::assert_filter_only_dump(&dump, "redis", 90);
+    let (ok, report) = common::run_compare(&dump, &dump, "redis");
+    assert!(ok, "self-comparison must pass");
+    let counts = &report["pairs"][0]["shapes"][0]["count_agreement"];
+    assert_eq!(counts["fraction"], 1.0);
+    assert_eq!(counts["complete_page_set_agreement"], 1.0);
+    fs::remove_dir_all(&proj.root).ok();
+}

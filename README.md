@@ -288,8 +288,77 @@ Options:
     --describe <TYPE>          Describe available 'datasets' or 'engines'
     -v, --verbose              Verbose output for --describe
     --plot <OUTPUT.svg>        Render a QPS-vs-precision trade-off chart from results/
+    --dump-results <DIR>       Write every timed query's result (external ids,
+                               scores, exact total, latency) to DIR as JSONL
     -h, --help                 Print help
+
+Commands:
+    compare-results <A> <B> --reference <ENGINE> [--json F] [--markdown F]
+                               Score one engine's --dump-results output against a
+                               declared reference engine's
 ```
+
+### Workloads: one dispatch point per search config (#344)
+
+Every entry of an engine config's `search_params` may declare which query
+family it runs:
+
+```json
+{"parallel": 8, "top": 10, "workload": "filter-only"}
+```
+
+| `workload` | engine method | oracle |
+|---|---|---|
+| `vector` (default when omitted) | `search` | brute-forced ground truth |
+| `hybrid` | `search_hybrid` | brute-forced (filtered) ground truth |
+| `fulltext` | `search_fulltext` | the declared reference engine |
+| `filter-only` | `search_filter_only` | exact totals vs the reference engine |
+
+The runner resolves each config's workloads once, before anything is downloaded
+or connected (`vector_db_benchmark::workload::plan`), and every measured query
+goes through one function, `engine::search_workload`. An engine/workload pair
+without an implementation is a hard error, never a fallback to `vector`; today
+`filter-only` exists on Redis, OpenSearch, Valkey and MongoDB, and `hybrid` /
+`fulltext` exist nowhere yet. The shared `full` index schema is not built yet,
+so one engine config cannot mix `filter-only` with another workload (they need
+different index layouts) — split them into two configs. `--skip-vector-index` is
+kept as an alias for "every search config is `filter-only`" (with its legacy
+`<engine>-no-vector` rename); combined with a config that declares another
+workload it is refused. Each result file's `params.workload` records the
+workload that ran.
+
+### Per-query results and `compare-results` (#343)
+
+`--dump-results DIR` writes one JSONL file per (config, dataset, workload,
+parallel, search config): a header line, then one record per timed query in
+dispatch order, failed queries included:
+
+```json
+{"kind":"header","schema_version":1,"engine":"redis","config":"redis-fo","dataset":"msmarco-cohere-1024-100K-cosine","workload":"filter-only","parallel":8,"top":10,"search_id":0,"id_space":{"kind":"field","field":"docid"}}
+{"kind":"query","query_id":3,"seq":0,"ids":["msmarco_v2.1_doc_…"],"total":1234,"latency":0.0011}
+```
+
+Ids are EXTERNAL: the dataset's `docid` payload field when the schema declares
+one (MS MARCO), else the corpus row id — never an engine key, `_id` or offset.
+Vector records also carry the ground-truth ids they were scored against
+(`expected`). Records are captured after each latency sample and written after
+the search phase, so the dump is not inside the timed window. An engine with no
+capture for the workload fails the run instead of writing an empty file, and a
+dump whose record count differs from the attempted query count is refused.
+Warm-ups and mixed (`--update-search-ratio`) phases are not dumped. Per-query
+capture exists for Redis and OpenSearch (vector and filter-only).
+
+```bash
+vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch \
+  --json report.json --markdown report.md
+```
+
+Dumps pair by (dataset, workload, parallel, k). Per pair and query shape the
+report gives overlap@k (against the reference's list), Jaccard@k, Kendall rank
+correlation over the ids both lists share, exact-count agreement for
+`filter-only` (whose order is unspecified, so overlap/rank are not reported),
+and recall@k against the dump's ground truth for `vector`/`hybrid`. It exits
+non-zero when any query was answered by one engine and not by the other.
 
 ### `--skip-upload`: reuse means reuse (issue #238)
 

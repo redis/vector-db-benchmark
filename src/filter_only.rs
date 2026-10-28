@@ -242,7 +242,19 @@ pub fn validate_page(total: u64, returned: usize, limit: usize) -> Result<(), St
     Ok(())
 }
 
+/// One validated filter-only page: the exact total and the returned ids, in
+/// response order (`_id` for OpenSearch, the full document key for Redis).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    pub total: u64,
+    pub ids: Vec<String>,
+}
+
 pub fn opensearch_counts(body: &Value, limit: usize) -> Result<(u64, usize), String> {
+    opensearch_page(body, limit).map(|p| (p.total, p.ids.len()))
+}
+
+pub fn opensearch_page(body: &Value, limit: usize) -> Result<Page, String> {
     if body["timed_out"] != false || body["_shards"]["failed"] != 0 {
         return Err("filter-only timed out, failed shards, or missing completion metadata".into());
     }
@@ -253,23 +265,29 @@ pub fn opensearch_counts(body: &Value, limit: usize) -> Result<(u64, usize), Str
         .as_u64()
         .ok_or("missing exact match count")?;
     let hits = body["hits"]["hits"].as_array().ok_or("missing hits")?;
-    let mut ids = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::with_capacity(hits.len());
     for hit in hits {
         let id = hit["_id"]
             .as_str()
             .or_else(|| hit["fields"]["_id"][0].as_str())
             .ok_or("missing hit ID")?;
-        if !ids.insert(id) {
+        if !seen.insert(id) {
             return Err("duplicate filter-only hit ID".into());
         }
+        ids.push(id.to_string());
     }
     validate_page(total, hits.len(), limit)?;
-    Ok((total, hits.len()))
+    Ok(Page { total, ids })
 }
 
 /// RESP3 exposes timeout warnings that RESP2 silently omits. Reject all
 /// warnings so partial replies cannot be published as exact match counts.
 pub fn redis_counts(value: &redis::Value, limit: usize) -> Result<(u64, usize), String> {
+    redis_page(value, limit).map(|p| (p.total, p.ids.len()))
+}
+
+pub fn redis_page(value: &redis::Value, limit: usize) -> Result<Page, String> {
     use redis::Value;
     let Value::Map(fields) = value else {
         return Err("filter-only requires a RESP3 FT.SEARCH map".into());
@@ -297,7 +315,8 @@ pub fn redis_counts(value: &redis::Value, limit: usize) -> Result<(u64, usize), 
     let Some(Value::Array(hits)) = field(fields, "results") else {
         return Err("missing Redis results".into());
     };
-    let mut ids = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::with_capacity(hits.len());
     for hit in hits {
         let Value::Map(fields) = hit else {
             return Err("invalid Redis result".into());
@@ -305,12 +324,22 @@ pub fn redis_counts(value: &redis::Value, limit: usize) -> Result<(u64, usize), 
         let id = field(fields, "id")
             .and_then(text)
             .ok_or("missing Redis hit ID")?;
-        if !ids.insert(id) {
+        if !seen.insert(id) {
             return Err("duplicate Redis hit ID".into());
         }
+        ids.push(id.to_string());
     }
     validate_page(total, hits.len(), limit)?;
-    Ok((total, hits.len()))
+    Ok(Page { total, ids })
+}
+
+/// Corpus row id from a Redis document key `<key_prefix><row>`. A key outside
+/// the prefix or with a non-integer suffix is an error, never a guess: the
+/// per-query dump must name the same rows the corpus was uploaded as.
+pub fn redis_key_row(key: &str, key_prefix: &str) -> Result<i64, String> {
+    key.strip_prefix(key_prefix)
+        .and_then(|rest| rest.parse::<i64>().ok())
+        .ok_or_else(|| format!("Redis key {key:?} is not <{key_prefix}><row id>"))
 }
 
 #[cfg(test)]
@@ -348,6 +377,14 @@ mod tests {
             redis_counts(&reply(12, &["a", "b"], vec![]), 2).unwrap(),
             (12, 2)
         );
+        // The page keeps the ids, in reply order.
+        assert_eq!(
+            redis_page(&reply(12, &["p:2", "p:1"], vec![]), 2).unwrap(),
+            Page {
+                total: 12,
+                ids: vec!["p:2".into(), "p:1".into()]
+            }
+        );
         assert_eq!(redis_counts(&reply(0, &[], vec![]), 2).unwrap(), (0, 0));
         for bad in [
             Array(vec![Int(0)]),
@@ -359,6 +396,12 @@ mod tests {
         ] {
             assert!(redis_counts(&bad, 2).is_err());
         }
+    }
+    #[test]
+    fn document_ids_map_back_to_corpus_rows_or_fail() {
+        assert_eq!(redis_key_row("cfg:17", "cfg:").unwrap(), 17);
+        assert!(redis_key_row("other:17", "cfg:").is_err());
+        assert!(redis_key_row("cfg:x", "cfg:").is_err());
     }
     #[test]
     fn vector_is_stored_but_never_indexed() {

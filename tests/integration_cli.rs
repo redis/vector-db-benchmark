@@ -220,3 +220,177 @@ fn scalar_unsupported_duplicates_are_skipped_before_selection_and_exact_collisio
     assert!(!stderr.contains("one config per engine type"), "{stderr}");
     assert!(!stderr.contains("same index namespace"), "{stderr}");
 }
+
+/// #344: a workload the engine has no arm for — or a config mixing index
+/// layouts — is refused at startup, before any download or connection, and is
+/// never run as the vector workload instead.
+#[test]
+fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
+    use serde_json::json;
+    let cases = [
+        (
+            "redis",
+            json!([{"workload":"fulltext"}]),
+            false,
+            "not implemented",
+        ),
+        (
+            "opensearch",
+            json!([{"workload":"hybrid"}]),
+            false,
+            "not implemented",
+        ),
+        (
+            "qdrant",
+            json!([{"workload":"filter-only"}]),
+            false,
+            "not implemented",
+        ),
+        (
+            "redis",
+            json!([{}, {"workload":"filter-only"}]),
+            false,
+            "#344",
+        ),
+        (
+            "redis",
+            json!([{"workload":"vector"}]),
+            true,
+            "--skip-vector-index",
+        ),
+    ];
+    for (engine, search_params, skip_vector_index, detail) in cases {
+        let root = tempfile::tempdir().unwrap();
+        let datasets = root.path().join("datasets");
+        std::fs::create_dir(&datasets).unwrap();
+        // A closed loopback endpoint: a broken guard fails fast instead of
+        // reaching a real server or downloading a real dataset.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        drop(listener);
+        std::fs::write(
+            datasets.join("datasets.json"),
+            json!([{
+                "name":"workload-fixture", "type":"tar", "path":"missing-corpus",
+                "vector_size":1,"distance":"l2","schema":{"tag":"keyword"},
+                "link":format!("http://127.0.0.1:{port}/must-not-download.tar.gz")
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let engines_file = root.path().join("engines.json");
+        std::fs::write(
+            &engines_file,
+            json!([{"name":"wl","engine":engine,"search_params":search_params}]).to_string(),
+        )
+        .unwrap();
+        let mut cmd = Command::new(common::binary_path());
+        cmd.current_dir(root.path())
+            .args([
+                "--engines",
+                "wl",
+                "--datasets",
+                "workload-fixture",
+                "--host",
+                "127.0.0.1",
+                "--engines-file",
+            ])
+            .arg(&engines_file)
+            .env("REDIS_PORT", &port)
+            .env("OPENSEARCH_PORT", &port)
+            .env("QDRANT_PORT", &port);
+        if skip_vector_index {
+            cmd.arg("--skip-vector-index");
+        }
+        let output = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success(),
+            "{engine} {search_params}: {stdout}"
+        );
+        assert!(
+            stderr.contains(detail),
+            "{engine} {search_params}: missing {detail:?}: {stderr}"
+        );
+        assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+        assert!(!datasets.join("missing-corpus").exists());
+    }
+}
+
+/// #343 acceptance through the real subcommand: a dump compared with itself
+/// passes with perfect agreement; a candidate that dropped a query the
+/// reference answered exits non-zero and names it.
+#[test]
+fn compare_results_self_passes_and_a_one_sided_answer_fails() {
+    use vector_db_benchmark::results_dump::{
+        write_dump, DumpHeader, IdSpace, QueryRecord, DUMP_SCHEMA_VERSION,
+    };
+    use vector_db_benchmark::workload::Workload;
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, engine: &str, drop_query_1: bool| {
+        let header = DumpHeader {
+            schema_version: DUMP_SCHEMA_VERSION,
+            engine: engine.into(),
+            config: format!("{engine}-cfg"),
+            dataset: "ds".into(),
+            workload: Workload::Fulltext,
+            parallel: 4,
+            top: 3,
+            search_id: 0,
+            id_space: IdSpace::Field {
+                field: "docid".into(),
+            },
+        };
+        let records: Vec<QueryRecord> = (0..3)
+            .map(|q| QueryRecord {
+                query_id: q,
+                seq: q,
+                shape: None,
+                ids: if drop_query_1 && q == 1 {
+                    vec![]
+                } else {
+                    vec!["d1".into(), "d2".into(), "d3".into()]
+                },
+                scores: None,
+                total: None,
+                latency: 0.001,
+                error: (drop_query_1 && q == 1).then(|| "timeout".to_string()),
+                expected: None,
+            })
+            .collect();
+        let path = dir.path().join(name);
+        write_dump(std::fs::File::create(&path).unwrap(), &header, &records).unwrap();
+        path
+    };
+    let reference = write("os.jsonl", "opensearch", false);
+    let candidate = write("redis.jsonl", "redis", true);
+    let compare = |a: &std::path::Path, b: &std::path::Path| {
+        Command::new(common::binary_path())
+            .arg("compare-results")
+            .arg(a)
+            .arg(b)
+            .args(["--reference", "opensearch"])
+            .output()
+            .unwrap()
+    };
+    let out = compare(&reference, &reference);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("Reference engine: **opensearch**"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("| 1.0000 | 1.0000 | 1.0000 |"), "{stdout}");
+
+    // Reference given second: still the reference, and the drop fails the run.
+    let out = compare(&candidate, &reference);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("query 1 answered only by the reference"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("answered by one engine"), "{stderr}");
+}

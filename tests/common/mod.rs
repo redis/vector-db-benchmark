@@ -2759,3 +2759,122 @@ pub fn resize_filter_only_vectors(root: &Path, dimension: usize, distance: &str)
     registry[0]["distance"] = serde_json::json!(distance);
     fs::write(registry_path, registry.to_string()).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Per-query result dumps + compare-results (#343)
+// ---------------------------------------------------------------------------
+
+/// Every dump the run wrote into `dir`, parsed with the library reader.
+pub fn read_dumps(dir: &Path) -> Vec<vector_db_benchmark::results_dump::Dump> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("no dump dir {}: {e}", dir.display()))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|f| {
+            vector_db_benchmark::results_dump::read_dump(std::io::BufReader::new(
+                fs::File::open(f).unwrap(),
+            ))
+            .unwrap_or_else(|e| panic!("{}: {e}", f.display()))
+        })
+        .collect()
+}
+
+/// Run `compare-results a b --reference <reference>`; returns (exit ok, JSON report).
+pub fn run_compare(a: &Path, b: &Path, reference: &str) -> (bool, serde_json::Value) {
+    let json = a
+        .parent()
+        .unwrap()
+        .join(format!("compare-{reference}.json"));
+    let out = std::process::Command::new(binary_path())
+        .arg("compare-results")
+        .arg(a)
+        .arg(b)
+        .args(["--reference", reference, "--json"])
+        .arg(&json)
+        .output()
+        .expect("run compare-results");
+    if !out.status.success() {
+        eprintln!(
+            "compare-results stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let report = serde_json::from_str(&fs::read_to_string(&json).unwrap()).unwrap();
+    (out.status.success(), report)
+}
+
+/// Filter-only dump of [`write_filter_only_project`] at `top: 3`: one record per
+/// attempted query, the exact total the independent oracle expects, a complete
+/// page, and ids that are corpus ROW ids satisfying the predicate (checked for
+/// the `color == "red"` query, whose oracle is `id % 7 < 2`) — not engine keys.
+pub fn assert_filter_only_dump(dir: &Path, engine: &str, queries: usize) {
+    let dumps = read_dumps(dir);
+    assert_eq!(dumps.len(), 1, "one dump per (config, workload, parallel)");
+    let d = &dumps[0];
+    assert_eq!(d.header.engine, engine);
+    assert_eq!(d.header.workload.as_str(), "filter-only");
+    assert_eq!(d.header.top, 3);
+    assert_eq!(d.records.len(), queries, "a record per timed query");
+    let expected = filter_only_expected_counts();
+    for r in &d.records {
+        assert!(
+            r.error.is_none(),
+            "query {} failed: {:?}",
+            r.query_id,
+            r.error
+        );
+        let total = r.total.expect("filter-only records carry the exact total");
+        assert_eq!(total, expected[r.query_id], "query {}", r.query_id);
+        assert_eq!(r.ids.len() as u64, total.min(3), "query {}", r.query_id);
+        assert!(r.scores.is_none());
+        for id in &r.ids {
+            let row: usize = id
+                .parse()
+                .unwrap_or_else(|_| panic!("id {id:?} is not a corpus row id"));
+            assert!(row < N_DOCS, "row {row} outside the corpus");
+            if r.query_id == 0 {
+                assert!(row % 7 < 2, "row {row} does not satisfy color == red");
+            }
+        }
+    }
+}
+
+/// Vector dump: one record per query, ids are corpus rows, and the recall
+/// `compare-results` derives from the dump's own ground truth equals the
+/// `mean_recall` the run published — the dump describes the measured run.
+pub fn assert_vector_dump_matches_run(root: &Path, dir: &Path, engine: &str, result_prefix: &str) {
+    let dumps = read_dumps(dir);
+    assert_eq!(dumps.len(), 1);
+    let d = &dumps[0];
+    assert_eq!(d.header.engine, engine);
+    assert_eq!(d.header.workload.as_str(), "vector");
+    let results = read_results_obj(root, result_prefix);
+    assert_eq!(
+        d.records.len() as u64,
+        results["requested_queries"].as_u64().unwrap()
+    );
+    for r in &d.records {
+        assert!(r.error.is_none());
+        assert!(r.expected.is_some(), "vector records carry ground truth");
+        assert_eq!(r.scores.as_ref().map(Vec::len), Some(r.ids.len()));
+        for id in &r.ids {
+            assert!(id.parse::<usize>().unwrap() < N_DOCS);
+        }
+    }
+    let (ok, report) = run_compare(dir, dir, engine);
+    assert!(ok, "self-comparison must pass");
+    let shape = &report["pairs"][0]["shapes"][0];
+    assert_eq!(shape["overlap_at_k"], 1.0);
+    assert_eq!(shape["jaccard_at_k"], 1.0);
+    let recall = shape["recall_at_k_reference"].as_f64().unwrap();
+    let published = results["mean_recall"].as_f64().unwrap();
+    assert!(
+        (recall - published).abs() < 1e-9,
+        "dump recall {recall} != published mean_recall {published}"
+    );
+}

@@ -1554,3 +1554,72 @@ fn test_binary_opensearch_filter_only_rejects_vector_index_reuse() {
         .unwrap();
     std::fs::remove_dir_all(proj.root).unwrap();
 }
+
+/// #343: `--dump-results` on the OpenSearch KNN path. Ids come back as the
+/// engine's uuid `_id`s and must be dumped as corpus rows; the dump's recall
+/// must equal the published `mean_recall`.
+#[test]
+fn test_binary_opensearch_dump_results_vector() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-dump-vec", "engine": "opensearch",
+        "search_params": [{"parallel": 2, "num_candidates": 400}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dump-vec-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-dump-vec",
+        "dump-vec-test",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_dump_vec")
+        ],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_vector_dump_matches_run(&proj.root, &dump, "opensearch", "os-dump-vec");
+}
+
+/// #343 + #344: declared `"workload": "filter-only"` on OpenSearch, dumped
+/// and self-compared.
+#[test]
+fn test_binary_opensearch_dump_results_declared_filter_only() {
+    wait_for_opensearch();
+    let _fielddata = DisabledIdFielddata::new();
+    let config = serde_json::json!([{
+        "name": "dump-fo-os", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1}, "upload_params": {"parallel": 1},
+        "search_params": [{"parallel": 2, "top": 3, "workload": "filter-only"}]
+    }]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "dump-fo-os",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", "dump-fo")],
+        &[
+            "--queries",
+            "90",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "dump-fo-os", total, returned);
+    common::assert_filter_only_dump(&dump, "opensearch", 90);
+    let (ok, report) = common::run_compare(&dump, &dump, "opensearch");
+    assert!(ok, "self-comparison must pass");
+    let counts = &report["pairs"][0]["shapes"][0]["count_agreement"];
+    assert_eq!(counts["fraction"], 1.0);
+    assert_eq!(counts["complete_page_set_agreement"], 1.0);
+}

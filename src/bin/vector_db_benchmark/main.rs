@@ -4,6 +4,7 @@
 //! Supports redis and vectorsets engines.
 
 mod cli;
+mod compare;
 mod config;
 mod dataset;
 mod download;
@@ -22,6 +23,14 @@ use cli::Args;
 
 fn main() {
     let args = Args::parse();
+
+    if let Some(cli::Command::CompareResults(c)) = &args.command {
+        if let Err(e) = compare::run(c) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Handle --describe option
     if let Some(describe) = &args.describe {

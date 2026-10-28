@@ -1,0 +1,334 @@
+//! The per-search-config query family ("workload") and the rules that decide
+//! whether an engine config may run it (#344, first half).
+//!
+//! # Contract for workload implementers (#339 fulltext, #340 filter-only, #341 hybrid)
+//!
+//! A search config (one entry of `search_params` in an engine configuration
+//! file) may declare `"workload": "vector" | "hybrid" | "fulltext" |
+//! "filter-only"`. Undeclared means `vector`, so every existing config keeps its
+//! meaning. The runner resolves every config's workload ONCE, before any engine
+//! is constructed, through [`plan`], and then sends every measured query of that
+//! config through the single dispatch point `engine::search_workload` in the
+//! binary. That function is the only place a [`Workload`] is turned into an
+//! engine call:
+//!
+//! | workload      | `Engine` method        | ground truth | scored against the reference by |
+//! |---------------|------------------------|--------------|---------------------------------|
+//! | `vector`      | `search`               | yes          | recall@k, overlap@k, rank corr. |
+//! | `hybrid`      | `search_hybrid`        | yes          | recall@k, overlap@k, rank corr. |
+//! | `fulltext`    | `search_fulltext`      | no           | overlap@k, Jaccard@k, rank corr.|
+//! | `filter-only` | `search_filter_only`   | no           | exact-count agreement           |
+//!
+//! To add an arm for an engine:
+//!
+//! 1. Implement the `Engine` method in the engine's module. Its default body is
+//!    a hard error, never a fallback to `search`.
+//! 2. Add the workload to that engine's row in [`implemented`]. [`plan`] refuses
+//!    any config that declares a workload its engine's row does not list, before
+//!    anything is downloaded or connected.
+//! 3. When `SearchParams::capture_query_results` is set, push one
+//!    [`crate::results_dump::RawQueryResult`] per timed query (failed ones
+//!    included, with `error` set) into `SearchResults::query_records`. The runner
+//!    refuses a run whose record count differs from `requested_queries`, and a
+//!    run that captured nothing when asked to.
+//!
+//! Every workload must leave its fingerprint on the result: filter-only results
+//! carry `filter_only` stats, the other three must not (see
+//! [`verify_result_shape`]). That is what catches an arm that quietly ran the
+//! vector path under another workload's name.
+//!
+//! # Index layout
+//!
+//! This step does NOT build the shared `full` schema (#344 second half). An
+//! index is built in one [`IndexLayout`], so all search configs of one engine
+//! config must need the same layout; mixing `filter-only` with any other
+//! workload in one config is refused by [`plan`] until that schema exists.
+
+use serde::{Deserialize, Serialize};
+
+/// One query family. Serialized exactly as the config key spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Workload {
+    /// Pure KNN (a dataset with per-query `conditions` adds them as a prefilter,
+    /// exactly as today).
+    Vector,
+    /// Prefilter + KNN on derived metadata fields (#341).
+    Hybrid,
+    /// Ranked full-text (BM25) (#339).
+    Fulltext,
+    /// Exact-match tag + numeric predicates, no vector clause (#328, #340).
+    FilterOnly,
+}
+
+impl Workload {
+    pub const ALL: [Workload; 4] = [
+        Workload::Vector,
+        Workload::Hybrid,
+        Workload::Fulltext,
+        Workload::FilterOnly,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Workload::Vector => "vector",
+            Workload::Hybrid => "hybrid",
+            Workload::Fulltext => "fulltext",
+            Workload::FilterOnly => "filter-only",
+        }
+    }
+
+    /// Whether the dataset's brute-forced neighbours are the oracle for this
+    /// workload. For the others the declared reference engine is.
+    pub fn has_ground_truth(self) -> bool {
+        matches!(self, Workload::Vector | Workload::Hybrid)
+    }
+
+    /// Whether result order is meaningful (ranked) — false for filter-only,
+    /// whose contract is "up to `limit` ids in unspecified order".
+    pub fn is_ranked(self) -> bool {
+        !matches!(self, Workload::FilterOnly)
+    }
+
+    /// The index layout `configure()` must build for this workload.
+    pub fn required_layout(self) -> IndexLayout {
+        match self {
+            Workload::FilterOnly => IndexLayout::NoVector,
+            // Fulltext runs on the vector layout today because that is the one
+            // whose schema indexes `text` fields (Redis `TEXT SORTABLE`); the
+            // no-vector layout rejects them. #339 may revisit this.
+            Workload::Vector | Workload::Hybrid | Workload::Fulltext => IndexLayout::Vector,
+        }
+    }
+}
+
+impl std::fmt::Display for Workload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Workload {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Workload::ALL
+            .into_iter()
+            .find(|w| w.as_str() == s)
+            .ok_or_else(|| {
+                format!("unknown workload {s:?}; expected vector, hybrid, fulltext or filter-only")
+            })
+    }
+}
+
+/// What the configure phase builds. Maps onto the engines' existing
+/// `skip_vector_index` switch: `NoVector` == `skip_vector_index = true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexLayout {
+    Vector,
+    NoVector,
+}
+
+/// The workloads each engine has a real code path for. The ONE table both the
+/// startup check ([`plan`]) and the runner's `--skip-vector-index` engine filter
+/// read. An engine type not listed here implements `vector` only.
+pub fn implemented(engine_type: &str) -> &'static [Workload] {
+    match engine_type {
+        "redis" | "opensearch" | "valkey" | "mongodb" => &[Workload::Vector, Workload::FilterOnly],
+        _ => &[Workload::Vector],
+    }
+}
+
+/// Every search config's resolved workload, and the one layout they share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadPlan {
+    pub engine_type: String,
+    pub layout: IndexLayout,
+    /// Indexed like the config's `search_params` array.
+    pub workloads: Vec<Workload>,
+}
+
+impl WorkloadPlan {
+    pub fn workload(&self, search_id: usize) -> Result<Workload, String> {
+        self.workloads.get(search_id).copied().ok_or_else(|| {
+            format!(
+                "search config #{search_id} has no resolved workload (plan covers {})",
+                self.workloads.len()
+            )
+        })
+    }
+}
+
+/// Resolve every search config's workload for one engine config.
+///
+/// `declared[i]` is search config `i`'s `workload` key. `skip_vector_index` is
+/// the legacy process-wide `--skip-vector-index`, kept as an alias for "every
+/// search config is `filter-only`"; a config that declares anything else under
+/// it is refused rather than silently re-labelled.
+///
+/// Errors (all before any download or connection):
+/// - a workload the engine has no arm for (see [`implemented`]);
+/// - search configs needing different index layouts (needs #344's `full`
+///   schema);
+/// - `--skip-vector-index` with a declared non-`filter-only` workload.
+pub fn plan(
+    engine_type: &str,
+    declared: &[Option<Workload>],
+    skip_vector_index: bool,
+) -> Result<WorkloadPlan, String> {
+    let mut workloads = Vec::with_capacity(declared.len());
+    for (i, d) in declared.iter().enumerate() {
+        let w = match (skip_vector_index, d) {
+            (true, Some(w)) if *w != Workload::FilterOnly => {
+                return Err(format!(
+                    "--skip-vector-index runs every search config as filter-only, but search \
+                     config #{i} declares workload \"{w}\"; drop the flag or the declaration"
+                ));
+            }
+            (true, _) => Workload::FilterOnly,
+            (false, Some(w)) => *w,
+            (false, None) => Workload::Vector,
+        };
+        if !implemented(engine_type).contains(&w) {
+            return Err(format!(
+                "workload \"{w}\" is not implemented for engine '{engine_type}' (search config \
+                 #{i}); implemented: {}",
+                implemented(engine_type)
+                    .iter()
+                    .map(|w| w.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        workloads.push(w);
+    }
+    let layout = if skip_vector_index {
+        IndexLayout::NoVector
+    } else {
+        let mut layouts = workloads.iter().map(|w| (w, w.required_layout()));
+        match layouts.next() {
+            None => IndexLayout::Vector,
+            Some((first_w, first)) => {
+                if let Some((w, _)) = layouts.find(|(_, l)| *l != first) {
+                    return Err(format!(
+                        "engine config mixes workloads \"{first_w}\" and \"{w}\", which need \
+                         different index layouts; one index serving both needs the shared \
+                         `full` schema (#344), which does not exist yet — split them into \
+                         separate engine configs"
+                    ));
+                }
+                first
+            }
+        }
+    };
+    Ok(WorkloadPlan {
+        engine_type: engine_type.to_string(),
+        layout,
+        workloads,
+    })
+}
+
+/// Refuse a result that does not carry its workload's fingerprint.
+///
+/// `filter_only_stats` is whether `SearchResults::filter_only` is set. A
+/// filter-only result without it did not go through the filter-only path; any
+/// other workload with it ran the filter-only path under the wrong name.
+pub fn verify_result_shape(workload: Workload, filter_only_stats: bool) -> Result<(), String> {
+    match (workload, filter_only_stats) {
+        (Workload::FilterOnly, false) => Err(
+            "workload filter-only returned a result without filter-only stats — the engine did \
+             not run its filter-only path"
+                .into(),
+        ),
+        (w, true) if w != Workload::FilterOnly => Err(format!(
+            "workload \"{w}\" returned filter-only stats — the engine ran its filter-only path"
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serde_spelling_matches_the_config_key() {
+        for w in Workload::ALL {
+            let json = serde_json::to_value(w).unwrap();
+            assert_eq!(json, serde_json::json!(w.as_str()));
+            assert_eq!(serde_json::from_value::<Workload>(json).unwrap(), w);
+            assert_eq!(w.as_str().parse::<Workload>().unwrap(), w);
+        }
+        assert!(serde_json::from_value::<Workload>(serde_json::json!("filter_only")).is_err());
+        assert!("knn".parse::<Workload>().is_err());
+    }
+
+    #[test]
+    fn undeclared_is_vector_and_layout_is_vector() {
+        let p = plan("redis", &[None, None], false).unwrap();
+        assert_eq!(p.workloads, vec![Workload::Vector; 2]);
+        assert_eq!(p.layout, IndexLayout::Vector);
+        // A config with no search params still needs a layout.
+        assert_eq!(
+            plan("qdrant", &[], false).unwrap().layout,
+            IndexLayout::Vector
+        );
+    }
+
+    #[test]
+    fn skip_vector_index_maps_onto_filter_only() {
+        let p = plan("opensearch", &[None, Some(Workload::FilterOnly)], true).unwrap();
+        assert_eq!(p.workloads, vec![Workload::FilterOnly; 2]);
+        assert_eq!(p.layout, IndexLayout::NoVector);
+    }
+
+    #[test]
+    fn declared_filter_only_selects_the_no_vector_layout() {
+        let p = plan("redis", &[Some(Workload::FilterOnly)], false).unwrap();
+        assert_eq!(p.layout, IndexLayout::NoVector);
+    }
+
+    #[test]
+    fn skip_vector_index_refuses_a_declared_non_filter_workload() {
+        let e = plan("redis", &[Some(Workload::Vector)], true).unwrap_err();
+        assert!(e.contains("--skip-vector-index"), "{e}");
+    }
+
+    #[test]
+    fn unimplemented_combinations_are_hard_errors() {
+        // No engine has fulltext or hybrid yet: refused, not run as vector.
+        for engine in ["redis", "opensearch", "qdrant"] {
+            for w in [Workload::Fulltext, Workload::Hybrid] {
+                let e = plan(engine, &[Some(w)], false).unwrap_err();
+                assert!(e.contains("not implemented"), "{e}");
+            }
+        }
+        // Filter-only only where an arm exists.
+        assert!(plan("qdrant", &[Some(Workload::FilterOnly)], false).is_err());
+        assert!(plan("qdrant", &[None], true).is_err());
+        assert!(plan("valkey", &[None], true).is_ok());
+    }
+
+    #[test]
+    fn mixed_layouts_are_refused_until_the_full_schema_exists() {
+        let e = plan("redis", &[None, Some(Workload::FilterOnly)], false).unwrap_err();
+        assert!(e.contains("#344"), "{e}");
+    }
+
+    #[test]
+    fn plan_lookup_is_bounds_checked() {
+        let p = plan("redis", &[None], false).unwrap();
+        assert_eq!(p.workload(0).unwrap(), Workload::Vector);
+        assert!(p.workload(1).is_err());
+    }
+
+    #[test]
+    fn result_shape_must_match_the_workload() {
+        assert!(verify_result_shape(Workload::FilterOnly, true).is_ok());
+        assert!(verify_result_shape(Workload::Vector, false).is_ok());
+        assert!(verify_result_shape(Workload::FilterOnly, false).is_err());
+        for w in [Workload::Vector, Workload::Hybrid, Workload::Fulltext] {
+            assert!(verify_result_shape(w, true).is_err(), "{w}");
+            assert!(verify_result_shape(w, false).is_ok(), "{w}");
+        }
+    }
+}

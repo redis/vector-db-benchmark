@@ -32,6 +32,8 @@ mod weaviate_grpc;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use std::time::{Duration, Instant};
+use vector_db_benchmark::results_dump::RawQueryResult;
+use vector_db_benchmark::workload::Workload;
 
 pub use chroma::ChromaEngine;
 pub use dragonfly::DragonflyEngine;
@@ -207,6 +209,14 @@ pub struct SearchResults {
     /// share one and still be reading materially different things, so the
     /// artifact carries the mechanism rather than only the grade.
     pub update_attribution_detail: Option<String>,
+    /// The workload that produced this result. Set only by [`search_workload`],
+    /// the single dispatch point, after the result passed its shape check.
+    pub workload: Option<Workload>,
+    /// One record per timed query (failures included), in no particular order.
+    /// `Some` only when the engine was asked to capture
+    /// (`SearchParams::capture_query_results`); see
+    /// `vector_db_benchmark::results_dump` for the contract.
+    pub query_records: Option<Vec<RawQueryResult>>,
 }
 
 /// How firmly an engine can tie a counted mixed-workload update to the corpus
@@ -681,6 +691,38 @@ pub trait Engine {
         num_queries: i64,
     ) -> Result<SearchResults, String>;
 
+    /// Filter-only workload: exact-match predicates, no vector clause, exact
+    /// total (#328/#340). Must set `SearchResults::filter_only`. Reached only
+    /// through [`search_workload`]; the default is a hard error.
+    fn search_filter_only(
+        &mut self,
+        _dataset: &Dataset,
+        _search_params: &SearchParams,
+        _num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        Err(workload_not_implemented(self.name(), Workload::FilterOnly))
+    }
+
+    /// Ranked full-text (BM25) workload (#339). Default: hard error.
+    fn search_fulltext(
+        &mut self,
+        _dataset: &Dataset,
+        _search_params: &SearchParams,
+        _num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        Err(workload_not_implemented(self.name(), Workload::Fulltext))
+    }
+
+    /// Hybrid prefilter + KNN workload (#341). Default: hard error.
+    fn search_hybrid(
+        &mut self,
+        _dataset: &Dataset,
+        _search_params: &SearchParams,
+        _num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        Err(workload_not_implemented(self.name(), Workload::Hybrid))
+    }
+
     /// Delete/cleanup the index
     fn delete(&mut self) -> Result<(), String>;
 
@@ -771,6 +813,54 @@ pub trait Engine {
             self.name()
         ))
     }
+}
+
+fn workload_not_implemented(engine: &str, workload: Workload) -> String {
+    format!("workload \"{workload}\" is not implemented by engine '{engine}'")
+}
+
+/// THE dispatch point from a resolved [`Workload`] to an engine call (#344).
+///
+/// Every measured search, warm-up included, goes through here. It refuses a
+/// combination the engine table (`workload::implemented`) does not list, then
+/// checks the result carries the workload's fingerprint and — under
+/// `--dump-results` — one per-query record per attempted query. A failure of
+/// any of these is an error, never a fallback to the vector path.
+pub fn search_workload(
+    engine: &mut dyn Engine,
+    engine_type: &str,
+    workload: Workload,
+    dataset: &Dataset,
+    params: &SearchParams,
+    num_queries: i64,
+) -> Result<SearchResults, String> {
+    if !vector_db_benchmark::workload::implemented(engine_type).contains(&workload) {
+        return Err(workload_not_implemented(engine.name(), workload));
+    }
+    let mut results = match workload {
+        Workload::Vector => engine.search(dataset, params, num_queries),
+        Workload::Hybrid => engine.search_hybrid(dataset, params, num_queries),
+        Workload::Fulltext => engine.search_fulltext(dataset, params, num_queries),
+        Workload::FilterOnly => engine.search_filter_only(dataset, params, num_queries),
+    }?;
+    vector_db_benchmark::workload::verify_result_shape(workload, results.filter_only.is_some())
+        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    if params.capture_query_results {
+        let records = results.query_records.as_ref().ok_or_else(|| {
+            format!(
+                "--dump-results: engine '{}' does not capture per-query results for workload \
+                 \"{workload}\"",
+                engine.name()
+            )
+        })?;
+        vector_db_benchmark::results_dump::validate_capture(
+            records.len(),
+            results.requested_queries,
+        )
+        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    }
+    results.workload = Some(workload);
+    Ok(results)
 }
 
 /// Build a Redis connection URL.
@@ -1202,5 +1292,178 @@ mod stats_tests {
         let ones = vec![1.0; 10];
         let r2 = compute_search_stats(&times, &ones, &ones, &ones, &ones, 1.0, 10, 1, 10).unwrap();
         assert!((r2.recall_p10 - 1.0).abs() < 1e-9);
+    }
+}
+
+/// The single workload dispatch point (#344) and its guards. A fake engine
+/// stands in for a server: what is under test is the routing and the checks
+/// on what comes back, not any engine's query.
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use vector_db_benchmark::results_dump::RawQueryResult;
+
+    struct Fake {
+        result: SearchResults,
+        has_filter_only_arm: bool,
+    }
+
+    impl Engine for Fake {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn configure(&mut self, _: &Dataset) -> Result<(), String> {
+            Ok(())
+        }
+        fn upload(&mut self, _: &Dataset) -> Result<UploadStats, String> {
+            Ok(UploadStats::default())
+        }
+        fn search(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            Ok(self.result.clone())
+        }
+        fn search_filter_only(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            if self.has_filter_only_arm {
+                Ok(self.result.clone())
+            } else {
+                Err("fake has no filter-only arm".into())
+            }
+        }
+        fn delete(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn search_params(&self) -> &[SearchParams] {
+            &[]
+        }
+    }
+
+    fn dataset() -> Dataset {
+        Dataset::new(serde_json::from_value(serde_json::json!({"name": "d", "path": "d"})).unwrap())
+    }
+
+    fn params(capture: bool) -> SearchParams {
+        let mut p: SearchParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        p.capture_query_results = capture;
+        p
+    }
+
+    fn vector_result(records: Option<usize>) -> SearchResults {
+        SearchResults {
+            requested_queries: 2,
+            query_records: records.map(|n| {
+                (0..n)
+                    .map(|i| RawQueryResult::ok(i, i, vec![], None, 0.0))
+                    .collect()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn filter_result() -> SearchResults {
+        SearchResults {
+            filter_only: Some(vector_db_benchmark::filter_only::Stats::default()),
+            ..vector_result(None)
+        }
+    }
+
+    fn run(
+        fake: &mut Fake,
+        engine_type: &str,
+        w: Workload,
+        capture: bool,
+    ) -> Result<SearchResults, String> {
+        search_workload(fake, engine_type, w, &dataset(), &params(capture), -1)
+    }
+
+    #[test]
+    fn routes_each_workload_to_its_arm_and_labels_the_result() {
+        let mut f = Fake {
+            result: vector_result(None),
+            has_filter_only_arm: false,
+        };
+        let r = run(&mut f, "redis", Workload::Vector, false).unwrap();
+        assert_eq!(r.workload, Some(Workload::Vector));
+        let mut f = Fake {
+            result: filter_result(),
+            has_filter_only_arm: true,
+        };
+        let r = run(&mut f, "redis", Workload::FilterOnly, false).unwrap();
+        assert_eq!(r.workload, Some(Workload::FilterOnly));
+    }
+
+    #[test]
+    fn an_engine_type_without_the_workload_is_refused_before_any_call() {
+        // The fake HAS a filter-only arm; the table still refuses qdrant.
+        let mut f = Fake {
+            result: filter_result(),
+            has_filter_only_arm: true,
+        };
+        let e = run(&mut f, "qdrant", Workload::FilterOnly, false).unwrap_err();
+        assert!(e.contains("not implemented"), "{e}");
+        for w in [Workload::Fulltext, Workload::Hybrid] {
+            assert!(run(&mut f, "redis", w, false).is_err(), "{w}");
+        }
+    }
+
+    #[test]
+    fn default_arms_are_hard_errors_not_vector_fallbacks() {
+        let mut f = Fake {
+            result: vector_result(None),
+            has_filter_only_arm: false,
+        };
+        let (d, p) = (dataset(), params(false));
+        assert!(f.search_fulltext(&d, &p, -1).is_err());
+        assert!(f.search_hybrid(&d, &p, -1).is_err());
+    }
+
+    #[test]
+    fn a_result_from_the_wrong_path_is_refused() {
+        // Filter-only arm that actually ran a vector search.
+        let mut f = Fake {
+            result: vector_result(None),
+            has_filter_only_arm: true,
+        };
+        assert!(run(&mut f, "redis", Workload::FilterOnly, false).is_err());
+        // Vector dispatch that came back with filter-only stats.
+        let mut f = Fake {
+            result: filter_result(),
+            has_filter_only_arm: false,
+        };
+        assert!(run(&mut f, "redis", Workload::Vector, false).is_err());
+    }
+
+    #[test]
+    fn a_requested_capture_must_cover_every_attempted_query() {
+        for (records, ok) in [
+            (None, false),
+            (Some(1), false),
+            (Some(3), false),
+            (Some(2), true),
+        ] {
+            let mut f = Fake {
+                result: vector_result(records),
+                has_filter_only_arm: false,
+            };
+            assert_eq!(
+                run(&mut f, "redis", Workload::Vector, true).is_ok(),
+                ok,
+                "records={records:?}"
+            );
+        }
+        // Not requested: no records is fine.
+        let mut f = Fake {
+            result: vector_result(None),
+            has_filter_only_arm: false,
+        };
+        assert!(run(&mut f, "redis", Workload::Vector, false).is_ok());
     }
 }
