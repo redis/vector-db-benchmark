@@ -621,6 +621,20 @@ fn rand_key_below(per_million: u64) -> Value {
 /// constant, so the set is the same for every variant and only the counts
 /// differ. Approximate selectivities (by construction) are noted per row; the
 /// realized ones are what `expected_count` records.
+///
+/// # Why the zero-count guard cannot newly fire on the 1M / 10M variants
+///
+/// [`DerivedCorpus::filter_query_rows`] refuses a query that matches nothing.
+/// The rarest constant predicate, `doc_len == 3000`, expects ~4 rows at 100K
+/// (P(0) ~ 1.6%), and it realized 6. Two facts make that result carry over to
+/// the larger sizes. The variants nest (crc32 thresholds 886 < 8805 < 88075),
+/// so every 100K passage is also in 1M and 10M. The derived values depend only
+/// on `docid`, so each such passage carries the same values there. Every
+/// predicate is therefore satisfied by a superset of its 100K matches, and its
+/// count can only grow. The `rand_key` lookups use the same keys at every
+/// size (see [`is_point_lookup_source`]), so they match >= 1 row everywhere.
+/// The guard stays a hard error regardless: if an upstream re-export broke
+/// the nesting, a regeneration would fail rather than publish a zero-count row.
 pub fn filter_query_templates(lookup_keys: &[u64]) -> Result<Vec<FilterQueryTemplate>, String> {
     if lookup_keys.len() != POINT_LOOKUP_KEYS {
         return Err(format!(
