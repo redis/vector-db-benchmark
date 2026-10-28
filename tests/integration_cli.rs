@@ -608,36 +608,69 @@ fn calibration_on_declared_filter_only_is_refused_at_startup() {
     assert!(!stdout.contains("Experiment stage:"), "{stdout}");
 }
 
-/// #339 review: an engine config mixing `fulltext` with a vector config is
-/// refused when the dataset's queries filter on text — the fulltext config
-/// would change the analyzer those filters run through — and is checked
-/// before anything touches the server (a closed port: the refusal must come
-/// first). The same mix on a dataset without text filters is not refused,
-/// and neither is a fulltext-only config.
+/// #339 review: refusals that happen before anything touches the server (a
+/// closed port: the refusal must come first), on both engines.
+///
+/// - An engine config mixing `fulltext` with a vector config is refused when
+///   the dataset's queries filter on a schema `text` field, with ANY condition
+///   type (`match.text`, `match.value`, `match.any`): the fulltext config
+///   would change the analyzer those filters run through.
+/// - A fulltext `fields` entry that is not a `text` field of the dataset
+///   schema is refused before configure/upload.
+///
+/// The same mix filtering only a keyword field is not refused, and neither is
+/// a fulltext-only config.
 #[test]
 fn fulltext_mixed_with_text_filtered_vector_configs_is_refused_before_connecting() {
     use serde_json::json;
+    let mix = json!([{}, {"workload": "fulltext"}]);
+    let text_only = json!([{"workload": "fulltext"}]);
+    let typo = json!([{"workload": "fulltext", "fulltext": {"fields": {"bdy": 1.0}}}]);
+    let on = |field: &str, cond: serde_json::Value| json!({"and": [{field: cond}]});
+    let refused_mix = "filter on text fields";
     let cases = [
-        (true, json!([{}, {"workload": "fulltext"}]), true),
-        (false, json!([{}, {"workload": "fulltext"}]), false),
-        (true, json!([{"workload": "fulltext"}]), false),
+        (
+            on("body", json!({"match": {"text": "quick"}})),
+            mix.clone(),
+            Some(refused_mix),
+        ),
+        (
+            on("body", json!({"match": {"value": "quick"}})),
+            mix.clone(),
+            Some(refused_mix),
+        ),
+        (
+            on("body", json!({"match": {"any": ["quick"]}})),
+            mix.clone(),
+            Some(refused_mix),
+        ),
+        (
+            on("tag", json!({"match": {"value": "a"}})),
+            mix.clone(),
+            None,
+        ),
+        (
+            on("body", json!({"match": {"text": "quick"}})),
+            text_only.clone(),
+            None,
+        ),
+        (
+            on("tag", json!({"match": {"value": "a"}})),
+            typo.clone(),
+            Some("fulltext field 'bdy' is not a `text` field"),
+        ),
     ];
     // The non-refused cases go on to connect; only Redis fails fast against a
-    // closed port (OpenSearch retries), so they run on Redis only — the rule
-    // itself is engine-agnostic and unit-tested in `fulltext`.
+    // closed port (OpenSearch retries), so they run on Redis only — the rules
+    // themselves are engine-agnostic and unit-tested in `fulltext`.
     for engine in ["redis", "opensearch"] {
-        for (text_filter, search_params, refused) in &cases {
-            if engine == "opensearch" && !*refused {
+        for (condition, search_params, refusal) in &cases {
+            if engine == "opensearch" && refusal.is_none() {
                 continue;
             }
             let root = tempfile::tempdir().unwrap();
             let ds = root.path().join("datasets/tm");
             std::fs::create_dir_all(&ds).unwrap();
-            let condition = if *text_filter {
-                json!({"and": [{"body": {"match": {"text": "quick"}}}]})
-            } else {
-                json!({"and": [{"tag": {"match": {"value": "a"}}}]})
-            };
             std::fs::write(
                 ds.join("tests.jsonl"),
                 json!({"query": [1.0, 0.0], "conditions": condition, "closest_ids": [0],
@@ -680,14 +713,19 @@ fn fulltext_mixed_with_text_filtered_vector_configs_is_refused_before_connecting
                 .output()
                 .unwrap();
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let hit = stderr.contains("filter on text");
-            assert_eq!(
-                hit, *refused,
-                "{engine} text_filter={text_filter} {search_params}: {stderr}"
-            );
-            if *refused {
-                assert!(!out.status.success(), "{stderr}");
-                assert!(stderr.contains("1 queries of dataset 'tm'"), "{stderr}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let ctx = format!("{engine} {condition} {search_params}: {stderr}");
+            match refusal {
+                Some(needle) => {
+                    assert!(!out.status.success(), "{ctx}");
+                    assert!(stderr.contains(needle), "{ctx}");
+                    // Refused before configure: nothing touched the server.
+                    assert!(!stdout.contains("Experiment stage: Configure"), "{ctx}");
+                }
+                None => {
+                    assert!(!stderr.contains(refused_mix), "{ctx}");
+                    assert!(!stderr.contains("is not a `text` field"), "{ctx}");
+                }
             }
         }
     }

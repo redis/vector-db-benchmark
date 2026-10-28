@@ -390,9 +390,10 @@ setting live in `src/fulltext.rs`.
 ```
 
 `fields` maps each searched field to its boost; omitted, every schema `text`
-field is searched at boost 1.0. A field that is not a `text` field of the
-dataset schema, an unknown key, a boost that is not a finite number > 0, or a
-`fulltext` block on another workload is refused at startup. `top` defaults to
+field is searched at boost 1.0. An unknown key, a boost that is not a finite
+number > 0, or a `fulltext` block on another workload is refused at startup; a
+field that is not a `text` field of the dataset schema is refused per dataset
+before configure/upload, i.e. before the server is touched. `top` defaults to
 10 and is never derived from ground truth. There is no ground truth: quality is
 `compare-results` against a reference engine (use OpenSearch), and the result
 files carry no recall/precision keys.
@@ -430,14 +431,19 @@ These settings are applied only when an engine config declares a `fulltext`
 search config. Fulltext uses the vector index layout (the one that indexes
 `text` fields), so it may share an engine config with `vector` configs, but not
 with `filter-only` (different layout, refused by `workload::plan`). Because the
-pinned analyzer then also governs the vector configs' text `match` filters (on
-OpenSearch it replaces `standard`, so `quick` would also match `quickly`), an
-engine config mixing `fulltext` with `vector`/`hybrid` configs is refused, before
-the server is touched, when the dataset's queries contain a text `match`
-condition — split the fulltext configs into their own engine config. No
-registered dataset has such queries today (H&M's and MS MARCO's `tests.jsonl`
-were checked); the rule applies to Redis too, where it is a no-op, so both
-engines follow one rule. The fulltext
+pinned analyzer then also governs the vector configs' filters on text fields (on
+OpenSearch it replaces `standard`: a `match.text` / `match.value` filter would
+also match `quickly` for `quick`, and `match.any` becomes a `terms` query over
+stemmed tokens), an engine config mixing `fulltext` with `vector`/`hybrid`
+configs is refused, before the server is touched, when any query condition of
+the dataset — of any type — targets a schema `text` field. Split the fulltext
+configs into their own engine config. No registered dataset has such queries
+today: H&M's 10,000 queries all filter with `match.value` on keyword fields,
+never its text field `detail_desc`, and MS MARCO's `tests.jsonl` has no
+conditions. The rule applies to Redis too, where it is a no-op, so both engines
+follow one rule. A mixed engine config that is allowed still uploads through the
+pinned analyzer on OpenSearch, so its upload time is not comparable to a
+vector-only config's. The fulltext
 arm refuses to start when a searched field is missing from the live index, or
 when the live index differs from anything `params.fulltext.engine_settings`
 claims — e.g. an index built by a vector-only config and reused with

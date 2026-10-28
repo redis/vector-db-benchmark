@@ -1264,13 +1264,30 @@ fn run_single_experiment(
         }
     }
 
-    // #339: a fulltext search config pins the text analyzer for the whole
-    // index, so it may not share one with vector/hybrid configs whose dataset
-    // filters on text. Checked before anything touches the server.
+    // #339: checked before anything touches the server (no configure/upload):
+    // every fulltext search config's fields resolve against this dataset's
+    // schema, and a fulltext search config — which pins the text analyzer for
+    // the whole index — does not share one with vector/hybrid configs whose
+    // dataset filters on a text field.
+    vector_db_benchmark::fulltext::check_fields_before_connecting(
+        engine
+            .search_params()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| plan.workload(*i).ok() == Some(Workload::Fulltext))
+            .map(|(_, sp)| sp.knob(vector_db_benchmark::fulltext::SPEC_KEY)),
+        dataset.config.schema.as_ref(),
+        &dataset.config.name,
+    )?;
     if vector_db_benchmark::fulltext::mixes_with_filtered_workloads(&plan.workloads) {
+        let text_fields =
+            vector_db_benchmark::fulltext::schema_text_fields(dataset.config.schema.as_ref());
         vector_db_benchmark::fulltext::check_mixed_text_filters(
             &plan.workloads,
-            vector_db_benchmark::fulltext::count_text_match_queries(&dataset.get_path()?)?,
+            vector_db_benchmark::fulltext::count_text_field_queries(
+                &dataset.get_path()?,
+                &text_fields,
+            )?,
             &dataset.config.name,
         )?;
     }

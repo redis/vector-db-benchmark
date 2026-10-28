@@ -59,7 +59,7 @@
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::BufRead;
 use std::path::Path;
 
@@ -162,26 +162,38 @@ pub fn validate_declared(
     }
 }
 
-/// Whether a query's `conditions` contain a full-text `{"match": {"text": …}}`
-/// leaf anywhere (any nesting of `and` / `or` / groups).
-pub fn has_text_match(conditions: &Value) -> bool {
-    match conditions {
-        Value::Object(o) => o.values().any(|v| {
-            v.get("match")
-                .and_then(Value::as_object)
-                .is_some_and(|m| m.contains_key("text"))
-                || has_text_match(v)
-        }),
-        Value::Array(a) => a.iter().any(has_text_match),
-        _ => false,
+/// Every field a query's `conditions` filter on, whatever the condition type
+/// (`match.text`, `match.value`, `match.any`, `range`, `geo`, …), through any
+/// nesting of `and` / `or` groups. An entry carrying `and` / `or` is a group;
+/// any other key of an entry is a field.
+pub fn filtered_fields(conditions: &Value) -> BTreeSet<String> {
+    fn walk(v: &Value, out: &mut BTreeSet<String>) {
+        match v {
+            Value::Array(a) => a.iter().for_each(|e| walk(e, out)),
+            Value::Object(o) if o.contains_key("and") || o.contains_key("or") => {
+                for key in ["and", "or"] {
+                    if let Some(g) = o.get(key) {
+                        walk(g, out);
+                    }
+                }
+            }
+            Value::Object(o) => out.extend(o.keys().cloned()),
+            _ => {}
+        }
     }
+    let mut out = BTreeSet::new();
+    walk(conditions, &mut out);
+    out
 }
 
-/// Queries of `<dir>/tests.jsonl` whose `conditions` contain a text match. A
-/// dataset without `tests.jsonl` (HDF5 / JSONL formats) has no conditions.
-pub fn count_text_match_queries(dir: &Path) -> Result<usize, String> {
+/// Queries of `<dir>/tests.jsonl` whose `conditions` filter on any of
+/// `text_fields` (any condition type — on OpenSearch `match.value` is an
+/// analyzed `match` and `match.any` a `terms` query, so the analyzer changes
+/// what either matches on a text field). A dataset without `tests.jsonl`
+/// (HDF5 / JSONL formats) has no conditions.
+pub fn count_text_field_queries(dir: &Path, text_fields: &[String]) -> Result<usize, String> {
     let path = dir.join("tests.jsonl");
-    if !path.is_file() {
+    if !path.is_file() || text_fields.is_empty() {
         return Ok(0);
     }
     let file = std::fs::File::open(&path)
@@ -194,11 +206,30 @@ pub fn count_text_match_queries(dir: &Path) -> Result<usize, String> {
         }
         let row: Value = serde_json::from_str(&line)
             .map_err(|e| format!("fulltext: {} line {}: {e}", path.display(), i + 1))?;
-        if row.get("conditions").is_some_and(has_text_match) {
+        if row
+            .get("conditions")
+            .is_some_and(|c| filtered_fields(c).iter().any(|f| text_fields.contains(f)))
+        {
             n += 1;
         }
     }
     Ok(n)
+}
+
+/// Pre-connect check (#339 review): every fulltext search config's `fields`
+/// resolve against the dataset schema, so a typo is refused before configure
+/// and upload rather than after a corpus upload. `blocks` are the `fulltext`
+/// blocks of the engine config's fulltext search configs.
+pub fn check_fields_before_connecting<'a>(
+    blocks: impl Iterator<Item = Option<&'a Value>>,
+    schema: Option<&Value>,
+    dataset: &str,
+) -> Result<(), String> {
+    for (i, block) in blocks.enumerate() {
+        resolve_fields(&parse_spec(block)?, schema)
+            .map_err(|e| format!("fulltext search config {i} on dataset '{dataset}': {e}"))?;
+    }
+    Ok(())
 }
 
 /// Whether an engine config's workloads need [`check_mixed_text_filters`]: a
@@ -211,11 +242,12 @@ pub fn mixes_with_filtered_workloads(workloads: &[Workload]) -> bool {
 }
 
 /// Refuse an engine config that mixes `fulltext` with `vector` / `hybrid`
-/// search configs on a dataset whose queries filter on text.
+/// search configs on a dataset whose queries filter on a schema `text` field
+/// (any condition type, see [`count_text_field_queries`]).
 ///
 /// A fulltext search config builds the index's text fields with the pinned
 /// analyzer. On OpenSearch that replaces `standard` (no stemming, no
-/// stopwords), so the vector configs' `{"match": {"text": …}}` filter would
+/// stopwords), so the vector configs' filters on those fields would
 /// silently match more documents than a vector-only config of the same name —
 /// and recall would still be scored against the same filtered ground truth.
 /// On Redis the pinned settings equal the defaults, but one rule for both
@@ -228,8 +260,9 @@ pub fn check_mixed_text_filters(
     if mixes_with_filtered_workloads(workloads) && text_match_queries > 0 {
         return Err(format!(
             "engine config mixes a fulltext search config with vector/hybrid search configs, \
-             and {text_match_queries} queries of dataset '{dataset}' filter on text \
-             (`match: {{text: …}}`): the fulltext config pins the text analyzer for the whole \
+             and {text_match_queries} queries of dataset '{dataset}' filter on text fields \
+             (any condition on a schema `text` field): the fulltext config pins the text \
+             analyzer for the whole \
              index, which would change what those filters match — split the fulltext search \
              configs into their own engine config"
         ));
@@ -958,7 +991,7 @@ fn engine_settings(engine: &str) -> Result<Value, String> {
     match engine {
         "redis" => Ok(json!({
             "index": {
-                "field_type": "TEXT SORTABLE, index WEIGHT 1",
+                "field_type": "TEXT, index WEIGHT 1 (built SORTABLE; SORTABLE is not verified — it changes neither matching nor BM25STD)",
                 "tokenizer": "RediSearch default (separators: space, tab and the ASCII set in `query_terms.separators`)",
                 "stemmer": "RediSearch default: Snowball English (Porter2); LANGUAGE and NOSTEM not set",
                 "stopwords": "explicit FT.CREATE STOPWORDS 33 <pinned list> (identical to the RediSearch default)",
@@ -1237,30 +1270,44 @@ mod tests {
     }
 
     #[test]
-    fn text_match_conditions_are_found_at_any_depth() {
-        assert!(has_text_match(
-            &json!({"and":[{"body":{"match":{"text":"quick"}}}]})
-        ));
-        assert!(has_text_match(
-            &json!({"or":[{"n":{"range":{"gt":1}}},{"and":[{"b":{"match":{"text":"x"}}}]}]})
-        ));
-        assert!(!has_text_match(
-            &json!({"and":[{"color":{"match":{"value":"red"}}}]})
-        ));
-        assert!(!has_text_match(
-            &json!({"and":[{"color":{"match":{"any":["a"]}}}]})
-        ));
-        assert!(!has_text_match(&json!(null)));
+    fn filtered_fields_cover_every_condition_type_at_any_depth() {
+        let f = |v: Value| filtered_fields(&v).into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            f(json!({"and":[{"body":{"match":{"text":"quick"}}}]})),
+            ["body"]
+        );
+        assert_eq!(
+            f(json!({"and":[{"body":{"match":{"value":"x"}}}]})),
+            ["body"]
+        );
+        assert_eq!(
+            f(json!({"and":[{"body":{"match":{"any":["x"]}}}]})),
+            ["body"]
+        );
+        assert_eq!(
+            f(
+                json!({"or":[{"n":{"range":{"gt":1}}},{"and":[{"b":{"match":{"text":"x"}}},
+                       {"or":[{"c":{"match":{"value":1}}}]}]}]})
+            ),
+            ["b", "c", "n"]
+        );
+        assert!(f(json!(null)).is_empty());
+        assert!(f(json!({})).is_empty());
+        let text = vec!["body".to_string(), "title".to_string()];
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(count_text_match_queries(dir.path()).unwrap(), 0);
+        assert_eq!(count_text_field_queries(dir.path(), &text).unwrap(), 0);
         std::fs::write(
             dir.path().join("tests.jsonl"),
-            "{\"conditions\":{\"and\":[{\"b\":{\"match\":{\"text\":\"q\"}}}]}}\n\
-             {\"conditions\":{\"and\":[{\"c\":{\"match\":{\"value\":\"r\"}}}]}}\n\
+            "{\"conditions\":{\"and\":[{\"body\":{\"match\":{\"text\":\"q\"}}}]}}\n\
+             {\"conditions\":{\"and\":[{\"title\":{\"match\":{\"value\":\"r\"}}}]}}\n\
+             {\"conditions\":{\"or\":[{\"body\":{\"match\":{\"any\":[\"s\"]}}}]}}\n\
+             {\"conditions\":{\"and\":[{\"tag\":{\"match\":{\"value\":\"t\"}}}]}}\n\
              {\"query\":[1]}\n",
         )
         .unwrap();
-        assert_eq!(count_text_match_queries(dir.path()).unwrap(), 1);
+        // text, value and any on text fields count; a keyword filter does not.
+        assert_eq!(count_text_field_queries(dir.path(), &text).unwrap(), 3);
+        assert_eq!(count_text_field_queries(dir.path(), &[]).unwrap(), 0);
     }
 
     #[test]
