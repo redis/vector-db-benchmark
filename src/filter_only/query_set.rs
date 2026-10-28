@@ -18,17 +18,16 @@
 //!
 //! # What gets indexed
 //!
-//! [`index_schema`]: only `keyword`/`int`/`float` fields are ever indexed for
-//! this workload (TAG/NUMERIC on Redis, keyword/long/double on OpenSearch).
-//! `text`, `geo`, `datetime` and other fields stay stored in the document but
-//! are not indexed, because no filter-only predicate may reference them. With a
-//! prepared query set, the index is narrowed further to the fields its
-//! predicates reference: the other declared scalar fields are stored only, so
-//! the shared-domain metadata checks (no `;` or edge whitespace in a tag) apply
-//! to what is indexed and queried — MS MARCO `url` values legitimately contain
-//! `;` — while every guard on an indexed field stays exactly as strict. Without
-//! a prepared set (the synthetic datasets) every declared scalar field is
-//! indexed and validated, as before.
+//! [`index_schema`]. Without a prepared set (H&M, the synthetic datasets) the
+//! layout is exactly the declared schema, as before #340: every declared field
+//! is indexed and every declared scalar field validated. With a prepared set,
+//! the index holds only the `keyword`/`int`/`float` fields its predicates
+//! reference (TAG/NUMERIC on Redis, keyword/long/double on OpenSearch, which
+//! also maps with `dynamic: false`). Every other field — MS MARCO's `text`
+//! fields, `docid`, and `url`, whose values legitimately contain `;` — stays
+//! stored in the document, unindexed, so the shared-domain metadata checks (no
+//! `;` or edge whitespace in a tag) apply to what is indexed and queried while
+//! every guard on an indexed field stays exactly as strict.
 //!
 //! # The per-query count gate
 //!
@@ -209,8 +208,17 @@ impl FilterQuerySet {
         }
     }
 
-    pub fn conditions(&self) -> &QueryConditions {
-        &self.conditions
+    /// [`QueryConditions::try_resolve_all`] over this set's conditions — the
+    /// ONLY way out for them: there is no accessor, so an engine (in the
+    /// binary) cannot read unresolved conditions from a set it obtained through
+    /// `Dataset::filter_query_file`, and the `filter_guard` read/resolve census
+    /// sees every read (#219).
+    pub fn try_resolve_all<T>(
+        &self,
+        engine: &str,
+        parse: impl Fn(&Value) -> Result<Option<T>, String>,
+    ) -> Result<Vec<crate::query_filter::QueryFilter<T>>, String> {
+        self.conditions.try_resolve_all(engine, parse)
     }
 
     pub fn len(&self) -> usize {
@@ -305,15 +313,16 @@ fn collect_fields(p: &Predicate, out: &mut BTreeSet<String>) {
 }
 
 /// The schema the filter-only workload indexes, and validates metadata and
-/// predicates against (see the module docs): the declared `keyword`/`int`/
-/// `float` fields, narrowed to the fields a prepared set references. Fields
-/// outside it are stored, not indexed, and no predicate may reference them.
+/// predicates against (see the module docs). Without a prepared set: the
+/// declared schema, unchanged. With one: the declared `keyword`/`int`/`float`
+/// fields its predicates reference; other fields are stored, not indexed, and
+/// no predicate may reference them.
 pub fn index_schema(schema: Option<&Value>, prepared: Option<&FilterQuerySet>) -> Option<Value> {
-    let fields = schema?.as_object()?;
-    let keep = |name: &str| match prepared {
-        Some(set) if set.is_prepared() => set.referenced.contains(name),
-        _ => true,
+    let Some(set) = prepared.filter(|s| s.is_prepared()) else {
+        return schema.cloned();
     };
+    let fields = schema?.as_object()?;
+    let keep = |name: &str| set.referenced.contains(name);
     Some(Value::Object(
         fields
             .iter()
@@ -364,7 +373,7 @@ mod tests {
         let s = parse(&two_queries(), Some(100)).unwrap();
         assert_eq!(s.len(), 2);
         assert!(s.is_prepared());
-        assert_eq!(s.conditions().declared_count(), 2);
+        assert_eq!(s.conditions.declared_count(), 2);
         assert_eq!(s.shape(0).as_deref(), Some("tag_eq"));
         assert_eq!(s.shape(1).as_deref(), Some("range_or_range"));
         assert_eq!(s.shape(2), None);
@@ -451,8 +460,25 @@ mod tests {
     #[test]
     fn index_schema_drops_unqueryable_kinds_and_narrows_to_referenced_fields() {
         let schema = msmarco_schema();
-        // No prepared set: every scalar field, never text/geo/datetime.
-        let all = index_schema(Some(&schema), None).unwrap();
+        // No prepared set: the declared schema unchanged (text/geo/datetime
+        // included), exactly the pre-#340 layout.
+        assert_eq!(index_schema(Some(&schema), None).unwrap(), schema);
+        let legacy = FilterQuerySet::from_conditions(QueryConditions::new(vec![]));
+        assert_eq!(index_schema(Some(&schema), Some(&legacy)).unwrap(), schema);
+        // A prepared set referencing every field still never indexes the
+        // unqueryable kinds.
+        let mut every = String::new();
+        for (i, f) in schema.as_object().unwrap().keys().enumerate() {
+            every += &row(
+                &format!("q{i}"),
+                "s",
+                json!({"and": [{f: {"match": {"value": "x"}}}]}),
+                0,
+                100,
+            );
+            every += "\n";
+        }
+        let all = index_schema(Some(&schema), Some(&parse(&every, None).unwrap())).unwrap();
         let keys = |v: &Value| {
             let mut k = v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
             k.sort();
@@ -471,8 +497,6 @@ mod tests {
                 "url"
             ]
         );
-        let legacy = FilterQuerySet::from_conditions(QueryConditions::new(vec![]));
-        assert_eq!(index_schema(Some(&schema), Some(&legacy)).unwrap(), all);
         // Prepared set: only what its predicates reference.
         let s = parse(&two_queries(), None).unwrap();
         assert_eq!(

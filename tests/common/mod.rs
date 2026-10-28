@@ -2883,6 +2883,38 @@ pub fn assert_vector_dump_matches_run(root: &Path, dir: &Path, engine: &str, res
 /// payload field (`doc-<row*3+7>`, deliberately not the row id) and declare it
 /// in the schema, so `--dump-results` resolves rows through the docid id space.
 /// Returns the row -> docid function the dump must agree with.
+/// Give every row of a [`write_filter_only_project`] fixture a `text` field
+/// `note` (declared in the schema) and return the declared field names, sorted.
+/// Datasets without a prepared query set must keep the pre-#340 filter-only
+/// layout: every declared field indexed, `text` included.
+pub fn add_text_field(root: &Path) -> Vec<String> {
+    let path = root.join("datasets/scalar-test/payloads.jsonl");
+    let lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(row, line)| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["note"] = serde_json::json!(format!("note {row}; free text"));
+            v.to_string()
+        })
+        .collect();
+    fs::write(&path, lines.join("\n")).unwrap();
+    let registry_path = root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["schema"]["note"] = serde_json::json!("text");
+    fs::write(&registry_path, registry.to_string()).unwrap();
+    let mut names: Vec<String> = registry[0]["schema"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
 pub fn add_docids(root: &Path) -> fn(usize) -> String {
     fn docid(row: usize) -> String {
         format!("doc-{}", row * 3 + 7)

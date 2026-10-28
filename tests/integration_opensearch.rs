@@ -1980,3 +1980,55 @@ fn test_binary_opensearch_msmarco_filter_only_per_query_gate() {
         .unwrap();
     std::fs::remove_dir_all(&p.root).ok();
 }
+
+/// #340 review: without a prepared query set (H&M, synthetic) filter-only maps
+/// every declared field as before #340 — `text` included — and leaves dynamic
+/// mapping alone. Only a prepared set narrows the layout.
+#[test]
+fn test_binary_opensearch_filter_only_without_prepared_set_keeps_the_declared_layout() {
+    wait_for_opensearch();
+    let config = serde_json::json!([{"name":"scalar-layout-os","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":3}]}]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let declared = common::add_text_field(&proj.root);
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "scalar-layout";
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-layout-os",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &["--skip-vector-index", "--skip-search", "--keep-data"],
+    ));
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let m = &mapping[index]["mappings"];
+    assert!(m.get("dynamic").is_none(), "{m}");
+    let mut fields: Vec<String> = m["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| *k != "vector")
+        .cloned()
+        .collect();
+    fields.sort();
+    assert_eq!(fields, declared, "{m}");
+    assert_eq!(m["properties"]["note"]["type"], "text", "{m}");
+    // Mapped by the harness, not by dynamic mapping (which would add a
+    // `.keyword` multi-field to every string): the layout is the declared one.
+    for f in &declared {
+        assert!(
+            m["properties"][f].get("fields").is_none(),
+            "{f} dynamic: {m}"
+        );
+    }
+    os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send()
+        .unwrap();
+    std::fs::remove_dir_all(&proj.root).ok();
+}

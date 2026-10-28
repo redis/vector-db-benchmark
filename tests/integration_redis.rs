@@ -5358,3 +5358,36 @@ fn test_binary_redis_msmarco_stale_corpus_is_refused_naming_the_cure() {
     }
     fs::remove_dir_all(&p.root).ok();
 }
+
+/// #340 review: without a prepared query set (H&M, synthetic) filter-only
+/// builds the same index as before #340 — every declared field, `text`
+/// included as TEXT. Only a prepared set narrows the layout.
+#[test]
+fn test_binary_redis_filter_only_without_prepared_set_keeps_the_declared_layout() {
+    let config = serde_json::json!([{"name":"scalar-layout","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":3}]}]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let declared = common::add_text_field(&proj.root);
+    assert!(declared.iter().any(|f| f == "note"));
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-layout",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &["--skip-vector-index", "--skip-search", "--keep-data"],
+    ));
+    let mut conn = get_test_connection();
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("idx:redis-no-vector")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(ft_info_attribute_names(&info), declared, "{info:?}");
+    assert!(format!("{info:?}").contains("TEXT"), "{info:?}");
+    let _: redis::Value = redis::cmd("FT.DROPINDEX")
+        .arg("idx:redis-no-vector")
+        .arg("DD")
+        .query(&mut conn)
+        .unwrap();
+    fs::remove_dir_all(&proj.root).ok();
+}

@@ -797,20 +797,22 @@ vector-db-benchmark --engines redis-fo --datasets msmarco-cohere-1024-1M-cosine 
   `corpus_size`; see `src/filter_only/query_set.rs`); others fall back to the
   predicates in `tests.jsonl`. `--queries N` cycles the set. Each per-query
   record's `shape` comes from the file, so `compare-results` reports per shape.
-- **Index layout.** Filter-only indexes only `keyword`/`int`/`float` fields
-  (Redis TAG/NUMERIC, OpenSearch keyword/long/double). `text`, `geo`,
-  `datetime` and other fields stay stored in the document, unindexed. With a
-  prepared query set the index narrows to the fields its predicates reference;
-  for MS MARCO that is `category` (TAG / keyword) and `doc_len`, `tier`,
-  `rand_key` (NUMERIC / long), while `docid`, `url` (which holds `;` and edge
-  whitespace) and the text fields are stored only — OpenSearch maps with
-  `dynamic: false`. The shared-domain metadata checks apply to every indexed
-  field exactly as before; without a prepared set (the synthetic `*-filters`
-  datasets) every declared scalar field is still indexed and validated.
+- **Index layout.** Without a prepared query set (H&M, the synthetic
+  `*-filters` datasets) filter-only builds exactly the index it built before
+  #340: every declared field, `text` included, and every declared scalar field
+  validated. With a prepared set the index holds only the `keyword`/`int`/`float`
+  fields its predicates reference: for MS MARCO `category` (TAG / keyword) and
+  `doc_len`, `tier`, `rand_key` (NUMERIC / long). `docid`, `url` (which holds `;`
+  and edge whitespace) and the text fields are stored in the document,
+  unindexed, and OpenSearch maps with `dynamic: false`. The shared-domain
+  metadata checks apply to every indexed field exactly as before.
 - **Per-query count gate.** Every answered query's exact total must equal its
   prepared `expected_count`, or the run fails naming the queries; the sum alone
   lets two compensating errors pass. The artifact records the answers checked
-  in `filter_only.per_query_counts_checked`. Exact totals, `--fail-on-dropped-queries`
+  in `filter_only.per_query_counts_checked`. That count covers ANSWERED queries
+  only: with `--queries N` below the set size, or with dropped queries when
+  `--fail-on-dropped-queries` is off, it is below the set size, and
+  `failed_queries` reports the drops. Exact totals, `--fail-on-dropped-queries`
   and the zero-retry rule are unchanged.
 - **Stale corpora.** An MS MARCO directory whose registry entry declares the
   derived fields but which has no `filter_queries.jsonl`, or whose payloads lack

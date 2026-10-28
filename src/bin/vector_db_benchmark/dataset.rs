@@ -19,11 +19,18 @@ use vector_db_benchmark::readers::{
 /// Dataset wrapper that provides access to vectors and metadata
 pub struct Dataset {
     pub config: DatasetConfig,
+    /// The prepared filter-only query set, loaded once per `Dataset` (one per
+    /// dataset per run): every filter-only step reads it, and the files do not
+    /// change during a run.
+    filter_query_file: std::sync::OnceLock<Result<Option<FilterQuerySet>, String>>,
 }
 
 impl Dataset {
     pub fn new(config: DatasetConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            filter_query_file: std::sync::OnceLock::new(),
+        }
     }
 
     /// Get the file path for this dataset, downloading it if absent.
@@ -400,29 +407,41 @@ impl Dataset {
     }
 
     /// The prepared filter-only query set (`filter_queries.jsonl`) of this
-    /// dataset, if it ships one (#340). A stale MS MARCO directory never gets
-    /// here: `get_path` refuses it. See `filter_only::query_set`.
-    pub fn filter_query_file(&self) -> Result<Option<FilterQuerySet>, String> {
-        let path = self.get_path()?;
-        FilterQuerySet::read_prepared(&path, &self.config.name, self.measured_vector_count()?)
+    /// dataset, if it ships one (#340), read once per `Dataset`. A stale MS
+    /// MARCO directory never gets here: `get_path` refuses it. Its conditions
+    /// are not reachable from engines; they go through
+    /// [`Self::filter_only_queries`]. See `filter_only::query_set`.
+    pub fn filter_query_file(&self) -> Result<Option<&FilterQuerySet>, String> {
+        self.filter_query_file
+            .get_or_init(|| {
+                let path = self.get_path()?;
+                FilterQuerySet::read_prepared(
+                    &path,
+                    &self.config.name,
+                    self.measured_vector_count()?,
+                )
+            })
+            .as_ref()
+            .map(Option::as_ref)
+            .map_err(Clone::clone)
     }
 
     /// The queries the filter-only workload runs: the prepared set when the
     /// dataset ships one, else the predicates in `tests.jsonl`.
     pub fn filter_only_queries(&self) -> Result<FilterQuerySet, String> {
         match self.filter_query_file()? {
-            Some(set) => Ok(set),
+            Some(set) => Ok(set.clone()),
             None => Ok(FilterQuerySet::from_conditions(self.read_queries()?.2)),
         }
     }
 
     /// The fields the filter-only workload indexes, validates and lets
-    /// predicates reference (`filter_only::query_set::index_schema`).
+    /// predicates reference (`filter_only::query_set::index_schema`): the
+    /// declared schema unchanged without a prepared set.
     pub fn filter_only_index_schema(&self) -> Result<Option<serde_json::Value>, String> {
-        let prepared = self.filter_query_file()?;
         Ok(vector_db_benchmark::filter_only::query_set::index_schema(
             self.config.schema.as_ref(),
-            prepared.as_ref(),
+            self.filter_query_file()?,
         ))
     }
 
@@ -1057,6 +1076,10 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+        // The prepared set is read once per `Dataset`: the stale verdict above
+        // stays cached on that instance; a fresh one (a new run) sees the fix.
+        assert!(dataset.filter_only_queries().is_err());
+        let mut dataset = Dataset::new(dataset.config.clone());
         assert_eq!(dataset.read_vectors(false).unwrap().0.len(), 2);
         let set = dataset.filter_only_queries().unwrap();
         assert!(set.is_prepared());
@@ -1066,14 +1089,15 @@ mod tests {
             serde_json::json!({"category": "keyword", "tier": "int"})
         );
         dataset.validate_scalar_metadata().unwrap();
-        // Without the derived schema, no prepared-set requirement and no
-        // narrowing: tests.jsonl, and every scalar field (`url` included).
+        // Without a prepared set: tests.jsonl, and the declared schema
+        // unchanged (text included, `url` validated) — the pre-#340 layout.
         std::fs::remove_file(dir.path().join("filter_queries.jsonl")).unwrap();
         dataset.config.schema = Some(serde_json::json!({"url": "keyword", "title": "text"}));
+        let dataset = Dataset::new(dataset.config.clone());
         assert!(!dataset.filter_only_queries().unwrap().is_prepared());
         assert_eq!(
             dataset.filter_only_index_schema().unwrap().unwrap(),
-            serde_json::json!({"url": "keyword"})
+            serde_json::json!({"url": "keyword", "title": "text"})
         );
         assert!(dataset
             .validate_scalar_metadata()

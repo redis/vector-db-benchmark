@@ -259,9 +259,11 @@ impl OpenSearchEngine {
             }
         });
 
-        // Add schema fields from dataset config. Filter-only maps only the
-        // fields its predicates may reference (#340); with `dynamic: false`
-        // below, every other payload field stays in `_source`, unindexed.
+        // Add schema fields from dataset config. With a prepared query set,
+        // filter-only maps only the fields its predicates reference (#340);
+        // with `dynamic: false` below, every other payload field stays in
+        // `_source`, unindexed. Without one the layout is the declared schema.
+        let narrowed = self.config.skip_vector_index && dataset.filter_query_file()?.is_some();
         let schema = if self.config.skip_vector_index {
             dataset.filter_only_index_schema()?
         } else {
@@ -317,7 +319,7 @@ impl OpenSearchEngine {
         }
 
         let mut mappings = serde_json::json!({ "properties": properties });
-        if self.config.skip_vector_index {
+        if narrowed {
             mappings["dynamic"] = serde_json::json!(false);
         }
         let mut body = serde_json::json!({
@@ -1746,14 +1748,13 @@ impl OpenSearchEngine {
         let (query_set, mut queries, mut neighbors, mut parsed_filters) = if filter_only {
             let set = dataset.filter_only_queries()?;
             let parsed: Vec<QueryFilter<serde_json::Value>> =
-                set.conditions()
-                    .try_resolve_all("OpenSearch", |condition| {
-                        vector_db_benchmark::filter_only::domain::validate_predicate(
-                            condition,
-                            index_schema.as_ref(),
-                        )?;
-                        Ok(parse_os_conditions(condition))
-                    })?;
+                set.try_resolve_all("OpenSearch", |condition| {
+                    vector_db_benchmark::filter_only::domain::validate_predicate(
+                        condition,
+                        index_schema.as_ref(),
+                    )?;
+                    Ok(parse_os_conditions(condition))
+                })?;
             let n = set.len();
             (Some(set), vec![Vec::new(); n], vec![Vec::new(); n], parsed)
         } else {

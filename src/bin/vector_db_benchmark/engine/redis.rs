@@ -885,15 +885,13 @@ impl RedisEngine {
         let parallel = params.parallel.unwrap_or(1) as usize;
         let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
         let query_set = dataset.filter_only_queries()?;
-        let parsed_filters = query_set
-            .conditions()
-            .try_resolve_all("Redis", |condition| {
-                vector_db_benchmark::filter_only::domain::validate_predicate(
-                    condition,
-                    index_schema.as_ref(),
-                )?;
-                Ok(parse_conditions(condition))
-            })?;
+        let parsed_filters = query_set.try_resolve_all("Redis", |condition| {
+            vector_db_benchmark::filter_only::domain::validate_predicate(
+                condition,
+                index_schema.as_ref(),
+            )?;
+            Ok(parse_conditions(condition))
+        })?;
         record_numeric_range_encoding(&parsed_filters);
         // A metadata result limit must not be derived from vector ground truth.
         let top = params
