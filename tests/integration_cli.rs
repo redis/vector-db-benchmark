@@ -756,9 +756,15 @@ fn fulltext_parity_index_rules_are_refused_at_startup() {
             json!([par(json!({"segment": 1})), par(json!({"title": 1}))]),
             "different field sets",
         ),
+        // Redis only: parity on a shared corpus, refused before the download
+        // (run with REDIS_KEY_PREFIX set, below).
+        (json!([par(json!({"segment": 1}))]), "REDIS_KEY_PREFIX"),
     ];
     for engine in ["redis", "opensearch"] {
         for (search_params, needle) in &cases {
+            if needle.contains("REDIS_KEY_PREFIX") && engine != "redis" {
+                continue;
+            }
             let root = tempfile::tempdir().unwrap();
             std::fs::create_dir(root.path().join("datasets")).unwrap();
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -780,15 +786,17 @@ fn fulltext_parity_index_rules_are_refused_at_startup() {
                     .to_string(),
             )
             .unwrap();
-            let out = Command::new(common::binary_path())
-                .current_dir(root.path())
+            let mut cmd = Command::new(common::binary_path());
+            cmd.current_dir(root.path())
                 .args(["--engines", "pf", "--datasets", "pf", "--host", "127.0.0.1"])
                 .arg("--engines-file")
                 .arg(&engines_file)
                 .env("REDIS_PORT", &port)
-                .env("OPENSEARCH_PORT", &port)
-                .output()
-                .unwrap();
+                .env("OPENSEARCH_PORT", &port);
+            if needle.contains("REDIS_KEY_PREFIX") {
+                cmd.env("REDIS_KEY_PREFIX", "shared");
+            }
+            let out = cmd.output().unwrap();
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(!out.status.success(), "{engine} {search_params}: {stderr}");
             assert!(stderr.contains(needle), "{engine} {needle}: {stderr}");

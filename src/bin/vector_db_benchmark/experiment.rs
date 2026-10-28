@@ -249,18 +249,28 @@ pub fn run(args: &Args) -> Result<(), String> {
         // #339 parity: the index profile all fulltext search configs share
         // (analysis mode, indexed text fields) must be resolvable, and parity
         // never shares an engine config with another workload.
-        vector_db_benchmark::fulltext::index_profile(
-            config
-                .search_params
-                .iter()
-                .flatten()
-                .enumerate()
-                .map(|(i, sp)| {
-                    (
-                        plan.workload(i).unwrap_or(Workload::Vector),
-                        sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
-                    )
-                }),
+        let profile_inputs = config
+            .search_params
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, sp)| {
+                Ok((
+                    plan.workload(i)?,
+                    sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let profile = vector_db_benchmark::fulltext::index_profile(profile_inputs)
+            .map_err(|e| format!("config '{name}': {e}"))?;
+        // Before any download: parity on a Redis shared corpus (the engine
+        // re-checks it at configure).
+        vector_db_benchmark::fulltext::check_parity_shared_corpus(
+            &plan.engine_type,
+            profile.as_ref(),
+            crate::effective_config::env_var("REDIS_KEY_PREFIX")
+                .ok()
+                .is_some_and(|s| !s.trim().is_empty()),
         )
         .map_err(|e| format!("config '{name}': {e}"))?;
         if args.target_qps > 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {

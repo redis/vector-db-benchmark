@@ -60,7 +60,7 @@ impl OpenSearchEngine {
     ) -> Result<(), String> {
         if let Some(p) = self.fulltext_profile()? {
             if p.normalizes_newlines() {
-                let n = fulltext::normalize_metadata(metadata, &p.text_fields);
+                let n = fulltext::normalize_metadata(metadata, &p.text_fields)?;
                 println!(
                     "\tfulltext parity: normalized newlines in {n} values of {:?}",
                     p.text_fields

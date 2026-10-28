@@ -37,13 +37,7 @@ impl RedisEngine {
                 sp.knob(fulltext::SPEC_KEY),
             )
         }))?;
-        if profile.as_ref().is_some_and(|p| p.normalizes_newlines()) && self.config.shared_corpus {
-            return Err(
-                "fulltext `analysis: parity` normalizes the uploaded text, which a shared corpus \
-                 (REDIS_KEY_PREFIX) would impose on every other config — unset REDIS_KEY_PREFIX"
-                    .into(),
-            );
-        }
+        fulltext::check_parity_shared_corpus("redis", profile.as_ref(), self.config.shared_corpus)?;
         Ok(profile)
     }
 
@@ -76,7 +70,7 @@ impl RedisEngine {
     ) -> Result<(), String> {
         if let Some(p) = self.fulltext_profile()? {
             if p.normalizes_newlines() {
-                let n = fulltext::normalize_metadata(metadata, &p.text_fields);
+                let n = fulltext::normalize_metadata(metadata, &p.text_fields)?;
                 println!(
                     "\tfulltext parity: normalized newlines in {n} values of {:?}",
                     p.text_fields

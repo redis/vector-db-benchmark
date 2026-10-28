@@ -143,28 +143,49 @@ pub const OPENSEARCH_MULTI_MATCH_TYPE: &str = "most_fields";
 
 /// Differences between the two engines' text pipelines that the pinned
 /// settings do NOT remove. Published in every fulltext result.
-pub const KNOWN_DIFFERENCES: [&str; 7] = [
+pub const KD_NEWLINE_TOKENS: &str =
     "tokenizer: RediSearch splits only on its ASCII separator set plus space and tab — NOT on \
      newline or carriage return, so lines joined by '\\n' (e.g. MS MARCO `headings`) index as \
      one token at each join; OpenSearch's standard tokenizer (UAX#29) splits on all whitespace \
-     and Unicode punctuation",
+     and Unicode punctuation";
+pub const KD_PUNCTUATION: &str =
     "tokenizer: RediSearch splits on '.', '-', '\\'' inside words ('u.s.a' -> u, s, a; \
      'e-mail' -> e, mail; '3.5' -> 3, 5; \"dog's\" -> dog, s; \"don't\" -> don, t); OpenSearch \
      keeps 'u.s.a', '3.5' and \"don't\" as single tokens and removes possessive 's. The query \
      side drops possessive 's before splitting (so no bare `s` term is sent), but other \
-     apostrophes still split into the same terms on both engines",
+     apostrophes still split into the same terms on both engines";
+pub const KD_STEM_TWICE: &str =
     "stemming: RediSearch indexes the original token AND its stem and expands each query term \
-     to both, so a term whose stem differs scores twice; Lucene indexes only the stem",
+     to both, so a term whose stem differs scores twice; Lucene indexes only the stem";
+pub const KD_WHOLE_DOCUMENT: &str =
     "scoring: RediSearch BM25STD uses one term frequency and one document length for the whole \
      document (all TEXT fields), restricted per field only by the field mask; Lucene BM25 keeps \
-     per-field term frequencies and per-field length norms",
+     per-field term frequencies and per-field length norms";
+pub const KD_SHARD_STATS: &str =
     "scoring: Lucene IDF and length norms are per shard and per segment statistics; RediSearch \
-     statistics are per index",
-    "ties: documents with equal scores may be returned in different orders by the two engines",
+     statistics are per index";
+pub const KD_TIES: &str =
+    "ties: documents with equal scores may be returned in different orders by the two engines";
+pub const KD_MIN_STEM_LEN: &str =
     "stemming: RediSearch stems only tokens of at least `search-min-stem-len` characters \
      (default 4, verified on the server and recorded as `redis_min_stem_len`); Lucene porter2 \
-     has no length floor",
+     has no length floor";
+
+/// Every difference that the pinned settings do not remove (english mode).
+pub const KNOWN_DIFFERENCES: [&str; 7] = [
+    KD_NEWLINE_TOKENS,
+    KD_PUNCTUATION,
+    KD_STEM_TWICE,
+    KD_WHOLE_DOCUMENT,
+    KD_SHARD_STATS,
+    KD_TIES,
+    KD_MIN_STEM_LEN,
 ];
+
+/// The known differences parity removes: newlines are normalized at upload,
+/// and nothing is stemmed (so neither stem double counting nor the minimum
+/// stem length applies).
+pub const PARITY_REMOVES: [&str; 3] = [KD_NEWLINE_TOKENS, KD_STEM_TWICE, KD_MIN_STEM_LEN];
 
 /// The `fulltext` block of a search config.
 ///
@@ -367,30 +388,63 @@ pub fn index_profile<'a>(
     }))
 }
 
+/// Startup check: parity normalizes the uploaded text, which a Redis shared
+/// corpus (`REDIS_KEY_PREFIX`, reused by every config of the sweep) would
+/// impose on the other configs. `shared_corpus` is whether the prefix is set.
+pub fn check_parity_shared_corpus(
+    engine_type: &str,
+    profile: Option<&IndexProfile>,
+    shared_corpus: bool,
+) -> Result<(), String> {
+    if engine_type == "redis" && shared_corpus && profile.is_some_and(|p| p.normalizes_newlines()) {
+        return Err(
+            "fulltext `analysis: parity` normalizes the uploaded text, which a shared corpus \
+             (REDIS_KEY_PREFIX) would impose on every other config — unset REDIS_KEY_PREFIX"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Replace `\r\n`, `\n` and `\r` by a space (parity mode, at upload).
 pub fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", " ").replace(['\n', '\r'], " ")
 }
 
 /// Normalize the string values of `fields` in place; returns how many values
-/// changed (for the upload log).
+/// changed (for the upload log). A value of an indexed text field that is not
+/// a string (a JSON array becomes `Labels`, which Redis joins with `;` and
+/// OpenSearch indexes as several values) is refused: parity could not claim
+/// `normalize_newlines` for it, and the two engines would not index it alike.
 pub fn normalize_metadata(
     items: &mut [Option<crate::readers::metadata::MetadataItem>],
     fields: &BTreeSet<String>,
-) -> usize {
+) -> Result<usize, String> {
     use crate::readers::metadata::MetadataValue;
     let mut changed = 0;
-    for item in items.iter_mut().flatten() {
+    for (row, item) in items.iter_mut().enumerate() {
+        let Some(item) = item else { continue };
         for (k, v) in item.fields.iter_mut() {
-            if let MetadataValue::String(s) = v {
-                if fields.contains(k) && s.contains(['\n', '\r']) {
-                    *s = normalize_newlines(s);
-                    changed += 1;
+            if !fields.contains(k) {
+                continue;
+            }
+            match v {
+                MetadataValue::String(s) => {
+                    if s.contains(['\n', '\r']) {
+                        *s = normalize_newlines(s);
+                        changed += 1;
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "fulltext parity: corpus row {row} field '{k}' is not a string \
+                         ({other:?}); parity normalizes and indexes plain text fields only"
+                    ))
                 }
             }
         }
     }
-    changed
+    Ok(changed)
 }
 
 /// Redis key holding an index's [`IndexProfile::marker`] (outside every
@@ -1496,12 +1550,10 @@ pub fn result_metadata(
 pub fn known_differences(analysis: Analysis) -> Vec<&'static str> {
     match analysis {
         Analysis::English => KNOWN_DIFFERENCES.to_vec(),
-        Analysis::Parity => vec![
-            KNOWN_DIFFERENCES[1],
-            KNOWN_DIFFERENCES[3],
-            KNOWN_DIFFERENCES[4],
-            KNOWN_DIFFERENCES[5],
-        ],
+        Analysis::Parity => KNOWN_DIFFERENCES
+            .into_iter()
+            .filter(|d| !PARITY_REMOVES.contains(d))
+            .collect(),
     }
 }
 
@@ -1993,7 +2045,7 @@ mod tests {
         };
         let mut items = vec![item("a\nb", "x\ny"), None, item("c", "z")];
         let fields: BTreeSet<String> = ["headings".to_string()].into();
-        assert_eq!(normalize_metadata(&mut items, &fields), 1);
+        assert_eq!(normalize_metadata(&mut items, &fields), Ok(1));
         let text = |i: usize, k: usize| match &items[i].as_ref().unwrap().fields[k].1 {
             MetadataValue::String(s) => s.clone(),
             _ => unreachable!(),
@@ -2005,6 +2057,37 @@ mod tests {
             "a field that is not indexed is left as uploaded"
         );
         assert_eq!(text(2, 0), "c");
+        // A non-string value of an indexed text field is refused (an array
+        // payload becomes Labels); outside the indexed fields it is ignored.
+        let labels = |field: &str| {
+            Some(MetadataItem {
+                fields: vec![(
+                    field.into(),
+                    MetadataValue::Labels(vec!["a\nb".into(), "c".into()]),
+                )],
+            })
+        };
+        let e = normalize_metadata(&mut [None, labels("headings")], &fields).unwrap_err();
+        assert!(e.contains("row 1 field 'headings' is not a string"), "{e}");
+        assert_eq!(normalize_metadata(&mut [labels("tags")], &fields), Ok(0));
+    }
+
+    #[test]
+    fn parity_refuses_a_redis_shared_corpus() {
+        let par = index_profile([(
+            Workload::Fulltext,
+            Some(&parity_block(json!({"segment": 1}))),
+        )])
+        .unwrap()
+        .unwrap();
+        let eng = IndexProfile::english();
+        assert!(check_parity_shared_corpus("redis", Some(&par), true)
+            .unwrap_err()
+            .contains("REDIS_KEY_PREFIX"));
+        assert!(check_parity_shared_corpus("redis", Some(&par), false).is_ok());
+        assert!(check_parity_shared_corpus("redis", Some(&eng), true).is_ok());
+        assert!(check_parity_shared_corpus("redis", None, true).is_ok());
+        assert!(check_parity_shared_corpus("opensearch", Some(&par), true).is_ok());
     }
 
     #[test]
@@ -2190,14 +2273,26 @@ mod tests {
             assert_eq!(m["normalize_newlines"], true);
             assert_eq!(m["indexed_text_fields"], json!(["segment"]));
             assert_eq!(m["index_marker"], par.marker());
-            let kd = m["known_differences"].as_array().unwrap();
-            assert_eq!(kd.len(), 4);
-            assert!(!kd
+            // By identity, whatever the order of KNOWN_DIFFERENCES: parity
+            // keeps every entry except exactly the ones it removes.
+            let kd: Vec<&str> = m["known_differences"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .any(|d| d.as_str().unwrap().contains("newline or carriage")));
-            assert!(!kd
-                .iter()
-                .any(|d| d.as_str().unwrap().starts_with("stemming")));
+                .map(|d| d.as_str().unwrap())
+                .collect();
+            for removed in PARITY_REMOVES {
+                assert!(!kd.contains(&removed), "{removed}");
+            }
+            let kept: Vec<&str> = KNOWN_DIFFERENCES
+                .into_iter()
+                .filter(|d| !PARITY_REMOVES.contains(d))
+                .collect();
+            assert_eq!(kd, kept);
+            assert_eq!(kd.len(), KNOWN_DIFFERENCES.len() - PARITY_REMOVES.len());
+            for d in [KD_PUNCTUATION, KD_WHOLE_DOCUMENT, KD_SHARD_STATS, KD_TIES] {
+                assert!(kd.contains(&d), "{d}");
+            }
             let e = result_metadata_for(
                 engine,
                 &[fb("segment", 1.0)],
