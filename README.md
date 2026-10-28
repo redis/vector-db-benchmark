@@ -472,6 +472,29 @@ claims — e.g. an index built by a vector-only config and reused with
   and norms; Lucene statistics are per shard/segment.
 - Equal scores may be ordered differently.
 
+**How much each difference costs** (100K MS MARCO, 1677 queries, one
+OpenSearch shard, `compare-results` with OpenSearch as reference, overlap@10 /
+Jaccard@10 / rank correlation). Each variant changes only the uploaded copy of
+the corpus or, for "stemming off", the analyzers of both engines (Redis
+`NOSTEM` + `VERBATIM`, OpenSearch without the porter2 filter); none is a
+shipped setting:
+
+| Variant | title 5, headings 3, segment 1 | segment |
+|---|---|---|
+| as shipped | 0.399 / 0.275 / 0.348 | 0.413 / 0.283 / 0.326 |
+| newlines → spaces | 0.425 / 0.299 / 0.340 | 0.431 / 0.300 / 0.340 |
+| only `segment` indexed | — | 0.440 / 0.307 / 0.369 |
+| only `segment` indexed, newlines → spaces | — | 0.470 / 0.337 / 0.389 |
+| stemming off | 0.610 / 0.465 / 0.455 | 0.691 / 0.549 / 0.565 |
+| stemming off, only `segment` indexed, newlines → spaces | — | 0.943 / 0.903 / 0.907 |
+
+So most of the gap is stemming. Both engines use Porter2, but RediSearch
+indexes a term and its stem and expands each query term to both. Newline
+tokenization (about 2–3 points) and whole-document BM25STD statistics (about 3)
+are small next to it. Once all three are removed the engines agree on about
+94% of the top 10. Treat the as-shipped overlap as the agreement of two default
+English pipelines, not as a BM25 implementation difference.
+
 Result JSON: `params.workload: "fulltext"` and `params.fulltext` (fields and
 boosts, query-term method, stopword list and provenance, the engine's analyzer /
 scorer / request, skipped queries, known differences). `--dump-results`
