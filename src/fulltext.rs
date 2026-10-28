@@ -38,7 +38,7 @@
 //! # Query construction
 //!
 //! The SAME term list is sent to both engines, derived once by
-//! [`query_terms`]: split on RediSearch's separators and all whitespace,
+//! [`query_terms`]: drop possessive `'s`, split on RediSearch's separators and all whitespace,
 //! lowercase, drop [`STOPWORDS`], drop duplicates, keep first-seen order.
 //! Splitting on RediSearch's own separator set is what makes a term safe to
 //! embed in a RediSearch query without escaping (every query-syntax character
@@ -100,8 +100,10 @@ pub const KNOWN_DIFFERENCES: [&str; 6] = [
      one token at each join; OpenSearch's standard tokenizer (UAX#29) splits on all whitespace \
      and Unicode punctuation",
     "tokenizer: RediSearch splits on '.', '-', '\\'' inside words ('u.s.a' -> u, s, a; \
-     'e-mail' -> e, mail; '3.5' -> 3, 5); OpenSearch keeps 'u.s.a' and '3.5' as single tokens \
-     and removes possessive 's",
+     'e-mail' -> e, mail; '3.5' -> 3, 5; \"dog's\" -> dog, s; \"don't\" -> don, t); OpenSearch \
+     keeps 'u.s.a', '3.5' and \"don't\" as single tokens and removes possessive 's. The query \
+     side drops possessive 's before splitting (so no bare `s` term is sent), but other \
+     apostrophes still split into the same terms on both engines",
     "stemming: RediSearch indexes the original token AND its stem and expands each query term \
      to both, so a term whose stem differs scores twice; Lucene indexes only the stem",
     "scoring: RediSearch BM25STD uses one term frequency and one document length for the whole \
@@ -124,6 +126,10 @@ pub const KNOWN_DIFFERENCES: [&str; 6] = [
 pub struct FulltextSpec {
     #[serde(default)]
     pub fields: Option<BTreeMap<String, f64>>,
+    /// OpenSearch only: accept an index with more than one shard (per-shard
+    /// BM25 statistics). Off by default; the shard count is always recorded.
+    #[serde(default)]
+    pub allow_multi_shard: bool,
 }
 
 /// Key of the block inside a search config.
@@ -226,10 +232,39 @@ fn is_separator(c: char) -> bool {
     c.is_whitespace() || REDISEARCH_SEPARATORS.contains(c)
 }
 
+/// Drop a possessive `'s` / `’s` (followed by the end or a non-alphanumeric
+/// character) before splitting. Splitting `dog's` on `'` would otherwise send
+/// the term `s` to both engines: on Redis it matches every possessive in the
+/// corpus (RediSearch indexes `'s` as a separate `s` token), on OpenSearch
+/// almost nothing (`possessive_english` removed them at index time). Stripping
+/// it on the query side, which both engines share, removes that asymmetry
+/// from the query; it mirrors what `possessive_english` does.
+pub fn strip_possessives(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let is_possessive = (c == '\'' || c == '\u{2019}')
+            && i > 0
+            && chars[i - 1].is_alphanumeric()
+            && chars.get(i + 1).is_some_and(|n| *n == 's' || *n == 'S')
+            && chars.get(i + 2).is_none_or(|n| !n.is_alphanumeric());
+        if is_possessive {
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// The query terms both engines receive (see the module docs).
 pub fn query_terms(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
-    text.split(is_separator)
+    strip_possessives(text)
+        .split(is_separator)
         .map(str::to_lowercase)
         .filter(|t| t.chars().any(char::is_alphanumeric))
         .filter(|t| !STOPWORDS.contains(&t.as_str()))
@@ -465,13 +500,67 @@ pub fn validate_redis_index(info: &Value, fields: &[FieldBoost]) -> Result<(), S
             .as_array()
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        for bad in ["NOSTEM", "NOINDEX"] {
-            if flags.contains(&bad) {
+        for bad in ["NOSTEM", "NOINDEX", "PHONETIC"] {
+            if flags.contains(&bad) || !attr[bad].is_null() {
                 return Err(format!(
-                    "fulltext: Redis field '{}' is {bad} — the pinned analyzer stems and indexes",
+                    "fulltext: Redis field '{}' is {bad} — the pinned analyzer stems, indexes \
+                     and matches terms exactly",
                     f.field
                 ));
             }
+        }
+    }
+    // Index-level settings `engine_settings("redis")` claims are pinned. Each
+    // changes stemming or BM25STD while the result would still say Porter2/BM25.
+    let def = &info["index_definition"];
+    if !def.is_object() {
+        return Err("fulltext: FT.INFO has no index_definition map (RESP3 expected)".into());
+    }
+    match &def["default_language"] {
+        Value::Null => {}
+        Value::String(l) if l.eq_ignore_ascii_case("english") => {}
+        other => {
+            return Err(format!(
+                "fulltext: Redis index LANGUAGE is {other} — the pinned stemmer is Snowball \
+                 English, the default"
+            ))
+        }
+    }
+    for key in ["language_field", "score_field", "payload_field"] {
+        if !def[key].is_null() {
+            return Err(format!(
+                "fulltext: Redis index sets {key} ({}) — per-document language or score \
+                 would change stemming or scale BM25STD",
+                def[key]
+            ));
+        }
+    }
+    let default_score = match &def["default_score"] {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    };
+    if default_score != Some(1.0) {
+        return Err(format!(
+            "fulltext: Redis index default_score is {} — BM25STD is multiplied by it, it must be 1",
+            def["default_score"]
+        ));
+    }
+    let options: Vec<&str> = match &info["index_options"] {
+        Value::Null => Vec::new(),
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        other => {
+            return Err(format!(
+                "fulltext: unreadable FT.INFO index_options {other}"
+            ))
+        }
+    };
+    for bad in ["NOFREQS", "NOOFFSETS", "NOFIELDS"] {
+        if options.contains(&bad) {
+            return Err(format!(
+                "fulltext: Redis index was built with {bad} — the pinned index keeps term \
+                 frequencies (BM25STD), field flags (@field clauses) and term offsets"
+            ));
         }
     }
     let stop = info["stopwords_list"].as_array().ok_or(
@@ -491,11 +580,18 @@ pub fn validate_redis_index(info: &Value, fields: &[FieldBoost]) -> Result<(), S
 /// and that analyzer and its filters are exactly [`opensearch_analysis`].
 /// `properties` is `mappings.properties`, `index` is `settings.index` (as
 /// `GET _settings` returns it — scalars may come back as strings).
+///
+/// Also refused: a `char_filter` on the analyzer, a non-BM25 similarity (per
+/// field or `index.similarity`), and more than one shard unless
+/// `allow_multi_shard` (Lucene IDF and length norms are per shard, so a
+/// multi-shard index is compared against Redis on per-shard statistics).
+/// Returns the index's shard count, for the result metadata.
 pub fn validate_opensearch_index(
     properties: &Value,
     index: &Value,
     fields: &[FieldBoost],
-) -> Result<(), String> {
+    allow_multi_shard: bool,
+) -> Result<u64, String> {
     for f in fields {
         let m = &properties[&f.field];
         if m.is_null() {
@@ -526,12 +622,64 @@ pub fn validate_opensearch_index(
                 f.field
             ));
         }
+        if !(m["similarity"].is_null() || m["similarity"] == "BM25") {
+            return Err(format!(
+                "fulltext: OpenSearch field '{}' uses similarity {} — the pinned scorer is \
+                 Lucene BM25",
+                f.field, m["similarity"]
+            ));
+        }
+    }
+    // `index.similarity` may only restate the default BM25, without parameters.
+    if let Some(sims) = index["similarity"].as_object() {
+        let default_bm25 = |v: &Value| {
+            v.as_object()
+                .is_some_and(|o| o.len() == 1 && o.get("type") == Some(&json!("BM25")))
+        };
+        if sims.len() != 1 || !sims.get("default").is_some_and(default_bm25) {
+            return Err(format!(
+                "fulltext: OpenSearch index.similarity is {} — the pinned scorer is the default \
+                 Lucene BM25 (k1=1.2, b=0.75)",
+                index["similarity"]
+            ));
+        }
+    } else if !index["similarity"].is_null() {
+        return Err(format!(
+            "fulltext: unreadable OpenSearch index.similarity {}",
+            index["similarity"]
+        ));
+    }
+    let shards = match &index["number_of_shards"] {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        format!(
+            "fulltext: unreadable OpenSearch number_of_shards {}",
+            index["number_of_shards"]
+        )
+    })?;
+    if shards > 1 && !allow_multi_shard {
+        return Err(format!(
+            "fulltext: the OpenSearch index has {shards} shards — BM25 statistics are per \
+             shard, so set collection_params.number_of_shards to 1, or opt in with \
+             `fulltext.allow_multi_shard: true` (the shard count is recorded either way)"
+        ));
     }
     let want = opensearch_analysis();
     let got = &index["analysis"];
     let analyzer = &got["analyzer"][OPENSEARCH_ANALYZER];
     let a_want = &want["analyzer"][OPENSEARCH_ANALYZER];
-    if analyzer["tokenizer"] != a_want["tokenizer"] || analyzer["filter"] != a_want["filter"] {
+    let no_char_filter = match &analyzer["char_filter"] {
+        Value::Null => true,
+        Value::Array(a) => a.is_empty(),
+        _ => false,
+    };
+    if analyzer["tokenizer"] != a_want["tokenizer"]
+        || analyzer["filter"] != a_want["filter"]
+        || !no_char_filter
+    {
         return Err(format!(
             "fulltext: OpenSearch analyzer {OPENSEARCH_ANALYZER} is {analyzer} — expected {a_want}"
         ));
@@ -562,7 +710,7 @@ pub fn validate_opensearch_index(
             "fulltext: OpenSearch stop filter {OS_STOP} sets ignore_case"
         ));
     }
-    Ok(())
+    Ok(shards)
 }
 
 /// Streaming rank check: every score finite and none above its predecessor.
@@ -724,6 +872,10 @@ fn engine_settings(engine: &str) -> Result<Value, String> {
                 "tokenizer": "RediSearch default (separators: space, tab and the ASCII set in `query_terms.separators`)",
                 "stemmer": "RediSearch default: Snowball English (Porter2); LANGUAGE and NOSTEM not set",
                 "stopwords": "explicit FT.CREATE STOPWORDS 33 <pinned list> (identical to the RediSearch default)",
+                "verified_on_live_index": "FT.INFO before the timed window: each searched field TEXT, WEIGHT 1, \
+                    no NOSTEM/NOINDEX/PHONETIC; default_language absent or english; no language_field, \
+                    score_field or payload_field; default_score 1; index_options without NOFREQS, \
+                    NOOFFSETS, NOFIELDS; stopwords_list = the pinned list",
             },
             "query": "(@field:(t1|t2|…)) => {$weight: boost;} joined with |",
             "command": "FT.SEARCH <idx> <query> NOCONTENT WITHSCORES SCORER BM25STD LIMIT 0 <top> DIALECT 2 TIMEOUT <ms>",
@@ -736,6 +888,10 @@ fn engine_settings(engine: &str) -> Result<Value, String> {
                 "analyzer": OPENSEARCH_ANALYZER,
                 "analysis": opensearch_analysis(),
                 "note": "the built-in `english` analyzer with porter2 (Snowball English) instead of porter, and its empty keyword_marker dropped",
+                "verified_on_live_index": "_mapping + _settings before the timed window: each searched field \
+                    text, indexed, analyzer (and search analyzer) vdbb_english_porter2, similarity absent or BM25; \
+                    analyzer tokenizer/filters as pinned and no char_filter; filters as pinned; index.similarity \
+                    absent or a parameterless default BM25; number_of_shards 1 unless allow_multi_shard",
             },
             "query": {"multi_match": {"type": OPENSEARCH_MULTI_MATCH_TYPE, "operator": "or"}},
             "request": {"_source": false, "track_total_hits": false},
@@ -768,7 +924,7 @@ pub fn result_metadata(
         "boosts_applied": "query time, on both engines",
         "operator": "or",
         "query_terms": {
-            "method": "client side, identical for both engines: split on separators and all \
+            "method": "client side, identical for both engines: drop possessive 's, split on separators and all \
                        whitespace, lowercase, drop pinned stopwords, drop duplicates, keep order",
             "separators": REDISEARCH_SEPARATORS,
         },
@@ -844,7 +1000,16 @@ mod tests {
             query_terms("What is the U.S. e-mail rate, (2023)? Rate!"),
             vec!["what", "u", "s", "e", "mail", "rate", "2023"]
         );
-        assert_eq!(query_terms("dog's bone"), vec!["dog", "s", "bone"]);
+        // Possessive 's is dropped on the query side (both engines), so no
+        // bare `s` term reaches Redis; other apostrophes still split.
+        assert_eq!(query_terms("dog's bone"), vec!["dog", "bone"]);
+        assert_eq!(query_terms("DOG\u{2019}S bone's"), vec!["dog", "bone"]);
+        assert_eq!(
+            query_terms("don't sing 'solo' cats' s"),
+            vec!["don", "t", "sing", "solo", "cats", "s"]
+        );
+        assert_eq!(query_terms("it's"), Vec::<String>::new());
+        assert_eq!(query_terms("'s"), vec!["s"]);
         assert!(query_terms("the a an IS ... --").is_empty());
         // Newlines and other whitespace separate on the query side.
         assert_eq!(
@@ -1007,7 +1172,12 @@ mod tests {
     }
 
     fn redis_info(stop: Option<Vec<&str>>, attrs: Value) -> Value {
-        let mut v = json!({"attributes": attrs});
+        // The RESP3 shape of a default-built index (redis 8.8).
+        let mut v = json!({
+            "attributes": attrs,
+            "index_options": [],
+            "index_definition": {"key_type": "HASH", "prefixes": ["p:"], "default_score": 1.0},
+        });
         if let Some(s) = stop {
             v["stopwords_list"] = json!(s);
         }
@@ -1057,6 +1227,61 @@ mod tests {
         let mut a = good();
         a[0]["WEIGHT"] = json!(1);
         assert!(validate_redis_index(&redis_info(stop(), a), &fields).is_ok());
+        // PHONETIC field.
+        let mut a = good();
+        a[1]["PHONETIC"] = json!("dm:en");
+        assert!(validate_redis_index(&redis_info(stop(), a), &fields).is_err());
+    }
+
+    /// #339 review: every index-level claim of `engine_settings("redis")` is
+    /// verified on the live index, not only recorded.
+    #[test]
+    fn redis_index_language_options_and_scores_are_checked() {
+        let fields = [fb("title", 1.0)];
+        let info = || redis_info(Some(STOPWORDS.to_vec()), json!([text_attr("title")]));
+        assert!(validate_redis_index(&info(), &fields).is_ok());
+        // English stated explicitly is the default.
+        let mut i = info();
+        i["index_definition"]["default_language"] = json!("english");
+        assert!(validate_redis_index(&i, &fields).is_ok());
+        // String default_score (RESP2-converted) is read too.
+        let mut i = info();
+        i["index_definition"]["default_score"] = json!("1");
+        assert!(validate_redis_index(&i, &fields).is_ok());
+        for (key, value, needle) in [
+            ("default_language", json!("german"), "LANGUAGE"),
+            ("language_field", json!("lang"), "language_field"),
+            ("score_field", json!("s"), "score_field"),
+            ("payload_field", json!("pl"), "payload_field"),
+            ("default_score", json!(0.5), "default_score"),
+        ] {
+            let mut i = info();
+            i["index_definition"][key] = value;
+            let e = validate_redis_index(&i, &fields).unwrap_err();
+            assert!(e.contains(needle), "{key}: {e}");
+        }
+        let mut i = info();
+        i["index_definition"] = Value::Null;
+        assert!(validate_redis_index(&i, &fields).is_err());
+        let mut i = info();
+        i["index_definition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("default_score");
+        assert!(validate_redis_index(&i, &fields).is_err());
+        for opt in ["NOFREQS", "NOOFFSETS", "NOFIELDS"] {
+            let mut i = info();
+            i["index_options"] = json!(["NOHL", opt]);
+            let e = validate_redis_index(&i, &fields).unwrap_err();
+            assert!(e.contains(opt), "{e}");
+        }
+        // NOHL alone does not change matching or scoring.
+        let mut i = info();
+        i["index_options"] = json!(["NOHL"]);
+        assert!(validate_redis_index(&i, &fields).is_ok());
+        let mut i = info();
+        i["index_options"] = json!("NOFREQS");
+        assert!(validate_redis_index(&i, &fields).is_err());
     }
 
     /// The shape `GET _settings` returns: analysis as written, scalars strings.
@@ -1072,11 +1297,11 @@ mod tests {
     #[test]
     fn opensearch_index_must_have_every_field_as_pinned() {
         let fields = [fb("title", 5.0), fb("segment", 1.0)];
-        assert!(validate_opensearch_index(&os_props(), &os_index(), &fields).is_ok());
+        assert!(validate_opensearch_index(&os_props(), &os_index(), &fields, false).is_ok());
         // Missing field -> hard error.
         let mut p = os_props();
         p.as_object_mut().unwrap().remove("segment");
-        let e = validate_opensearch_index(&p, &os_index(), &fields).unwrap_err();
+        let e = validate_opensearch_index(&p, &os_index(), &fields, false).unwrap_err();
         assert!(
             e.contains("'segment' is not in the OpenSearch mapping"),
             "{e}"
@@ -1084,37 +1309,93 @@ mod tests {
         // Default (standard) analyzer.
         let mut p = os_props();
         p["title"] = json!({"type":"text"});
-        assert!(validate_opensearch_index(&p, &os_index(), &fields).is_err());
+        assert!(validate_opensearch_index(&p, &os_index(), &fields, false).is_err());
         // Different search analyzer.
         let mut p = os_props();
         p["title"]["search_analyzer"] = json!("standard");
-        assert!(validate_opensearch_index(&p, &os_index(), &fields).is_err());
+        assert!(validate_opensearch_index(&p, &os_index(), &fields, false).is_err());
         // keyword instead of text.
         let mut p = os_props();
         p["title"]["type"] = json!("keyword");
-        assert!(validate_opensearch_index(&p, &os_index(), &fields).is_err());
+        assert!(validate_opensearch_index(&p, &os_index(), &fields, false).is_err());
         // Porter (english) instead of porter2.
         let mut i = os_index();
         i["analysis"]["filter"][OS_STEMMER]["language"] = json!("english");
-        assert!(validate_opensearch_index(&os_props(), &i, &fields).is_err());
+        assert!(validate_opensearch_index(&os_props(), &i, &fields, false).is_err());
         // Filter order changed (stemming before stop).
         let mut i = os_index();
         i["analysis"]["analyzer"][OPENSEARCH_ANALYZER]["filter"] =
             json!([OS_POSSESSIVE, "lowercase", OS_STEMMER, OS_STOP]);
-        assert!(validate_opensearch_index(&os_props(), &i, &fields).is_err());
+        assert!(validate_opensearch_index(&os_props(), &i, &fields, false).is_err());
         // `_english_` by name, or a different list.
         let mut i = os_index();
         i["analysis"]["filter"][OS_STOP]["stopwords"] = json!("_english_");
-        assert!(validate_opensearch_index(&os_props(), &i, &fields).is_err());
+        assert!(validate_opensearch_index(&os_props(), &i, &fields, false).is_err());
         let mut i = os_index();
         i["analysis"]["filter"][OS_STOP]["stopwords"][0] = json!("hello");
-        assert!(validate_opensearch_index(&os_props(), &i, &fields).is_err());
+        assert!(validate_opensearch_index(&os_props(), &i, &fields, false).is_err());
         let mut i = os_index();
         i["analysis"]["filter"][OS_STOP]["ignore_case"] = json!("true");
-        assert!(validate_opensearch_index(&os_props(), &i, &fields).is_err());
+        assert!(validate_opensearch_index(&os_props(), &i, &fields, false).is_err());
         // No analysis at all (index built for a vector-only config).
         let i = json!({"number_of_shards":"1"});
-        assert!(validate_opensearch_index(&os_props(), &i, &fields).is_err());
+        assert!(validate_opensearch_index(&os_props(), &i, &fields, false).is_err());
+    }
+
+    /// #339 review: char filters, non-BM25 similarities and multi-shard
+    /// statistics are refused; the shard count is returned for the metadata.
+    #[test]
+    fn opensearch_index_char_filter_similarity_and_shards_are_checked() {
+        let fields = [fb("title", 5.0), fb("segment", 1.0)];
+        let ok = |p: &Value, i: &Value| validate_opensearch_index(p, i, &fields, false);
+        assert_eq!(ok(&os_props(), &os_index()), Ok(1));
+        // A char filter (e.g. mapping '\n' to a space).
+        let mut i = os_index();
+        i["analysis"]["analyzer"][OPENSEARCH_ANALYZER]["char_filter"] = json!(["nl"]);
+        assert!(ok(&os_props(), &i).is_err());
+        let mut i = os_index();
+        i["analysis"]["analyzer"][OPENSEARCH_ANALYZER]["char_filter"] = json!([]);
+        assert!(ok(&os_props(), &i).is_ok());
+        // Per-field similarity.
+        let mut p = os_props();
+        p["segment"]["similarity"] = json!("boolean");
+        assert!(ok(&p, &os_index()).unwrap_err().contains("similarity"));
+        let mut p = os_props();
+        p["segment"]["similarity"] = json!("BM25");
+        assert!(ok(&p, &os_index()).is_ok());
+        // Index-level similarity: only a parameterless default BM25.
+        let mut i = os_index();
+        i["similarity"] = json!({"default": {"type": "BM25"}});
+        assert!(ok(&os_props(), &i).is_ok());
+        for sim in [
+            json!({"default": {"type": "boolean"}}),
+            json!({"default": {"type": "BM25", "k1": "2.0"}}),
+            json!({"default": {"type": "BM25"}, "custom": {"type": "DFR"}}),
+            json!({"custom": {"type": "BM25"}}),
+            json!("BM25"),
+        ] {
+            let mut i = os_index();
+            i["similarity"] = sim.clone();
+            assert!(ok(&os_props(), &i).is_err(), "{sim}");
+        }
+        // Shards: more than one refused unless opted in; unreadable refused.
+        let mut i = os_index();
+        i["number_of_shards"] = json!("3");
+        assert!(ok(&os_props(), &i).unwrap_err().contains("3 shards"));
+        assert_eq!(
+            validate_opensearch_index(&os_props(), &i, &fields, true),
+            Ok(3)
+        );
+        let mut i = os_index();
+        i.as_object_mut().unwrap().remove("number_of_shards");
+        assert!(ok(&os_props(), &i).is_err());
+        // The opt-in is a spec key, off by default.
+        assert!(!parse_spec(None).unwrap().allow_multi_shard);
+        assert!(
+            parse_spec(Some(&json!({"allow_multi_shard": true})))
+                .unwrap()
+                .allow_multi_shard
+        );
     }
 
     /// Both modes must agree on validity and count; only `keep` returns hits.

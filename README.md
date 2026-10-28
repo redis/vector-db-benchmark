@@ -398,7 +398,7 @@ dataset schema, an unknown key, a boost that is not a finite number > 0, or a
 files carry no recall/precision keys.
 
 **Queries.** Both engines receive the same term list, derived client-side:
-split on RediSearch's separator set and all whitespace, lowercase, drop the
+drop possessive `'s`, split on RediSearch's separator set and all whitespace, lowercase, drop the
 pinned stopwords and duplicates. Terms are OR-ed. A query with no term left is
 skipped on both engines and listed in `params.fulltext.queries_skipped_no_terms`.
 Boosts are applied at query time on both sides, so one index serves every
@@ -431,11 +431,24 @@ search config. Fulltext uses the vector index layout (the one that indexes
 `text` fields), so it may share an engine config with `vector` configs — which
 then also see the pinned analyzer in any text `match` filter — but not with
 `filter-only` (different layout, refused by `workload::plan`). The fulltext
-arm refuses to start when a searched field is missing from the live index, is
-not a stemmed TEXT field with index weight 1 (Redis) / a `text` field analyzed
-by `vdbb_english_porter2` (OpenSearch), or the index's stopwords or analyzer
-differ from the pinned ones — e.g. an index built by a vector-only config and
-reused with `--skip-upload`.
+arm refuses to start when a searched field is missing from the live index, or
+when the live index differs from anything `params.fulltext.engine_settings`
+claims — e.g. an index built by a vector-only config and reused with
+`--skip-upload`:
+
+- Redis (`FT.INFO`): each searched field TEXT, index WEIGHT 1, no
+  NOSTEM / NOINDEX / PHONETIC; default language absent or English; no
+  LANGUAGE_FIELD / SCORE_FIELD / PAYLOAD_FIELD; default score 1; no NOFREQS /
+  NOOFFSETS / NOFIELDS; `stopwords_list` equal to the pinned list.
+- OpenSearch (`_mapping`, `_settings`): each searched field `text`, indexed,
+  analyzed (and search-analyzed) by `vdbb_english_porter2`, similarity absent
+  or `BM25`; the analyzer's tokenizer and filters as pinned and no
+  `char_filter`; `index.similarity` absent or a parameterless default BM25;
+  one shard. Lucene IDF and length norms are per shard, so a multi-shard index
+  is refused unless the search config sets `"allow_multi_shard": true` in its
+  `fulltext` block; the live shard count is recorded as
+  `params.fulltext.number_of_shards` either way. (`dfs_query_then_fetch` would
+  globalize IDF but adds a round trip to every timed query, so it is not used.)
 
 **What cannot be pinned** (published as `params.fulltext.known_differences`):
 

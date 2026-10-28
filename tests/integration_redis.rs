@@ -4847,8 +4847,40 @@ fn test_binary_redis_fulltext_refuses_unpinned_or_incomplete_index() {
         run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
         "'body' is not in the Redis index",
     );
-    // The same index with only its own fields searches fine.
+    // #339 review: index-level settings read from the live FT.INFO. Rebuild
+    // the same index (same name and prefix, pinned stopwords, docs kept) with
+    // one setting the result metadata says is not set, and reuse it.
     write_config(&proj.root, fulltext(serde_json::json!({"title": 1.0})));
+    let index = format!("idx:{name}");
+    let stopwords: Vec<&str> = vector_db_benchmark::fulltext::STOPWORDS.to_vec();
+    for (setting, needle) in [
+        (&["LANGUAGE", "german"][..], "LANGUAGE"),
+        (&["NOFREQS"][..], "NOFREQS"),
+        (&["SCORE_FIELD", "s"][..], "score_field"),
+    ] {
+        let _ = redis::cmd("FT.DROPINDEX")
+            .arg(&index)
+            .query::<()>(&mut conn);
+        redis::cmd("FT.CREATE")
+            .arg(&index)
+            .arg(&["ON", "HASH", "PREFIX", "1", &format!("{name}:")][..])
+            .arg(setting)
+            .arg("STOPWORDS")
+            .arg(stopwords.len())
+            .arg(&stopwords)
+            .arg(&["SCHEMA", "title", "TEXT", "SORTABLE"][..])
+            .query::<()>(&mut conn)
+            .unwrap();
+        refused(
+            run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+            needle,
+        );
+    }
+    // Rebuilt by the tool: the same index with only its own fields searches fine.
+    let _ = redis::cmd("FT.DROPINDEX")
+        .arg(&index)
+        .query::<()>(&mut conn);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
     let ok = run(&["--skip-upload", "--exit-on-error"]);
     assert!(
         ok.status.success(),

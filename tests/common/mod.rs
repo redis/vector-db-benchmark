@@ -3144,11 +3144,15 @@ pub fn assert_bm25_run(root: &Path, dump: &Path, engine: &str, config: &str) {
         assert!(!ft["known_differences"].as_array().unwrap().is_empty());
         match engine {
             "redis" => assert_eq!(ft["engine_settings"]["scorer"], "BM25STD"),
-            _ => assert_eq!(
-                ft["engine_settings"]["index"]["analysis"]["filter"]
-                    ["vdbb_english_porter2_stemmer"]["language"],
-                "porter2"
-            ),
+            _ => {
+                assert_eq!(
+                    ft["engine_settings"]["index"]["analysis"]["filter"]
+                        ["vdbb_english_porter2_stemmer"]["language"],
+                    "porter2"
+                );
+                // Read back from the live index, not the config.
+                assert_eq!(ft["number_of_shards"], 1);
+            }
         }
         let r = &doc["results"];
         assert_eq!(r["requested_queries"], 4, "termless query not dispatched");

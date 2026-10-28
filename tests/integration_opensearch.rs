@@ -1727,6 +1727,36 @@ fn test_binary_opensearch_fulltext_refuses_unpinned_or_incomplete_index() {
         "{}",
         String::from_utf8_lossy(&ok.stderr)
     );
+
+    // #339 review: a 2-shard index (per-shard BM25 statistics) is refused
+    // unless the config opts in; the opt-in records the live shard count.
+    common::write_bm25_registry(&proj.root, false);
+    let two_shards = |search_params: serde_json::Value| {
+        std::fs::write(
+            proj.root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "opensearch",
+                "collection_params": {"number_of_shards": 2},
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    two_shards(fulltext(serde_json::json!({"title": 1.0})));
+    refused(run(&["--keep-data", "--exit-on-error"]), "2 shards");
+    common::clear_result_files(&proj.root);
+    two_shards(
+        serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"title": 1.0}, "allow_multi_shard": true}}]),
+    );
+    let ok = run(&["--skip-upload", "--exit-on-error"]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let doc = common::read_result_doc(&proj.root, name);
+    assert_eq!(doc["params"]["fulltext"]["number_of_shards"], 2);
+    assert_eq!(doc["params"]["fulltext"]["allow_multi_shard"], true);
     let _ = os_client()
         .delete(format!("{}/{index}", os_base_url()))
         .send();

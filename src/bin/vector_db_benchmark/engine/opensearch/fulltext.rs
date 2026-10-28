@@ -46,7 +46,11 @@ impl OpenSearchEngine {
         index_settings["analysis"] = fulltext::opensearch_analysis();
     }
 
-    fn validate_fulltext_index(&self, fields: &[fulltext::FieldBoost]) -> Result<(), String> {
+    fn validate_fulltext_index(
+        &self,
+        fields: &[fulltext::FieldBoost],
+        allow_multi_shard: bool,
+    ) -> Result<u64, String> {
         let (mapping, settings) = self
             .rt
             .block_on(async {
@@ -75,6 +79,7 @@ impl OpenSearchEngine {
             &mapping[&self.index_name]["mappings"]["properties"],
             &settings[&self.index_name]["settings"]["index"],
             fields,
+            allow_multi_shard,
         )
     }
 
@@ -95,7 +100,7 @@ impl OpenSearchEngine {
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
-        self.validate_fulltext_index(&fields)?;
+        let shards = self.validate_fulltext_index(&fields, spec.allow_multi_shard)?;
 
         let texts = fulltext::read_query_texts(&dataset.get_path()?)?;
         let set = fulltext::build_query_set(&texts)?;
@@ -263,6 +268,9 @@ impl OpenSearchEngine {
         result.query_records = captured;
         let mut meta = fulltext::result_metadata("opensearch", &fields, &set, top)?;
         meta["retried_queries"] = serde_json::json!(retried_queries);
+        // Read back from the live index (`_settings`), not from the config.
+        meta["number_of_shards"] = serde_json::json!(shards);
+        meta["allow_multi_shard"] = serde_json::json!(spec.allow_multi_shard);
         result.fulltext = Some(meta);
         Ok(result)
     }
