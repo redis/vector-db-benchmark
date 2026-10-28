@@ -221,9 +221,8 @@ fn scalar_unsupported_duplicates_are_skipped_before_selection_and_exact_collisio
     assert!(!stderr.contains("same index namespace"), "{stderr}");
 }
 
-/// #344: a workload the engine has no arm for — or a config mixing index
-/// layouts — is refused at startup, before any download or connection, and is
-/// never run as the vector workload instead.
+/// #344: a workload the engine has no arm for is refused at startup, before
+/// any download or connection, and is never run as the vector workload instead.
 #[test]
 fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
     use serde_json::json;
@@ -234,13 +233,10 @@ fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
             false,
             "not implemented",
         ),
-        // #339: fulltext shares the vector layout, not filter-only's.
-        (
-            "opensearch",
-            json!([{"workload":"fulltext"}, {"workload":"filter-only"}]),
-            false,
-            "#344",
-        ),
+        // A config mixing filter-only with vector-index workloads is no longer
+        // refused on Redis/OpenSearch: it builds the shared `full` index (#344,
+        // covered by the engines' integration suites). Elsewhere filter-only is
+        // not implemented, which is refused first.
         // #339: a `fulltext` block is refused on another workload, and a
         // misspelled key or a non-positive boost is refused before connecting.
         (
@@ -293,12 +289,6 @@ fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
             json!([{"workload":"filter-only"}]),
             false,
             "not implemented",
-        ),
-        (
-            "redis",
-            json!([{}, {"workload":"filter-only"}]),
-            false,
-            "#344",
         ),
         (
             "redis",
@@ -389,6 +379,7 @@ fn compare_results_self_passes_and_a_one_sided_answer_fails() {
             id_space: IdSpace::Field {
                 field: "docid".into(),
             },
+            index_layout: None,
         };
         let records: Vec<QueryRecord> = (0..3)
             .map(|q| QueryRecord {
@@ -606,6 +597,82 @@ fn calibration_on_declared_filter_only_is_refused_at_startup() {
     assert!(!output.status.success(), "{stdout}");
     assert!(stderr.contains("calibration_param"), "{stderr}");
     assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+}
+
+/// #344 review: `--update-search-ratio` with a non-vector search config in the
+/// engine config — filter-only on the shared `full` index, or fulltext next to
+/// vector — is refused at startup (closed port, undownloadable corpus), not
+/// when the mixed phase reaches that config, which used to discard every
+/// completed pure-search result. `0:S` (pure search, no mixed phase) is not
+/// refused by this check.
+#[test]
+fn update_search_ratio_with_a_non_vector_search_config_fails_before_connecting() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let datasets = root.path().join("datasets");
+    std::fs::create_dir(&datasets).unwrap();
+    std::fs::write(
+        datasets.join("datasets.json"),
+        json!([{
+            "name":"usr-fixture", "type":"tar", "path":"missing-corpus",
+            "vector_size":1,"distance":"l2","schema":{"tag":"keyword","title":"text"},
+            "link":"http://127.0.0.1:9/must-not-download.tar.gz"
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let engines_file = root.path().join("engines.json");
+    std::fs::write(
+        &engines_file,
+        json!([
+            {"name":"usr-full","engine":"redis","search_params":[
+                {"parallel":1},{"parallel":1,"workload":"filter-only"}]},
+            {"name":"usr-text","engine":"opensearch","search_params":[
+                {"parallel":1},{"parallel":1,"workload":"fulltext"}]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let run = |config: &str, ratio: &str| {
+        Command::new(common::binary_path())
+            .current_dir(root.path())
+            .args([
+                "--engines",
+                config,
+                "--datasets",
+                "usr-fixture",
+                "--host",
+                "127.0.0.1",
+                "--update-search-ratio",
+                ratio,
+                "--engines-file",
+            ])
+            .arg(&engines_file)
+            .env("REDIS_PORT", "9")
+            .env("OPENSEARCH_PORT", "9")
+            .output()
+            .unwrap()
+    };
+    for (config, workload) in [("usr-full", "filter-only"), ("usr-text", "fulltext")] {
+        let output = run(config, "1:10");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{config}: {stdout}");
+        assert!(
+            stderr.contains(&format!(
+                "config '{config}': --update-search-ratio runs the vector workload in its \
+                 mixed phases, but search config #1 is \"{workload}\""
+            )),
+            "{config}: {stderr}"
+        );
+        assert!(!stdout.contains("Experiment stage:"), "{config}: {stdout}");
+        assert!(!stdout.contains("Running experiment"), "{config}: {stdout}");
+    }
+    // Pure search only: this check does not fire (the run then fails on the
+    // missing corpus / closed port, which is not what is tested here).
+    let output = run("usr-full", "0:5");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("--update-search-ratio runs"), "{stderr}");
 }
 
 /// #339 review: refusals that happen before anything touches the server (a

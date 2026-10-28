@@ -1019,6 +1019,7 @@ impl Engine for DragonflyEngine {
             batch_size: self.config.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: None,
         })
     }
 

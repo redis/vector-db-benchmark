@@ -90,7 +90,9 @@ src/
   msmarco.rs          # MS MARCO corpus prep: sampling, oracle, NPY writers (unit-tested)
   query_filter.rs     # The ONE door from a dataset's `conditions` JSON to a filter (#219)
   metrics.rs          # recall / precision / MRR / NDCG — see the metric-naming note below
-  workload.rs         # per-search-config workload + engine/workload table (#344)
+  workload.rs         # per-search-config workload + engine/workload table, index layouts
+                      #   incl. the shared `full` one (#344)
+  ingest.rs           # ingestion phases (upload / index wait / total) on one clock (#344)
   results_dump.rs     # per-query record contract, --dump-results JSONL (#343)
   fulltext.rs         # ranked BM25 workload: query terms, pinned analyzers, index checks (#339)
   compare_results.rs  # compare-results: overlap/Jaccard/rank/count vs a reference

@@ -37,12 +37,34 @@
 //! [`verify_result_shape`]). That is what catches an arm that quietly ran the
 //! vector path under another workload's name.
 //!
-//! # Index layout
+//! # Index layout: one ingest, many workloads (#344)
 //!
-//! This step does NOT build the shared `full` schema (#344 second half). An
-//! index is built in one [`IndexLayout`], so all search configs of one engine
-//! config must need the same layout; mixing `filter-only` with any other
-//! workload in one config is refused by [`plan`] until that schema exists.
+//! All search configs of one engine config run against ONE index, built once
+//! by `configure()` + `upload()`. [`plan`] picks the layout that index needs
+//! from the workloads its search configs declare ([`combine_layouts`]):
+//!
+//! | workloads                                   | layout                    |
+//! |---------------------------------------------|---------------------------|
+//! | only vector / hybrid / fulltext             | [`IndexLayout::Vector`]   |
+//! | only filter-only (or `--skip-vector-index`) | [`IndexLayout::NoVector`] |
+//! | filter-only + any of the others             | [`IndexLayout::Full`]     |
+//!
+//! `Full` is the union: the vector field and the text fields exactly as in
+//! `Vector`, and the scalar fields typed the way the filter-only contract
+//! needs them (Redis `TAG CASESENSITIVE`, OpenSearch `double` for `float`). A
+//! single-workload config keeps the layout it had before `Full` existed. A
+//! filter-only search on a `Full` index still sends no vector clause: every
+//! request is checked, as it will be sent, before the timed run
+//! ([`crate::filter_only::check_opensearch_body`] on the request body,
+//! [`crate::filter_only::check_redis_command`] on the FT.SEARCH arguments)
+//! and the result
+//! records `filter_only.index_layout`.
+//!
+//! Because `Full` types tags case-sensitively on Redis (and floats as `double`
+//! on OpenSearch), a vector/hybrid filter on a `Full` index matches exactly
+//! what the filter-only contract matches, which can differ from the same
+//! config on a `Vector` index for mixed-case tags. Every search result
+//! therefore records `params.index_layout`.
 
 use serde::{Deserialize, Serialize};
 
@@ -97,8 +119,9 @@ impl Workload {
             // Fulltext runs on the vector layout: it is the one whose schema
             // indexes `text` fields (Redis `TEXT SORTABLE`, OpenSearch `text`),
             // while the no-vector layout refuses them (CASESENSITIVE tags,
-            // scalar-only schema checks). So vector + fulltext may share one
-            // engine config; filter-only + fulltext may not (#339). An engine
+            // scalar-only schema checks). So vector + fulltext share the
+            // vector layout; filter-only + fulltext share the `full` layout
+            // (#344, see `combine_layouts`). An engine
             // config with a fulltext search config builds its text fields with
             // the pinned analyzer (`crate::fulltext`), which then also governs
             // any text `match` filter its vector configs run.
@@ -126,11 +149,92 @@ impl std::str::FromStr for Workload {
 }
 
 /// What the configure phase builds. Maps onto the engines' existing
-/// `skip_vector_index` switch: `NoVector` == `skip_vector_index = true`.
+/// `skip_vector_index` switch (`NoVector` == `skip_vector_index = true`) and
+/// the runtime-only `full_index_layout` engine-config flag (`Full`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexLayout {
+    /// Vector field + every declared schema field: what every
+    /// vector/hybrid/fulltext config has always built.
     Vector,
+    /// No indexed vector field; scalar fields typed for the filter-only
+    /// contract (#328).
     NoVector,
+    /// The union (#344): `Vector` with its scalar fields typed as in
+    /// `NoVector`, so filter-only shares the index with the vector-index
+    /// workloads. Built only when an engine config mixes them.
+    Full,
+}
+
+impl IndexLayout {
+    /// Spelling used in result files (`params.index_layout`,
+    /// `filter_only.index_layout`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexLayout::Vector => "vector",
+            IndexLayout::NoVector => "no-vector",
+            IndexLayout::Full => "full",
+        }
+    }
+
+    /// Whether `workload` can run on an index built in this layout.
+    pub fn serves(self, workload: Workload) -> bool {
+        self == IndexLayout::Full || workload.required_layout() == self
+    }
+}
+
+impl std::fmt::Display for IndexLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The layout an engine config's two flags select: `skip_vector_index`
+/// (`NoVector`) and the runtime-only `full_index_layout` (`Full`). Both at once
+/// is contradictory — a full index HAS a vector field — and is refused rather
+/// than letting one flag silently win.
+pub fn layout_from_flags(
+    skip_vector_index: bool,
+    full_index_layout: bool,
+) -> Result<IndexLayout, String> {
+    match (skip_vector_index, full_index_layout) {
+        (true, true) => Err(
+            "engine config sets both skip_vector_index and the full index layout; the full \
+             layout indexes the vector field (#344)"
+                .into(),
+        ),
+        (true, false) => Ok(IndexLayout::NoVector),
+        (false, true) => Ok(IndexLayout::Full),
+        (false, false) => Ok(IndexLayout::Vector),
+    }
+}
+
+/// Engines whose `configure()` can build [`IndexLayout::Full`]. An engine
+/// added here must build the union schema, accept filter-only on it (checking
+/// the realized schema, and that no request carries a vector clause), and
+/// stamp `filter_only.index_layout`.
+pub fn supports_full_layout(engine_type: &str) -> bool {
+    matches!(engine_type, "redis" | "opensearch")
+}
+
+/// The one layout an index must have to serve every workload in `workloads`
+/// (see the module docs). Mixing workloads that need the vector layout with
+/// ones that need the no-vector layout needs [`IndexLayout::Full`], which only
+/// [`supports_full_layout`] engines build; anywhere else the mix is refused
+/// with the reason, before anything is downloaded or connected.
+pub fn combine_layouts(engine_type: &str, workloads: &[Workload]) -> Result<IndexLayout, String> {
+    let needing = |l: IndexLayout| workloads.iter().find(|w| w.required_layout() == l);
+    match (needing(IndexLayout::Vector), needing(IndexLayout::NoVector)) {
+        (Some(_), Some(_)) if supports_full_layout(engine_type) => Ok(IndexLayout::Full),
+        (Some(v), Some(nv)) => Err(format!(
+            "engine config mixes workloads \"{v}\" and \"{nv}\", which need a vector index and \
+             a no-vector index; engine '{engine_type}' cannot build the shared `full` index \
+             (#344), which exists for redis and opensearch only — split them into separate \
+             engine configs"
+        )),
+        (None, Some(_)) => Ok(IndexLayout::NoVector),
+        // No search configs at all still builds the vector layout.
+        (_, None) => Ok(IndexLayout::Vector),
+    }
 }
 
 /// The workloads each engine has a contract-conforming code path for — what a
@@ -211,6 +315,48 @@ pub fn check_calibration(
     Ok(())
 }
 
+/// Whether `--ef-runtime` (`ef_filter`; empty = no filter) keeps a search
+/// config. EF is a vector-index knob, so filter-only configs are never
+/// dropped by it — on `no-vector` and on the shared `full` layout alike
+/// (#344). Every other workload is kept unless it declares an `ef` that is
+/// not in the filter.
+pub fn ef_runtime_keeps(workload: Workload, ef: Option<i64>, ef_filter: &[i64]) -> bool {
+    if ef_filter.is_empty() || workload == Workload::FilterOnly {
+        return true;
+    }
+    ef.is_none_or(|ef| ef_filter.contains(&ef))
+}
+
+/// `--update-search-ratio` mixed phases interleave VECTOR searches with
+/// updates; any other workload would be measured as something it is not. A
+/// config that holds one must be refused at startup, before any download or
+/// connection — not when the mixed phase reaches it, which returns before
+/// the completed pure-search results are written (#344 review). This covers
+/// the shared `full` layout (filter-only + vector) and vector + fulltext /
+/// hybrid on the `vector` layout.
+///
+/// The `no-vector` layout is exempt: it holds only filter-only, and the run
+/// keeps skipping its mixed phases as it always has (there are no vector
+/// updates to benchmark there).
+pub fn check_update_search_ratio(plan: &WorkloadPlan, has_ratio: bool) -> Result<(), String> {
+    if !has_ratio || plan.layout == IndexLayout::NoVector {
+        return Ok(());
+    }
+    match plan
+        .workloads
+        .iter()
+        .enumerate()
+        .find(|(_, w)| **w != Workload::Vector)
+    {
+        Some((i, w)) => Err(format!(
+            "--update-search-ratio runs the vector workload in its mixed phases, but search \
+             config #{i} is \"{w}\"; run the non-vector search configs in a separate engine \
+             config without --update-search-ratio"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Engines whose pre-#328 filter-only harness is reachable ONLY through the
 /// process-wide `--skip-vector-index` flag. Their results keep the legacy shape:
 /// no `filter_only` stats, `mean_precision_at_returned == -1.0` as the
@@ -261,8 +407,8 @@ impl WorkloadPlan {
 ///
 /// Errors (all before any download or connection):
 /// - a workload the engine has no arm for (see [`implemented`]);
-/// - search configs needing different index layouts (needs #344's `full`
-///   schema);
+/// - search configs needing different index layouts on an engine that cannot
+///   build the shared `full` index ([`combine_layouts`]);
 /// - `--skip-vector-index` with a declared non-`filter-only` workload.
 pub fn plan(
     engine_type: &str,
@@ -303,21 +449,7 @@ pub fn plan(
     let layout = if skip_vector_index {
         IndexLayout::NoVector
     } else {
-        let mut layouts = workloads.iter().map(|w| (w, w.required_layout()));
-        match layouts.next() {
-            None => IndexLayout::Vector,
-            Some((first_w, first)) => {
-                if let Some((w, _)) = layouts.find(|(_, l)| *l != first) {
-                    return Err(format!(
-                        "engine config mixes workloads \"{first_w}\" and \"{w}\", which need \
-                         different index layouts; one index serving both needs the shared \
-                         `full` schema (#344), which does not exist yet — split them into \
-                         separate engine configs"
-                    ));
-                }
-                first
-            }
-        }
+        combine_layouts(engine_type, &workloads)?
     };
     Ok(WorkloadPlan {
         engine_type: engine_type.to_string(),
@@ -481,6 +613,48 @@ mod tests {
         assert!(!dispatchable("qdrant", Workload::FilterOnly));
     }
 
+    /// #344 review: a non-vector search config next to `--update-search-ratio`
+    /// is refused at plan time, on `full` (filter-only + vector) and on
+    /// `vector` (vector + fulltext) alike; only-vector configs and the
+    /// no-vector layout (which skips its mixed phases) are unaffected.
+    #[test]
+    fn update_search_ratio_refuses_non_vector_search_configs_up_front() {
+        let full = plan("redis", &[None, Some(Workload::FilterOnly)], false).unwrap();
+        assert_eq!(full.layout, IndexLayout::Full);
+        let e = check_update_search_ratio(&full, true).unwrap_err();
+        assert!(e.contains("search config #1 is \"filter-only\""), "{e}");
+        check_update_search_ratio(&full, false).unwrap();
+        let text = plan("opensearch", &[None, Some(Workload::Fulltext)], false).unwrap();
+        assert_eq!(text.layout, IndexLayout::Vector);
+        let e = check_update_search_ratio(&text, true).unwrap_err();
+        assert!(e.contains("search config #1 is \"fulltext\""), "{e}");
+        check_update_search_ratio(&plan("redis", &[None, None], false).unwrap(), true).unwrap();
+        let no_vector = plan("redis", &[Some(Workload::FilterOnly)], false).unwrap();
+        assert_eq!(no_vector.layout, IndexLayout::NoVector);
+        check_update_search_ratio(&no_vector, true).unwrap();
+        check_update_search_ratio(&plan("redis", &[None], true).unwrap(), true).unwrap();
+    }
+
+    /// #344 review: `--ef-runtime` never drops a filter-only config (EF is a
+    /// vector-index knob), keyed on the workload so `full` behaves like
+    /// `no-vector`; other workloads keep the old rule.
+    #[test]
+    fn ef_runtime_filter_is_keyed_on_the_workload() {
+        let filter = [64, 128];
+        for ef in [None, Some(64), Some(512)] {
+            assert!(
+                ef_runtime_keeps(Workload::FilterOnly, ef, &filter),
+                "{ef:?}"
+            );
+            assert!(ef_runtime_keeps(Workload::Vector, ef, &[]), "{ef:?}");
+        }
+        for w in [Workload::Vector, Workload::Hybrid, Workload::Fulltext] {
+            assert!(ef_runtime_keeps(w, Some(128), &filter));
+            assert!(!ef_runtime_keeps(w, Some(512), &filter), "{w}");
+            assert!(ef_runtime_keeps(w, None, &filter), "{w}");
+        }
+    }
+
     #[test]
     fn capture_is_checked_per_engine_and_workload() {
         let ok = plan("redis", &[None, None], false).unwrap();
@@ -535,24 +709,102 @@ mod tests {
     }
 
     #[test]
-    fn mixed_layouts_are_refused_until_the_full_schema_exists() {
-        let e = plan("redis", &[None, Some(Workload::FilterOnly)], false).unwrap_err();
-        assert!(e.contains("#344"), "{e}");
-        // Fulltext needs the vector layout's TEXT fields: it cannot share an
-        // index with filter-only, and can with vector (#339).
+    fn mixing_filter_only_with_vector_index_workloads_builds_the_full_layout() {
         for engine in ["redis", "opensearch"] {
-            let e = plan(
+            let p = plan(engine, &[None, Some(Workload::FilterOnly)], false).unwrap();
+            assert_eq!(p.layout, IndexLayout::Full, "{engine}");
+            let p = plan(
                 engine,
-                &[Some(Workload::Fulltext), Some(Workload::FilterOnly)],
+                &[
+                    Some(Workload::Fulltext),
+                    Some(Workload::FilterOnly),
+                    Some(Workload::Vector),
+                ],
                 false,
             )
-            .unwrap_err();
-            assert!(e.contains("#344"), "{e}");
+            .unwrap();
+            assert_eq!(p.layout, IndexLayout::Full, "{engine}");
+            assert_eq!(
+                p.workloads,
+                vec![Workload::Fulltext, Workload::FilterOnly, Workload::Vector]
+            );
+            // Single-layout configs keep their pre-#344 layout: `Full` is only
+            // ever built for a mix.
             let p = plan(engine, &[None, Some(Workload::Fulltext)], false).unwrap();
             assert_eq!(p.layout, IndexLayout::Vector);
             assert_eq!(p.workloads, vec![Workload::Vector, Workload::Fulltext]);
+            let p = plan(engine, &[Some(Workload::FilterOnly); 2], false).unwrap();
+            assert_eq!(p.layout, IndexLayout::NoVector);
         }
+        // The flag is still "every config is filter-only", never a mix.
         assert!(plan("redis", &[Some(Workload::Fulltext)], true).is_err());
+    }
+
+    #[test]
+    fn combine_layouts_is_the_union_only_where_the_engine_builds_it() {
+        use Workload::*;
+        // Every workload needing the vector layout, mixed with filter-only.
+        for w in [Vector, Hybrid, Fulltext] {
+            for engine in ["redis", "opensearch"] {
+                assert_eq!(
+                    combine_layouts(engine, &[w, FilterOnly]).unwrap(),
+                    IndexLayout::Full
+                );
+                assert_eq!(
+                    combine_layouts(engine, &[FilterOnly, w]).unwrap(),
+                    IndexLayout::Full
+                );
+            }
+            // An engine that cannot build `full` gets a reasoned refusal.
+            for engine in ["qdrant", "valkey", "mongodb", "elasticsearch"] {
+                let e = combine_layouts(engine, &[w, FilterOnly]).unwrap_err();
+                assert!(e.contains("#344") && e.contains(engine), "{e}");
+                assert!(!supports_full_layout(engine));
+            }
+            assert_eq!(
+                combine_layouts("qdrant", &[w, w]).unwrap(),
+                IndexLayout::Vector
+            );
+        }
+        assert_eq!(
+            combine_layouts("qdrant", &[FilterOnly]).unwrap(),
+            IndexLayout::NoVector
+        );
+        assert_eq!(combine_layouts("redis", &[]).unwrap(), IndexLayout::Vector);
+    }
+
+    #[test]
+    fn engine_flags_select_one_layout_and_refuse_the_contradiction() {
+        assert_eq!(
+            layout_from_flags(false, false).unwrap(),
+            IndexLayout::Vector
+        );
+        assert_eq!(
+            layout_from_flags(true, false).unwrap(),
+            IndexLayout::NoVector
+        );
+        assert_eq!(layout_from_flags(false, true).unwrap(), IndexLayout::Full);
+        assert!(layout_from_flags(true, true).unwrap_err().contains("both"));
+    }
+
+    #[test]
+    fn full_layout_serves_every_workload_and_the_others_only_their_own() {
+        for w in Workload::ALL {
+            assert!(IndexLayout::Full.serves(w), "{w}");
+            assert_eq!(
+                IndexLayout::NoVector.serves(w),
+                w == Workload::FilterOnly,
+                "{w}"
+            );
+            assert_eq!(
+                IndexLayout::Vector.serves(w),
+                w != Workload::FilterOnly,
+                "{w}"
+            );
+        }
+        assert_eq!(IndexLayout::Full.as_str(), "full");
+        assert_eq!(IndexLayout::NoVector.to_string(), "no-vector");
+        assert_eq!(IndexLayout::Vector.as_str(), "vector");
     }
 
     #[test]

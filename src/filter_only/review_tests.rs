@@ -451,6 +451,7 @@ fn scalar_stats_roundtrip_keeps_exact_integer_counts() {
         returned_documents_sum: 0,
         retried_queries: 7,
         per_query_counts_checked: Some(u64::MAX),
+        index_layout: None,
     };
     let encoded = serde_json::to_value(&stats).unwrap();
     let decoded: Stats = serde_json::from_value(encoded).unwrap();

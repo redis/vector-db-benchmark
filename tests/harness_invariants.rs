@@ -693,7 +693,10 @@ fn inv_p5_shared_helpers_must_not_wipe_a_server() {
                 .into_owned()
         })
         .collect();
-    let expected: BTreeSet<String> = ["mod.rs"].iter().map(|s| s.to_string()).collect();
+    let expected: BTreeSet<String> = ["mod.rs", "shared_index.rs"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(
         names, expected,
         "the set of shared helper files under tests/common/ changed; add it here \

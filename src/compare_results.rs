@@ -39,7 +39,7 @@
 //! (parallel, k). An `ef` / `M` sweep in one directory collides and is refused;
 //! pass the two files to compare explicitly.
 
-use crate::results_dump::{first_answers, Dump, IdSpace, QueryRecord};
+use crate::results_dump::{first_answers, Dump, DumpHeader, IdSpace, QueryRecord};
 use crate::workload::Workload;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -102,6 +102,10 @@ pub struct PairReport {
     pub one_sided: Vec<OneSided>,
     /// Attempted by at least one side, answered by neither.
     pub unanswered_by_both: Vec<usize>,
+    /// Differences that do not fail the comparison but qualify it (e.g.
+    /// the two sides ran on different index layouts, #344).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -220,6 +224,18 @@ fn side_info(file: &str, d: &Dump) -> SideInfo {
 }
 
 /// Compare one candidate dump against one reference dump.
+/// The index layout a dump's queries ran on, and whether it was inferred. A
+/// dump written before #344 has no `index_layout`; then only two layouts
+/// existed — filter-only ran on `no-vector`, every other workload on
+/// `vector` — so the header's workload determines it.
+fn dump_layout(header: &DumpHeader) -> (String, bool) {
+    match &header.index_layout {
+        Some(layout) => (layout.clone(), false),
+        None if header.workload == Workload::FilterOnly => ("no-vector".into(), true),
+        None => ("vector".into(), true),
+    }
+}
+
 pub fn compare_pair(
     reference: (&str, &Dump),
     candidate: (&str, &Dump),
@@ -310,6 +326,29 @@ pub fn compare_pair(
         .map(|(shape, qs)| shape_report(shape, workload, k, &qs))
         .collect();
 
+    let mut warnings = Vec::new();
+    let ((rl, r_inferred), (cl, c_inferred)) = (dump_layout(rh), dump_layout(ch));
+    {
+        // `full` and `no-vector` type scalars the same way (filter-only's
+        // CASESENSITIVE tags / `double` floats); only `vector` differs.
+        if (rl == "vector") != (cl == "vector") {
+            let tag = |inferred: bool| {
+                if inferred {
+                    " (inferred: pre-#344 dump)"
+                } else {
+                    ""
+                }
+            };
+            let (rt, ct) = (tag(r_inferred), tag(c_inferred));
+            warnings.push(format!(
+                "{rf} ran on the `{rl}` index layout{rt} and {cf} on `{cl}`{ct}, so filtered results \
+                 may disagree (#344): on Redis, `full` / `no-vector` index tags \
+                 CASESENSITIVE and `vector` does not (mixed-case tag predicates); on \
+                 OpenSearch, `full` / `no-vector` map float fields as `double` and `vector` \
+                 as `float` (range predicates on values closer than binary32 precision)"
+            ));
+        }
+    }
     Ok(PairReport {
         dataset: rh.dataset.clone(),
         workload,
@@ -319,6 +358,7 @@ pub fn compare_pair(
         shapes,
         one_sided,
         unanswered_by_both: neither,
+        warnings,
     })
 }
 
@@ -545,6 +585,13 @@ pub fn render_markdown(r: &Report) -> String {
             ));
         }
     }
+    let warnings: Vec<&String> = r.pairs.iter().flat_map(|p| &p.warnings).collect();
+    if !warnings.is_empty() {
+        s.push_str("\n**Warning** (does not fail the comparison):\n\n");
+        for w in warnings {
+            s.push_str(&format!("- {w}\n"));
+        }
+    }
     if !r.unpaired.is_empty() {
         s.push_str(&format!(
             "\n**FAILED** (unless --allow-unpaired): {} dump(s) with no counterpart on the other \
@@ -593,7 +640,7 @@ pub fn render_markdown(r: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::results_dump::{DumpHeader, DUMP_SCHEMA_VERSION};
+    use crate::results_dump::DUMP_SCHEMA_VERSION;
 
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -625,6 +672,7 @@ mod tests {
                 top: 4,
                 search_id: 0,
                 id_space: IdSpace::Row,
+                index_layout: None,
             },
             records,
         }
@@ -817,6 +865,78 @@ mod tests {
         assert_eq!(c.fraction, Some(0.5));
         assert_eq!(c.complete_pages, 1);
         assert_eq!(c.complete_page_set_agreement, Some(1.0));
+    }
+
+    /// #344: a `vector`-layout and a `full`-layout run can legitimately differ
+    /// on mixed-case tag predicates, so the pair is compared but flagged.
+    #[test]
+    fn different_index_layouts_are_compared_with_a_warning() {
+        let mut a = vector_dump("opensearch");
+        let mut b = vector_dump("redis");
+        let same = compare_pair(("a", &a), ("b", &b)).unwrap();
+        assert!(same.warnings.is_empty());
+        a.header.index_layout = Some("full".into());
+        b.header.index_layout = Some("full".into());
+        assert!(compare_pair(("a", &a), ("b", &b))
+            .unwrap()
+            .warnings
+            .is_empty());
+        // `full` and `no-vector` type scalars the same way: no warning.
+        b.header.index_layout = Some("no-vector".into());
+        assert!(compare_pair(("a", &a), ("b", &b))
+            .unwrap()
+            .warnings
+            .is_empty());
+        // A pre-#344 dump (no `index_layout`): its layout is inferred from
+        // the workload — a vector dump ran on `vector` — so it warns against
+        // `full`, and says the layout was inferred.
+        b.header.index_layout = None;
+        let w = compare_pair(("a", &a), ("b", &b)).unwrap().warnings;
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("`vector` (inferred: pre-#344 dump)"), "{w:?}");
+        // Two pre-#344 vector dumps: both `vector`, no warning.
+        let old = vector_dump("redis");
+        assert!(compare_pair(("o", &old), ("b", &b))
+            .unwrap()
+            .warnings
+            .is_empty());
+        // A pre-#344 filter-only dump ran on `no-vector`: like `full`.
+        let mut fo_old = vector_dump("redis");
+        fo_old.header.workload = Workload::FilterOnly;
+        let mut fo_full = fo_old.clone();
+        fo_full.header.index_layout = Some("full".into());
+        assert_eq!(dump_layout(&fo_old.header), ("no-vector".to_string(), true));
+        assert_eq!(dump_layout(&fo_full.header), ("full".to_string(), false));
+        b.header.index_layout = Some("vector".into());
+        let report = compare(
+            &[("a".into(), a.clone())],
+            &[("b".into(), b.clone())],
+            "opensearch",
+        )
+        .unwrap();
+        let w = &report.pairs[0].warnings;
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("`full`") && w[0].contains("`vector`"),
+            "{w:?}"
+        );
+        // Both engines' causes are named: Redis tag case, OpenSearch float width.
+        assert!(
+            w[0].contains("CASESENSITIVE") && w[0].contains("`double`"),
+            "{w:?}"
+        );
+        assert!(report.passed(), "a warning does not fail the comparison");
+        let md = render_markdown(&report);
+        assert!(md.contains("**Warning**") && md.contains(&w[0]), "{md}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["pairs"][0]["warnings"][0], w[0]);
+        // The header round-trips; a pre-#344 header without the key still reads.
+        let header = serde_json::to_value(&a.header).unwrap();
+        assert_eq!(header["index_layout"], "full");
+        let mut old = header.clone();
+        old.as_object_mut().unwrap().remove("index_layout");
+        let parsed: DumpHeader = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.index_layout, None);
     }
 
     #[test]

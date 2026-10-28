@@ -233,6 +233,37 @@ pub fn run(args: &Args) -> Result<(), String> {
             args.skip_vector_index,
         )
         .map_err(|e| format!("config '{name}': {e}"))?;
+        // `0:S` is pure search; only a ratio with updates runs a mixed phase.
+        let mixed_phases = args
+            .update_search_ratio
+            .iter()
+            .map(|s| parse_update_search_ratio(s).map(|r| r.updates > 0))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|mixed| mixed);
+        vector_db_benchmark::workload::check_update_search_ratio(&plan, mixed_phases)
+            .map_err(|e| format!("config '{name}': {e}"))?;
+        // A conflicting filter-only result limit on the shared index is refused
+        // here, before any download; the search stage applies the same rule.
+        if plan.layout == IndexLayout::Full {
+            vector_db_benchmark::filter_only::mixed_search_param_indices(
+                config
+                    .search_params
+                    .iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(i, sp)| {
+                        Ok((
+                            plan.workload(i)? == Workload::FilterOnly,
+                            sp.parallel,
+                            sp.top,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                Some(vector_db_benchmark::filter_only::DEFAULT_LIMIT as i64),
+            )
+            .map_err(|e| format!("config '{name}': {e}"))?;
+        }
         if args.dump_results.is_some() {
             vector_db_benchmark::workload::check_capture(&plan)
                 .map_err(|e| format!("config '{name}': {e}"))?;
@@ -439,6 +470,9 @@ pub fn run(args: &Args) -> Result<(), String> {
         if plan.layout == IndexLayout::NoVector {
             engine_config.skip_vector_index = true;
         }
+        // One shared index for a config mixing filter-only with vector-index
+        // workloads (#344); `plan` only picks it for engines that build it.
+        engine_config.full_index_layout = plan.layout == IndexLayout::Full;
         if args.skip_vector_index {
             let engine_type = engine_config.engine.as_deref().unwrap_or("unknown");
             engine_config.name = format!("{}-no-vector", engine_type);
@@ -1348,6 +1382,7 @@ fn run_single_experiment(
             &dataset.config.name,
             &upload_stats,
             number_of_shards,
+            plan,
         )?;
     } else {
         // `--skip-upload` means: the server already holds the corpus I want —
@@ -1373,6 +1408,12 @@ fn run_single_experiment(
         // the real corpus sits untouched under the original config name.
         corpus_reuse = check_corpus_reuse_precondition(engine, dataset, args, no_vector_layout)?;
     }
+
+    // The index every search config is about to run on must be the layout the
+    // results will be labelled with (#344) — checked once, before any search
+    // config, so a reused index of the wrong layout fails before anything is
+    // written, whatever order the search configs are declared in.
+    engine.check_index_layout(dataset, plan.layout)?;
 
     // Build ordered search phases: pure search first, then mixed ratios ascending
     let search_phases: Vec<Option<UpdateSearchRatio>> = if args.update_search_ratio.is_empty() {
@@ -1573,6 +1614,27 @@ fn run_single_experiment(
             .into_iter()
             .map(|index| (index, all_search_params[index].clone()))
             .collect()
+        } else if plan.layout == IndexLayout::Full {
+            // #344: the filter-only configs on the shared index follow the
+            // no-vector rule above; the other workloads run as declared.
+            vector_db_benchmark::filter_only::mixed_search_param_indices(
+                all_search_params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sp)| {
+                        Ok((
+                            plan.workload(i)? == Workload::FilterOnly,
+                            sp.parallel,
+                            sp.top,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                // `full` exists on Redis and OpenSearch only: the fixed default.
+                Some(vector_db_benchmark::filter_only::DEFAULT_LIMIT as i64),
+            )?
+            .into_iter()
+            .map(|index| (index, all_search_params[index].clone()))
+            .collect()
         } else {
             all_search_params.into_iter().enumerate().collect()
         };
@@ -1606,19 +1668,18 @@ fn run_single_experiment(
                     }
                 }
 
-                // Filter by ef_runtime if specified (irrelevant for skip_vector_index)
-                if !skip_vector_index && !args.ef_runtime.is_empty() {
-                    if let Some(ref inner) = search_params.search_params {
-                        if let Some(ef) = inner.ef {
-                            if !args.ef_runtime.contains(&ef) {
-                                continue;
-                            }
-                        }
-                    }
+                let workload = plan.workload(*search_id)?;
+                // Filter by ef_runtime if specified; EF never drops a
+                // filter-only config, on `no-vector` or on `full` (#344).
+                if !vector_db_benchmark::workload::ef_runtime_keeps(
+                    workload,
+                    search_params.search_params.as_ref().and_then(|s| s.ef),
+                    &args.ef_runtime,
+                ) {
+                    continue;
                 }
 
                 let parallel = search_params.parallel.unwrap_or(1);
-                let workload = plan.workload(*search_id)?;
                 // Mixed phases interleave VECTOR searches with updates; any other
                 // workload there would be measured as something it is not.
                 if phase.is_some() && workload != Workload::Vector {
@@ -1720,7 +1781,9 @@ fn run_single_experiment(
                     runtime_params.max_lateness_ms = Some(args.max_lateness_ms);
                 }
                 let effective_params = &runtime_params;
-                let effective_ef = if skip_vector_index {
+                // Per search config, not per index: on the shared `full` index
+                // (#344) a filter-only config sits next to vector ones.
+                let effective_ef = if workload == Workload::FilterOnly {
                     "n/a".to_string()
                 } else {
                     effective_params
@@ -1731,7 +1794,7 @@ fn run_single_experiment(
                         .unwrap_or_else(|| "default".to_string())
                 };
 
-                if skip_vector_index {
+                if workload == Workload::FilterOnly {
                     println!(
                         "\tRunning filter-only search {}: parallel={}",
                         search_id, parallel
@@ -1924,8 +1987,11 @@ fn run_single_experiment(
                 }
 
                 match best {
-                    Some(results) => {
-                        if skip_vector_index {
+                    Some(mut results) => {
+                        // Every workload of this config ran on the one index
+                        // the plan's layout built (#344).
+                        results.index_layout = Some(plan.layout);
+                        if workload == Workload::FilterOnly {
                             println!("\t→ QPS: {:.1} (filter-only, no precision)", results.rps);
                         } else {
                             println!(
@@ -2550,6 +2616,7 @@ fn write_query_dumps(
             top: results.top,
             search_id: *search_id,
             id_space: ids.space(),
+            index_layout: results.index_layout.map(|l| l.as_str().to_string()),
         };
         let path = dir.join(dump::dump_file_name(&header));
         let file = fs::OpenOptions::new()
@@ -2739,6 +2806,11 @@ fn build_search_result_json(
     // The workload the dispatch point actually ran (#344), on every result.
     if let Some(workload) = results.workload {
         result["params"]["workload"] = serde_json::json!(workload.as_str());
+    }
+    // The index it ran on (#344): "full" means one ingest served this config's
+    // other workloads too, and its scalar fields are typed for filter-only.
+    if let Some(layout) = results.index_layout {
+        result["params"]["index_layout"] = serde_json::json!(layout.as_str());
     }
     // #343 review: a --dump-results run's rps includes the per-query capture
     // work (outside each latency sample, inside the throughput window). Say so
@@ -2939,6 +3011,7 @@ fn save_upload_results(
     dataset_name: &str,
     stats: &crate::engine::UploadStats,
     number_of_shards: Option<&serde_json::Value>,
+    plan: &WorkloadPlan,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let filename = format!(
@@ -2946,14 +3019,16 @@ fn save_upload_results(
         engine_name, dataset_name, stats.upload_count, timestamp
     );
 
+    check_upload_phases(stats)?;
     crate::effective_config::set_phase("upload");
-    let result = build_upload_result_json(
+    let mut result = build_upload_result_json(
         engine_name,
         dataset_name,
         stats,
         number_of_shards,
         &crate::effective_config::snapshot(),
     );
+    stamp_shared_index(&mut result, plan);
 
     let path = results_dir().join(&filename);
     fs::write(&path, serde_json::to_string_pretty(&result).unwrap())
@@ -2961,6 +3036,31 @@ fn save_upload_results(
 
     println!("Results saved to: {:?}", path);
     Ok(())
+}
+
+/// Refuse to publish ingest phases that are not the measurement the legacy
+/// keys report (#344): a phase report whose `upload_time` or `total_time`
+/// disagrees with the engine's would put two different ingests in one file.
+fn check_upload_phases(stats: &crate::engine::UploadStats) -> Result<(), String> {
+    match &stats.ingest_phases {
+        Some(p) => p.check_legacy_fields(stats.upload_time, stats.total_time),
+        None => Ok(()),
+    }
+}
+
+/// Record which index this upload built and which workloads it serves
+/// (#344): `params.index_layout` and `params.index_workloads` (the distinct
+/// workloads of the engine config's search configs, in first-declared order).
+/// The search files of the same experiment carry the same `index_layout`.
+fn stamp_shared_index(result: &mut serde_json::Value, plan: &WorkloadPlan) {
+    let mut workloads: Vec<&str> = Vec::new();
+    for w in &plan.workloads {
+        if !workloads.contains(&w.as_str()) {
+            workloads.push(w.as_str());
+        }
+    }
+    result["params"]["index_layout"] = json!(plan.layout.as_str());
+    result["params"]["index_workloads"] = json!(workloads);
 }
 
 /// Build the upload-result JSON document. Split out for the same reason as
@@ -3004,6 +3104,14 @@ fn build_upload_result_json(
         result["results"]["index_searchable_count"] = json!(coverage.searchable);
         result["results"]["index_expected_count"] = json!(coverage.expected);
         result["results"]["index_coverage_fraction"] = json!(coverage.fraction());
+    }
+
+    // Ingestion as phases (#344): `read_time`, `index_wait_time`,
+    // `total_ingest_time`, docs/s and the timestamped boundaries, NEXT TO the
+    // legacy `upload_time` / `total_time`, which keep their meaning. Absent for
+    // engines that do not report phases — absence reads as "unreported".
+    if let Some(phases) = &stats.ingest_phases {
+        phases.write_into(&mut result["results"]);
     }
 
     // Same provenance block as the search files (#212), tagged `phase: "upload"`.
@@ -4733,6 +4841,7 @@ mod filter_only_serialization_tests {
                         returned_documents_sum: 6,
                         retried_queries: 0,
                         per_query_counts_checked: None,
+                        index_layout: None,
                     }),
                     // What `engine::search_workload` stamps on every result.
                     workload: Some(if scalar {
@@ -4989,3 +5098,7 @@ mod p90_publication_tests {
         assert!(close(got("p99_time"), 0.09901));
     }
 }
+
+#[cfg(test)]
+#[path = "experiment/shared_index_tests.rs"]
+mod shared_index_tests;

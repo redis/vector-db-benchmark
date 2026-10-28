@@ -12,6 +12,9 @@
 
 #![allow(dead_code)]
 
+/// One ingest, many workloads (#344) fixture and assertions.
+pub mod shared_index;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1991,6 +1994,23 @@ pub fn read_params_obj(root: &Path, engine: &str) -> serde_json::Value {
     read_result_doc(root, engine)["params"].clone()
 }
 
+/// The one result file under `results/` whose name matches `pattern` (a glob).
+pub fn read_result_file(root: &Path, pattern: &str) -> serde_json::Value {
+    let glob = glob::Pattern::new(pattern).unwrap();
+    let paths: Vec<_> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| glob.matches(&p.file_name().unwrap().to_string_lossy()))
+        .collect();
+    assert_eq!(
+        paths.len(),
+        1,
+        "expected one result file for {pattern}: {paths:?}"
+    );
+    serde_json::from_str(&fs::read_to_string(&paths[0]).unwrap()).unwrap()
+}
+
 /// The whole search-result document for `engine`.
 pub fn read_result_doc(root: &Path, engine: &str) -> serde_json::Value {
     let pattern = format!("{}-*-search-*.json", engine);
@@ -3608,6 +3628,58 @@ pub fn write_msmarco_filter_project(engine_configs_json: &str) -> MsmarcoFilterP
 /// expected total, with `docid` external ids.
 pub fn assert_msmarco_filter_run(p: &MsmarcoFilterProject, engine: &str, n: usize, dump: &Path) {
     let doc = read_result_doc(&p.root, engine);
+    let dumps = read_dumps(dump);
+    assert_eq!(dumps.len(), 1);
+    assert_msmarco_filter_result(p, &doc, n, &dumps[0]);
+}
+
+/// [`assert_msmarco_filter_run`] for a mixed engine config on the shared
+/// `full` index (#344): among its search results and dumps, the filter-only
+/// ones pass the same checks and say they ran on `full`, beside a vector
+/// result on the same index. Returns the filter-only result document.
+pub fn assert_msmarco_full_run(
+    p: &MsmarcoFilterProject,
+    n: usize,
+    dump: &Path,
+) -> serde_json::Value {
+    let docs: Vec<serde_json::Value> = fs::read_dir(p.root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|f| {
+            f.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-search-")
+        })
+        .map(|f| serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap())
+        .collect();
+    assert_eq!(docs.len(), 2, "one vector and one filter-only result");
+    let by = |w: &str| {
+        docs.iter()
+            .find(|d| d["params"]["workload"] == w)
+            .unwrap_or_else(|| panic!("no {w} result"))
+            .clone()
+    };
+    let (vector, filter) = (by("vector"), by("filter-only"));
+    assert_eq!(vector["params"]["index_layout"], "full", "{vector}");
+    assert_eq!(filter["params"]["index_layout"], "full", "{filter}");
+    assert_eq!(filter["results"]["filter_only"]["index_layout"], "full");
+    let dumps = read_dumps(dump);
+    let d = dumps
+        .iter()
+        .find(|d| d.header.workload == vector_db_benchmark::workload::Workload::FilterOnly)
+        .expect("a filter-only dump");
+    assert_eq!(d.header.index_layout.as_deref(), Some("full"));
+    assert_msmarco_filter_result(p, &filter, n, d);
+    filter
+}
+
+fn assert_msmarco_filter_result(
+    p: &MsmarcoFilterProject,
+    doc: &serde_json::Value,
+    n: usize,
+    d: &vector_db_benchmark::results_dump::Dump,
+) {
     let r = &doc["results"];
     assert_eq!(doc["params"]["workload"], "filter-only");
     assert_eq!(r["requested_queries"], n as u64);
@@ -3615,9 +3687,6 @@ pub fn assert_msmarco_filter_run(p: &MsmarcoFilterProject, engine: &str, n: usiz
     assert_eq!(r["filter_only"]["retried_queries"], 0);
     assert_eq!(r["filter_only"]["per_query_counts_checked"], n as u64);
     assert_eq!(r["filter_only"]["matched_documents_sum"], p.cycled_total(n));
-    let dumps = read_dumps(dump);
-    assert_eq!(dumps.len(), 1);
-    let d = &dumps[0];
     assert_eq!(d.records.len(), n);
     assert_eq!(
         d.header.id_space,

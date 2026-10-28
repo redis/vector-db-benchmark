@@ -28,6 +28,7 @@ use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
+use vector_db_benchmark::workload::{IndexLayout, Workload};
 
 /// Ranked full-text workload (#339).
 mod fulltext;
@@ -42,6 +43,11 @@ pub struct RedisEngineConfig {
     pub batch_size: usize,
     pub parallel: usize,
     pub skip_vector_index: bool,
+    /// The index layout `configure()` builds (#344), resolved once from the
+    /// engine flags: `vector`, `no-vector` (`skip_vector_index`) or the shared
+    /// `full` one (the vector layout with TAG fields `CASESENSITIVE` as
+    /// filter-only needs them). Every layout-dependent decision reads this.
+    pub layout: vector_db_benchmark::workload::IndexLayout,
     /// SVS-VAMANA build params, resolved once in `new()` with precedence
     /// `collection_params.svs-vamana_config` > env (`REDIS_SVS_*`) > derived.
     /// `None` graph/window → derive from `m`*2 / `ef_construction` at FT.CREATE.
@@ -297,6 +303,10 @@ impl RedisEngine {
                 batch_size,
                 parallel,
                 skip_vector_index: engine_config.skip_vector_index,
+                layout: vector_db_benchmark::workload::layout_from_flags(
+                    engine_config.skip_vector_index,
+                    engine_config.full_index_layout,
+                )?,
                 svs_graph_max_degree,
                 svs_construction_window_size,
                 svs_compression,
@@ -466,7 +476,9 @@ impl RedisEngine {
                         // keyword treatment so exact TAG matching works.
                         "keyword" | "uuid" | "bool" => {
                             cmd.arg(field_name).arg("TAG").arg("SEPARATOR").arg(";");
-                            if self.config.skip_vector_index {
+                            // Filter-only's exact-match contract, on its own
+                            // index or on the shared `full` one (#344).
+                            if self.config.layout.serves(Workload::FilterOnly) {
                                 cmd.arg("CASESENSITIVE");
                             }
                             cmd.arg("SORTABLE").arg("UNF");
@@ -874,10 +886,15 @@ impl RedisEngine {
                 .arg(&self.config.index_name)
                 .query(&mut conn)
                 .map_err(|e| format!("filter-only schema check failed: {e}"))?;
-            vector_db_benchmark::filter_only::validate_redis_schema(
-                &redis_value_to_json(&info),
-                index_schema.as_ref(),
-            )?;
+            // The realized layout must be the one this config built: no VECTOR
+            // on the no-vector index, a VECTOR plus filter-only scalar typing
+            // on the shared `full` one (#344).
+            let validate = if self.config.layout == IndexLayout::Full {
+                vector_db_benchmark::filter_only::validate_redis_full_schema
+            } else {
+                vector_db_benchmark::filter_only::validate_redis_schema
+            };
+            validate(&redis_value_to_json(&info), index_schema.as_ref())?;
         }
         if !self.scalar_metadata_validated {
             dataset.validate_scalar_metadata()?;
@@ -914,6 +931,12 @@ impl RedisEngine {
                 })
             })
             .unzip();
+        // No filter-only command may carry a vector clause — on the `full`
+        // layout the index would serve it (#344). Every command exactly as it
+        // will be sent, checked before anything is timed.
+        for cmd in &commands {
+            check_filter_only_command(cmd)?;
+        }
         let capture = params.capture_query_results;
         let key_prefix = self.config.key_prefix.as_str();
         let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
@@ -1133,8 +1156,14 @@ impl RedisEngine {
             returned_documents_sum: returned_sum,
             retried_queries: 0,
             per_query_counts_checked,
+            index_layout: Some(self.index_layout().as_str().to_string()),
         });
         Ok(result)
+    }
+
+    /// The layout `configure()` builds for this config (#344).
+    fn index_layout(&self) -> vector_db_benchmark::workload::IndexLayout {
+        self.config.layout
     }
 
     fn create_progress_bar(&self, total: usize) -> ProgressBar {
@@ -1742,6 +1771,21 @@ fn build_condition(
 
 // ── FT.SEARCH ────────────────────────────────────────────────────────────
 
+/// [`vector_db_benchmark::filter_only::check_redis_command`] over a built
+/// command's arguments, exactly as they go on the wire.
+fn check_filter_only_command(cmd: &redis::Cmd) -> Result<(), String> {
+    let args: Vec<&[u8]> = cmd
+        .args_iter()
+        .map(|a| match a {
+            redis::Arg::Simple(bytes) => bytes,
+            // A cursor (or any future non-literal) argument is not part of
+            // the metadata shape: the placeholder fails the check.
+            _ => b"<non-literal argument>".as_slice(),
+        })
+        .collect();
+    vector_db_benchmark::filter_only::check_redis_command(&args)
+}
+
 /// Execute filter-only FT.SEARCH (no KNN vector query).
 fn build_filter_only_command(
     index_name: &str,
@@ -2143,6 +2187,16 @@ impl Engine for RedisEngine {
                 "Using algorithm {} with config {{'M': {}, 'EF_CONSTRUCTION': {}}}",
                 self.config.algorithm, self.config.m, self.config.ef_construction
             );
+            if self.config.layout == IndexLayout::Full {
+                println!(
+                    "Building the shared `full` index (#344): vector + text + CASESENSITIVE \
+                     TAG + NUMERIC, one ingest for every workload of this config"
+                );
+                println!(
+                    "  note: on this index vector/hybrid tag filters match CASE-SENSITIVELY \
+                     (unlike the `vector` layout); results record params.index_layout=full"
+                );
+            }
         }
 
         self.create_index(&mut conn, dataset)?;
@@ -2169,6 +2223,18 @@ impl Engine for RedisEngine {
                 let mut conn = self.get_connection()?;
                 let existing = count_prefix_keys(&mut conn, &self.config.key_prefix);
                 if shared_corpus_is_complete(existing, expected) {
+                    // The same pre-upload gate as the upload path below (#344
+                    // review): an earlier config (e.g. a `vector` one, which
+                    // does not check filter-only's metadata domain) may have
+                    // uploaded this corpus. Streams the metadata only — the
+                    // one extra read on this path — so a bad token is refused
+                    // here, before this config writes any result.
+                    if self.config.layout.serves(Workload::FilterOnly)
+                        && !self.scalar_metadata_validated
+                    {
+                        dataset.validate_scalar_metadata()?;
+                        self.scalar_metadata_validated = true;
+                    }
                     println!(
                         "Shared corpus already populated ({existing}/{expected} keys under prefix \
                          '{}'); skipping re-upload (#188 upload-once/build-many).",
@@ -2187,21 +2253,29 @@ impl Engine for RedisEngine {
                     // time is part of ingest cost for every other config, so it
                     // is counted in total_time here too (upload_time stays 0 —
                     // the corpus really was uploaded once).
-                    let index_start = Instant::now();
+                    // Phases (#344): an explicitly zero-length upload phase,
+                    // then the backfill. `upload_time` is exactly 0.0, so
+                    // `upload_docs_per_sec` is null rather than docs / ~1µs.
+                    let clock = vector_db_benchmark::ingest::IngestClock::without_upload();
                     self.wait_for_indexing(existing)?;
-                    let index_time = index_start.elapsed().as_secs_f64();
+                    let phases = clock.index_ready(
+                        existing,
+                        0.0,
+                        vector_db_benchmark::ingest::IndexWait::RedisPercentIndexed,
+                    )?;
                     println!(
                         "Index time (backfill over the shared corpus): {:.3}s",
-                        index_time
+                        phases.index_wait_time
                     );
                     return Ok(UploadStats {
                         upload_time: 0.0,
-                        total_time: index_time,
+                        total_time: phases.total_ingest_time,
                         upload_count: existing,
                         parallel: self.config.parallel,
                         batch_size: self.config.batch_size,
                         memory_usage: None,
                         index_coverage: None,
+                        ingest_phases: Some(phases),
                     });
                 }
             }
@@ -2216,7 +2290,12 @@ impl Engine for RedisEngine {
         // #339 parity: normalize newlines in the indexed text fields before
         // anything is sent (recorded in the index marker by configure()).
         self.normalize_fulltext_upload(&mut metadata)?;
-        if self.config.skip_vector_index {
+        // Filter-only's metadata domain (no `;` / edge whitespace in tags, no
+        // -0.0, ...) is checked before anything is sent whenever the index
+        // will serve filter-only — on `no-vector` AND on the shared `full`
+        // index (#344), so a bad token is refused before the upload, not at
+        // the first filter-only search after other configs wrote results.
+        if self.config.layout.serves(Workload::FilterOnly) {
             vector_db_benchmark::filter_only::domain::validate_metadata(
                 &metadata,
                 dataset.filter_only_index_schema()?.as_ref(),
@@ -2237,7 +2316,9 @@ impl Engine for RedisEngine {
             "Starting upload with {} threads, batch size {}...",
             self.config.parallel, self.config.batch_size
         );
-        let upload_start = Instant::now();
+        // One clock for both ingest phases (#344), so they sum to the wall time
+        // from the first batch to index-ready.
+        let mut clock = vector_db_benchmark::ingest::IngestClock::start();
 
         if self.config.parallel <= 1 {
             self.upload_sequential(&ids, &vectors, &metadata)?;
@@ -2245,7 +2326,7 @@ impl Engine for RedisEngine {
             self.upload_parallel(&ids, &vectors, &metadata)?;
         }
 
-        let upload_time = upload_start.elapsed().as_secs_f64();
+        let upload_time = clock.upload_done();
 
         println!(
             "Upload time: {:.3}s ({:.0} records/sec)",
@@ -2259,11 +2340,15 @@ impl Engine for RedisEngine {
         // post_upload()). Excluding it made every engine but mongodb look
         // artificially fast to index.
         let expected = vectors.len();
-        let index_start = Instant::now();
         self.wait_for_indexing(expected)?;
-        let index_time = index_start.elapsed().as_secs_f64();
+        let phases = clock.index_ready(
+            expected,
+            read_time,
+            vector_db_benchmark::ingest::IndexWait::RedisPercentIndexed,
+        )?;
+        let index_time = phases.index_wait_time;
 
-        let total_time = read_time + upload_time + index_time;
+        let total_time = read_time + phases.total_ingest_time;
         println!(
             "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
             index_time, total_time
@@ -2286,6 +2371,7 @@ impl Engine for RedisEngine {
             batch_size: self.config.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: Some(phases),
         })
     }
 
@@ -2295,10 +2381,13 @@ impl Engine for RedisEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        if !self.config.skip_vector_index {
+        if !self
+            .index_layout()
+            .serves(vector_db_benchmark::workload::Workload::FilterOnly)
+        {
             return Err(
-                "filter-only search requested on an index built with a vector field; the \
-                 filter-only workload needs the no-vector layout (shared `full` schema is #344)"
+                "filter-only search requested on an index built in the vector layout; the \
+                 filter-only workload needs the no-vector or the shared `full` layout (#344)"
                     .into(),
             );
         }
@@ -3024,6 +3113,39 @@ impl Engine for RedisEngine {
         Ok(results)
     }
 
+    fn check_index_layout(
+        &mut self,
+        dataset: &Dataset,
+        layout: vector_db_benchmark::workload::IndexLayout,
+    ) -> Result<(), String> {
+        use vector_db_benchmark::filter_only as fo;
+        use vector_db_benchmark::workload::IndexLayout;
+        let schema = dataset.config.schema.as_ref();
+        let validate = match layout {
+            IndexLayout::Full => fo::validate_redis_full_schema,
+            // Only tag fields can tell the layouts apart; a schema without
+            // them has nothing to check, so skip the round trip.
+            IndexLayout::Vector
+                if schema.and_then(|s| s.as_object()).is_some_and(|fields| {
+                    fields
+                        .values()
+                        .any(|k| matches!(k.as_str(), Some("keyword" | "uuid" | "bool")))
+                }) =>
+            {
+                fo::validate_redis_vector_layout
+            }
+            // No-vector: filter-only reads it back before every run.
+            _ => return Ok(()),
+        };
+        let mut conn = self.get_connection()?;
+        let info: redis::Value = redis::cmd("FT.INFO")
+            .arg(&self.config.index_name)
+            .query(&mut conn)
+            .map_err(|e| format!("index layout check ({layout}): FT.INFO failed: {e}"))?;
+        validate(&redis_value_to_json(&info), schema)
+            .map_err(|e| format!("index layout check ({layout}): {e}"))
+    }
+
     fn delete(&mut self) -> Result<(), String> {
         let mut conn = self.get_connection()?;
         // Normally DD (drop index + this config's docs). In shared-corpus mode
@@ -3355,6 +3477,37 @@ mod tests {
         assert!(matches!(params.get("color_1"), Some(FilterParamValue::Str(s)) if s == "blue"));
     }
 
+    /// #344: the filter-only check runs on the command the builder produces,
+    /// so a builder that grew a vector clause (or any non-metadata option)
+    /// fails here, not only a filter expression that carried one.
+    #[test]
+    fn filter_only_commands_as_built_are_metadata_only() {
+        for cond in [
+            serde_json::json!({"and":[{"color":{"match":{"value":"KNN"}}}]}),
+            serde_json::json!({"and":[{"size":{"range":{"gte":1,"lt":5}}},
+                                      {"color":{"match":{"any":["a","=>[KNN 1 @v $v]"]}}}]}),
+        ] {
+            let filter = parse_conditions(&cond).unwrap();
+            let cmd = super::build_filter_only_command("idx:t", 10, 1000, &filter);
+            super::check_filter_only_command(&cmd).unwrap_or_else(|e| panic!("{cond}: {e}"));
+            let wire = cmd.get_packed_command();
+            assert!(
+                String::from_utf8_lossy(&wire).contains("PARAMS"),
+                "operands travel as PARAMS"
+            );
+        }
+        // The same check refuses a command carrying a KNN clause.
+        let mut knn = super::build_filter_only_command(
+            "idx:t",
+            10,
+            1000,
+            &parse_conditions(&serde_json::json!({"and":[{"color":{"match":{"value":"r"}}}]}))
+                .unwrap(),
+        );
+        knn.arg("SORTBY").arg("__vector_score");
+        assert!(super::check_filter_only_command(&knn).is_err());
+    }
+
     #[test]
     fn match_any_int_list_emits_numeric_or() {
         let cond = serde_json::json!({"and":[{"size":{"match":{"any":[1,2]}}}]});
@@ -3619,6 +3772,7 @@ mod tests {
             batch_size: 1,
             parallel: 1,
             skip_vector_index: false,
+            layout: vector_db_benchmark::workload::IndexLayout::Vector,
             svs_graph_max_degree: None,
             svs_construction_window_size: None,
             svs_compression: None,

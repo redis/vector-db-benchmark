@@ -1526,6 +1526,7 @@ impl Engine for VertexEngine {
                 batch_size: vectors.len(),
                 memory_usage: None,
                 index_coverage: None,
+                ingest_phases: None,
             });
         }
 
@@ -1718,6 +1719,7 @@ impl Engine for VertexEngine {
             batch_size: self.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: None,
         })
     }
 

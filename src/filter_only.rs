@@ -22,6 +22,109 @@ pub struct Stats {
     /// set's `expected_count` (#340); absent when the set has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_query_counts_checked: Option<u64>,
+    /// The layout of the index the queries ran on (#344):
+    /// `crate::workload::IndexLayout::as_str`. `"full"` means the index also
+    /// holds an indexed vector field for the engine config's other workloads;
+    /// the filter-only requests themselves were each checked, as sent, to carry
+    /// no vector clause before the timed run ([`check_opensearch_body`] on the
+    /// request body, [`check_redis_command`] on the FT.SEARCH arguments). Absent on engines that do not report it (the
+    /// legacy Valkey/MongoDB harnesses never publish these stats at all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_layout: Option<String>,
+}
+
+/// Refuse a filter-only OpenSearch request body that carries a vector clause
+/// anywhere (#344): on a `full` index a stray `knn` clause would be served and
+/// measured as a metadata query. Checked for every distinct request before the
+/// timed run, on every layout.
+pub fn check_opensearch_body(body: &Value) -> Result<(), String> {
+    // Query types that score by vector. A schema field with one of these names
+    // would be a false positive, which fails loudly rather than silently.
+    const VECTOR_CLAUSES: [&str; 3] = ["knn", "neural", "script_score"];
+    fn find(v: &Value) -> Option<&str> {
+        match v {
+            Value::Object(map) => map.iter().find_map(|(k, child)| {
+                VECTOR_CLAUSES
+                    .iter()
+                    .find(|c| k.eq_ignore_ascii_case(c))
+                    .copied()
+                    .or_else(|| find(child))
+            }),
+            Value::Array(items) => items.iter().find_map(find),
+            _ => None,
+        }
+    }
+    match find(body) {
+        Some(clause) => Err(format!(
+            "filter-only request carries a vector clause ({clause:?}); filter-only must issue \
+             metadata predicates only"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a filter-only FT.SEARCH command, as sent, that is anything but the
+/// metadata shape (#344): `FT.SEARCH <index> <query>` with the query passing
+/// [`check_redis_query`], followed only by `LIMIT o n`, `NOCONTENT`,
+/// `DIALECT d`, `TIMEOUT t` and `PARAMS n <name value>…`. Checking the
+/// finished arguments (not the filter expression) means a vector clause, a
+/// vector `PARAMS` blob's `=>[KNN …]` reference or any other option the
+/// command builder adds is caught too — on the `full` layout the index would
+/// serve it.
+pub fn check_redis_command(args: &[&[u8]]) -> Result<(), String> {
+    let text = |a: &[u8]| String::from_utf8_lossy(a).into_owned();
+    let refuse = |why: String| {
+        Err(format!(
+            "filter-only FT.SEARCH is not a metadata-only command ({why}); filter-only must \
+             issue metadata predicates only"
+        ))
+    };
+    if args.len() < 3 || !args[0].eq_ignore_ascii_case(b"FT.SEARCH") {
+        return refuse("expected FT.SEARCH <index> <query>".into());
+    }
+    check_redis_query(&text(args[2]))?;
+    let mut i = 3;
+    while i < args.len() {
+        let option = text(args[i]).to_ascii_uppercase();
+        let operands = match option.as_str() {
+            "NOCONTENT" => 0,
+            "DIALECT" | "TIMEOUT" => 1,
+            "LIMIT" => 2,
+            "PARAMS" => {
+                let n = args
+                    .get(i + 1)
+                    .and_then(|a| text(a).parse::<usize>().ok())
+                    .ok_or_else(|| "PARAMS without a count".to_string());
+                match n {
+                    Ok(n) if n % 2 == 0 => n + 1,
+                    Ok(n) => return refuse(format!("odd PARAMS count {n}")),
+                    Err(e) => return refuse(e),
+                }
+            }
+            _ => return refuse(format!("unexpected argument {option:?}")),
+        };
+        if i + operands >= args.len() {
+            return refuse(format!("{option} is missing operands"));
+        }
+        i += 1 + operands;
+    }
+    Ok(())
+}
+
+/// Refuse a filter-only RediSearch query string that carries a vector clause
+/// (#344). In DIALECT 2 a KNN clause needs `=>[KNN …]` and a vector range
+/// needs `VECTOR_RANGE`; filter-only renders every operand through `PARAMS`,
+/// so neither token can come from data. [`check_redis_command`] applies it to
+/// the query argument of the command actually sent.
+pub fn check_redis_query(query: &str) -> Result<(), String> {
+    if query.contains("=>") || query.to_ascii_uppercase().contains("VECTOR_RANGE") {
+        return Err(format!(
+            "filter-only query carries a vector clause ({:?}); filter-only must issue \
+             metadata predicates only",
+            query.chars().take(120).collect::<String>()
+        ));
+    }
+    Ok(())
 }
 
 pub fn opensearch_body(filter: &Value, limit: usize) -> Value {
@@ -108,6 +211,31 @@ pub fn search_param_indices(
     Ok(selected)
 }
 
+/// [`search_param_indices`] for an engine config that mixes workloads on the
+/// shared `full` layout (#344): its filter-only search configs get exactly the
+/// treatment they get on `no-vector` — the first per concurrency kept, a
+/// conflicting result limit refused — so the same filter-only configs behave
+/// the same on both layouts. Every other search config is kept as declared.
+/// Input: `(is_filter_only, parallel, top)` per search config, in order.
+/// Output: the indices to run, in declared order.
+pub fn mixed_search_param_indices(
+    params: impl IntoIterator<Item = (bool, Option<i64>, Option<i64>)>,
+    default_limit: Option<i64>,
+) -> Result<Vec<usize>, String> {
+    let params: Vec<_> = params.into_iter().collect();
+    let filter_only: Vec<usize> = (0..params.len()).filter(|&i| params[i].0).collect();
+    let kept: std::collections::HashSet<usize> = search_param_indices(
+        filter_only.iter().map(|&i| (params[i].1, params[i].2)),
+        default_limit,
+    )?
+    .into_iter()
+    .map(|k| filter_only[k])
+    .collect();
+    Ok((0..params.len())
+        .filter(|i| !params[*i].0 || kept.contains(i))
+        .collect())
+}
+
 /// Validate realized schema before timing, including when reusing an index.
 pub fn validate_opensearch_schema(
     properties: &Value,
@@ -121,6 +249,40 @@ pub fn validate_opensearch_schema(
     if vector["type"] != "float" || vector["index"] != false || vector["doc_values"] != false {
         return Err("filter-only requires an unindexed vector field without doc values".into());
     }
+    validate_opensearch_scalar_fields(properties, schema)
+}
+
+/// [`validate_opensearch_schema`] for the shared `full` layout (#344): the
+/// index must be a k-NN index with an indexed `knn_vector` field (so it really
+/// is the index the engine config's vector workloads run on, not a reused
+/// no-vector or foreign index), and every scalar field the filter-only contract
+/// uses must be mapped exactly as on the no-vector layout.
+pub fn validate_opensearch_full_schema(
+    properties: &Value,
+    index: &Value,
+    schema: Option<&Value>,
+) -> Result<(), String> {
+    if !matches!(&index["knn"], Value::Bool(true)) && index["knn"] != "true" {
+        return Err(
+            "filter-only on the full layout requires index.knn=true; the index was not built \
+             for the full layout"
+                .into(),
+        );
+    }
+    if properties["vector"]["type"] != "knn_vector" {
+        return Err(
+            "filter-only on the full layout requires an indexed knn_vector field; the index \
+             was not built for the full layout"
+                .into(),
+        );
+    }
+    validate_opensearch_scalar_fields(properties, schema)
+}
+
+fn validate_opensearch_scalar_fields(
+    properties: &Value,
+    schema: Option<&Value>,
+) -> Result<(), String> {
     if let Some(fields) = schema.and_then(Value::as_object) {
         for (field, kind) in fields {
             if matches!(kind.as_str(), Some("int" | "float" | "keyword"))
@@ -163,62 +325,156 @@ pub fn validate_opensearch_schema(
 /// FT.INFO can arrive as RESP2 pairs or a RESP3 map; attributes also contain
 /// standalone flags, so do not deserialize them as key/value maps.
 pub fn validate_redis_schema(info: &Value, schema: Option<&Value>) -> Result<(), String> {
-    fn entries(v: &Value) -> impl Iterator<Item = (&Value, Option<&Value>)> {
-        let mut items = v.as_array().into_iter().flatten();
-        std::iter::from_fn(move || {
-            let key = items.next()?;
-            let standalone = matches!(
-                key.as_str(),
-                Some(
-                    "CASESENSITIVE"
-                        | "SORTABLE"
-                        | "UNF"
-                        | "NOINDEX"
-                        | "NOSTEM"
-                        | "WITHSUFFIXTRIE"
-                        | "INDEXEMPTY"
-                        | "INDEXMISSING"
-                )
-            );
-            Some((key, if standalone { None } else { items.next() }))
-        })
+    validate_redis_layout(info, schema, false)
+}
+
+/// [`validate_redis_schema`] for the shared `full` layout (#344): the index
+/// must hold a VECTOR field (it is the index the engine config's vector
+/// workloads run on, not a reused no-vector one), and every scalar field the
+/// filter-only contract uses must be indexed exactly as on the no-vector
+/// layout (`TAG SEPARATOR ; CASESENSITIVE`, `NUMERIC`).
+pub fn validate_redis_full_schema(info: &Value, schema: Option<&Value>) -> Result<(), String> {
+    validate_redis_layout(info, schema, true)
+}
+
+/// FT.INFO key/value entries; attributes also contain standalone flags.
+fn ft_info_entries(v: &Value) -> impl Iterator<Item = (&Value, Option<&Value>)> {
+    let mut items = v.as_array().into_iter().flatten();
+    std::iter::from_fn(move || {
+        let key = items.next()?;
+        let standalone = matches!(
+            key.as_str(),
+            Some(
+                "CASESENSITIVE"
+                    | "SORTABLE"
+                    | "UNF"
+                    | "NOINDEX"
+                    | "NOSTEM"
+                    | "WITHSUFFIXTRIE"
+                    | "INDEXEMPTY"
+                    | "INDEXMISSING"
+            )
+        );
+        Some((key, if standalone { None } else { items.next() }))
+    })
+}
+
+/// One FT.INFO field, from a RESP3 map or RESP2 pairs.
+fn ft_info_field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
+    if let Some(map) = v.as_object() {
+        return map.get(name);
     }
-    fn field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
-        if let Some(map) = v.as_object() {
-            return map.get(name);
+    ft_info_entries(v).find_map(|(key, value)| (key == name).then_some(value).flatten())
+}
+
+/// Whether an FT.INFO attribute carries a standalone flag (RESP2 or RESP3).
+fn ft_info_has_flag(attr: &Value, flag: &str) -> bool {
+    ft_info_entries(attr).any(|(key, value)| key == flag && value.is_none())
+        || ft_info_field(attr, "flags")
+            .and_then(Value::as_array)
+            .is_some_and(|flags| flags.iter().any(|f| f == flag))
+}
+
+/// Refuse to label a Redis index `vector` (#344) when it was built for
+/// filter-only (the shared `full` or the no-vector layout): a tag field
+/// indexed `CASESENSITIVE` matches case-sensitively, so a vector or hybrid
+/// result on it would carry the wrong `params.index_layout`. Reached under
+/// `--skip-upload`, when a `vector`-plan config reuses another config's index.
+pub fn validate_redis_vector_layout(info: &Value, schema: Option<&Value>) -> Result<(), String> {
+    // Fail closed: an FT.INFO without attributes is not an index whose layout
+    // can be confirmed.
+    let attributes = ft_info_field(info, "attributes")
+        .and_then(Value::as_array)
+        .ok_or(
+            "index layout check: FT.INFO has no attributes; cannot confirm the `vector` layout",
+        )?;
+    for (name, kind) in schema.and_then(Value::as_object).into_iter().flatten() {
+        if !matches!(kind.as_str(), Some("keyword" | "uuid" | "bool")) {
+            continue;
         }
-        entries(v).find_map(|(key, value)| (key == name).then_some(value).flatten())
+        let attr = attributes
+            .iter()
+            .find(|a| ft_info_field(a, "attribute").and_then(Value::as_str) == Some(name));
+        if attr.is_some_and(|a| ft_info_has_flag(a, "CASESENSITIVE")) {
+            return Err(format!(
+                "the index is not a `vector`-layout index: tag field {name} is CASESENSITIVE \
+                 (built for the `full` or `no-vector` layout), so its results would be \
+                 mislabelled; rebuild it without --skip-upload or run the config that built it"
+            ));
+        }
     }
+    Ok(())
+}
+
+/// [`validate_redis_vector_layout`] for OpenSearch: a schema `float` field
+/// mapped `double` was built for filter-only (`full` / `no-vector`), where
+/// range filters compare binary64 values instead of the vector layout's
+/// 32-bit floats.
+pub fn validate_opensearch_vector_layout(
+    properties: &Value,
+    schema: Option<&Value>,
+) -> Result<(), String> {
+    // Fail closed: a mapping without properties is not an index whose layout
+    // can be confirmed (indexing a non-object yields null, which would pass).
+    if !properties.is_object() {
+        return Err(
+            "index layout check: the mapping has no properties; cannot confirm the `vector` layout"
+                .into(),
+        );
+    }
+    for (name, kind) in schema.and_then(Value::as_object).into_iter().flatten() {
+        if kind == "float" && properties[name]["type"] == "double" {
+            return Err(format!(
+                "the index is not a `vector`-layout index: float field {name} is mapped double \
+                 (built for the `full` or `no-vector` layout), so its results would be \
+                 mislabelled; rebuild it without --skip-upload or run the config that built it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_redis_layout(info: &Value, schema: Option<&Value>, full: bool) -> Result<(), String> {
+    let field = ft_info_field;
     let attributes = field(info, "attributes")
         .and_then(Value::as_array)
         .ok_or("filter-only missing FT.INFO attributes")?;
+    let mut has_vector = false;
     for attr in attributes {
         let kind = field(attr, "type")
             .and_then(Value::as_str)
             .ok_or("filter-only missing FT.INFO attribute type")?;
         if kind.eq_ignore_ascii_case("VECTOR") {
-            return Err("filter-only cannot reuse an index containing VECTOR".into());
+            if !full {
+                return Err("filter-only cannot reuse an index containing VECTOR".into());
+            }
+            has_vector = true;
         }
+    }
+    if full && !has_vector {
+        return Err(
+            "filter-only on the full layout requires an index with a VECTOR field; the index \
+             was not built for the full layout"
+                .into(),
+        );
     }
     if let Some(fields) = schema.and_then(Value::as_object) {
         for (name, kind) in fields {
-            if !matches!(kind.as_str(), Some("int" | "float" | "keyword")) {
+            // Every kind create_index indexes as a TAG (keyword, uuid, bool) gets
+            // the same CASESENSITIVE requirement as keyword (#344 review).
+            let tag = matches!(kind.as_str(), Some("keyword" | "uuid" | "bool"));
+            if !tag && !matches!(kind.as_str(), Some("int" | "float")) {
                 continue;
             }
             let attr = attributes
                 .iter()
                 .find(|a| field(a, "attribute").and_then(Value::as_str) == Some(name))
                 .ok_or_else(|| format!("filter-only missing indexed field {name}"))?;
-            let has_flag = |name: &str| {
-                entries(attr).any(|(key, value)| key == name && value.is_none())
-                    || field(attr, "flags")
-                        .and_then(Value::as_array)
-                        .is_some_and(|flags| flags.iter().any(|flag| flag == name))
-            };
+            let has_flag = |flag: &str| ft_info_has_flag(attr, flag);
             if has_flag("NOINDEX") {
                 return Err(format!("filter-only requires indexed field {name}"));
             }
-            if kind != "keyword" {
+            if !tag {
                 if field(attr, "type").and_then(Value::as_str) != Some("NUMERIC") {
                     return Err(format!("filter-only requires NUMERIC field {name}"));
                 }
@@ -492,3 +748,7 @@ mod tests {
 #[cfg(test)]
 #[path = "filter_only/review_tests.rs"]
 mod review_tests;
+
+#[cfg(test)]
+#[path = "filter_only/full_layout_tests.rs"]
+mod full_layout_tests;

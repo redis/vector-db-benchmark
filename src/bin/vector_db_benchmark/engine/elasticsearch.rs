@@ -1018,6 +1018,7 @@ impl Engine for ElasticsearchEngine {
             batch_size: self.config.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: None,
         })
     }
 
@@ -1440,6 +1441,7 @@ mod tests {
             search_params: None,
             upload_params: None,
             skip_vector_index: false,
+            full_index_layout: false,
             raw: None,
         };
         let engine = ElasticsearchEngine::new(&config, "localhost").unwrap();
@@ -1471,6 +1473,7 @@ mod tests {
                 "batch_size": 1000
             })),
             skip_vector_index: false,
+            full_index_layout: false,
             raw: None,
         };
         let engine = ElasticsearchEngine::new(&config, "localhost").unwrap();

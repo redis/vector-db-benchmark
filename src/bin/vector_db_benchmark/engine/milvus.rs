@@ -1568,6 +1568,7 @@ impl Engine for MilvusEngine {
             batch_size: self.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: None,
         })
     }
 

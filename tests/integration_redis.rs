@@ -2590,6 +2590,36 @@ fn test_binary_redis_shared_corpus_upload_once() {
         stdout
     );
 
+    // Ingest phases (#344). Whichever config ran second skipped the upload: it
+    // has no upload phase at all — `upload_time` exactly 0.0 (how a consumer
+    // tells "backfill, no upload" from a real upload) and no upload rate, not
+    // `documents / (time between two clock reads)` ≈ 10^11/s. The config that
+    // uploaded has a real upload phase and rate.
+    let (mut backfill, mut uploaded) = (Vec::new(), Vec::new());
+    for config in ["redis-sc-a", "redis-sc-b"] {
+        let doc = common::read_result_file(&proj.root, &format!("{config}-sc-test-upload-*.json"));
+        let r = doc["results"].clone();
+        if r["upload_time"].as_f64() == Some(0.0) {
+            backfill.push(r);
+        } else {
+            uploaded.push(r);
+        }
+    }
+    assert_eq!(
+        (backfill.len(), uploaded.len()),
+        (1, 1),
+        "{backfill:?} {uploaded:?}"
+    );
+    let r = &backfill[0];
+    assert!(r["upload_docs_per_sec"].is_null(), "{r}");
+    assert_eq!(
+        r["ingest_phases"]["upload_finished_at"], r["ingest_phases"]["upload_started_at"],
+        "{r}"
+    );
+    assert!(r["index_wait_time"].as_f64().unwrap() > 0.0, "{r}");
+    assert!(r["ingest_docs_per_sec"].as_f64().unwrap() > 0.0, "{r}");
+    assert!(uploaded[0]["upload_docs_per_sec"].as_f64().unwrap() > 0.0);
+
     // Both configs' indexes work over the shared corpus.
     let ra = common::read_recall(&proj.root, "redis-sc-a");
     let rb = common::read_recall(&proj.root, "redis-sc-b");
@@ -5288,6 +5318,91 @@ fn test_binary_redis_msmarco_filter_only_per_query_gate() {
     fs::remove_dir_all(&p.root).ok();
 }
 
+/// #340 x #344: filter-only with MS MARCO prepared queries on the shared
+/// `full` index. One engine config mixes a vector search config with the
+/// filter-only one, so the index carries VECTOR plus every declared field
+/// (the vector workload may filter on any of them, `url` included), while
+/// filter-only keeps #340's contract: it validates the realized schema, the
+/// metadata domain and its predicates against the narrowed field set (so
+/// `url`'s `;` and edge whitespace upload fine), runs the prepared set and
+/// passes the per-query count gate — which still fails a SUM-PRESERVING
+/// error in two expected counts.
+#[test]
+fn test_binary_redis_msmarco_filter_only_on_the_full_layout() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let config = serde_json::json!([{"name":"msm-redis-full","engine":"redis","upload_params":{"parallel":2},
+        "search_params":[{"parallel":1,"top":1},{"parallel":4,"top":5,"workload":"filter-only"}]}]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let n = p.queries.len();
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    let dump = p.root.join("dumps");
+    let out = common::run_binary_output(
+        &p.root,
+        "msm-redis-full",
+        common::MSM_DATASET,
+        "localhost",
+        &envs,
+        &[
+            "--keep-data",
+            "--fail-on-dropped-queries",
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.matches("Experiment stage: Upload").count(),
+        1,
+        "{stdout}"
+    );
+    common::assert_msmarco_full_run(&p, n, &dump);
+
+    let index = "idx:msm-redis-full";
+    let info: redis::Value = redis::cmd("FT.INFO").arg(index).query(&mut conn).unwrap();
+    let names = ft_info_attribute_names(&info);
+    for field in ["vector", "category", "doc_len", "rand_key", "tier", "url"] {
+        assert!(
+            names.iter().any(|n| n == field),
+            "{field} not indexed: {names:?}"
+        );
+    }
+    let info = format!("{info:?}");
+    for token in ["VECTOR", "CASESENSITIVE", "NUMERIC"] {
+        assert!(info.contains(token), "FT.INFO lacks {token}: {info}");
+    }
+
+    // Two compensating errors keep the sum; the per-query gate still fails
+    // on `full`, naming the queries.
+    common::clear_result_files(&p.root);
+    p.tamper_expected_counts(&[(0, 1), (3, -1)]);
+    let out = common::run_binary_output(
+        &p.root,
+        "msm-redis-full",
+        common::MSM_DATASET,
+        "localhost",
+        &envs,
+        &["--skip-upload", "--keep-data", "--repetitions", "1"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("per-query count gate"), "{stderr}");
+    assert!(stderr.contains("fx-filter-000 (tag_eq)"), "{stderr}");
+    assert!(stderr.contains("fx-filter-003 (numeric_point)"), "{stderr}");
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&p.root).ok();
+}
+
 /// #340: an old MS MARCO tarball (derived fields declared, absent from the
 /// payloads, no `filter_queries.jsonl`) is refused end to end naming
 /// `--add-derived-fields` — on filter-only index reuse, filter-only upload and
@@ -5389,5 +5504,195 @@ fn test_binary_redis_filter_only_without_prepared_set_keeps_the_declared_layout(
         .arg("DD")
         .query(&mut conn)
         .unwrap();
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344: one engine config runs vector, filter-only and fulltext against ONE
+/// index built once in the shared `full` layout — one upload file with ingest
+/// phases, three search files, exact filter-only totals and exact filtered
+/// recall (both need the CASESENSITIVE TAG the full layout adds). See
+/// `common::shared_index::assert_run` for every claim.
+#[test]
+fn test_binary_redis_one_ingest_many_workloads() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let config = "redis-shared";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "redis", "upload_params": {"parallel": 2},
+        "search_params": shared_index::search_params()
+    }]);
+    let proj = shared_index::write_project(&configs.to_string());
+    let port = test_port().to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        config,
+        shared_index::DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &["--fail-on-dropped-queries", "--keep-data"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.matches("Experiment stage: Upload").count(),
+        1,
+        "one ingest for three workloads: {stdout}"
+    );
+    shared_index::assert_run(&proj, config, "redis_ft_info_percent_indexed");
+
+    // The realized index is the union: VECTOR + TEXT + CASESENSITIVE TAG +
+    // NUMERIC, holding the corpus once.
+    let index = format!("idx:{config}");
+    let info: redis::Value = redis::cmd("FT.INFO").arg(&index).query(&mut conn).unwrap();
+    let info = format!("{info:?}");
+    for token in ["VECTOR", "TEXT", "CASESENSITIVE", "NUMERIC"] {
+        assert!(info.contains(token), "FT.INFO lacks {token}: {info}");
+    }
+    assert_eq!(
+        ft_info_num_docs(&mut conn, &index),
+        shared_index::DOCS as i64
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344: the realized index is checked against the planned layout ONCE,
+/// before any search config runs. A `--skip-upload` run of the mixed config —
+/// search configs in their natural order, vector FIRST — over an index a
+/// vector-only config built (VECTOR, but case-insensitive TAGs) is refused
+/// before any result is written: no vector result labelled `full` that really
+/// matched case-insensitively.
+#[test]
+fn test_binary_redis_full_layout_refuses_a_reused_vector_layout_index() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let proj = shared_index::write_project("[]");
+    let port = test_port().to_string();
+    shared_index::assert_reuse_refused(
+        &proj,
+        &serde_json::json!({"name": "redis-shared-reuse", "engine": "redis",
+            "upload_params": {"parallel": 1}}),
+        TEST_HOST,
+        &[("REDIS_PORT", port.as_str())],
+        shared_index::vector_only(),
+        shared_index::search_params(),
+        "index layout check (full): filter-only requires CASESENSITIVE TAG",
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344, the reverse: a vector-only config (`vector` plan) reusing the `full`
+/// index a mixed config built would match tags case-sensitively while its
+/// results say `vector`. Refused before any result is written.
+#[test]
+fn test_binary_redis_vector_layout_refuses_a_reused_full_index() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let proj = shared_index::write_project("[]");
+    let port = test_port().to_string();
+    shared_index::assert_reuse_refused(
+        &proj,
+        &serde_json::json!({"name": "redis-shared-reverse", "engine": "redis",
+            "upload_params": {"parallel": 1}}),
+        TEST_HOST,
+        &[("REDIS_PORT", port.as_str())],
+        shared_index::search_params(),
+        shared_index::vector_only(),
+        "index layout check (vector): the index is not a `vector`-layout index",
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344 review: on the shared `full` index, a corpus token outside
+/// filter-only's metadata domain is refused before the upload — not at the
+/// first filter-only search, after the vector config had already run.
+#[test]
+fn test_binary_redis_full_layout_refuses_bad_metadata_before_upload() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let config = "redis-shared-domain";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": shared_index::search_params()
+    }]);
+    let proj = shared_index::write_project(&configs.to_string());
+    let port = test_port().to_string();
+    shared_index::assert_bad_metadata_refused_before_upload(
+        &proj,
+        config,
+        TEST_HOST,
+        &[("REDIS_PORT", port.as_str())],
+    );
+    let keys: i64 = redis::cmd("DBSIZE").query(&mut conn).unwrap();
+    // configure() may leave its index marker key; the corpus is not there.
+    assert!(
+        keys < shared_index::DOCS as i64,
+        "corpus not uploaded: {keys} keys"
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344 review: the shared-corpus backfill path (REDIS_KEY_PREFIX) checks
+/// filter-only's metadata domain too. A `vector` config — which does not check
+/// that domain — uploads a corpus with a `;` tag under the shared prefix; a
+/// `full` config then finds the corpus complete and skips its own upload. It
+/// must still refuse the bad token before writing any result.
+#[test]
+fn test_binary_redis_shared_corpus_full_layout_refuses_bad_metadata() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([
+        {"name": "redis-scfull-vector", "engine": "redis", "upload_params": {"parallel": 1},
+         "search_params": shared_index::vector_only()},
+        {"name": "redis-scfull-mixed", "engine": "redis", "upload_params": {"parallel": 1},
+         "search_params": shared_index::search_params()}
+    ]);
+    let proj = shared_index::write_project(&configs.to_string());
+    shared_index::poison_keyword_token(&proj);
+    let port = test_port().to_string();
+    let envs = [
+        ("REDIS_PORT", port.as_str()),
+        ("REDIS_KEY_PREFIX", "shared_scfull:"),
+    ];
+    // The vector config uploads the corpus (no domain check on `vector`).
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-scfull-vector",
+        shared_index::DATASET,
+        TEST_HOST,
+        &envs,
+        &["--skip-search", "--keep-data"],
+    ));
+    common::clear_result_files(&proj.root);
+    let keys: i64 = redis::cmd("EVAL")
+        .arg("return #redis.call('keys', KEYS[1])")
+        .arg(1)
+        .arg("shared_scfull:*")
+        .query(&mut conn)
+        .unwrap();
+    assert!(
+        keys >= shared_index::DOCS as i64,
+        "shared corpus uploaded: {keys}"
+    );
+    // The `full` config reuses it via the backfill path, and refuses.
+    shared_index::assert_refused_on_bad_metadata(&proj, "redis-scfull-mixed", TEST_HOST, &envs);
+    flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }

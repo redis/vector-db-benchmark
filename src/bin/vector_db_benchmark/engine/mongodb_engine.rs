@@ -2449,6 +2449,7 @@ impl Engine for MongoDBEngine {
             batch_size: self.config.batch_size,
             memory_usage: None,
             index_coverage,
+            ingest_phases: None,
         })
     }
 

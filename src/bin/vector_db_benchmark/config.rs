@@ -209,6 +209,13 @@ pub struct EngineConfig {
     /// When true, vectors are uploaded but not indexed; search is filter-only.
     #[serde(default)]
     pub skip_vector_index: bool,
+    /// Runtime-only (never read from or written to a config file): set by the
+    /// runner when the config's workload plan needs the shared `full` index
+    /// (`vector_db_benchmark::workload::IndexLayout::Full`, #344) — the vector
+    /// layout with its scalar fields typed for filter-only. Honoured by the
+    /// engines in `workload::supports_full_layout`.
+    #[serde(skip)]
+    pub full_index_layout: bool,
     /// This entry exactly as it appears in the configuration FILE.
     ///
     /// The typed fields above are lossy in three ways that matter to an artifact

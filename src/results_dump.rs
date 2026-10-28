@@ -226,6 +226,12 @@ pub struct DumpHeader {
     /// Index of the search config within the engine config's `search_params`.
     pub search_id: usize,
     pub id_space: IdSpace,
+    /// The index layout the queries ran on (`vector` | `no-vector` | `full`,
+    /// #344). On `full`, tag filters match case-sensitively, so
+    /// `compare-results` warns when the two sides differ. Absent in dumps
+    /// written before #344.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_layout: Option<String>,
 }
 
 /// One timed query, as written to the dump.
@@ -483,6 +489,7 @@ mod tests {
             top: 2,
             search_id: 0,
             id_space: IdSpace::Row,
+            index_layout: None,
         }
     }
 

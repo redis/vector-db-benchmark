@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
+use vector_db_benchmark::workload::{IndexLayout, Workload};
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
@@ -34,6 +35,11 @@ mod fulltext;
 #[derive(Clone)]
 struct OpenSearchConfig {
     skip_vector_index: bool,
+    /// The shared `full` index (#344): the k-NN mapping with `float` fields
+    /// mapped `double`, as filter-only needs them.
+    /// The index layout `configure()` builds (#344), resolved once from the
+    /// engine flags; every layout-dependent decision reads this.
+    layout: vector_db_benchmark::workload::IndexLayout,
     m: i64,
     ef_construction: i64,
     batch_size: usize,
@@ -136,6 +142,10 @@ impl OpenSearchEngine {
             force_merge_budget,
             config: OpenSearchConfig {
                 skip_vector_index: engine_config.skip_vector_index,
+                layout: vector_db_benchmark::workload::layout_from_flags(
+                    engine_config.skip_vector_index,
+                    engine_config.full_index_layout,
+                )?,
                 m,
                 ef_construction,
                 batch_size,
@@ -198,6 +208,27 @@ impl OpenSearchEngine {
     }
 
     fn validate_filter_only_schema(&self, dataset: &Dataset) -> Result<(), String> {
+        let (properties, index) = self.realized_schema("filter-only")?;
+        // The realized layout must be the one this config built: `index.knn`
+        // off and the vector unindexed on the no-vector index, a k-NN index
+        // with filter-only scalar mappings on the shared `full` one (#344).
+        let validate = if self.config.layout == IndexLayout::Full {
+            vector_db_benchmark::filter_only::validate_opensearch_full_schema
+        } else {
+            vector_db_benchmark::filter_only::validate_opensearch_schema
+        };
+        validate(
+            &properties,
+            &index,
+            dataset.filter_only_index_schema()?.as_ref(),
+        )
+    }
+
+    /// The realized index: its mapping `properties` and its `settings.index`.
+    fn realized_schema(
+        &self,
+        what: &str,
+    ) -> Result<(serde_json::Value, serde_json::Value), String> {
         let mapping = self
             .rt
             .block_on(async {
@@ -210,7 +241,7 @@ impl OpenSearchEngine {
                     .json::<serde_json::Value>()
                     .await
             })
-            .map_err(|e| format!("filter-only mapping check failed: {e}"))?;
+            .map_err(|e| format!("{what} mapping check failed: {e}"))?;
         let settings = self
             .rt
             .block_on(async {
@@ -223,12 +254,11 @@ impl OpenSearchEngine {
                     .json::<serde_json::Value>()
                     .await
             })
-            .map_err(|e| format!("filter-only settings check failed: {e}"))?;
-        vector_db_benchmark::filter_only::validate_opensearch_schema(
-            &mapping[&self.index_name]["mappings"]["properties"],
-            &settings[&self.index_name]["settings"]["index"],
-            dataset.filter_only_index_schema()?.as_ref(),
-        )
+            .map_err(|e| format!("{what} settings check failed: {e}"))?;
+        Ok((
+            mapping[&self.index_name]["mappings"]["properties"].clone(),
+            settings[&self.index_name]["settings"]["index"].clone(),
+        ))
     }
 
     fn create_index(&self, dataset: &Dataset) -> Result<(), String> {
@@ -276,7 +306,9 @@ impl OpenSearchEngine {
                     let ft = field_type.as_str().unwrap_or("");
                     let os_type = match ft {
                         "int" => "long",
-                        "float" if self.config.skip_vector_index => "double",
+                        // Filter-only compares binary64 values, on its own
+                        // index or on the shared `full` one (#344).
+                        "float" if self.config.layout.serves(Workload::FilterOnly) => "double",
                         "geo" => "geo_point",
                         // "bool"/"datetime" are not valid OS types; map to the real
                         // ones. OS coerces the reader's "true"/"false" string into a
@@ -1819,10 +1851,14 @@ impl OpenSearchEngine {
         let raw_bodies: Vec<Box<serde_json::value::RawValue>> = (0..num_to_run)
             .map(|idx| {
                 let body = if filter_only {
-                    vector_db_benchmark::filter_only::opensearch_body(
+                    let body = vector_db_benchmark::filter_only::opensearch_body(
                         parsed_filters[idx].as_ref().unwrap(),
                         tops[idx],
-                    )
+                    );
+                    // No filter-only request may carry a vector clause — on
+                    // the `full` layout the index would serve it (#344).
+                    vector_db_benchmark::filter_only::check_opensearch_body(&body)?;
+                    body
                 } else {
                     build_knn_body(
                         &queries[idx],
@@ -2225,9 +2261,15 @@ impl OpenSearchEngine {
                 returned_documents_sum: returned_sum,
                 retried_queries: retried,
                 per_query_counts_checked,
+                index_layout: Some(self.index_layout().as_str().to_string()),
             });
         }
         Ok(result)
+    }
+
+    /// The layout `configure()` builds for this config (#344).
+    fn index_layout(&self) -> vector_db_benchmark::workload::IndexLayout {
+        self.config.layout
     }
 }
 
@@ -2332,6 +2374,17 @@ impl Engine for OpenSearchEngine {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "cluster-default".to_string()),
         );
+        if self.config.layout == IndexLayout::Full {
+            println!(
+                "Building the shared `full` index (#344): knn_vector + text + keyword + \
+                 long/double, one ingest for every workload of this config"
+            );
+            println!(
+                "  note: on this index vector/hybrid range filters compare float fields as \
+                 binary64 `double` (unlike the `vector` layout's `float`); results record \
+                 params.index_layout=full"
+            );
+        }
 
         println!("Ensuring index does not exist...");
         self.delete_index()?;
@@ -2352,7 +2405,10 @@ impl Engine for OpenSearchEngine {
         // #339 parity: normalize newlines in the indexed text fields before
         // anything is sent (recorded in the index `_meta` by configure()).
         self.normalize_fulltext_upload(&mut metadata)?;
-        if self.config.skip_vector_index {
+        // Filter-only's metadata domain is checked before anything is sent
+        // whenever the index will serve filter-only: `no-vector` AND the
+        // shared `full` index (#344).
+        if self.config.layout.serves(Workload::FilterOnly) {
             vector_db_benchmark::filter_only::domain::validate_metadata(
                 &metadata,
                 dataset.filter_only_index_schema()?.as_ref(),
@@ -2372,9 +2428,11 @@ impl Engine for OpenSearchEngine {
             "Starting upload with {} threads, batch size {}...",
             self.config.parallel, self.config.batch_size
         );
-        let upload_start = Instant::now();
+        // One clock for both ingest phases (#344), so they sum to the wall time
+        // from the first batch to index-ready.
+        let mut clock = vector_db_benchmark::ingest::IngestClock::start();
         self.upload_parallel(&ids, &vectors, &metadata)?;
-        let upload_time = upload_start.elapsed().as_secs_f64();
+        let upload_time = clock.upload_done();
 
         println!(
             "Upload time: {:.3}s ({:.0} records/sec)",
@@ -2412,11 +2470,15 @@ impl Engine for OpenSearchEngine {
         // Include the merge time in total_time for cross-engine comparability
         // (mirrors mongodb; matches v0's post_upload() timing). Pinning the merge
         // to one segment makes this phase much longer than it used to be (#210).
-        let index_start = Instant::now();
         self.force_merge()?;
-        let index_time = index_start.elapsed().as_secs_f64();
+        let phases = clock.index_ready(
+            vectors.len(),
+            read_time,
+            vector_db_benchmark::ingest::IndexWait::OpenSearchForceMergeRefresh,
+        )?;
+        let index_time = phases.index_wait_time;
 
-        let total_time = read_time + upload_time + index_time;
+        let total_time = read_time + phases.total_ingest_time;
         println!(
             "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
             index_time, total_time
@@ -2430,6 +2492,7 @@ impl Engine for OpenSearchEngine {
             batch_size: self.config.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: Some(phases),
         })
     }
 
@@ -2467,14 +2530,46 @@ impl Engine for OpenSearchEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        if !self.config.skip_vector_index {
+        if !self
+            .index_layout()
+            .serves(vector_db_benchmark::workload::Workload::FilterOnly)
+        {
             return Err(
-                "filter-only search requested on an index built with a vector field; the \
-                 filter-only workload needs the no-vector layout (shared `full` schema is #344)"
+                "filter-only search requested on an index built in the vector layout; the \
+                 filter-only workload needs the no-vector or the shared `full` layout (#344)"
                     .into(),
             );
         }
         self.search_impl(true, dataset, params, num_queries)
+    }
+
+    fn check_index_layout(
+        &mut self,
+        dataset: &Dataset,
+        layout: vector_db_benchmark::workload::IndexLayout,
+    ) -> Result<(), String> {
+        use vector_db_benchmark::filter_only as fo;
+        use vector_db_benchmark::workload::IndexLayout;
+        let schema = dataset.config.schema.as_ref();
+        let (properties, index) = match layout {
+            IndexLayout::Full => self.realized_schema("index layout check")?,
+            // Only float fields (`float` vs `double`) tell the layouts apart; a
+            // schema without them has nothing to check.
+            IndexLayout::Vector
+                if schema
+                    .and_then(|s| s.as_object())
+                    .is_some_and(|fields| fields.values().any(|k| k == "float")) =>
+            {
+                self.realized_schema("index layout check")?
+            }
+            // No-vector: filter-only reads it back before every run.
+            _ => return Ok(()),
+        };
+        match layout {
+            IndexLayout::Full => fo::validate_opensearch_full_schema(&properties, &index, schema),
+            _ => fo::validate_opensearch_vector_layout(&properties, schema),
+        }
+        .map_err(|e| format!("index layout check ({layout}): {e}"))
     }
 
     fn delete(&mut self) -> Result<(), String> {

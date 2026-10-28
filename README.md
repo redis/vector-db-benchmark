@@ -321,13 +321,114 @@ without an implementation is a hard error, never a fallback to `vector`; today
 a declared `filter-only` and `fulltext` exist on Redis and OpenSearch, and
 `hybrid` exists nowhere yet. Valkey and MongoDB keep their legacy filter-only
 harness reachable only through `--skip-vector-index`, exactly as before; a
-config that declares `filter-only` for them is refused. The shared `full` index schema is not built yet,
-so one engine config cannot mix `filter-only` with another workload (they need
-different index layouts) — split them into two configs. `--skip-vector-index` is
+config that declares `filter-only` for them is refused. `--skip-vector-index` is
 kept as an alias for "every search config is `filter-only`" (with its legacy
 `<engine>-no-vector` rename); combined with a config that declares another
 workload it is refused. Each result file's `params.workload` records the
 workload that ran.
+
+#### One ingest, many workloads (#344)
+
+All search configs of one engine config run against one index, uploaded and
+built once. The plan picks the layout that index needs:
+
+| search configs declare | index layout (`params.index_layout`) |
+|---|---|
+| only `vector` / `hybrid` / `fulltext` | `vector` (unchanged) |
+| only `filter-only`, or `--skip-vector-index` | `no-vector` (unchanged) |
+| `filter-only` **and** any of the others | `full` |
+
+`full` is the union, built on Redis and OpenSearch: the vector field and text
+fields exactly as in `vector`, and the scalar fields typed as filter-only needs
+them — Redis `TAG SEPARATOR ; CASESENSITIVE` + `NUMERIC`, OpenSearch `keyword`
++ `long` + `double` next to `knn_vector` + `text`. So one invocation runs all
+four workloads on one corpus:
+
+```json
+{"name": "redis-msmarco-all", "engine": "redis", "search_params": [
+  {"parallel": 8, "top": 10},
+  {"parallel": 8, "top": 10, "workload": "hybrid"},
+  {"parallel": 8, "top": 10, "workload": "fulltext"},
+  {"parallel": 8, "top": 10, "workload": "filter-only"}]}
+```
+
+- Filter-only on a `full` index still sends no vector clause: every request is
+  checked, exactly as it will be sent, before the timed run — on Redis the
+  finished `FT.SEARCH` arguments must be the metadata shape (query without
+  `=>` / `VECTOR_RANGE`, then only `LIMIT`, `NOCONTENT`, `DIALECT`, `TIMEOUT`,
+  `PARAMS`); on OpenSearch the request body may hold no `knn`, `neural` or
+  `script_score` key at any depth. Its result records
+  `filter_only.index_layout: "full"`.
+  - That body scan matches key NAMES, case-insensitively, so a schema field named
+    `knn`, `neural` or `script_score` (or `KNN`, `Neural`, ...) is refused as a vector clause (loudly,
+    before anything is timed). Rename the field in the dataset to run
+    filter-only on it.
+- The realized index is read back (`FT.INFO` / `_mapping` + `_settings`) once,
+  after configure (or the `--skip-upload` reuse check) and before ANY search
+  config runs, and must match the planned layout — so the order of the search
+  configs does not matter:
+  - `full` plan: the index must be a `full` one. Reusing a `vector`-layout
+    index under `--skip-upload` is refused (its tags are case-insensitive /
+    its floats are 32-bit).
+  - `vector` plan: an index built for filter-only (`CASESENSITIVE` tags on
+    Redis, `double` floats on OpenSearch) is refused, so a vector result is
+    never labelled `vector` while matching tags case-sensitively.
+- On `full`, a vector or hybrid filter on a tag matches case-sensitively, like
+  filter-only and like OpenSearch `keyword`; on `vector` it does not. That is
+  why every search file (and every `--dump-results` header) records
+  `index_layout`, and `compare-results` warns when one side ran on `vector`
+  and the other on `full` / `no-vector` (which type scalars alike). A dump
+  written before #344 has no `index_layout`; its layout is inferred from its
+  workload (filter-only ran on `no-vector`, everything else on `vector`).
+- An engine that cannot build `full` refuses the mix at startup, naming it.
+- `--update-search-ratio` (a ratio with updates) interleaves VECTOR searches
+  with updates, so an engine config holding any other workload — filter-only
+  on `full`, or fulltext / hybrid next to vector — is refused at startup,
+  before any download. Run those search configs in a separate engine config.
+  (The `no-vector` layout keeps skipping its mixed phases.)
+- Filter-only QPS and latency on `full` are **not yet established as
+  comparable** to the same queries on `no-vector`: the `full` index also holds
+  the HNSW vector index (memory, cache pressure), and no A/B has been run.
+  Compare filter-only numbers within one layout until one is (tracked in #363).
+- `--ef-runtime` never drops a filter-only search config (EF is a
+  vector-index knob), on `no-vector` and on `full` alike.
+- Filter-only search configs follow one rule on `no-vector` and on `full`:
+  the first per `parallel` runs, a repeat with the same result limit is
+  collapsed, and a different `top` at the same `parallel` is refused.
+- The summary of a mixed config lists `workloads` and labels each row with its
+  `workload`; precision buckets and concurrency curves cover the vector/hybrid
+  rows only. The top-level `workload` key stays reserved for single-workload
+  summaries. This applies to every mix, including vector + fulltext (allowed
+  since #339, on the `vector` layout): its summary now lists `workloads` too,
+  and its fulltext rows no longer enter the precision buckets or curves.
+
+**Ingest phases.** The upload file (`*-upload-*.json`) keeps `upload_time`,
+`total_time` (= read + upload + index wait) and `upload_count`, and on Redis and
+OpenSearch adds the keys below. `total_time` is not comparable across layouts:
+on a `full` index its read now includes filter-only's metadata-domain scan,
+which a pre-#344 `vector` ingest never did (`no-vector` always did). Compare
+`total_ingest_time`, which excludes the read.
+
+| key | meaning |
+|---|---|
+| `results.read_time` | client-side dataset read, before the first batch; on a `full` or `no-vector` index it includes the filter-only metadata-domain scan of the corpus |
+| `results.index_wait_time` | last batch acknowledged → index searchable |
+| `results.total_ingest_time` | `upload_time + index_wait_time`: first batch → index-ready |
+| `results.upload_docs_per_sec` / `ingest_docs_per_sec` | `upload_count` over each |
+| `results.ingest_phases` | `upload_started_at`, `upload_finished_at`, `index_ready_at` (unix epoch seconds), `index_wait` (`redis_ft_info_percent_indexed` or `opensearch_force_merge_refresh`), `documents` |
+| `params.index_layout`, `params.index_workloads` | the index built, and the workloads it serves |
+
+Both phases come from one monotonic clock, so they sum to the wall time between
+the timestamps; a report that does not (or whose `upload_time` / `total_time`
+disagree with the legacy keys) is refused rather than written. Other engines
+write the legacy keys only. A config that reuses a corpus another config
+uploaded (Redis shared-corpus mode) only waits for its index to backfill: its
+`upload_time` is exactly `0.0`, `upload_docs_per_sec` is `null`, and the whole
+ingest is `index_wait_time`. When its index serves filter-only (`full` or
+`no-vector`), that path still streams the corpus metadata once to check
+filter-only's metadata domain before any result is written — the corpus may
+have been uploaded by a `vector` config, which does not check it. That read
+happens before the ingest clock starts, so it is not counted in any phase.
 
 ### Per-query results and `compare-results` (#343)
 
@@ -806,6 +907,13 @@ vector-db-benchmark --engines redis-fo --datasets msmarco-cohere-1024-1M-cosine 
   and edge whitespace) and the text fields are stored in the document,
   unindexed, and OpenSearch maps with `dynamic: false`. The shared-domain
   metadata checks apply to every indexed field exactly as before.
+  On the shared `full` index (#344: filter-only mixed with other workloads in
+  one engine config) the index also serves those workloads, so it indexes
+  every declared field as the `vector` layout does, with filter-only's
+  CASESENSITIVE tags / `double` floats, and OpenSearch leaves `dynamic` alone.
+  Filter-only itself is unchanged: its realized-schema, metadata-domain and
+  predicate checks still use the narrowed field set, so `url`'s `;` does not
+  stop the upload, and the per-query count gate applies.
 - **Per-query count gate.** Every answered query's exact total must equal its
   prepared `expected_count`, or the run fails naming the queries; the sum alone
   lets two compensating errors pass. The artifact records the answers checked

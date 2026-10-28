@@ -6,6 +6,7 @@
 //! - `msmarco` - MS MARCO v2.1 + Cohere embed-v3 corpus preparation (vectors + metadata)
 //! - `query_filter` - the one door from a dataset's `conditions` JSON to a filter
 //! - `workload` - per-search-config query family and the engine/workload table
+//! - `ingest` - ingestion phases (upload, index wait, total) for the upload results
 //! - `results_dump` - per-query result records and the `--dump-results` format
 //! - `compare_results` - scores one engine's dumps against a declared reference
 //! - `config` - Redis configuration from environment
@@ -15,6 +16,7 @@ pub mod compare_results;
 pub mod config;
 pub mod filter_only;
 pub mod fulltext;
+pub mod ingest;
 pub mod metrics;
 pub mod msmarco;
 pub mod opensearch_maintenance;

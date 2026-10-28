@@ -96,6 +96,11 @@ pub struct UploadStats {
     pub memory_usage: Option<serde_json::Value>,
     /// See [`IndexCoverage`]. `None` = this engine does not verify.
     pub index_coverage: Option<IndexCoverage>,
+    /// Upload / index-wait / total ingest phases on one clock (#344), emitted
+    /// as extra keys in the upload file. `None` = this engine does not report
+    /// phases yet (only Redis and OpenSearch do); the legacy `upload_time` /
+    /// `total_time` keys are written either way.
+    pub ingest_phases: Option<vector_db_benchmark::ingest::IngestPhases>,
 }
 
 /// Update-to-search ratio for mixed workload benchmarks.
@@ -221,6 +226,9 @@ pub struct SearchResults {
     /// The workload that produced this result. Set only by [`search_workload`],
     /// the single dispatch point, after the result passed its shape check.
     pub workload: Option<Workload>,
+    /// The layout of the index this result was measured on (#344), stamped by
+    /// the runner from the workload plan; emitted as `params.index_layout`.
+    pub index_layout: Option<vector_db_benchmark::workload::IndexLayout>,
     /// One record per timed query (failures included), in no particular order.
     /// `Some` only when the engine was asked to capture
     /// (`SearchParams::capture_query_results`); see
@@ -736,6 +744,20 @@ pub trait Engine {
         _num_queries: i64,
     ) -> Result<SearchResults, String> {
         Err(workload_not_implemented(self.name(), Workload::Hybrid))
+    }
+
+    /// Read back the realized index and refuse one that is not `layout` (#344),
+    /// so every search result's `params.index_layout` names the index it ran
+    /// on. Runs once after configure/upload (or the `--skip-upload` reuse
+    /// check) and BEFORE any search config, so the order of search configs
+    /// does not decide whether a mislabelled result is written. Default: no
+    /// check — only engines that build more than one layout implement it.
+    fn check_index_layout(
+        &mut self,
+        _dataset: &Dataset,
+        _layout: vector_db_benchmark::workload::IndexLayout,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     /// Delete/cleanup the index
