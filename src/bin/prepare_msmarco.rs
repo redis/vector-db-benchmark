@@ -204,8 +204,9 @@ fn run(args: &Args) -> Result<(), String> {
 
     let dir = args.out_dir.join(variant.dir);
     // A corpus without the filter query set — typically an extracted tarball
-    // published before the derived fields existed (tarballs carry no COMPLETE
-    // marker either) — would otherwise fall through to a full 259 GB rebuild.
+    // published before the derived fields existed (only the original 10M
+    // tarball carries a COMPLETE marker; the -v2 tarballs carry none) — would
+    // otherwise fall through to a full 259 GB rebuild.
     if !args.force && !dir.join(FILTER_QUERIES).exists() && has_corpus_files(&dir, variant) {
         return Err(format!(
             "{} holds a {} corpus prepared before the derived exact-match fields existed (no \
