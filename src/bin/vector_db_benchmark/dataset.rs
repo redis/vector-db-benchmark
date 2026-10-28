@@ -25,8 +25,23 @@ impl Dataset {
         Self { config }
     }
 
-    /// Get the file path for this dataset
+    /// Get the file path for this dataset, downloading it if absent.
+    ///
+    /// An MS MARCO directory cached before the derived exact-match fields
+    /// existed is refused here (#340): the download is skipped whenever the
+    /// directory exists, so without this check a stale cache would be loaded
+    /// against a schema that declares columns its payloads do not have.
     pub fn get_path(&self) -> Result<PathBuf, String> {
+        let path = self.resolve_path()?;
+        vector_db_benchmark::msmarco::derived::check_prepared_dir(
+            &self.config.name,
+            self.config.schema.as_ref(),
+            &path,
+        )?;
+        Ok(path)
+    }
+
+    fn resolve_path(&self) -> Result<PathBuf, String> {
         if let Some(path_str) = self.config.path.as_str() {
             // Check in datasets/ directory
             let datasets_path = datasets_dir().join(path_str);
@@ -911,6 +926,22 @@ mod tests {
             schema: None,
             description: None,
         })
+    }
+
+    /// A stale MS MARCO cache (directory present, so no re-download) must not
+    /// load against a schema that declares the derived fields (#340).
+    #[test]
+    fn get_path_refuses_an_msmarco_dir_without_the_derived_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payloads.jsonl"), "{\"docid\":\"doc-a\"}\n").unwrap();
+        let mut dataset = dataset_at(dir.path(), "tar", None);
+        dataset.config.name = "msmarco-cohere-1024-100K-cosine".to_string();
+        dataset.config.schema = Some(serde_json::json!({"docid":"keyword","category":"keyword"}));
+        let e = dataset.get_path().unwrap_err();
+        assert!(e.contains("--add-derived-fields"), "{e}");
+        // The same directory under a schema without the derived fields loads.
+        dataset.config.schema = Some(serde_json::json!({"docid":"keyword"}));
+        assert_eq!(dataset.get_path().unwrap(), dir.path());
     }
 
     #[test]

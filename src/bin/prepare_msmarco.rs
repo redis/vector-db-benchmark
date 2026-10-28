@@ -349,7 +349,7 @@ fn run(args: &Args) -> Result<(), String> {
 const COMPLETE_MARKER: &str = "COMPLETE";
 
 /// The filter-only query set over the derived fields.
-const FILTER_QUERIES: &str = "filter_queries.jsonl";
+const FILTER_QUERIES: &str = msmarco::derived::FILTER_QUERIES_FILE;
 
 const OUTPUTS: [&str; 5] = [
     "vectors.npy",

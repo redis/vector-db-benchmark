@@ -326,6 +326,22 @@ pub const VARIANTS: &[Variant] = &[
     },
 ];
 
+/// Revision suffix of the prepared tarballs in S3. Bumped whenever the files a
+/// tarball holds change shape (v2: payloads gain the derived fields and
+/// `filter_queries.jsonl` is added, #340), so a new artifact never overwrites an
+/// old one under the same name. The old objects stay in place.
+///
+/// This does NOT invalidate a local cache: the benchmark keys the local copy on
+/// the entry's `path` (the variant's `dir`) and skips the download whenever that
+/// directory exists. A stale directory is caught on load instead, by
+/// `derived::check_prepared_dir`.
+pub const TARBALL_REVISION: &str = "v2";
+
+/// `msmarco-cohere-1024-1M-cosine-v2`, the stem of a variant's published tarball.
+pub fn tarball_stem(v: &Variant) -> String {
+    format!("{}-{}", v.dataset_name, TARBALL_REVISION)
+}
+
 /// Look a variant up by its registered dataset name.
 pub fn variant(dataset_name: &str) -> Option<&'static Variant> {
     VARIANTS.iter().find(|v| v.dataset_name == dataset_name)
@@ -1205,7 +1221,7 @@ mod tests {
             // exist.
             if let Some(link) = entry.get("link").and_then(|l| l.as_str()) {
                 assert!(
-                    link.ends_with(&format!("/{}.tgz", v.dataset_name)),
+                    link.ends_with(&format!("/{}.tgz", tarball_stem(v))),
                     "{}: link {link:?} does not name this variant's tarball",
                     v.dataset_name
                 );

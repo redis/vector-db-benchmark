@@ -893,6 +893,72 @@ pub fn check_filter_queries(
     })
 }
 
+/// File name of the filter-only query set inside a prepared directory.
+pub const FILTER_QUERIES_FILE: &str = "filter_queries.jsonl";
+
+/// Refuse a local MS MARCO directory prepared before the derived fields existed
+/// when the registry already declares them.
+///
+/// The benchmark skips the download whenever the dataset directory exists. A
+/// host that extracted an older tarball therefore keeps payloads without
+/// `category`/`doc_len`/`tier`/`rand_key`, while the schema tells every engine
+/// to build those columns. The result is columns no document fills (Milvus
+/// stores an absent VarChar as `""`), and a filter run scores 0 hits as if they
+/// were real. Cheap by design, so it can run on every dataset access:
+///
+/// * `filter_queries.jsonl` must exist. `--add-derived-fields` renames it LAST,
+///   so its presence means the upgraded payloads were already in place.
+/// * The FIRST payload line must carry every derived field with the derived
+///   value ([`check_payload`]). That catches a hand-copied or mixed directory.
+///   It does not scan the whole file; `prepare-msmarco --verify` does.
+///
+/// Does nothing for datasets that are not registered MS MARCO variants, or
+/// whose schema declares none of the derived fields.
+pub fn check_prepared_dir(
+    dataset_name: &str,
+    schema: Option<&Value>,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::BufRead as _;
+    if super::variant(dataset_name).is_none() {
+        return Ok(());
+    }
+    let declares = schema
+        .and_then(Value::as_object)
+        .is_some_and(|s| DERIVED_FIELDS.iter().any(|(f, _)| s.contains_key(*f)));
+    if !declares {
+        return Ok(());
+    }
+    let remedy = format!(
+        "This directory predates the derived exact-match fields (#340). Either upgrade it in \
+         place with `prepare-msmarco --dataset {dataset_name} --add-derived-fields --out-dir \
+         <datasets dir>`, or delete {} so the current tarball is downloaded again.",
+        dir.display()
+    );
+    if !dir.join(FILTER_QUERIES_FILE).exists() {
+        return Err(format!(
+            "{dataset_name}: {} has no {FILTER_QUERIES_FILE}, but the registry declares the \
+             derived fields. {remedy}",
+            dir.display()
+        ));
+    }
+    let payloads = dir.join("payloads.jsonl");
+    let f = std::fs::File::open(&payloads)
+        .map_err(|e| format!("{dataset_name}: open {}: {e}", payloads.display()))?;
+    let mut first = String::new();
+    std::io::BufReader::new(f)
+        .read_line(&mut first)
+        .map_err(|e| format!("{dataset_name}: read {}: {e}", payloads.display()))?;
+    let payload: Value = serde_json::from_str(first.trim_end()).map_err(|e| {
+        format!(
+            "{dataset_name}: first line of {} is not JSON: {e}",
+            payloads.display()
+        )
+    })?;
+    check_payload(&payload).map_err(|e| format!("{dataset_name}: {e} {remedy}"))?;
+    Ok(())
+}
+
 /// The `derived_fields` block recorded in `PREPARED.json`.
 pub fn manifest_entry(corpus: &DerivedCorpus, rows: &[Value]) -> Value {
     let mut per_category = vec![0u64; CATEGORY_COUNT];
@@ -1306,5 +1372,62 @@ mod tests {
         assert_eq!(ids.len() as u64, count_matches(c.rows(), &p).unwrap());
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
         assert!(ids.iter().all(|i| c.rows()[*i as usize].category == 2));
+    }
+
+    fn prepared_dir(fq: bool, payload: &Value) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("payloads.jsonl"),
+            format!("{payload}\n{{\"docid\":\"later\"}}\n"),
+        )
+        .unwrap();
+        if fq {
+            std::fs::write(dir.path().join(FILTER_QUERIES_FILE), "{}\n").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_prepared_dir_without_the_derived_fields_is_refused() {
+        const NAME: &str = "msmarco-cohere-1024-100K-cosine";
+        let schema = json!({"docid": "keyword", "category": "keyword", "rand_key": "int"});
+        let old = json!({"docid": "doc-a"});
+        let mut m = old.as_object().unwrap().clone();
+        DerivedFields::from_docid("doc-a")
+            .insert_into(&mut m)
+            .unwrap();
+        let new = Value::Object(m);
+
+        // Upgraded directory: accepted.
+        let d = prepared_dir(true, &new);
+        check_prepared_dir(NAME, Some(&schema), d.path()).unwrap();
+
+        // No filter_queries.jsonl: refused, naming both remedies.
+        let d = prepared_dir(false, &new);
+        let e = check_prepared_dir(NAME, Some(&schema), d.path()).unwrap_err();
+        assert!(
+            e.contains("--add-derived-fields") && e.contains("delete"),
+            "{e}"
+        );
+
+        // filter_queries.jsonl present but old payloads (a mixed directory).
+        let d = prepared_dir(true, &old);
+        let e = check_prepared_dir(NAME, Some(&schema), d.path()).unwrap_err();
+        assert!(
+            e.contains("category") && e.contains("--add-derived-fields"),
+            "{e}"
+        );
+
+        // A drifted value in the first payload is refused too.
+        let mut drifted = new.clone();
+        drifted["tier"] = json!(-1);
+        let d = prepared_dir(true, &drifted);
+        assert!(check_prepared_dir(NAME, Some(&schema), d.path()).is_err());
+
+        // Not applicable: another dataset, or a schema without derived fields.
+        let d = prepared_dir(false, &old);
+        check_prepared_dir("glove-100-angular", Some(&schema), d.path()).unwrap();
+        check_prepared_dir(NAME, Some(&json!({"docid": "keyword"})), d.path()).unwrap();
+        check_prepared_dir(NAME, None, d.path()).unwrap();
     }
 }
