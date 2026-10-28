@@ -189,8 +189,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     if args.skip_vector_index {
         engines.retain(|(_, config)| {
             let engine_type = config.engine.as_deref().unwrap_or("unknown");
-            let supported = vector_db_benchmark::workload::implemented(engine_type)
-                .contains(&Workload::FilterOnly);
+            let supported = vector_db_benchmark::workload::supports_skip_vector_index(engine_type);
             if !supported {
                 eprintln!(
                     "WARNING: --skip-vector-index not implemented for engine '{}', skipping",

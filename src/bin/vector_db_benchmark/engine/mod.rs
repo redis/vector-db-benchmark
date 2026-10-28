@@ -822,7 +822,8 @@ fn workload_not_implemented(engine: &str, workload: Workload) -> String {
 /// THE dispatch point from a resolved [`Workload`] to an engine call (#344).
 ///
 /// Every measured search, warm-up included, goes through here. It refuses a
-/// combination the engine table (`workload::implemented`) does not list, then
+/// combination `workload::dispatchable` does not allow (the `implemented`
+/// table, plus the flag-only legacy filter-only engines), then
 /// checks the result carries the workload's fingerprint and — under
 /// `--dump-results` — one per-query record per attempted query. A failure of
 /// any of these is an error, never a fallback to the vector path.
@@ -834,7 +835,7 @@ pub fn search_workload(
     params: &SearchParams,
     num_queries: i64,
 ) -> Result<SearchResults, String> {
-    if !vector_db_benchmark::workload::implemented(engine_type).contains(&workload) {
+    if !vector_db_benchmark::workload::dispatchable(engine_type, workload) {
         return Err(workload_not_implemented(engine.name(), workload));
     }
     let mut results = match workload {
@@ -843,8 +844,13 @@ pub fn search_workload(
         Workload::Fulltext => engine.search_fulltext(dataset, params, num_queries),
         Workload::FilterOnly => engine.search_filter_only(dataset, params, num_queries),
     }?;
-    vector_db_benchmark::workload::verify_result_shape(workload, results.filter_only.is_some())
-        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    vector_db_benchmark::workload::verify_engine_result_shape(
+        engine_type,
+        workload,
+        results.filter_only.is_some(),
+        results.mean_precision_at_returned == -1.0,
+    )
+    .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
     if params.capture_query_results {
         let records = results.query_records.as_ref().ok_or_else(|| {
             format!(
@@ -1465,5 +1471,36 @@ mod dispatch_tests {
             has_filter_only_arm: false,
         };
         assert!(run(&mut f, "redis", Workload::Vector, false).is_ok());
+    }
+
+    /// PR #351 CI regression: Valkey/MongoDB's legacy filter-only harness
+    /// returns the `-1.0` precision sentinel and no `filter_only` stats. Under
+    /// `--skip-vector-index` that must dispatch and pass, as on master, while a
+    /// result missing the sentinel is still refused as a misroute.
+    #[test]
+    fn legacy_filter_only_engines_dispatch_on_the_precision_sentinel() {
+        let legacy = |sentinel: bool| SearchResults {
+            mean_precision_at_returned: if sentinel { -1.0 } else { 0.9 },
+            ..vector_result(None)
+        };
+        for engine_type in ["valkey", "mongodb"] {
+            let mut f = Fake {
+                result: legacy(true),
+                has_filter_only_arm: true,
+            };
+            let r = run(&mut f, engine_type, Workload::FilterOnly, false).unwrap();
+            assert_eq!(r.workload, Some(Workload::FilterOnly));
+            let mut f = Fake {
+                result: legacy(false),
+                has_filter_only_arm: true,
+            };
+            assert!(run(&mut f, engine_type, Workload::FilterOnly, false).is_err());
+            // The vector path returning the sentinel ran the filter-only harness.
+            let mut f = Fake {
+                result: legacy(true),
+                has_filter_only_arm: false,
+            };
+            assert!(run(&mut f, engine_type, Workload::Vector, false).is_err());
+        }
     }
 }

@@ -318,8 +318,10 @@ The runner resolves each config's workloads once, before anything is downloaded
 or connected (`vector_db_benchmark::workload::plan`), and every measured query
 goes through one function, `engine::search_workload`. An engine/workload pair
 without an implementation is a hard error, never a fallback to `vector`; today
-`filter-only` exists on Redis, OpenSearch, Valkey and MongoDB, and `hybrid` /
-`fulltext` exist nowhere yet. The shared `full` index schema is not built yet,
+a declared `filter-only` exists on Redis and OpenSearch, and `hybrid` /
+`fulltext` exist nowhere yet. Valkey and MongoDB keep their legacy filter-only
+harness reachable only through `--skip-vector-index`, exactly as before; a
+config that declares `filter-only` for them is refused. The shared `full` index schema is not built yet,
 so one engine config cannot mix `filter-only` with another workload (they need
 different index layouts) — split them into two configs. `--skip-vector-index` is
 kept as an alias for "every search config is `filter-only`" (with its legacy

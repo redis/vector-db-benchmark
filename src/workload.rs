@@ -128,14 +128,42 @@ pub enum IndexLayout {
     NoVector,
 }
 
-/// The workloads each engine has a real code path for. The ONE table both the
-/// startup check ([`plan`]) and the runner's `--skip-vector-index` engine filter
-/// read. An engine type not listed here implements `vector` only.
+/// The workloads each engine has a contract-conforming code path for — what a
+/// search config may DECLARE. An engine type not listed here implements
+/// `vector` only. Checked by [`plan`] at startup and again by the binary's
+/// `engine::search_workload` at dispatch.
+///
+/// Valkey and MongoDB are deliberately absent from the `filter-only` row: their
+/// filter-only harnesses predate the #328 contract (no server-side layout check,
+/// legacy result format, no `<engine>-no-vector` rename unless the flag is
+/// used). They stay reachable exactly as on master — through
+/// `--skip-vector-index` only — via [`legacy_filter_only`].
 pub fn implemented(engine_type: &str) -> &'static [Workload] {
     match engine_type {
-        "redis" | "opensearch" | "valkey" | "mongodb" => &[Workload::Vector, Workload::FilterOnly],
+        "redis" | "opensearch" => &[Workload::Vector, Workload::FilterOnly],
         _ => &[Workload::Vector],
     }
+}
+
+/// Engines whose pre-#328 filter-only harness is reachable ONLY through the
+/// process-wide `--skip-vector-index` flag. Their results keep the legacy shape:
+/// no `filter_only` stats, `mean_precision_at_returned == -1.0` as the
+/// filter-only sentinel.
+pub fn legacy_filter_only(engine_type: &str) -> bool {
+    matches!(engine_type, "valkey" | "mongodb")
+}
+
+/// Whether `--skip-vector-index` can run on this engine type at all.
+pub fn supports_skip_vector_index(engine_type: &str) -> bool {
+    implemented(engine_type).contains(&Workload::FilterOnly) || legacy_filter_only(engine_type)
+}
+
+/// Whether the dispatch point may route `workload` to this engine type: a
+/// declared workload from [`implemented`], or the legacy flag-only filter-only
+/// harness. [`plan`] has already refused a DECLARED legacy filter-only.
+pub fn dispatchable(engine_type: &str, workload: Workload) -> bool {
+    implemented(engine_type).contains(&workload)
+        || (workload == Workload::FilterOnly && legacy_filter_only(engine_type))
 }
 
 /// Every search config's resolved workload, and the one layout they share.
@@ -188,7 +216,12 @@ pub fn plan(
             (false, Some(w)) => *w,
             (false, None) => Workload::Vector,
         };
-        if !implemented(engine_type).contains(&w) {
+        let allowed = if skip_vector_index {
+            supports_skip_vector_index(engine_type)
+        } else {
+            implemented(engine_type).contains(&w)
+        };
+        if !allowed {
             return Err(format!(
                 "workload \"{w}\" is not implemented for engine '{engine_type}' (search config \
                  #{i}); implemented: {}",
@@ -225,6 +258,33 @@ pub fn plan(
         layout,
         workloads,
     })
+}
+
+/// [`verify_result_shape`] for a specific engine type. Legacy filter-only
+/// engines ([`legacy_filter_only`]) never publish `filter_only` stats, so their
+/// fingerprint is the precision sentinel instead: a filter-only result must
+/// carry `mean_precision_at_returned == -1.0` (`precision_sentinel`), and any
+/// other workload must not.
+pub fn verify_engine_result_shape(
+    engine_type: &str,
+    workload: Workload,
+    filter_only_stats: bool,
+    precision_sentinel: bool,
+) -> Result<(), String> {
+    if !legacy_filter_only(engine_type) {
+        return verify_result_shape(workload, filter_only_stats);
+    }
+    match (workload, precision_sentinel) {
+        (Workload::FilterOnly, false) => Err(format!(
+            "workload filter-only on '{engine_type}' returned a result without the -1.0 \
+             precision sentinel — the engine did not run its filter-only path"
+        )),
+        (w, true) if w != Workload::FilterOnly => Err(format!(
+            "workload \"{w}\" on '{engine_type}' returned the filter-only precision sentinel \
+             — the engine ran its filter-only path"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Refuse a result that does not carry its workload's fingerprint.
@@ -305,7 +365,46 @@ mod tests {
         // Filter-only only where an arm exists.
         assert!(plan("qdrant", &[Some(Workload::FilterOnly)], false).is_err());
         assert!(plan("qdrant", &[None], true).is_err());
-        assert!(plan("valkey", &[None], true).is_ok());
+    }
+
+    /// Valkey/MongoDB filter-only stays exactly as reachable as on master:
+    /// through `--skip-vector-index`, never through a declared workload.
+    #[test]
+    fn legacy_filter_only_engines_are_flag_only() {
+        for engine in ["valkey", "mongodb"] {
+            let p = plan(engine, &[None], true).unwrap();
+            assert_eq!(p.workloads, vec![Workload::FilterOnly]);
+            assert_eq!(p.layout, IndexLayout::NoVector);
+            let e = plan(engine, &[Some(Workload::FilterOnly)], false).unwrap_err();
+            assert!(e.contains("not implemented"), "{e}");
+            assert!(supports_skip_vector_index(engine));
+            assert!(dispatchable(engine, Workload::FilterOnly));
+            assert!(!dispatchable(engine, Workload::Fulltext));
+        }
+        for engine in ["redis", "opensearch"] {
+            assert!(plan(engine, &[Some(Workload::FilterOnly)], false).is_ok());
+            assert!(!legacy_filter_only(engine));
+        }
+        assert!(!supports_skip_vector_index("qdrant"));
+        assert!(!dispatchable("qdrant", Workload::FilterOnly));
+    }
+
+    /// The CI failure this pins: legacy engines publish no `filter_only`
+    /// stats, so their fingerprint is the -1.0 sentinel — and the check must
+    /// still catch a misroute in either direction.
+    #[test]
+    fn legacy_engines_are_checked_by_the_precision_sentinel() {
+        for engine in ["valkey", "mongodb"] {
+            assert!(verify_engine_result_shape(engine, Workload::FilterOnly, false, true).is_ok());
+            assert!(
+                verify_engine_result_shape(engine, Workload::FilterOnly, false, false).is_err()
+            );
+            assert!(verify_engine_result_shape(engine, Workload::Vector, false, false).is_ok());
+            assert!(verify_engine_result_shape(engine, Workload::Vector, false, true).is_err());
+        }
+        // Contract engines still need the stats; the sentinel alone is not enough.
+        assert!(verify_engine_result_shape("redis", Workload::FilterOnly, false, true).is_err());
+        assert!(verify_engine_result_shape("redis", Workload::FilterOnly, true, true).is_ok());
     }
 
     #[test]

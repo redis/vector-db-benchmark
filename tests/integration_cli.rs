@@ -246,6 +246,19 @@ fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
             false,
             "not implemented",
         ),
+        // Legacy filter-only harnesses stay flag-only, as on master.
+        (
+            "valkey",
+            json!([{"workload":"filter-only"}]),
+            false,
+            "not implemented",
+        ),
+        (
+            "mongodb",
+            json!([{"workload":"filter-only"}]),
+            false,
+            "not implemented",
+        ),
         (
             "redis",
             json!([{}, {"workload":"filter-only"}]),
