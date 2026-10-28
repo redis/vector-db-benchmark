@@ -2407,6 +2407,13 @@ fn build_search_result_json(
     // profile is evaluated at the `top` this run actually used, so a reader can
     // see whether `mean_recall` is the same quantity upstream calls
     // `mean_precisions` for this dataset — or by how much they cannot be.
+    // p90 (#346), next to the p50/p95/p99 fields above. Inserted here rather
+    // than in the literal because that `json!` is at the macro recursion limit;
+    // serde_json's map is sorted, so the emitted document is the same.
+    result["results"]["p90_time"] = json!(results.p90_time);
+    result["results"]["schedule_delay_p90_time"] = json!(results.schedule_delay_p90_time);
+    result["results"]["end_to_end_p90_time"] = json!(results.end_to_end_p90_time);
+
     let gt_stats = ground_truth.and_then(|gt| gt.stats(results.top));
     result["metrics_schema"] = metrics_schema(gt_stats.as_ref());
 
@@ -2526,6 +2533,9 @@ fn build_search_result_json(
         }
         if let Some(t) = results.update_p50_time {
             results_obj.insert("update_p50_time".to_string(), json!(t));
+        }
+        if let Some(t) = results.update_p90_time {
+            results_obj.insert("update_p90_time".to_string(), json!(t));
         }
         if let Some(t) = results.update_p95_time {
             results_obj.insert("update_p95_time".to_string(), json!(t));
@@ -4400,5 +4410,146 @@ mod filter_only_serialization_tests {
                 }
             }
         }
+    }
+}
+
+/// #346: p90 is published for every latency series (search, update,
+/// schedule-delay, end-to-end) and is the numpy-linear p90 of that series' own
+/// samples.
+#[cfg(test)]
+mod p90_publication_tests {
+    use super::build_search_result_json;
+    use crate::config::SearchParams;
+    use crate::engine::{
+        attach_open_loop_metrics, compute_search_stats, finalize_update_stats, OpenLoopPlan,
+        UpdateAttribution, UpdateSearchRatio, UpdateTally,
+    };
+    use serde_json::json;
+
+    /// `numpy.percentile(v, 90)` (linear), written out independently of
+    /// `percentile_linear` so a shared bug in that helper cannot pass both.
+    fn numpy_p90(values: &[f64]) -> f64 {
+        let mut v = values.to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let rank = 0.9 * (v.len() - 1) as f64;
+        let lo = rank.floor() as usize;
+        let frac = rank - lo as f64;
+        if frac == 0.0 {
+            v[lo]
+        } else {
+            v[lo] + (v[lo + 1] - v[lo]) * frac
+        }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-12
+    }
+
+    #[test]
+    fn p90_is_published_for_every_latency_series_from_a_known_sample() {
+        // Each series gets a DIFFERENT known sample, so a p90 copied from the
+        // wrong series, or from p50/p95, cannot match. Reversed so the
+        // computation has to sort. Hand-derived numpy-linear p90s:
+        //   search  1..=100 ms : rank 89.1 -> 90.1 ms   (nearest-rank would give 91)
+        //   update  10..=100 ms step 10 : rank 8.1 -> 91 ms
+        //   sched   1..=20 ms  : rank 17.1 -> 18.1 ms
+        //   e2e     2..=100 ms step 2   : rank 44.1 -> 90.2 ms
+        let search: Vec<f64> = (1..=100).rev().map(|i| i as f64 / 1000.0).collect();
+        let update: Vec<f64> = (1..=10).rev().map(|i| i as f64 / 100.0).collect();
+        let sched: Vec<f64> = (1..=20).rev().map(|i| i as f64 / 1000.0).collect();
+        let e2e: Vec<f64> = (1..=50).rev().map(|i| i as f64 * 2.0 / 1000.0).collect();
+        for (v, want) in [
+            (&search, 0.0901),
+            (&update, 0.091),
+            (&sched, 0.0181),
+            (&e2e, 0.0902),
+        ] {
+            assert!(close(numpy_p90(v), want), "reference p90 of {v:?}");
+        }
+
+        let params: SearchParams = serde_json::from_value(json!({
+            "parallel": 1, "top": 10, "target_qps": 100.0, "duration_seconds": 1.0
+        }))
+        .unwrap();
+        let ones = vec![1.0; search.len()];
+        let mut results =
+            compute_search_stats(&search, &ones, &ones, &ones, &ones, 1.0, 10, 1, 100).unwrap();
+        finalize_update_stats(
+            &mut results,
+            UpdateTally {
+                times: update.clone(),
+                unattributed: 0,
+                failed: 0,
+            },
+            1.0,
+            UpdateAttribution::CorpusRow,
+            &UpdateSearchRatio {
+                updates: 1,
+                searches: 1,
+            },
+            "test",
+        );
+        let plan = OpenLoopPlan::from_params(&params).unwrap().unwrap();
+        attach_open_loop_metrics(&mut results, plan, &sched, &e2e, 0, 0);
+
+        let doc = build_search_result_json(
+            "redis-test",
+            "fixture",
+            &params,
+            &results,
+            None,
+            None,
+            true, // --dump-raw-latencies
+            None,
+            None,
+            None,
+            None,
+            &json!({}),
+        );
+        let r = &doc["results"];
+        let got = |k: &str| {
+            r[k].as_f64()
+                .unwrap_or_else(|| panic!("{k} missing or not a number in {r}"))
+        };
+
+        assert!(
+            close(got("p90_time"), 0.0901),
+            "p90_time={}",
+            got("p90_time")
+        );
+        assert!(close(got("update_p90_time"), 0.091));
+        assert!(close(got("schedule_delay_p90_time"), 0.0181));
+        assert!(close(got("end_to_end_p90_time"), 0.0902));
+
+        // The published p90 is the p90 of the raw samples published beside it.
+        let raw = |k: &str| -> Vec<f64> {
+            r[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap())
+                .collect()
+        };
+        assert!(close(got("p90_time"), numpy_p90(&raw("latencies"))));
+        assert!(close(
+            got("update_p90_time"),
+            numpy_p90(&raw("update_latencies"))
+        ));
+
+        // Back-compat: the existing percentiles are still published, unchanged,
+        // and p90 sits between its neighbours in every series.
+        for prefix in ["", "update_", "schedule_delay_", "end_to_end_"] {
+            let p = |q: &str| got(&format!("{prefix}p{q}_time"));
+            assert!(
+                p("50") <= p("90") && p("90") <= p("95") && p("95") <= p("99"),
+                "{prefix}: p50={} p90={} p95={} p99={}",
+                p("50"),
+                p("90"),
+                p("95"),
+                p("99")
+            );
+        }
+        assert!(close(got("p50_time"), 0.0505));
+        assert!(close(got("p95_time"), 0.09505));
+        assert!(close(got("p99_time"), 0.09901));
     }
 }

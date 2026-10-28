@@ -137,6 +137,8 @@ pub struct SearchResults {
     pub max_time: f64,
     pub rps: f64,
     pub p50_time: f64,
+    /// Added for #346; p50/p95/p99 fields are unchanged for back-compat.
+    pub p90_time: f64,
     pub p95_time: f64,
     pub p99_time: f64,
     /// Per-query precision-at-returned samples (see `mean_precision_at_returned`).
@@ -167,9 +169,11 @@ pub struct SearchResults {
     pub dropped_queries: usize,
     pub late_queries: usize,
     pub schedule_delay_p50_time: Option<f64>,
+    pub schedule_delay_p90_time: Option<f64>,
     pub schedule_delay_p95_time: Option<f64>,
     pub schedule_delay_p99_time: Option<f64>,
     pub end_to_end_p50_time: Option<f64>,
+    pub end_to_end_p90_time: Option<f64>,
     pub end_to_end_p95_time: Option<f64>,
     pub end_to_end_p99_time: Option<f64>,
     // Mixed benchmark update metrics (None when search-only)
@@ -183,6 +187,7 @@ pub struct SearchResults {
     pub update_rps: Option<f64>,
     pub update_mean_time: Option<f64>,
     pub update_p50_time: Option<f64>,
+    pub update_p90_time: Option<f64>,
     pub update_p95_time: Option<f64>,
     pub update_p99_time: Option<f64>,
     pub update_latencies: Option<Vec<f64>>,
@@ -354,6 +359,7 @@ pub fn finalize_update_stats(
         results.update_rps = Some(0.0);
         results.update_mean_time = None;
         results.update_p50_time = None;
+        results.update_p90_time = None;
         results.update_p95_time = None;
         results.update_p99_time = None;
         results.update_latencies = Some(times);
@@ -365,6 +371,7 @@ pub fn finalize_update_stats(
     results.update_rps = Some(times.len() as f64 / total_time);
     results.update_mean_time = Some(times.iter().sum::<f64>() / times.len() as f64);
     results.update_p50_time = Some(percentile_linear(&sorted, 0.50));
+    results.update_p90_time = Some(percentile_linear(&sorted, 0.90));
     results.update_p95_time = Some(percentile_linear(&sorted, 0.95));
     results.update_p99_time = Some(percentile_linear(&sorted, 0.99));
     results.update_latencies = Some(times);
@@ -464,25 +471,28 @@ pub fn attach_open_loop_metrics(
     dropped_queries: usize,
     late_queries: usize,
 ) {
-    let percentiles = |values: &[f64]| -> (f64, f64, f64) {
+    let percentiles = |values: &[f64]| -> (f64, f64, f64, f64) {
         let mut sorted = values.to_vec();
         sorted.sort_by(|a, b| a.total_cmp(b));
         (
             percentile_linear(&sorted, 0.50),
+            percentile_linear(&sorted, 0.90),
             percentile_linear(&sorted, 0.95),
             percentile_linear(&sorted, 0.99),
         )
     };
-    let (sd50, sd95, sd99) = percentiles(schedule_delays);
-    let (e2e50, e2e95, e2e99) = percentiles(end_to_end_latencies);
+    let (sd50, sd90, sd95, sd99) = percentiles(schedule_delays);
+    let (e2e50, e2e90, e2e95, e2e99) = percentiles(end_to_end_latencies);
     results.target_qps = Some(plan.target_qps);
     results.offered_queries = Some(plan.total_requests);
     results.dropped_queries = dropped_queries;
     results.late_queries = late_queries;
     results.schedule_delay_p50_time = Some(sd50);
+    results.schedule_delay_p90_time = Some(sd90);
     results.schedule_delay_p95_time = Some(sd95);
     results.schedule_delay_p99_time = Some(sd99);
     results.end_to_end_p50_time = Some(e2e50);
+    results.end_to_end_p90_time = Some(e2e90);
     results.end_to_end_p95_time = Some(e2e95);
     results.end_to_end_p99_time = Some(e2e99);
 }
@@ -582,6 +592,7 @@ pub fn compute_search_stats(
         max_time,
         rps: times.len() as f64 / total_time,
         p50_time: pct(0.50),
+        p90_time: pct(0.90),
         p95_time: pct(0.95),
         p99_time: pct(0.99),
         precisions_at_returned: precisions.to_vec(),

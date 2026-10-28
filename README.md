@@ -1,6 +1,6 @@
 # vector-db-benchmark
 
-A benchmarking tool for vector databases, written in Rust. Measures upload throughput, search QPS, latency percentiles (p50/p95/p99), and recall for vector search engines.
+A benchmarking tool for vector databases, written in Rust. Measures upload throughput, search QPS, latency percentiles (p50/p90/p95/p99), and recall for vector search engines.
 
 ## Supported Engines
 
@@ -666,6 +666,7 @@ Results JSON includes separate metrics for both operation types:
     "mean_precision_at_returned": 0.9785,
     "mean_recall": 0.9785,
     "p50_time": 0.00032,
+    "p90_time": 0.00071,
     "p95_time": 0.00089,
     "p99_time": 0.00142,
     "update_count": 5891,
@@ -676,6 +677,7 @@ Results JSON includes separate metrics for both operation types:
     "update_rps": 589.1,
     "update_mean_time": 0.00045,
     "update_p50_time": 0.00041,
+    "update_p90_time": 0.00082,
     "update_p95_time": 0.00098,
     "update_p99_time": 0.00156,
     "update_search_ratio": "1:10"
