@@ -785,6 +785,44 @@ and uses DIALECT 2 instead of 4 to avoid optimizations that can skip exact count
 old filter-only timings and Valkey's legacy filter-only path are not directly
 comparable. KNN behavior is unchanged.
 
+#### Filter-only on MS MARCO: prepared queries and the per-query count gate (#340)
+
+```bash
+vector-db-benchmark --engines redis-fo --datasets msmarco-cohere-1024-1M-cosine \
+  --skip-vector-index --fail-on-dropped-queries --repetitions 1 --dump-results dumps/redis
+```
+
+- **Queries.** A compound dataset that ships `filter_queries.jsonl` runs exactly
+  those queries (`query_id`, `shape`, `conditions`, `expected_count`,
+  `corpus_size`; see `src/filter_only/query_set.rs`); others fall back to the
+  predicates in `tests.jsonl`. `--queries N` cycles the set. Each per-query
+  record's `shape` comes from the file, so `compare-results` reports per shape.
+- **Index layout.** Filter-only indexes only `keyword`/`int`/`float` fields
+  (Redis TAG/NUMERIC, OpenSearch keyword/long/double). `text`, `geo`,
+  `datetime` and other fields stay stored in the document, unindexed. With a
+  prepared query set the index narrows to the fields its predicates reference;
+  for MS MARCO that is `category` (TAG / keyword) and `doc_len`, `tier`,
+  `rand_key` (NUMERIC / long), while `docid`, `url` (which holds `;` and edge
+  whitespace) and the text fields are stored only — OpenSearch maps with
+  `dynamic: false`. The shared-domain metadata checks apply to every indexed
+  field exactly as before; without a prepared set (the synthetic `*-filters`
+  datasets) every declared scalar field is still indexed and validated.
+- **Per-query count gate.** Every answered query's exact total must equal its
+  prepared `expected_count`, or the run fails naming the queries; the sum alone
+  lets two compensating errors pass. The artifact records the answers checked
+  in `filter_only.per_query_counts_checked`. Exact totals, `--fail-on-dropped-queries`
+  and the zero-retry rule are unchanged.
+- **Stale corpora.** An MS MARCO directory whose registry entry declares the
+  derived fields but which has no `filter_queries.jsonl`, or whose payloads lack
+  the fields — an S3 tarball prepared before #340 — is refused by the dataset
+  loader for every workload, naming `prepare-msmarco --add-derived-fields`; it
+  never runs over empty columns or falls back to `tests.jsonl`.
+
+Verified on `msmarco-cohere-1024-100K-cosine` (31 queries × 3 repetitions):
+Redis and OpenSearch both pass the gate, and `compare-results` reports 1.0 count
+agreement with max Δ 0 for every shape. CI exercises the same paths on a
+2,000-row MS MARCO-shaped fixture (`write_msmarco_filter_project`).
+
 Run `make agent-check`, `make integration-test`, and
 `make integration-test-opensearch` to verify the contract. For instrumented
 library, CLI, and real-server coverage, install `cargo-llvm-cov` and the Rust

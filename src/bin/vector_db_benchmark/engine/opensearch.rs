@@ -227,7 +227,7 @@ impl OpenSearchEngine {
         vector_db_benchmark::filter_only::validate_opensearch_schema(
             &mapping[&self.index_name]["mappings"]["properties"],
             &settings[&self.index_name]["settings"]["index"],
-            dataset.config.schema.as_ref(),
+            dataset.filter_only_index_schema()?.as_ref(),
         )
     }
 
@@ -259,8 +259,15 @@ impl OpenSearchEngine {
             }
         });
 
-        // Add schema fields from dataset config
-        if let Some(schema) = &dataset.config.schema {
+        // Add schema fields from dataset config. Filter-only maps only the
+        // fields its predicates may reference (#340); with `dynamic: false`
+        // below, every other payload field stays in `_source`, unindexed.
+        let schema = if self.config.skip_vector_index {
+            dataset.filter_only_index_schema()?
+        } else {
+            dataset.config.schema.clone()
+        };
+        if let Some(schema) = &schema {
             if let Some(schema_obj) = schema.as_object() {
                 let props = properties.as_object_mut().unwrap();
                 for (field_name, field_type) in schema_obj {
@@ -309,11 +316,13 @@ impl OpenSearchEngine {
             );
         }
 
+        let mut mappings = serde_json::json!({ "properties": properties });
+        if self.config.skip_vector_index {
+            mappings["dynamic"] = serde_json::json!(false);
+        }
         let mut body = serde_json::json!({
             "settings": { "index": index_settings },
-            "mappings": {
-                "properties": properties,
-            }
+            "mappings": mappings,
         });
         if let Some(meta) = fulltext_meta {
             body["mappings"]["_meta"] = meta;
@@ -1719,28 +1728,40 @@ impl OpenSearchEngine {
     ) -> Result<SearchResults, String> {
         let parallel = params.parallel.unwrap_or(1) as usize;
 
-        if filter_only {
+        let index_schema = if filter_only {
             self.validate_filter_only_schema(dataset)?;
             if !self.scalar_metadata_validated {
                 dataset.validate_scalar_metadata()?;
                 self.scalar_metadata_validated = true;
             }
-        }
+            dataset.filter_only_index_schema()?
+        } else {
+            None
+        };
 
         let query_path = dataset.get_path()?;
         println!("\tReading queries from {}...", query_path.display());
-        let (mut queries, mut neighbors, conditions) = dataset.read_queries()?;
-
-        let mut parsed_filters: Vec<QueryFilter<serde_json::Value>> =
-            conditions.try_resolve_all("OpenSearch", |condition| {
-                if filter_only {
-                    vector_db_benchmark::filter_only::domain::validate_predicate(
-                        condition,
-                        dataset.config.schema.as_ref(),
-                    )?;
-                }
-                Ok(parse_os_conditions(condition))
-            })?;
+        // Filter-only runs the dataset's filter query set (the prepared
+        // `filter_queries.jsonl` when it ships one, #340) and needs no vectors.
+        let (query_set, mut queries, mut neighbors, mut parsed_filters) = if filter_only {
+            let set = dataset.filter_only_queries()?;
+            let parsed: Vec<QueryFilter<serde_json::Value>> =
+                set.conditions()
+                    .try_resolve_all("OpenSearch", |condition| {
+                        vector_db_benchmark::filter_only::domain::validate_predicate(
+                            condition,
+                            index_schema.as_ref(),
+                        )?;
+                        Ok(parse_os_conditions(condition))
+                    })?;
+            let n = set.len();
+            (Some(set), vec![Vec::new(); n], vec![Vec::new(); n], parsed)
+        } else {
+            let (queries, neighbors, conditions) = dataset.read_queries()?;
+            let parsed: Vec<QueryFilter<serde_json::Value>> = conditions
+                .try_resolve_all("OpenSearch", |condition| Ok(parse_os_conditions(condition)))?;
+            (None, queries, neighbors, parsed)
+        };
 
         // Dataset query index of each position below (identity for KNN; the
         // selected, cycled predicates for filter-only), so per-query records name
@@ -1845,6 +1866,7 @@ impl OpenSearchEngine {
         let capture = params.capture_query_results;
         let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
         let mut capture_failure: Option<String> = None;
+        let mut observed_totals: Vec<(usize, u64)> = Vec::new();
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(s, "opensearch-search", parallel);
@@ -1871,6 +1893,7 @@ impl OpenSearchEngine {
                     let mut retried = 0u64;
                     let mut cap: Vec<RawQueryResult> = Vec::new();
                     let mut capture_error: Option<String> = None;
+                    let mut totals: Vec<(usize, u64)> = Vec::new();
 
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -1894,6 +1917,7 @@ impl OpenSearchEngine {
                                 retried,
                                 cap,
                                 capture_error,
+                                totals,
                             );
                         }
                     };
@@ -1916,6 +1940,7 @@ impl OpenSearchEngine {
                                 retried,
                                 cap,
                                 capture_error,
+                                totals,
                             );
                         }
                     };
@@ -1942,6 +1967,7 @@ impl OpenSearchEngine {
                             retried,
                             cap,
                             capture_error,
+                            totals,
                         );
                     }
 
@@ -1974,6 +2000,7 @@ impl OpenSearchEngine {
                                     // Scalar latency includes every attempt and backoff;
                                     // Redis's scalar path makes a single attempt.
                                     t.push(elapsed.as_secs_f64());
+                                    totals.push((query_id, page.total));
                                     matched += page.total;
                                     returned_count += page.returned as u64;
                                     // `ids` is Some only when capturing.
@@ -2094,6 +2121,7 @@ impl OpenSearchEngine {
                         retried,
                         cap,
                         capture_error,
+                        totals,
                     )
                 })?;
             }
@@ -2102,9 +2130,22 @@ impl OpenSearchEngine {
             // Stamp the shared measurement start and release them together.
             let (per_worker, measured_start) = pool.start()?;
 
-            for (t, p, r, mr, nd, matched, returned_count, errors, retried, cap, capture_error) in
-                per_worker
+            for (
+                t,
+                p,
+                r,
+                mr,
+                nd,
+                matched,
+                returned_count,
+                errors,
+                retried,
+                cap,
+                capture_error,
+                totals,
+            ) in per_worker
             {
+                observed_totals.extend(totals);
                 if let Some(records) = captured.as_mut() {
                     records.extend(cap);
                 }
@@ -2170,12 +2211,19 @@ impl OpenSearchEngine {
         )?;
         result.query_records = captured;
         if filter_only {
+            // Per-query count gate (#340): every answer against its prepared
+            // count. `query_set` is always `Some` on this path.
+            let per_query_counts_checked = match &query_set {
+                Some(set) => set.check_counts(&observed_totals, times.len())?,
+                None => None,
+            };
             result.mean_precision_at_returned = -1.0;
             result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
                 result_limit: top,
                 matched_documents_sum: matched_sum,
                 returned_documents_sum: returned_sum,
                 retried_queries: retried,
+                per_query_counts_checked,
             });
         }
         Ok(result)
@@ -2306,7 +2354,7 @@ impl Engine for OpenSearchEngine {
         if self.config.skip_vector_index {
             vector_db_benchmark::filter_only::domain::validate_metadata(
                 &metadata,
-                dataset.config.schema.as_ref(),
+                dataset.filter_only_index_schema()?.as_ref(),
             )?;
             self.scalar_metadata_validated = true;
         }

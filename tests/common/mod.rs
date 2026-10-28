@@ -3339,3 +3339,300 @@ pub fn assert_bm25_parity_run(root: &Path, dump: &Path, engine: &str, config: &s
     let (ok, report) = run_compare(dump, dump, engine);
     assert!(ok, "self-comparison must pass: {report}");
 }
+
+// ---------------------------------------------------------------------------
+// MS MARCO-shaped filter-only fixture (#340 query side)
+// ---------------------------------------------------------------------------
+
+/// Rows in [`write_msmarco_filter_project`]'s corpus.
+pub const MSM_DOCS: usize = 2000;
+/// Dataset name of [`write_msmarco_filter_project`]: a registered MS MARCO
+/// variant name (in the fixture's own registry, at 2,000 rows), so the
+/// loader's stale-directory check (`derived::check_prepared_dir`) applies to
+/// it exactly as to the real corpus.
+pub const MSM_DATASET: &str = "msmarco-cohere-1024-100K-cosine";
+
+/// A small corpus with the MS MARCO schema — real-looking metadata (`docid`,
+/// `url` with `;` and edge whitespace as the real corpus has, `text` fields,
+/// offsets) plus the four derived fields from `msmarco::derived` — and a
+/// prepared `filter_queries.jsonl` covering all six shapes, whose
+/// `expected_count`s come from an INDEPENDENT oracle over the derived values
+/// (plain comparisons here, not `derived::Predicate`).
+pub struct MsmarcoFilterProject {
+    pub root: PathBuf,
+    /// Per prepared query, in file order: (shape, expected_count).
+    pub queries: Vec<(String, u64)>,
+}
+
+impl MsmarcoFilterProject {
+    pub fn dataset_dir(&self) -> PathBuf {
+        self.root.join("datasets").join(MSM_DATASET)
+    }
+
+    /// Exact total expected for the run's `n`-query cycle over the set.
+    pub fn cycled_total(&self, n: usize) -> u64 {
+        (0..n).map(|i| self.queries[i % self.queries.len()].1).sum()
+    }
+
+    /// Rewrite payloads.jsonl WITHOUT the derived fields, as a pre-#340
+    /// tarball has them.
+    pub fn strip_derived_payload_fields(&self) {
+        let path = self.dataset_dir().join("payloads.jsonl");
+        let stripped = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+                for (name, _) in vector_db_benchmark::msmarco::derived::DERIVED_FIELDS {
+                    v.as_object_mut().unwrap().remove(*name);
+                }
+                v.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, stripped).unwrap();
+    }
+
+    /// Shift the expected counts of the listed queries by their deltas,
+    /// keeping every other row byte-identical.
+    pub fn tamper_expected_counts(&self, deltas: &[(usize, i64)]) {
+        let path = self.dataset_dir().join("filter_queries.jsonl");
+        let rows = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+                if let Some((_, d)) = deltas.iter().find(|(q, _)| *q == i) {
+                    let n = v["expected_count"].as_i64().unwrap() + d;
+                    v["expected_count"] = serde_json::json!(n);
+                }
+                v.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, rows + "\n").unwrap();
+    }
+}
+
+pub fn write_msmarco_filter_project(engine_configs_json: &str) -> MsmarcoFilterProject {
+    use vector_db_benchmark::msmarco::derived::{DerivedFields, CATEGORY_NAMES, RAND_KEY_SPAN};
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let ds_dir = root.join("datasets").join(MSM_DATASET);
+    fs::create_dir_all(&ds_dir).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+
+    let mut rng = StdRng::seed_from_u64(0x340);
+    let dim = 4;
+    let vectors: Vec<Vec<f32>> = (0..MSM_DOCS)
+        .map(|_| (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect())
+        .collect();
+    write_npy_vectors(ds_dir.join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+
+    let docid = |i: usize| format!("msmarco_v2.1_doc_fx_{}#{}_{}", i / 7, i % 7, i * 31);
+    let rows: Vec<DerivedFields> = (0..MSM_DOCS)
+        .map(|i| DerivedFields::from_docid(&docid(i)))
+        .collect();
+    let payloads = (0..MSM_DOCS)
+        .map(|i| {
+            // The real corpus has `;` and edge whitespace in `url`; neither
+            // may stop a run whose predicates never touch `url`.
+            let url = match i % 50 {
+                0 => format!("http://fx.example/{i};jsessionid=1"),
+                1 => format!(" http://fx.example/{i}"),
+                _ => format!("http://fx.example/{i}"),
+            };
+            let title = if i % 9 == 0 {
+                String::new()
+            } else {
+                format!("Title {i}; part")
+            };
+            let mut p = serde_json::json!({
+                "docid": docid(i),
+                "url": url,
+                "title": title,
+                "headings": format!("Heading {i}\nSub; heading\n"),
+                "segment": format!("Passage {i} text, with punctuation; and spaces "),
+                "start_char": (i * 13) as i64,
+                "end_char": (i * 13 + 400) as i64,
+            });
+            for (k, v) in rows[i].to_json_fields() {
+                p[k] = v;
+            }
+            p.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds_dir.join("payloads.jsonl"), payloads).unwrap();
+    // Query vectors with no conditions, exactly like the real tests.jsonl:
+    // a filter-only run that fell back to it would find no predicate.
+    let tests = (0..4)
+        .map(|i| {
+            serde_json::json!({"query": vectors[i], "conditions": null, "closest_ids": [i]})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds_dir.join("tests.jsonl"), tests).unwrap();
+
+    let key17 = rows[17].rand_key;
+    let tenth = RAND_KEY_SPAN / 10;
+    type Oracle = Box<dyn Fn(&DerivedFields) -> bool>;
+    let cat = |c: &DerivedFields| CATEGORY_NAMES[c.category as usize];
+    let cases: Vec<(&str, serde_json::Value, Oracle)> = vec![
+        (
+            "tag_eq",
+            serde_json::json!({"and":[{"category":{"match":{"value":"cat00"}}}]}),
+            Box::new(move |r| cat(r) == "cat00"),
+        ),
+        (
+            "tag_eq",
+            serde_json::json!({"and":[{"category":{"match":{"any":["cat02","cat05"]}}}]}),
+            Box::new(move |r| cat(r) == "cat02" || cat(r) == "cat05"),
+        ),
+        (
+            "numeric_point",
+            serde_json::json!({"and":[{"rand_key":{"match":{"value":key17}}}]}),
+            Box::new(move |r| r.rand_key == key17),
+        ),
+        (
+            "numeric_point",
+            serde_json::json!({"and":[{"tier":{"match":{"value":3}}}]}),
+            Box::new(|r| r.tier == 3),
+        ),
+        (
+            "numeric_range",
+            serde_json::json!({"and":[{"rand_key":{"range":{"lt":tenth}}}]}),
+            Box::new(move |r| r.rand_key < tenth),
+        ),
+        (
+            "numeric_range",
+            serde_json::json!({"and":[{"doc_len":{"range":{"gte":1024,"lt":4096}}}]}),
+            Box::new(|r| (1024..4096).contains(&r.doc_len)),
+        ),
+        (
+            "repeated_value_range",
+            serde_json::json!({"and":[{"tier":{"range":{"gte":2,"lte":3}}}]}),
+            Box::new(|r| (2..=3).contains(&r.tier)),
+        ),
+        (
+            "tag_and_range",
+            serde_json::json!({"and":[{"category":{"match":{"value":"cat01"}}},{"tier":{"range":{"lte":4}}}]}),
+            Box::new(move |r| cat(r) == "cat01" && r.tier <= 4),
+        ),
+        (
+            "range_or_range",
+            serde_json::json!({"or":[{"tier":{"range":{"lte":0}}},{"doc_len":{"range":{"gte":32768}}}]}),
+            Box::new(|r| r.tier == 0 || r.doc_len >= 32768),
+        ),
+    ];
+    let mut queries = Vec::new();
+    let lines = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (shape, conditions, oracle))| {
+            let count = rows.iter().filter(|r| oracle(r)).count() as u64;
+            assert!(count > 0, "fixture query {i} matches nothing");
+            queries.push((shape.to_string(), count));
+            serde_json::json!({
+                "query_id": format!("fx-filter-{i:03}"), "shape": shape,
+                "conditions": conditions, "expected_count": count,
+                "corpus_size": MSM_DOCS,
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds_dir.join("filter_queries.jsonl"), lines + "\n").unwrap();
+
+    let datasets_json = serde_json::json!([{
+        "name": MSM_DATASET, "type": "tar", "path": format!("{MSM_DATASET}/"),
+        "distance": "cosine", "vector_size": dim, "vector_count": MSM_DOCS,
+        "schema": {
+            "docid": "keyword", "url": "keyword", "title": "text", "headings": "text",
+            "segment": "text", "start_char": "int", "end_char": "int",
+            "category": "keyword", "doc_len": "int", "tier": "int", "rand_key": "int"
+        },
+    }]);
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+    MsmarcoFilterProject { root, queries }
+}
+
+/// A `--queries n` filter-only run over [`write_msmarco_filter_project`]
+/// passed the per-query count gate: every answer checked, exact totals, no
+/// drops, no retries; and its dump carries each query's prepared shape and
+/// expected total, with `docid` external ids.
+pub fn assert_msmarco_filter_run(p: &MsmarcoFilterProject, engine: &str, n: usize, dump: &Path) {
+    let doc = read_result_doc(&p.root, engine);
+    let r = &doc["results"];
+    assert_eq!(doc["params"]["workload"], "filter-only");
+    assert_eq!(r["requested_queries"], n as u64);
+    assert_eq!(r["failed_queries"], 0);
+    assert_eq!(r["filter_only"]["retried_queries"], 0);
+    assert_eq!(r["filter_only"]["per_query_counts_checked"], n as u64);
+    assert_eq!(r["filter_only"]["matched_documents_sum"], p.cycled_total(n));
+    let dumps = read_dumps(dump);
+    assert_eq!(dumps.len(), 1);
+    let d = &dumps[0];
+    assert_eq!(d.records.len(), n);
+    assert_eq!(
+        d.header.id_space,
+        vector_db_benchmark::results_dump::IdSpace::Field {
+            field: "docid".into()
+        }
+    );
+    for rec in &d.records {
+        let (shape, expected) = &p.queries[rec.query_id];
+        assert_eq!(
+            rec.shape.as_deref(),
+            Some(shape.as_str()),
+            "{}",
+            rec.query_id
+        );
+        assert_eq!(rec.total, Some(*expected), "query {}", rec.query_id);
+        assert!(rec
+            .ids
+            .iter()
+            .all(|id| id.starts_with("msmarco_v2.1_doc_fx_")));
+    }
+}
+
+/// Run the binary expecting failure; returns stderr. Asserts no search result
+/// was written, so a refused run cannot leave a plausible artifact behind.
+pub fn run_binary_expect_failure(
+    root: &Path,
+    engine: &str,
+    dataset: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+    extra: &[&str],
+) -> String {
+    let out = std::process::Command::new(binary_path())
+        .args(["--engines", engine, "--datasets", dataset, "--host", host])
+        .args(["--skip-if-exists", "false"])
+        .args(extra)
+        .current_dir(root)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("run vector-db-benchmark");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "expected failure; stderr:\n{stderr}");
+    let searched = fs::read_dir(root.join("results"))
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().contains("-search-"));
+    assert!(!searched, "a refused run wrote a search result");
+    stderr
+}

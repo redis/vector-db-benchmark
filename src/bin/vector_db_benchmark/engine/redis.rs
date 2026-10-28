@@ -446,8 +446,15 @@ impl RedisEngine {
             }
         }
 
-        // Add schema fields from dataset config for filtering
-        if let Some(schema) = &dataset.config.schema {
+        // Add schema fields from dataset config for filtering. Filter-only
+        // indexes only the fields its predicates may reference (#340); the rest
+        // stay stored in the hash, unindexed.
+        let schema = if self.config.skip_vector_index {
+            dataset.filter_only_index_schema()?
+        } else {
+            dataset.config.schema.clone()
+        };
+        if let Some(schema) = &schema {
             if let Some(schema_obj) = schema.as_object() {
                 for (field_name, field_type) in schema_obj {
                     let ft = field_type.as_str().unwrap_or("");
@@ -859,6 +866,7 @@ impl RedisEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
+        let index_schema = dataset.filter_only_index_schema()?;
         {
             let mut conn = self.get_connection()?;
             let info: redis::Value = redis::cmd("FT.INFO")
@@ -867,7 +875,7 @@ impl RedisEngine {
                 .map_err(|e| format!("filter-only schema check failed: {e}"))?;
             vector_db_benchmark::filter_only::validate_redis_schema(
                 &redis_value_to_json(&info),
-                dataset.config.schema.as_ref(),
+                index_schema.as_ref(),
             )?;
         }
         if !self.scalar_metadata_validated {
@@ -876,14 +884,16 @@ impl RedisEngine {
         }
         let parallel = params.parallel.unwrap_or(1) as usize;
         let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
-        let (_, _, conditions) = dataset.read_queries()?;
-        let parsed_filters = conditions.try_resolve_all("Redis", |condition| {
-            vector_db_benchmark::filter_only::domain::validate_predicate(
-                condition,
-                dataset.config.schema.as_ref(),
-            )?;
-            Ok(parse_conditions(condition))
-        })?;
+        let query_set = dataset.filter_only_queries()?;
+        let parsed_filters = query_set
+            .conditions()
+            .try_resolve_all("Redis", |condition| {
+                vector_db_benchmark::filter_only::domain::validate_predicate(
+                    condition,
+                    index_schema.as_ref(),
+                )?;
+                Ok(parse_conditions(condition))
+            })?;
         record_numeric_range_encoding(&parsed_filters);
         // A metadata result limit must not be derived from vector ground truth.
         let top = params
@@ -922,6 +932,7 @@ impl RedisEngine {
         let mut returned_sum = 0u64;
         let mut errors = Vec::new();
         let mut times = Vec::with_capacity(num_to_run);
+        let mut observed_totals: Vec<(usize, u64)> = Vec::with_capacity(num_to_run);
         let pb = self.create_progress_bar(num_to_run);
         let measured_start = std::thread::scope(|scope| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(scope, "redis-filter-only", parallel);
@@ -939,6 +950,7 @@ impl RedisEngine {
                     let mut pending = 0u64;
                     let mut cap: Vec<RawQueryResult> = Vec::new();
                     let mut capture_error: Option<String> = None;
+                    let mut totals: Vec<(usize, u64)> = Vec::new();
                     let mut conn = match redis::Client::open(redis_url.as_str()).and_then(|c| {
                         let info = c.get_connection_info();
                         let settings = info
@@ -951,7 +963,15 @@ impl RedisEngine {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("Redis filter-only connection failed: {e}"));
-                            return (samples, matched, returned_count, errors, cap, capture_error);
+                            return (
+                                samples,
+                                matched,
+                                returned_count,
+                                errors,
+                                cap,
+                                capture_error,
+                                totals,
+                            );
                         }
                     };
                     let deadline =
@@ -963,11 +983,27 @@ impl RedisEngine {
                         ticket.fail(format!(
                             "Redis filter-only socket deadline setup failed: {e}"
                         ));
-                        return (samples, matched, returned_count, errors, cap, capture_error);
+                        return (
+                            samples,
+                            matched,
+                            returned_count,
+                            errors,
+                            cap,
+                            capture_error,
+                            totals,
+                        );
                     }
                     let _ = commands[0].query::<redis::Value>(&mut conn);
                     if ticket.arrive_and_wait().is_none() {
-                        return (samples, matched, returned_count, errors, cap, capture_error);
+                        return (
+                            samples,
+                            matched,
+                            returned_count,
+                            errors,
+                            cap,
+                            capture_error,
+                            totals,
+                        );
                     }
                     loop {
                         let seq = query_idx.fetch_add(1, Ordering::Relaxed);
@@ -984,6 +1020,7 @@ impl RedisEngine {
                         }) {
                             Ok(page) => {
                                 samples.push(elapsed);
+                                totals.push((query_id, page.total));
                                 matched += page.total;
                                 returned_count += page.returned as u64;
                                 // `ids` is Some only when capturing, so a run
@@ -1032,11 +1069,20 @@ impl RedisEngine {
                         }
                     }
                     pb.inc(pending);
-                    (samples, matched, returned_count, errors, cap, capture_error)
+                    (
+                        samples,
+                        matched,
+                        returned_count,
+                        errors,
+                        cap,
+                        capture_error,
+                        totals,
+                    )
                 })?;
             }
             let (workers, start) = pool.start()?;
-            for (samples, matched, returned, worker_errors, cap, capture_error) in workers {
+            for (samples, matched, returned, worker_errors, cap, capture_error, totals) in workers {
+                observed_totals.extend(totals);
                 if let Some(e) = capture_error {
                     capture_failure.get_or_insert(e);
                 }
@@ -1078,6 +1124,8 @@ impl RedisEngine {
             parallel,
             num_to_run,
         )?;
+        // Per-query count gate (#340): every answer against its prepared count.
+        let per_query_counts_checked = query_set.check_counts(&observed_totals, times.len())?;
         result.mean_precision_at_returned = -1.0;
         result.query_records = captured;
         result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
@@ -1085,6 +1133,7 @@ impl RedisEngine {
             matched_documents_sum: matched_sum,
             returned_documents_sum: returned_sum,
             retried_queries: 0,
+            per_query_counts_checked,
         });
         Ok(result)
     }
@@ -2171,7 +2220,7 @@ impl Engine for RedisEngine {
         if self.config.skip_vector_index {
             vector_db_benchmark::filter_only::domain::validate_metadata(
                 &metadata,
-                dataset.config.schema.as_ref(),
+                dataset.filter_only_index_schema()?.as_ref(),
             )?;
             self.scalar_metadata_validated = true;
         }

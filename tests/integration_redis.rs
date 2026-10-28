@@ -5157,3 +5157,204 @@ fn test_binary_redis_fulltext_marker_under_a_prefix_acl() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// Every attribute name in an `FT.INFO` reply (RESP2 or RESP3): each value
+/// that follows an `attribute` token.
+fn ft_info_attribute_names(info: &redis::Value) -> Vec<String> {
+    fn text(v: &redis::Value) -> Option<String> {
+        match v {
+            redis::Value::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            redis::Value::SimpleString(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+    fn walk(v: &redis::Value, out: &mut Vec<String>) {
+        let items: Vec<&redis::Value> = match v {
+            redis::Value::Array(a) => a.iter().collect(),
+            redis::Value::Map(m) => m.iter().flat_map(|(k, v)| [k, v]).collect(),
+            _ => return,
+        };
+        for pair in items.windows(2) {
+            if text(pair[0]).as_deref() == Some("attribute") {
+                if let Some(name) = text(pair[1]) {
+                    out.push(name);
+                }
+            }
+        }
+        for item in items {
+            walk(item, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(info, &mut out);
+    // A RESP map is seen both as pairs and as its flattened items.
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// #340 query side on Redis, over an MS MARCO-shaped corpus: the prepared
+/// `filter_queries.jsonl` runs, every answer passes the per-query count gate,
+/// records carry the prepared shape, only the derived TAG/NUMERIC fields the
+/// queries reference are indexed (text and `url` — which holds `;` — stored
+/// but not indexed), reuse revalidates, and a SUM-PRESERVING error in two
+/// expected counts fails the run.
+#[test]
+fn test_binary_redis_msmarco_filter_only_per_query_gate() {
+    let config = serde_json::json!([{"name":"msm-redis","engine":"redis","upload_params":{"parallel":2},"search_params":[{"parallel":4,"top":5}]}]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    let dump = p.root.join("dumps");
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "--skip-vector-index",
+            "--queries",
+            "27",
+            "--repetitions",
+            "1",
+            "--keep-data",
+            "--fail-on-dropped-queries",
+        ];
+        args.extend_from_slice(extra);
+        common::run_binary_extra(
+            &p.root,
+            "msm-redis",
+            common::MSM_DATASET,
+            "localhost",
+            &envs,
+            &args,
+        )
+    };
+    assert!(run(&["--dump-results", dump.to_str().unwrap()]));
+    common::assert_msmarco_filter_run(&p, "redis-no-vector", 27, &dump);
+
+    let mut conn = get_test_connection();
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("idx:redis-no-vector")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(
+        ft_info_attribute_names(&info),
+        ["category", "doc_len", "rand_key", "tier"],
+        "filter-only indexes exactly the fields its queries reference"
+    );
+    // ...and the rest is still stored in the hash.
+    let hit: redis::Value = redis::cmd("FT.SEARCH")
+        .arg("idx:redis-no-vector")
+        .arg("@tier:[0 9]")
+        .arg("LIMIT")
+        .arg(0)
+        .arg(1)
+        .query(&mut conn)
+        .unwrap();
+    let hit = format!("{hit:?}");
+    for stored in ["Passage", "http://fx.example/", "msmarco_v2.1_doc_fx_"] {
+        assert!(hit.contains(stored), "{stored} not stored: {hit}");
+    }
+
+    // Reuse: the realized schema and the local corpus are revalidated.
+    common::clear_result_files(&p.root);
+    assert!(run(&["--skip-upload"]));
+    let r = common::read_results_obj(&p.root, "redis-no-vector");
+    assert_eq!(r["filter_only"]["per_query_counts_checked"], 27);
+
+    // Two compensating errors keep the sum; the per-query gate still fails.
+    common::clear_result_files(&p.root);
+    p.tamper_expected_counts(&[(0, 1), (3, -1)]);
+    let stderr = common::run_binary_expect_failure(
+        &p.root,
+        "msm-redis",
+        common::MSM_DATASET,
+        "localhost",
+        &envs,
+        &[
+            "--skip-vector-index",
+            "--skip-upload",
+            "--keep-data",
+            "--repetitions",
+            "1",
+        ],
+    );
+    assert!(stderr.contains("per-query count gate"), "{stderr}");
+    assert!(stderr.contains("fx-filter-000 (tag_eq)"), "{stderr}");
+    assert!(stderr.contains("fx-filter-003 (numeric_point)"), "{stderr}");
+
+    let _: redis::Value = redis::cmd("FT.DROPINDEX")
+        .arg("idx:redis-no-vector")
+        .arg("DD")
+        .query(&mut conn)
+        .unwrap();
+    fs::remove_dir_all(&p.root).ok();
+}
+
+/// #340: an old MS MARCO tarball (derived fields declared, absent from the
+/// payloads, no `filter_queries.jsonl`) is refused end to end naming
+/// `--add-derived-fields` — on filter-only index reuse, filter-only upload and
+/// the VECTOR workload (which indexes the schema's fields too) — by the
+/// loader's `check_prepared_dir`. Never an index with empty columns.
+#[test]
+fn test_binary_redis_msmarco_stale_corpus_is_refused_naming_the_cure() {
+    let config = serde_json::json!([
+        {"name":"msm-stale","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":5}]},
+        {"name":"msm-stale-vec","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":1}]}
+    ]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    let mut conn = get_test_connection();
+    let cure = "--add-derived-fields";
+    let refuse = |engine: &str, extra: &[&str]| {
+        common::run_binary_expect_failure(
+            &p.root,
+            engine,
+            common::MSM_DATASET,
+            "localhost",
+            &envs,
+            extra,
+        )
+    };
+
+    // A good corpus uploaded, then the local copy goes stale: reuse refuses.
+    assert!(common::run_binary_extra(
+        &p.root,
+        "msm-stale",
+        common::MSM_DATASET,
+        "localhost",
+        &envs,
+        &["--skip-vector-index", "--skip-search", "--keep-data"],
+    ));
+    common::clear_result_files(&p.root);
+    p.strip_derived_payload_fields();
+    let e = refuse(
+        "msm-stale",
+        &["--skip-vector-index", "--skip-upload", "--keep-data"],
+    );
+    assert!(e.contains(cure) && e.contains("\"category\""), "{e}");
+    // Filter-only upload, and the vector workload.
+    let e = refuse("msm-stale", &["--skip-vector-index"]);
+    assert!(e.contains(cure), "{e}");
+    let e = refuse("msm-stale-vec", &["--skip-search"]);
+    assert!(e.contains(cure), "{e}");
+    // An old tarball has no filter_queries.jsonl either: refused rather than
+    // falling back to tests.jsonl, whose conditions are null.
+    fs::remove_file(p.dataset_dir().join("filter_queries.jsonl")).unwrap();
+    let e = refuse("msm-stale", &["--skip-vector-index"]);
+    assert!(
+        e.contains(cure) && e.contains("filter_queries.jsonl"),
+        "{e}"
+    );
+
+    if let Ok(indexes) = redis::cmd("FT._LIST").query::<Vec<String>>(&mut conn) {
+        for idx in indexes
+            .iter()
+            .filter(|i| i.contains("msm-stale") || *i == "idx:redis-no-vector")
+        {
+            let _: redis::RedisResult<()> = redis::cmd("FT.DROPINDEX")
+                .arg(idx)
+                .arg("DD")
+                .query(&mut conn);
+        }
+    }
+    fs::remove_dir_all(&p.root).ok();
+}

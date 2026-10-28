@@ -2531,7 +2531,15 @@ fn write_query_dumps(
         } else {
             None
         };
-        let records = dump::resolve_records(&raw, &ids, gt, results.top, &|_| None)?;
+        // Filter-only records carry the prepared query's shape (#340), so
+        // `compare-results` reports per shape; other workloads have none yet.
+        let filter_set = if workload == vector_db_benchmark::workload::Workload::FilterOnly {
+            dataset.filter_query_file()?
+        } else {
+            None
+        };
+        let shape = |q: usize| filter_set.as_ref().and_then(|s| s.shape(q));
+        let records = dump::resolve_records(&raw, &ids, gt, results.top, &shape)?;
         let header = dump::DumpHeader {
             schema_version: dump::DUMP_SCHEMA_VERSION,
             engine: engine_type.to_string(),
@@ -4724,6 +4732,7 @@ mod filter_only_serialization_tests {
                         matched_documents_sum: 17,
                         returned_documents_sum: 6,
                         retried_queries: 0,
+                        per_query_counts_checked: None,
                     }),
                     // What `engine::search_workload` stamps on every result.
                     workload: Some(if scalar {

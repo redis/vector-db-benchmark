@@ -1037,12 +1037,15 @@ fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
     for (name, src) in engine_sources() {
         // `.read_queries()` on ANY receiver: an engine that names it `ds`
         // rather than `dataset` must not be exempt.
-        let reads = count_loose(&src, &[".read_queries()"]);
+        // `.filter_only_queries()` hands out the same conditions (from the
+        // prepared filter query set when the dataset ships one, #340).
+        let reads = count_loose(&src, &[".read_queries()"])
+            + count_loose(&src, &[".filter_only_queries()"]);
         let resolves =
             count_loose(&src, &[".resolve_all("]) + count_loose(&src, &[".try_resolve_all("]);
         assert_eq!(
             reads, resolves,
-            "{name} calls .read_queries() {reads}x but resolves conditions {resolves}x — \
+            "{name} reads query conditions {reads}x but resolves them {resolves}x — \
              an unresolved read runs every query UNFILTERED (issue #219)"
         );
         reads_total += reads;
@@ -1050,7 +1053,7 @@ fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
     }
     assert_eq!(
         (reads_total, resolves_total),
-        (23, 23),
+        (24, 24),
         "the read/resolve census changed; confirm the new site is guarded"
     );
 }

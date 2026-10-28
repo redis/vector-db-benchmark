@@ -181,6 +181,10 @@ auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
   `msmarco::derived` (`Predicate`, `count_matches`, `matching_ids`) rather than
   re-implementing predicate evaluation. `--add-derived-fields` upgrades an
   already-prepared corpus in place without the full rescan.
+- The filter-only workload reads `filter_queries.jsonl` through
+  `filter_only::query_set` (prepared set, index layout, per-query count gate).
+  It relies on the loader (`Dataset::get_path` -> `derived::check_prepared_dir`)
+  to refuse a stale directory before any workload sees it; do not re-check.
 
 ## Key Patterns
 

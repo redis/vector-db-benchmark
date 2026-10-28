@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub mod domain;
+pub mod query_set;
 
 pub const DEFAULT_LIMIT: usize = 10;
 
@@ -17,6 +18,10 @@ pub struct Stats {
     /// Successful measured queries requiring retries; priming is excluded.
     #[serde(default)]
     pub retried_queries: u64,
+    /// Answers checked by the per-query count gate against a prepared query
+    /// set's `expected_count` (#340); absent when the set has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_query_counts_checked: Option<u64>,
 }
 
 pub fn opensearch_body(filter: &Value, limit: usize) -> Value {

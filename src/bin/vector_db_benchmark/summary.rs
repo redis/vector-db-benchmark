@@ -848,6 +848,7 @@ mod tests {
                     matched_documents_sum: 123,
                     returned_documents_sum: 80,
                     retried_queries: 0,
+                    per_query_counts_checked: None,
                 });
                 e
             })

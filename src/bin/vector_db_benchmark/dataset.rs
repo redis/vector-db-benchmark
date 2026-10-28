@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::config::{datasets_dir, DatasetConfig};
 use crate::download;
+use vector_db_benchmark::filter_only::query_set::FilterQuerySet;
 use vector_db_benchmark::query_filter::QueryConditions;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 use vector_db_benchmark::readers::{
@@ -389,12 +390,40 @@ impl Dataset {
         }
         let path = self.get_path()?;
         self.validate_vector_count()?;
+        let schema = self.filter_only_index_schema()?;
         vector_db_benchmark::readers::visit_compound_metadata(&path, |item| {
             vector_db_benchmark::filter_only::domain::validate_metadata(
                 std::slice::from_ref(&item),
-                self.config.schema.as_ref(),
+                schema.as_ref(),
             )
         })
+    }
+
+    /// The prepared filter-only query set (`filter_queries.jsonl`) of this
+    /// dataset, if it ships one (#340). A stale MS MARCO directory never gets
+    /// here: `get_path` refuses it. See `filter_only::query_set`.
+    pub fn filter_query_file(&self) -> Result<Option<FilterQuerySet>, String> {
+        let path = self.get_path()?;
+        FilterQuerySet::read_prepared(&path, &self.config.name, self.measured_vector_count()?)
+    }
+
+    /// The queries the filter-only workload runs: the prepared set when the
+    /// dataset ships one, else the predicates in `tests.jsonl`.
+    pub fn filter_only_queries(&self) -> Result<FilterQuerySet, String> {
+        match self.filter_query_file()? {
+            Some(set) => Ok(set),
+            None => Ok(FilterQuerySet::from_conditions(self.read_queries()?.2)),
+        }
+    }
+
+    /// The fields the filter-only workload indexes, validates and lets
+    /// predicates reference (`filter_only::query_set::index_schema`).
+    pub fn filter_only_index_schema(&self) -> Result<Option<serde_json::Value>, String> {
+        let prepared = self.filter_query_file()?;
+        Ok(vector_db_benchmark::filter_only::query_set::index_schema(
+            self.config.schema.as_ref(),
+            prepared.as_ref(),
+        ))
     }
 
     /// Read all vectors and metadata from the dataset
@@ -964,6 +993,88 @@ mod tests {
             "fixture has no vector values"
         );
         std::fs::write(payloads, "{\"tag\":\"red\"}\n{\"tag\":\"bad;tag\"}\n").unwrap();
+        assert!(dataset
+            .validate_scalar_metadata()
+            .unwrap_err()
+            .contains("keyword tokens"));
+    }
+
+    /// #340: the filter-only entry points refuse a stale MS MARCO directory
+    /// (through the loader's `check_prepared_dir`), pick the prepared query set
+    /// over `tests.jsonl`, and narrow the filter-only index to the fields it
+    /// references.
+    #[test]
+    fn filter_only_glue_uses_the_prepared_set_and_its_index_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        write_npy_vectors(
+            dir.path().join("vectors.npy").to_str().unwrap(),
+            &[vec![0.0; 3], vec![1.0; 3]],
+        )
+        .unwrap();
+        let mut dataset = dataset_at(dir.path(), "tar", Some(2));
+        // A registered variant name: the loader's stale-directory check applies.
+        dataset.config.name = "msmarco-cohere-1024-100K-cosine".into();
+        dataset.config.schema = Some(serde_json::json!({
+            "docid": "keyword", "url": "keyword", "title": "text",
+            "category": "keyword", "doc_len": "int", "tier": "int", "rand_key": "int"
+        }));
+        let payloads = dir.path().join("payloads.jsonl");
+        let row = |derived: bool| {
+            let mut p = serde_json::json!({"docid": "d", "url": "u;v", "title": "t"});
+            if derived {
+                let d = vector_db_benchmark::msmarco::derived::DerivedFields::from_docid("d");
+                for (k, v) in d.to_json_fields() {
+                    p[k] = v;
+                }
+            }
+            p.to_string()
+        };
+        std::fs::write(
+            dir.path().join("tests.jsonl"),
+            "{\"query\":[0,0,0],\"conditions\":null,\"closest_ids\":[0]}\n",
+        )
+        .unwrap();
+        // Old tarball: no derived fields, no query set.
+        std::fs::write(&payloads, format!("{}\n{}\n", row(false), row(false))).unwrap();
+        for e in [
+            dataset.filter_only_queries().unwrap_err(),
+            dataset.filter_only_index_schema().unwrap_err(),
+            dataset.validate_scalar_metadata().unwrap_err(),
+        ] {
+            assert!(e.contains("--add-derived-fields"), "{e}");
+        }
+        // Upgraded: fields present and a prepared set that references two of
+        // them. `url` holds `;` but is not indexed, so it is not validated.
+        std::fs::write(&payloads, format!("{}\n{}\n", row(true), row(true))).unwrap();
+        std::fs::write(
+            dir.path().join("filter_queries.jsonl"),
+            serde_json::json!({
+                "query_id": "q0", "shape": "tag_and_range",
+                "conditions": {"and": [{"category": {"match": {"value": "cat01"}}},
+                                       {"tier": {"range": {"lte": 4}}}]},
+                "expected_count": 2, "corpus_size": 2
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(dataset.read_vectors(false).unwrap().0.len(), 2);
+        let set = dataset.filter_only_queries().unwrap();
+        assert!(set.is_prepared());
+        assert_eq!(set.shape(0).as_deref(), Some("tag_and_range"));
+        assert_eq!(
+            dataset.filter_only_index_schema().unwrap().unwrap(),
+            serde_json::json!({"category": "keyword", "tier": "int"})
+        );
+        dataset.validate_scalar_metadata().unwrap();
+        // Without the derived schema, no prepared-set requirement and no
+        // narrowing: tests.jsonl, and every scalar field (`url` included).
+        std::fs::remove_file(dir.path().join("filter_queries.jsonl")).unwrap();
+        dataset.config.schema = Some(serde_json::json!({"url": "keyword", "title": "text"}));
+        assert!(!dataset.filter_only_queries().unwrap().is_prepared());
+        assert_eq!(
+            dataset.filter_only_index_schema().unwrap().unwrap(),
+            serde_json::json!({"url": "keyword"})
+        );
         assert!(dataset
             .validate_scalar_metadata()
             .unwrap_err()

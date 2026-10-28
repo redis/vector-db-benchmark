@@ -1867,3 +1867,116 @@ fn test_binary_opensearch_fulltext_parity() {
         .send();
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #340 query side on OpenSearch, over an MS MARCO-shaped corpus: the prepared
+/// `filter_queries.jsonl` runs, every answer passes the per-query count gate,
+/// records carry the prepared shape, the mapping holds exactly the referenced
+/// derived keyword/long fields with `dynamic: false` (text and `url` stay in
+/// `_source`, unindexed), reuse revalidates, and a SUM-PRESERVING error in two
+/// expected counts fails the run.
+#[test]
+fn test_binary_opensearch_msmarco_filter_only_per_query_gate() {
+    wait_for_opensearch();
+    let _fielddata = DisabledIdFielddata::new();
+    let config = serde_json::json!([{"name":"msm-os","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":2},"search_params":[{"parallel":4,"top":5}]}]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "msm-filter";
+    let envs = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", index),
+    ];
+    let dump = p.root.join("dumps");
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "--skip-vector-index",
+            "--queries",
+            "27",
+            "--repetitions",
+            "1",
+            "--keep-data",
+            "--fail-on-dropped-queries",
+        ];
+        args.extend_from_slice(extra);
+        common::run_binary_extra(
+            &p.root,
+            "msm-os",
+            common::MSM_DATASET,
+            "http://127.0.0.1",
+            &envs,
+            &args,
+        )
+    };
+    assert!(run(&["--dump-results", dump.to_str().unwrap()]));
+    common::assert_msmarco_filter_run(&p, "opensearch-no-vector", 27, &dump);
+
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let m = &mapping[index]["mappings"];
+    assert_eq!(m["dynamic"], "false", "{m}");
+    let mut fields: Vec<&String> = m["properties"].as_object().unwrap().keys().collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        ["category", "doc_len", "rand_key", "tier", "vector"],
+        "filter-only maps exactly the fields its queries reference: {m}"
+    );
+    assert_eq!(m["properties"]["category"]["type"], "keyword");
+    assert_eq!(m["properties"]["rand_key"]["type"], "long");
+    // Unmapped fields are stored in _source, not indexed: a query on one
+    // matches nothing although every document holds it.
+    let hit: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_search?size=1", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let source = &hit["hits"]["hits"][0]["_source"];
+    assert!(source["segment"].as_str().unwrap().starts_with("Passage"));
+    assert!(source["url"].as_str().unwrap().contains("fx.example"));
+    let unindexed: serde_json::Value = os_client()
+        .post(format!("{}/{index}/_count", os_base_url()))
+        .json(&serde_json::json!({"query": {"exists": {"field": "segment"}}}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(unindexed["count"], 0, "{unindexed}");
+
+    // Reuse: the realized mapping and the local corpus are revalidated.
+    common::clear_result_files(&p.root);
+    assert!(run(&["--skip-upload"]));
+    let r = common::read_results_obj(&p.root, "opensearch-no-vector");
+    assert_eq!(r["filter_only"]["per_query_counts_checked"], 27);
+
+    // Two compensating errors keep the sum; the per-query gate still fails.
+    common::clear_result_files(&p.root);
+    p.tamper_expected_counts(&[(0, 1), (3, -1)]);
+    let stderr = common::run_binary_expect_failure(
+        &p.root,
+        "msm-os",
+        common::MSM_DATASET,
+        "http://127.0.0.1",
+        &envs,
+        &[
+            "--skip-vector-index",
+            "--skip-upload",
+            "--keep-data",
+            "--repetitions",
+            "1",
+        ],
+    );
+    assert!(stderr.contains("per-query count gate"), "{stderr}");
+    assert!(stderr.contains("fx-filter-000 (tag_eq)"), "{stderr}");
+    assert!(stderr.contains("fx-filter-003 (numeric_point)"), "{stderr}");
+
+    os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send()
+        .unwrap();
+    std::fs::remove_dir_all(&p.root).ok();
+}

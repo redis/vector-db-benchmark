@@ -450,6 +450,7 @@ fn scalar_stats_roundtrip_keeps_exact_integer_counts() {
         matched_documents_sum: u64::MAX,
         returned_documents_sum: 0,
         retried_queries: 7,
+        per_query_counts_checked: Some(u64::MAX),
     };
     let encoded = serde_json::to_value(&stats).unwrap();
     let decoded: Stats = serde_json::from_value(encoded).unwrap();
@@ -457,6 +458,13 @@ fn scalar_stats_roundtrip_keeps_exact_integer_counts() {
     assert_eq!(decoded.matched_documents_sum, u64::MAX);
     assert_eq!(decoded.returned_documents_sum, 0);
     assert_eq!(decoded.retried_queries, 7);
+    assert_eq!(decoded.per_query_counts_checked, Some(u64::MAX));
+    // Absent (no prepared counts) stays absent in the artifact, and an old
+    // artifact without the key still reads.
+    let legacy = serde_json::to_value(Stats::default()).unwrap();
+    assert!(legacy.get("per_query_counts_checked").is_none(), "{legacy}");
+    let decoded: Stats = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.per_query_counts_checked, None);
     assert_eq!(Stats::default().retried_queries, 0);
     assert_eq!(Stats::default().matched_documents_sum, 0);
 }
