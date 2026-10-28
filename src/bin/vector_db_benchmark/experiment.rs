@@ -221,7 +221,23 @@ pub fn run(args: &Args) -> Result<(), String> {
             args.skip_vector_index,
         )
         .map_err(|e| format!("config '{name}': {e}"))?;
-        if args.target_qps != 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {
+        let calibration_declared: Vec<bool> = config
+            .search_params
+            .iter()
+            .flatten()
+            .map(|sp| sp.calibration_param.is_some())
+            .collect();
+        vector_db_benchmark::workload::check_calibration(
+            &plan,
+            &calibration_declared,
+            args.skip_vector_index,
+        )
+        .map_err(|e| format!("config '{name}': {e}"))?;
+        if args.dump_results.is_some() {
+            vector_db_benchmark::workload::check_capture(&plan)
+                .map_err(|e| format!("config '{name}': {e}"))?;
+        }
+        if args.target_qps > 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {
             return Err(format!(
                 "--target-qps currently supports search-only vector benchmarks; config \
                  '{name}' declares a non-vector workload"
@@ -1544,9 +1560,9 @@ fn run_single_experiment(
                     ));
                 }
                 // Calibration tunes a vector search knob (it calls the vector
-                // path). Filter-only keeps its legacy behaviour of ignoring it;
-                // any other workload declaring it is refused rather than tuned
-                // against a different query family.
+                // path). Refused at startup by `workload::check_calibration`
+                // except for the legacy `--skip-vector-index` filter-only path,
+                // which keeps ignoring it; this is the backstop.
                 if !matches!(workload, Workload::Vector | Workload::FilterOnly)
                     && search_params.calibration_param.is_some()
                 {

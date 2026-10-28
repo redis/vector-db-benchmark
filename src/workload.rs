@@ -145,6 +145,67 @@ pub fn implemented(engine_type: &str) -> &'static [Workload] {
     }
 }
 
+/// Whether the engine's arm for `workload` records per-query results
+/// (`results_dump::RawQueryResult`) when `--dump-results` asks it to. Checked
+/// at startup for every planned (engine, workload) under `--dump-results`
+/// ([`check_capture`]), so a run that could not produce its dump is refused
+/// before any download or connection, not after the timed search. The
+/// dispatcher still checks the records it actually got.
+///
+/// An arm added to [`implemented`] that captures must be added here too.
+pub fn captures(engine_type: &str, workload: Workload) -> bool {
+    matches!(
+        (engine_type, workload),
+        (
+            "redis" | "opensearch",
+            Workload::Vector | Workload::FilterOnly
+        )
+    )
+}
+
+/// Refuse `--dump-results` for a plan with any workload the engine cannot
+/// capture (see [`captures`]).
+pub fn check_capture(plan: &WorkloadPlan) -> Result<(), String> {
+    match plan
+        .workloads
+        .iter()
+        .find(|w| !captures(&plan.engine_type, **w))
+    {
+        Some(w) => Err(format!(
+            "--dump-results: engine '{}' does not capture per-query results for workload \
+             \"{w}\"; per-query capture exists for redis and opensearch (vector, filter-only)",
+            plan.engine_type
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a search config that declares `calibration_param` for a workload
+/// that calibration does not tune. Calibration drives the VECTOR search path,
+/// so on any other workload the knob would be silently ignored or tuned
+/// against the wrong query family. The one tolerated case is the legacy
+/// `--skip-vector-index` flag (`skip_vector_index`), where configs written for
+/// a vector sweep are reused as filter-only and their calibration keys were
+/// always ignored.
+///
+/// `calibration_declared[i]` is whether search config `i` sets
+/// `calibration_param`; indexed like `plan.workloads`.
+pub fn check_calibration(
+    plan: &WorkloadPlan,
+    calibration_declared: &[bool],
+    skip_vector_index: bool,
+) -> Result<(), String> {
+    for (i, (w, declared)) in plan.workloads.iter().zip(calibration_declared).enumerate() {
+        if *declared && *w != Workload::Vector && !skip_vector_index {
+            return Err(format!(
+                "search config #{i} declares calibration_param, which only tunes the vector \
+                 workload; it is \"{w}\" — remove calibration_param"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Engines whose pre-#328 filter-only harness is reachable ONLY through the
 /// process-wide `--skip-vector-index` flag. Their results keep the legacy shape:
 /// no `filter_only` stats, `mean_precision_at_returned == -1.0` as the
@@ -387,6 +448,35 @@ mod tests {
         }
         assert!(!supports_skip_vector_index("qdrant"));
         assert!(!dispatchable("qdrant", Workload::FilterOnly));
+    }
+
+    #[test]
+    fn capture_is_checked_per_engine_and_workload() {
+        let ok = plan("redis", &[None, None], false).unwrap();
+        assert!(check_capture(&ok).is_ok());
+        let ok = plan("opensearch", &[Some(Workload::FilterOnly)], false).unwrap();
+        assert!(check_capture(&ok).is_ok());
+        // Implemented but not capturing: refused.
+        let e = check_capture(&plan("qdrant", &[None], false).unwrap()).unwrap_err();
+        assert!(e.contains("does not capture"), "{e}");
+        for legacy in ["valkey", "mongodb"] {
+            assert!(check_capture(&plan(legacy, &[None], true).unwrap()).is_err());
+        }
+        assert!(!captures("redis", Workload::Fulltext));
+    }
+
+    #[test]
+    fn calibration_is_refused_off_the_vector_workload_except_under_the_flag() {
+        let fo = plan("redis", &[Some(Workload::FilterOnly)], false).unwrap();
+        assert!(check_calibration(&fo, &[true], false).is_err());
+        assert!(check_calibration(&fo, &[false], false).is_ok());
+        let flag = plan("redis", &[None], true).unwrap();
+        assert!(
+            check_calibration(&flag, &[true], true).is_ok(),
+            "legacy flag tolerated"
+        );
+        let vec = plan("redis", &[None], false).unwrap();
+        assert!(check_calibration(&vec, &[true], false).is_ok());
     }
 
     /// The CI failure this pins: legacy engines publish no `filter_only`

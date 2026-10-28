@@ -462,3 +462,113 @@ fn a_non_empty_dump_dir_is_refused_before_download_or_connection() {
     assert!(!stdout.contains("Experiment stage:"), "{stdout}");
     assert!(!datasets.join("missing-corpus").exists());
 }
+
+/// #343 review: `--dump-results` for an engine/workload without per-query
+/// capture is refused at startup — before any download, connection, upload or
+/// timed search — not after the first timed search point.
+#[test]
+fn dump_results_without_capture_is_refused_before_download_or_connection() {
+    use serde_json::json;
+    for (engine, skip_vector_index) in [("qdrant", false), ("valkey", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let datasets = root.path().join("datasets");
+        std::fs::create_dir(&datasets).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        drop(listener);
+        std::fs::write(
+            datasets.join("datasets.json"),
+            json!([{
+                "name":"cap-fixture", "type":"tar", "path":"missing-corpus",
+                "vector_size":1,"distance":"l2","schema":{"tag":"keyword"},
+                "link":format!("http://127.0.0.1:{port}/must-not-download.tar.gz")
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let engines_file = root.path().join("engines.json");
+        std::fs::write(
+            &engines_file,
+            json!([{"name":"cap-cfg","engine":engine,"search_params":[{}]}]).to_string(),
+        )
+        .unwrap();
+        let mut cmd = Command::new(common::binary_path());
+        cmd.current_dir(root.path())
+            .args([
+                "--engines",
+                "cap-cfg",
+                "--datasets",
+                "cap-fixture",
+                "--host",
+                "127.0.0.1",
+                "--engines-file",
+            ])
+            .arg(&engines_file)
+            .arg("--dump-results")
+            .arg(root.path().join("dumps"))
+            .env("QDRANT_PORT", &port)
+            .env("REDIS_PORT", &port);
+        if skip_vector_index {
+            cmd.arg("--skip-vector-index");
+        }
+        let output = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{engine}: {stdout}");
+        assert!(
+            stderr.contains("does not capture per-query results"),
+            "{engine}: {stderr}"
+        );
+        assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+        assert!(!datasets.join("missing-corpus").exists());
+    }
+}
+
+/// #344 review: `calibration_param` on a DECLARED filter-only config is
+/// refused at startup instead of silently ignored.
+#[test]
+fn calibration_on_declared_filter_only_is_refused_at_startup() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let datasets = root.path().join("datasets");
+    std::fs::create_dir(&datasets).unwrap();
+    std::fs::write(
+        datasets.join("datasets.json"),
+        json!([{
+            "name":"cal-fixture", "type":"tar", "path":"missing-corpus",
+            "vector_size":1,"distance":"l2","schema":{"tag":"keyword"},
+            "link":"http://127.0.0.1:9/must-not-download.tar.gz"
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let engines_file = root.path().join("engines.json");
+    std::fs::write(
+        &engines_file,
+        json!([{"name":"cal-cfg","engine":"redis","search_params":[
+            {"workload":"filter-only","calibration_param":"ef","calibration_precision":0.9}
+        ]}])
+        .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(common::binary_path())
+        .current_dir(root.path())
+        .args([
+            "--engines",
+            "cal-cfg",
+            "--datasets",
+            "cal-fixture",
+            "--host",
+            "127.0.0.1",
+            "--engines-file",
+        ])
+        .arg(&engines_file)
+        .env("REDIS_PORT", "9")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(stderr.contains("calibration_param"), "{stderr}");
+    assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+}
