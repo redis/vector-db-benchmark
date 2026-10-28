@@ -553,6 +553,10 @@ Parity changes the uploaded corpus, so it is guarded:
   - parity in the same engine config as any `vector`, `hybrid` or `filter-only` config. Normalization and the reduced text index never apply to other workloads.
 - **Redis shared corpus.** On Redis, parity also refuses a shared corpus (`REDIS_KEY_PREFIX`).
 - **Recorded in the index.** The mode is written into the index: a Redis key `vdbb:fulltext-profile:<index>`, and OpenSearch `mappings._meta.vdbb_fulltext` (`{"analysis", "normalize_whitespace", "text_fields"}`).
+- **Marker access on Redis.** The marker key lives outside the config's key prefix.
+  - In english mode, a denied marker write or read (e.g. NOPERM for an ACL user limited to `~<config>:*`) is a printed note, and the result records `index_marker: null`.
+  - In parity mode it is a hard error: the marker is what proves the normalization, so the user needs access to `vdbb:fulltext-profile:*`.
+  - Vector-only configs never touch the marker key.
 - **Verified on `--skip-upload` reuse,** together with the analyzer / `NOSTEM` / indexed-field checks:
   - an index uploaded without normalization (english, or built before markers existed) is refused in parity;
   - a parity index is refused in english.

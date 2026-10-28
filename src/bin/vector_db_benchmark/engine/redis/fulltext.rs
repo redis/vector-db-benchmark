@@ -58,8 +58,16 @@ impl RedisEngine {
         for args in fulltext::redis_marker_create_commands(&self.config.index_name, profile) {
             let mut cmd = redis::cmd(&args[0]);
             cmd.arg(&args[1..]);
-            cmd.query::<()>(conn)
-                .map_err(|e| format!("fulltext marker: {e}"))?;
+            if let Err(e) = cmd.query::<()>(conn) {
+                // English: non-fatal (the result records index_marker: null);
+                // parity: fatal, naming the key pattern it needs.
+                let p = profile.expect("marker commands exist only with a profile");
+                eprintln!(
+                    "{}",
+                    fulltext::redis_marker_failure(p, "write", &e.to_string())?
+                );
+                break;
+            }
         }
         Ok(())
     }
@@ -110,10 +118,20 @@ impl RedisEngine {
                 .arg(&self.config.index_name)
                 .query(&mut conn)
                 .map_err(|e| format!("fulltext: FT.INFO failed: {e}"))?;
-            let marker: Option<String> = redis::cmd("GET")
+            let marker: Option<String> = match redis::cmd("GET")
                 .arg(fulltext::redis_marker_key(&self.config.index_name))
                 .query(&mut conn)
-                .map_err(|e| format!("fulltext: marker read failed: {e}"))?;
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    // English: read as "no marker"; parity: refused.
+                    eprintln!(
+                        "{}",
+                        fulltext::redis_marker_failure(&profile, "read", &e.to_string())?
+                    );
+                    None
+                }
+            };
             let marker = match marker {
                 None => serde_json::Value::Null,
                 Some(m) => serde_json::from_str(&m)

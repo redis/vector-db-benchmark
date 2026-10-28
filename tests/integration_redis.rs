@@ -5074,3 +5074,86 @@ fn test_binary_redis_vector_only_stays_inside_its_key_prefix() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #358 review 5: under an ACL user limited to the config's key prefix (no
+/// access to `vdbb:fulltext-profile:*`), an english fulltext config still runs
+/// and records `index_marker: null`, while a parity config is refused with an
+/// error naming the key pattern it needs.
+#[test]
+fn test_binary_redis_fulltext_marker_under_a_prefix_acl() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-acl-ft";
+    redis::cmd("ACL")
+        .arg(
+            &[
+                "SETUSER",
+                "vdbb-acl-ft",
+                "reset",
+                "on",
+                ">acl-pw",
+                &format!("~{name}:*"),
+                "+@all",
+            ][..],
+        )
+        .query::<()>(&mut conn)
+        .unwrap();
+    let proj = common::write_bm25_project("[]");
+    let write_config = |search_params: serde_json::Value| {
+        fs::write(
+            proj.root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "redis",
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let port = test_port().to_string();
+    let envs = [
+        ("REDIS_PORT", port.as_str()),
+        ("REDIS_USER", "vdbb-acl-ft"),
+        ("REDIS_AUTH", "acl-pw"),
+    ];
+    let run = || {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &envs,
+            &["--exit-on-error"],
+        )
+    };
+    write_config(
+        serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"title": 1.0, "segment": 1.0}}}]),
+    );
+    let english = run();
+    write_config(common::bm25_parity_search_params());
+    let parity = run();
+    let _ = redis::cmd("ACL")
+        .arg(&["DELUSER", "vdbb-acl-ft"][..])
+        .query::<()>(&mut conn);
+    let stderr = String::from_utf8_lossy(&english.stderr);
+    assert!(
+        english.status.success(),
+        "english under a prefix ACL: {stderr}"
+    );
+    assert!(stderr.contains("records index_marker: null"), "{stderr}");
+    let doc = common::read_result_doc(&proj.root, name);
+    assert_eq!(doc["params"]["fulltext"]["analysis"], "english");
+    assert!(
+        doc["params"]["fulltext"]["index_marker"].is_null(),
+        "{}",
+        doc["params"]["fulltext"]["index_marker"]
+    );
+    let stderr = String::from_utf8_lossy(&parity.stderr);
+    assert!(!parity.status.success(), "parity must refuse: {stderr}");
+    assert!(stderr.contains("'vdbb:fulltext-profile:*'"), "{stderr}");
+    // Refused when the marker cannot be written (configure), before any upload.
+    let stdout = String::from_utf8_lossy(&parity.stdout);
+    assert!(!stdout.contains("Experiment stage: Upload"), "{stdout}");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

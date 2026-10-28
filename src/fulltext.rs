@@ -464,6 +464,34 @@ pub fn redis_marker_create_commands(
     ]
 }
 
+/// What a failed marker command (write or clear at create time, read before
+/// the search) means for `profile`'s mode.
+///
+/// - English: the marker is bookkeeping, not part of what is measured, so a
+///   failure (typically NOPERM: an ACL user limited to its key prefix cannot
+///   reach `vdbb:fulltext-profile:*`) is non-fatal — `Ok(note)` to print, and
+///   the result records `index_marker: null`, as for a pre-marker index.
+/// - Parity: the marker is what proves the uploaded corpus was normalized, so
+///   the run stops, naming the access it needs.
+pub fn redis_marker_failure(
+    profile: &IndexProfile,
+    operation: &str,
+    error: &str,
+) -> Result<String, String> {
+    match profile.analysis {
+        Analysis::English => Ok(format!(
+            "\tfulltext: could not {operation} the index marker ({error}); english mode \
+             continues and records index_marker: null"
+        )),
+        Analysis::Parity => Err(format!(
+            "fulltext parity: could not {operation} the index marker ({error}). Parity records \
+             the upload normalization in the key {REDIS_MARKER_NAMESPACE}<index> and verifies it on \
+             reuse, so the Redis user needs read/write access to the key pattern \
+             '{REDIS_MARKER_NAMESPACE}*' (an ACL limited to the config's key prefix denies it)"
+        )),
+    }
+}
+
 /// Redis commands that remove an index's marker at teardown: only for an
 /// engine config that has a fulltext profile (see
 /// [`redis_marker_create_commands`]).
@@ -2215,6 +2243,29 @@ mod tests {
         assert_eq!(resolve_shared_prefix(Some("a:")), Some("a:".into()));
         assert_eq!(resolve_shared_prefix(Some("  ")), None);
         assert_eq!(resolve_shared_prefix(None), None);
+    }
+
+    /// #358 review 5: a marker failure is a note in english mode and a
+    /// refusal naming the needed key pattern in parity mode.
+    #[test]
+    fn marker_failures_are_fatal_only_in_parity() {
+        let eng = IndexProfile::english();
+        let note = redis_marker_failure(&eng, "write", "NOPERM").unwrap();
+        assert!(
+            note.contains("index_marker: null") && note.contains("NOPERM"),
+            "{note}"
+        );
+        let par = index_profile([(
+            Workload::Fulltext,
+            Some(&parity_block(json!({"segment": 1}))),
+        )])
+        .unwrap()
+        .unwrap();
+        let e = redis_marker_failure(&par, "read", "NOPERM").unwrap_err();
+        assert!(
+            e.contains("'vdbb:fulltext-profile:*'") && e.contains("NOPERM"),
+            "{e}"
+        );
     }
 
     /// #358 review 3: a vector-only config never touches a key outside its
