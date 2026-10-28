@@ -14,16 +14,30 @@
 //!   positions in each list; queries sharing fewer than 2 ids are skipped.
 //!   Ranked workloads only.
 //! - `count_agreement` (filter-only): fraction of queries whose exact totals are
-//!   equal, the largest absolute difference, and — where both totals fit in k,
+//!   equal (`None` when no compared query carried totals), the largest absolute
+//!   difference, and — where both totals fit in k,
 //!   i.e. both pages are complete result sets — the fraction whose id sets are
 //!   equal. Filter-only order is unspecified, so overlap/rank are not reported.
 //! - `recall_at_k_{reference,candidate}` (vector, hybrid): against the
 //!   ground truth carried in the dump; same denominator as `mean_recall`.
 //!
-//! A query answered by one side and not the other (failed, or absent from the
-//! dump) is listed in `one_sided`; [`Report::passed`] is false when any exist,
-//! and the CLI exits non-zero. Same policy as `--fail-on-dropped-queries`
-//! (#213): a comparison over the queries both happened to answer is biased.
+//! Two things fail a comparison ([`Report::passed`] is false, the CLI exits
+//! non-zero), together the `--fail-on-dropped-queries` policy (#213) applied to
+//! the dumps — a comparison over the queries both sides happened to answer is
+//! biased:
+//! - a query answered by one side and not the other (failed on every attempt,
+//!   or absent from the dump) — listed in `one_sided`;
+//! - ANY failed attempt on either side, counted per side in
+//!   `SideInfo::failed_attempts`. Under query cycling (`--queries N` above the
+//!   query count, duration runs) a query can fail once and succeed on a later
+//!   cycle; it is still compared on its first answer, but the failed attempt is
+//!   exactly what `--fail-on-dropped-queries` would have counted, so it is not
+//!   hidden by the later success.
+//!
+//! Directory mode pairs dumps by (dataset, workload, parallel, k, id space), so
+//! each side may hold ONE dump per key — e.g. a single search config per
+//! (parallel, k). An `ef` / `M` sweep in one directory collides and is refused;
+//! pass the two files to compare explicitly.
 
 use crate::results_dump::{first_answers, Dump, IdSpace, QueryRecord};
 use crate::workload::Workload;
@@ -38,13 +52,17 @@ pub struct SideInfo {
     pub parallel: usize,
     pub queries_attempted: usize,
     pub queries_answered: usize,
+    /// Records with `error` set, counting every attempt (a query cycled several
+    /// times can contribute more than one). Nonzero fails the comparison.
+    pub failed_attempts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CountAgreement {
     pub queries: usize,
     pub exact_matches: usize,
-    pub fraction: f64,
+    /// `exact_matches / queries`; `None` when no compared query carried totals.
+    pub fraction: Option<f64>,
     pub max_abs_diff: u64,
     /// Queries where both totals are <= k, so both pages are the full result set.
     pub complete_pages: usize,
@@ -94,11 +112,13 @@ pub struct Report {
     /// Dumps with no counterpart on the other side (file names).
     pub unpaired: Vec<String>,
     pub one_sided_total: usize,
+    /// Sum of both sides' `failed_attempts` over every pair.
+    pub failed_attempts_total: usize,
 }
 
 impl Report {
     pub fn passed(&self) -> bool {
-        self.one_sided_total == 0
+        self.one_sided_total == 0 && self.failed_attempts_total == 0
     }
 }
 
@@ -184,6 +204,7 @@ fn side_info(file: &str, d: &Dump) -> SideInfo {
             .collect::<BTreeSet<_>>()
             .len(),
         queries_answered: answered.len(),
+        failed_attempts: d.records.iter().filter(|r| !r.answered()).count(),
     }
 }
 
@@ -338,11 +359,7 @@ fn shape_report(
         CountAgreement {
             queries: with_totals,
             exact_matches: exact,
-            fraction: if with_totals == 0 {
-                0.0
-            } else {
-                exact as f64 / with_totals as f64
-            },
+            fraction: (with_totals > 0).then(|| exact as f64 / with_totals as f64),
             max_abs_diff: max_diff,
             complete_pages: complete,
             complete_page_set_agreement: (complete > 0)
@@ -392,7 +409,8 @@ fn index<'a>(
     for entry in side {
         if let Some(prev) = out.insert(key(&entry.1), entry) {
             return Err(format!(
-                "{label}: {} and {} have the same (dataset, workload, parallel, k); pass the \
+                "{label}: {} and {} have the same (dataset, workload, parallel, k, id space); \
+                 directory mode holds one dump per key (a sweep of search configs collides); pass the \
                  two files to compare explicitly",
                 prev.0, entry.0
             ));
@@ -448,11 +466,16 @@ pub fn compare(
         ));
     }
     let one_sided_total = pairs.iter().map(|p| p.one_sided.len()).sum();
+    let failed_attempts_total = pairs
+        .iter()
+        .map(|p| p.reference.failed_attempts + p.candidate.failed_attempts)
+        .sum();
     Ok(Report {
         reference_engine: reference_engine.to_string(),
         pairs,
         unpaired,
         one_sided_total,
+        failed_attempts_total,
     })
 }
 
@@ -475,8 +498,11 @@ pub fn render_markdown(r: &Report) -> String {
                 .as_ref()
                 .map(|c| {
                     format!(
-                        "{}/{} ({:.4}), max Δ {}",
-                        c.exact_matches, c.queries, c.fraction, c.max_abs_diff
+                        "{}/{} ({}), max Δ {}",
+                        c.exact_matches,
+                        c.queries,
+                        f(c.fraction),
+                        c.max_abs_diff
                     )
                 })
                 .unwrap_or_else(|| "—".into());
@@ -507,7 +533,24 @@ pub fn render_markdown(r: &Report) -> String {
             s.push_str(&format!("- {u}\n"));
         }
     }
-    if !r.passed() {
+    if r.failed_attempts_total > 0 {
+        s.push_str(&format!(
+            "\n**FAILED**: {} failed query attempt(s) in the dumps (the \
+             --fail-on-dropped-queries policy, #213):\n\n",
+            r.failed_attempts_total
+        ));
+        for p in &r.pairs {
+            for (side, info) in [("reference", &p.reference), ("candidate", &p.candidate)] {
+                if info.failed_attempts > 0 {
+                    s.push_str(&format!(
+                        "- {} {} p{}: {} failed attempt(s) on the {side} ({})\n",
+                        p.dataset, p.workload, info.parallel, info.failed_attempts, info.config
+                    ));
+                }
+            }
+        }
+    }
+    if r.one_sided_total > 0 {
         s.push_str(&format!(
             "\n**FAILED**: {} quer{} answered by one engine and not the other:\n\n",
             r.one_sided_total,
@@ -666,14 +709,58 @@ mod tests {
             .iter()
             .all(|o| o.answered_by == "reference"));
         assert!(render_markdown(&r).contains("FAILED"));
-        // A query both sides dropped is reported but is not one-sided.
+        // A query both sides dropped is not one-sided, but the failed attempts
+        // still fail the comparison.
         let mut a = vector_dump("opensearch");
         a.records[0].error = Some("x".into());
         let mut b = vector_dump("redis");
         b.records[0].error = Some("x".into());
         let r = compare(&[("a".into(), a)], &[("b".into(), b)], "opensearch").unwrap();
-        assert!(r.passed());
+        assert!(r.pairs[0].one_sided.is_empty());
         assert_eq!(r.pairs[0].unanswered_by_both, vec![0]);
+        assert_eq!(r.failed_attempts_total, 2);
+        assert!(!r.passed());
+    }
+
+    /// #343 review: under query cycling a query can fail once and be answered
+    /// on a later cycle. It is compared on that answer, but the failed attempt
+    /// must still fail the comparison, as --fail-on-dropped-queries would.
+    #[test]
+    fn a_failed_attempt_answered_on_a_later_cycle_still_fails() {
+        let reference = vector_dump("opensearch");
+        let mut cand = vector_dump("redis");
+        let mut retry = cand.records[0].clone();
+        cand.records[0].error = Some("timeout".into());
+        cand.records[0].ids.clear();
+        retry.seq = 10; // the same query, answered on the next cycle
+        cand.records.push(retry);
+        let r = compare(
+            &[("ref".into(), reference)],
+            &[("cand".into(), cand)],
+            "opensearch",
+        )
+        .unwrap();
+        assert!(r.pairs[0].one_sided.is_empty(), "answered on the retry");
+        assert_eq!(r.pairs[0].candidate.failed_attempts, 1);
+        assert_eq!(r.pairs[0].reference.failed_attempts, 0);
+        assert_eq!(one(&r).overlap_at_k, Some(1.0), "compared on the answer");
+        assert!(!r.passed());
+        assert!(render_markdown(&r).contains("1 failed attempt(s) on the candidate"));
+    }
+
+    #[test]
+    fn count_agreement_without_totals_is_not_computed() {
+        let mut a = dump(
+            "opensearch",
+            Workload::FilterOnly,
+            1,
+            vec![rec(0, &["a"], None, true)],
+        );
+        a.records[0].expected = None;
+        let r = compare(&[("a".into(), a.clone())], &[("b".into(), a)], "opensearch").unwrap();
+        let c = one(&r).count_agreement.as_ref().unwrap();
+        assert_eq!((c.queries, c.fraction), (0, None));
+        assert!(render_markdown(&r).contains("0/0 (—)"));
     }
 
     #[test]
@@ -705,6 +792,7 @@ mod tests {
         assert_eq!(s.recall_at_k_reference, None);
         let c = s.count_agreement.as_ref().unwrap();
         assert_eq!((c.queries, c.exact_matches, c.max_abs_diff), (2, 1, 1));
+        assert_eq!(c.fraction, Some(0.5));
         assert_eq!(c.complete_pages, 1);
         assert_eq!(c.complete_page_set_agreement, Some(1.0));
     }

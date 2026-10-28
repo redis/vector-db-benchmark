@@ -51,13 +51,15 @@ pub fn run(args: &CompareResultsArgs) -> Result<(), String> {
     }
     if !report.passed() {
         return Err(format!(
-            "{} quer{} answered by one engine and not the other (see the report)",
+            "comparison failed: {} quer{} answered by one engine and not the other, and {} \
+             failed query attempt(s) across both dumps (see the report)",
             report.one_sided_total,
             if report.one_sided_total == 1 {
                 "y was"
             } else {
                 "ies were"
-            }
+            },
+            report.failed_attempts_total
         ));
     }
     Ok(())

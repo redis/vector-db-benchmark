@@ -359,12 +359,18 @@ vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference ope
   --json report.json --markdown report.md
 ```
 
-Dumps pair by (dataset, workload, parallel, k). Per pair and query shape the
+Dumps pair by (dataset, workload, parallel, k, id space), so a directory may
+hold one dump per key: a sweep of several search configs at the same
+(parallel, k) is refused as ambiguous — pass the two files explicitly. Per pair
+and query shape the
 report gives overlap@k (against the reference's list), Jaccard@k, Kendall rank
 correlation over the ids both lists share, exact-count agreement for
 `filter-only` (whose order is unspecified, so overlap/rank are not reported),
 and recall@k against the dump's ground truth for `vector`/`hybrid`. It exits
-non-zero when any query was answered by one engine and not by the other.
+non-zero when any query was answered by one engine and not by the other, or when
+either dump holds ANY failed attempt — including a query that failed once and
+was answered on a later cycle (`--queries N` above the query count, duration
+runs): that is the `--fail-on-dropped-queries` policy applied to the dumps.
 
 ### `--skip-upload`: reuse means reuse (issue #238)
 
