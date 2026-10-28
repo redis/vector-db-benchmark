@@ -24,32 +24,58 @@ type WorkerOut = (
 );
 
 impl OpenSearchEngine {
-    /// Whether this engine config runs the fulltext workload, i.e. whether the
-    /// index must be created with the pinned analyzer.
-    pub(super) fn serves_fulltext(&self) -> bool {
-        self.search_params
-            .iter()
-            .any(|sp| sp.workload == Some(vector_db_benchmark::workload::Workload::Fulltext))
+    /// The index profile this engine config's fulltext search configs need
+    /// (`None` when it has none). Same resolution as the startup check.
+    pub(super) fn fulltext_profile(&self) -> Result<Option<fulltext::IndexProfile>, String> {
+        fulltext::index_profile(self.search_params.iter().map(|sp| {
+            (
+                sp.workload
+                    .unwrap_or(vector_db_benchmark::workload::Workload::Vector),
+                sp.knob(fulltext::SPEC_KEY),
+            )
+        }))
     }
 
-    /// Analyze every schema `text` field with the pinned analyzer and declare
-    /// it in the index settings.
+    /// Map every schema `text` field for `profile` (its analyzer, or not
+    /// indexed when parity does not search it), declare the analysis in the
+    /// index settings, and return the `mappings._meta` recording the profile.
     pub(super) fn pin_fulltext_analyzer(
         &self,
         dataset: &Dataset,
+        profile: &fulltext::IndexProfile,
         properties: &mut serde_json::Value,
         index_settings: &mut serde_json::Value,
-    ) {
+    ) -> serde_json::Value {
         for field in fulltext::schema_text_fields(dataset.config.schema.as_ref()) {
-            properties[field.as_str()] = fulltext::opensearch_text_mapping();
+            properties[field.as_str()] = fulltext::opensearch_text_mapping_for(profile, &field);
         }
-        index_settings["analysis"] = fulltext::opensearch_analysis();
+        index_settings["analysis"] = fulltext::opensearch_analysis_for(profile.analysis);
+        serde_json::json!({ fulltext::OPENSEARCH_META_KEY: profile.marker() })
+    }
+
+    /// Parity mode: newlines → spaces in the indexed text fields.
+    pub(super) fn normalize_fulltext_upload(
+        &self,
+        metadata: &mut [Option<vector_db_benchmark::readers::metadata::MetadataItem>],
+    ) -> Result<(), String> {
+        if let Some(p) = self.fulltext_profile()? {
+            if p.normalizes_newlines() {
+                let n = fulltext::normalize_metadata(metadata, &p.text_fields);
+                println!(
+                    "\tfulltext parity: normalized newlines in {n} values of {:?}",
+                    p.text_fields
+                );
+            }
+        }
+        Ok(())
     }
 
     fn validate_fulltext_index(
         &self,
         fields: &[fulltext::FieldBoost],
         allow_multi_shard: bool,
+        profile: &fulltext::IndexProfile,
+        schema_text_fields: &[String],
     ) -> Result<u64, String> {
         let (mapping, settings) = self
             .rt
@@ -75,11 +101,15 @@ impl OpenSearchEngine {
                 Ok::<_, opensearch::Error>((mapping, settings))
             })
             .map_err(|e| format!("fulltext: index check failed: {e}"))?;
-        fulltext::validate_opensearch_index(
-            &mapping[&self.index_name]["mappings"]["properties"],
+        let mappings = &mapping[&self.index_name]["mappings"];
+        fulltext::validate_opensearch_index_for(
+            &mappings["properties"],
             &settings[&self.index_name]["settings"]["index"],
             fields,
             allow_multi_shard,
+            profile,
+            &mappings["_meta"][fulltext::OPENSEARCH_META_KEY],
+            schema_text_fields,
         )
     }
 
@@ -100,7 +130,15 @@ impl OpenSearchEngine {
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
-        let shards = self.validate_fulltext_index(&fields, spec.allow_multi_shard)?;
+        let profile = self
+            .fulltext_profile()?
+            .ok_or("fulltext: no fulltext search config resolved an index profile")?;
+        let shards = self.validate_fulltext_index(
+            &fields,
+            spec.allow_multi_shard,
+            &profile,
+            &fulltext::schema_text_fields(dataset.config.schema.as_ref()),
+        )?;
 
         let texts = fulltext::read_query_texts(&dataset.get_path()?)?;
         let set = fulltext::build_query_set(&texts)?;
@@ -266,7 +304,7 @@ impl OpenSearchEngine {
         )?;
         result.mean_precision_at_returned = -1.0;
         result.query_records = captured;
-        let mut meta = fulltext::result_metadata("opensearch", &fields, &set, top)?;
+        let mut meta = fulltext::result_metadata_for("opensearch", &fields, &set, top, &profile)?;
         meta["retried_queries"] = serde_json::json!(retried_queries);
         // Read back from the live index (`_settings`), not from the config.
         meta["number_of_shards"] = serde_json::json!(shards);

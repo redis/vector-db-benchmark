@@ -246,6 +246,23 @@ pub fn run(args: &Args) -> Result<(), String> {
             )
             .map_err(|e| format!("config '{name}', search config #{i}: {e}"))?;
         }
+        // #339 parity: the index profile all fulltext search configs share
+        // (analysis mode, indexed text fields) must be resolvable, and parity
+        // never shares an engine config with another workload.
+        vector_db_benchmark::fulltext::index_profile(
+            config
+                .search_params
+                .iter()
+                .flatten()
+                .enumerate()
+                .map(|(i, sp)| {
+                    (
+                        plan.workload(i).unwrap_or(Workload::Vector),
+                        sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
+                    )
+                }),
+        )
+        .map_err(|e| format!("config '{name}': {e}"))?;
         if args.target_qps > 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {
             return Err(format!(
                 "--target-qps currently supports search-only vector benchmarks; config \

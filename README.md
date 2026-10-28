@@ -505,6 +505,50 @@ and Lucene's `porter2` output, RediSearch's minimum stem length, and
 accounts for the gap. Treat the as-shipped overlap as the agreement of two
 default English pipelines, not as a BM25 implementation difference.
 
+#### Two analysis modes: `english` (headline) and `parity` (agreement check)
+
+`fulltext.analysis` selects how both engines analyze text:
+
+| | `english` (default) | `parity` |
+|---|---|---|
+| stemming | Porter2 on both, as pinned above | none: Redis `NOSTEM` + `VERBATIM` queries; OpenSearch `vdbb_english_nostem` (the english analyzer without porter2: same tokenizer, possessive, lowercase, stop list) |
+| text fields indexed | every schema `text` field | exactly the searched `fields` (OpenSearch maps the others `index: false`; Redis leaves them out of the schema), so BM25STD's whole-document statistics cover only those |
+| uploaded text | as is | `\r\n` / `\n` / `\r` → space in the indexed text fields, on both engines |
+| use | headline numbers | agreement check against OpenSearch as source of truth |
+
+```json
+{"parallel": 1, "top": 10, "workload": "fulltext",
+ "fulltext": {"analysis": "parity", "fields": {"segment": 1.0}}}
+```
+
+Report the **english** run as the headline: it is what each engine does with
+its default English pipeline. Report **parity** next to it to show how closely
+Redis matches OpenSearch once the known pipeline differences are removed. On
+the 100K MS MARCO corpus, segment-only parity agrees on about 94% of the top 10
+(see below). `experiments/configurations/redis-msmarco-fulltext.json` and
+`opensearch-msmarco-fulltext.json` ship both modes as separate engine configs,
+so they run side by side:
+
+```bash
+vector-db-benchmark --engines '*-msmarco-fulltext-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/<engine> …
+vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch
+```
+
+Parity changes the uploaded corpus, so it is guarded:
+
+- **Startup rules.** Refused before anything is downloaded or connected:
+  - an engine config whose fulltext configs mix `english` and `parity` (they need different indexes);
+  - parity without explicit `fields`;
+  - parity configs searching different field sets;
+  - parity in the same engine config as any `vector`, `hybrid` or `filter-only` config. Normalization and the reduced text index never apply to other workloads.
+- **Redis shared corpus.** On Redis, parity also refuses a shared corpus (`REDIS_KEY_PREFIX`).
+- **Recorded in the index.** The mode is written into the index: a Redis key `vdbb:fulltext-profile:<index>`, and OpenSearch `mappings._meta.vdbb_fulltext` (`{"analysis", "normalize_newlines", "text_fields"}`).
+- **Verified on `--skip-upload` reuse,** together with the analyzer / `NOSTEM` / indexed-field checks:
+  - an index uploaded without normalization (english, or built before markers existed) is refused in parity;
+  - a parity index is refused in english.
+- **In the result.** `params.fulltext` records `analysis`, `normalize_newlines`, `indexed_text_fields`, `index_marker`, and the `known_differences` that remain in that mode.
+
 Result JSON: `params.workload: "fulltext"` and `params.fulltext` (fields and
 boosts, query-term method, stopword list and provenance, the engine's analyzer /
 scorer / request, skipped queries, known differences). `--dump-results`

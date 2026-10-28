@@ -27,10 +27,63 @@ type WorkerOut = (Vec<f64>, Vec<String>, Vec<RawQueryResult>, Option<String>);
 impl RedisEngine {
     /// Whether this engine config runs the fulltext workload, i.e. whether
     /// `FT.CREATE` must pin the analyzer settings (`fulltext::redis_stopword_args`).
-    pub(super) fn serves_fulltext(&self) -> bool {
-        self.search_params
-            .iter()
-            .any(|sp| sp.workload == Some(vector_db_benchmark::workload::Workload::Fulltext))
+    /// The index profile this engine config's fulltext search configs need
+    /// (`None` when it has none). Same resolution as the startup check.
+    pub(super) fn fulltext_profile(&self) -> Result<Option<fulltext::IndexProfile>, String> {
+        let profile = fulltext::index_profile(self.search_params.iter().map(|sp| {
+            (
+                sp.workload
+                    .unwrap_or(vector_db_benchmark::workload::Workload::Vector),
+                sp.knob(fulltext::SPEC_KEY),
+            )
+        }))?;
+        if profile.as_ref().is_some_and(|p| p.normalizes_newlines()) && self.config.shared_corpus {
+            return Err(
+                "fulltext `analysis: parity` normalizes the uploaded text, which a shared corpus \
+                 (REDIS_KEY_PREFIX) would impose on every other config — unset REDIS_KEY_PREFIX"
+                    .into(),
+            );
+        }
+        Ok(profile)
+    }
+
+    /// Record the profile next to the index (or clear a stale one), so a
+    /// `--skip-upload` reuse can verify how the corpus was uploaded.
+    pub(super) fn write_fulltext_marker(
+        &self,
+        conn: &mut redis::Connection,
+        profile: Option<&fulltext::IndexProfile>,
+    ) -> Result<(), String> {
+        let key = fulltext::redis_marker_key(&self.config.index_name);
+        redis::cmd("DEL")
+            .arg(&key)
+            .query::<()>(conn)
+            .map_err(|e| format!("fulltext marker: {e}"))?;
+        if let Some(p) = profile {
+            redis::cmd("SET")
+                .arg(&key)
+                .arg(p.marker().to_string())
+                .query::<()>(conn)
+                .map_err(|e| format!("fulltext marker: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Parity mode: newlines → spaces in the indexed text fields.
+    pub(super) fn normalize_fulltext_upload(
+        &self,
+        metadata: &mut [Option<vector_db_benchmark::readers::metadata::MetadataItem>],
+    ) -> Result<(), String> {
+        if let Some(p) = self.fulltext_profile()? {
+            if p.normalizes_newlines() {
+                let n = fulltext::normalize_metadata(metadata, &p.text_fields);
+                println!(
+                    "\tfulltext parity: normalized newlines in {n} values of {:?}",
+                    p.text_fields
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn search_fulltext_harness(
@@ -50,6 +103,9 @@ impl RedisEngine {
         let spec = fulltext::parse_spec(params.knob(fulltext::SPEC_KEY))?;
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
 
+        let profile = self
+            .fulltext_profile()?
+            .ok_or("fulltext: no fulltext search config resolved an index profile")?;
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
         let min_stem_len = {
@@ -59,7 +115,21 @@ impl RedisEngine {
                 .arg(&self.config.index_name)
                 .query(&mut conn)
                 .map_err(|e| format!("fulltext: FT.INFO failed: {e}"))?;
-            fulltext::validate_redis_index(&redis_value_to_json(&info), &fields)?;
+            let marker: Option<String> = redis::cmd("GET")
+                .arg(fulltext::redis_marker_key(&self.config.index_name))
+                .query(&mut conn)
+                .map_err(|e| format!("fulltext: marker read failed: {e}"))?;
+            let marker = match marker {
+                None => serde_json::Value::Null,
+                Some(m) => serde_json::from_str(&m)
+                    .map_err(|e| format!("fulltext: unreadable index marker {m:?}: {e}"))?,
+            };
+            fulltext::validate_redis_index_for(
+                &redis_value_to_json(&info),
+                &fields,
+                &profile,
+                &marker,
+            )?;
             // Server-wide, not in FT.INFO: which tokens get stemmed at all.
             let mut read = |cmd: &mut redis::Cmd, name: &str| {
                 cmd.query::<redis::Value>(&mut conn)
@@ -98,11 +168,12 @@ impl RedisEngine {
             .iter()
             .map(|q| {
                 let mut cmd = redis::cmd("FT.SEARCH");
-                for a in fulltext::redis_args(
+                for a in fulltext::redis_args_for(
                     &self.config.index_name,
                     &fulltext::redis_query(&fields, &q.terms),
                     top,
                     query_timeout,
+                    profile.analysis,
                 ) {
                     cmd.arg(a);
                 }
@@ -251,7 +322,7 @@ impl RedisEngine {
         // No ground truth: the -1 sentinel keeps it out of precision tables.
         result.mean_precision_at_returned = -1.0;
         result.query_records = captured;
-        let mut meta = fulltext::result_metadata("redis", &fields, &set, top)?;
+        let mut meta = fulltext::result_metadata_for("redis", &fields, &set, top, &profile)?;
         meta["redis_min_stem_len"] = min_stem_len;
         result.fulltext = Some(meta);
         Ok(result)

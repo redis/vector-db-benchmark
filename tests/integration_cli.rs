@@ -730,3 +730,69 @@ fn fulltext_mixed_with_text_filtered_vector_configs_is_refused_before_connecting
         }
     }
 }
+
+/// #339 follow-up: parity index rules refused at startup, before any
+/// download or connection (closed port, missing corpus): parity mixed with
+/// english, parity next to a vector config, parity without explicit fields,
+/// parity configs searching different field sets.
+#[test]
+fn fulltext_parity_index_rules_are_refused_at_startup() {
+    use serde_json::json;
+    let par = |fields: serde_json::Value| json!({"workload": "fulltext", "fulltext": {"analysis": "parity", "fields": fields}});
+    let cases = [
+        (
+            json!([par(json!({"segment": 1})), {"workload": "fulltext"}]),
+            "mixes fulltext analysis",
+        ),
+        (
+            json!([{}, par(json!({"segment": 1}))]),
+            "must never apply to other workloads",
+        ),
+        (
+            json!([{"workload": "fulltext", "fulltext": {"analysis": "parity"}}]),
+            "needs explicit",
+        ),
+        (
+            json!([par(json!({"segment": 1})), par(json!({"title": 1}))]),
+            "different field sets",
+        ),
+    ];
+    for engine in ["redis", "opensearch"] {
+        for (search_params, needle) in &cases {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("datasets")).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port().to_string();
+            drop(listener);
+            std::fs::write(
+                root.path().join("datasets/datasets.json"),
+                json!([{"name": "pf", "type": "tar", "path": "missing-corpus",
+                        "vector_size": 1, "distance": "l2",
+                        "schema": {"title": "text", "segment": "text"},
+                        "link": format!("http://127.0.0.1:{port}/must-not-download.tgz")}])
+                .to_string(),
+            )
+            .unwrap();
+            let engines_file = root.path().join("engines.json");
+            std::fs::write(
+                &engines_file,
+                json!([{"name": "pf", "engine": engine, "search_params": search_params}])
+                    .to_string(),
+            )
+            .unwrap();
+            let out = Command::new(common::binary_path())
+                .current_dir(root.path())
+                .args(["--engines", "pf", "--datasets", "pf", "--host", "127.0.0.1"])
+                .arg("--engines-file")
+                .arg(&engines_file)
+                .env("REDIS_PORT", &port)
+                .env("OPENSEARCH_PORT", &port)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{engine} {search_params}: {stderr}");
+            assert!(stderr.contains(needle), "{engine} {needle}: {stderr}");
+            assert!(!stderr.contains("must-not-download"), "{stderr}");
+        }
+    }
+}

@@ -2419,7 +2419,28 @@ mod shipped_config_knob_guard {
                 }
                 if let Some(list) = entry.get("search_params").and_then(|v| v.as_array()) {
                     for sp in list {
-                        collect_knobs(sp, "search_params", &mut knobs);
+                        // #339: the `fulltext` block is a typed,
+                        // deny_unknown_fields struct parsed by the library
+                        // (`fulltext::FulltextSpec`), and the keys under its
+                        // `fields` are data (field names), not knobs — so it is
+                        // validated with the real parser instead of by token
+                        // matching an engine's source.
+                        let mut sp = sp.clone();
+                        if let Some(block) = sp
+                            .as_object_mut()
+                            .and_then(|o| o.remove(vector_db_benchmark::fulltext::SPEC_KEY))
+                        {
+                            if let Err(e) = vector_db_benchmark::fulltext::validate_declared(
+                                engine,
+                                vector_db_benchmark::workload::Workload::Fulltext,
+                                Some(&block),
+                            ) {
+                                violations.push(format!(
+                                    "{file_name} [{name}] has an invalid fulltext block: {e}"
+                                ));
+                            }
+                        }
+                        collect_knobs(&sp, "search_params", &mut knobs);
                     }
                 }
 

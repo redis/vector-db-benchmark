@@ -356,7 +356,8 @@ impl RedisEngine {
         // #339: a config that runs the fulltext workload pins the stopword list
         // explicitly (it equals the RediSearch default) so FT.INFO reports it
         // and the fulltext arm can refuse an index built any other way.
-        if self.serves_fulltext() {
+        let ft_profile = self.fulltext_profile()?;
+        if ft_profile.is_some() {
             for a in vector_db_benchmark::fulltext::redis_stopword_args() {
                 cmd.arg(a);
             }
@@ -471,9 +472,20 @@ impl RedisEngine {
                         "datetime" => {
                             cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
                         }
-                        "text" => {
-                            cmd.arg(field_name).arg("TEXT").arg("SORTABLE");
-                        }
+                        // #339 parity: only the searched text fields are
+                        // indexed, NOSTEM; english / no fulltext: all, stemmed.
+                        "text" => match &ft_profile {
+                            Some(p) if !p.indexes_text_field(field_name) => {}
+                            Some(p) if !p.stems() => {
+                                cmd.arg(field_name)
+                                    .arg("TEXT")
+                                    .arg("NOSTEM")
+                                    .arg("SORTABLE");
+                            }
+                            _ => {
+                                cmd.arg(field_name).arg("TEXT").arg("SORTABLE");
+                            }
+                        },
                         "geo" => {
                             cmd.arg(field_name).arg("GEO").arg("SORTABLE");
                         }
@@ -485,6 +497,7 @@ impl RedisEngine {
 
         cmd.query::<()>(conn)
             .map_err(|e| format!("Failed to create index: {}", e))?;
+        self.write_fulltext_marker(conn, ft_profile.as_ref())?;
 
         Ok(())
     }
@@ -2151,7 +2164,10 @@ impl Engine for RedisEngine {
         let dataset_path = dataset.get_path()?;
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
-        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        let (ids, vectors, mut metadata) = dataset.read_vectors(normalize)?;
+        // #339 parity: normalize newlines in the indexed text fields before
+        // anything is sent (recorded in the index marker by configure()).
+        self.normalize_fulltext_upload(&mut metadata)?;
         if self.config.skip_vector_index {
             vector_db_benchmark::filter_only::domain::validate_metadata(
                 &metadata,
@@ -2972,6 +2988,11 @@ impl Engine for RedisEngine {
             cmd.arg("DD");
         }
         let _ = cmd.query::<()>(&mut conn);
+        let _ = redis::cmd("DEL")
+            .arg(vector_db_benchmark::fulltext::redis_marker_key(
+                &self.config.index_name,
+            ))
+            .query::<()>(&mut conn);
         Ok(())
     }
 

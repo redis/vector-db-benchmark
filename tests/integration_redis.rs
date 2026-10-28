@@ -4906,3 +4906,87 @@ fn test_binary_redis_fulltext_refuses_unpinned_or_incomplete_index() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #339 follow-up: `analysis: parity` end to end on Redis — no stemming,
+/// newline normalization at upload (verified on the stored hash), only the
+/// searched fields indexed (`NOSTEM`), and refusal of an index uploaded in the
+/// other mode when reused through `--skip-upload`, in both directions.
+#[test]
+fn test_binary_redis_fulltext_parity() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-bm25-parity";
+    let write_config = |root: &std::path::Path, search_params: serde_json::Value| {
+        fs::write(
+            root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "redis",
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let proj = common::write_bm25_project("[]");
+    write_config(&proj.root, common::bm25_parity_search_params());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        name,
+        common::BM25_DATASET,
+        TEST_HOST,
+        &envs,
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data"
+        ]
+    ));
+    common::assert_bm25_parity_run(&proj.root, &dump, "redis", name);
+    // The uploaded copy of the indexed field was normalized; the unindexed
+    // title is untouched (it holds no newline in the fixture anyway).
+    let headings: String = redis::cmd("HGET")
+        .arg(format!("{name}:4"))
+        .arg("headings")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(headings, "alpha beta");
+    let run = |extra: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &envs,
+            extra,
+        )
+    };
+    let refused = |out: std::process::Output, needle: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must refuse: {stderr}");
+        assert!(stderr.contains(needle), "expected {needle:?} in: {stderr}");
+    };
+    let english = serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"headings": 1.0, "segment": 1.0}}}]);
+    // Parity index reused in english mode: refused (marker says normalized).
+    write_config(&proj.root, english.clone());
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "the index records analysis",
+    );
+    // English index (stemmed, unnormalized upload) reused in parity: refused.
+    common::clear_result_files(&proj.root);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    write_config(&proj.root, common::bm25_parity_search_params());
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "without newline normalization",
+    );
+    flush_db(&mut conn);
+    let _ = redis::cmd("DEL")
+        .arg(format!("vdbb:fulltext-profile:idx:{name}"))
+        .query::<()>(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

@@ -182,7 +182,225 @@ pub struct FulltextSpec {
     /// BM25 statistics). Off by default; the shard count is always recorded.
     #[serde(default)]
     pub allow_multi_shard: bool,
+    /// Text analysis mode (see [`Analysis`]). Default `english`.
+    #[serde(default)]
+    pub analysis: Analysis,
 }
+
+/// How both engines analyze text for the fulltext workload.
+///
+/// - `english` (default, the headline configuration): each engine's default
+///   English pipeline, pinned — Porter2 stemming on both, the shared stopword
+///   list, every schema `text` field indexed, the corpus uploaded as is.
+/// - `parity` (the agreement check against OpenSearch as source of truth):
+///   removes the three differences that dominate the Redis/OpenSearch gap —
+///   no stemming (Redis `NOSTEM` + `VERBATIM` queries; OpenSearch analyzer
+///   without the porter2 filter, same tokenizer / possessive / lowercase /
+///   stop), only the searched fields indexed as text (so RediSearch's
+///   whole-document statistics cover exactly those fields), and `\n` / `\r`
+///   in those fields replaced by a space at upload on both engines (RediSearch
+///   does not split tokens on line breaks). The normalization changes the
+///   uploaded corpus, so it is recorded in the index (Redis marker key,
+///   OpenSearch `_meta`) and verified on reuse, and parity never shares an
+///   engine config with any other workload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Analysis {
+    #[default]
+    English,
+    Parity,
+}
+
+impl Analysis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Analysis::English => "english",
+            Analysis::Parity => "parity",
+        }
+    }
+}
+
+/// What an engine config's fulltext search configs require of the index:
+/// resolved once from all of them ([`index_profile`]), because the index is
+/// shared by every search config of the engine config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexProfile {
+    pub analysis: Analysis,
+    /// Parity: exactly the searched fields (the only fields indexed as text,
+    /// and the only ones normalized). English: empty — every schema `text`
+    /// field is indexed and nothing is normalized.
+    pub text_fields: BTreeSet<String>,
+}
+
+impl IndexProfile {
+    pub fn english() -> Self {
+        IndexProfile {
+            analysis: Analysis::English,
+            text_fields: BTreeSet::new(),
+        }
+    }
+
+    /// Whether schema `text` field `field` is indexed as text.
+    pub fn indexes_text_field(&self, field: &str) -> bool {
+        match self.analysis {
+            Analysis::English => true,
+            Analysis::Parity => self.text_fields.contains(field),
+        }
+    }
+
+    pub fn stems(&self) -> bool {
+        self.analysis == Analysis::English
+    }
+
+    pub fn normalizes_newlines(&self) -> bool {
+        self.analysis == Analysis::Parity
+    }
+
+    /// The record written into the index (Redis marker key, OpenSearch
+    /// `_meta.vdbb_fulltext`) and required to match on reuse.
+    pub fn marker(&self) -> Value {
+        json!({
+            "analysis": self.analysis.as_str(),
+            "normalize_newlines": self.normalizes_newlines(),
+            "text_fields": self.text_fields.iter().collect::<Vec<_>>(),
+        })
+    }
+
+    /// Check an index's recorded marker against this profile. `Null` means the
+    /// index carries none — accepted only in english mode (indexes built before
+    /// markers existed, or by a vector-only config, are english).
+    pub fn check_marker(&self, recorded: &Value) -> Result<(), String> {
+        let ok = match (self.analysis, recorded) {
+            (Analysis::English, Value::Null) => true,
+            (_, r) => *r == self.marker(),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "fulltext: the index records analysis {recorded} but this run needs {} — an \
+                 index uploaded {} newline normalization (or with a different text field set) \
+                 cannot be reused; rebuild it without --skip-upload",
+                self.marker(),
+                if self.normalizes_newlines() {
+                    "without"
+                } else {
+                    "with"
+                }
+            ))
+        }
+    }
+}
+
+/// Resolve the [`IndexProfile`] an engine config's search configs need.
+/// `configs` are every search config's `(workload, fulltext block)`.
+/// `None` when no search config is fulltext. Errors (all at startup):
+/// - fulltext configs disagreeing on `analysis` (they need different indexes);
+/// - parity without explicit `fields`, or parity configs with different field
+///   sets (the indexed text fields are exactly the searched ones);
+/// - parity sharing the engine config with any non-fulltext workload: the
+///   normalization and the reduced text index must never apply to vector,
+///   hybrid or filter-only configs.
+pub fn index_profile<'a>(
+    configs: impl IntoIterator<Item = (Workload, Option<&'a Value>)>,
+) -> Result<Option<IndexProfile>, String> {
+    let mut analysis: Option<Analysis> = None;
+    let mut parity_fields: Option<BTreeSet<String>> = None;
+    let mut other_workload: Option<Workload> = None;
+    for (i, (w, block)) in configs.into_iter().enumerate() {
+        if w != Workload::Fulltext {
+            other_workload.get_or_insert(w);
+            continue;
+        }
+        let spec = parse_spec(block)?;
+        match analysis {
+            Some(a) if a != spec.analysis => {
+                return Err(format!(
+                    "engine config mixes fulltext analysis \"{}\" and \"{}\" (search config \
+                     #{i}); they need different indexes — split them into separate engine configs",
+                    a.as_str(),
+                    spec.analysis.as_str()
+                ))
+            }
+            _ => analysis = Some(spec.analysis),
+        }
+        if spec.analysis == Analysis::Parity {
+            let fields: BTreeSet<String> = spec
+                .fields
+                .as_ref()
+                .ok_or_else(|| {
+                    format!(
+                        "fulltext search config #{i}: `analysis: parity` needs explicit \
+                         `fields` — only the searched fields are indexed as text"
+                    )
+                })?
+                .keys()
+                .cloned()
+                .collect();
+            match &parity_fields {
+                Some(prev) if *prev != fields => {
+                    return Err(format!(
+                        "parity fulltext search configs search different field sets ({prev:?} \
+                         vs {fields:?}); in parity mode the indexed text fields are exactly the \
+                         searched ones, so they need different indexes — split them"
+                    ))
+                }
+                _ => parity_fields = Some(fields),
+            }
+        }
+    }
+    let Some(analysis) = analysis else {
+        return Ok(None);
+    };
+    if analysis == Analysis::Parity {
+        if let Some(w) = other_workload {
+            return Err(format!(
+                "`analysis: parity` changes the uploaded corpus (newlines normalized) and the \
+                 text index, which must never apply to other workloads; this engine config \
+                 also declares \"{w}\" — split it"
+            ));
+        }
+    }
+    Ok(Some(IndexProfile {
+        analysis,
+        text_fields: parity_fields.unwrap_or_default(),
+    }))
+}
+
+/// Replace `\r\n`, `\n` and `\r` by a space (parity mode, at upload).
+pub fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r'], " ")
+}
+
+/// Normalize the string values of `fields` in place; returns how many values
+/// changed (for the upload log).
+pub fn normalize_metadata(
+    items: &mut [Option<crate::readers::metadata::MetadataItem>],
+    fields: &BTreeSet<String>,
+) -> usize {
+    use crate::readers::metadata::MetadataValue;
+    let mut changed = 0;
+    for item in items.iter_mut().flatten() {
+        for (k, v) in item.fields.iter_mut() {
+            if let MetadataValue::String(s) = v {
+                if fields.contains(k) && s.contains(['\n', '\r']) {
+                    *s = normalize_newlines(s);
+                    changed += 1;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Redis key holding an index's [`IndexProfile::marker`] (outside every
+/// config's key prefix, so it is neither indexed nor counted as corpus).
+pub fn redis_marker_key(index_name: &str) -> String {
+    format!("vdbb:fulltext-profile:{index_name}")
+}
+
+/// Key of the profile marker inside OpenSearch `mappings._meta`.
+pub const OPENSEARCH_META_KEY: &str = "vdbb_fulltext";
 
 /// Key of the block inside a search config.
 pub const SPEC_KEY: &str = "fulltext";
@@ -586,6 +804,26 @@ pub fn redis_query(fields: &[FieldBoost], terms: &[String]) -> String {
 
 /// Every `FT.SEARCH` argument after the command name.
 pub fn redis_args(index: &str, query: &str, top: usize, timeout_ms: i64) -> Vec<String> {
+    redis_args_for(index, query, top, timeout_ms, Analysis::English)
+}
+
+/// [`redis_args`] for `analysis`: parity adds `VERBATIM` (no query-time stem
+/// expansion).
+pub fn redis_args_for(
+    index: &str,
+    query: &str,
+    top: usize,
+    timeout_ms: i64,
+    analysis: Analysis,
+) -> Vec<String> {
+    let mut args = redis_args_base(index, query, top, timeout_ms);
+    if analysis == Analysis::Parity {
+        args.insert(3, "VERBATIM".to_string());
+    }
+    args
+}
+
+fn redis_args_base(index: &str, query: &str, top: usize, timeout_ms: i64) -> Vec<String> {
     [
         index,
         query,
@@ -622,6 +860,49 @@ pub fn opensearch_body(fields: &[FieldBoost], terms: &[String], top: usize) -> V
                 .collect::<Vec<_>>(),
         }},
     })
+}
+
+/// Name of the parity-mode OpenSearch analyzer (no stemmer).
+pub const OPENSEARCH_PARITY_ANALYZER: &str = "vdbb_english_nostem";
+
+/// The analyzer an index in `analysis` mode uses.
+pub fn opensearch_analyzer_name(analysis: Analysis) -> &'static str {
+    match analysis {
+        Analysis::English => OPENSEARCH_ANALYZER,
+        Analysis::Parity => OPENSEARCH_PARITY_ANALYZER,
+    }
+}
+
+/// `settings.index.analysis` for `analysis` mode. Parity is the english
+/// pipeline minus the porter2 filter.
+pub fn opensearch_analysis_for(analysis: Analysis) -> Value {
+    match analysis {
+        Analysis::English => opensearch_analysis(),
+        Analysis::Parity => json!({
+            "filter": {
+                OS_POSSESSIVE: {"type": "stemmer", "language": "possessive_english"},
+                OS_STOP: {"type": "stop", "stopwords": STOPWORDS.as_slice()},
+            },
+            "analyzer": {
+                OPENSEARCH_PARITY_ANALYZER: {
+                    "type": "custom",
+                    "tokenizer": "standard",
+                    "filter": [OS_POSSESSIVE, "lowercase", OS_STOP],
+                }
+            }
+        }),
+    }
+}
+
+/// Mapping of a schema `text` field in an index built for `profile`: the
+/// mode's analyzer when indexed, else stored but not indexed (parity).
+pub fn opensearch_text_mapping_for(profile: &IndexProfile, field: &str) -> Value {
+    if profile.indexes_text_field(field) {
+        json!({"type": "text", "index": true,
+               "analyzer": opensearch_analyzer_name(profile.analysis)})
+    } else {
+        json!({"type": "text", "index": false})
+    }
 }
 
 /// `settings.index.analysis` for an OpenSearch index serving this workload.
@@ -669,6 +950,20 @@ fn same_word_set<'a>(got: impl Iterator<Item = &'a str>) -> bool {
 /// index weight would multiply them), and the index stopword list is
 /// [`STOPWORDS`]. Any mismatch is a hard error before the timed window.
 pub fn validate_redis_index(info: &Value, fields: &[FieldBoost]) -> Result<(), String> {
+    validate_redis_index_for(info, fields, &IndexProfile::english(), &Value::Null)
+}
+
+/// [`validate_redis_index`] for an [`IndexProfile`]. Parity additionally
+/// requires every searched field NOSTEM (english refuses it), no other TEXT
+/// field in the index, and `marker` (the value of [`redis_marker_key`],
+/// parsed; `Null` when absent) equal to the profile's.
+pub fn validate_redis_index_for(
+    info: &Value,
+    fields: &[FieldBoost],
+    profile: &IndexProfile,
+    marker: &Value,
+) -> Result<(), String> {
+    profile.check_marker(marker)?;
     let attributes = info["attributes"]
         .as_array()
         .ok_or("fulltext: FT.INFO has no attributes (RESP3 map expected)")?;
@@ -705,12 +1000,40 @@ pub fn validate_redis_index(info: &Value, fields: &[FieldBoost]) -> Result<(), S
             .as_array()
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        for bad in ["NOSTEM", "NOINDEX", "PHONETIC"] {
+        for bad in ["NOINDEX", "PHONETIC"] {
             if flags.contains(&bad) || !attr[bad].is_null() {
                 return Err(format!(
-                    "fulltext: Redis field '{}' is {bad} — the pinned analyzer stems, indexes \
-                     and matches terms exactly",
+                    "fulltext: Redis field '{}' is {bad} — the pinned analyzer indexes and \
+                     matches terms exactly",
                     f.field
+                ));
+            }
+        }
+        let nostem = flags.contains(&"NOSTEM") || !attr["NOSTEM"].is_null();
+        if nostem == profile.stems() {
+            return Err(format!(
+                "fulltext: Redis field '{}' is {} — analysis \"{}\" {}",
+                f.field,
+                if nostem { "NOSTEM" } else { "stemmed" },
+                profile.analysis.as_str(),
+                if profile.stems() {
+                    "stems (Snowball English)"
+                } else {
+                    "needs NOSTEM"
+                }
+            ));
+        }
+    }
+    if profile.analysis == Analysis::Parity {
+        // Only the searched fields may be TEXT: BM25STD's document length and
+        // term frequency span every TEXT field of the index.
+        for a in attributes {
+            let name = a["attribute"].as_str().unwrap_or_default();
+            if a["type"].as_str() == Some("TEXT") && !profile.text_fields.contains(name) {
+                return Err(format!(
+                    "fulltext: parity index has TEXT field '{name}' that is not searched — \
+                     only {:?} may be indexed as text",
+                    profile.text_fields
                 ));
             }
         }
@@ -797,6 +1120,48 @@ pub fn validate_opensearch_index(
     fields: &[FieldBoost],
     allow_multi_shard: bool,
 ) -> Result<u64, String> {
+    validate_opensearch_index_for(
+        properties,
+        index,
+        fields,
+        allow_multi_shard,
+        &IndexProfile::english(),
+        &Value::Null,
+        &[],
+    )
+}
+
+/// [`validate_opensearch_index`] for an [`IndexProfile`]: the mode's analyzer
+/// and filters, `meta` (`mappings._meta.vdbb_fulltext`, `Null` when absent)
+/// equal to the profile's marker, and in parity no other `text` field indexed.
+pub fn validate_opensearch_index_for(
+    properties: &Value,
+    index: &Value,
+    fields: &[FieldBoost],
+    allow_multi_shard: bool,
+    profile: &IndexProfile,
+    meta: &Value,
+    schema_text_fields: &[String],
+) -> Result<u64, String> {
+    profile.check_marker(meta)?;
+    let analyzer_name = opensearch_analyzer_name(profile.analysis);
+    if profile.analysis == Analysis::Parity {
+        // The schema's text fields the tool maps: only the searched ones may
+        // be indexed. A payload key outside the schema that OpenSearch maps
+        // dynamically cannot change the searched fields' scores (Lucene keeps
+        // per-field statistics), so it is not this check's concern.
+        for name in schema_text_fields {
+            let m = &properties[name.as_str()];
+            let indexed = !(m["index"] == false || m["index"] == "false");
+            if m["type"] == "text" && indexed && !profile.text_fields.contains(name) {
+                return Err(format!(
+                    "fulltext: parity index has indexed text field '{name}' that is not \
+                     searched — only {:?} may be indexed as text",
+                    profile.text_fields
+                ));
+            }
+        }
+    }
     for f in fields {
         let m = &properties[&f.field];
         if m.is_null() {
@@ -812,12 +1177,12 @@ pub fn validate_opensearch_index(
                 f.field, m["type"]
             ));
         }
-        if m["analyzer"] != OPENSEARCH_ANALYZER
-            || !(m["search_analyzer"].is_null() || m["search_analyzer"] == OPENSEARCH_ANALYZER)
+        if m["analyzer"] != analyzer_name
+            || !(m["search_analyzer"].is_null() || m["search_analyzer"] == analyzer_name)
         {
             return Err(format!(
                 "fulltext: OpenSearch field '{}' is analyzed by {} / search {} — expected the \
-                 pinned {OPENSEARCH_ANALYZER}",
+                 pinned {analyzer_name}",
                 f.field, m["analyzer"], m["search_analyzer"]
             ));
         }
@@ -872,10 +1237,10 @@ pub fn validate_opensearch_index(
              `fulltext.allow_multi_shard: true` (the shard count is recorded either way)"
         ));
     }
-    let want = opensearch_analysis();
+    let want = opensearch_analysis_for(profile.analysis);
     let got = &index["analysis"];
-    let analyzer = &got["analyzer"][OPENSEARCH_ANALYZER];
-    let a_want = &want["analyzer"][OPENSEARCH_ANALYZER];
+    let analyzer = &got["analyzer"][analyzer_name];
+    let a_want = &want["analyzer"][analyzer_name];
     let no_char_filter = match &analyzer["char_filter"] {
         Value::Null => true,
         Value::Array(a) => a.is_empty(),
@@ -886,10 +1251,15 @@ pub fn validate_opensearch_index(
         || !no_char_filter
     {
         return Err(format!(
-            "fulltext: OpenSearch analyzer {OPENSEARCH_ANALYZER} is {analyzer} — expected {a_want}"
+            "fulltext: OpenSearch analyzer {analyzer_name} is {analyzer} — expected {a_want}"
         ));
     }
-    for name in [OS_POSSESSIVE, OS_STEMMER] {
+    let checked: &[&str] = if profile.stems() {
+        &[OS_POSSESSIVE, OS_STEMMER]
+    } else {
+        &[OS_POSSESSIVE]
+    };
+    for &name in checked {
         let (g, w) = (&got["filter"][name], &want["filter"][name]);
         if g["type"] != w["type"] || g["language"] != w["language"] {
             return Err(format!(
@@ -1111,6 +1481,77 @@ fn engine_settings(engine: &str) -> Result<Value, String> {
 /// The `fulltext` block of a result JSON: everything that defines what was
 /// measured, so two results can be checked for comparability.
 pub fn result_metadata(
+    engine: &str,
+    fields: &[FieldBoost],
+    set: &QuerySet,
+    top: usize,
+) -> Result<Value, String> {
+    result_metadata_for(engine, fields, set, top, &IndexProfile::english())
+}
+
+/// The differences that remain in `analysis` mode. Parity removes the newline
+/// tokenization one (normalized at upload) and the stemming one (no stemming
+/// on either engine); whole-document statistics remain but span exactly the
+/// searched fields.
+pub fn known_differences(analysis: Analysis) -> Vec<&'static str> {
+    match analysis {
+        Analysis::English => KNOWN_DIFFERENCES.to_vec(),
+        Analysis::Parity => vec![
+            KNOWN_DIFFERENCES[1],
+            KNOWN_DIFFERENCES[3],
+            KNOWN_DIFFERENCES[4],
+            KNOWN_DIFFERENCES[5],
+        ],
+    }
+}
+
+/// [`result_metadata`] for an [`IndexProfile`]: records the analysis mode,
+/// whether the uploaded text was normalized and which text fields are indexed.
+pub fn result_metadata_for(
+    engine: &str,
+    fields: &[FieldBoost],
+    set: &QuerySet,
+    top: usize,
+    profile: &IndexProfile,
+) -> Result<Value, String> {
+    let mut m = result_metadata_english(engine, fields, set, top)?;
+    m["analysis"] = json!(profile.analysis.as_str());
+    m["normalize_newlines"] = json!(profile.normalizes_newlines());
+    m["index_marker"] = profile.marker();
+    m["known_differences"] = json!(known_differences(profile.analysis));
+    if profile.analysis == Analysis::Parity {
+        m["stemmer"] = json!("none on either engine (parity)");
+        m["indexed_text_fields"] = json!(profile.text_fields);
+        m["normalization"] = json!(
+            "'\\r\\n', '\\n' and '\\r' replaced by a space in the indexed text fields at \
+             upload, on both engines; recorded in the index and verified on reuse"
+        );
+        let settings = &mut m["engine_settings"];
+        match engine {
+            "redis" => {
+                settings["index"]["stemmer"] =
+                    json!("none: NOSTEM on the indexed text fields (verified via FT.INFO)");
+                settings["index"]["field_type"] =
+                    json!("TEXT NOSTEM, index WEIGHT 1, only the searched fields (verified)");
+                settings["command"] = json!(
+                    "FT.SEARCH <idx> <query> NOCONTENT VERBATIM WITHSCORES SCORER BM25STD \
+                     LIMIT 0 <top> DIALECT 2 TIMEOUT <ms>"
+                );
+            }
+            _ => {
+                settings["index"]["analyzer"] = json!(OPENSEARCH_PARITY_ANALYZER);
+                settings["index"]["analysis"] = opensearch_analysis_for(Analysis::Parity);
+                settings["index"]["note"] = json!(
+                    "the english pipeline without the porter2 filter; text fields that are not \
+                     searched are mapped with index: false"
+                );
+            }
+        }
+    }
+    Ok(m)
+}
+
+fn result_metadata_english(
     engine: &str,
     fields: &[FieldBoost],
     set: &QuerySet,
@@ -1486,6 +1927,342 @@ mod tests {
             config_get_value(&json!({"other": "4"}), "search-min-stem-len"),
             None
         );
+    }
+
+    fn parity_block(fields: Value) -> Value {
+        json!({"analysis": "parity", "fields": fields})
+    }
+
+    #[test]
+    fn index_profile_resolves_one_mode_per_engine_config() {
+        use Workload::*;
+        let ft = |b: &Value| (Fulltext, Some(b.clone()));
+        let eng = json!({"fields": {"title": 1.0}});
+        let par = parity_block(json!({"segment": 1.0, "headings": 2.0}));
+        let profile = |cfgs: Vec<(Workload, Option<Value>)>| {
+            index_profile(cfgs.iter().map(|(w, b)| (*w, b.as_ref())))
+        };
+        // No fulltext config: no profile.
+        assert_eq!(profile(vec![(Vector, None)]).unwrap(), None);
+        // English (default), alone or with vector configs.
+        let p = profile(vec![(Vector, None), ft(&eng), (Fulltext, None)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(p, IndexProfile::english());
+        assert!(p.stems() && !p.normalizes_newlines() && p.indexes_text_field("anything"));
+        // Parity: exactly the searched fields, same set across configs (boosts may differ).
+        let par2 = parity_block(json!({"segment": 5.0, "headings": 1.0}));
+        let p = profile(vec![ft(&par), ft(&par2)]).unwrap().unwrap();
+        assert_eq!(p.analysis, Analysis::Parity);
+        assert!(!p.stems() && p.normalizes_newlines());
+        assert!(p.indexes_text_field("segment") && !p.indexes_text_field("title"));
+        assert_eq!(
+            p.marker(),
+            json!({"analysis":"parity","normalize_newlines":true,"text_fields":["headings","segment"]})
+        );
+        // Refusals.
+        let e = profile(vec![ft(&eng), ft(&par)]).unwrap_err();
+        assert!(e.contains("mixes fulltext analysis"), "{e}");
+        let e = profile(vec![ft(&parity_block(json!({"segment": 1.0}))), ft(&par)]).unwrap_err();
+        assert!(e.contains("different field sets"), "{e}");
+        let e = profile(vec![ft(&json!({"analysis": "parity"}))]).unwrap_err();
+        assert!(e.contains("needs explicit"), "{e}");
+        for other in [Vector, Hybrid, FilterOnly] {
+            let e = profile(vec![(other, None), ft(&par)]).unwrap_err();
+            assert!(
+                e.contains("must never apply to other workloads"),
+                "{other}: {e}"
+            );
+        }
+        assert!(parse_spec(Some(&json!({"analysis": "porter"}))).is_err());
+    }
+
+    #[test]
+    fn newline_normalization_touches_only_the_indexed_text_fields() {
+        use crate::readers::metadata::{MetadataItem, MetadataValue};
+        assert_eq!(normalize_newlines("a\r\nb\nc\rd"), "a b c d");
+        assert_eq!(normalize_newlines("plain"), "plain");
+        let item = |h: &str, t: &str| {
+            Some(MetadataItem {
+                fields: vec![
+                    ("headings".into(), MetadataValue::String(h.into())),
+                    ("title".into(), MetadataValue::String(t.into())),
+                    ("n".into(), MetadataValue::Int(1)),
+                ],
+            })
+        };
+        let mut items = vec![item("a\nb", "x\ny"), None, item("c", "z")];
+        let fields: BTreeSet<String> = ["headings".to_string()].into();
+        assert_eq!(normalize_metadata(&mut items, &fields), 1);
+        let text = |i: usize, k: usize| match &items[i].as_ref().unwrap().fields[k].1 {
+            MetadataValue::String(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(text(0, 0), "a b");
+        assert_eq!(
+            text(0, 1),
+            "x\ny",
+            "a field that is not indexed is left as uploaded"
+        );
+        assert_eq!(text(2, 0), "c");
+    }
+
+    #[test]
+    fn markers_must_match_the_mode() {
+        let eng = IndexProfile::english();
+        let par = index_profile([(
+            Workload::Fulltext,
+            Some(&parity_block(json!({"segment": 1}))),
+        )])
+        .unwrap()
+        .unwrap();
+        // English accepts no marker (older or vector-built indexes) or its own.
+        assert!(eng.check_marker(&Value::Null).is_ok());
+        assert!(eng.check_marker(&eng.marker()).is_ok());
+        assert!(eng.check_marker(&par.marker()).is_err());
+        // Parity needs its own marker: an unnormalized upload is refused.
+        assert!(par.check_marker(&par.marker()).is_ok());
+        let e = par.check_marker(&Value::Null).unwrap_err();
+        assert!(e.contains("without newline normalization"), "{e}");
+        assert!(par.check_marker(&eng.marker()).is_err());
+        let mut other = par.marker();
+        other["text_fields"] = json!(["headings", "segment"]);
+        assert!(par.check_marker(&other).is_err());
+    }
+
+    #[test]
+    fn parity_requests_and_analyzers() {
+        let a = redis_args_for("idx", "q", 5, 100, Analysis::Parity);
+        assert_eq!(a[..4], ["idx", "q", "NOCONTENT", "VERBATIM"]);
+        assert!(!redis_args_for("idx", "q", 5, 100, Analysis::English)
+            .contains(&"VERBATIM".to_string()));
+        assert_eq!(
+            redis_args_for("idx", "q", 5, 100, Analysis::English),
+            redis_args("idx", "q", 5, 100)
+        );
+        let an = opensearch_analysis_for(Analysis::Parity);
+        assert_eq!(
+            an["analyzer"][OPENSEARCH_PARITY_ANALYZER]["filter"],
+            json!([OS_POSSESSIVE, "lowercase", OS_STOP])
+        );
+        assert!(an["filter"][OS_STEMMER].is_null());
+        assert_eq!(
+            an["filter"][OS_STOP],
+            opensearch_analysis()["filter"][OS_STOP]
+        );
+        assert_eq!(
+            opensearch_analysis_for(Analysis::English),
+            opensearch_analysis()
+        );
+        let par = index_profile([(
+            Workload::Fulltext,
+            Some(&parity_block(json!({"segment": 1}))),
+        )])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            opensearch_text_mapping_for(&par, "segment")["analyzer"],
+            OPENSEARCH_PARITY_ANALYZER
+        );
+        assert_eq!(
+            opensearch_text_mapping_for(&par, "title"),
+            json!({"type":"text","index":false})
+        );
+        assert_eq!(
+            opensearch_text_mapping_for(&IndexProfile::english(), "title"),
+            opensearch_text_mapping()
+        );
+    }
+
+    #[test]
+    fn parity_redis_index_is_nostem_searched_fields_only_and_marked() {
+        let par = index_profile([(
+            Workload::Fulltext,
+            Some(&parity_block(json!({"segment": 1, "title": 1}))),
+        )])
+        .unwrap()
+        .unwrap();
+        let fields = [fb("segment", 1.0), fb("title", 1.0)];
+        let nostem = |n: &str| json!({"identifier":n,"attribute":n,"type":"TEXT","WEIGHT":"1","flags":["SORTABLE","NOSTEM"]});
+        let info = |attrs: Value| redis_info(Some(STOPWORDS.to_vec()), attrs);
+        let good = json!([nostem("segment"), nostem("title")]);
+        assert!(
+            validate_redis_index_for(&info(good.clone()), &fields, &par, &par.marker()).is_ok()
+        );
+        // Stemmed field (an english-built index) refused in parity...
+        let stemmed = json!([text_attr("segment"), nostem("title")]);
+        let e = validate_redis_index_for(&info(stemmed), &fields, &par, &par.marker()).unwrap_err();
+        assert!(e.contains("needs NOSTEM"), "{e}");
+        // ...and a NOSTEM field refused in english.
+        let e = validate_redis_index_for(
+            &info(good.clone()),
+            &fields,
+            &IndexProfile::english(),
+            &Value::Null,
+        )
+        .unwrap_err();
+        assert!(e.contains("NOSTEM"), "{e}");
+        // An extra TEXT field (not searched) refused in parity.
+        let extra = json!([nostem("segment"), nostem("title"), text_attr("headings")]);
+        let e = validate_redis_index_for(&info(extra), &fields, &par, &par.marker()).unwrap_err();
+        assert!(e.contains("'headings'"), "{e}");
+        // Marker: absent or english = unnormalized upload, refused in parity.
+        assert!(
+            validate_redis_index_for(&info(good.clone()), &fields, &par, &Value::Null).is_err()
+        );
+        assert!(validate_redis_index_for(
+            &info(good),
+            &fields,
+            &par,
+            &IndexProfile::english().marker()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parity_opensearch_index_is_nostem_searched_fields_only_and_marked() {
+        let par = index_profile([(
+            Workload::Fulltext,
+            Some(&parity_block(json!({"segment": 1}))),
+        )])
+        .unwrap()
+        .unwrap();
+        let fields = [fb("segment", 1.0)];
+        let schema_text = vec!["segment".to_string(), "title".to_string()];
+        let props = json!({
+            "segment": opensearch_text_mapping_for(&par, "segment"),
+            "title": opensearch_text_mapping_for(&par, "title"),
+            "docid": {"type": "keyword"},
+        });
+        let index =
+            json!({"number_of_shards":"1","analysis": opensearch_analysis_for(Analysis::Parity)});
+        let check = |p: &Value, i: &Value, m: &Value| {
+            validate_opensearch_index_for(p, i, &fields, false, &par, m, &schema_text)
+        };
+        // A payload key outside the schema, dynamically mapped as text, does not
+        // count (per-field statistics) — the 100K corpus's derived fields hit this.
+        let mut p = props.clone();
+        p["category"] = json!({"type": "text", "fields": {"keyword": {"type": "keyword"}}});
+        assert_eq!(check(&p, &index, &par.marker()), Ok(1));
+        assert_eq!(check(&props, &index, &par.marker()), Ok(1));
+        // Marker missing (unnormalized upload) or english.
+        assert!(check(&props, &index, &Value::Null).is_err());
+        assert!(check(&props, &index, &IndexProfile::english().marker()).is_err());
+        // English analysis (porter2) refused in parity.
+        let mut p = props.clone();
+        p["segment"] = opensearch_text_mapping();
+        assert!(check(&p, &index, &par.marker()).is_err());
+        let mut i = index.clone();
+        i["analysis"]["analyzer"][OPENSEARCH_PARITY_ANALYZER]["filter"] =
+            json!([OS_POSSESSIVE, "lowercase", OS_STOP, OS_STEMMER]);
+        assert!(check(&props, &i, &par.marker()).is_err());
+        // A non-searched text field that is indexed.
+        let mut p = props.clone();
+        p["title"] = json!({"type":"text","index":true,"analyzer":OPENSEARCH_PARITY_ANALYZER});
+        assert!(check(&p, &index, &par.marker())
+            .unwrap_err()
+            .contains("'title'"));
+        // And the parity index reused in english mode.
+        assert!(validate_opensearch_index_for(
+            &props,
+            &index,
+            &fields,
+            false,
+            &IndexProfile::english(),
+            &par.marker(),
+            &schema_text
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parity_metadata_records_the_mode_and_drops_removed_differences() {
+        let set = build_query_set(&["apple".into()]).unwrap();
+        let par = index_profile([(
+            Workload::Fulltext,
+            Some(&parity_block(json!({"segment": 1}))),
+        )])
+        .unwrap()
+        .unwrap();
+        for engine in ["redis", "opensearch"] {
+            let m = result_metadata_for(engine, &[fb("segment", 1.0)], &set, 10, &par).unwrap();
+            assert_eq!(m["analysis"], "parity");
+            assert_eq!(m["normalize_newlines"], true);
+            assert_eq!(m["indexed_text_fields"], json!(["segment"]));
+            assert_eq!(m["index_marker"], par.marker());
+            let kd = m["known_differences"].as_array().unwrap();
+            assert_eq!(kd.len(), 4);
+            assert!(!kd
+                .iter()
+                .any(|d| d.as_str().unwrap().contains("newline or carriage")));
+            assert!(!kd
+                .iter()
+                .any(|d| d.as_str().unwrap().starts_with("stemming")));
+            let e = result_metadata_for(
+                engine,
+                &[fb("segment", 1.0)],
+                &set,
+                10,
+                &IndexProfile::english(),
+            )
+            .unwrap();
+            assert_eq!(e["analysis"], "english");
+            assert_eq!(e["normalize_newlines"], false);
+            assert_eq!(
+                e["known_differences"].as_array().unwrap().len(),
+                KNOWN_DIFFERENCES.len()
+            );
+        }
+        let r = result_metadata_for("redis", &[fb("segment", 1.0)], &set, 10, &par).unwrap();
+        assert!(r["engine_settings"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("VERBATIM"));
+        let o = result_metadata_for("opensearch", &[fb("segment", 1.0)], &set, 10, &par).unwrap();
+        assert_eq!(
+            o["engine_settings"]["index"]["analyzer"],
+            OPENSEARCH_PARITY_ANALYZER
+        );
+    }
+
+    /// The shipped MS MARCO fulltext configs resolve to the mode their name
+    /// says: `*-english` to the headline english profile, `*-parity` to parity
+    /// over exactly the searched fields, so the two run side by side.
+    #[test]
+    fn shipped_msmarco_fulltext_configs_resolve_to_their_mode() {
+        for file in [
+            "redis-msmarco-fulltext.json",
+            "opensearch-msmarco-fulltext.json",
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("experiments/configurations")
+                .join(file);
+            let configs: Vec<Value> =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let mut modes = Vec::new();
+            for c in &configs {
+                let name = c["name"].as_str().unwrap();
+                let sps = c["search_params"].as_array().unwrap();
+                let profile = index_profile(sps.iter().map(|sp| {
+                    let w: Workload = serde_json::from_value(sp["workload"].clone()).unwrap();
+                    (w, sp.get(SPEC_KEY))
+                }))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{file} [{name}] has no fulltext config"));
+                let want = if name.ends_with("-parity") {
+                    Analysis::Parity
+                } else {
+                    assert!(name.ends_with("-english"), "{name}");
+                    Analysis::English
+                };
+                assert_eq!(profile.analysis, want, "{file} [{name}]");
+                if want == Analysis::Parity {
+                    assert_eq!(profile.text_fields, BTreeSet::from(["segment".to_string()]));
+                }
+                modes.push(want);
+            }
+            assert_eq!(modes, [Analysis::English, Analysis::Parity], "{file}");
+        }
     }
 
     #[test]

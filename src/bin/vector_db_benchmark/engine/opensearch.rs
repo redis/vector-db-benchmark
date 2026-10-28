@@ -297,11 +297,11 @@ impl OpenSearchEngine {
 
         let mut index_settings = build_index_settings(self.config.number_of_shards);
         // #339: a config that runs the fulltext workload analyzes its text
-        // fields with the pinned english/porter2 analyzer (see
+        // fields with the pinned analyzer of its analysis mode (see
         // `vector_db_benchmark::fulltext`); otherwise they keep `standard`.
-        if self.serves_fulltext() {
-            self.pin_fulltext_analyzer(dataset, &mut properties, &mut index_settings);
-        }
+        let fulltext_meta = self
+            .fulltext_profile()?
+            .map(|p| self.pin_fulltext_analyzer(dataset, &p, &mut properties, &mut index_settings));
         if self.config.skip_vector_index {
             vector_db_benchmark::filter_only::disable_vector_index(
                 &mut properties,
@@ -309,12 +309,15 @@ impl OpenSearchEngine {
             );
         }
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "settings": { "index": index_settings },
             "mappings": {
                 "properties": properties,
             }
         });
+        if let Some(meta) = fulltext_meta {
+            body["mappings"]["_meta"] = meta;
+        }
 
         // Same transient-state problem as delete_index: a cluster whose manager
         // thread pool is busy answers create-index with
@@ -2296,7 +2299,10 @@ impl Engine for OpenSearchEngine {
         let dataset_path = dataset.get_path()?;
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
-        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        let (ids, vectors, mut metadata) = dataset.read_vectors(normalize)?;
+        // #339 parity: normalize newlines in the indexed text fields before
+        // anything is sent (recorded in the index `_meta` by configure()).
+        self.normalize_fulltext_upload(&mut metadata)?;
         if self.config.skip_vector_index {
             vector_db_benchmark::filter_only::domain::validate_metadata(
                 &metadata,
@@ -3192,6 +3198,10 @@ mod tests {
             // default. Deliberately NOT the ES constant: this file exists to
             // measure the other shard count, not to pair with Elasticsearch.
             ("opensearch-5-shard.json", (5_i64, 7)),
+            // #339: the fulltext arm refuses more than one shard (Lucene BM25
+            // statistics are per shard) unless a config opts in; these
+            // english/parity configs compare against Redis on one shard.
+            ("opensearch-msmarco-fulltext.json", (1_i64, 2)),
         ]);
 
         let dir = crate::config::project_root().join("experiments/configurations");

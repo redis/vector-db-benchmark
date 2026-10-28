@@ -1762,3 +1762,108 @@ fn test_binary_opensearch_fulltext_refuses_unpinned_or_incomplete_index() {
         .send();
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #339 follow-up: `analysis: parity` end to end on OpenSearch — the nostem
+/// analyzer, newline normalization at upload (verified on `_source`), only
+/// the searched fields indexed, and refusal of an index uploaded in the other
+/// mode when reused through `--skip-upload`, in both directions.
+#[test]
+fn test_binary_opensearch_fulltext_parity() {
+    wait_for_opensearch();
+    let name = "os-bm25-parity";
+    let index = "bench_bm25_parity";
+    let write_config = |root: &std::path::Path, search_params: serde_json::Value| {
+        std::fs::write(
+            root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "opensearch",
+                "collection_params": {"number_of_shards": 1},
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let proj = common::write_bm25_project("[]");
+    write_config(&proj.root, common::bm25_parity_search_params());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let envs = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", index),
+    ];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        name,
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &envs,
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data"
+        ]
+    ));
+    common::assert_bm25_parity_run(&proj.root, &dump, "opensearch", name);
+    let hit: serde_json::Value = os_client()
+        .post(format!("{}/{index}/_search", os_base_url()))
+        .json(&serde_json::json!({"query": {"term": {"docid": "d4"}}}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        hit["hits"]["hits"][0]["_source"]["headings"], "alpha beta",
+        "{hit}"
+    );
+    let run = |extra: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            "http://127.0.0.1",
+            &envs,
+            extra,
+        )
+    };
+    let refused = |out: std::process::Output, needle: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must refuse: {stderr}");
+        assert!(stderr.contains(needle), "expected {needle:?} in: {stderr}");
+    };
+    let english = serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"headings": 1.0, "segment": 1.0}}}]);
+    write_config(&proj.root, english);
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "the index records analysis",
+    );
+    common::clear_result_files(&proj.root);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    write_config(&proj.root, common::bm25_parity_search_params());
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "without newline normalization",
+    );
+    // A schema text field that is indexed but not searched is refused in
+    // parity. Build the parity index while the schema does not declare
+    // `title` (OpenSearch then maps the payload key dynamically, as indexed
+    // text), then reuse it once the schema declares `title` as text.
+    let registry_path = proj.root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["schema"]
+        .as_object_mut()
+        .unwrap()
+        .remove("title");
+    std::fs::write(&registry_path, registry.to_string()).unwrap();
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    common::write_bm25_registry(&proj.root, false);
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "indexed text field 'title' that is not searched",
+    );
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
