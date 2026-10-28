@@ -318,7 +318,7 @@ fn operand(field: &str, v: &Value) -> Result<Operand, String> {
         return Ok(Operand::Keyword(s.to_string()));
     }
     match v.as_i64() {
-        Some(n) if n.abs() <= MAX_EXACT_INTEGER => Ok(Operand::Int(n)),
+        Some(n) if n.unsigned_abs() <= MAX_EXACT_INTEGER as u64 => Ok(Operand::Int(n)),
         _ => Err(format!(
             "{field}: match operands must be strings or integers within +/-2^53, got {v}"
         )),
@@ -494,7 +494,7 @@ impl Predicate {
                         Ok(hit)
                     }
                     (Leaf::Range { gt, gte, lt, lte }, FieldValue::Int(n)) => {
-                        if n.abs() > MAX_EXACT_INTEGER {
+                        if n.unsigned_abs() > MAX_EXACT_INTEGER as u64 {
                             return Err(format!("{field}: value {n} is outside +/-2^53"));
                         }
                         let x = n as f64;
@@ -1372,6 +1372,26 @@ mod tests {
         assert_eq!(ids.len() as u64, count_matches(c.rows(), &p).unwrap());
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
         assert!(ids.iter().all(|i| c.rows()[*i as usize].category == 2));
+    }
+
+    /// `i64::MIN.abs()` wraps back to `i64::MIN` in release builds, where CI
+    /// runs, so an `abs()`-based bound check would accept it. Both the operand
+    /// check and the field-value check must refuse it.
+    #[test]
+    fn i64_min_is_outside_the_exact_domain() {
+        let e = Predicate::compile(&json!({"and":[{"tier":{"match":{"value":i64::MIN}}}]}))
+            .unwrap_err();
+        assert!(e.contains("2^53"), "{e}");
+        let ok = MAX_EXACT_INTEGER;
+        Predicate::compile(&json!({"and":[{"tier":{"match":{"value":-ok}}}]})).unwrap();
+        Predicate::compile(&json!({"and":[{"tier":{"match":{"value":-ok - 1}}}]})).unwrap_err();
+
+        let p = Predicate::compile(&json!({"and":[{"n":{"range":{"lte":0}}}]})).unwrap();
+        let mut m = Map::new();
+        m.insert("n".into(), json!(i64::MIN));
+        assert!(p.matches(&m).is_err());
+        m.insert("n".into(), json!(-ok));
+        assert!(p.matches(&m).unwrap());
     }
 
     fn prepared_dir(fq: bool, payload: &Value) -> tempfile::TempDir {
