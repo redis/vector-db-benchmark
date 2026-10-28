@@ -4668,3 +4668,54 @@ fn test_binary_redis_dump_results_declared_filter_only() {
     assert_eq!(counts["complete_page_set_agreement"], 1.0);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #343 review: `--target-qps` + `--dump-results`. An open-loop request that is
+/// dropped for lateness is never dispatched: it gets no record and is excluded
+/// from `requested_queries`, so the capture check (records == requested) holds
+/// with drops present, and records + drops account for every offered request.
+/// `--max-lateness-ms 0` at a rate one client cannot sustain forces drops.
+#[test]
+fn test_binary_redis_dump_results_open_loop_with_dropped_requests() {
+    wait_for_redis();
+    let configs = serde_json::json!([{
+        "name": "redis-dump-ol", "engine": "redis",
+        "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dump-ol-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-dump-ol",
+        "dump-ol-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--target-qps",
+            "50000",
+            "--search-duration",
+            "1",
+            "--max-lateness-ms",
+            "0",
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+        ]
+    ));
+    let results = common::read_results_obj(&proj.root, "redis-dump-ol");
+    let requested = results["requested_queries"].as_u64().unwrap();
+    let dropped = results["dropped_queries"].as_u64().unwrap();
+    let offered = results["offered_queries"].as_u64().unwrap();
+    assert!(
+        dropped > 0,
+        "the fixture must force open-loop drops: {results}"
+    );
+    let dumps = common::read_dumps(&dump);
+    assert_eq!(dumps.len(), 1);
+    let records = dumps[0].records.len() as u64;
+    assert_eq!(records, requested, "one record per dispatched request");
+    assert_eq!(records + dropped, offered, "records + drops = offered");
+    fs::remove_dir_all(&proj.root).ok();
+}

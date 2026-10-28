@@ -4599,6 +4599,12 @@ mod filter_only_serialization_tests {
                         returned_documents_sum: 6,
                         retried_queries: 0,
                     }),
+                    // What `engine::search_workload` stamps on every result.
+                    workload: Some(if scalar {
+                        vector_db_benchmark::workload::Workload::FilterOnly
+                    } else {
+                        vector_db_benchmark::workload::Workload::Vector
+                    }),
                     ..Default::default()
                 };
                 let doc = build_search_result_json(
@@ -4661,7 +4667,8 @@ mod filter_only_serialization_tests {
                     );
                     assert!(doc["metrics_schema"].get("ground_truth").is_none());
                 } else {
-                    assert!(doc["params"].get("workload").is_none());
+                    // #344: the dispatched workload is recorded on every result.
+                    assert_eq!(doc["params"]["workload"], "vector");
                     assert_eq!(result["mean_recall"], 0.5);
                 }
             }
