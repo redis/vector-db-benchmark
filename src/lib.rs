@@ -14,6 +14,7 @@
 pub mod compare_results;
 pub mod config;
 pub mod filter_only;
+pub mod fulltext;
 pub mod metrics;
 pub mod msmarco;
 pub mod opensearch_maintenance;

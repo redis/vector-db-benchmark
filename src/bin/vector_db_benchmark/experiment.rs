@@ -237,6 +237,46 @@ pub fn run(args: &Args) -> Result<(), String> {
             vector_db_benchmark::workload::check_capture(&plan)
                 .map_err(|e| format!("config '{name}': {e}"))?;
         }
+        // #339: a `fulltext` block only on a fulltext search config, and well-formed.
+        for (i, sp) in config.search_params.iter().flatten().enumerate() {
+            vector_db_benchmark::fulltext::validate_declared(
+                &plan.engine_type,
+                plan.workload(i)?,
+                sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
+            )
+            .map_err(|e| format!("config '{name}', search config #{i}: {e}"))?;
+        }
+        // #339 parity: the index profile all fulltext search configs share
+        // (analysis mode, indexed text fields) must be resolvable, and parity
+        // never shares an engine config with another workload.
+        let profile_inputs = config
+            .search_params
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, sp)| {
+                Ok((
+                    plan.workload(i)?,
+                    sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let profile = vector_db_benchmark::fulltext::index_profile(profile_inputs)
+            .map_err(|e| format!("config '{name}': {e}"))?;
+        // Before any download: a fulltext profile on a Redis shared corpus
+        // (parity, or a prefix overlapping the marker keys); the engine
+        // re-checks it at configure.
+        vector_db_benchmark::fulltext::check_redis_shared_prefix(
+            &plan.engine_type,
+            profile.as_ref(),
+            vector_db_benchmark::fulltext::resolve_shared_prefix(
+                crate::effective_config::env_var("REDIS_KEY_PREFIX")
+                    .ok()
+                    .as_deref(),
+            )
+            .as_deref(),
+        )
+        .map_err(|e| format!("config '{name}': {e}"))?;
         if args.target_qps > 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {
             return Err(format!(
                 "--target-qps currently supports search-only vector benchmarks; config \
@@ -1253,6 +1293,34 @@ fn run_single_experiment(
             println!("Skipping (results exist): {}", glob_pattern);
             return Ok(());
         }
+    }
+
+    // #339: checked before anything touches the server (no configure/upload):
+    // every fulltext search config's fields resolve against this dataset's
+    // schema, and a fulltext search config — which pins the text analyzer for
+    // the whole index — does not share one with vector/hybrid configs whose
+    // dataset filters on a text field.
+    vector_db_benchmark::fulltext::check_fields_before_connecting(
+        engine
+            .search_params()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| plan.workload(*i).ok() == Some(Workload::Fulltext))
+            .map(|(i, sp)| (i, sp.knob(vector_db_benchmark::fulltext::SPEC_KEY))),
+        dataset.config.schema.as_ref(),
+        &dataset.config.name,
+    )?;
+    if vector_db_benchmark::fulltext::mixes_with_filtered_workloads(&plan.workloads) {
+        let text_fields =
+            vector_db_benchmark::fulltext::schema_text_fields(dataset.config.schema.as_ref());
+        vector_db_benchmark::fulltext::check_mixed_text_filters(
+            &plan.workloads,
+            vector_db_benchmark::fulltext::count_text_field_queries(
+                &dataset.get_path()?,
+                &text_fields,
+            )?,
+            &dataset.config.name,
+        )?;
     }
 
     // Snapshot server metadata BEFORE any upload/search so results are
@@ -2697,6 +2765,34 @@ fn build_search_result_json(
         }
     }
 
+    // #339: what a fulltext run measured (analyzers, boosts, skipped queries).
+    // There is no ground truth: quality is scored against a reference engine
+    // by `compare-results`, so the vector-quality keys are not published.
+    if let Some(meta) = &results.fulltext {
+        result["params"]["workload"] = serde_json::json!("fulltext");
+        result["params"]["fulltext"] = meta.clone();
+        result["metrics_schema"] = serde_json::json!({
+            "version": 2, "workload": "fulltext", "vector_quality": "not applicable",
+            "result_order": "ranked by engine score (descending)",
+            "returned_fields": "IDs and engine-native BM25 scores (not comparable across engines)",
+            "quality": "overlap@k / Jaccard@k / rank correlation against a reference engine via compare-results",
+            "latency": "OpenSearch excludes retry/backoff (as on its vector path); Redis uses one attempt; connection setup and priming excluded"
+        });
+        for key in [
+            "mean_precision_at_returned",
+            "mean_recall",
+            "recall_p10",
+            "mean_mrr",
+            "mean_ndcg",
+            "precision_at_returned_dist",
+            "recall_dist",
+            "mrr_dist",
+            "ndcg_dist",
+        ] {
+            result["results"].as_object_mut().unwrap().remove(key);
+        }
+    }
+
     // How the swept parameter was chosen, and — crucially — whether the target
     // was actually reached. A calibration that converged on the maximum value
     // without reaching its target is not a calibration.
@@ -2740,7 +2836,7 @@ fn build_search_result_json(
         let results_obj = result["results"].as_object_mut().unwrap();
         // `precisions` is another upstream key name carrying upstream's per-query
         // recall@top values, so our array ships under an unambiguous name too.
-        if results.filter_only.is_none() {
+        if results.filter_only.is_none() && results.fulltext.is_none() {
             results_obj.insert(
                 "precisions_at_returned".to_string(),
                 json!(results.precisions_at_returned),

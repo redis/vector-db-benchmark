@@ -214,6 +214,10 @@ pub struct SearchResults {
     /// share one and still be reading materially different things, so the
     /// artifact carries the mechanism rather than only the grade.
     pub update_attribution_detail: Option<String>,
+    /// #339: the fulltext workload's `vector_db_benchmark::fulltext::result_metadata`
+    /// block (analyzers, boosts, query set). Its presence is the fulltext
+    /// fingerprint checked by [`search_workload`].
+    pub fulltext: Option<serde_json::Value>,
     /// The workload that produced this result. Set only by [`search_workload`],
     /// the single dispatch point, after the result passed its shape check.
     pub workload: Option<Workload>,
@@ -862,6 +866,8 @@ pub fn search_workload(
         results.mean_precision_at_returned == -1.0,
     )
     .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    vector_db_benchmark::workload::verify_fulltext_shape(workload, results.fulltext.is_some())
+        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
     if params.capture_query_results {
         let records = results.query_records.as_ref().ok_or_else(|| {
             format!(
@@ -1513,5 +1519,85 @@ mod dispatch_tests {
             };
             assert!(run(&mut f, engine_type, Workload::Vector, false).is_err());
         }
+    }
+}
+
+/// #339: the dispatch point checks the fulltext fingerprint both ways.
+#[cfg(test)]
+mod fulltext_dispatch_tests {
+    use super::*;
+
+    struct TextFake {
+        fulltext_meta: bool,
+    }
+
+    impl Engine for TextFake {
+        fn name(&self) -> &str {
+            "text-fake"
+        }
+        fn configure(&mut self, _: &Dataset) -> Result<(), String> {
+            Ok(())
+        }
+        fn upload(&mut self, _: &Dataset) -> Result<UploadStats, String> {
+            Ok(UploadStats::default())
+        }
+        fn search(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            Ok(SearchResults {
+                fulltext: self.fulltext_meta.then(|| serde_json::json!({})),
+                ..Default::default()
+            })
+        }
+        fn search_fulltext(
+            &mut self,
+            d: &Dataset,
+            p: &SearchParams,
+            n: i64,
+        ) -> Result<SearchResults, String> {
+            self.search(d, p, n)
+        }
+        fn delete(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn search_params(&self) -> &[SearchParams] {
+            &[]
+        }
+    }
+
+    fn run(meta: bool, engine_type: &str, w: Workload) -> Result<SearchResults, String> {
+        let d = Dataset::new(
+            serde_json::from_value(serde_json::json!({"name": "d", "path": "d"})).unwrap(),
+        );
+        let p: SearchParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        search_workload(
+            &mut TextFake {
+                fulltext_meta: meta,
+            },
+            engine_type,
+            w,
+            &d,
+            &p,
+            -1,
+        )
+    }
+
+    #[test]
+    fn fulltext_is_routed_and_fingerprinted() {
+        for engine in ["redis", "opensearch"] {
+            let r = run(true, engine, Workload::Fulltext).unwrap();
+            assert_eq!(r.workload, Some(Workload::Fulltext));
+            // A "fulltext" result without the metadata did not run the arm.
+            assert!(run(false, engine, Workload::Fulltext).is_err());
+            // A vector result carrying it ran the wrong arm.
+            assert!(run(true, engine, Workload::Vector).is_err());
+            assert!(run(false, engine, Workload::Vector).is_ok());
+        }
+        // Engines without the arm are refused before the call.
+        let e = run(true, "valkey", Workload::Fulltext).unwrap_err();
+        assert!(e.contains("not implemented"), "{e}");
     }
 }

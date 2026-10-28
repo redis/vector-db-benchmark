@@ -29,6 +29,9 @@ use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
 
+/// Ranked full-text workload (#339).
+mod fulltext;
+
 /// Redis engine configuration
 #[derive(Clone)]
 pub struct RedisEngineConfig {
@@ -350,6 +353,16 @@ impl RedisEngine {
             .arg("1")
             .arg(&self.config.key_prefix);
 
+        // #339: a config that runs the fulltext workload pins the stopword list
+        // explicitly (it equals the RediSearch default) so FT.INFO reports it
+        // and the fulltext arm can refuse an index built any other way.
+        let ft_profile = self.fulltext_profile()?;
+        if ft_profile.is_some() {
+            for a in vector_db_benchmark::fulltext::redis_stopword_args() {
+                cmd.arg(a);
+            }
+        }
+
         cmd.arg("SCHEMA");
 
         // Vector field with HNSW params (matches Python v0 configure.py)
@@ -459,9 +472,20 @@ impl RedisEngine {
                         "datetime" => {
                             cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
                         }
-                        "text" => {
-                            cmd.arg(field_name).arg("TEXT").arg("SORTABLE");
-                        }
+                        // #339 parity: only the searched text fields are
+                        // indexed, NOSTEM; english / no fulltext: all, stemmed.
+                        "text" => match &ft_profile {
+                            Some(p) if !p.indexes_text_field(field_name) => {}
+                            Some(p) if !p.stems() => {
+                                cmd.arg(field_name)
+                                    .arg("TEXT")
+                                    .arg("NOSTEM")
+                                    .arg("SORTABLE");
+                            }
+                            _ => {
+                                cmd.arg(field_name).arg("TEXT").arg("SORTABLE");
+                            }
+                        },
                         "geo" => {
                             cmd.arg(field_name).arg("GEO").arg("SORTABLE");
                         }
@@ -473,6 +497,7 @@ impl RedisEngine {
 
         cmd.query::<()>(conn)
             .map_err(|e| format!("Failed to create index: {}", e))?;
+        self.write_fulltext_marker(conn, ft_profile.as_ref())?;
 
         Ok(())
     }
@@ -2139,7 +2164,10 @@ impl Engine for RedisEngine {
         let dataset_path = dataset.get_path()?;
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
-        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        let (ids, vectors, mut metadata) = dataset.read_vectors(normalize)?;
+        // #339 parity: normalize newlines in the indexed text fields before
+        // anything is sent (recorded in the index marker by configure()).
+        self.normalize_fulltext_upload(&mut metadata)?;
         if self.config.skip_vector_index {
             vector_db_benchmark::filter_only::domain::validate_metadata(
                 &metadata,
@@ -2228,6 +2256,15 @@ impl Engine for RedisEngine {
         }
         self.prepare_search(dataset)?;
         self.search_filter_only_harness(dataset, params, num_queries)
+    }
+
+    fn search_fulltext(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_fulltext_harness(dataset, params, num_queries)
     }
 
     fn search(
@@ -2951,6 +2988,16 @@ impl Engine for RedisEngine {
             cmd.arg("DD");
         }
         let _ = cmd.query::<()>(&mut conn);
+        // Only a fulltext config owns a marker (outside its key prefix).
+        let profile = self.fulltext_profile().ok().flatten();
+        for args in vector_db_benchmark::fulltext::redis_marker_teardown_commands(
+            &self.config.index_name,
+            profile.as_ref(),
+        ) {
+            let mut cmd = redis::cmd(&args[0]);
+            cmd.arg(&args[1..]);
+            let _ = cmd.query::<()>(&mut conn);
+        }
         Ok(())
     }
 

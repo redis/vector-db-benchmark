@@ -229,10 +229,45 @@ fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
     use serde_json::json;
     let cases = [
         (
-            "redis",
+            "valkey",
             json!([{"workload":"fulltext"}]),
             false,
             "not implemented",
+        ),
+        // #339: fulltext shares the vector layout, not filter-only's.
+        (
+            "opensearch",
+            json!([{"workload":"fulltext"}, {"workload":"filter-only"}]),
+            false,
+            "#344",
+        ),
+        // #339: a `fulltext` block is refused on another workload, and a
+        // misspelled key or a non-positive boost is refused before connecting.
+        (
+            "redis",
+            json!([{"fulltext":{"fields":{"title":2.0}}}]),
+            false,
+            "only valid on a fulltext search config",
+        ),
+        (
+            "redis",
+            json!([{"workload":"fulltext","fulltext":{"feilds":{"title":2.0}}}]),
+            false,
+            "invalid `fulltext` block",
+        ),
+        (
+            "opensearch",
+            json!([{"workload":"fulltext","fulltext":{"fields":{"title":0}}}]),
+            false,
+            "finite number > 0",
+        ),
+        // #339 review: an OpenSearch-only key on another engine is refused,
+        // not accepted and ignored.
+        (
+            "redis",
+            json!([{"workload":"fulltext","fulltext":{"allow_multi_shard":true}}]),
+            false,
+            "only applies to OpenSearch",
         ),
         (
             "opensearch",
@@ -571,4 +606,214 @@ fn calibration_on_declared_filter_only_is_refused_at_startup() {
     assert!(!output.status.success(), "{stdout}");
     assert!(stderr.contains("calibration_param"), "{stderr}");
     assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+}
+
+/// #339 review: refusals that happen before anything touches the server (a
+/// closed port: the refusal must come first), on both engines.
+///
+/// - An engine config mixing `fulltext` with a vector config is refused when
+///   the dataset's queries filter on a schema `text` field, with ANY condition
+///   type (`match.text`, `match.value`, `match.any`): the fulltext config
+///   would change the analyzer those filters run through.
+/// - A fulltext `fields` entry that is not a `text` field of the dataset
+///   schema is refused before configure/upload.
+///
+/// The same mix filtering only a keyword field is not refused, and neither is
+/// a fulltext-only config.
+#[test]
+fn fulltext_mixed_with_text_filtered_vector_configs_is_refused_before_connecting() {
+    use serde_json::json;
+    let mix = json!([{}, {"workload": "fulltext"}]);
+    let text_only = json!([{"workload": "fulltext"}]);
+    let typo = json!([{"workload": "fulltext", "fulltext": {"fields": {"bdy": 1.0}}}]);
+    let on = |field: &str, cond: serde_json::Value| json!({"and": [{field: cond}]});
+    let refused_mix = "filter on text fields";
+    let cases = [
+        (
+            on("body", json!({"match": {"text": "quick"}})),
+            mix.clone(),
+            Some(refused_mix),
+        ),
+        (
+            on("body", json!({"match": {"value": "quick"}})),
+            mix.clone(),
+            Some(refused_mix),
+        ),
+        (
+            on("body", json!({"match": {"any": ["quick"]}})),
+            mix.clone(),
+            Some(refused_mix),
+        ),
+        (
+            on("tag", json!({"match": {"value": "a"}})),
+            mix.clone(),
+            None,
+        ),
+        (
+            on("body", json!({"match": {"text": "quick"}})),
+            text_only.clone(),
+            None,
+        ),
+        (
+            on("tag", json!({"match": {"value": "a"}})),
+            typo.clone(),
+            Some("fulltext field 'bdy' is not a `text` field"),
+        ),
+    ];
+    // The non-refused cases go on to connect; only Redis fails fast against a
+    // closed port (OpenSearch retries), so they run on Redis only — the rules
+    // themselves are engine-agnostic and unit-tested in `fulltext`.
+    for engine in ["redis", "opensearch"] {
+        for (condition, search_params, refusal) in &cases {
+            if engine == "opensearch" && refusal.is_none() {
+                continue;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let ds = root.path().join("datasets/tm");
+            std::fs::create_dir_all(&ds).unwrap();
+            std::fs::write(
+                ds.join("tests.jsonl"),
+                json!({"query": [1.0, 0.0], "conditions": condition, "closest_ids": [0],
+                       "query_text": "quick fox"})
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("datasets/datasets.json"),
+                json!([{"name": "tm", "type": "tar", "path": "tm", "vector_size": 2,
+                        "distance": "l2", "schema": {"body": "text", "tag": "keyword"}}])
+                .to_string(),
+            )
+            .unwrap();
+            let engines_file = root.path().join("engines.json");
+            std::fs::write(
+                &engines_file,
+                json!([{"name": "mix", "engine": engine, "search_params": search_params}])
+                    .to_string(),
+            )
+            .unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port().to_string();
+            drop(listener);
+            let out = Command::new(common::binary_path())
+                .current_dir(root.path())
+                .args([
+                    "--engines",
+                    "mix",
+                    "--datasets",
+                    "tm",
+                    "--host",
+                    "127.0.0.1",
+                ])
+                .arg("--engines-file")
+                .arg(&engines_file)
+                .args(["--exit-on-error"])
+                .env("REDIS_PORT", &port)
+                .env("OPENSEARCH_PORT", &port)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let ctx = format!("{engine} {condition} {search_params}: {stderr}");
+            match refusal {
+                Some(needle) => {
+                    assert!(!out.status.success(), "{ctx}");
+                    assert!(stderr.contains(needle), "{ctx}");
+                    // Refused before configure: nothing touched the server.
+                    assert!(!stdout.contains("Experiment stage: Configure"), "{ctx}");
+                }
+                None => {
+                    assert!(!stderr.contains(refused_mix), "{ctx}");
+                    assert!(!stderr.contains("is not a `text` field"), "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+/// #339 follow-up: parity index rules refused at startup, before any
+/// download or connection (closed port, missing corpus): parity mixed with
+/// english, parity next to a vector config, parity without explicit fields,
+/// parity configs searching different field sets.
+#[test]
+fn fulltext_parity_index_rules_are_refused_at_startup() {
+    use serde_json::json;
+    let par = |fields: serde_json::Value| json!({"workload": "fulltext", "fulltext": {"analysis": "parity", "fields": fields}});
+    let cases = [
+        (
+            json!([par(json!({"segment": 1})), {"workload": "fulltext"}]),
+            "mixes fulltext analysis",
+        ),
+        (
+            json!([{}, par(json!({"segment": 1}))]),
+            "must never apply to other workloads",
+        ),
+        (
+            json!([{"workload": "fulltext", "fulltext": {"analysis": "parity"}}]),
+            "needs explicit",
+        ),
+        (
+            json!([par(json!({"segment": 1})), par(json!({"title": 1}))]),
+            "different field sets",
+        ),
+        // Redis only: parity on a shared corpus, refused before the download
+        // (run with REDIS_KEY_PREFIX set, below).
+        (json!([par(json!({"segment": 1}))]), "REDIS_KEY_PREFIX"),
+        // Redis only: a shared prefix covering the marker keys (run with
+        // REDIS_KEY_PREFIX=vdbb, below), even in english mode.
+        (
+            json!([{"workload": "fulltext", "fulltext": {"fields": {"segment": 1}}}]),
+            "overlaps the fulltext marker keys",
+        ),
+    ];
+    for engine in ["redis", "opensearch"] {
+        for (search_params, needle) in &cases {
+            let shared_prefix = if needle.contains("REDIS_KEY_PREFIX") {
+                Some("shared")
+            } else if needle.contains("overlaps the fulltext marker keys") {
+                Some("vdbb")
+            } else {
+                None
+            };
+            if shared_prefix.is_some() && engine != "redis" {
+                continue;
+            }
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("datasets")).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port().to_string();
+            drop(listener);
+            std::fs::write(
+                root.path().join("datasets/datasets.json"),
+                json!([{"name": "pf", "type": "tar", "path": "missing-corpus",
+                        "vector_size": 1, "distance": "l2",
+                        "schema": {"title": "text", "segment": "text"},
+                        "link": format!("http://127.0.0.1:{port}/must-not-download.tgz")}])
+                .to_string(),
+            )
+            .unwrap();
+            let engines_file = root.path().join("engines.json");
+            std::fs::write(
+                &engines_file,
+                json!([{"name": "pf", "engine": engine, "search_params": search_params}])
+                    .to_string(),
+            )
+            .unwrap();
+            let mut cmd = Command::new(common::binary_path());
+            cmd.current_dir(root.path())
+                .args(["--engines", "pf", "--datasets", "pf", "--host", "127.0.0.1"])
+                .arg("--engines-file")
+                .arg(&engines_file)
+                .env("REDIS_PORT", &port)
+                .env("OPENSEARCH_PORT", &port);
+            if let Some(p) = shared_prefix {
+                cmd.env("REDIS_KEY_PREFIX", p);
+            }
+            let out = cmd.output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{engine} {search_params}: {stderr}");
+            assert!(stderr.contains(needle), "{engine} {needle}: {stderr}");
+            assert!(!stderr.contains("must-not-download"), "{stderr}");
+        }
+    }
 }

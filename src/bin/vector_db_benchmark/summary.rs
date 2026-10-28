@@ -65,6 +65,10 @@ fn analyze_precision_performance(entries: &[SearchEntry]) -> Vec<PrecisionBucket
     let mut buckets: BTreeMap<String, PrecisionBucket> = BTreeMap::new();
 
     for entry in entries {
+        // #339: fulltext has no ground truth, so no precision bucket.
+        if entry.results.fulltext.is_some() {
+            continue;
+        }
         let key = format_precision_key(entry.results.mean_precision_at_returned);
 
         let candidate = PrecisionBucket {
@@ -693,6 +697,39 @@ pub fn save_summary(
         }
     }
 
+    // #339: fulltext rows carry no vector quality (no ground truth); quality
+    // comes from compare-results against a reference engine.
+    if entries.iter().any(|e| e.results.fulltext.is_some()) {
+        for (row, entry) in summary["search_results"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(entries)
+        {
+            let Some(meta) = &entry.results.fulltext else {
+                continue;
+            };
+            for key in [
+                "mean_precision_at_returned",
+                "mean_recall",
+                "recall_p10",
+                "mean_mrr",
+                "mean_ndcg",
+            ] {
+                row.as_object_mut().unwrap().remove(key);
+            }
+            row["workload"] = json!("fulltext");
+            row["fulltext"] =
+                json!({"fields": meta["fields"], "result_limit": meta["result_limit"]});
+            row["requested_queries"] = json!(entry.results.requested_queries);
+            row["failed_queries"] = json!(entry.results.failed_queries);
+        }
+        if entries.iter().all(|e| e.results.fulltext.is_some()) {
+            summary["workload"] = json!("fulltext");
+            summary.as_object_mut().unwrap().remove("precision_summary");
+        }
+    }
+
     if let Some(upload) = upload_json {
         summary
             .as_object_mut()
@@ -1070,6 +1107,52 @@ mod tests {
                 ..Default::default()
             },
             calibration: None,
+        }
+    }
+
+    /// #339: a fulltext row publishes no vector-quality key and lands in no
+    /// precision bucket; a vector row next to it keeps both.
+    #[test]
+    fn fulltext_rows_carry_no_vector_quality() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vector = entry("64", 1, 100.0, 0.002, "");
+        vector.results.mean_precision_at_returned = 0.9;
+        vector.results.mean_recall = 0.9;
+        let mut text = entry("n/a", 4, 400.0, 0.003, "");
+        text.search_id = 1;
+        text.results.mean_precision_at_returned = -1.0;
+        text.results.requested_queries = 7;
+        text.results.num_queries = 7;
+        text.results.fulltext = Some(json!({"fields": {"title": 5.0}, "result_limit": 10}));
+        for (name, entries, all_text) in [
+            ("mixed", vec![vector.clone(), text.clone()], false),
+            ("text", vec![text.clone()], true),
+        ] {
+            save_summary(name, "fx", &entries, None, dir.path(), &json!({})).unwrap();
+            let doc: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(dir.path().join(format!("{name}-fx-summary.json"))).unwrap(),
+            )
+            .unwrap();
+            let rows = doc["search_results"].as_array().unwrap();
+            let t = rows.last().unwrap();
+            assert_eq!(t["workload"], "fulltext");
+            assert_eq!(t["fulltext"]["fields"], json!({"title": 5.0}));
+            assert_eq!(t["requested_queries"], 7);
+            for key in [
+                "mean_precision_at_returned",
+                "mean_recall",
+                "mean_mrr",
+                "mean_ndcg",
+            ] {
+                assert!(t.get(key).is_none(), "{name}: {key}");
+            }
+            assert_eq!(doc.get("precision_summary").is_none(), all_text, "{name}");
+            if !all_text {
+                assert!(rows[0].get("mean_recall").is_some());
+                let buckets = doc["precision_summary"].as_object().unwrap();
+                assert_eq!(buckets.len(), 1, "{buckets:?}");
+            }
+            assert_eq!(doc["workload"] == "fulltext", all_text, "{name}");
         }
     }
 

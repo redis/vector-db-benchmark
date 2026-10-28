@@ -92,6 +92,7 @@ src/
   metrics.rs          # recall / precision / MRR / NDCG — see the metric-naming note below
   workload.rs         # per-search-config workload + engine/workload table (#344)
   results_dump.rs     # per-query record contract, --dump-results JSONL (#343)
+  fulltext.rs         # ranked BM25 workload: query terms, pinned analyzers, index checks (#339)
   compare_results.rs  # compare-results: overlap/Jaccard/rank/count vs a reference
   start_gate.rs       # Worker barrier for parallel search
   config.rs, redis_client.rs, parsers.rs

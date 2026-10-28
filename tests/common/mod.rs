@@ -2943,3 +2943,399 @@ pub fn assert_filter_only_docid_dump(dir: &Path, docid: fn(usize) -> String) {
         "the red query must return ids for this check to mean anything"
     );
 }
+
+// ── #339: ranked full-text (BM25) fixture ─────────────────────────────────
+
+/// Dataset name of [`write_bm25_project`].
+pub const BM25_DATASET: &str = "bm25-test";
+
+/// `(docid, title, headings, segment)`. Each row exists to make one claim
+/// observable on a live server; see [`assert_bm25_run`].
+const BM25_DOCS: [(&str, &str, &str, &str); 8] = [
+    // Boost direction: "apple" only in the title of d0, only in the segment of
+    // d1. A title boost ranks d0 first, a segment boost d1.
+    (
+        "d0",
+        "Apple orchard guide",
+        "Seasons",
+        "Planting trees in spring and autumn.",
+    ),
+    (
+        "d1",
+        "Orchard guide",
+        "Seasons",
+        "Apple trees in spring and autumn.",
+    ),
+    // Stemmer: "generously" is "generous" under Porter2 (Snowball English) and
+    // "gener" under Porter. "generation" is "generat" under Porter2 and also
+    // "gener" under Porter — so d3 is returned iff an engine stems with Porter.
+    ("d2", "Generous donors", "Charity", "A generous gift helps."),
+    ("d3", "Generation gap", "Family", "Each generation differs."),
+    // Tokenizer: RediSearch does not split on '\n', OpenSearch does.
+    ("d4", "Notes", "alpha\nbeta", "Greek letters."),
+    // Plural/stem match on both engines ("crossing" in title AND segment, so a
+    // parity index of headings + segment still holds it, unstemmed).
+    (
+        "d5",
+        "Zebra crossing rules",
+        "Roads",
+        "Pedestrians use the crossing here.",
+    ),
+    // Stopword-only text.
+    ("d6", "The Who", "To be", "to be or not to be"),
+    ("d7", "Lorem ipsum", "Dolor", "Sit amet consectetur."),
+];
+
+/// `query_text` of each `tests.jsonl` line. Line 2 has no searchable term.
+pub const BM25_QUERIES: [&str; 6] = [
+    "apple",
+    "generously",
+    "the of and",
+    "beta",
+    "Zebra crossings!",
+    "crossings",
+];
+
+/// Write the BM25 fixture: 4-d random vectors (only so the corpus uploads
+/// through the vector layout), `docid` + three `text` fields, and a
+/// `query_text` on every test line.
+pub fn write_bm25_project(engine_configs_json: &str) -> MatchAnyProject {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let ds = root.join("datasets").join(BM25_DATASET);
+    fs::create_dir_all(&ds).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+    let mut rng = StdRng::seed_from_u64(0xB325);
+    let vectors: Vec<Vec<f32>> = (0..BM25_DOCS.len())
+        .map(|_| (0..4).map(|_| rng.gen_range(-1.0f32..1.0)).collect())
+        .collect();
+    write_npy_vectors(ds.join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+    let payloads = BM25_DOCS
+        .iter()
+        .map(|(docid, title, headings, segment)| {
+            serde_json::json!({"docid": docid, "title": title, "headings": headings, "segment": segment})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds.join("payloads.jsonl"), payloads).unwrap();
+    let tests = BM25_QUERIES
+        .iter()
+        .map(|q| {
+            serde_json::json!({"query": [1.0, 0.0, 0.0, 0.0], "closest_ids": [0], "query_text": q})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds.join("tests.jsonl"), tests).unwrap();
+    write_bm25_registry(&root, false);
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+    MatchAnyProject {
+        root,
+        dataset_name: BM25_DATASET.to_string(),
+        top: 5,
+        matching_docs: BM25_DOCS.len(),
+    }
+}
+
+/// (Re)write the fixture's dataset registry. `with_body` declares a fourth
+/// `text` field that no index built from the 3-field schema has.
+pub fn write_bm25_registry(root: &Path, with_body: bool) {
+    let mut schema = serde_json::json!({
+        "docid": "keyword", "title": "text", "headings": "text", "segment": "text"
+    });
+    if with_body {
+        schema["body"] = serde_json::json!("text");
+    }
+    let registry = serde_json::json!([{
+        "name": BM25_DATASET, "type": "tar", "path": format!("{BM25_DATASET}/"),
+        "distance": "l2", "vector_size": 4, "vector_count": BM25_DOCS.len(),
+        "schema": schema,
+    }]);
+    fs::write(root.join("datasets/datasets.json"), registry.to_string()).unwrap();
+}
+
+/// The two fulltext search configs [`assert_bm25_run`] expects: title-boosted
+/// (search config 0) and segment-boosted (search config 1).
+pub fn bm25_search_params() -> serde_json::Value {
+    serde_json::json!([
+        {"parallel": 2, "top": 5, "workload": "fulltext",
+         "fulltext": {"fields": {"title": 5.0, "headings": 1.0, "segment": 1.0}}},
+        {"parallel": 1, "top": 5, "workload": "fulltext",
+         "fulltext": {"fields": {"title": 1.0, "headings": 1.0, "segment": 5.0}}}
+    ])
+}
+
+/// Run the binary and return its full output (for refusal assertions).
+pub fn run_binary_output(
+    root: &Path,
+    engine: &str,
+    dataset: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+    extra: &[&str],
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(binary_path());
+    cmd.args([
+        "--engines",
+        engine,
+        "--datasets",
+        dataset,
+        "--host",
+        host,
+        "--skip-if-exists",
+        "false",
+    ])
+    .args(extra)
+    .current_dir(root);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run vector-db-benchmark")
+}
+
+/// Every claim the BM25 fixture makes, checked on one engine's run of
+/// [`bm25_search_params`] with `--dump-results <dump>`:
+///
+/// - result JSON: `workload: fulltext`, the configured boosts, the pinned
+///   stopword list and the engine's analyzer settings, the skipped query, no
+///   vector-quality keys;
+/// - dump: one record per eligible query (the termless one skipped), docids
+///   (not engine keys), descending scores;
+/// - boosts reach the server: "apple" ranks d0 first under the title boost
+///   and d1 first under the segment boost;
+/// - Porter2 on both engines: "generously" returns d2 and never d3;
+/// - "crossings" matches "crossing" (stemming applied at query and index time);
+/// - the newline tokenizer difference recorded in `known_differences`: "beta"
+///   (second line of d4's headings) is found by OpenSearch only.
+pub fn assert_bm25_run(root: &Path, dump: &Path, engine: &str, config: &str) {
+    use vector_db_benchmark::fulltext::STOPWORDS;
+    let docs: Vec<serde_json::Value> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().to_string();
+            n.starts_with(&format!("{config}-")) && n.contains("-search-")
+        })
+        .map(|p| serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(docs.len(), 2, "one result file per search config");
+    let boosts = [
+        serde_json::json!({"title": 5.0, "headings": 1.0, "segment": 1.0}),
+        serde_json::json!({"title": 1.0, "headings": 1.0, "segment": 5.0}),
+    ];
+    for doc in &docs {
+        let p = &doc["params"];
+        assert_eq!(p["workload"], "fulltext", "{doc}");
+        let ft = &p["fulltext"];
+        assert!(boosts.contains(&ft["fields"]), "{ft}");
+        assert_eq!(ft["engine"], engine);
+        assert_eq!(
+            ft["stopwords"]["list"],
+            serde_json::json!(STOPWORDS.as_slice())
+        );
+        assert_eq!(ft["queries_total"], 6);
+        assert_eq!(ft["queries_skipped_no_terms"], serde_json::json!([2]));
+        assert_eq!(ft["result_limit"], 5);
+        // A fresh index carries the marker this run wrote, read back.
+        assert_eq!(ft["index_marker"], ft["index_marker_expected"], "{ft}");
+        assert_eq!(ft["index_marker"]["analysis"], "english");
+        assert!(!ft["known_differences"].as_array().unwrap().is_empty());
+        match engine {
+            "redis" => {
+                assert_eq!(ft["engine_settings"]["scorer"], "BM25STD");
+                // Read back from the server, not assumed.
+                assert_eq!(
+                    ft["redis_min_stem_len"],
+                    serde_json::json!({"value": 4, "verified": true})
+                );
+            }
+            _ => {
+                assert_eq!(
+                    ft["engine_settings"]["index"]["analysis"]["filter"]
+                        ["vdbb_english_porter2_stemmer"]["language"],
+                    "porter2"
+                );
+                // Read back from the live index, not the config.
+                assert_eq!(ft["number_of_shards"], 1);
+            }
+        }
+        let r = &doc["results"];
+        assert_eq!(r["requested_queries"], 5, "termless query not dispatched");
+        assert_eq!(r["failed_queries"], 0);
+        for key in ["mean_recall", "mean_precision_at_returned", "mean_ndcg"] {
+            assert!(r.get(key).is_none(), "fulltext result carries {key}");
+        }
+        assert_eq!(doc["metrics_schema"]["workload"], "fulltext");
+    }
+
+    let dumps = read_dumps(dump);
+    assert_eq!(dumps.len(), 2, "one dump per search config");
+    let mut by_config: std::collections::BTreeMap<usize, _> = Default::default();
+    for d in &dumps {
+        assert_eq!(d.header.engine, engine);
+        assert_eq!(d.header.workload.as_str(), "fulltext");
+        assert_eq!(d.header.top, 5);
+        assert_eq!(d.records.len(), 5, "a record per eligible query");
+        let mut per_query = std::collections::BTreeMap::new();
+        for r in &d.records {
+            assert!(
+                r.error.is_none(),
+                "query {} failed: {:?}",
+                r.query_id,
+                r.error
+            );
+            assert_ne!(r.query_id, 2, "the termless query must not be dispatched");
+            // An empty answer has no scores (results_dump omits the key).
+            let empty = Vec::new();
+            let scores = match &r.scores {
+                Some(s) => s,
+                None if r.ids.is_empty() => &empty,
+                None => panic!("fulltext records carry scores: {:?}", r.ids),
+            };
+            assert_eq!(scores.len(), r.ids.len());
+            assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+            assert!(r.ids.iter().all(|id| id.starts_with('d')), "{:?}", r.ids);
+            per_query.insert(r.query_id, r.ids.clone());
+        }
+        by_config.insert(d.header.search_id, per_query);
+    }
+    let title = &by_config[&0];
+    let segment = &by_config[&1];
+    assert_eq!(
+        &title[&0][..2],
+        ["d0", "d1"],
+        "title boost: {:?}",
+        title[&0]
+    );
+    assert_eq!(
+        &segment[&0][..2],
+        ["d1", "d0"],
+        "segment boost: {:?}",
+        segment[&0]
+    );
+    for q in [title, segment] {
+        assert_eq!(q[&1], ["d2"], "Porter2 on {engine}: {:?}", q[&1]);
+        assert_eq!(q[&4].first().map(String::as_str), Some("d5"), "{:?}", q[&4]);
+        // Stemmed: "crossings" finds "crossing".
+        assert_eq!(q[&5], ["d5"], "stemming on {engine}: {:?}", q[&5]);
+        let beta: &[&str] = if engine == "redis" { &[] } else { &["d4"] };
+        assert_eq!(q[&3], beta, "newline tokenization on {engine}");
+    }
+    // compare-results accepts fulltext dumps (self-comparison is perfect).
+    let (ok, report) = run_compare(dump, dump, engine);
+    assert!(ok, "self-comparison must pass: {report}");
+    for pair in report["pairs"].as_array().unwrap() {
+        assert_eq!(pair["workload"], "fulltext", "{pair}");
+    }
+}
+
+// ── #339 follow-up: parity analysis on the BM25 fixture ───────────────────
+
+/// Two parity search configs over the same field set (headings + segment;
+/// title is NOT indexed), differing in boosts and `parallel` (the
+/// compare-results pairing key).
+pub fn bm25_parity_search_params() -> serde_json::Value {
+    serde_json::json!([
+        {"parallel": 2, "top": 5, "workload": "fulltext",
+         "fulltext": {"analysis": "parity", "fields": {"headings": 1.0, "segment": 1.0}}},
+        {"parallel": 1, "top": 5, "workload": "fulltext",
+         "fulltext": {"analysis": "parity", "fields": {"headings": 1.0, "segment": 3.0}}}
+    ])
+}
+
+/// Every claim parity makes, on one engine's run of
+/// [`bm25_parity_search_params`] with `--dump-results <dump>`:
+///
+/// - result JSON records `analysis: parity`, the whitespace normalization, the
+///   indexed text fields and the index marker;
+/// - no stemming: "generously" finds nothing (d2 holds only "generous") and
+///   "crossings" no longer finds "crossing" (d5) — both found in english mode;
+/// - newlines split identically: "beta" (second line of d4's headings) is
+///   found on BOTH engines (english: OpenSearch only);
+/// - only the searched fields are indexed: "apple" finds d1 (segment) but not
+///   d0 (title only), and "zebra crossings" (zebra: title only) finds nothing.
+pub fn assert_bm25_parity_run(root: &Path, dump: &Path, engine: &str, config: &str) {
+    let docs: Vec<serde_json::Value> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().to_string();
+            n.starts_with(&format!("{config}-")) && n.contains("-search-")
+        })
+        .map(|p| serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(docs.len(), 2, "one result file per search config");
+    for doc in &docs {
+        let ft = &doc["params"]["fulltext"];
+        assert_eq!(doc["params"]["workload"], "fulltext");
+        assert_eq!(ft["analysis"], "parity", "{ft}");
+        assert_eq!(ft["normalize_whitespace"], true);
+        assert_eq!(
+            ft["indexed_text_fields"],
+            serde_json::json!(["headings", "segment"])
+        );
+        assert_eq!(
+            ft["index_marker"],
+            serde_json::json!({"analysis": "parity", "normalize_whitespace": true,
+                               "text_fields": ["headings", "segment"]})
+        );
+        match engine {
+            "redis" => assert!(ft["engine_settings"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("VERBATIM")),
+            _ => assert_eq!(
+                ft["engine_settings"]["index"]["analyzer"],
+                "vdbb_english_nostem"
+            ),
+        }
+        assert_eq!(doc["results"]["failed_queries"], 0);
+        assert_eq!(doc["results"]["requested_queries"], 5);
+    }
+    let dumps = read_dumps(dump);
+    assert_eq!(dumps.len(), 2, "one dump per search config");
+    for d in &dumps {
+        assert_eq!(d.header.engine, engine);
+        let q: std::collections::BTreeMap<usize, Vec<String>> = d
+            .records
+            .iter()
+            .map(|r| {
+                assert!(
+                    r.error.is_none(),
+                    "query {} failed: {:?}",
+                    r.query_id,
+                    r.error
+                );
+                (r.query_id, r.ids.clone())
+            })
+            .collect();
+        let none: Vec<String> = Vec::new();
+        assert_eq!(q[&0], ["d1"], "only the searched fields: {:?}", q[&0]);
+        assert_eq!(
+            q[&1], none,
+            "no stemming: generously ≠ generous: {:?}",
+            q[&1]
+        );
+        assert_eq!(
+            q[&3],
+            ["d4"],
+            "newlines normalized on {engine}: {:?}",
+            q[&3]
+        );
+        assert_eq!(q[&4], none, "zebra is in the unindexed title: {:?}", q[&4]);
+        assert_eq!(
+            q[&5], none,
+            "no stemming: crossings ≠ crossing: {:?}",
+            q[&5]
+        );
+    }
+    let (ok, report) = run_compare(dump, dump, engine);
+    assert!(ok, "self-comparison must pass: {report}");
+}
