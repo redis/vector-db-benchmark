@@ -2641,6 +2641,16 @@ fn build_search_result_json(
     if let Some(workload) = results.workload {
         result["params"]["workload"] = serde_json::json!(workload.as_str());
     }
+    // #343 review: a --dump-results run's rps includes the per-query capture
+    // work (outside each latency sample, inside the throughput window). Say so
+    // in the artifact, where its QPS will be compared with a non-dump run's.
+    if search_params.capture_query_results {
+        result["params"]["per_query_capture"] = serde_json::json!({
+            "enabled": true,
+            "in_throughput_window": true,
+            "in_latency_samples": false,
+        });
+    }
     if let Some(contract) = &results.filter_only {
         result["params"]["workload"] = serde_json::json!("filter-only");
         result["results"]["filter_only"] = serde_json::to_value(contract).unwrap();
@@ -4658,6 +4668,44 @@ mod filter_only_serialization_tests {
                     assert_eq!(doc["params"]["workload"], "vector");
                     assert_eq!(result["mean_recall"], 0.5);
                 }
+            }
+        }
+    }
+
+    /// #343 review: a run with per-query capture says so in the artifact; a run
+    /// without it carries no such block.
+    #[test]
+    fn per_query_capture_is_recorded_only_when_on() {
+        for capture in [false, true] {
+            let mut params: SearchParams = serde_json::from_value(json!({"parallel":1})).unwrap();
+            params.capture_query_results = capture;
+            let results = SearchResults {
+                top: 10,
+                parallel: 1,
+                requested_queries: 1,
+                num_queries: 1,
+                latencies: vec![0.001],
+                workload: Some(vector_db_benchmark::workload::Workload::Vector),
+                ..Default::default()
+            };
+            let doc = build_search_result_json(
+                "test",
+                "fixture",
+                &params,
+                &results,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                &json!({}),
+            );
+            let block = doc["params"].get("per_query_capture");
+            assert_eq!(block.is_some(), capture, "capture={capture}");
+            if capture {
+                assert_eq!(block.unwrap()["in_throughput_window"], true);
             }
         }
     }

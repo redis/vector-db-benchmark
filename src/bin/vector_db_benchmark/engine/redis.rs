@@ -1030,6 +1030,11 @@ impl RedisEngine {
         for error in errors.iter().take(3) {
             eprintln!("{error}");
         }
+        // Checked before anything else can fail, as OpenSearch does: the
+        // specific capture cause must not be masked by a later error.
+        if let Some(e) = capture_failure {
+            return Err(format!("--dump-results: {e}"));
+        }
         let mut check_conn = self.get_connection()?;
         redis_utils::check_commandstats(
             &mut check_conn,
@@ -1048,9 +1053,6 @@ impl RedisEngine {
             parallel,
             num_to_run,
         )?;
-        if let Some(e) = capture_failure {
-            return Err(format!("--dump-results: {e}"));
-        }
         result.mean_precision_at_returned = -1.0;
         result.query_records = captured;
         result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
