@@ -250,6 +250,11 @@ pub enum FieldValue<'a> {
     /// Present, but not a type the exact-match grammar compares (float, bool,
     /// array, object). Evaluating a predicate against it is an error.
     Other,
+    /// A name the row type cannot represent (the compact derived row has only
+    /// the four derived fields). Not absence: evaluating against it is an
+    /// error, so a predicate on `url` or a misspelt `catgory` cannot quietly
+    /// count zero matches.
+    Unknown,
 }
 
 /// Anything a predicate can be evaluated against: the compact derived row, or
@@ -267,7 +272,7 @@ impl Fields for DerivedFields {
             "doc_len" => FieldValue::Int(self.doc_len as i64),
             "tier" => FieldValue::Int(self.tier as i64),
             "rand_key" => FieldValue::Int(self.rand_key as i64),
-            _ => return None,
+            _ => FieldValue::Unknown,
         })
     }
 }
@@ -509,15 +514,46 @@ impl Predicate {
                     (_, FieldValue::Other) => Err(format!(
                         "{field}: holds a value the exact-match grammar cannot compare"
                     )),
+                    (_, FieldValue::Unknown) => Err(unknown_field(field)),
                 }
             }
         }
     }
 }
 
+fn unknown_field(field: &str) -> String {
+    format!(
+        "{field}: not a field of this row type (the compact derived row holds only {})",
+        DERIVED_FIELDS
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Every leaf field of `p` must be one the row type can represent. Checked up
+/// front because `and`/`or` short-circuit: a disjunct naming an unknown field
+/// after one every row satisfies would otherwise never be evaluated.
+fn check_fields_known<F: Fields>(rows: &[F], p: &Predicate) -> Result<(), String> {
+    let Some(row) = rows.first() else {
+        return Ok(());
+    };
+    match p {
+        Predicate::And(c) | Predicate::Or(c) => {
+            c.iter().try_for_each(|q| check_fields_known(rows, q))
+        }
+        Predicate::Leaf { field, .. } => match row.field(field) {
+            Some(FieldValue::Unknown) => Err(unknown_field(field)),
+            _ => Ok(()),
+        },
+    }
+}
+
 /// How many rows satisfy `p`. Parallel; the count does not depend on the
 /// thread count.
 pub fn count_matches<F: Fields + Sync>(rows: &[F], p: &Predicate) -> Result<u64, String> {
+    check_fields_known(rows, p)?;
     rows.par_iter()
         .map(|r| p.matches(r).map(u64::from))
         .try_reduce(|| 0, |a, b| Ok(a + b))
@@ -526,6 +562,7 @@ pub fn count_matches<F: Fields + Sync>(rows: &[F], p: &Predicate) -> Result<u64,
 /// The ids (positions in `rows`, which are the corpus ids) satisfying `p`, in
 /// ascending order. What a filtered brute-force ground truth (#341) iterates.
 pub fn matching_ids<F: Fields + Sync>(rows: &[F], p: &Predicate) -> Result<Vec<u64>, String> {
+    check_fields_known(rows, p)?;
     let hits: Vec<Option<u64>> = rows
         .par_iter()
         .enumerate()
@@ -1174,8 +1211,28 @@ mod tests {
         assert!(t(
             json!({"and":[{"category":{"match":{"value":"cat03"}}},{"or":[{"tier":{"match":{"value":0}}},{"rand_key":{"range":{"gte":1000}}}]}]})
         ));
-        // An absent field matches nothing.
-        assert!(!t(json!({"and":[{"title":{"match":{"value":"x"}}}]})));
+        // A field the compact row cannot represent is an error, not absence,
+        // under `and` and under `or` alike, even when an earlier disjunct
+        // already matches every row.
+        for p in [
+            json!({"and":[{"title":{"match":{"value":"x"}}}]}),
+            json!({"or":[{"tier":{"match":{"value":4}}},{"catgory":{"match":{"value":"cat03"}}}]}),
+        ] {
+            let p = Predicate::compile(&p).unwrap();
+            assert!(count_matches(std::slice::from_ref(&r), &p).is_err());
+            assert!(matching_ids(std::slice::from_ref(&r), &p).is_err());
+        }
+        assert!(
+            Predicate::compile(&json!({"and":[{"catgory":{"match":{"value":"cat03"}}}]}))
+                .unwrap()
+                .matches(&r)
+                .is_err()
+        );
+        // On a payload object the same field is genuinely absent and matches
+        // nothing, which is what both engines do.
+        let payload: Map<String, Value> = json!({"tier": 4}).as_object().unwrap().clone();
+        let p = Predicate::compile(&json!({"and":[{"title":{"match":{"value":"x"}}}]})).unwrap();
+        assert!(!p.matches(&payload).unwrap());
     }
 
     #[test]
