@@ -234,6 +234,16 @@ pub struct SearchResults {
     /// (`SearchParams::capture_query_results`); see
     /// `vector_db_benchmark::results_dump` for the contract.
     pub query_records: Option<Vec<RawQueryResult>>,
+    /// Hybrid workload only (#341): the per-selectivity-bucket report and the
+    /// width profile of the FILTERED ground truth the run was scored against.
+    pub hybrid: Option<HybridOutcome>,
+}
+
+/// What a hybrid run publishes beyond the common search statistics.
+#[derive(Debug, Clone)]
+pub struct HybridOutcome {
+    pub report: vector_db_benchmark::hybrid::HybridReport,
+    pub ground_truth: Option<crate::ground_truth::GroundTruthStats>,
 }
 
 /// How firmly an engine can tie a counted mixed-workload update to the corpus
@@ -889,6 +899,8 @@ pub fn search_workload(
     )
     .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
     vector_db_benchmark::workload::verify_fulltext_shape(workload, results.fulltext.is_some())
+        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    vector_db_benchmark::hybrid::verify_fingerprint(workload, results.hybrid.is_some())
         .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
     if params.capture_query_results {
         let records = results.query_records.as_ref().ok_or_else(|| {
@@ -1621,5 +1633,293 @@ mod fulltext_dispatch_tests {
         // Engines without the arm are refused before the call.
         let e = run(true, "valkey", Workload::Fulltext).unwrap_err();
         assert!(e.contains("not implemented"), "{e}");
+    }
+}
+
+/// The hybrid workload's per-bucket driver (#341), shared by every engine arm.
+///
+/// Calls `pass(bucket, positions)` once per non-empty selectivity bucket, in
+/// bucket order; `positions` index the query set, and the pass returns its
+/// timed `SearchResults` (records, if captured, naming queries by their
+/// position in `positions`) plus the engine evidence for the bucket. Each
+/// bucket is therefore its own timed window and its QPS a measured throughput.
+/// The returned result is the union of the passes (latencies, quality samples,
+/// time and requested counts summed) with the per-bucket report attached.
+pub fn run_hybrid_buckets(
+    set: &vector_db_benchmark::hybrid::HybridQuerySet,
+    top: usize,
+    text_match: serde_json::Value,
+    engine_note: serde_json::Value,
+    mut pass: impl FnMut(
+        vector_db_benchmark::hybrid::Bucket,
+        &[usize],
+    ) -> Result<(SearchResults, serde_json::Value), String>,
+) -> Result<SearchResults, String> {
+    use vector_db_benchmark::hybrid as hy;
+    let mut buckets = Vec::new();
+    let (mut times, mut precs, mut recs, mut mrrs, mut ndcgs) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut total_time, mut requested, mut parallel) = (0.0, 0usize, 1usize);
+    let mut records: Option<Vec<RawQueryResult>> = None;
+    for (bucket, positions) in set.by_bucket() {
+        println!(
+            "\tHybrid bucket {bucket}: {} queries over {} predicate(s)",
+            positions.len(),
+            {
+                let mut p: Vec<&str> = positions
+                    .iter()
+                    .map(|&i| set.meta[i].predicate_id.as_str())
+                    .collect();
+                p.sort_unstable();
+                p.dedup();
+                p.len()
+            }
+        );
+        let (r, evidence) = pass(bucket, &positions)?;
+        if r.top != top {
+            return Err(format!(
+                "hybrid bucket {bucket} ran at k={} but the config pins top={top}",
+                r.top
+            ));
+        }
+        let meta: Vec<&hy::HybridQueryMeta> = positions.iter().map(|&i| &set.meta[i]).collect();
+        let report = hy::bucket_report(
+            bucket,
+            &r.latencies,
+            &r.recalls,
+            r.total_time,
+            r.requested_queries,
+            &meta,
+            evidence,
+        )?;
+        println!(
+            "\t  {bucket}: recall@{top}={:.4} rps={:.1} p50={:.2}ms p90={:.2}ms p99={:.2}ms",
+            report.mean_recall,
+            report.rps,
+            report.p50_time * 1e3,
+            report.p90_time * 1e3,
+            report.p99_time * 1e3
+        );
+        buckets.push(report);
+        if let Some(raw) = r.query_records {
+            records
+                .get_or_insert_with(Vec::new)
+                .extend(hy::remap_records(raw, &positions, requested)?);
+        }
+        times.extend(r.latencies);
+        precs.extend(r.precisions_at_returned);
+        recs.extend(r.recalls);
+        mrrs.extend(r.mrrs);
+        ndcgs.extend(r.ndcgs);
+        total_time += r.total_time;
+        requested += r.requested_queries;
+        parallel = r.parallel;
+    }
+    let mut out = compute_search_stats(
+        &times, &precs, &recs, &mrrs, &ndcgs, total_time, top, parallel, requested,
+    )?;
+    out.query_records = records;
+    out.hybrid = Some(HybridOutcome {
+        report: hy::HybridReport {
+            query_file: hy::HYBRID_QUERIES_FILE,
+            top,
+            queries: set.meta.len(),
+            text_match,
+            buckets,
+            engine: engine_note,
+        },
+        ground_truth: crate::ground_truth::GroundTruthProfile::from_rows(set.neighbors.clone())
+            .stats(top),
+    });
+    Ok(out)
+}
+
+#[cfg(test)]
+mod hybrid_driver_tests {
+    use super::*;
+    use vector_db_benchmark::hybrid::{Bucket, HybridQueryMeta, HybridQuerySet};
+
+    fn set() -> HybridQuerySet {
+        let meta = |i: usize, bucket| HybridQueryMeta {
+            query_id: format!("q{i}"),
+            predicate_id: format!("p{}", i % 2),
+            predicate_shape: "numeric_range".into(),
+            bucket,
+            matching_count: 10,
+            selectivity: 0.1,
+        };
+        HybridQuerySet::from_parts(
+            vec![vec![0.0]; 4],
+            vec![vec![1, 2, 3]; 4],
+            vec![serde_json::json!({"and": [{"tier": {"range": {"lt": 3}}}]}); 4],
+            vec![
+                meta(0, Bucket::S1),
+                meta(1, Bucket::S50),
+                meta(2, Bucket::S1),
+                meta(3, Bucket::S50),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn pass_result(n: usize, latency: f64, time: f64, capture: bool) -> SearchResults {
+        let mut r = compute_search_stats(
+            &vec![latency; n],
+            &vec![1.0; n],
+            &vec![0.5; n],
+            &vec![1.0; n],
+            &vec![1.0; n],
+            time,
+            10,
+            2,
+            n,
+        )
+        .unwrap();
+        r.query_records = capture.then(|| {
+            (0..n)
+                .map(|i| RawQueryResult::ok(i, i, vec![], None, latency))
+                .collect()
+        });
+        r
+    }
+
+    #[test]
+    fn each_bucket_is_its_own_pass_and_the_union_is_reported() {
+        let s = set();
+        let mut seen = Vec::new();
+        let r = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |b, p| {
+                seen.push((b, p.to_vec()));
+                let lat = if b == Bucket::S50 { 0.01 } else { 0.02 };
+                Ok((
+                    pass_result(p.len(), lat, 1.0, true),
+                    serde_json::json!({"b": b}),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![(Bucket::S50, vec![1, 3]), (Bucket::S1, vec![0, 2])]
+        );
+        let h = r.hybrid.as_ref().unwrap();
+        assert_eq!(h.report.buckets.len(), 2);
+        assert!((h.report.buckets[0].p50_time - 0.01).abs() < 1e-12);
+        assert!((h.report.buckets[1].p50_time - 0.02).abs() < 1e-12);
+        assert_eq!(h.report.buckets[0].predicates, vec!["p1"]);
+        assert_eq!(r.requested_queries, 4);
+        assert!((r.total_time - 2.0).abs() < 1e-12);
+        assert!((r.rps - 2.0).abs() < 1e-12);
+        // Records name the query-set position and keep a unique dispatch order.
+        let recs = r.query_records.unwrap();
+        let mut ids: Vec<(usize, usize)> = recs.iter().map(|q| (q.seq, q.query_id)).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![(0, 1), (1, 3), (2, 0), (3, 2)]);
+        assert_eq!(h.ground_truth.as_ref().unwrap().top, 10);
+    }
+
+    #[test]
+    fn a_pass_at_another_k_or_with_no_success_is_an_error() {
+        let s = set();
+        let e = run_hybrid_buckets(
+            &s,
+            5,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, p| {
+                Ok((
+                    pass_result(p.len(), 0.01, 1.0, false),
+                    serde_json::json!({}),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("k=10"), "{e}");
+        let e = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, _| Err("engine refused".into()),
+        )
+        .unwrap_err();
+        assert_eq!(e, "engine refused");
+    }
+
+    /// An engine whose hybrid arm returns a canned result.
+    struct HybridFake(SearchResults);
+
+    impl Engine for HybridFake {
+        fn name(&self) -> &str {
+            "hybrid-fake"
+        }
+        fn configure(&mut self, _: &Dataset) -> Result<(), String> {
+            Ok(())
+        }
+        fn upload(&mut self, _: &Dataset) -> Result<UploadStats, String> {
+            Ok(UploadStats::default())
+        }
+        fn search(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            Ok(self.0.clone())
+        }
+        fn search_hybrid(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            Ok(self.0.clone())
+        }
+        fn delete(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn search_params(&self) -> &[SearchParams] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn dispatch_requires_the_hybrid_fingerprint() {
+        let d = Dataset::new(
+            serde_json::from_value(serde_json::json!({"name": "d", "path": "d"})).unwrap(),
+        );
+        let p: SearchParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        let s = set();
+        let hybrid = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, p| {
+                Ok((
+                    pass_result(p.len(), 0.01, 1.0, false),
+                    serde_json::json!({}),
+                ))
+            },
+        )
+        .unwrap();
+        // The hybrid arm's real result passes and is labelled.
+        let mut f = HybridFake(hybrid.clone());
+        let r = search_workload(&mut f, "redis", Workload::Hybrid, &d, &p, -1).unwrap();
+        assert_eq!(r.workload, Some(Workload::Hybrid));
+        // A "hybrid" arm that returned a plain vector result is refused...
+        let mut f = HybridFake(pass_result(4, 0.01, 1.0, false));
+        let e = search_workload(&mut f, "redis", Workload::Hybrid, &d, &p, -1).unwrap_err();
+        assert!(e.contains("hybrid report"), "{e}");
+        // ...and so is a vector dispatch that came back with a hybrid report.
+        let mut f = HybridFake(hybrid);
+        assert!(search_workload(&mut f, "redis", Workload::Vector, &d, &p, -1).is_err());
+        // Engines without the arm are refused by the table before any call.
+        let mut f = HybridFake(pass_result(4, 0.01, 1.0, false));
+        assert!(search_workload(&mut f, "valkey", Workload::Hybrid, &d, &p, -1).is_err());
     }
 }

@@ -249,7 +249,12 @@ pub fn combine_layouts(engine_type: &str, workloads: &[Workload]) -> Result<Inde
 /// `--skip-vector-index` only — via [`legacy_filter_only`].
 pub fn implemented(engine_type: &str) -> &'static [Workload] {
     match engine_type {
-        "redis" | "opensearch" => &[Workload::Vector, Workload::FilterOnly, Workload::Fulltext],
+        "redis" | "opensearch" => &[
+            Workload::Vector,
+            Workload::Hybrid,
+            Workload::FilterOnly,
+            Workload::Fulltext,
+        ],
         _ => &[Workload::Vector],
     }
 }
@@ -267,7 +272,7 @@ pub fn captures(engine_type: &str, workload: Workload) -> bool {
         (engine_type, workload),
         (
             "redis" | "opensearch",
-            Workload::Vector | Workload::FilterOnly | Workload::Fulltext
+            Workload::Vector | Workload::Hybrid | Workload::FilterOnly | Workload::Fulltext
         )
     )
 }
@@ -282,7 +287,7 @@ pub fn check_capture(plan: &WorkloadPlan) -> Result<(), String> {
     {
         Some(w) => Err(format!(
             "--dump-results: engine '{}' does not capture per-query results for workload \
-             \"{w}\"; per-query capture exists for redis and opensearch (vector, filter-only, fulltext)",
+             \"{w}\"; per-query capture exists for redis and opensearch (vector, hybrid, filter-only, fulltext)",
             plan.engine_type
         )),
         None => Ok(()),
@@ -570,11 +575,6 @@ mod tests {
 
     #[test]
     fn unimplemented_combinations_are_hard_errors() {
-        // No engine has hybrid yet: refused, not run as vector.
-        for engine in ["redis", "opensearch", "qdrant"] {
-            let e = plan(engine, &[Some(Workload::Hybrid)], false).unwrap_err();
-            assert!(e.contains("not implemented"), "{e}");
-        }
         // Fulltext exists on Redis and OpenSearch only (#339).
         for engine in ["valkey", "mongodb", "qdrant", "elasticsearch"] {
             let e = plan(engine, &[Some(Workload::Fulltext)], false).unwrap_err();
@@ -586,6 +586,16 @@ mod tests {
                 "{engine}"
             );
         }
+        // Hybrid exists on Redis and OpenSearch only (#341).
+        for engine in ["redis", "opensearch"] {
+            assert!(plan(engine, &[Some(Workload::Hybrid)], false).is_ok());
+        }
+        for engine in ["valkey", "mongodb", "qdrant", "elasticsearch"] {
+            let e = plan(engine, &[Some(Workload::Hybrid)], false).unwrap_err();
+            assert!(e.contains("not implemented"), "{e}");
+        }
+        // Hybrid shares the vector layout, so it may sit beside vector configs.
+        assert!(plan("redis", &[None, Some(Workload::Hybrid)], false).is_ok());
         // Filter-only only where an arm exists.
         assert!(plan("qdrant", &[Some(Workload::FilterOnly)], false).is_err());
         assert!(plan("qdrant", &[None], true).is_err());
@@ -667,10 +677,12 @@ mod tests {
         for legacy in ["valkey", "mongodb"] {
             assert!(check_capture(&plan(legacy, &[None], true).unwrap()).is_err());
         }
-        // #339: fulltext captures on Redis and OpenSearch, hybrid nowhere.
+        // #339 / #341: fulltext and hybrid capture on Redis and OpenSearch.
         for engine in ["redis", "opensearch"] {
             assert!(captures(engine, Workload::Fulltext), "{engine}");
-            assert!(!captures(engine, Workload::Hybrid), "{engine}");
+            assert!(captures(engine, Workload::Hybrid), "{engine}");
+            let hy = plan(engine, &[Some(Workload::Hybrid)], false).unwrap();
+            assert!(check_capture(&hy).is_ok(), "{engine}");
             let ft = plan(engine, &[Some(Workload::Fulltext)], false).unwrap();
             assert!(check_capture(&ft).is_ok(), "{engine}");
         }
@@ -738,6 +750,57 @@ mod tests {
         }
         // The flag is still "every config is filter-only", never a mix.
         assert!(plan("redis", &[Some(Workload::Fulltext)], true).is_err());
+    }
+
+    /// #341 x #344: hybrid needs the vector index, so on its own or beside
+    /// vector / fulltext it plans `vector`, and beside filter-only it plans the
+    /// shared `full` layout (Redis and OpenSearch only). A ratio with updates
+    /// refuses it like every other non-vector workload, on either layout.
+    #[test]
+    fn hybrid_plans_the_vector_layout_and_mixes_into_full() {
+        use Workload::*;
+        for engine in ["redis", "opensearch"] {
+            let p = plan(engine, &[Some(Hybrid)], false).unwrap();
+            assert_eq!(p.layout, IndexLayout::Vector, "{engine}");
+            let p = plan(engine, &[None, Some(Hybrid)], false).unwrap();
+            assert_eq!(p.layout, IndexLayout::Vector, "{engine}");
+            assert_eq!(p.workloads, vec![Vector, Hybrid]);
+            let p = plan(engine, &[Some(Hybrid), Some(Fulltext)], false).unwrap();
+            assert_eq!(p.layout, IndexLayout::Vector, "{engine}");
+            for mix in [
+                vec![Some(Hybrid), Some(FilterOnly)],
+                vec![Some(FilterOnly), Some(Hybrid)],
+                vec![None, Some(Hybrid), Some(FilterOnly)],
+            ] {
+                let p = plan(engine, &mix, false).unwrap();
+                assert_eq!(p.layout, IndexLayout::Full, "{engine} {mix:?}");
+                assert!(p.workloads.iter().all(|w| p.layout.serves(*w)));
+            }
+            // The flag means "every config is filter-only": never with hybrid.
+            assert!(plan(engine, &[Some(Hybrid)], true).is_err());
+            assert!(captures(engine, Hybrid));
+
+            let ratio = |mix: &[Option<Workload>]| {
+                check_update_search_ratio(&plan(engine, mix, false).unwrap(), true)
+            };
+            let e = ratio(&[None, Some(Hybrid)]).unwrap_err();
+            assert!(e.contains("search config #1 is \"hybrid\""), "{e}");
+            let e = ratio(&[Some(Hybrid), Some(FilterOnly)]).unwrap_err();
+            assert!(e.contains("search config #0 is \"hybrid\""), "{e}");
+            let e = ratio(&[Some(Hybrid)]).unwrap_err();
+            assert!(e.contains("search config #0 is \"hybrid\""), "{e}");
+            // Pure search (`0:S`) runs no mixed phase.
+            check_update_search_ratio(&plan(engine, &[Some(Hybrid)], false).unwrap(), false)
+                .unwrap();
+        }
+        assert!(IndexLayout::Vector.serves(Hybrid));
+        assert!(IndexLayout::Full.serves(Hybrid));
+        assert!(!IndexLayout::NoVector.serves(Hybrid));
+        // Hybrid exists only where `full` can be built, so no engine plans a
+        // hybrid + filter-only mix it cannot serve.
+        for engine in ["qdrant", "valkey", "mongodb", "elasticsearch"] {
+            assert!(plan(engine, &[Some(Hybrid), Some(FilterOnly)], false).is_err());
+        }
     }
 
     #[test]

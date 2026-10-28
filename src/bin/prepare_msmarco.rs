@@ -26,6 +26,10 @@
 //! * `filter_queries.jsonl` — the filter-only query set over the derived
 //!   exact-match fields (`msmarco::derived`), with each query's exact
 //!   `expected_count` on this corpus.
+//! * `hybrid_queries.jsonl` — the hybrid (prefilter + KNN) query set
+//!   (`msmarco::hybrid`): every query vector paired with a predicate over the
+//!   derived fields and/or a `title` text match, at ~50/10/1/0.1%
+//!   selectivity, with the brute-forced top-1000 over the matching rows.
 //! * `PREPARED.json`  — provenance: source repo, sizes, and the verification
 //!   statistics from the pass described below.
 //!
@@ -162,6 +166,14 @@ struct Args {
     #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "force"])]
     add_derived_fields: bool,
 
+    /// Upgrade an ALREADY prepared dataset (with derived fields) in place: write
+    /// `hybrid_queries.jsonl` — predicates, exact matching counts and the
+    /// brute-forced filtered top-1000 — from the corpus on disk, without the
+    /// 259 GB rescan. `vectors.npy`, `payloads.jsonl` and `tests.jsonl` are
+    /// read, never rewritten.
+    #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "force", "add_derived_fields"])]
+    add_hybrid_queries: bool,
+
     /// Hugging Face token, for rate-limited or gated access. Also read from
     /// `HF_TOKEN`.
     #[arg(long, env = "HF_TOKEN", hide_env_values = true)]
@@ -185,6 +197,9 @@ fn run(args: &Args) -> Result<(), String> {
     }
     if args.add_derived_fields {
         return add_derived_fields(args);
+    }
+    if args.add_hybrid_queries {
+        return add_hybrid_queries(args);
     }
     let dataset = args
         .dataset
@@ -212,6 +227,19 @@ fn run(args: &Args) -> Result<(), String> {
             "{} holds a {} corpus prepared before the derived exact-match fields existed (no \
              {FILTER_QUERIES}). Upgrade it in place with --add-derived-fields; pass --force only \
              to rebuild from the full 259 GB corpus.",
+            dir.display(),
+            variant.dataset_name
+        ));
+    }
+    if !args.force
+        && dir.join(FILTER_QUERIES).exists()
+        && !dir.join(HYBRID_QUERIES).exists()
+        && has_corpus_files(&dir, variant)
+    {
+        return Err(format!(
+            "{} holds a {} corpus prepared before the hybrid query set existed (no \
+             {HYBRID_QUERIES}). Add it in place with --add-hybrid-queries; pass --force only to \
+             rebuild from the full 259 GB corpus.",
             dir.display(),
             variant.dataset_name
         ));
@@ -313,13 +341,27 @@ fn run(args: &Args) -> Result<(), String> {
     let ranked = brute_force_ground_truth(&dir, variant, &queries)?;
     let stats = verify(variant.limit, &queries, &ranked, &docid_at)?;
     write_tests(&dir, &queries, &ranked)?;
+
+    // The hybrid query set, read back from the staged payloads / vectors /
+    // tests just written — the same bytes the engines will load.
+    let hybrid = msmarco::hybrid::prepare(
+        &msmarco::hybrid::HybridInputs {
+            payloads: staged(&dir, "payloads.jsonl"),
+            vectors: staged(&dir, "vectors.npy"),
+            tests: staged(&dir, "tests.jsonl"),
+        },
+        Some(variant.limit),
+    )?;
+    msmarco::hybrid::write_rows(&staged(&dir, HYBRID_QUERIES), &hybrid.rows)?;
+    let mut extra_manifest = msmarco::derived::manifest_entry(&derived, &filter_rows);
+    merge_object(&mut extra_manifest, &hybrid.manifest)?;
     write_manifest(
         &dir,
         variant,
         &stats,
         &queries,
         &max_field_bytes,
-        &msmarco::derived::manifest_entry(&derived, &filter_rows),
+        &extra_manifest,
     )?;
     publish(&dir, &OUTPUTS)?;
 
@@ -352,13 +394,20 @@ const COMPLETE_MARKER: &str = "COMPLETE";
 /// The filter-only query set over the derived fields.
 const FILTER_QUERIES: &str = msmarco::derived::FILTER_QUERIES_FILE;
 
-const OUTPUTS: [&str; 5] = [
+/// The hybrid (prefilter + KNN) query set with its filtered ground truth.
+const HYBRID_QUERIES: &str = vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE;
+
+const OUTPUTS: [&str; 6] = [
     "vectors.npy",
     "payloads.jsonl",
     FILTER_QUERIES,
     "tests.jsonl",
+    HYBRID_QUERIES,
     "PREPARED.json",
 ];
+
+/// What `--add-hybrid-queries` writes.
+const HYBRID_OUTPUTS: [&str; 2] = [HYBRID_QUERIES, "PREPARED.json"];
 
 /// What `--add-derived-fields` rewrites. `vectors.npy` and `tests.jsonl` are
 /// left alone.
@@ -413,6 +462,7 @@ fn is_complete(dir: &Path, variant: &Variant) -> bool {
     // mid-publish leaves a directory that does NOT read as complete.
     dir.join(COMPLETE_MARKER).exists()
         && dir.join(FILTER_QUERIES).exists()
+        && dir.join(HYBRID_QUERIES).exists()
         && has_corpus_files(dir, variant)
 }
 
@@ -615,6 +665,28 @@ fn verify_prepared(args: &Args) -> Result<(), String> {
         summary.queries,
         summary.min_count,
         summary.max_count
+    );
+
+    // The hybrid query set: regenerated from the corpus on disk (predicates,
+    // exact counts AND the brute-forced filtered top-1000) and compared row by
+    // row. A full brute-force pass, so this is the slow local step.
+    let regenerated = msmarco::hybrid::prepare(
+        &msmarco::hybrid::HybridInputs::in_dir(&dir),
+        Some(variant.limit),
+    )?;
+    let on_disk = vector_db_benchmark::hybrid::read_rows(&dir.join(HYBRID_QUERIES))?;
+    let hybrid = msmarco::hybrid::check_rows(&regenerated.rows, &on_disk)?;
+    println!(
+        "{}: {} hybrid queries match their regenerated predicates, counts and filtered ground \
+         truth (per bucket: {}).",
+        variant.dataset_name,
+        hybrid.queries,
+        hybrid
+            .per_bucket
+            .iter()
+            .map(|(b, n)| format!("{b} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     let client = http_client()?;
@@ -1682,6 +1754,78 @@ fn add_derived_fields(args: &Args) -> Result<(), String> {
             r["shape"].as_str().unwrap_or_default(),
             r["expected_count"].as_u64().unwrap_or_default(),
             r["conditions"]
+        );
+    }
+    Ok(())
+}
+
+/// `--add-hybrid-queries`: write `hybrid_queries.jsonl` for an already
+/// prepared corpus and record it in `PREPARED.json`. Staged and published
+/// like a build, so an interruption leaves the previous corpus intact.
+fn add_hybrid_queries(args: &Args) -> Result<(), String> {
+    let dataset = args
+        .dataset
+        .as_deref()
+        .ok_or("--dataset is required with --add-hybrid-queries")?;
+    let variant =
+        msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
+    let dir = args.out_dir.join(variant.dir);
+    if !has_corpus_files(&dir, variant) {
+        return Err(format!(
+            "{} does not hold a complete {} corpus to upgrade",
+            dir.display(),
+            variant.dataset_name
+        ));
+    }
+    if !dir.join(FILTER_QUERIES).exists() {
+        return Err(format!(
+            "{} has no derived fields yet; run --add-derived-fields first",
+            dir.display()
+        ));
+    }
+    for name in HYBRID_OUTPUTS {
+        let _ = std::fs::remove_file(staged(&dir, name));
+    }
+    let started = Instant::now();
+    let hybrid = msmarco::hybrid::prepare(
+        &msmarco::hybrid::HybridInputs::in_dir(&dir),
+        Some(variant.limit),
+    )?;
+    msmarco::hybrid::write_rows(&staged(&dir, HYBRID_QUERIES), &hybrid.rows)?;
+
+    let manifest_path = dir.join("PREPARED.json");
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("read {}: {e}", manifest_path.display()))?,
+    )
+    .map_err(|e| format!("parse {}: {e}", manifest_path.display()))?;
+    merge_object(&mut manifest, &hybrid.manifest)?;
+    merge_object(
+        &mut manifest,
+        &serde_json::json!({"hybrid_queries_added_at": chrono::Utc::now().to_rfc3339()}),
+    )?;
+    write_manifest_value(&dir, &manifest)?;
+    publish(&dir, &HYBRID_OUTPUTS)?;
+
+    println!(
+        "Wrote {} hybrid queries to {} in {:.1}s.",
+        hybrid.rows.len(),
+        dir.join(HYBRID_QUERIES).display(),
+        started.elapsed().as_secs_f64()
+    );
+    let m = &hybrid.manifest["hybrid_queries"];
+    println!(
+        "  text terms: common {} , rare {}",
+        m["text_match"]["common_term"], m["text_match"]["rare_term"]
+    );
+    for p in m["predicates"].as_array().into_iter().flatten() {
+        println!(
+            "  {} {:<5} {:<15} {:>9}  {}",
+            p["predicate_id"].as_str().unwrap_or_default(),
+            p["bucket"].as_str().unwrap_or_default(),
+            p["shape"].as_str().unwrap_or_default(),
+            p["matching_count"].as_u64().unwrap_or_default(),
+            p["conditions"]
         );
     }
     Ok(())

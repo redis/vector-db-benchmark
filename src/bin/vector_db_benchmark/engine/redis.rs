@@ -173,6 +173,23 @@ pub struct RedisEngine {
     /// server started — failing a search in which nothing actually failed. This
     /// flag disambiguates so `search()` can prime the baseline exactly once.
     commandstats_primed: bool,
+    /// One hybrid bucket pass (#341), consumed by the next `search()` in place
+    /// of the dataset's vector query set. Set only by `search_hybrid`, which
+    /// calls `search()` immediately; `take()`n at the single read site so it
+    /// can never leak into a later vector run.
+    hybrid_pass: Option<HybridPass>,
+    /// The `HYBRID_POLICY` the last `search()` actually sent for a hybrid
+    /// pass — what the post-pass `FT.PROFILE` replays, so the profile checks
+    /// the timed commands rather than the configuration.
+    hybrid_policy_sent: Option<String>,
+}
+
+/// The query subset, filters and request options of one hybrid bucket pass.
+struct HybridPass {
+    queries: Vec<Vec<f32>>,
+    neighbors: Vec<Vec<i64>>,
+    filters: Vec<QueryFilter<ParsedFilter>>,
+    policy: String,
 }
 
 impl RedisEngine {
@@ -324,6 +341,8 @@ impl RedisEngine {
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             commandstats_baseline: None,
             commandstats_primed: false,
+            hybrid_pass: None,
+            hybrid_policy_sent: None,
         })
     }
 
@@ -2136,6 +2155,231 @@ fn prime_datetime_fields(schema: Option<&serde_json::Value>) -> HashSet<String> 
 
 // ── Engine trait implementation ──────────────────────────────────────────
 
+/// The hybrid workload (#341).
+impl RedisEngine {
+    /// One timed KNN pass per selectivity bucket over the dataset's hybrid
+    /// query set, through the vector arm's own loop (`search()` with
+    /// `hybrid_pass` set). Every predicate is checked to have survived the
+    /// filter builder intact; `HYBRID_POLICY` is explicit when configured
+    /// (`hybrid_policy` search knob, or `REDIS_HYBRID_POLICY`). After each
+    /// pass a fixed sample of the bucket — the first
+    /// `hybrid::PROFILE_SAMPLE_PER_PREDICATE` queries of each predicate — is
+    /// `FT.PROFILE`d (outside the timed window) with the policy the pass sent,
+    /// and the vector search mode every shard reports is recorded — and must
+    /// match the configured policy.
+    fn search_hybrid_buckets(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        use vector_db_benchmark::hybrid as hy;
+        if self.config.skip_vector_index {
+            return Err("hybrid search requested on an index built without a vector field".into());
+        }
+        let top = hy::check_params(
+            params.top,
+            params.target_qps,
+            params.duration_seconds,
+            num_queries,
+        )?;
+        // Also resolved at startup (experiment.rs), before anything is
+        // downloaded or connected; resolved again here from the same inputs.
+        let policy = hy::resolve_redis_policy(
+            params.knob("hybrid_policy"),
+            &crate::effective_config::env_or("REDIS_HYBRID_POLICY", ""),
+        )?;
+        crate::effective_config::record_effective("hybrid_policy", policy.unwrap_or("unset"));
+
+        let set = dataset.read_hybrid_query_set()?;
+        for (i, p) in set.predicates.iter().enumerate() {
+            hy::validate_against_schema(p, dataset.config.schema.as_ref())
+                .map_err(|e| format!("{}: {e}", set.meta[i].query_id))?;
+        }
+        let parsed: Vec<QueryFilter<ParsedFilter>> =
+            set.conditions.resolve_all("Redis", parse_conditions)?;
+        for (i, f) in parsed.iter().enumerate() {
+            let filter = f.as_ref().ok_or_else(|| {
+                format!("{}: hybrid query without a filter", set.meta[i].query_id)
+            })?;
+            check_hybrid_filter(&set.predicates[i], filter)
+                .map_err(|e| format!("{}: {e}", set.meta[i].query_id))?;
+        }
+        record_numeric_range_encoding(&parsed);
+
+        let text_match = serde_json::json!({
+            "rule": vector_db_benchmark::msmarco::text_match::RULE_VERSION,
+            "redis": "@field:($term), FT.SEARCH ... VERBATIM (no stemming expansion)",
+        });
+        let engine_note = serde_json::json!({
+            "hybrid_policy": policy.unwrap_or("unset (Redis chooses per query)"),
+            "verbatim": true,
+            "mode_source": format!(
+                "FT.PROFILE of a fixed sample (the first {} queries of each predicate) after \
+                 each bucket's timed pass, with the policy the pass sent; one mode per shard",
+                hy::PROFILE_SAMPLE_PER_PREDICATE
+            ),
+        });
+        let ef = resolve_ef(params);
+        let policy_str = policy.unwrap_or("").to_string();
+        crate::engine::run_hybrid_buckets(&set, top, text_match, engine_note, |_, subset| {
+            let filters: Vec<QueryFilter<ParsedFilter>> =
+                subset.iter().map(|&i| parsed[i].clone()).collect();
+            let queries: Vec<Vec<f32>> = subset.iter().map(|&i| set.queries[i].clone()).collect();
+            self.hybrid_pass = Some(HybridPass {
+                queries: queries.clone(),
+                neighbors: subset.iter().map(|&i| set.neighbors[i].clone()).collect(),
+                filters: filters.clone(),
+                policy: policy_str.clone(),
+            });
+            self.hybrid_policy_sent = None;
+            let r = self.search(dataset, params, num_queries);
+            self.hybrid_pass = None;
+            let r = r?;
+            let sent = self
+                .hybrid_policy_sent
+                .take()
+                .ok_or("search() did not run the hybrid pass it was given")?;
+            // A fixed per-predicate sample, not the whole bucket (profiling
+            // is serial and untimed; a brute-force bucket on 10M would
+            // otherwise take tens of minutes here).
+            let ids: Vec<&str> = subset
+                .iter()
+                .map(|&i| set.meta[i].predicate_id.as_str())
+                .collect();
+            let sample = hy::profile_sample(&ids, hy::PROFILE_SAMPLE_PER_PREDICATE);
+            let sq: Vec<Vec<f32>> = sample.iter().map(|&i| queries[i].clone()).collect();
+            let sf: Vec<QueryFilter<ParsedFilter>> =
+                sample.iter().map(|&i| filters[i].clone()).collect();
+            let (modes, shards) = self.profile_vector_modes(&sq, &sf, top, ef, &sent)?;
+            hy::check_redis_modes(policy, &modes, sq.len() as u64, shards)?;
+            Ok((
+                r,
+                serde_json::json!({
+                    "vector_search_modes": modes,
+                    "profiled_queries": sq.len(),
+                    "profile_sample_per_predicate": hy::PROFILE_SAMPLE_PER_PREDICATE,
+                    "bucket_queries": queries.len(),
+                    "shards": shards,
+                }),
+            ))
+        })
+    }
+
+    /// `FT.PROFILE` each query through the exact command the timed loop sends
+    /// (plus `VERBATIM`) and tally the `Vector search mode` every shard
+    /// reports (one per shard through a cluster coordinator). Returns the
+    /// tally and the shard count, which must be the same for every query.
+    fn profile_vector_modes(
+        &self,
+        queries: &[Vec<f32>],
+        filters: &[QueryFilter<ParsedFilter>],
+        top: usize,
+        ef: i64,
+        hybrid_policy: &str,
+    ) -> Result<(std::collections::BTreeMap<String, u64>, u64), String> {
+        let mut conn = self.get_connection()?;
+        let mut shards: Option<u64> = None;
+        let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
+        let mut modes = std::collections::BTreeMap::new();
+        for (q, f) in queries.iter().zip(filters) {
+            let query_str = build_knn_query_str(&self.config.algorithm, hybrid_policy, f.as_ref());
+            let mut search = build_ft_search_cmd(
+                &self.config.index_name,
+                &encode_vector(&self.config.data_type, q),
+                &query_str,
+                top,
+                ef,
+                &self.config.algorithm,
+                hybrid_policy,
+                query_timeout,
+                f.as_ref(),
+            );
+            search.arg("VERBATIM");
+            let reply: redis::Value = profile_cmd(&search)?
+                .query(&mut conn)
+                .map_err(|e| format!("FT.PROFILE failed: {e}"))?;
+            let mut flat = Vec::new();
+            flatten_reply(&reply, &mut flat);
+            let per_shard = vector_db_benchmark::hybrid::redis_profile_modes(&flat)?;
+            let n = per_shard.len() as u64;
+            if *shards.get_or_insert(n) != n {
+                return Err(format!(
+                    "FT.PROFILE replies disagree on the shard count ({} vs {n})",
+                    shards.unwrap_or_default()
+                ));
+            }
+            for m in per_shard {
+                *modes.entry(m).or_insert(0) += 1;
+            }
+        }
+        Ok((modes, shards.unwrap_or(0)))
+    }
+}
+
+/// The rendered filter must express the predicate structurally
+/// (`hybrid::check_redis_filter`), with its `PARAMS` resolved.
+fn check_hybrid_filter(
+    p: &vector_db_benchmark::msmarco::derived::Predicate,
+    (expr, params): &ParsedFilter,
+) -> Result<(), String> {
+    use vector_db_benchmark::hybrid::RedisParam;
+    let params = params
+        .iter()
+        .map(|(k, v)| {
+            let v = match v {
+                FilterParamValue::Str(s) => RedisParam::Str(s.clone()),
+                FilterParamValue::Int(i) => RedisParam::Num(*i as f64),
+                FilterParamValue::Float(f) => RedisParam::Num(*f),
+            };
+            (k.clone(), v)
+        })
+        .collect();
+    vector_db_benchmark::hybrid::check_redis_filter(p, expr, &params)
+}
+
+/// `FT.SEARCH idx <args...>` -> `FT.PROFILE idx SEARCH QUERY <args...>`.
+fn profile_cmd(search: &redis::Cmd) -> Result<redis::Cmd, String> {
+    let mut args = search.args_iter();
+    match args.next() {
+        Some(redis::Arg::Simple(b"FT.SEARCH")) => {}
+        _ => return Err("profile_cmd expects an FT.SEARCH command".into()),
+    }
+    let mut profile = redis::cmd("FT.PROFILE");
+    match args.next() {
+        Some(redis::Arg::Simple(index)) => profile.arg(index),
+        _ => return Err("FT.SEARCH command has no index".into()),
+    };
+    profile.arg("SEARCH").arg("QUERY");
+    for a in args {
+        match a {
+            redis::Arg::Simple(b) => profile.arg(b),
+            _ => return Err("FT.SEARCH command holds a non-literal arg".into()),
+        };
+    }
+    Ok(profile)
+}
+
+/// Every scalar of a (nested) reply, as strings, in order — what
+/// `hybrid::redis_vector_search_modes` scans for `Vector search mode`.
+fn flatten_reply(v: &redis::Value, out: &mut Vec<String>) {
+    match v {
+        redis::Value::BulkString(b) => out.push(String::from_utf8_lossy(b).into_owned()),
+        redis::Value::SimpleString(s) => out.push(s.clone()),
+        redis::Value::Int(i) => out.push(i.to_string()),
+        redis::Value::Double(d) => out.push(d.to_string()),
+        redis::Value::Array(a) | redis::Value::Set(a) => {
+            a.iter().for_each(|x| flatten_reply(x, out))
+        }
+        redis::Value::Map(m) => m.iter().for_each(|(k, x)| {
+            flatten_reply(k, out);
+            flatten_reply(x, out);
+        }),
+        redis::Value::Attribute { data, .. } => flatten_reply(data, out),
+        _ => {}
+    }
+}
+
 /// Establish the commandstats baseline if configure() did not (issue #238).
 impl RedisEngine {
     /// Idempotent and a no-op on the normal configure -> upload -> search path,
@@ -2404,6 +2648,15 @@ impl Engine for RedisEngine {
         self.search_fulltext_harness(dataset, params, num_queries)
     }
 
+    fn search_hybrid(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_hybrid_buckets(dataset, params, num_queries)
+    }
+
     fn search(
         &mut self,
         dataset: &Dataset,
@@ -2431,21 +2684,33 @@ impl Engine for RedisEngine {
 
         let ef = resolve_ef(params);
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let hybrid_policy = crate::effective_config::env_or("REDIS_HYBRID_POLICY", "");
         let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
 
-        // Read queries, ground truth, and filter conditions
-        let query_path = dataset.get_path()?;
-        println!("\tReading queries from {}...", query_path.display());
-        let (queries, neighbors, conditions) = dataset.read_queries()?;
+        // A hybrid bucket pass (#341) brings its own queries, filters and
+        // policy, and sends every FT.SEARCH `VERBATIM` (text predicates must
+        // not be stem-expanded; see `msmarco::text_match`).
+        let verbatim = self.hybrid_pass.is_some();
+        let (queries, neighbors, parsed_filters, hybrid_policy) = match self.hybrid_pass.take() {
+            Some(pass) => {
+                self.hybrid_policy_sent = Some(pass.policy.clone());
+                (pass.queries, pass.neighbors, pass.filters, pass.policy)
+            }
+            None => {
+                let hybrid_policy = crate::effective_config::env_or("REDIS_HYBRID_POLICY", "");
+                // Read queries, ground truth, and filter conditions
+                let query_path = dataset.get_path()?;
+                println!("\tReading queries from {}...", query_path.display());
+                let (queries, neighbors, conditions) = dataset.read_queries()?;
+                // Parse all conditions up front (before timing begins)
+                let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+                    conditions.resolve_all("Redis", parse_conditions)?;
+                record_numeric_range_encoding(&parsed_filters);
+                (queries, neighbors, parsed_filters, hybrid_policy)
+            }
+        };
         if queries.is_empty() {
             return Err("dataset contains no search queries".to_string());
         }
-
-        // Parse all conditions up front (before timing begins)
-        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
-            conditions.resolve_all("Redis", parse_conditions)?;
-        record_numeric_range_encoding(&parsed_filters);
 
         // When top is explicitly set, use it for all queries.
         // When not set, use per-query ground truth count (matches Python v0 behavior
@@ -2595,7 +2860,7 @@ impl Engine for RedisEngine {
                     // effort: errors are ignored and its sample is NOT recorded.
                     {
                         let prime_top = explicit_top.unwrap_or(10);
-                        let prime_cmd = build_ft_search_cmd(
+                        let mut prime_cmd = build_ft_search_cmd(
                             index_name,
                             &encoded_queries[0],
                             &query_strs[0],
@@ -2606,6 +2871,9 @@ impl Engine for RedisEngine {
                             query_timeout,
                             parsed_filters[0].as_ref(),
                         );
+                        if verbatim {
+                            prime_cmd.arg("VERBATIM");
+                        }
                         let _ = exec_ft_search(&mut conn, &prime_cmd);
                     }
 
@@ -2670,7 +2938,7 @@ impl Engine for RedisEngine {
                         // Build the FT.SEARCH command OUTSIDE the timer — pure
                         // client-side arg assembly on precomputed inputs (blob,
                         // query string, resolved index name). `top` is known here.
-                        let cmd = build_ft_search_cmd(
+                        let mut cmd = build_ft_search_cmd(
                             index_name,
                             &encoded_queries[query_pos],
                             &query_strs[query_pos],
@@ -2681,6 +2949,9 @@ impl Engine for RedisEngine {
                             query_timeout,
                             parsed_filters[query_pos].as_ref(),
                         );
+                        if verbatim {
+                            cmd.arg("VERBATIM");
+                        }
 
                         // Timed window: ONLY the RPC round-trip + reply parse,
                         // matching the Vertex engine's boundary.
@@ -4420,5 +4691,40 @@ mod tests {
     fn exact_match_array_value_is_none() {
         // A non-scalar (array) value matches no scalar arm → dropped → None.
         assert!(exact_q(serde_json::json!({"value":[1,2]})).is_none());
+    }
+}
+
+/// #341: every hybrid predicate the MS MARCO generator emits renders, through
+/// the real builder, to an expression the structural check accepts — so a
+/// builder regression (e.g. `or` emitted as implicit AND) is a test failure,
+/// not a recall dip.
+#[cfg(test)]
+mod hybrid_filter_tests {
+    use super::*;
+    use vector_db_benchmark::msmarco::derived::Predicate;
+    use vector_db_benchmark::msmarco::hybrid::{templates, TextTerms};
+
+    #[test]
+    fn the_builder_renders_every_hybrid_predicate_structurally() {
+        let terms = TextTerms {
+            common: ("quora".into(), 1),
+            rare: ("ancient".into(), 1),
+        };
+        let mut cases: Vec<serde_json::Value> = templates(&terms)
+            .into_iter()
+            .map(|t| t.conditions)
+            .collect();
+        // Shapes the generator does not emit today but the grammar allows.
+        cases.push(serde_json::json!({"and":[{"tier":{"match":{"any":[1,3]}}}]}));
+        cases.push(serde_json::json!({"and":[{"tier":{"match":{"value":3}}}]}));
+        cases.push(
+            serde_json::json!({"or":[{"and":[{"category":{"match":{"value":"cat00"}}},
+            {"tier":{"range":{"gt":2,"lte":7}}}]},{"title":{"match":{"text":"quora"}}}]}),
+        );
+        for c in cases {
+            let p = Predicate::compile(&c).unwrap();
+            let f = parse_conditions(&c).expect("builder renders a filter");
+            check_hybrid_filter(&p, &f).unwrap_or_else(|e| panic!("{c}: {e}"));
+        }
     }
 }

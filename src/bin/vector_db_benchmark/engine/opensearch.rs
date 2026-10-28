@@ -71,6 +71,17 @@ pub struct OpenSearchEngine {
     rt: tokio::runtime::Runtime,
     /// Shared OpenSearch client
     client: Arc<OpenSearch>,
+    /// One hybrid bucket pass (#341), consumed by the next `search_impl` in
+    /// place of the dataset's vector query set. Set only by `search_hybrid`
+    /// right before it calls `search_impl`; `take()`n at the read site.
+    hybrid_pass: Option<HybridPass>,
+}
+
+/// The query subset and its (already checked) filters for one hybrid pass.
+struct HybridPass {
+    queries: Vec<Vec<f32>>,
+    neighbors: Vec<Vec<i64>>,
+    filters: Vec<QueryFilter<serde_json::Value>>,
 }
 
 impl OpenSearchEngine {
@@ -156,6 +167,7 @@ impl OpenSearchEngine {
             base_url,
             rt,
             client: Arc::new(client),
+            hybrid_pass: None,
         })
     }
 
@@ -1751,6 +1763,29 @@ fn extract_knn_hits(resp_body: &serde_json::Value) -> Result<Vec<(i64, f64)>, St
 // ── Engine trait implementation ──────────────────────────────────────────
 
 impl OpenSearchEngine {
+    /// Sum over nodes of the k-NN plugin's `knn_query_with_filter_requests`.
+    fn knn_filter_requests(&self) -> Result<u64, String> {
+        let body: serde_json::Value = self
+            .rt
+            .block_on(async {
+                self.client
+                    .send(
+                        opensearch::http::Method::Get,
+                        "/_plugins/_knn/stats",
+                        opensearch::http::headers::HeaderMap::new(),
+                        None::<&()>,
+                        None::<JsonBody<serde_json::Value>>,
+                        None,
+                    )
+                    .await?
+                    .error_for_status_code()?
+                    .json::<serde_json::Value>()
+                    .await
+            })
+            .map_err(|e| format!("k-NN stats request failed: {e}"))?;
+        vector_db_benchmark::hybrid::opensearch_filter_requests(&body)
+    }
+
     /// The KNN and filter-only search loop. One loop for both so the two
     /// workloads share the timing boundary, priming and retry accounting.
     fn search_impl(
@@ -1773,28 +1808,39 @@ impl OpenSearchEngine {
             None
         };
 
-        let query_path = dataset.get_path()?;
-        println!("\tReading queries from {}...", query_path.display());
-        // Filter-only runs the dataset's filter query set (the prepared
-        // `filter_queries.jsonl` when it ships one, #340) and needs no vectors.
-        let (query_set, mut queries, mut neighbors, mut parsed_filters) = if filter_only {
-            let set = dataset.filter_only_queries()?;
-            let parsed: Vec<QueryFilter<serde_json::Value>> =
-                set.try_resolve_all("OpenSearch", |condition| {
-                    vector_db_benchmark::filter_only::domain::validate_predicate(
-                        condition,
-                        index_schema.as_ref(),
-                    )?;
-                    Ok(parse_os_conditions(condition))
-                })?;
-            let n = set.len();
-            (Some(set), vec![Vec::new(); n], vec![Vec::new(); n], parsed)
-        } else {
-            let (queries, neighbors, conditions) = dataset.read_queries()?;
-            let parsed: Vec<QueryFilter<serde_json::Value>> = conditions
-                .try_resolve_all("OpenSearch", |condition| Ok(parse_os_conditions(condition)))?;
-            (None, queries, neighbors, parsed)
-        };
+        // A hybrid bucket pass (#341) brings its own queries and filters.
+        // Otherwise filter-only runs the dataset's filter query set (the
+        // prepared `filter_queries.jsonl` when it ships one, #340) and needs no
+        // vectors, and KNN reads the dataset's queries.
+        let (query_set, mut queries, mut neighbors, mut parsed_filters) =
+            match self.hybrid_pass.take() {
+                Some(pass) if !filter_only => (None, pass.queries, pass.neighbors, pass.filters),
+                Some(_) => return Err("a hybrid pass reached the filter-only loop".into()),
+                None => {
+                    let query_path = dataset.get_path()?;
+                    println!("\tReading queries from {}...", query_path.display());
+                    if filter_only {
+                        let set = dataset.filter_only_queries()?;
+                        let parsed: Vec<QueryFilter<serde_json::Value>> =
+                            set.try_resolve_all("OpenSearch", |condition| {
+                                vector_db_benchmark::filter_only::domain::validate_predicate(
+                                    condition,
+                                    index_schema.as_ref(),
+                                )?;
+                                Ok(parse_os_conditions(condition))
+                            })?;
+                        let n = set.len();
+                        (Some(set), vec![Vec::new(); n], vec![Vec::new(); n], parsed)
+                    } else {
+                        let (queries, neighbors, conditions) = dataset.read_queries()?;
+                        let parsed: Vec<QueryFilter<serde_json::Value>> = conditions
+                            .try_resolve_all("OpenSearch", |condition| {
+                                Ok(parse_os_conditions(condition))
+                            })?;
+                        (None, queries, neighbors, parsed)
+                    }
+                }
+            };
 
         // Dataset query index of each position below (identity for KNN; the
         // selected, cycled predicates for filter-only), so per-query records name
@@ -2522,6 +2568,92 @@ impl Engine for OpenSearchEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         self.search_fulltext_impl(dataset, params, num_queries)
+    }
+
+    /// The hybrid workload (#341): lucene `knn` with the predicate as its
+    /// `filter` (efficient filtering, explicit `k` = `top`), one timed pass per
+    /// selectivity bucket through the vector arm's own loop. Every predicate
+    /// is checked to have been rendered exactly (`hybrid::check_opensearch_filter`)
+    /// and, per pass, the k-NN plugin's `knn_query_with_filter_requests`
+    /// counter must grow by at least the number of ANSWERED queries
+    /// (requested - failed; a cluster-wide lower bound). Whether
+    /// Lucene fell back to exact search for a query is NOT observable from
+    /// OpenSearch (neither the stats API nor `profile` reports it); the report
+    /// says so instead of guessing.
+    fn search_hybrid(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        use vector_db_benchmark::hybrid as hy;
+        if self.config.skip_vector_index {
+            return Err("hybrid search requested on an index built without a vector field".into());
+        }
+        let top = hy::check_params(
+            params.top,
+            params.target_qps,
+            params.duration_seconds,
+            num_queries,
+        )?;
+        let set = dataset.read_hybrid_query_set()?;
+        let mut filters = Vec::with_capacity(set.meta.len());
+        let parsed: Vec<QueryFilter<serde_json::Value>> = set
+            .conditions
+            .resolve_all("OpenSearch", parse_os_conditions)?;
+        for (i, f) in parsed.into_iter().enumerate() {
+            let id = &set.meta[i].query_id;
+            hy::validate_against_schema(&set.predicates[i], dataset.config.schema.as_ref())
+                .map_err(|e| format!("{id}: {e}"))?;
+            let rendered = f
+                .as_ref()
+                .ok_or_else(|| format!("{id}: hybrid query without a filter"))?;
+            let conditions = hy::conditions_of(&set, i)?;
+            hy::check_opensearch_filter(conditions, rendered).map_err(|e| format!("{id}: {e}"))?;
+            filters.push(f);
+        }
+        let text_match = serde_json::json!({
+            "rule": vector_db_benchmark::msmarco::text_match::RULE_VERSION,
+            "opensearch": "{\"match\": {field: term}} on a default `text` field (standard analyzer)",
+        });
+        let engine_note = serde_json::json!({
+            "method": "lucene knn with `filter` inside the knn clause (efficient filtering), k = top",
+            "exact_search_fallback": "not observable: OpenSearch reports neither per-query nor \
+                                      aggregate Lucene exact-search fallback",
+            "filtered_request_counter": "knn_query_with_filter_requests delta summed over every \
+                                         node: a cluster-wide LOWER BOUND on this run's filtered \
+                                         requests, not isolated from concurrent clients",
+        });
+        crate::engine::run_hybrid_buckets(&set, top, text_match, engine_note, |_, subset| {
+            self.hybrid_pass = Some(HybridPass {
+                queries: subset.iter().map(|&i| set.queries[i].clone()).collect(),
+                neighbors: subset.iter().map(|&i| set.neighbors[i].clone()).collect(),
+                filters: subset.iter().map(|&i| filters[i].clone()).collect(),
+            });
+            // Fetched (and failed on) BEFORE the timed pass: an unreadable
+            // stats endpoint must not cost a full pass first.
+            let before = match self.knn_filter_requests() {
+                Ok(v) => v,
+                Err(e) => {
+                    self.hybrid_pass = None;
+                    return Err(e);
+                }
+            };
+            let r = self.search_impl(false, dataset, params, num_queries);
+            self.hybrid_pass = None;
+            let r = r?;
+            let after = self.knn_filter_requests()?;
+            let delta = after.saturating_sub(before);
+            hy::check_opensearch_filtered_requests(
+                delta,
+                r.requested_queries as u64,
+                r.failed_queries as u64,
+            )?;
+            Ok((
+                r,
+                serde_json::json!({"knn_query_with_filter_requests_delta": delta}),
+            ))
+        })
     }
 
     fn search_filter_only(
@@ -3946,3 +4078,25 @@ mod tests {
 #[cfg(test)]
 #[path = "opensearch_retry_tests.rs"]
 mod scalar_retry_tests;
+
+/// #341: every hybrid predicate the MS MARCO generator emits renders, through
+/// the real builder, to exactly the structure `hybrid::check_opensearch_filter`
+/// requires.
+#[cfg(test)]
+mod hybrid_filter_tests {
+    use super::parse_os_conditions;
+    use vector_db_benchmark::msmarco::hybrid::{templates, TextTerms};
+
+    #[test]
+    fn the_builder_renders_every_hybrid_predicate_structurally() {
+        let terms = TextTerms {
+            common: ("quora".into(), 1),
+            rare: ("ancient".into(), 1),
+        };
+        for t in templates(&terms) {
+            let f = parse_os_conditions(&t.conditions).expect("builder renders a filter");
+            vector_db_benchmark::hybrid::check_opensearch_filter(&t.conditions, &f)
+                .unwrap_or_else(|e| panic!("{}: {e}", t.conditions));
+        }
+    }
+}

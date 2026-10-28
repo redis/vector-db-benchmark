@@ -265,8 +265,9 @@ fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
             false,
             "only applies to OpenSearch",
         ),
+        // Hybrid exists on Redis and OpenSearch (#341), not on Valkey.
         (
-            "opensearch",
+            "valkey",
             json!([{"workload":"hybrid"}]),
             false,
             "not implemented",
@@ -628,7 +629,12 @@ fn update_search_ratio_with_a_non_vector_search_config_fails_before_connecting()
             {"name":"usr-full","engine":"redis","search_params":[
                 {"parallel":1},{"parallel":1,"workload":"filter-only"}]},
             {"name":"usr-text","engine":"opensearch","search_params":[
-                {"parallel":1},{"parallel":1,"workload":"fulltext"}]}
+                {"parallel":1},{"parallel":1,"workload":"fulltext"}]},
+            {"name":"usr-hyb","engine":"redis","search_params":[
+                {"parallel":1},{"parallel":1,"top":10,"workload":"hybrid"}]},
+            {"name":"usr-hyb-full","engine":"opensearch","search_params":[
+                {"parallel":1,"top":10,"workload":"hybrid"},
+                {"parallel":1,"workload":"filter-only"}]}
         ])
         .to_string(),
     )
@@ -653,7 +659,14 @@ fn update_search_ratio_with_a_non_vector_search_config_fails_before_connecting()
             .output()
             .unwrap()
     };
-    for (config, workload) in [("usr-full", "filter-only"), ("usr-text", "fulltext")] {
+    // #341: hybrid beside vector (`vector` layout) and beside filter-only
+    // (`full`) is refused the same way.
+    for (config, index, workload) in [
+        ("usr-full", 1, "filter-only"),
+        ("usr-text", 1, "fulltext"),
+        ("usr-hyb", 1, "hybrid"),
+        ("usr-hyb-full", 0, "hybrid"),
+    ] {
         let output = run(config, "1:10");
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -661,7 +674,7 @@ fn update_search_ratio_with_a_non_vector_search_config_fails_before_connecting()
         assert!(
             stderr.contains(&format!(
                 "config '{config}': --update-search-ratio runs the vector workload in its \
-                 mixed phases, but search config #1 is \"{workload}\""
+                 mixed phases, but search config #{index} is \"{workload}\""
             )),
             "{config}: {stderr}"
         );
@@ -883,4 +896,202 @@ fn fulltext_parity_index_rules_are_refused_at_startup() {
             assert!(!stderr.contains("must-not-download"), "{stderr}");
         }
     }
+}
+
+/// #341: hybrid configuration errors are refused before any engine is built —
+/// no server is running here (a closed loopback port), so reaching configure
+/// or upload would show up as a connection error, not the expected message.
+#[test]
+fn hybrid_misconfiguration_fails_before_configure_or_upload() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let configs = serde_json::json!([
+        {"name": "hyb-redis", "engine": "redis",
+         "search_params": [{"parallel": 1, "top": 10, "workload": "hybrid",
+                            "hybrid_policy": "ADHOC_BF"}]},
+        {"name": "hyb-os", "engine": "opensearch",
+         "search_params": [{"parallel": 1, "top": 10, "workload": "hybrid"}]}
+    ]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let envs = |extra: Option<(&'static str, &'static str)>| {
+        let mut e = vec![
+            ("REDIS_PORT", port.clone()),
+            ("OPENSEARCH_PORT", port.clone()),
+        ];
+        if let Some((k, v)) = extra {
+            e.push((k, v.to_string()));
+        }
+        e
+    };
+    let run = |engine: &str, extra| {
+        let e = envs(extra);
+        let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        common::run_binary_text(&proj.root, engine, "hybrid-test", "127.0.0.1", &e)
+    };
+
+    // 0. --queries N would silently mean N per bucket: refused at startup.
+    {
+        let e = envs(None);
+        let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut cmd = std::process::Command::new(common::binary_path());
+        cmd.args([
+            "--engines",
+            "hyb-os",
+            "--datasets",
+            "hybrid-test",
+            "--host",
+            "127.0.0.1",
+            "--queries",
+            "5",
+        ])
+        .current_dir(&proj.root);
+        for (k, v) in &e {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(!out.status.success());
+        assert!(stderr.contains("--queries 5"), "{stderr}");
+        assert!(!stdout.contains("Running experiment"), "{stdout}");
+    }
+    // 0a. The CLI open-loop flags are merged into search configs only at
+    // search time; Redis passes the duration-bounded engine gate, so they must
+    // still be refused for hybrid at startup, not after the upload.
+    // (--target-qps alone is refused earlier: it needs --search-duration.)
+    for flag in [
+        &["--search-duration", "60"][..],
+        &["--target-qps", "100", "--search-duration", "60"][..],
+    ] {
+        let e = envs(None);
+        let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut cmd = std::process::Command::new(common::binary_path());
+        cmd.args([
+            "--engines",
+            "hyb-redis",
+            "--datasets",
+            "hybrid-test",
+            "--host",
+            "127.0.0.1",
+        ])
+        .args(flag)
+        .current_dir(&proj.root);
+        for (k, v) in &e {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(!out.status.success(), "{flag:?}");
+        assert!(
+            stderr.contains("target_qps / duration_seconds are not supported"),
+            "{flag:?}: {stderr}"
+        );
+        assert!(!stdout.contains("Experiment stage:"), "{flag:?}: {stdout}");
+    }
+    // 0b. A top wider than the narrowest filtered truth (min 10 ids here is
+    // fine; 2000 is wider than any) is refused before configure.
+    {
+        let wide = serde_json::json!([{"name": "hyb-wide", "engine": "opensearch",
+            "search_params": [{"parallel": 1, "top": 2000, "workload": "hybrid"}]}]);
+        std::fs::write(
+            proj.root.join("experiments/configurations/wide.json"),
+            wide.to_string(),
+        )
+        .unwrap();
+        let (ok, stdout, stderr) = run("hyb-wide", None);
+        assert!(!ok);
+        assert!(stderr.contains("top 2000 exceeds"), "{stderr}");
+        assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+        std::fs::remove_file(proj.root.join("experiments/configurations/wide.json")).unwrap();
+    }
+
+    // 0c. Fulltext pins the index's text analyzer, which would change what the
+    // hybrid `title` text predicates match: one engine config mixing the two
+    // is refused (fulltext's mix rule, fed the hybrid query set) before
+    // configure.
+    {
+        let mix = serde_json::json!([{"name": "hyb-ft-mix", "engine": "opensearch",
+        "search_params": [
+            {"parallel": 1, "top": 10, "workload": "hybrid"},
+            {"parallel": 1, "top": 5, "workload": "fulltext"}
+        ]}]);
+        let cfg = proj.root.join("experiments/configurations/mix.json");
+        std::fs::write(&cfg, mix.to_string()).unwrap();
+        let (ok, stdout, stderr) = run("hyb-ft-mix", None);
+        assert!(!ok);
+        assert!(stderr.contains("filter on text fields"), "{stderr}");
+        assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+        std::fs::remove_file(cfg).unwrap();
+    }
+
+    // 0d. `hybrid_policy` where nothing reads it (a Redis vector config, an
+    // OpenSearch hybrid config) is refused while planning, not ignored.
+    {
+        let knob = serde_json::json!([
+            {"name": "knob-redis-vec", "engine": "redis",
+             "search_params": [{"parallel": 1, "top": 10, "hybrid_policy": "ADHOC_BF"}]},
+            {"name": "knob-os-hyb", "engine": "opensearch",
+             "search_params": [{"parallel": 1, "top": 10, "workload": "hybrid",
+                                "hybrid_policy": "ADHOC_BF"}]}
+        ]);
+        let cfg = proj.root.join("experiments/configurations/knob.json");
+        std::fs::write(&cfg, knob.to_string()).unwrap();
+        for engine in ["knob-redis-vec", "knob-os-hyb"] {
+            let (ok, stdout, stderr) = run(engine, None);
+            assert!(!ok, "{engine}");
+            assert!(stderr.contains("silently ignored"), "{engine}: {stderr}");
+            assert!(!stdout.contains("Running experiment"), "{engine}: {stdout}");
+        }
+        std::fs::remove_file(cfg).unwrap();
+    }
+
+    // 1. HYBRID_POLICY conflict: refused while planning, before the loop.
+    let (ok, stdout, stderr) = run("hyb-redis", Some(("REDIS_HYBRID_POLICY", "BATCHES")));
+    assert!(!ok);
+    assert!(stderr.contains("REDIS_HYBRID_POLICY"), "{stderr}");
+    assert!(!stdout.contains("Running experiment"), "{stdout}");
+
+    let ds = proj.root.join("datasets/hybrid-test");
+    let file = ds.join(vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE);
+    let original = std::fs::read_to_string(&file).unwrap();
+
+    // 2. An invalid query set (a row whose bucket contradicts its count).
+    let mut lines: Vec<serde_json::Value> = original
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    lines[0]["bucket"] = serde_json::json!("0.1%");
+    std::fs::write(
+        &file,
+        lines
+            .iter()
+            .map(|l| l.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    for engine in ["hyb-redis", "hyb-os"] {
+        let (ok, stdout, stderr) = run(engine, None);
+        assert!(!ok);
+        assert!(stderr.contains("declared bucket"), "{engine}: {stderr}");
+        assert!(!stdout.contains("Experiment stage:"), "{engine}: {stdout}");
+    }
+
+    // 3. No query set at all (e.g. a corpus from a tarball without it).
+    std::fs::remove_file(&file).unwrap();
+    for engine in ["hyb-redis", "hyb-os"] {
+        let (ok, stdout, stderr) = run(engine, None);
+        assert!(!ok);
+        assert!(
+            stderr.contains("--add-hybrid-queries"),
+            "{engine}: {stderr}"
+        );
+        assert!(!stdout.contains("Experiment stage:"), "{engine}: {stdout}");
+    }
+    std::fs::remove_dir_all(&proj.root).ok();
 }

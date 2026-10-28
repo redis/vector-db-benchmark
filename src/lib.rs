@@ -7,6 +7,7 @@
 //! - `query_filter` - the one door from a dataset's `conditions` JSON to a filter
 //! - `workload` - per-search-config query family and the engine/workload table
 //! - `ingest` - ingestion phases (upload, index wait, total) for the upload results
+//! - `hybrid` - the hybrid (prefilter + KNN) query set, buckets and per-bucket report
 //! - `results_dump` - per-query result records and the `--dump-results` format
 //! - `compare_results` - scores one engine's dumps against a declared reference
 //! - `config` - Redis configuration from environment
@@ -16,6 +17,7 @@ pub mod compare_results;
 pub mod config;
 pub mod filter_only;
 pub mod fulltext;
+pub mod hybrid;
 pub mod ingest;
 pub mod metrics;
 pub mod msmarco;

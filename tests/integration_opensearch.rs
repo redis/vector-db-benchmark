@@ -2289,3 +2289,117 @@ fn os_reuse_refused(
         .send();
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #341: the hybrid workload on OpenSearch — lucene `knn` with the predicate
+/// as its `filter` and an explicit `k`, one timed pass per selectivity bucket,
+/// recall against the brute-forced FILTERED truth per bucket. The k-NN
+/// plugin's filtered-request counter must have grown by at least one per
+/// query in every bucket (the filter reached the k-NN query), and the report
+/// states that Lucene's exact-search fallback is not observable.
+#[test]
+fn test_binary_opensearch_hybrid_per_bucket_recall() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-hyb", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                           "search_params": {"ef": 200}}],
+        "upload_params": {"parallel": 2, "batch_size": 500}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-hyb",
+        "hybrid-test",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_hybrid")
+        ],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    let evidence = common::assert_hybrid_run(&proj, "os-hyb", &dump, 0.8, "vector");
+    for e in &evidence {
+        // Exact on this dedicated single-node container: 12 queries plus one
+        // prime per worker (parallel 2). Production only requires >= answered.
+        assert_eq!(e["knn_query_with_filter_requests_delta"], 14, "{e}");
+    }
+    let results = common::read_results_obj(&proj.root, "os-hyb");
+    assert!(results["hybrid"]["engine"]["exact_search_fallback"]
+        .as_str()
+        .unwrap()
+        .starts_with("not observable"));
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+/// #341 x #344: hybrid and filter-only in ONE engine config share one index,
+/// built once in the `full` layout. Hybrid's filter still reaches the k-NN
+/// query in every bucket; filter-only passes its per-query count gate (and its
+/// requests carry no vector clause, checked before timing); both search files
+/// and the hybrid dump record `full`.
+#[test]
+fn test_binary_opensearch_hybrid_and_filter_only_share_one_full_index() {
+    wait_for_opensearch();
+    let config = "os-hyb-fo";
+    let index = "bench_hybrid_full";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [
+            {"parallel": 2, "top": 10, "workload": "hybrid", "search_params": {"ef": 200}},
+            {"parallel": 2, "top": 10, "workload": "filter-only"}],
+        "upload_params": {"parallel": 2, "batch_size": 500}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let counts = common::add_hybrid_filter_queries(&proj);
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let out = common::run_binary_output(
+        &proj.root,
+        config,
+        "hybrid-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let evidence = common::assert_hybrid_run(&proj, config, &dump, 0.8, "full");
+    for e in &evidence {
+        assert!(
+            e["knn_query_with_filter_requests_delta"].as_u64().unwrap() >= 12,
+            "{e}"
+        );
+    }
+    common::assert_hybrid_mix_filter_only(&proj, config, &stdout, &counts);
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let props = &mapping[index]["mappings"]["properties"];
+    assert_eq!(props["vector"]["type"], "knn_vector", "{props}");
+    assert_eq!(props["title"]["type"], "text", "{props}");
+    assert_eq!(props["category"]["type"], "keyword", "{props}");
+    assert_eq!(props["tier"]["type"], "long", "{props}");
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}

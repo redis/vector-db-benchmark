@@ -1038,9 +1038,12 @@ fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
         // `.read_queries()` on ANY receiver: an engine that names it `ds`
         // rather than `dataset` must not be exempt.
         // `.filter_only_queries()` hands out the same conditions (from the
-        // prepared filter query set when the dataset ships one, #340).
+        // prepared filter query set when the dataset ships one, #340), and the
+        // hybrid query set (#341) carries conditions too: each read must be
+        // resolved exactly like the vector one.
         let reads = count_loose(&src, &[".read_queries()"])
-            + count_loose(&src, &[".filter_only_queries()"]);
+            + count_loose(&src, &[".filter_only_queries()"])
+            + count_loose(&src, &[".read_hybrid_query_set()"]);
         let resolves =
             count_loose(&src, &[".resolve_all("]) + count_loose(&src, &[".try_resolve_all("]);
         assert_eq!(
@@ -1053,7 +1056,9 @@ fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
     }
     assert_eq!(
         (reads_total, resolves_total),
-        (24, 24),
+        // +1 (#340): filter-only's `filter_only_queries`; +2 (#341): the Redis
+        // and OpenSearch hybrid arms' `read_hybrid_query_set`.
+        (26, 26),
         "the read/resolve census changed; confirm the new site is guarded"
     );
 }

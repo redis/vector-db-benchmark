@@ -3737,3 +3737,338 @@ pub fn run_binary_expect_failure(
     assert!(!searched, "a refused run wrote a search result");
     stderr
 }
+
+// ---------------------------------------------------------------------------
+// Hybrid prefilter + KNN (#341)
+// ---------------------------------------------------------------------------
+
+/// Passages in the hybrid fixture: the smallest corpus on which the 0.1%
+/// bucket still matches >= `hybrid::MIN_MATCHES` rows.
+pub const HYBRID_N: usize = 20_000;
+/// Query vectors in the hybrid fixture: 4 per predicate, 12 per bucket.
+pub const HYBRID_QUERIES: usize = 48;
+
+/// A compound dataset shaped like the prepared MS MARCO corpus — real derived
+/// fields, titles with the agreement-safe text terms, cosine vectors — whose
+/// `hybrid_queries.jsonl` is written by the SAME library code
+/// `prepare-msmarco --add-hybrid-queries` runs (`msmarco::hybrid::prepare`).
+pub fn write_msmarco_hybrid_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+) -> MatchAnyProject {
+    use vector_db_benchmark::msmarco::hybrid as mh;
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let ds_dir = root.join("datasets").join(dataset_name);
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+    mh::write_fixture_corpus(&ds_dir, HYBRID_N, 16, HYBRID_QUERIES).unwrap();
+    let prepared = mh::prepare(&mh::HybridInputs::in_dir(&ds_dir), Some(HYBRID_N as u64)).unwrap();
+    mh::write_rows(
+        &ds_dir.join(vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE),
+        &prepared.rows,
+    )
+    .unwrap();
+    let datasets_json = serde_json::json!([{
+        "name": dataset_name,
+        "type": "tar",
+        "path": format!("{}/", dataset_name),
+        "distance": "cosine",
+        "vector_size": 16,
+        "vector_count": HYBRID_N,
+        "schema": {
+            "docid": "keyword", "title": "text", "category": "keyword",
+            "doc_len": "int", "tier": "int", "rand_key": "int"
+        },
+    }]);
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+    MatchAnyProject {
+        root,
+        dataset_name: dataset_name.to_string(),
+        top: TOP,
+        matching_docs: HYBRID_N,
+    }
+}
+
+/// The run published a per-bucket hybrid report (all four buckets, every
+/// query answered, recall@k at least `min_recall` in each), and its dump
+/// carries the bucket as each record's shape, the filtered truth as
+/// `expected`, docids as ids — and `compare-results` derives, per bucket, the
+/// same recall the run published. Returns the per-bucket engine evidence.
+///
+/// `layout` is the index layout the run must record (#344) in the hybrid
+/// search file's `params.index_layout` and in its dump header: `vector` for a
+/// hybrid-only config, `full` when the config also holds filter-only. Other
+/// workloads' search files and dumps in the same run are ignored here.
+pub fn assert_hybrid_run(
+    proj: &MatchAnyProject,
+    config: &str,
+    dump_dir: &Path,
+    min_recall: f64,
+    layout: &str,
+) -> Vec<serde_json::Value> {
+    let docs = search_docs_of_workload(&proj.root, config, "hybrid");
+    assert_eq!(docs.len(), 1, "{config}: one hybrid search file");
+    assert_eq!(
+        docs[0]["params"]["index_layout"], layout,
+        "{config}: {}",
+        docs[0]["params"]
+    );
+    let results = docs[0]["results"].clone();
+    let hybrid = &results["hybrid"];
+    let buckets = hybrid["buckets"]
+        .as_array()
+        .expect("results.hybrid.buckets");
+    let names: Vec<&str> = buckets
+        .iter()
+        .map(|b| b["bucket"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["50%", "10%", "1%", "0.1%"], "{config}");
+    assert_eq!(results["requested_queries"], HYBRID_QUERIES as u64);
+    let mut published = std::collections::HashMap::new();
+    for b in buckets {
+        let name = b["bucket"].as_str().unwrap();
+        assert_eq!(b["requested_queries"], 12, "{config} {name}");
+        assert_eq!(b["failed_queries"], 0, "{config} {name}");
+        let recall = b["mean_recall"].as_f64().unwrap();
+        eprintln!(
+            "{config} bucket {name}: recall@{}={recall:.4} rps={:.1} p50={:.3}ms p90={:.3}ms p99={:.3}ms evidence={}",
+            hybrid["top"],
+            b["rps"].as_f64().unwrap(),
+            b["p50_time"].as_f64().unwrap() * 1e3,
+            b["p90_time"].as_f64().unwrap() * 1e3,
+            b["p99_time"].as_f64().unwrap() * 1e3,
+            b["engine"]
+        );
+        assert!(recall >= min_recall, "{config} {name}: recall {recall}");
+        assert!(b["rps"].as_f64().unwrap() > 0.0);
+        let (p50, p90, p99) = (
+            b["p50_time"].as_f64().unwrap(),
+            b["p90_time"].as_f64().unwrap(),
+            b["p99_time"].as_f64().unwrap(),
+        );
+        assert!(0.0 < p50 && p50 <= p90 && p90 <= p99, "{config} {name}");
+        published.insert(name.to_string(), recall);
+    }
+    // The headline mean is the union of the four passes (12 queries each).
+    let mean: f64 = published.values().sum::<f64>() / 4.0;
+    assert!((results["mean_recall"].as_f64().unwrap() - mean).abs() < 1e-9);
+
+    let rows = vector_db_benchmark::hybrid::read_rows(
+        &proj
+            .root
+            .join("datasets")
+            .join(&proj.dataset_name)
+            .join(vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE),
+    )
+    .unwrap();
+    // Only the hybrid dump: a mixed config also dumps its other workloads.
+    let hybrid_dir = dump_dir.join("hybrid-only");
+    fs::create_dir_all(&hybrid_dir).unwrap();
+    for entry in fs::read_dir(dump_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|x| x == "jsonl") {
+            let dump = vector_db_benchmark::results_dump::read_dump(std::io::BufReader::new(
+                fs::File::open(&path).unwrap(),
+            ))
+            .unwrap();
+            if dump.header.workload.as_str() == "hybrid" {
+                fs::copy(&path, hybrid_dir.join(path.file_name().unwrap())).unwrap();
+            }
+        }
+    }
+    let dumps = read_dumps(&hybrid_dir);
+    assert_eq!(dumps.len(), 1);
+    let d = &dumps[0];
+    assert_eq!(d.header.workload.as_str(), "hybrid");
+    assert_eq!(d.header.index_layout.as_deref(), Some(layout), "{config}");
+    assert_eq!(d.records.len(), HYBRID_QUERIES);
+    for r in &d.records {
+        assert!(r.error.is_none(), "{:?}", r.error);
+        let row = &rows[r.query_id];
+        assert_eq!(r.shape.as_deref(), Some(row.bucket.as_str()));
+        let expected = r.expected.as_ref().expect("hybrid records carry truth");
+        assert_eq!(expected.len(), row.closest_ids.len().min(d.header.top));
+        for id in r.ids.iter().chain(expected) {
+            assert!(id.starts_with("fixture_doc_"), "{id} is not a docid");
+        }
+    }
+    let (ok, report) = run_compare(&hybrid_dir, &hybrid_dir, config);
+    assert!(ok, "self-comparison must pass");
+    let shapes = report["pairs"][0]["shapes"].as_array().unwrap();
+    assert_eq!(shapes.len(), 4);
+    for s in shapes {
+        let name = s["shape"].as_str().unwrap();
+        let recall = s["recall_at_k_reference"].as_f64().unwrap();
+        assert!(
+            (recall - published[name]).abs() < 1e-9,
+            "{config} {name}: dump recall {recall} != published {}",
+            published[name]
+        );
+    }
+    buckets.iter().map(|b| b["engine"].clone()).collect()
+}
+
+/// Every search result file of `config` whose `params.workload` is `workload`.
+pub fn search_docs_of_workload(
+    root: &Path,
+    config: &str,
+    workload: &str,
+) -> Vec<serde_json::Value> {
+    let pattern = glob::Pattern::new(&format!("{config}-*-search-*.json")).unwrap();
+    fs::read_dir(root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| pattern.matches(&p.file_name().unwrap().to_string_lossy()))
+        .map(|p| {
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(p).unwrap()).unwrap()
+        })
+        .filter(|d| d["params"]["workload"] == workload)
+        .collect()
+}
+
+/// Give [`write_msmarco_hybrid_project`]'s corpus a prepared
+/// `filter_queries.jsonl` (#340) over its derived fields, so one engine config
+/// can run hybrid AND filter-only on one shared `full` index (#344). Exact
+/// counts come from the oracle (`msmarco::derived::count_matches`) over the
+/// payloads as written. The full MS MARCO set needs more corpus than the
+/// fixture has (its rarest constant predicate would match nothing at 20K), so
+/// these are four of its shapes at fixture-sized selectivities. Returns the
+/// expected count per query, in file order.
+pub fn add_hybrid_filter_queries(proj: &MatchAnyProject) -> Vec<u64> {
+    use vector_db_benchmark::msmarco::derived::{count_matches, DerivedCorpus, Predicate};
+    let dir = proj.root.join("datasets").join(&proj.dataset_name);
+    let mut corpus = DerivedCorpus::new();
+    for line in fs::read_to_string(dir.join("payloads.jsonl"))
+        .unwrap()
+        .lines()
+    {
+        corpus
+            .push_payload(&serde_json::from_str(line).unwrap())
+            .unwrap();
+    }
+    let cases = [
+        (
+            "tag_eq",
+            serde_json::json!({"and":[{"category":{"match":{"value":"cat03"}}}]}),
+        ),
+        (
+            "numeric_range",
+            serde_json::json!({"and":[{"tier":{"range":{"gte":2,"lte":3}}}]}),
+        ),
+        (
+            "tag_and_range",
+            serde_json::json!({"and":[{"category":{"match":{"any":["cat01","cat07"]}}},{"doc_len":{"range":{"gte":1024}}}]}),
+        ),
+        (
+            "range_or_range",
+            serde_json::json!({"or":[{"tier":{"range":{"lte":0}}},{"doc_len":{"range":{"gte":32768}}}]}),
+        ),
+    ];
+    let mut counts = Vec::new();
+    let mut lines = String::new();
+    for (i, (shape, conditions)) in cases.iter().enumerate() {
+        let n = count_matches(corpus.rows(), &Predicate::compile(conditions).unwrap()).unwrap();
+        assert!(n > 0, "fixture filter query {i} matches nothing");
+        counts.push(n);
+        lines.push_str(
+            &serde_json::json!({
+                "query_id": format!("hyb-filter-{i:03}"), "shape": shape,
+                "conditions": conditions, "expected_count": n, "corpus_size": HYBRID_N,
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+    }
+    fs::write(dir.join("filter_queries.jsonl"), lines).unwrap();
+    counts
+}
+
+/// The filter-only half of a hybrid + filter-only run on one shared `full`
+/// index (#341 x #344): ONE upload for both workloads, stamped `full` and
+/// naming both; the filter-only search file on `full` (params and stats) with
+/// every prepared query's count gate passed and the exact total.
+pub fn assert_hybrid_mix_filter_only(
+    proj: &MatchAnyProject,
+    config: &str,
+    stdout: &str,
+    counts: &[u64],
+) {
+    assert_eq!(
+        stdout.matches("Experiment stage: Upload").count(),
+        1,
+        "one ingest for hybrid and filter-only: {stdout}"
+    );
+    let pattern = glob::Pattern::new(&format!("{config}-*-upload-*.json")).unwrap();
+    let uploads: Vec<serde_json::Value> = fs::read_dir(proj.root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| pattern.matches(&p.file_name().unwrap().to_string_lossy()))
+        .map(|p| serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(uploads.len(), 1, "{config}: one upload file");
+    assert_eq!(uploads[0]["params"]["index_layout"], "full");
+    assert_eq!(
+        uploads[0]["params"]["index_workloads"],
+        serde_json::json!(["hybrid", "filter-only"])
+    );
+    let fo = search_docs_of_workload(&proj.root, config, "filter-only");
+    assert_eq!(fo.len(), 1, "{config}: one filter-only search file");
+    assert_eq!(fo[0]["params"]["index_layout"], "full");
+    let r = &fo[0]["results"];
+    assert_eq!(r["failed_queries"], 0, "{r}");
+    assert_eq!(r["requested_queries"], counts.len() as u64, "{r}");
+    assert_eq!(r["filter_only"]["index_layout"], "full", "{r}");
+    assert_eq!(
+        r["filter_only"]["per_query_counts_checked"],
+        counts.len() as u64,
+        "{r}"
+    );
+    assert_eq!(
+        r["filter_only"]["matched_documents_sum"],
+        counts.iter().sum::<u64>(),
+        "{r}"
+    );
+}
+
+/// Run the benchmark binary; returns (exit ok, stdout, stderr) so a test can
+/// assert WHY a run failed, not only that it did.
+pub fn run_binary_text(
+    root: &Path,
+    engine: &str,
+    dataset: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+) -> (bool, String, String) {
+    let mut cmd = std::process::Command::new(binary_path());
+    cmd.args([
+        "--engines",
+        engine,
+        "--datasets",
+        dataset,
+        "--host",
+        host,
+        "--skip-if-exists",
+        "false",
+    ])
+    .current_dir(root);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run vector-db-benchmark");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}

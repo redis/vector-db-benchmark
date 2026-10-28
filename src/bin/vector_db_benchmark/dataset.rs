@@ -590,6 +590,23 @@ impl Dataset {
         }
     }
 
+    /// The hybrid (prefilter + KNN) query set of a compound dataset (#341):
+    /// `hybrid_queries.jsonl` next to `tests.jsonl`. Not to be confused with
+    /// [`Dataset::read_hybrid_queries`], the dense+sparse layout.
+    pub fn read_hybrid_query_set(
+        &self,
+    ) -> Result<vector_db_benchmark::hybrid::HybridQuerySet, String> {
+        let path = self.get_path()?;
+        if !path.is_dir() {
+            return Err(format!(
+                "dataset '{}' is not a compound directory; the hybrid workload reads {} from one",
+                self.config.name,
+                vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE
+            ));
+        }
+        vector_db_benchmark::hybrid::read_query_set(&path, self.needs_normalization())
+    }
+
     /// Whether this is a sparse-vector dataset (`dataset_type: "sparse"`).
     pub fn is_sparse(&self) -> bool {
         self.config.dataset_type.as_deref() == Some("sparse")

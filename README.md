@@ -319,7 +319,7 @@ or connected (`vector_db_benchmark::workload::plan`), and every measured query
 goes through one function, `engine::search_workload`. An engine/workload pair
 without an implementation is a hard error, never a fallback to `vector`; today
 a declared `filter-only` and `fulltext` exist on Redis and OpenSearch, and
-`hybrid` exists nowhere yet. Valkey and MongoDB keep their legacy filter-only
+`hybrid` on Redis and OpenSearch (see below). Valkey and MongoDB keep their legacy filter-only
 harness reachable only through `--skip-vector-index`, exactly as before; a
 config that declares `filter-only` for them is refused. `--skip-vector-index` is
 kept as an alias for "every search config is `filter-only`" (with its legacy
@@ -430,6 +430,82 @@ filter-only's metadata domain before any result is written — the corpus may
 have been uploaded by a `vector` config, which does not check it. That read
 happens before the ingest clock starts, so it is not counted in any phase.
 
+### Hybrid prefilter + KNN (#341)
+
+`"workload": "hybrid"` runs the dataset's `hybrid_queries.jsonl` (written by
+`prepare-msmarco`; `--add-hybrid-queries` upgrades an existing corpus in place):
+each query vector of `tests.jsonl` paired with a predicate over the derived
+exact-match fields and/or a full-text match on `title`, with the exact number
+of matching rows and the brute-forced top-1000 OVER THOSE ROWS ONLY.
+
+```json
+{"parallel": 8, "top": 10, "workload": "hybrid", "hybrid_policy": "ADHOC_BF", "search_params": {"ef": 128}}
+```
+
+- **Buckets.** Predicates are designed for ~50%, 10%, 1% and 0.1% selectivity
+  and bucketed by their REALIZED selectivity (boundaries at 25% / 2.5% /
+  0.25%). Each bucket runs as its own timed pass, so `results.hybrid.buckets[]`
+  reports a measured QPS, p50/p90/p99 and recall@k against the filtered truth
+  per bucket; the top-level numbers are the union of the passes (total queries
+  over summed pass time, so dominated by the slowest bucket — compare hybrid runs
+  per bucket, not by `results.rps` against vector runs). `top` is required (the
+  truth is up to 1000 wide) and may not exceed the narrowest predicate's
+  filtered truth (refused at startup); open-loop / duration modes and
+  `--queries N` (which would silently apply per bucket) are refused, so a
+  hybrid run always runs the whole query set. A fast
+  bucket's pass can be very short (Redis 0.1% on the 100K corpus: ~420 queries
+  in ~26 ms), so worker start-up and tail drain are a real share of it: each
+  bucket publishes its `total_time` next to `rps`, and sub-100 ms passes should
+  not be compared across runs. With `--repetitions N` (default 3) the kept
+  repetition is the one with the best union `rps`, which the slowest (50%)
+  bucket dominates, so every per-bucket figure comes from that one repetition
+  rather than being a per-bucket best-of-N.
+- **Fails before anything is uploaded.** At startup, a Redis `hybrid_policy`
+  that contradicts `REDIS_HYBRID_POLICY` is refused (before any download or
+  connection); once the dataset is on disk and before the engine is built,
+  `hybrid_queries.jsonl` must exist, every row must be consistent and every
+  predicate must fit the schema.
+- **Expressibility is checked, not assumed.** Every predicate is compiled by
+  the oracle's evaluator (`msmarco::derived::Predicate`), typed against the
+  dataset schema, and after the engine's builder ran the rendered filter must be
+  the predicate STRUCTURALLY: OpenSearch's bool query is compared node by node;
+  Redis's RediSearch expression is parsed back (AND = juxtaposition, OR = `|`,
+  groups) and compared node by node with its `PARAMS` resolved — group kind and
+  arity, tag value sets, text term, range bounds and their inclusivity. A
+  predicate an engine cannot express is a hard error.
+- **Redis** sends `FT.SEARCH ... VERBATIM` (text terms must not be
+  stem-expanded) with `=>{$HYBRID_POLICY: …}` when `hybrid_policy` (search
+  knob) or `REDIS_HYBRID_POLICY` is set (`ADHOC_BF` | `BATCHES`; conflicting
+  values are an error). After each pass a fixed sample of the bucket (see
+  below) is `FT.PROFILE`d with the policy the pass actually sent. Through a cluster coordinator the reply holds
+  one profile per shard, so the tally is per shard: every shard must report
+  exactly one `Vector search mode`, every mode must match the configured
+  policy, and the tally must be profiled queries x shards. Profiling replays
+  queries serially outside the timed window, so it uses a fixed sample — the
+  first 4 queries of each predicate in the bucket (12 per bucket) — published
+  as `profiled_queries` next to the tally, `bucket_queries` and `shards`.
+  With the policy unset, the tally only shows that a hybrid mode ran on the
+  sampled queries; it is not the bucket's mode distribution (e.g. queries that
+  switch `HYBRID_BATCHES_TO_ADHOC_BF` mid-query can be absent from the sample).
+- **OpenSearch** sends lucene `knn` with the predicate as its `filter` and
+  `k = top`. The k-NN plugin's `knn_query_with_filter_requests`, summed over
+  nodes and read before and after each pass, must grow by at least one per
+  ANSWERED query (requested minus failed; a failed query may never have reached
+  the plugin), i.e. the filter reached the k-NN query. The delta is a cluster-wide LOWER BOUND —
+  concurrent clients on a shared domain inflate it — and the result says so.
+  Whether Lucene fell back to exact search is not observable and is reported as
+  such.
+- **Text match semantics** (`src/msmarco/text_match.rs`). Redis (RediSearch
+  tokenizer, stemming, `\` escapes) and OpenSearch (`standard` analyzer, UAX#29)
+  do NOT tokenize alike, so exact agreement is impossible for arbitrary terms.
+  A text term is one lowercase ASCII word, not a RediSearch stopword, and a
+  document counts as matching only when the term occurs as a whole ASCII run
+  delimited by contexts both tokenizers split on; any other context (`'`, `.`
+  or `:` before a letter, `\`, non-ASCII neighbours, characters that fold to
+  ASCII, >255-char runs) is *ambiguous*. Ground truth is never computed for an
+  ambiguous document: preparation picks the 1% / 0.1% title terms only among
+  terms with ZERO ambiguous documents in the corpus (100K: `quora`, `ancient`).
+
 ### Per-query results and `compare-results` (#343)
 
 `--dump-results DIR` writes one JSONL file per (config, dataset, workload,
@@ -453,7 +529,9 @@ An engine with no
 capture for the workload fails the run instead of writing an empty file, and a
 dump whose record count differs from the attempted query count is refused.
 Warm-ups and mixed (`--update-search-ratio`) phases are not dumped. Per-query
-capture exists for Redis and OpenSearch (vector, filter-only and fulltext).
+capture exists for Redis and OpenSearch (vector, filter-only, fulltext and
+hybrid); hybrid records carry the filtered ground truth as `expected` and their
+selectivity bucket as `shape`, so `compare-results` reports recall per bucket.
 
 ```bash
 vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch \

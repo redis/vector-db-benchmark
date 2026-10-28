@@ -92,6 +92,8 @@ pub const NEIGHBOURS: usize = 1000;
 pub const QUERY_COUNT: usize = 1677;
 
 pub mod derived;
+pub mod hybrid;
+pub mod text_match;
 
 /// Payload fields carried over from the MS MARCO segmented-document records,
 /// with the `schema` type each is registered under in `datasets/datasets.json`.
@@ -718,6 +720,23 @@ impl TopK {
     /// `first_id`. Parallelised across queries, so each rayon task owns one
     /// query's `best` list exclusively and the block is read-shared.
     pub fn add_block(&mut self, block: &[f32], first_id: i64) -> Result<(), String> {
+        self.add_block_where(block, first_id, |_, _| true)
+    }
+
+    /// [`TopK::add_block`] restricted per query: row `id` is a candidate for
+    /// query `qi` only when `keep(qi, id)`. The SAME scoring, insertion and
+    /// tie-break as the unfiltered oracle — `add_block` is this with an
+    /// always-true `keep` — so a filtered ground truth (#341) is the unfiltered
+    /// ranking with non-matching rows removed, never a second implementation.
+    pub fn add_block_where<F>(
+        &mut self,
+        block: &[f32],
+        first_id: i64,
+        keep: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(usize, i64) -> bool + Sync,
+    {
         // A returned error, NOT a debug_assert: every suite and the preparer itself
         // run `--release`, where a debug assertion is compiled out — so the guard
         // would have been absent from exactly the binary that writes published
@@ -747,12 +766,15 @@ impl TopK {
         self.best.par_iter_mut().enumerate().for_each(|(qi, best)| {
             let q = &queries[qi * dim..(qi + 1) * dim];
             for (row, doc) in block.chunks_exact(dim).enumerate() {
+                let id = first_id + row as i64;
+                if !keep(qi, id) {
+                    continue;
+                }
                 // Cosine on unit vectors is the plain dot product.
                 let score = dot(q, doc);
                 if best.len() == k && score <= best[k - 1].0 {
                     continue;
                 }
-                let id = first_id + row as i64;
                 let pos = best
                     .binary_search_by(|probe| {
                         // Descending by score; ascending by id on a tie so

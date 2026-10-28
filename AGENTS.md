@@ -187,6 +187,14 @@ auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
   `filter_only::query_set` (prepared set, index layout, per-query count gate).
   It relies on the loader (`Dataset::get_path` -> `derived::check_prepared_dir`)
   to refuse a stale directory before any workload sees it; do not re-check.
+- `hybrid_queries.jsonl` (#341, `src/msmarco/hybrid.rs`, format in
+  `src/hybrid.rs`) pairs every query vector with a predicate (derived fields
+  and/or a `title` text match) and its brute-forced FILTERED top-1000, computed
+  by the unfiltered oracle's own `TopK` (`add_block_where`) and cross-checked
+  against `tests.jsonl`. Text-match agreement rules live in
+  `src/msmarco/text_match.rs`; never send a text predicate whose term was not
+  chosen by them. `--add-hybrid-queries` adds the file in place; `--verify`
+  regenerates it.
 
 ## Key Patterns
 

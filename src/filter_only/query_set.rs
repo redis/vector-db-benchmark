@@ -155,6 +155,16 @@ impl FilterQuerySet {
                 .get("conditions")
                 .ok_or_else(|| err(n, "missing conditions".into()))?;
             let predicate = Predicate::compile(condition).map_err(|e| err(n, e))?;
+            // The predicate grammar also takes a `match.text` term since the
+            // hybrid set (#341) needs one; filter-only stays exact-match.
+            if crate::hybrid::has_text(&predicate) {
+                return Err(err(
+                    n,
+                    "a full-text `match.text` term is not an exact-match predicate; \
+                     filter-only queries hold exact-match predicates only"
+                        .into(),
+                ));
+            }
             collect_fields(&predicate, &mut referenced);
             conditions.push(Some(condition.clone()));
             prepared.push(PreparedQuery {
@@ -385,7 +395,8 @@ mod tests {
             (row("q0", "s", tag("a"), 101, 100), "exceeds corpus_size"),
             (format!("{}\n{}", ok(tag("a")), ok(tag("b"))), "duplicate"),
             (ok(json!({"category": {"match": {"value": "a"}}})), "top level"),
-            (ok(json!({"and": [{"t": {"match": {"text": "a"}}}]})), "full-text"),
+            // A valid term (#341's grammar accepts it), still not exact-match.
+            (ok(json!({"and": [{"t": {"match": {"text": "quora"}}}]})), "full-text"),
             (
                 json!({"query_id":"q","shape":"s","conditions":tag("a"),"expected_count":1,"corpus_size":100,"x":1}).to_string(),
                 "unexpected key",

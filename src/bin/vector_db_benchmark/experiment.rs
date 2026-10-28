@@ -308,6 +308,48 @@ pub fn run(args: &Args) -> Result<(), String> {
             .as_deref(),
         )
         .map_err(|e| format!("config '{name}': {e}"))?;
+        // Hybrid (#341): `top`, `--queries` and the open-loop knobs are
+        // checked here, before anything is downloaded or connected. The CLI
+        // `--target-qps` / `--search-duration` are merged into each search
+        // config only at search time, so they are folded in here too.
+        let cli_target_qps = (args.target_qps > 0.0).then_some(args.target_qps);
+        let cli_duration = (args.search_duration > 0.0).then_some(args.search_duration);
+        for (i, sp) in config.search_params.iter().flatten().enumerate() {
+            if plan.workload(i)? == Workload::Hybrid {
+                vector_db_benchmark::hybrid::check_params(
+                    sp.top,
+                    sp.target_qps.or(cli_target_qps),
+                    sp.duration_seconds.or(cli_duration),
+                    args.queries,
+                )
+                .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
+            }
+        }
+        // Hybrid (#341): `hybrid_policy` is read only by the Redis hybrid arm;
+        // anywhere else it would be silently ignored.
+        for (i, sp) in config.search_params.iter().flatten().enumerate() {
+            vector_db_benchmark::hybrid::check_policy_knob_allowed(
+                &plan.engine_type,
+                plan.workload(i)?,
+                sp.knob("hybrid_policy").is_some(),
+            )
+            .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
+        }
+        // Hybrid (#341): a Redis HYBRID_POLICY conflict needs nothing from the
+        // server, so it is refused here, before anything is downloaded or
+        // connected — not after an upload.
+        if plan.engine_type == "redis" {
+            let env_policy = crate::effective_config::env_or("REDIS_HYBRID_POLICY", "");
+            for (i, sp) in config.search_params.iter().flatten().enumerate() {
+                if plan.workload(i)? == Workload::Hybrid {
+                    vector_db_benchmark::hybrid::resolve_redis_policy(
+                        sp.knob("hybrid_policy"),
+                        &env_policy,
+                    )
+                    .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
+                }
+            }
+        }
         if args.target_qps > 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {
             return Err(format!(
                 "--target-qps currently supports search-only vector benchmarks; config \
@@ -508,6 +550,32 @@ pub fn run(args: &Args) -> Result<(), String> {
             });
 
             let dataset = Dataset::new((*dataset_config).clone());
+
+            // Hybrid (#341): the query set must exist and be valid before the
+            // engine is built, so a corpus without `hybrid_queries.jsonl` fails
+            // here rather than after configure + upload.
+            if plan.workloads.contains(&Workload::Hybrid) {
+                let tops: Vec<usize> = engine_config
+                    .search_params
+                    .iter()
+                    .flatten()
+                    .enumerate()
+                    .filter(|(i, _)| plan.workload(*i).ok() == Some(Workload::Hybrid))
+                    .filter_map(|(_, sp)| sp.top.filter(|t| *t > 0).map(|t| t as usize))
+                    .collect();
+                let n = vector_db_benchmark::hybrid::preflight(
+                    &dataset.get_path()?,
+                    dataset.config.schema.as_ref(),
+                    &tops,
+                )
+                .map_err(|e| {
+                    format!(
+                        "[config={} dataset={}] hybrid workload: {e}",
+                        engine_config.name, dataset_name
+                    )
+                })?;
+                pb.suspend(|| println!("Hybrid query set: {n} queries checked"));
+            }
 
             // Start this experiment's provenance recording BEFORE the engine is
             // built — engines resolve most of their environment knobs in `new()`,
@@ -1347,12 +1415,20 @@ fn run_single_experiment(
     if vector_db_benchmark::fulltext::mixes_with_filtered_workloads(&plan.workloads) {
         let text_fields =
             vector_db_benchmark::fulltext::schema_text_fields(dataset.config.schema.as_ref());
+        // Hybrid (#341): its predicates live in hybrid_queries.jsonl, not in
+        // tests.jsonl, and its text-match agreement rules assume each engine's
+        // DEFAULT text analysis — count them too.
+        let hybrid_text_queries = if plan.workloads.contains(&Workload::Hybrid) {
+            vector_db_benchmark::hybrid::count_text_field_rows(&dataset.get_path()?, &text_fields)?
+        } else {
+            0
+        };
         vector_db_benchmark::fulltext::check_mixed_text_filters(
             &plan.workloads,
             vector_db_benchmark::fulltext::count_text_field_queries(
                 &dataset.get_path()?,
                 &text_fields,
-            )?,
+            )? + hybrid_text_queries,
             &dataset.config.name,
         )?;
     }
@@ -2582,6 +2658,8 @@ fn write_query_dumps(
     }
     let ids = external_ids(dataset)?;
     let mut expected: Option<Vec<Vec<i64>>> = None;
+    // Hybrid (#341): truth and the per-query bucket come from the hybrid set.
+    let mut hybrid: Option<(Vec<Vec<i64>>, Vec<String>)> = None;
     for (search_id, params, results, _) in pending.iter_mut() {
         let Some(raw) = results.query_records.take() else {
             continue;
@@ -2589,23 +2667,39 @@ fn write_query_dumps(
         let workload = results
             .workload
             .ok_or("--dump-results: a result reached the dump without a dispatched workload")?;
-        let gt = if workload.has_ground_truth() {
-            if expected.is_none() {
-                expected = Some(dataset.read_queries()?.1);
-            }
-            expected.as_deref()
+        if workload == Workload::Hybrid && hybrid.is_none() {
+            let set = dataset.read_hybrid_query_set()?;
+            let buckets = set
+                .meta
+                .iter()
+                .map(|m| m.bucket.as_str().to_string())
+                .collect();
+            hybrid = Some((set.neighbors, buckets));
+        }
+        let records = if workload == Workload::Hybrid {
+            let (gt, buckets) = hybrid.as_ref().ok_or("hybrid query set not loaded")?;
+            dump::resolve_records(&raw, &ids, Some(gt), results.top, &|q| {
+                buckets.get(q).cloned()
+            })?
         } else {
-            None
+            let gt = if workload.has_ground_truth() {
+                if expected.is_none() {
+                    expected = Some(dataset.read_queries()?.1);
+                }
+                expected.as_deref()
+            } else {
+                None
+            };
+            // Filter-only records carry the prepared query's shape (#340), so
+            // `compare-results` reports per shape; KNN has none yet.
+            let filter_set = if workload == Workload::FilterOnly {
+                dataset.filter_query_file()?
+            } else {
+                None
+            };
+            let shape = |q: usize| filter_set.as_ref().and_then(|s| s.shape(q));
+            dump::resolve_records(&raw, &ids, gt, results.top, &shape)?
         };
-        // Filter-only records carry the prepared query's shape (#340), so
-        // `compare-results` reports per shape; other workloads have none yet.
-        let filter_set = if workload == vector_db_benchmark::workload::Workload::FilterOnly {
-            dataset.filter_query_file()?
-        } else {
-            None
-        };
-        let shape = |q: usize| filter_set.as_ref().and_then(|s| s.shape(q));
-        let records = dump::resolve_records(&raw, &ids, gt, results.top, &shape)?;
         let header = dump::DumpHeader {
             schema_version: dump::DUMP_SCHEMA_VERSION,
             engine: engine_type.to_string(),
@@ -2821,6 +2915,21 @@ fn build_search_result_json(
             "in_throughput_window": true,
             "in_latency_samples": false,
         });
+    }
+    // Hybrid (#341): the per-bucket report, and the metric schema's width
+    // profile describes the FILTERED ground truth the run was scored against.
+    if let Some(h) = &results.hybrid {
+        result["results"]["hybrid"] = serde_json::to_value(&h.report).unwrap();
+        result["metrics_schema"] = metrics_schema(h.ground_truth.as_ref());
+        result["metrics_schema"]["ground_truth_source"] =
+            serde_json::json!(vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE);
+        result["metrics_schema"]["hybrid_headline"] = serde_json::json!(
+            "top-level rps / latency / recall are the UNION of one timed pass per selectivity \
+             bucket (total queries / summed pass time), dominated by the slowest bucket; compare \
+             hybrid runs per bucket (results.hybrid.buckets), not results.rps against vector runs. \
+             With --repetitions N the kept repetition is the one with the best UNION rps, so the \
+             per-bucket figures all come from that repetition, not from a per-bucket best-of-N"
+        );
     }
     if let Some(contract) = &results.filter_only {
         result["params"]["workload"] = serde_json::json!("filter-only");
@@ -5102,3 +5211,85 @@ mod p90_publication_tests {
 #[cfg(test)]
 #[path = "experiment/shared_index_tests.rs"]
 mod shared_index_tests;
+
+#[cfg(test)]
+mod hybrid_serialization_tests {
+    use super::build_search_result_json;
+    use crate::config::SearchParams;
+    use crate::engine::{HybridOutcome, SearchResults};
+    use crate::ground_truth::GroundTruthProfile;
+
+    /// #341: a hybrid result publishes its per-bucket report, and the metric
+    /// schema's ground-truth profile is the FILTERED truth's, not the vector
+    /// truth the runner profiled for the dataset.
+    #[test]
+    fn hybrid_result_carries_its_report_and_filtered_truth_profile() {
+        let params: SearchParams =
+            serde_json::from_value(serde_json::json!({"parallel": 1, "top": 10})).unwrap();
+        let report = vector_db_benchmark::hybrid::HybridReport {
+            query_file: vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE,
+            top: 10,
+            queries: 2,
+            text_match: serde_json::json!({}),
+            buckets: Vec::new(),
+            engine: serde_json::json!({"hybrid_policy": "ADHOC_BF"}),
+        };
+        let narrow = GroundTruthProfile::from_rows(vec![vec![1, 2, 3]; 2]);
+        let results = SearchResults {
+            top: 10,
+            latencies: vec![0.001, 0.002],
+            hybrid: Some(HybridOutcome {
+                report,
+                ground_truth: narrow.stats(10),
+            }),
+            ..Default::default()
+        };
+        let vector_gt = GroundTruthProfile::from_rows(vec![(0..100).collect(); 2]);
+        let build = |r: &SearchResults| {
+            build_search_result_json(
+                "redis-test",
+                "d",
+                &params,
+                r,
+                None,
+                None,
+                false,
+                None,
+                Some(&vector_gt),
+                None,
+                None,
+                &serde_json::json!({}),
+            )
+        };
+        let doc = build(&results);
+        assert_eq!(
+            doc["results"]["hybrid"]["engine"]["hybrid_policy"],
+            "ADHOC_BF"
+        );
+        assert_eq!(
+            doc["metrics_schema"]["ground_truth_source"],
+            "hybrid_queries.jsonl"
+        );
+        assert!(doc["metrics_schema"]["hybrid_headline"]
+            .as_str()
+            .unwrap()
+            .contains("per bucket"));
+        assert!(doc["metrics_schema"]["hybrid_headline"]
+            .as_str()
+            .unwrap()
+            .contains("not from a per-bucket best-of-N"));
+        assert_eq!(
+            doc["metrics_schema"]["ground_truth"]["queries_with_fewer_than_top_neighbours"],
+            2
+        );
+        // Without a hybrid outcome nothing hybrid is emitted.
+        let plain = SearchResults {
+            top: 10,
+            latencies: vec![0.001],
+            ..Default::default()
+        };
+        let doc = build(&plain);
+        assert!(doc["results"].get("hybrid").is_none());
+        assert!(doc["metrics_schema"].get("ground_truth_source").is_none());
+    }
+}

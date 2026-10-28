@@ -305,6 +305,9 @@ pub enum Leaf {
         lt: Option<f64>,
         lte: Option<f64>,
     },
+    /// `match.text`: one term, with the agreement semantics of
+    /// [`super::text_match`] (#341). Only the hybrid query set uses it.
+    Text(String),
 }
 
 /// A `conditions` value compiled once and evaluated per row.
@@ -388,7 +391,13 @@ impl Predicate {
                     .as_object()
                     .filter(|c| c.len() == 1)
                     .ok_or_else(|| format!("{field}: match needs exactly one of value/any"))?;
-                if let Some(v) = c.get("value") {
+                if let Some(t) = c.get("text") {
+                    let term = t
+                        .as_str()
+                        .ok_or_else(|| format!("{field}: match.text must be a string"))?;
+                    super::text_match::validate_term(term).map_err(|e| format!("{field}: {e}"))?;
+                    Ok(Leaf::Text(term.to_string()))
+                } else if let Some(v) = c.get("value") {
                     Ok(Leaf::Match(vec![operand(field, v)?]))
                 } else if let Some(any) = c.get("any") {
                     let any = any
@@ -402,8 +411,7 @@ impl Predicate {
                     ))
                 } else {
                     Err(format!(
-                        "{field}: match supports only value/any here (full-text `text` is not an \
-                         exact-match predicate)"
+                        "{field}: match needs exactly one of value, any or text"
                     ))
                 }
             }
@@ -510,6 +518,19 @@ impl Predicate {
                     }
                     (Leaf::Range { .. }, FieldValue::Keyword(_)) => {
                         Err(format!("{field}: range predicate on a keyword field"))
+                    }
+                    (Leaf::Text(term), FieldValue::Keyword(text)) => {
+                        match super::text_match::classify(text, term) {
+                            super::text_match::TextMatch::Yes => Ok(true),
+                            super::text_match::TextMatch::No => Ok(false),
+                            super::text_match::TextMatch::Ambiguous => Err(format!(
+                                "{field}: whether {text:?} matches the term {term:?} depends on \
+                                 the engine's tokenizer; no ground truth can be computed for it"
+                            )),
+                        }
+                    }
+                    (Leaf::Text(_), FieldValue::Int(_)) => {
+                        Err(format!("{field}: text match on an integer field"))
                     }
                     (_, FieldValue::Other) => Err(format!(
                         "{field}: holds a value the exact-match grammar cannot compare"

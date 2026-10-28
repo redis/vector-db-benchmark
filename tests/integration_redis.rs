@@ -5696,3 +5696,147 @@ fn test_binary_redis_shared_corpus_full_layout_refuses_bad_metadata() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #341: the hybrid workload on an MS MARCO-shaped fixture (the prepared 100K
+/// corpus is too large for CI). One timed pass per selectivity bucket; recall
+/// against the brute-forced FILTERED truth is reported per bucket, and the
+/// per-query dump carries the bucket as its shape. With an explicit
+/// `HYBRID_POLICY: ADHOC_BF` every query is brute force, so recall is exact —
+/// and `FT.PROFILE` must confirm Redis ran that mode for all 12 queries of each
+/// bucket. Unset, Redis chooses; every query must still report a hybrid mode.
+#[test]
+fn test_binary_redis_hybrid_per_bucket_recall_and_policy() {
+    wait_for_redis();
+    let configs = serde_json::json!([
+        {"name": "redis-hyb-adhoc", "engine": "redis",
+         "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                            "hybrid_policy": "ADHOC_BF", "search_params": {"ef": 200}}],
+         "upload_params": {"parallel": 2, "batch_size": 500}},
+        {"name": "redis-hyb-auto", "engine": "redis",
+         "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                            "search_params": {"ef": 200}}],
+         "upload_params": {"parallel": 2, "batch_size": 500}}
+    ]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let port = test_port().to_string();
+    for (config, min_recall) in [("redis-hyb-adhoc", 0.999), ("redis-hyb-auto", 0.8)] {
+        let dump = proj.root.join(format!("dumps-{config}"));
+        assert!(common::run_binary_extra(
+            &proj.root,
+            config,
+            "hybrid-test",
+            "localhost",
+            &[("REDIS_PORT", &port)],
+            &[
+                "--dump-results",
+                dump.to_str().unwrap(),
+                "--fail-on-dropped-queries"
+            ]
+        ));
+        let evidence = common::assert_hybrid_run(&proj, config, &dump, min_recall, "vector");
+        for e in &evidence {
+            // 4 per predicate x 3 predicates: here, the whole 12-query bucket.
+            assert_eq!(e["profiled_queries"], 12, "{config}: {e}");
+            assert_eq!(e["profile_sample_per_predicate"], 4, "{config}: {e}");
+            assert_eq!(e["bucket_queries"], 12, "{config}: {e}");
+            assert_eq!(e["shards"], 1, "{config}: {e}");
+            let modes = e["vector_search_modes"].as_object().unwrap();
+            assert_eq!(
+                modes.values().map(|v| v.as_u64().unwrap()).sum::<u64>(),
+                12,
+                "{config}: {e}"
+            );
+            if config == "redis-hyb-adhoc" {
+                assert_eq!(modes.len(), 1, "{e}");
+                assert_eq!(modes["HYBRID_ADHOC_BF"], 12, "{e}");
+            } else {
+                assert!(modes.keys().all(|m| m.starts_with("HYBRID_")), "{e}");
+            }
+        }
+        let results = common::read_results_obj(&proj.root, config);
+        let note = &results["hybrid"]["engine"];
+        assert_eq!(note["verbatim"], true);
+        assert_eq!(
+            note["mode_source"],
+            "FT.PROFILE of a fixed sample (the first 4 queries of each predicate) after each \
+             bucket's timed pass, with the policy the pass sent; one mode per shard"
+        );
+        if config == "redis-hyb-adhoc" {
+            assert_eq!(note["hybrid_policy"], "ADHOC_BF");
+        }
+    }
+    // A config policy that contradicts REDIS_HYBRID_POLICY is a hard error,
+    // not a silent pick of one of them — refused at startup, for that reason.
+    let (ok, stdout, stderr) = common::run_binary_text(
+        &proj.root,
+        "redis-hyb-adhoc",
+        "hybrid-test",
+        "localhost",
+        &[("REDIS_PORT", &port), ("REDIS_HYBRID_POLICY", "BATCHES")],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("REDIS_HYBRID_POLICY"), "{stderr}");
+    assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #341 x #344: hybrid and filter-only in ONE engine config share one index,
+/// built once in the `full` layout (hybrid needs the vector field, filter-only
+/// the CASESENSITIVE tags). Hybrid keeps exact per-bucket recall under
+/// `ADHOC_BF` with FT.PROFILE confirming the mode; filter-only passes its
+/// per-query count gate; both search files and the hybrid dump record `full`.
+#[test]
+fn test_binary_redis_hybrid_and_filter_only_share_one_full_index() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let config = "redis-hyb-fo";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "redis",
+        "search_params": [
+            {"parallel": 2, "top": 10, "workload": "hybrid", "hybrid_policy": "ADHOC_BF",
+             "search_params": {"ef": 200}},
+            {"parallel": 2, "top": 10, "workload": "filter-only"}],
+        "upload_params": {"parallel": 2, "batch_size": 500}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let counts = common::add_hybrid_filter_queries(&proj);
+    let port = test_port().to_string();
+    let dump = proj.root.join("dumps");
+    let out = common::run_binary_output(
+        &proj.root,
+        config,
+        "hybrid-test",
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let evidence = common::assert_hybrid_run(&proj, config, &dump, 0.999, "full");
+    for e in &evidence {
+        assert_eq!(e["vector_search_modes"]["HYBRID_ADHOC_BF"], 12, "{e}");
+    }
+    common::assert_hybrid_mix_filter_only(&proj, config, &stdout, &counts);
+    // The realized index is the union: VECTOR + TEXT (title) + CASESENSITIVE
+    // TAG + NUMERIC.
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg(format!("idx:{config}"))
+        .query(&mut conn)
+        .unwrap();
+    let info = format!("{info:?}");
+    for token in ["VECTOR", "TEXT", "CASESENSITIVE", "NUMERIC"] {
+        assert!(info.contains(token), "FT.INFO lacks {token}: {info}");
+    }
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
