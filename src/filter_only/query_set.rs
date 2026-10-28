@@ -82,15 +82,11 @@ impl FilterQuerySet {
 
     /// Parse a prepared set. Every row must hold exactly `query_id`, `shape`,
     /// `conditions`, `expected_count` and `corpus_size`; `corpus_size` must
-    /// equal the corpus being benchmarked when that is known (a query set for
-    /// another variant has other expected counts). Conditions must be in the
+    /// equal the corpus being benchmarked (a query set for another variant has
+    /// other expected counts). Conditions must be in the
     /// exact-match grammar `msmarco::derived::Predicate` evaluates — the
     /// grammar the expected counts were computed under.
-    pub fn parse(
-        reader: impl BufRead,
-        dataset: &str,
-        corpus_size: Option<u64>,
-    ) -> Result<Self, String> {
+    pub fn parse(reader: impl BufRead, dataset: &str, corpus_size: u64) -> Result<Self, String> {
         let err = |line: usize, msg: String| format!("{FILTER_QUERIES_FILE} line {line}: {msg}");
         let mut lines: Vec<String> = Vec::new();
         for line in reader.lines() {
@@ -137,16 +133,14 @@ impl FilterQuerySet {
             let shape = text("shape")?;
             let expected_count = count("expected_count")?;
             let size = count("corpus_size")?;
-            if let Some(corpus) = corpus_size {
-                if size != corpus {
-                    return Err(err(
-                        n,
-                        format!(
-                            "query {name} was prepared for a {size}-row corpus but this corpus \
-                             holds {corpus} rows; its expected counts are for another corpus"
-                        ),
-                    ));
-                }
+            if size != corpus_size {
+                return Err(err(
+                    n,
+                    format!(
+                        "query {name} was prepared for a {size}-row corpus but this corpus \
+                         holds {corpus_size} rows; its expected counts are for another corpus"
+                    ),
+                ));
             }
             if expected_count > size {
                 return Err(err(
@@ -177,7 +171,9 @@ impl FilterQuerySet {
     }
 
     /// The prepared set in `dir`, if the dataset has one (`Ok(None)` when
-    /// `dir` holds no [`FILTER_QUERIES_FILE`]).
+    /// `dir` holds no [`FILTER_QUERIES_FILE`]). `corpus_size` is the measured
+    /// row count of the corpus; when a prepared set exists but the size could
+    /// not be measured (`None`) this is an error, never a skipped check (#290).
     pub fn read_prepared(
         dir: &Path,
         dataset: &str,
@@ -187,25 +183,19 @@ impl FilterQuerySet {
         if !path.is_file() {
             return Ok(None);
         }
+        let corpus_size = corpus_size.ok_or_else(|| {
+            format!(
+                "{}: the corpus row count of '{dataset}' cannot be measured, so the \
+                 corpus_size of its {FILTER_QUERIES_FILE} (and therefore its expected counts) \
+                 cannot be checked",
+                dir.display()
+            )
+        })?;
         let file = std::fs::File::open(&path)
             .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         Self::parse(std::io::BufReader::new(file), dataset, corpus_size)
             .map(Some)
             .map_err(|e| format!("{}: {e}", dir.display()))
-    }
-
-    /// The prepared set if there is one, else the legacy `tests.jsonl`
-    /// predicates (read lazily, since that read loads the query vectors too).
-    pub fn load(
-        dir: &Path,
-        dataset: &str,
-        corpus_size: Option<u64>,
-        legacy: impl FnOnce() -> Result<QueryConditions, String>,
-    ) -> Result<Self, String> {
-        match Self::read_prepared(dir, dataset, corpus_size)? {
-            Some(set) => Ok(set),
-            None => Ok(Self::from_conditions(legacy()?)),
-        }
     }
 
     /// [`QueryConditions::try_resolve_all`] over this set's conditions — the
@@ -364,13 +354,13 @@ mod tests {
             + "\n"
     }
 
-    fn parse(text: &str, size: Option<u64>) -> Result<FilterQuerySet, String> {
+    fn parse(text: &str, size: u64) -> Result<FilterQuerySet, String> {
         FilterQuerySet::parse(text.as_bytes(), "ds", size)
     }
 
     #[test]
     fn parses_shapes_counts_and_referenced_fields() {
-        let s = parse(&two_queries(), Some(100)).unwrap();
+        let s = parse(&two_queries(), 100).unwrap();
         assert_eq!(s.len(), 2);
         assert!(s.is_prepared());
         assert_eq!(s.conditions.declared_count(), 2);
@@ -382,8 +372,6 @@ mod tests {
             s.referenced.iter().map(String::as_str).collect::<Vec<_>>(),
             ["category", "doc_len", "tier"]
         );
-        // Unknown corpus size: accepted (the caller could not measure it).
-        parse(&two_queries(), None).unwrap();
     }
 
     #[test]
@@ -415,14 +403,14 @@ mod tests {
                 "missing conditions",
             ),
         ] {
-            let e = parse(&text, Some(100)).unwrap_err();
+            let e = parse(&text, 100).unwrap_err();
             assert!(e.contains(needle), "{needle:?} not in {e:?} for {text:?}");
         }
     }
 
     #[test]
     fn the_gate_checks_every_answer_not_the_sum() {
-        let s = parse(&two_queries(), Some(100)).unwrap();
+        let s = parse(&two_queries(), 100).unwrap();
         assert_eq!(
             s.check_counts(&[(0, 7), (1, 3), (0, 7)], 3).unwrap(),
             Some(3)
@@ -478,7 +466,7 @@ mod tests {
             );
             every += "\n";
         }
-        let all = index_schema(Some(&schema), Some(&parse(&every, None).unwrap())).unwrap();
+        let all = index_schema(Some(&schema), Some(&parse(&every, 100).unwrap())).unwrap();
         let keys = |v: &Value| {
             let mut k = v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
             k.sort();
@@ -498,7 +486,7 @@ mod tests {
             ]
         );
         // Prepared set: only what its predicates reference.
-        let s = parse(&two_queries(), None).unwrap();
+        let s = parse(&two_queries(), 100).unwrap();
         assert_eq!(
             index_schema(Some(&schema), Some(&s)).unwrap(),
             json!({"category":"keyword","doc_len":"int","tier":"int"})
@@ -514,26 +502,24 @@ mod tests {
     }
 
     #[test]
-    fn the_prepared_file_wins_and_its_corpus_size_is_checked() {
+    fn the_prepared_file_is_read_and_its_corpus_size_is_checked_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
-        // No file: tests.jsonl's predicates, read lazily.
-        assert!(FilterQuerySet::read_prepared(dir.path(), "syn", None)
-            .unwrap()
-            .is_none());
-        let s = FilterQuerySet::load(dir.path(), "syn", None, || {
-            Ok(QueryConditions::new(vec![Some(tag("a")), None]))
-        })
-        .unwrap();
-        assert!(!s.is_prepared());
-        assert_eq!(s.len(), 2);
-        // With the file present, it is used and tests.jsonl is never read.
+        // No file: no prepared set, whether or not the size is known.
+        for size in [None, Some(100)] {
+            assert!(FilterQuerySet::read_prepared(dir.path(), "syn", size)
+                .unwrap()
+                .is_none());
+        }
         std::fs::write(dir.path().join(FILTER_QUERIES_FILE), two_queries()).unwrap();
-        let s = FilterQuerySet::load(dir.path(), "msm", Some(100), || {
-            panic!("a prepared set must not read tests.jsonl")
-        })
-        .unwrap();
+        let s = FilterQuerySet::read_prepared(dir.path(), "msm", Some(100))
+            .unwrap()
+            .unwrap();
         assert!(s.is_prepared());
         let e = FilterQuerySet::read_prepared(dir.path(), "msm", Some(5)).unwrap_err();
         assert!(e.contains("5 rows"), "{e}");
+        // A prepared set whose corpus cannot be measured is refused, not
+        // accepted unchecked (#290).
+        let e = FilterQuerySet::read_prepared(dir.path(), "msm", None).unwrap_err();
+        assert!(e.contains("cannot be measured"), "{e}");
     }
 }

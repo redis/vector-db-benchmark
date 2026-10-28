@@ -407,7 +407,10 @@ impl Dataset {
     }
 
     /// The prepared filter-only query set (`filter_queries.jsonl`) of this
-    /// dataset, if it ships one (#340), read once per `Dataset`. A stale MS
+    /// dataset, if it ships one (#340), read once per `Dataset`. The first
+    /// outcome is cached, an error included: a failed read (stale directory,
+    /// unreadable file, unmeasurable corpus) fails every later filter-only step
+    /// on this dataset in the run rather than being retried. A stale MS
     /// MARCO directory never gets here: `get_path` refuses it. Its conditions
     /// are not reachable from engines; they go through
     /// [`Self::filter_only_queries`]. See `filter_only::query_set`.

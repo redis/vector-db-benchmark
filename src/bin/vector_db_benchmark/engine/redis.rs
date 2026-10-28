@@ -446,9 +446,10 @@ impl RedisEngine {
             }
         }
 
-        // Add schema fields from dataset config for filtering. Filter-only
-        // indexes only the fields its predicates may reference (#340); the rest
-        // stay stored in the hash, unindexed.
+        // Add schema fields from dataset config for filtering. With a prepared
+        // query set, filter-only indexes only the fields its predicates
+        // reference (#340); the rest stay stored in the hash, unindexed.
+        // Without one the layout is the declared schema.
         let schema = if self.config.skip_vector_index {
             dataset.filter_only_index_schema()?
         } else {

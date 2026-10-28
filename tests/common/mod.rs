@@ -2879,10 +2879,6 @@ pub fn assert_vector_dump_matches_run(root: &Path, dir: &Path, engine: &str, res
     );
 }
 
-/// Give every corpus row of a [`write_filter_only_project`] fixture a `docid`
-/// payload field (`doc-<row*3+7>`, deliberately not the row id) and declare it
-/// in the schema, so `--dump-results` resolves rows through the docid id space.
-/// Returns the row -> docid function the dump must agree with.
 /// Give every row of a [`write_filter_only_project`] fixture a `text` field
 /// `note` (declared in the schema) and return the declared field names, sorted.
 /// Datasets without a prepared query set must keep the pre-#340 filter-only
@@ -2915,6 +2911,10 @@ pub fn add_text_field(root: &Path) -> Vec<String> {
     names
 }
 
+/// Give every corpus row of a [`write_filter_only_project`] fixture a `docid`
+/// payload field (`doc-<row*3+7>`, deliberately not the row id) and declare it
+/// in the schema, so `--dump-results` resolves rows through the docid id space.
+/// Returns the row -> docid function the dump must agree with.
 pub fn add_docids(root: &Path) -> fn(usize) -> String {
     fn docid(row: usize) -> String {
         format!("doc-{}", row * 3 + 7)
