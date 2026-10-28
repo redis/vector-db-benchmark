@@ -18,6 +18,7 @@ use opensearch::indices::{
 use opensearch::params::WaitForStatus;
 use opensearch::{BulkParts, CountParts, OpenSearch, SearchParts};
 use uuid::Uuid;
+
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
 
@@ -26,6 +27,9 @@ use crate::dataset::Dataset;
 use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
+
+/// Ranked full-text workload (#339).
+mod fulltext;
 
 #[derive(Clone)]
 struct OpenSearchConfig {
@@ -292,6 +296,12 @@ impl OpenSearchEngine {
         }
 
         let mut index_settings = build_index_settings(self.config.number_of_shards);
+        // #339: a config that runs the fulltext workload analyzes its text
+        // fields with the pinned english/porter2 analyzer (see
+        // `vector_db_benchmark::fulltext`); otherwise they keep `standard`.
+        if self.serves_fulltext() {
+            self.pin_fulltext_analyzer(dataset, &mut properties, &mut index_settings);
+        }
         if self.config.skip_vector_index {
             vector_db_benchmark::filter_only::disable_vector_index(
                 &mut properties,
@@ -2385,6 +2395,15 @@ impl Engine for OpenSearchEngine {
             );
         }
         self.search_impl(false, dataset, params, num_queries)
+    }
+
+    fn search_fulltext(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_fulltext_impl(dataset, params, num_queries)
     }
 
     fn search_filter_only(

@@ -318,8 +318,8 @@ The runner resolves each config's workloads once, before anything is downloaded
 or connected (`vector_db_benchmark::workload::plan`), and every measured query
 goes through one function, `engine::search_workload`. An engine/workload pair
 without an implementation is a hard error, never a fallback to `vector`; today
-a declared `filter-only` exists on Redis and OpenSearch, and `hybrid` /
-`fulltext` exist nowhere yet. Valkey and MongoDB keep their legacy filter-only
+a declared `filter-only` and `fulltext` exist on Redis and OpenSearch, and
+`hybrid` exists nowhere yet. Valkey and MongoDB keep their legacy filter-only
 harness reachable only through `--skip-vector-index`, exactly as before; a
 config that declares `filter-only` for them is refused. The shared `full` index schema is not built yet,
 so one engine config cannot mix `filter-only` with another workload (they need
@@ -352,7 +352,7 @@ An engine with no
 capture for the workload fails the run instead of writing an empty file, and a
 dump whose record count differs from the attempted query count is refused.
 Warm-ups and mixed (`--update-search-ratio`) phases are not dumped. Per-query
-capture exists for Redis and OpenSearch (vector and filter-only).
+capture exists for Redis and OpenSearch (vector, filter-only and fulltext).
 
 ```bash
 vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch \
@@ -376,6 +376,89 @@ dump with no counterpart on the other side also fails the comparison, unless
 engine/workload without per-query capture (today: Redis and OpenSearch,
 vector and filter-only), and `calibration_param` on a declared non-vector
 workload is refused at startup.
+
+### Ranked full-text (BM25): `"workload": "fulltext"` (#339)
+
+Redis `FT.SEARCH` vs OpenSearch `multi_match` over a dataset's `text` fields,
+queried with the `query_text` of every `tests.jsonl` line (MS MARCO:
+`title` / `headings` / `segment`, 1677 TREC-DL queries). Logic and every pinned
+setting live in `src/fulltext.rs`.
+
+```json
+{"parallel": 8, "top": 10, "workload": "fulltext",
+ "fulltext": {"fields": {"title": 5.0, "headings": 3.0, "segment": 1.0}}}
+```
+
+`fields` maps each searched field to its boost; omitted, every schema `text`
+field is searched at boost 1.0. A field that is not a `text` field of the
+dataset schema, an unknown key, a boost that is not a finite number > 0, or a
+`fulltext` block on another workload is refused at startup. `top` defaults to
+10 and is never derived from ground truth. There is no ground truth: quality is
+`compare-results` against a reference engine (use OpenSearch), and the result
+files carry no recall/precision keys.
+
+**Queries.** Both engines receive the same term list, derived client-side:
+split on RediSearch's separator set and all whitespace, lowercase, drop the
+pinned stopwords and duplicates. Terms are OR-ed. A query with no term left is
+skipped on both engines and listed in `params.fulltext.queries_skipped_no_terms`.
+Boosts are applied at query time on both sides, so one index serves every
+search config: Redis `(@title:(t1|t2)) => {$weight: 5.0;} | (@segment:(t1|t2)) => {$weight: 1.0;}`
+with `NOCONTENT WITHSCORES SCORER BM25STD DIALECT 2` (RESP3, any warning is an
+error); OpenSearch `multi_match` `type: most_fields`, `operator: or`,
+`fields: ["title^5.0", …]`, `_source: false`, `track_total_hits: false`.
+Both sum boost × per-field-clause BM25 over the fields a document matches.
+
+**Analyzers (pinned, verified on the live index before the timed window).**
+
+| | Redis | OpenSearch |
+|---|---|---|
+| tokenizer | RediSearch default | `standard` |
+| stopwords | `FT.CREATE … STOPWORDS 33 <list>` | `stop` with the same list |
+| stemmer | RediSearch default, Snowball English (Porter2) | `stemmer` `porter2` |
+| other | — | `possessive_english`, `lowercase` |
+
+The custom OpenSearch analyzer (`vdbb_english_porter2`) is the built-in
+`english` analyzer with `porter2` in place of `porter`: the built-in one stems
+with the original Porter algorithm (`generously` → `gener`), RediSearch with
+Porter2 (`generously` → `generous`). The stopword list is RediSearch's
+`DEFAULT_STOPWORDS` (`src/stopwords.h`), which is the same 33 words as Lucene's
+`EnglishAnalyzer.ENGLISH_STOP_WORDS_SET` (`_english_`); both engines are still
+given it explicitly so the server reports it back (`FT.INFO stopwords_list`,
+`_settings`). A unit test pins the list against both sources.
+
+These settings are applied only when an engine config declares a `fulltext`
+search config. Fulltext uses the vector index layout (the one that indexes
+`text` fields), so it may share an engine config with `vector` configs — which
+then also see the pinned analyzer in any text `match` filter — but not with
+`filter-only` (different layout, refused by `workload::plan`). The fulltext
+arm refuses to start when a searched field is missing from the live index, is
+not a stemmed TEXT field with index weight 1 (Redis) / a `text` field analyzed
+by `vdbb_english_porter2` (OpenSearch), or the index's stopwords or analyzer
+differ from the pinned ones — e.g. an index built by a vector-only config and
+reused with `--skip-upload`.
+
+**What cannot be pinned** (published as `params.fulltext.known_differences`):
+
+- RediSearch does not split tokens on `\n`/`\r` (only on its ASCII separator
+  set, space and tab). MS MARCO `headings` are newline-joined — 180,249 of the
+  299,892 text fields of the 100K corpus contain a newline — so Redis indexes a
+  merged token at every heading boundary that OpenSearch splits.
+- RediSearch splits on `.`, `-`, `'` inside words; `standard` keeps `u.s.a` and
+  `3.5` whole and strips possessive `'s`.
+- RediSearch indexes a term and its stem and expands a query term to both, so a
+  term whose stem differs is scored twice; Lucene indexes the stem only.
+- RediSearch BM25STD uses one term frequency and one document length for the
+  whole document (field restriction is a mask), Lucene per-field frequencies
+  and norms; Lucene statistics are per shard/segment.
+- Equal scores may be ordered differently.
+
+Result JSON: `params.workload: "fulltext"` and `params.fulltext` (fields and
+boosts, query-term method, stopword list and provenance, the engine's analyzer /
+scorer / request, skipped queries, known differences). `--dump-results`
+records carry `docid`s and the engine's BM25 scores (not comparable across
+engines). Note that `compare-results` pairs dumps by (dataset, workload,
+parallel, k): two fulltext configs that differ only in boosts need different
+`parallel` or `top` to stay distinguishable.
 
 ### `--skip-upload`: reuse means reuse (issue #238)
 

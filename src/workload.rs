@@ -94,9 +94,14 @@ impl Workload {
     pub fn required_layout(self) -> IndexLayout {
         match self {
             Workload::FilterOnly => IndexLayout::NoVector,
-            // Fulltext runs on the vector layout today because that is the one
-            // whose schema indexes `text` fields (Redis `TEXT SORTABLE`); the
-            // no-vector layout rejects them. #339 may revisit this.
+            // Fulltext runs on the vector layout: it is the one whose schema
+            // indexes `text` fields (Redis `TEXT SORTABLE`, OpenSearch `text`),
+            // while the no-vector layout refuses them (CASESENSITIVE tags,
+            // scalar-only schema checks). So vector + fulltext may share one
+            // engine config; filter-only + fulltext may not (#339). An engine
+            // config with a fulltext search config builds its text fields with
+            // the pinned analyzer (`crate::fulltext`), which then also governs
+            // any text `match` filter its vector configs run.
             Workload::Vector | Workload::Hybrid | Workload::Fulltext => IndexLayout::Vector,
         }
     }
@@ -140,7 +145,7 @@ pub enum IndexLayout {
 /// `--skip-vector-index` only — via [`legacy_filter_only`].
 pub fn implemented(engine_type: &str) -> &'static [Workload] {
     match engine_type {
-        "redis" | "opensearch" => &[Workload::Vector, Workload::FilterOnly],
+        "redis" | "opensearch" => &[Workload::Vector, Workload::FilterOnly, Workload::Fulltext],
         _ => &[Workload::Vector],
     }
 }
@@ -158,7 +163,7 @@ pub fn captures(engine_type: &str, workload: Workload) -> bool {
         (engine_type, workload),
         (
             "redis" | "opensearch",
-            Workload::Vector | Workload::FilterOnly
+            Workload::Vector | Workload::FilterOnly | Workload::Fulltext
         )
     )
 }
@@ -173,7 +178,7 @@ pub fn check_capture(plan: &WorkloadPlan) -> Result<(), String> {
     {
         Some(w) => Err(format!(
             "--dump-results: engine '{}' does not capture per-query results for workload \
-             \"{w}\"; per-query capture exists for redis and opensearch (vector, filter-only)",
+             \"{w}\"; per-query capture exists for redis and opensearch (vector, filter-only, fulltext)",
             plan.engine_type
         )),
         None => Ok(()),
@@ -348,6 +353,23 @@ pub fn verify_engine_result_shape(
     }
 }
 
+/// Fulltext fingerprint (#339): a fulltext result carries its
+/// `crate::fulltext::result_metadata` block, no other workload's does.
+/// Checked at the dispatch point next to [`verify_engine_result_shape`].
+pub fn verify_fulltext_shape(workload: Workload, fulltext_metadata: bool) -> Result<(), String> {
+    match (workload, fulltext_metadata) {
+        (Workload::Fulltext, false) => Err(
+            "workload fulltext returned a result without fulltext metadata — the engine did not \
+             run its fulltext path"
+                .into(),
+        ),
+        (w, true) if w != Workload::Fulltext => Err(format!(
+            "workload \"{w}\" returned fulltext metadata — the engine ran its fulltext path"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Refuse a result that does not carry its workload's fingerprint.
 ///
 /// `filter_only_stats` is whether `SearchResults::filter_only` is set. A
@@ -416,12 +438,21 @@ mod tests {
 
     #[test]
     fn unimplemented_combinations_are_hard_errors() {
-        // No engine has fulltext or hybrid yet: refused, not run as vector.
+        // No engine has hybrid yet: refused, not run as vector.
         for engine in ["redis", "opensearch", "qdrant"] {
-            for w in [Workload::Fulltext, Workload::Hybrid] {
-                let e = plan(engine, &[Some(w)], false).unwrap_err();
-                assert!(e.contains("not implemented"), "{e}");
-            }
+            let e = plan(engine, &[Some(Workload::Hybrid)], false).unwrap_err();
+            assert!(e.contains("not implemented"), "{e}");
+        }
+        // Fulltext exists on Redis and OpenSearch only (#339).
+        for engine in ["valkey", "mongodb", "qdrant", "elasticsearch"] {
+            let e = plan(engine, &[Some(Workload::Fulltext)], false).unwrap_err();
+            assert!(e.contains("not implemented"), "{e}");
+        }
+        for engine in ["redis", "opensearch"] {
+            assert!(
+                implemented(engine).contains(&Workload::Fulltext),
+                "{engine}"
+            );
         }
         // Filter-only only where an arm exists.
         assert!(plan("qdrant", &[Some(Workload::FilterOnly)], false).is_err());
@@ -462,7 +493,13 @@ mod tests {
         for legacy in ["valkey", "mongodb"] {
             assert!(check_capture(&plan(legacy, &[None], true).unwrap()).is_err());
         }
-        assert!(!captures("redis", Workload::Fulltext));
+        // #339: fulltext captures on Redis and OpenSearch, hybrid nowhere.
+        for engine in ["redis", "opensearch"] {
+            assert!(captures(engine, Workload::Fulltext), "{engine}");
+            assert!(!captures(engine, Workload::Hybrid), "{engine}");
+            let ft = plan(engine, &[Some(Workload::Fulltext)], false).unwrap();
+            assert!(check_capture(&ft).is_ok(), "{engine}");
+        }
     }
 
     #[test]
@@ -501,6 +538,31 @@ mod tests {
     fn mixed_layouts_are_refused_until_the_full_schema_exists() {
         let e = plan("redis", &[None, Some(Workload::FilterOnly)], false).unwrap_err();
         assert!(e.contains("#344"), "{e}");
+        // Fulltext needs the vector layout's TEXT fields: it cannot share an
+        // index with filter-only, and can with vector (#339).
+        for engine in ["redis", "opensearch"] {
+            let e = plan(
+                engine,
+                &[Some(Workload::Fulltext), Some(Workload::FilterOnly)],
+                false,
+            )
+            .unwrap_err();
+            assert!(e.contains("#344"), "{e}");
+            let p = plan(engine, &[None, Some(Workload::Fulltext)], false).unwrap();
+            assert_eq!(p.layout, IndexLayout::Vector);
+            assert_eq!(p.workloads, vec![Workload::Vector, Workload::Fulltext]);
+        }
+        assert!(plan("redis", &[Some(Workload::Fulltext)], true).is_err());
+    }
+
+    #[test]
+    fn fulltext_results_must_carry_fulltext_metadata() {
+        assert!(verify_fulltext_shape(Workload::Fulltext, true).is_ok());
+        assert!(verify_fulltext_shape(Workload::Fulltext, false).is_err());
+        for w in [Workload::Vector, Workload::Hybrid, Workload::FilterOnly] {
+            assert!(verify_fulltext_shape(w, true).is_err(), "{w}");
+            assert!(verify_fulltext_shape(w, false).is_ok(), "{w}");
+        }
     }
 
     #[test]

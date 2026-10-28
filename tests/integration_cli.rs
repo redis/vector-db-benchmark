@@ -229,10 +229,37 @@ fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
     use serde_json::json;
     let cases = [
         (
-            "redis",
+            "valkey",
             json!([{"workload":"fulltext"}]),
             false,
             "not implemented",
+        ),
+        // #339: fulltext shares the vector layout, not filter-only's.
+        (
+            "opensearch",
+            json!([{"workload":"fulltext"}, {"workload":"filter-only"}]),
+            false,
+            "#344",
+        ),
+        // #339: a `fulltext` block is refused on another workload, and a
+        // misspelled key or a non-positive boost is refused before connecting.
+        (
+            "redis",
+            json!([{"fulltext":{"fields":{"title":2.0}}}]),
+            false,
+            "only valid on a fulltext search config",
+        ),
+        (
+            "redis",
+            json!([{"workload":"fulltext","fulltext":{"feilds":{"title":2.0}}}]),
+            false,
+            "invalid `fulltext` block",
+        ),
+        (
+            "opensearch",
+            json!([{"workload":"fulltext","fulltext":{"fields":{"title":0}}}]),
+            false,
+            "finite number > 0",
         ),
         (
             "opensearch",

@@ -29,6 +29,9 @@ use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
 
+/// Ranked full-text workload (#339).
+mod fulltext;
+
 /// Redis engine configuration
 #[derive(Clone)]
 pub struct RedisEngineConfig {
@@ -349,6 +352,15 @@ impl RedisEngine {
             .arg("PREFIX")
             .arg("1")
             .arg(&self.config.key_prefix);
+
+        // #339: a config that runs the fulltext workload pins the stopword list
+        // explicitly (it equals the RediSearch default) so FT.INFO reports it
+        // and the fulltext arm can refuse an index built any other way.
+        if self.serves_fulltext() {
+            for a in vector_db_benchmark::fulltext::redis_stopword_args() {
+                cmd.arg(a);
+            }
+        }
 
         cmd.arg("SCHEMA");
 
@@ -2228,6 +2240,15 @@ impl Engine for RedisEngine {
         }
         self.prepare_search(dataset)?;
         self.search_filter_only_harness(dataset, params, num_queries)
+    }
+
+    fn search_fulltext(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_fulltext_harness(dataset, params, num_queries)
     }
 
     fn search(

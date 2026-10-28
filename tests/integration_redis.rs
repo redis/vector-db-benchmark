@@ -4752,3 +4752,109 @@ fn test_binary_redis_dump_results_docid_id_space() {
     common::assert_filter_only_docid_dump(&dump, docid);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #339: the ranked full-text workload end to end — boosts, Porter2, the
+/// skipped termless query, per-query docids + scores, and the pinned analyzer
+/// recorded in the result. See `common::assert_bm25_run` for every claim.
+#[test]
+fn test_binary_redis_fulltext_bm25() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{
+        "name": "redis-bm25", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": common::bm25_search_params()
+    }]);
+    let proj = common::write_bm25_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-bm25",
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_bm25_run(&proj.root, &dump, "redis", "redis-bm25");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #339: the fulltext arm refuses, before the timed window, an index that
+/// was not built with the pinned settings (a vector-only config's index: no
+/// explicit stopword list) and an index missing a searched text field. Both
+/// are reached through `--skip-upload`, the path that reuses what is there.
+#[test]
+fn test_binary_redis_fulltext_refuses_unpinned_or_incomplete_index() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-bm25-guard";
+    let write_config = |root: &std::path::Path, search_params: serde_json::Value| {
+        fs::write(
+            root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "redis",
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let fulltext = |fields: serde_json::Value| {
+        serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+            "fulltext": {"fields": fields}}])
+    };
+    let proj = common::write_bm25_project("[]");
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    let run = |extra: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &envs,
+            extra,
+        )
+    };
+    let refused = |out: std::process::Output, needle: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must refuse: {stderr}");
+        assert!(stderr.contains(needle), "expected {needle:?} in: {stderr}");
+    };
+
+    // Index built by a vector-only config: stopwords not pinned.
+    write_config(&proj.root, serde_json::json!([{"parallel": 1}]));
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    write_config(&proj.root, fulltext(serde_json::json!({"title": 1.0})));
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "stopwords_list",
+    );
+
+    // Pinned index, but the dataset now declares a text field it lacks.
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    common::write_bm25_registry(&proj.root, true);
+    write_config(
+        &proj.root,
+        fulltext(serde_json::json!({"title": 1.0, "body": 1.0})),
+    );
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "'body' is not in the Redis index",
+    );
+    // The same index with only its own fields searches fine.
+    write_config(&proj.root, fulltext(serde_json::json!({"title": 1.0})));
+    let ok = run(&["--skip-upload", "--exit-on-error"]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
