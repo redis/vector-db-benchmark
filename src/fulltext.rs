@@ -89,12 +89,61 @@ const OS_STEMMER: &str = "vdbb_english_porter2_stemmer";
 /// The Redis scorer, passed explicitly on every query.
 pub const REDIS_SCORER: &str = "BM25STD";
 
+/// RediSearch's default minimum stem length (`search-min-stem-len` /
+/// `MINSTEMLEN`): tokens shorter than this are not stemmed.
+pub const REDIS_DEFAULT_MIN_STEM_LEN: i64 = 4;
+
+/// Read a numeric setting from a `CONFIG GET` / `FT.CONFIG GET` reply
+/// converted to JSON: a map `{name: value}`, a flat `[name, value]` or a nested
+/// `[[name, value]]`. `None` when the reply does not carry `name`.
+pub fn config_get_value(reply: &Value, name: &str) -> Option<i64> {
+    let parse = |v: &Value| match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    };
+    match reply {
+        Value::Object(o) => o
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| parse(v)),
+        Value::Array(a) => {
+            if a.len() == 2 && a[0].as_str().is_some_and(|k| k.eq_ignore_ascii_case(name)) {
+                return parse(&a[1]);
+            }
+            a.iter().find_map(|e| config_get_value(e, name))
+        }
+        _ => None,
+    }
+}
+
+/// The server's minimum stem length must be the default: it changes which
+/// tokens RediSearch stems at index and query time, and FT.INFO does not
+/// report it. `read` is what the server reported (`None`: the server would not
+/// say — e.g. CONFIG disabled on a managed service — which is recorded as
+/// unverified rather than refused). Returns the `redis_min_stem_len` record.
+pub fn check_redis_min_stem_len(read: Option<i64>) -> Result<Value, String> {
+    match read {
+        Some(REDIS_DEFAULT_MIN_STEM_LEN) => {
+            Ok(json!({"value": REDIS_DEFAULT_MIN_STEM_LEN, "verified": true}))
+        }
+        Some(n) => Err(format!(
+            "fulltext: the Redis server's search-min-stem-len is {n}, not the default \
+             {REDIS_DEFAULT_MIN_STEM_LEN} — tokens shorter than it are not stemmed, so the \
+             pinned english analysis would not be what runs; reset it \
+             (CONFIG SET search-min-stem-len {REDIS_DEFAULT_MIN_STEM_LEN})"
+        )),
+        None => Ok(json!({"value": null, "verified": false,
+            "note": "neither CONFIG GET search-min-stem-len nor FT.CONFIG GET MINSTEMLEN answered"})),
+    }
+}
+
 /// `multi_match` type sent to OpenSearch. See the module docs.
 pub const OPENSEARCH_MULTI_MATCH_TYPE: &str = "most_fields";
 
 /// Differences between the two engines' text pipelines that the pinned
 /// settings do NOT remove. Published in every fulltext result.
-pub const KNOWN_DIFFERENCES: [&str; 6] = [
+pub const KNOWN_DIFFERENCES: [&str; 7] = [
     "tokenizer: RediSearch splits only on its ASCII separator set plus space and tab — NOT on \
      newline or carriage return, so lines joined by '\\n' (e.g. MS MARCO `headings`) index as \
      one token at each join; OpenSearch's standard tokenizer (UAX#29) splits on all whitespace \
@@ -112,6 +161,9 @@ pub const KNOWN_DIFFERENCES: [&str; 6] = [
     "scoring: Lucene IDF and length norms are per shard and per segment statistics; RediSearch \
      statistics are per index",
     "ties: documents with equal scores may be returned in different orders by the two engines",
+    "stemming: RediSearch stems only tokens of at least `search-min-stem-len` characters \
+     (default 4, verified on the server and recorded as `redis_min_stem_len`); Lucene porter2 \
+     has no length floor",
 ];
 
 /// The `fulltext` block of a search config.
@@ -318,7 +370,35 @@ pub fn schema_text_fields(schema: Option<&Value>) -> Vec<String> {
 /// Resolve the searched fields against the dataset schema. Every configured
 /// field must be a `text` field of the schema — a typo would otherwise search
 /// a field that does not exist, which both engines answer with silence.
+/// Whether `name` can be written as `@name` in a RediSearch query without
+/// escaping: ASCII letters, digits and `_`, not starting with a digit.
+pub fn is_plain_field_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub fn resolve_fields(
+    spec: &FulltextSpec,
+    schema: Option<&Value>,
+) -> Result<Vec<FieldBoost>, String> {
+    let fields = resolve_schema_fields(spec, schema)?;
+    // `redis_query` writes `@field:` unescaped; a name with `-`, `.` or other
+    // query syntax would make every query a syntax error. Refused here, which
+    // the runner calls before connecting.
+    if let Some(bad) = fields.iter().find(|f| !is_plain_field_name(&f.field)) {
+        return Err(format!(
+            "fulltext field '{}' is not a plain identifier (ASCII letters, digits, `_`, not \
+             starting with a digit) — it cannot be written unescaped in a RediSearch query",
+            bad.field
+        ));
+    }
+    Ok(fields)
+}
+
+fn resolve_schema_fields(
     spec: &FulltextSpec,
     schema: Option<&Value>,
 ) -> Result<Vec<FieldBoost>, String> {
@@ -1330,6 +1410,67 @@ mod tests {
     }
 
     #[test]
+    fn field_names_must_be_plain_identifiers() {
+        for ok in ["title", "_x", "seg_2", "A1"] {
+            assert!(is_plain_field_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "2nd",
+            "page-title",
+            "a.b",
+            "a b",
+            "ti@tle",
+            "tïtle",
+            "a|b",
+        ] {
+            assert!(!is_plain_field_name(bad), "{bad}");
+        }
+        let schema = json!({"page-title": "text", "body": "text"});
+        // Named explicitly, or picked up as a default field: refused either way.
+        let spec = parse_spec(Some(&json!({"fields": {"page-title": 1.0}}))).unwrap();
+        let e = resolve_fields(&spec, Some(&schema)).unwrap_err();
+        assert!(e.contains("'page-title' is not a plain identifier"), "{e}");
+        assert!(resolve_fields(&FulltextSpec::default(), Some(&schema)).is_err());
+        let spec = parse_spec(Some(&json!({"fields": {"body": 1.0}}))).unwrap();
+        assert!(resolve_fields(&spec, Some(&schema)).is_ok());
+    }
+
+    #[test]
+    fn redis_min_stem_len_must_be_the_default_or_recorded_unverified() {
+        assert_eq!(
+            check_redis_min_stem_len(Some(4)).unwrap(),
+            json!({"value": 4, "verified": true})
+        );
+        for n in [0, 2, 3, 5] {
+            let e = check_redis_min_stem_len(Some(n)).unwrap_err();
+            assert!(e.contains(&format!("search-min-stem-len is {n}")), "{e}");
+        }
+        let u = check_redis_min_stem_len(None).unwrap();
+        assert_eq!(u["verified"], false);
+        assert!(u["value"].is_null());
+        // Reply shapes: RESP3 map, RESP2 flat pair, FT.CONFIG nested pairs.
+        assert_eq!(
+            config_get_value(&json!({"search-min-stem-len": "4"}), "search-min-stem-len"),
+            Some(4)
+        );
+        assert_eq!(
+            config_get_value(&json!(["search-min-stem-len", "3"]), "search-min-stem-len"),
+            Some(3)
+        );
+        assert_eq!(
+            config_get_value(&json!([["MINSTEMLEN", "5"]]), "MINSTEMLEN"),
+            Some(5)
+        );
+        assert_eq!(config_get_value(&json!([]), "MINSTEMLEN"), None);
+        assert_eq!(config_get_value(&json!({}), "search-min-stem-len"), None);
+        assert_eq!(
+            config_get_value(&json!({"other": "4"}), "search-min-stem-len"),
+            None
+        );
+    }
+
+    #[test]
     fn query_set_skips_termless_queries_and_refuses_an_empty_set() {
         let texts: Vec<String> = ["apple pie", "the of a", "Pie!"]
             .iter()
@@ -1720,7 +1861,7 @@ mod tests {
             assert_eq!(m["queries_skipped_no_terms"], json!([1]));
             assert_eq!(m["stopwords"]["list"], json!(STOPWORDS.as_slice()));
             assert_eq!(m["engine"], engine);
-            assert_eq!(m["known_differences"].as_array().unwrap().len(), 6);
+            assert_eq!(m["known_differences"].as_array().unwrap().len(), 7);
         }
         assert_eq!(
             result_metadata("opensearch", &fields, &set, 10).unwrap()["engine_settings"]["index"]

@@ -3143,7 +3143,14 @@ pub fn assert_bm25_run(root: &Path, dump: &Path, engine: &str, config: &str) {
         assert_eq!(ft["result_limit"], 5);
         assert!(!ft["known_differences"].as_array().unwrap().is_empty());
         match engine {
-            "redis" => assert_eq!(ft["engine_settings"]["scorer"], "BM25STD"),
+            "redis" => {
+                assert_eq!(ft["engine_settings"]["scorer"], "BM25STD");
+                // Read back from the server, not assumed.
+                assert_eq!(
+                    ft["redis_min_stem_len"],
+                    serde_json::json!({"value": 4, "verified": true})
+                );
+            }
             _ => {
                 assert_eq!(
                     ft["engine_settings"]["index"]["analysis"]["filter"]

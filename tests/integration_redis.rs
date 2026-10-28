@@ -4876,6 +4876,22 @@ fn test_binary_redis_fulltext_refuses_unpinned_or_incomplete_index() {
             needle,
         );
     }
+    // #339 review 4: the server-wide minimum stem length is read back and a
+    // non-default value refused (FT.INFO does not report it).
+    let _ = redis::cmd("FT.DROPINDEX")
+        .arg(&index)
+        .query::<()>(&mut conn);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    redis::cmd("CONFIG")
+        .arg(&["SET", "search-min-stem-len", "3"][..])
+        .query::<()>(&mut conn)
+        .unwrap();
+    let out = run(&["--skip-upload", "--keep-data", "--exit-on-error"]);
+    redis::cmd("CONFIG")
+        .arg(&["SET", "search-min-stem-len", "4"][..])
+        .query::<()>(&mut conn)
+        .unwrap();
+    refused(out, "search-min-stem-len is 3");
     // Rebuilt by the tool: the same index with only its own fields searches fine.
     let _ = redis::cmd("FT.DROPINDEX")
         .arg(&index)

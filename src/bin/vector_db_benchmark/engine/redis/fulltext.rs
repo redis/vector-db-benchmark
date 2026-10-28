@@ -52,7 +52,7 @@ impl RedisEngine {
 
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
-        {
+        let min_stem_len = {
             let mut conn = resp3_connection(&self.redis_url)
                 .map_err(|e| format!("fulltext: Redis RESP3 connection failed: {e}"))?;
             let info: redis::Value = redis::cmd("FT.INFO")
@@ -60,7 +60,24 @@ impl RedisEngine {
                 .query(&mut conn)
                 .map_err(|e| format!("fulltext: FT.INFO failed: {e}"))?;
             fulltext::validate_redis_index(&redis_value_to_json(&info), &fields)?;
-        }
+            // Server-wide, not in FT.INFO: which tokens get stemmed at all.
+            let mut read = |cmd: &mut redis::Cmd, name: &str| {
+                cmd.query::<redis::Value>(&mut conn)
+                    .ok()
+                    .and_then(|v| fulltext::config_get_value(&redis_value_to_json(&v), name))
+            };
+            let value = read(
+                redis::cmd("CONFIG").arg("GET").arg("search-min-stem-len"),
+                "search-min-stem-len",
+            )
+            .or_else(|| {
+                read(
+                    redis::cmd("FT.CONFIG").arg("GET").arg("MINSTEMLEN"),
+                    "MINSTEMLEN",
+                )
+            });
+            fulltext::check_redis_min_stem_len(value)?
+        };
 
         let texts = fulltext::read_query_texts(&dataset.get_path()?)?;
         let set = fulltext::build_query_set(&texts)?;
@@ -234,7 +251,9 @@ impl RedisEngine {
         // No ground truth: the -1 sentinel keeps it out of precision tables.
         result.mean_precision_at_returned = -1.0;
         result.query_records = captured;
-        result.fulltext = Some(fulltext::result_metadata("redis", &fields, &set, top)?);
+        let mut meta = fulltext::result_metadata("redis", &fields, &set, top)?;
+        meta["redis_min_stem_len"] = min_stem_len;
+        result.fulltext = Some(meta);
         Ok(result)
     }
 }

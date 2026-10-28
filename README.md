@@ -494,12 +494,16 @@ shipped setting:
 | stemming off | 0.610 / 0.465 / 0.455 | 0.691 / 0.549 / 0.565 |
 | stemming off, only `segment` indexed, newlines → spaces | — | 0.943 / 0.903 / 0.907 |
 
-So most of the gap is stemming. Both engines use Porter2, but RediSearch
-indexes a term and its stem and expands each query term to both. Newline
-tokenization (about 2–3 points) and whole-document BM25STD statistics (about 3)
-are small next to it. Once all three are removed the engines agree on about
-94% of the top 10. Treat the as-shipped overlap as the agreement of two default
-English pipelines, not as a BM25 implementation difference.
+So most of the gap goes with stemming: turning it off on both engines is worth
+21–28 points of overlap@10, against about 2–3 for newline tokenization and
+about 3 for whole-document BM25STD statistics. With all three removed the
+engines agree on about 94% of the top 10. The "stemming off" rows change
+several things at once — RediSearch indexing a term together with its stem and
+expanding each query term to both, any difference between RediSearch's Snowball
+and Lucene's `porter2` output, RediSearch's minimum stem length, and
+`VERBATIM` on the query side — so they do not say which of these mechanisms
+accounts for the gap. Treat the as-shipped overlap as the agreement of two
+default English pipelines, not as a BM25 implementation difference.
 
 Result JSON: `params.workload: "fulltext"` and `params.fulltext` (fields and
 boosts, query-term method, stopword list and provenance, the engine's analyzer /
