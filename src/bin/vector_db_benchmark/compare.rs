@@ -49,17 +49,23 @@ pub fn run(args: &CompareResultsArgs) -> Result<(), String> {
         let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
         fs::write(p, json).map_err(|e| format!("{}: {e}", p.display()))?;
     }
-    if !report.passed() {
+    if !report.passed_allowing_unpaired(args.allow_unpaired) {
         return Err(format!(
-            "comparison failed: {} quer{} answered by one engine and not the other, and {} \
-             failed query attempt(s) across both dumps (see the report)",
+            "comparison failed: {} quer{} answered by one engine and not the other, {} \
+             failed query attempt(s) across both dumps, {} unpaired dump(s){} (see the report)",
             report.one_sided_total,
             if report.one_sided_total == 1 {
                 "y was"
             } else {
                 "ies were"
             },
-            report.failed_attempts_total
+            report.failed_attempts_total,
+            report.unpaired.len(),
+            if args.allow_unpaired {
+                " (allowed)"
+            } else {
+                ""
+            }
         ));
     }
     Ok(())

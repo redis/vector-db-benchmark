@@ -370,7 +370,12 @@ and recall@k against the dump's ground truth for `vector`/`hybrid`. It exits
 non-zero when any query was answered by one engine and not by the other, or when
 either dump holds ANY failed attempt — including a query that failed once and
 was answered on a later cycle (`--queries N` above the query count, duration
-runs): that is the `--fail-on-dropped-queries` policy applied to the dumps.
+runs): that is the `--fail-on-dropped-queries` policy applied to the dumps. A
+dump with no counterpart on the other side also fails the comparison, unless
+`--allow-unpaired` is passed. `--dump-results` is refused at startup for any
+engine/workload without per-query capture (today: Redis and OpenSearch,
+vector and filter-only), and `calibration_param` on a declared non-vector
+workload is refused at startup.
 
 ### `--skip-upload`: reuse means reuse (issue #238)
 

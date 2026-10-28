@@ -3313,11 +3313,18 @@ mod tests {
         /// `#[cfg(test)] const` at item level has no brace, and the guard's
         /// `strip_test_modules` used to brace-count from the next `{` it found —
         /// silently deleting the production code in between.
-        const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[(
-            "verbose",
-            "console output only: changes what is printed, never what is measured \
+        const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[
+            (
+                "verbose",
+                "console output only: changes what is printed, never what is measured \
          or which experiments run",
-        )];
+            ),
+            (
+                "allow_unpaired",
+                "a `compare-results` subcommand flag: that subcommand reads dumps and runs \
+                 no benchmark, so there is no run artifact for it to reach",
+            ),
+        ];
 
         /// Every `Args` BOOLEAN that changes what is measured must be recorded.
         ///

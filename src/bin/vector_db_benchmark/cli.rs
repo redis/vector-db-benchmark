@@ -264,6 +264,10 @@ pub struct CompareResultsArgs {
     /// Write the Markdown table here (it is always printed to stdout).
     #[arg(long, value_name = "FILE")]
     pub markdown: Option<PathBuf>,
+    /// Do not fail when a dump on either side has no counterpart (they are
+    /// still listed). Off by default: a missing dump is a missing comparison.
+    #[arg(long)]
+    pub allow_unpaired: bool,
 }
 
 #[cfg(test)]

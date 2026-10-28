@@ -117,8 +117,19 @@ pub struct Report {
 }
 
 impl Report {
+    /// Strict verdict: no one-sided query, no failed attempt, and no dump left
+    /// without a counterpart (a missing file is the same gap as a missing
+    /// query, one level up).
     pub fn passed(&self) -> bool {
-        self.one_sided_total == 0 && self.failed_attempts_total == 0
+        self.passed_allowing_unpaired(false)
+    }
+
+    /// [`Self::passed`], optionally tolerating unpaired dumps
+    /// (`compare-results --allow-unpaired`).
+    pub fn passed_allowing_unpaired(&self, allow_unpaired: bool) -> bool {
+        self.one_sided_total == 0
+            && self.failed_attempts_total == 0
+            && (allow_unpaired || self.unpaired.is_empty())
     }
 }
 
@@ -271,13 +282,20 @@ pub fn compare_pair(
 
     let mut groups: BTreeMap<String, Vec<(&QueryRecord, &QueryRecord)>> = BTreeMap::new();
     for (q, r, c) in &both {
-        if let (Some(re), Some(ce)) = (&r.expected, &c.expected) {
-            if re != ce {
+        match (&r.expected, &c.expected) {
+            (Some(re), Some(ce)) if re != ce => {
                 return Err(format!(
                     "query {q}: {rf} and {cf} carry different ground truth — the dumps were \
                      not produced from the same corpus"
                 ));
             }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(format!(
+                    "query {q}: only one of {rf} and {cf} carries ground truth; recall would be \
+                     reported for one side only"
+                ));
+            }
+            _ => {}
         }
         let shape = r
             .shape
@@ -528,7 +546,11 @@ pub fn render_markdown(r: &Report) -> String {
         }
     }
     if !r.unpaired.is_empty() {
-        s.push_str("\nUnpaired dumps (no counterpart on the other side):\n\n");
+        s.push_str(&format!(
+            "\n**FAILED** (unless --allow-unpaired): {} dump(s) with no counterpart on the other \
+             side:\n\n",
+            r.unpaired.len()
+        ));
         for u in &r.unpaired {
             s.push_str(&format!("- {u}\n"));
         }
@@ -814,6 +836,10 @@ mod tests {
         let mut b = vector_dump("redis");
         b.records[0].expected = Some(ids(&["z"]));
         assert!(compare_pair(("a", &a), ("b", &b)).is_err());
+        // Ground truth on one side only.
+        let mut b = vector_dump("redis");
+        b.records[0].expected = None;
+        assert!(compare_pair(("a", &a), ("b", &b)).is_err());
         // Neither side names the reference.
         assert!(compare(
             &[("a".into(), a.clone())],
@@ -842,6 +868,10 @@ mod tests {
         let mut unpaired = r.unpaired.clone();
         unpaired.sort();
         assert_eq!(unpaired, vec!["c3".to_string(), "r2".to_string()]);
+        // A dump with no counterpart fails the comparison unless allowed.
+        assert!(!r.passed());
+        assert!(r.passed_allowing_unpaired(true));
+        assert!(render_markdown(&r).contains("2 dump(s) with no counterpart"));
         // Two reference dumps with the same key are ambiguous.
         let e = compare(
             &[("x".into(), r1.clone()), ("y".into(), r1)],
