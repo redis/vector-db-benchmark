@@ -106,7 +106,7 @@ fn scalar_search_reports_measured_retries_but_not_priming_retries() {
         // against the peer above, while corpus validation is covered separately.
         engine.scalar_metadata_validated = true;
         let params = serde_json::from_value(json!({"parallel":1,"top":1})).unwrap();
-        let results = engine.search(&dataset, &params, 2).unwrap();
+        let results = engine.search_filter_only(&dataset, &params, 2).unwrap();
         server.join().unwrap();
         assert_eq!(results.requested_queries, 2);
         assert_eq!(results.failed_queries, 0);

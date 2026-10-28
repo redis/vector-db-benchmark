@@ -17,6 +17,7 @@ use crate::config::{
 use crate::dataset::Dataset;
 use crate::engine::{create_engine, CorpusCount, Engine, UpdateSearchRatio};
 use crate::summary::{self, SearchEntry};
+use vector_db_benchmark::workload::{IndexLayout, Workload, WorkloadPlan};
 
 /// Results directory
 fn results_dir() -> PathBuf {
@@ -166,7 +167,6 @@ pub fn run(args: &Args) -> Result<(), String> {
         "vertex",
         "chroma",
     ];
-    let skip_vector_engines = ["redis", "valkey", "mongodb", "opensearch"];
     let mut engines: Vec<_> = engine_configs
         .iter()
         .filter(|(name, config)| {
@@ -189,7 +189,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     if args.skip_vector_index {
         engines.retain(|(_, config)| {
             let engine_type = config.engine.as_deref().unwrap_or("unknown");
-            let supported = skip_vector_engines.contains(&engine_type);
+            let supported = vector_db_benchmark::workload::supports_skip_vector_index(engine_type);
             if !supported {
                 eprintln!(
                     "WARNING: --skip-vector-index not implemented for engine '{}', skipping",
@@ -201,6 +201,52 @@ pub fn run(args: &Args) -> Result<(), String> {
         if engines.is_empty() {
             return Err("No selected engines support --skip-vector-index".into());
         }
+    }
+
+    // Resolve every search config's workload (#344) before anything is
+    // downloaded or connected: an unimplemented (engine, workload) pair or a
+    // config mixing index layouts is a hard error here, never a fallback.
+    let mut plans: std::collections::HashMap<String, WorkloadPlan> =
+        std::collections::HashMap::new();
+    for (name, config) in &engines {
+        let declared: Vec<Option<Workload>> = config
+            .search_params
+            .iter()
+            .flatten()
+            .map(|sp| sp.workload)
+            .collect();
+        let plan = vector_db_benchmark::workload::plan(
+            config.engine.as_deref().unwrap_or("unknown"),
+            &declared,
+            args.skip_vector_index,
+        )
+        .map_err(|e| format!("config '{name}': {e}"))?;
+        let calibration_declared: Vec<bool> = config
+            .search_params
+            .iter()
+            .flatten()
+            .map(|sp| sp.calibration_param.is_some())
+            .collect();
+        vector_db_benchmark::workload::check_calibration(
+            &plan,
+            &calibration_declared,
+            args.skip_vector_index,
+        )
+        .map_err(|e| format!("config '{name}': {e}"))?;
+        if args.dump_results.is_some() {
+            vector_db_benchmark::workload::check_capture(&plan)
+                .map_err(|e| format!("config '{name}': {e}"))?;
+        }
+        if args.target_qps > 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {
+            return Err(format!(
+                "--target-qps currently supports search-only vector benchmarks; config \
+                 '{name}' declares a non-vector workload"
+            ));
+        }
+        plans.insert(name.to_string(), plan);
+    }
+    if let Some(dir) = &args.dump_results {
+        vector_db_benchmark::results_dump::prepare_dump_dir(dir)?;
     }
 
     if args.target_qps > 0.0 || args.search_duration > 0.0 {
@@ -338,18 +384,24 @@ pub fn run(args: &Args) -> Result<(), String> {
             num_engine_configs
         );
     }
-    'experiments: for (engine_idx, (_engine_name, engine_config)) in engines.iter().enumerate() {
+    'experiments: for (engine_idx, (engine_name, engine_config)) in engines.iter().enumerate() {
         // With --reset-between-configs, only the LAST config keeps its data under
         // --keep-data; earlier configs tear down after finishing so at most one
         // config's corpus is resident (#184). (A full M×EF sweep runs every config
         // over the same datasets, so the last config is the last to touch each.)
         let is_last_config = engine_idx + 1 == num_engine_configs;
-        // Apply --skip-vector-index: override name and set flag on config
+        let plan = plans
+            .get(engine_name.as_str())
+            .ok_or_else(|| format!("no workload plan for config '{engine_name}'"))?;
+        // The plan's index layout decides whether configure() builds a vector
+        // index. `--skip-vector-index` additionally keeps its legacy rename.
         let mut engine_config = (*engine_config).clone();
+        if plan.layout == IndexLayout::NoVector {
+            engine_config.skip_vector_index = true;
+        }
         if args.skip_vector_index {
             let engine_type = engine_config.engine.as_deref().unwrap_or("unknown");
             engine_config.name = format!("{}-no-vector", engine_type);
-            engine_config.skip_vector_index = true;
         }
 
         for (dataset_name, dataset_config) in &datasets {
@@ -410,6 +462,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                 &mut *engine,
                 &dataset,
                 args,
+                plan,
                 is_last_config,
                 number_of_shards.as_ref(),
                 recording,
@@ -465,6 +518,8 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
         // Caught by the guard below on the very first merge after it landed.
         "allow_partial_corpus": args.allow_partial_corpus,
         "dump_raw_latencies": args.dump_raw_latencies,
+        // Non-boolean: where per-query result dumps went (#343).
+        "dump_results": args.dump_results,
         "exit_on_error": args.exit_on_error,
         "fail_on_dropped_queries": args.fail_on_dropped_queries,
         "keep_data": args.keep_data,
@@ -795,6 +850,7 @@ fn check_corpus_reuse_precondition(
     engine: &mut dyn Engine,
     dataset: &Dataset,
     args: &Args,
+    no_vector_layout: bool,
 ) -> Result<Option<serde_json::Value>, String> {
     // Nothing is measured, so nothing can be misreported.
     if args.skip_search {
@@ -805,7 +861,7 @@ fn check_corpus_reuse_precondition(
     // search phase returns before `read_queries()`. Same rationale as
     // `--skip-search` above, and checking it here also keeps the fetch below
     // from downloading a corpus for a run that will publish nothing.
-    if args.skip_vector_index
+    if no_vector_layout
         && !dataset
             .config
             .schema
@@ -1138,6 +1194,7 @@ fn run_single_experiment(
     engine: &mut dyn Engine,
     dataset: &Dataset,
     args: &Args,
+    plan: &WorkloadPlan,
     is_last_config: bool,
     number_of_shards: Option<&serde_json::Value>,
     // Consumed, never read: holding it proves `begin_experiment` ran for THIS
@@ -1159,6 +1216,9 @@ fn run_single_experiment(
     // not create the corpus must not tear it down, whatever `--keep-data` says.
     let keep_data =
         args.skip_upload || (args.keep_data && (is_last_config || !args.reset_between_configs));
+    // Every search config of this engine config needs this layout (#344);
+    // `NoVector` is exactly the legacy `--skip-vector-index` path.
+    let no_vector_layout = plan.layout == IndexLayout::NoVector;
 
     // Skip an incompatible (engine, dataset) pair BEFORE `get_path()`, which would
     // otherwise download the archive — hundreds of MB for the msmarco-sparse sets
@@ -1243,7 +1303,7 @@ fn run_single_experiment(
         // it: if phase 1 was a NORMAL upload, phase 2 does not destroy anything —
         // it publishes a QPS number from an empty `<engine>-no-vector` index while
         // the real corpus sits untouched under the original config name.
-        corpus_reuse = check_corpus_reuse_precondition(engine, dataset, args)?;
+        corpus_reuse = check_corpus_reuse_precondition(engine, dataset, args, no_vector_layout)?;
     }
 
     // Build ordered search phases: pure search first, then mixed ratios ascending
@@ -1301,7 +1361,7 @@ fn run_single_experiment(
     // query vector just to drop it (~22 s warm / ~137 s cold per config on the
     // compound h-and-m dataset, paid once per config in a sweep).
     let ground_truth: Option<crate::ground_truth::GroundTruthProfile> =
-        if args.skip_vector_index || args.skip_search {
+        if no_vector_layout || args.skip_search {
             None
         } else {
             match crate::ground_truth::GroundTruthProfile::load(dataset) {
@@ -1393,7 +1453,7 @@ fn run_single_experiment(
     // just as much to a hard search failure, and matters more now that a
     // short-staffed worker pool is one of them (#214).
     let mut fatal_search_error: Option<String> = None;
-    let skip_vector_index = args.skip_vector_index;
+    let skip_vector_index = no_vector_layout;
 
     if !args.skip_search {
         // --skip-vector-index + no query conditions = nothing to search for
@@ -1439,7 +1499,7 @@ fn run_single_experiment(
                 all_search_params.iter().map(|sp| (sp.parallel, sp.top)),
                 // --skip-vector-index canonicalizes names to <engine>-no-vector.
                 // Legacy adapters still derive their default from ground truth.
-                matches!(engine.name(), "redis-no-vector" | "opensearch-no-vector")
+                matches!(plan.engine_type.as_str(), "redis" | "opensearch")
                     .then_some(vector_db_benchmark::filter_only::DEFAULT_LIMIT as i64),
             )?
             .into_iter()
@@ -1490,10 +1550,31 @@ fn run_single_experiment(
                 }
 
                 let parallel = search_params.parallel.unwrap_or(1);
+                let workload = plan.workload(*search_id)?;
+                // Mixed phases interleave VECTOR searches with updates; any other
+                // workload there would be measured as something it is not.
+                if phase.is_some() && workload != Workload::Vector {
+                    return Err(format!(
+                        "--update-search-ratio runs the vector workload; search config \
+                         #{search_id} is \"{workload}\""
+                    ));
+                }
+                // Calibration tunes a vector search knob (it calls the vector
+                // path). Refused at startup by `workload::check_calibration`
+                // except for the legacy `--skip-vector-index` filter-only path,
+                // which keeps ignoring it; this is the backstop.
+                if !matches!(workload, Workload::Vector | Workload::FilterOnly)
+                    && search_params.calibration_param.is_some()
+                {
+                    return Err(format!(
+                        "calibration_param is only supported for the vector workload; search \
+                         config #{search_id} is \"{workload}\""
+                    ));
+                }
 
                 // Calibration is skipped for filter-only mode (no vector search to tune)
                 let mut calibration_json: Option<serde_json::Value> = None;
-                let calibrated_params = if skip_vector_index {
+                let calibrated_params = if workload != Workload::Vector {
                     None
                 } else if let (Some(cal_param), Some(cal_precision)) = (
                     &search_params.calibration_param,
@@ -1559,6 +1640,10 @@ fn run_single_experiment(
 
                 let base_params = calibrated_params.as_ref().unwrap_or(search_params);
                 let mut runtime_params = base_params.clone();
+                // Recorded in the result file's params; the engine reads the
+                // dispatch, not this field.
+                runtime_params.workload = Some(workload);
+                runtime_params.capture_query_results = args.dump_results.is_some();
                 if args.search_duration > 0.0 {
                     runtime_params.duration_seconds = Some(args.search_duration);
                 }
@@ -1597,8 +1682,17 @@ fn run_single_experiment(
                         "\tOpen-loop warm-up: {:.1} QPS for {:.1}s",
                         args.target_qps, args.warmup_seconds
                     );
+                    // A warm-up's records are discarded; do not pay for them.
+                    warmup_params.capture_query_results = false;
                     run_with_search_watchdog(args.search_timeout, "open-loop warm-up", || {
-                        engine.search(dataset, &warmup_params, args.queries)
+                        crate::engine::search_workload(
+                            engine,
+                            &plan.engine_type,
+                            workload,
+                            dataset,
+                            &warmup_params,
+                            args.queries,
+                        )
                     })
                     .map_err(|e| format!("open-loop warm-up failed: {}", e))?;
                 } else if args.search_duration > 0.0 && args.warmup_seconds > 0.0 {
@@ -1610,8 +1704,16 @@ fn run_single_experiment(
                     warmup_params.duration_seconds = Some(args.warmup_seconds);
                     warmup_params.target_qps = None;
                     println!("\tClosed-loop warm-up: {:.1}s", args.warmup_seconds);
+                    warmup_params.capture_query_results = false;
                     run_with_search_watchdog(args.search_timeout, "closed-loop warm-up", || {
-                        engine.search(dataset, &warmup_params, args.queries)
+                        crate::engine::search_workload(
+                            engine,
+                            &plan.engine_type,
+                            workload,
+                            dataset,
+                            &warmup_params,
+                            args.queries,
+                        )
                     })
                     .map_err(|e| format!("closed-loop warm-up failed: {}", e))?;
                 }
@@ -1667,7 +1769,14 @@ fn run_single_experiment(
                             Some(ratio) => {
                                 engine.search_mixed(dataset, effective_params, args.queries, ratio)
                             }
-                            None => engine.search(dataset, effective_params, args.queries),
+                            None => crate::engine::search_workload(
+                                engine,
+                                &plan.engine_type,
+                                workload,
+                                dataset,
+                                effective_params,
+                                args.queries,
+                            ),
                         });
                     let cpu_after = crate::proc_cpu::sample();
 
@@ -1875,6 +1984,25 @@ fn run_single_experiment(
         )?;
     }
 
+    // Per-query dumps (#343), written after every timed window has closed. A
+    // failure here is RECORDED, not returned: it must not replace a hard search
+    // failure or the dropped-query verdict below, nor skip summary and teardown.
+    // It is reported last (see `with_dump_failure`).
+    let dump_failure: Option<String> = match &args.dump_results {
+        Some(dir) => write_query_dumps(
+            dir,
+            &plan.engine_type,
+            engine.name(),
+            dataset,
+            &mut pending_saves,
+        )
+        .err(),
+        None => None,
+    };
+    if let Some(e) = &dump_failure {
+        eprintln!("\t⚠ {e}");
+    }
+
     // Only now that the completed points are on disk may a hard search failure
     // end the run.
     if let Some(msg) = fatal_search_error {
@@ -1884,7 +2012,7 @@ fn run_single_experiment(
                 pending_saves.len()
             );
         }
-        return Err(msg);
+        return Err(with_dump_failure(msg, dump_failure.as_deref()));
     }
 
     // Now that the evidence is on disk, honour --fail-on-dropped-queries. Every
@@ -1892,13 +2020,16 @@ fn run_single_experiment(
     // engine-agnostic by construction: it reads the `failed_queries` that
     // `compute_search_stats` derives for all of them.
     if args.fail_on_dropped_queries && !dropped_query_failures.is_empty() {
-        return Err(format!(
-            "{} search config(s) lost queries and --fail-on-dropped-queries is set: {}. \
-             Recall/latency for these cover the surviving subset only, which biases recall \
-             upward. Results were still written; re-run with less load, or drop the flag to \
-             accept a partial run.",
-            dropped_query_failures.len(),
-            dropped_query_failures.join("; ")
+        return Err(with_dump_failure(
+            format!(
+                "{} search config(s) lost queries and --fail-on-dropped-queries is set: {}. \
+                 Recall/latency for these cover the surviving subset only, which biases recall \
+                 upward. Results were still written; re-run with less load, or drop the flag to \
+                 accept a partial run.",
+                dropped_query_failures.len(),
+                dropped_query_failures.join("; ")
+            ),
+            dump_failure.as_deref(),
         ));
     }
 
@@ -1977,8 +2108,23 @@ fn run_single_experiment(
         engine.delete()?;
     }
 
+    // A failed dump write is surfaced only after summary and teardown ran.
+    if let Some(e) = dump_failure {
+        return Err(e);
+    }
+
     println!("Experiment stage: Done");
     Ok(())
+}
+
+/// An experiment's primary failure, with a secondary `--dump-results` write
+/// failure appended rather than substituted (#343 review): the search failure
+/// or dropped-query verdict is what the run is about, and must stay first.
+fn with_dump_failure(primary: String, dump_failure: Option<&str>) -> String {
+    match dump_failure {
+        Some(d) => format!("{primary}\n(also: {d})"),
+        None => primary,
+    }
 }
 
 /// Outcome of a calibration sweep, including whether it actually got there.
@@ -2253,6 +2399,103 @@ fn metrics_schema(gt: Option<&crate::ground_truth::GroundTruthStats>) -> serde_j
     schema
 }
 
+/// Row id -> external id for a dataset's per-query dumps (logic and tests in
+/// `results_dump::external_ids_for_dataset`). Cached for the most recent
+/// dataset: a sweep dumps every config against the same corpus, and the
+/// `docid` scan reads the whole `payloads.jsonl`. Outside every timed window.
+fn external_ids(
+    dataset: &Dataset,
+) -> Result<std::sync::Arc<vector_db_benchmark::results_dump::ExternalIds>, String> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<Option<(String, Arc<vector_db_benchmark::results_dump::ExternalIds>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut slot = cache.lock().map_err(|_| "external id cache poisoned")?;
+    if let Some((name, ids)) = slot.as_ref() {
+        if *name == dataset.config.name {
+            return Ok(Arc::clone(ids));
+        }
+    }
+    let ids = Arc::new(vector_db_benchmark::results_dump::external_ids_for_dataset(
+        &dataset.config.name,
+        dataset.config.dataset_type.as_deref(),
+        dataset.config.schema.as_ref(),
+        || dataset.get_path(),
+    )?);
+    *slot = Some((dataset.config.name.clone(), Arc::clone(&ids)));
+    Ok(ids)
+}
+
+/// Write one JSONL per completed search point that captured per-query results
+/// (`--dump-results`, #343). Consumes the captures so they are not kept in
+/// memory afterwards. Refuses to overwrite an existing dump: two runs' records
+/// in one file could not be told apart.
+fn write_query_dumps(
+    dir: &std::path::Path,
+    engine_type: &str,
+    engine_name: &str,
+    dataset: &Dataset,
+    pending: &mut [(
+        usize,
+        SearchParams,
+        crate::engine::SearchResults,
+        Option<serde_json::Value>,
+    )],
+) -> Result<(), String> {
+    use vector_db_benchmark::results_dump as dump;
+    if pending.iter().all(|(_, _, r, _)| r.query_records.is_none()) {
+        return Ok(());
+    }
+    let ids = external_ids(dataset)?;
+    let mut expected: Option<Vec<Vec<i64>>> = None;
+    for (search_id, params, results, _) in pending.iter_mut() {
+        let Some(raw) = results.query_records.take() else {
+            continue;
+        };
+        let workload = results
+            .workload
+            .ok_or("--dump-results: a result reached the dump without a dispatched workload")?;
+        let gt = if workload.has_ground_truth() {
+            if expected.is_none() {
+                expected = Some(dataset.read_queries()?.1);
+            }
+            expected.as_deref()
+        } else {
+            None
+        };
+        let records = dump::resolve_records(&raw, &ids, gt, results.top, &|_| None)?;
+        let header = dump::DumpHeader {
+            schema_version: dump::DUMP_SCHEMA_VERSION,
+            engine: engine_type.to_string(),
+            config: engine_name.to_string(),
+            dataset: dataset.config.name.clone(),
+            workload,
+            parallel: params.parallel.unwrap_or(1).max(1) as usize,
+            top: results.top,
+            search_id: *search_id,
+            id_space: ids.space(),
+        };
+        let path = dir.join(dump::dump_file_name(&header));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                format!(
+                    "--dump-results: cannot create {} ({e}); use an empty directory per run",
+                    path.display()
+                )
+            })?;
+        dump::write_dump(std::io::BufWriter::new(file), &header, &records)?;
+        println!(
+            "\tPer-query results ({} records) dumped to: {:?}",
+            records.len(),
+            path
+        );
+    }
+    Ok(())
+}
+
 /// Save search results to JSON file (matches Python v0 format)
 #[allow(clippy::too_many_arguments)]
 fn save_search_results(
@@ -2407,9 +2650,30 @@ fn build_search_result_json(
     // profile is evaluated at the `top` this run actually used, so a reader can
     // see whether `mean_recall` is the same quantity upstream calls
     // `mean_precisions` for this dataset — or by how much they cannot be.
+    // p90 (#346), next to the p50/p95/p99 fields above. Inserted here rather
+    // than in the literal because that `json!` is at the macro recursion limit;
+    // serde_json's map is sorted, so the emitted document is the same.
+    result["results"]["p90_time"] = json!(results.p90_time);
+    result["results"]["schedule_delay_p90_time"] = json!(results.schedule_delay_p90_time);
+    result["results"]["end_to_end_p90_time"] = json!(results.end_to_end_p90_time);
+
     let gt_stats = ground_truth.and_then(|gt| gt.stats(results.top));
     result["metrics_schema"] = metrics_schema(gt_stats.as_ref());
 
+    // The workload the dispatch point actually ran (#344), on every result.
+    if let Some(workload) = results.workload {
+        result["params"]["workload"] = serde_json::json!(workload.as_str());
+    }
+    // #343 review: a --dump-results run's rps includes the per-query capture
+    // work (outside each latency sample, inside the throughput window). Say so
+    // in the artifact, where its QPS will be compared with a non-dump run's.
+    if search_params.capture_query_results {
+        result["params"]["per_query_capture"] = serde_json::json!({
+            "enabled": true,
+            "in_throughput_window": true,
+            "in_latency_samples": false,
+        });
+    }
     if let Some(contract) = &results.filter_only {
         result["params"]["workload"] = serde_json::json!("filter-only");
         result["results"]["filter_only"] = serde_json::to_value(contract).unwrap();
@@ -2526,6 +2790,9 @@ fn build_search_result_json(
         }
         if let Some(t) = results.update_p50_time {
             results_obj.insert("update_p50_time".to_string(), json!(t));
+        }
+        if let Some(t) = results.update_p90_time {
+            results_obj.insert("update_p90_time".to_string(), json!(t));
         }
         if let Some(t) = results.update_p95_time {
             results_obj.insert("update_p95_time".to_string(), json!(t));
@@ -3056,11 +3323,18 @@ mod tests {
         /// `#[cfg(test)] const` at item level has no brace, and the guard's
         /// `strip_test_modules` used to brace-count from the next `{` it found —
         /// silently deleting the production code in between.
-        const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[(
-            "verbose",
-            "console output only: changes what is printed, never what is measured \
+        const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[
+            (
+                "verbose",
+                "console output only: changes what is printed, never what is measured \
          or which experiments run",
-        )];
+            ),
+            (
+                "allow_unpaired",
+                "a `compare-results` subcommand flag: that subcommand reads dumps and runs \
+                 no benchmark, so there is no run artifact for it to reach",
+            ),
+        ];
 
         /// Every `Args` BOOLEAN that changes what is measured must be recorded.
         ///
@@ -3149,6 +3423,8 @@ mod tests {
                 "warmup_seconds",
                 "configurations_dir",
                 "results_dir",
+                // #343: where per-query dumps went (an Option<PathBuf> flag).
+                "dump_results",
             ];
             let fabricated: Vec<&String> = recorded
                 .keys()
@@ -4230,9 +4506,10 @@ mod reuse_handler_tests {
         let ds = measurable_dataset(dir.path(), 400);
         let mut engine = stub("chroma-handler", Ok(None));
 
-        let record = check_corpus_reuse_precondition(&mut engine, &ds, &args())
-            .expect("an engine with no probe must not abort the run")
-            .expect("the verdict must still be recorded in the artifact");
+        let record =
+            check_corpus_reuse_precondition(&mut engine, &ds, &args(), args().skip_vector_index)
+                .expect("an engine with no probe must not abort the run")
+                .expect("the verdict must still be recorded in the artifact");
 
         assert_eq!(record["status"], "unverified");
         assert_eq!(record["actual_rows"], serde_json::Value::Null);
@@ -4252,8 +4529,9 @@ mod reuse_handler_tests {
         let ds = measurable_dataset(dir.path(), 400);
         let mut engine = stub("redis-handler", Ok(Some(CorpusCount::exact(1))));
 
-        let err = check_corpus_reuse_precondition(&mut engine, &ds, &args())
-            .expect_err("a short exact count must abort");
+        let err =
+            check_corpus_reuse_precondition(&mut engine, &ds, &args(), args().skip_vector_index)
+                .expect_err("a short exact count must abort");
         assert!(
             err.contains("the corpus you asked to reuse is incomplete"),
             "{err}"
@@ -4287,11 +4565,29 @@ mod reuse_handler_tests {
             "--skip-upload",
             "--skip-vector-index",
         ]);
-        let out = check_corpus_reuse_precondition(&mut engine, &ds, &args)
+        let out = check_corpus_reuse_precondition(&mut engine, &ds, &args, args.skip_vector_index)
             .expect("a run that searches nothing must not be rejected");
         assert!(
             out.is_none(),
             "no verdict should be recorded for a run that measures nothing: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dump_failure_ordering_tests {
+    use super::with_dump_failure;
+
+    /// A late `--dump-results` write failure is appended to, never substituted
+    /// for, the experiment's primary failure (#343 review).
+    #[test]
+    fn the_primary_failure_stays_first_and_the_dump_failure_is_kept() {
+        let e = with_dump_failure("search failed".into(), Some("dump: disk full"));
+        assert!(e.starts_with("search failed"), "{e}");
+        assert!(e.contains("dump: disk full"), "{e}");
+        assert_eq!(
+            with_dump_failure("search failed".into(), None),
+            "search failed"
         );
     }
 }
@@ -4332,6 +4628,12 @@ mod filter_only_serialization_tests {
                         matched_documents_sum: 17,
                         returned_documents_sum: 6,
                         retried_queries: 0,
+                    }),
+                    // What `engine::search_workload` stamps on every result.
+                    workload: Some(if scalar {
+                        vector_db_benchmark::workload::Workload::FilterOnly
+                    } else {
+                        vector_db_benchmark::workload::Workload::Vector
                     }),
                     ..Default::default()
                 };
@@ -4395,10 +4697,190 @@ mod filter_only_serialization_tests {
                     );
                     assert!(doc["metrics_schema"].get("ground_truth").is_none());
                 } else {
-                    assert!(doc["params"].get("workload").is_none());
+                    // #344: the dispatched workload is recorded on every result.
+                    assert_eq!(doc["params"]["workload"], "vector");
                     assert_eq!(result["mean_recall"], 0.5);
                 }
             }
         }
+    }
+
+    /// #343 review: a run with per-query capture says so in the artifact; a run
+    /// without it carries no such block.
+    #[test]
+    fn per_query_capture_is_recorded_only_when_on() {
+        for capture in [false, true] {
+            let mut params: SearchParams = serde_json::from_value(json!({"parallel":1})).unwrap();
+            params.capture_query_results = capture;
+            let results = SearchResults {
+                top: 10,
+                parallel: 1,
+                requested_queries: 1,
+                num_queries: 1,
+                latencies: vec![0.001],
+                workload: Some(vector_db_benchmark::workload::Workload::Vector),
+                ..Default::default()
+            };
+            let doc = build_search_result_json(
+                "test",
+                "fixture",
+                &params,
+                &results,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                &json!({}),
+            );
+            let block = doc["params"].get("per_query_capture");
+            assert_eq!(block.is_some(), capture, "capture={capture}");
+            if capture {
+                assert_eq!(block.unwrap()["in_throughput_window"], true);
+            }
+        }
+    }
+}
+
+/// #346: p90 is published for every latency series (search, update,
+/// schedule-delay, end-to-end) and is the numpy-linear p90 of that series' own
+/// samples.
+#[cfg(test)]
+mod p90_publication_tests {
+    use super::build_search_result_json;
+    use crate::config::SearchParams;
+    use crate::engine::{
+        attach_open_loop_metrics, compute_search_stats, finalize_update_stats, OpenLoopPlan,
+        UpdateAttribution, UpdateSearchRatio, UpdateTally,
+    };
+    use serde_json::json;
+
+    /// `numpy.percentile(v, 90)` (linear), written out independently of
+    /// `percentile_linear` so a shared bug in that helper cannot pass both.
+    fn numpy_p90(values: &[f64]) -> f64 {
+        let mut v = values.to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let rank = 0.9 * (v.len() - 1) as f64;
+        let lo = rank.floor() as usize;
+        let frac = rank - lo as f64;
+        if frac == 0.0 {
+            v[lo]
+        } else {
+            v[lo] + (v[lo + 1] - v[lo]) * frac
+        }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-12
+    }
+
+    #[test]
+    fn p90_is_published_for_every_latency_series_from_a_known_sample() {
+        // Each series gets a DIFFERENT known sample, so a p90 copied from the
+        // wrong series, or from p50/p95, cannot match. Reversed so the
+        // computation has to sort. Hand-derived numpy-linear p90s:
+        //   search  1..=100 ms : rank 89.1 -> 90.1 ms   (nearest-rank would give 91)
+        //   update  10..=100 ms step 10 : rank 8.1 -> 91 ms
+        //   sched   1..=20 ms  : rank 17.1 -> 18.1 ms
+        //   e2e     2..=100 ms step 2   : rank 44.1 -> 90.2 ms
+        let search: Vec<f64> = (1..=100).rev().map(|i| i as f64 / 1000.0).collect();
+        let update: Vec<f64> = (1..=10).rev().map(|i| i as f64 / 100.0).collect();
+        let sched: Vec<f64> = (1..=20).rev().map(|i| i as f64 / 1000.0).collect();
+        let e2e: Vec<f64> = (1..=50).rev().map(|i| i as f64 * 2.0 / 1000.0).collect();
+        for (v, want) in [
+            (&search, 0.0901),
+            (&update, 0.091),
+            (&sched, 0.0181),
+            (&e2e, 0.0902),
+        ] {
+            assert!(close(numpy_p90(v), want), "reference p90 of {v:?}");
+        }
+
+        let params: SearchParams = serde_json::from_value(json!({
+            "parallel": 1, "top": 10, "target_qps": 100.0, "duration_seconds": 1.0
+        }))
+        .unwrap();
+        let ones = vec![1.0; search.len()];
+        let mut results =
+            compute_search_stats(&search, &ones, &ones, &ones, &ones, 1.0, 10, 1, 100).unwrap();
+        finalize_update_stats(
+            &mut results,
+            UpdateTally {
+                times: update.clone(),
+                unattributed: 0,
+                failed: 0,
+            },
+            1.0,
+            UpdateAttribution::CorpusRow,
+            &UpdateSearchRatio {
+                updates: 1,
+                searches: 1,
+            },
+            "test",
+        );
+        let plan = OpenLoopPlan::from_params(&params).unwrap().unwrap();
+        attach_open_loop_metrics(&mut results, plan, &sched, &e2e, 0, 0);
+
+        let doc = build_search_result_json(
+            "redis-test",
+            "fixture",
+            &params,
+            &results,
+            None,
+            None,
+            true, // --dump-raw-latencies
+            None,
+            None,
+            None,
+            None,
+            &json!({}),
+        );
+        let r = &doc["results"];
+        let got = |k: &str| {
+            r[k].as_f64()
+                .unwrap_or_else(|| panic!("{k} missing or not a number in {r}"))
+        };
+
+        assert!(
+            close(got("p90_time"), 0.0901),
+            "p90_time={}",
+            got("p90_time")
+        );
+        assert!(close(got("update_p90_time"), 0.091));
+        assert!(close(got("schedule_delay_p90_time"), 0.0181));
+        assert!(close(got("end_to_end_p90_time"), 0.0902));
+
+        // The published p90 is the p90 of the raw samples published beside it.
+        let raw = |k: &str| -> Vec<f64> {
+            r[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap())
+                .collect()
+        };
+        assert!(close(got("p90_time"), numpy_p90(&raw("latencies"))));
+        assert!(close(
+            got("update_p90_time"),
+            numpy_p90(&raw("update_latencies"))
+        ));
+
+        // Back-compat: the existing percentiles are still published, unchanged,
+        // and p90 sits between its neighbours in every series.
+        for prefix in ["", "update_", "schedule_delay_", "end_to_end_"] {
+            let p = |q: &str| got(&format!("{prefix}p{q}_time"));
+            assert!(
+                p("50") <= p("90") && p("90") <= p("95") && p("95") <= p("99"),
+                "{prefix}: p50={} p90={} p95={} p99={}",
+                p("50"),
+                p("90"),
+                p("95"),
+                p("99")
+            );
+        }
+        assert!(close(got("p50_time"), 0.0505));
+        assert!(close(got("p95_time"), 0.09505));
+        assert!(close(got("p99_time"), 0.09901));
     }
 }

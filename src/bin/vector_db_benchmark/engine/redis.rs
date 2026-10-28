@@ -26,6 +26,7 @@ use crate::metrics::compute_metrics;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, parse_ft_search_response};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
+use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
 
 /// Redis engine configuration
@@ -805,9 +806,29 @@ impl RedisEngine {
         None
     }
 
+    /// Search-phase preconditions shared by every workload, outside any timed
+    /// window.
+    fn prepare_search(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // configure() normally resets the server's command counters and
+        // establishes the commandstats baseline; on the `--skip-upload` path it
+        // never runs (#238), so check_commandstats below would compare this run's
+        // failure count against zero while the counters still hold every failure
+        // since the server started — failing a run in which nothing failed.
+        // Idempotent no-op once primed; outside every timed window.
+        self.prime_commandstats_if_needed()?;
+
+        // Prime the datetime field-type map from the schema so datetime range
+        // filters are built with the correct field type even on the
+        // `--skip-upload` path, where configure() (which normally primes it) is
+        // never called. Idempotent: on the upload path this reproduces exactly
+        // what configure() already set.
+        self.config.datetime_fields = Arc::new(datetime_fields_from_schema(dataset));
+        Ok(())
+    }
+
     /// Filter-only search: run FT.SEARCH with filter conditions only (no KNN).
     /// No precision calculation (no ground truth for filter-only queries).
-    fn search_filter_only(
+    fn search_filter_only_harness(
         &mut self,
         dataset: &Dataset,
         params: &SearchParams,
@@ -844,11 +865,25 @@ impl RedisEngine {
             .top
             .map(|t| t as usize)
             .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT);
-        let commands: Vec<redis::Cmd> = parsed_filters
+        // `command_query_ids[i]` is the dataset query index `commands[i]` was
+        // built from, so a per-query record names the query, not its position
+        // among the filtered ones.
+        let (command_query_ids, commands): (Vec<usize>, Vec<redis::Cmd>) = parsed_filters
             .iter()
-            .filter_map(|f| f.as_ref())
-            .map(|f| build_filter_only_command(&self.config.index_name, top, query_timeout, f))
-            .collect();
+            .enumerate()
+            .filter_map(|(i, f)| {
+                f.as_ref().map(|f| {
+                    (
+                        i,
+                        build_filter_only_command(&self.config.index_name, top, query_timeout, f),
+                    )
+                })
+            })
+            .unzip();
+        let capture = params.capture_query_results;
+        let key_prefix = self.config.key_prefix.as_str();
+        let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
+        let mut capture_failure: Option<String> = None;
         if commands.is_empty() {
             return Err("No queries with filter conditions for filter-only search".into());
         }
@@ -868,6 +903,7 @@ impl RedisEngine {
             for _ in 0..parallel {
                 let redis_url = &self.redis_url;
                 let commands = &commands;
+                let command_query_ids = &command_query_ids;
                 let query_idx = &query_idx;
                 let pb = &pb;
                 pool.spawn(move |ticket| {
@@ -876,6 +912,8 @@ impl RedisEngine {
                     let mut returned_count = 0u64;
                     let mut errors = Vec::new();
                     let mut pending = 0u64;
+                    let mut cap: Vec<RawQueryResult> = Vec::new();
+                    let mut capture_error: Option<String> = None;
                     let mut conn = match redis::Client::open(redis_url.as_str()).and_then(|c| {
                         let info = c.get_connection_info();
                         let settings = info
@@ -888,7 +926,7 @@ impl RedisEngine {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("Redis filter-only connection failed: {e}"));
-                            return (samples, matched, returned_count, errors);
+                            return (samples, matched, returned_count, errors, cap, capture_error);
                         }
                     };
                     let deadline =
@@ -900,11 +938,11 @@ impl RedisEngine {
                         ticket.fail(format!(
                             "Redis filter-only socket deadline setup failed: {e}"
                         ));
-                        return (samples, matched, returned_count, errors);
+                        return (samples, matched, returned_count, errors, cap, capture_error);
                     }
                     let _ = commands[0].query::<redis::Value>(&mut conn);
                     if ticket.arrive_and_wait().is_none() {
-                        return (samples, matched, returned_count, errors);
+                        return (samples, matched, returned_count, errors, cap, capture_error);
                     }
                     loop {
                         let seq = query_idx.fetch_add(1, Ordering::Relaxed);
@@ -915,16 +953,48 @@ impl RedisEngine {
                         let response =
                             commands[seq % commands.len()].query::<redis::Value>(&mut conn);
                         let elapsed = start.elapsed().as_secs_f64();
-                        match response
-                            .map_err(|e| e.to_string())
-                            .and_then(|v| vector_db_benchmark::filter_only::redis_counts(&v, top))
-                        {
-                            Ok((total, returned)) => {
+                        let query_id = command_query_ids[seq % commands.len()];
+                        match response.map_err(|e| e.to_string()).and_then(|v| {
+                            vector_db_benchmark::filter_only::redis_page(&v, top, capture)
+                        }) {
+                            Ok(page) => {
                                 samples.push(elapsed);
-                                matched += total;
-                                returned_count += returned as u64;
+                                matched += page.total;
+                                returned_count += page.returned as u64;
+                                // `ids` is Some only when capturing, so a run
+                                // without --dump-results parses no keys here.
+                                if let Some(ids) = &page.ids {
+                                    // A key that does not map back to a corpus
+                                    // row is a harness bug, not a dropped query:
+                                    // fail the run rather than dump a guess.
+                                    let hits = ids
+                                        .iter()
+                                        .map(|key| {
+                                            vector_db_benchmark::filter_only::redis_key_row(
+                                                key, key_prefix,
+                                            )
+                                            .map(|row| RawHit { row, score: None })
+                                        })
+                                        .collect::<Result<Vec<_>, _>>();
+                                    match hits {
+                                        Ok(hits) => cap.push(RawQueryResult::ok(
+                                            query_id,
+                                            seq,
+                                            hits,
+                                            Some(page.total),
+                                            elapsed,
+                                        )),
+                                        Err(e) => {
+                                            capture_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
+                                if capture {
+                                    cap.push(RawQueryResult::failed(query_id, seq, elapsed, &e));
+                                }
                                 if errors.len() < 3 {
                                     errors.push(format!("Filter-only query {seq} failed: {e}"));
                                 }
@@ -937,11 +1007,17 @@ impl RedisEngine {
                         }
                     }
                     pb.inc(pending);
-                    (samples, matched, returned_count, errors)
+                    (samples, matched, returned_count, errors, cap, capture_error)
                 })?;
             }
             let (workers, start) = pool.start()?;
-            for (samples, matched, returned, worker_errors) in workers {
+            for (samples, matched, returned, worker_errors, cap, capture_error) in workers {
+                if let Some(e) = capture_error {
+                    capture_failure.get_or_insert(e);
+                }
+                if let Some(records) = captured.as_mut() {
+                    records.extend(cap);
+                }
                 times.extend(samples);
                 matched_sum += matched;
                 returned_sum += returned;
@@ -953,6 +1029,11 @@ impl RedisEngine {
         pb.finish_and_clear();
         for error in errors.iter().take(3) {
             eprintln!("{error}");
+        }
+        // Checked before anything else can fail, as OpenSearch does: the
+        // specific capture cause must not be masked by a later error.
+        if let Some(e) = capture_failure {
+            return Err(format!("--dump-results: {e}"));
         }
         let mut check_conn = self.get_connection()?;
         redis_utils::check_commandstats(
@@ -973,6 +1054,7 @@ impl RedisEngine {
             num_to_run,
         )?;
         result.mean_precision_at_returned = -1.0;
+        result.query_records = captured;
         result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
             result_limit: top,
             matched_documents_sum: matched_sum,
@@ -2131,30 +2213,40 @@ impl Engine for RedisEngine {
         })
     }
 
+    fn search_filter_only(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        if !self.config.skip_vector_index {
+            return Err(
+                "filter-only search requested on an index built with a vector field; the \
+                 filter-only workload needs the no-vector layout (shared `full` schema is #344)"
+                    .into(),
+            );
+        }
+        self.prepare_search(dataset)?;
+        self.search_filter_only_harness(dataset, params, num_queries)
+    }
+
     fn search(
         &mut self,
         dataset: &Dataset,
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        // configure() normally resets the server's command counters and
-        // establishes the commandstats baseline; on the `--skip-upload` path it
-        // never runs (#238), so check_commandstats below would compare this run's
-        // failure count against zero while the counters still hold every failure
-        // since the server started — failing a run in which nothing failed.
-        // Idempotent no-op once primed; outside every timed window.
-        self.prime_commandstats_if_needed()?;
-
-        // Prime the datetime field-type map from the schema so datetime range
-        // filters are built with the correct field type even on the
-        // `--skip-upload` path, where configure() (which normally primes it) is
-        // never called. Idempotent: on the upload path this reproduces exactly
-        // what configure() already set.
-        self.config.datetime_fields = Arc::new(datetime_fields_from_schema(dataset));
-
+        // The vector workload against an index built without a vector field
+        // would measure nothing; `engine::search_workload` routes filter-only
+        // configs to `search_filter_only`, so arriving here is a dispatch bug.
         if self.config.skip_vector_index {
-            return self.search_filter_only(dataset, params, num_queries);
+            return Err(
+                "vector search requested on an index built without a vector field \
+                 (skip_vector_index); filter-only configs must go through search_filter_only"
+                    .into(),
+            );
         }
+        self.prepare_search(dataset)?;
 
         // Index-existence guard (#151-4): on the --skip-upload path a missing or
         // mismatched index would otherwise write a silent recall-0.0 result file.
@@ -2258,6 +2350,8 @@ impl Engine for RedisEngine {
         let mut dropped_queries = 0usize;
         let mut late_queries = 0usize;
         let query_count = queries.len();
+        let capture = params.capture_query_results;
+        let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
 
         // Workers recycle queries with `query_pos = idx % query_count` and index
         // `neighbors[query_pos]` in lock-step; a ground-truth set shorter than the
@@ -2294,6 +2388,9 @@ impl Engine for RedisEngine {
                     let mut dropped = 0usize;
                     let mut late = 0usize;
                     let mut pb_pending: u64 = 0;
+                    // Per-query capture for --dump-results, filled AFTER each
+                    // latency sample is taken.
+                    let mut cap: Vec<RawQueryResult> = Vec::new();
 
                     let client = match redis::Client::open(redis_url.as_str()) {
                         Ok(c) => c,
@@ -2303,14 +2400,14 @@ impl Engine for RedisEngine {
                             // reported as `parallel`. Settle the ticket with the
                             // reason; the coordinator turns it into a hard error.
                             ticket.fail(format!("redis client open failed: {e}"));
-                            return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
                         }
                     };
                     let mut conn = match client.get_connection() {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("redis connect failed: {e}"));
-                            return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
                         }
                     };
                     // Bound a blackholed endpoint to a finite wait instead of the
@@ -2341,7 +2438,7 @@ impl Engine for RedisEngine {
                     // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
                     let Some(start_time) = ticket.arrive_and_wait() else {
-                        return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                        return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
                     };
 
                     loop {
@@ -2427,6 +2524,21 @@ impl Engine for RedisEngine {
                                 let ordered_ids: Vec<i64> =
                                     result_ids.iter().map(|(id, _)| *id).collect();
                                 let m = compute_metrics(&ordered_ids, &neighbors[query_pos], top);
+                                if capture {
+                                    cap.push(RawQueryResult::ok(
+                                        query_pos,
+                                        idx,
+                                        result_ids
+                                            .iter()
+                                            .map(|&(row, score)| RawHit {
+                                                row,
+                                                score: Some(score),
+                                            })
+                                            .collect(),
+                                        None,
+                                        query_time,
+                                    ));
+                                }
                                 t.push(query_time);
                                 p.push(m.precision);
                                 r.push(m.recall);
@@ -2442,6 +2554,9 @@ impl Engine for RedisEngine {
                             }
                             Err(e) => {
                                 eprintln!("Search query {} failed: {}", idx, e);
+                                if capture {
+                                    cap.push(RawQueryResult::failed(query_pos, idx, query_time, e));
+                                }
                             }
                         }
                         // Batch progress updates so the highest-QPS runs don't pay a
@@ -2455,7 +2570,7 @@ impl Engine for RedisEngine {
                     if pb_pending > 0 {
                         pb.inc(pb_pending);
                     }
-                    (t, p, r, mr, nd, sd, e2e, dropped, late)
+                    (t, p, r, mr, nd, sd, e2e, dropped, late, cap)
                 })?;
             }
 
@@ -2464,7 +2579,10 @@ impl Engine for RedisEngine {
             // offset is needed now — the cold setup is already behind the gate.
             let (per_worker, measured_start) = pool.start()?;
 
-            for (t, p, r, mr, nd, sd, e2e, dropped, late) in per_worker {
+            for (t, p, r, mr, nd, sd, e2e, dropped, late, cap) in per_worker {
+                if let Some(records) = captured.as_mut() {
+                    records.extend(cap);
+                }
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
@@ -2498,6 +2616,7 @@ impl Engine for RedisEngine {
                 return Err("No searches completed".to_string());
             }
             let mut results = zero_search_results(total_time, top, parallel, attempted_queries);
+            results.query_records = captured;
             if let Some(plan) = open_loop {
                 attach_open_loop_metrics(
                     &mut results,
@@ -2531,6 +2650,7 @@ impl Engine for RedisEngine {
             parallel,
             attempted_queries,
         )?;
+        results.query_records = captured;
         // In open-loop mode, drops are distinct from attempted request failures.
         if let Some(plan) = open_loop {
             attach_open_loop_metrics(

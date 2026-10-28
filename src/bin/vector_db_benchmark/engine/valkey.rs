@@ -497,7 +497,7 @@ impl ValkeyEngine {
     }
 
     /// Filter-only search: run FT.SEARCH with filter conditions only (no KNN).
-    fn search_filter_only(
+    fn search_filter_only_harness(
         &mut self,
         dataset: &Dataset,
         params: &SearchParams,
@@ -1719,122 +1719,12 @@ impl ValkeyEngine {
     }
 }
 
-impl Engine for ValkeyEngine {
-    /// Server-side corpus size for this config's index, for the `--skip-upload`
-    /// reuse precondition (issue #238). `FT.INFO <index>` → `num_docs`; a missing
-    /// index counts as 0 (the corpus to reuse is not there).
-    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
-        let mut conn = self.get_connection()?;
-        Ok(
-            redis_utils::ft_index_num_docs(&mut conn, &self.config.index_name)?
-                .map(CorpusCount::exact),
-        )
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn search_params(&self) -> &[SearchParams] {
-        &self.search_params
-    }
-
-    fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
-        let mut conn = self.get_connection()?;
-
-        // Record datetime fields (ISO → epoch seconds) and text fields (degraded
-        // to whitespace-tokenised TAG) so upload can transform their values.
-        let (dt_fields, text_fields) = schema_transform_fields(dataset);
-        self.config.datetime_fields = Arc::new(dt_fields);
-        self.config.text_tag_fields = Arc::new(text_fields);
-
-        if self.config.skip_vector_index {
-            println!("Skipping vector index (filter-only mode)");
-        } else {
-            println!(
-                "Using algorithm {} with config {{'M': {}, 'EF_CONSTRUCTION': {}}}",
-                self.config.algorithm, self.config.m, self.config.ef_construction
-            );
-        }
-
-        self.create_index(&mut conn, dataset)?;
-        self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
-        self.commandstats_primed = true;
-        Ok(())
-    }
-
-    fn upload(&mut self, dataset: &Dataset) -> Result<UploadStats, String> {
-        let normalize = dataset.needs_normalization();
-
-        let dataset_path = dataset.get_path()?;
-        println!("Reading dataset from {}...", dataset_path.display());
-        let read_start = Instant::now();
-        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
-        let read_time = read_start.elapsed().as_secs_f64();
-
-        println!(
-            "Read {} vectors ({}d) in {:.3}s ({:.0} vectors/sec)",
-            vectors.len(),
-            vectors.first().map(|v| v.len()).unwrap_or(0),
-            read_time,
-            vectors.len() as f64 / read_time
-        );
-
-        println!(
-            "Starting upload with {} threads, batch size {}...",
-            self.config.parallel, self.config.batch_size
-        );
-        let upload_start = Instant::now();
-
-        if self.config.parallel <= 1 {
-            self.upload_sequential(&ids, &vectors, &metadata)?;
-        } else {
-            self.upload_parallel(&ids, &vectors, &metadata)?;
-        }
-
-        let upload_time = upload_start.elapsed().as_secs_f64();
-
-        println!(
-            "Upload time: {:.3}s ({:.0} records/sec)",
-            upload_time,
-            vectors.len() as f64 / upload_time
-        );
-
-        // Include the index-build wait in total_time for cross-engine
-        // comparability (mirrors mongodb; matches v0's post_upload() timing).
-        let expected = vectors.len();
-        let index_start = Instant::now();
-        self.wait_for_indexing(expected)?;
-        let index_time = index_start.elapsed().as_secs_f64();
-
-        let total_time = read_time + upload_time + index_time;
-        println!(
-            "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
-            index_time, total_time
-        );
-
-        // Verify no HSET failures occurred during upload
-        let mut conn = self.get_connection()?;
-        redis_utils::check_commandstats(
-            &mut conn,
-            &["hset"],
-            "upload",
-            self.commandstats_baseline.as_ref(),
-        )?;
-
-        Ok(UploadStats {
-            upload_time,
-            total_time,
-            upload_count: vectors.len(),
-            parallel: self.config.parallel,
-            batch_size: self.config.batch_size,
-            memory_usage: None,
-            index_coverage: None,
-        })
-    }
-
-    fn search(
+impl ValkeyEngine {
+    /// Shared search entry for the vector and filter-only workloads; the
+    /// trait methods decide which one and guard the index layout.
+    fn search_impl(
         &mut self,
+        filter_only: bool,
         dataset: &Dataset,
         params: &SearchParams,
         num_queries: i64,
@@ -1856,8 +1746,8 @@ impl Engine for ValkeyEngine {
         self.config.datetime_fields = Arc::new(dt_fields);
         self.config.text_tag_fields = Arc::new(text_fields);
 
-        if self.config.skip_vector_index {
-            return self.search_filter_only(dataset, params, num_queries);
+        if filter_only {
+            return self.search_filter_only_harness(dataset, params, num_queries);
         }
 
         // Index-existence guard (#151-4): fail loudly on a missing/mismatched index.
@@ -2114,6 +2004,156 @@ impl Engine for ValkeyEngine {
         crate::engine::compute_search_stats(
             &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
         )
+    }
+}
+
+impl Engine for ValkeyEngine {
+    /// Server-side corpus size for this config's index, for the `--skip-upload`
+    /// reuse precondition (issue #238). `FT.INFO <index>` → `num_docs`; a missing
+    /// index counts as 0 (the corpus to reuse is not there).
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
+        let mut conn = self.get_connection()?;
+        Ok(
+            redis_utils::ft_index_num_docs(&mut conn, &self.config.index_name)?
+                .map(CorpusCount::exact),
+        )
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn search_params(&self) -> &[SearchParams] {
+        &self.search_params
+    }
+
+    fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        let mut conn = self.get_connection()?;
+
+        // Record datetime fields (ISO → epoch seconds) and text fields (degraded
+        // to whitespace-tokenised TAG) so upload can transform their values.
+        let (dt_fields, text_fields) = schema_transform_fields(dataset);
+        self.config.datetime_fields = Arc::new(dt_fields);
+        self.config.text_tag_fields = Arc::new(text_fields);
+
+        if self.config.skip_vector_index {
+            println!("Skipping vector index (filter-only mode)");
+        } else {
+            println!(
+                "Using algorithm {} with config {{'M': {}, 'EF_CONSTRUCTION': {}}}",
+                self.config.algorithm, self.config.m, self.config.ef_construction
+            );
+        }
+
+        self.create_index(&mut conn, dataset)?;
+        self.commandstats_baseline = redis_utils::reset_commandstats(&mut conn)?;
+        self.commandstats_primed = true;
+        Ok(())
+    }
+
+    fn upload(&mut self, dataset: &Dataset) -> Result<UploadStats, String> {
+        let normalize = dataset.needs_normalization();
+
+        let dataset_path = dataset.get_path()?;
+        println!("Reading dataset from {}...", dataset_path.display());
+        let read_start = Instant::now();
+        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        let read_time = read_start.elapsed().as_secs_f64();
+
+        println!(
+            "Read {} vectors ({}d) in {:.3}s ({:.0} vectors/sec)",
+            vectors.len(),
+            vectors.first().map(|v| v.len()).unwrap_or(0),
+            read_time,
+            vectors.len() as f64 / read_time
+        );
+
+        println!(
+            "Starting upload with {} threads, batch size {}...",
+            self.config.parallel, self.config.batch_size
+        );
+        let upload_start = Instant::now();
+
+        if self.config.parallel <= 1 {
+            self.upload_sequential(&ids, &vectors, &metadata)?;
+        } else {
+            self.upload_parallel(&ids, &vectors, &metadata)?;
+        }
+
+        let upload_time = upload_start.elapsed().as_secs_f64();
+
+        println!(
+            "Upload time: {:.3}s ({:.0} records/sec)",
+            upload_time,
+            vectors.len() as f64 / upload_time
+        );
+
+        // Include the index-build wait in total_time for cross-engine
+        // comparability (mirrors mongodb; matches v0's post_upload() timing).
+        let expected = vectors.len();
+        let index_start = Instant::now();
+        self.wait_for_indexing(expected)?;
+        let index_time = index_start.elapsed().as_secs_f64();
+
+        let total_time = read_time + upload_time + index_time;
+        println!(
+            "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
+            index_time, total_time
+        );
+
+        // Verify no HSET failures occurred during upload
+        let mut conn = self.get_connection()?;
+        redis_utils::check_commandstats(
+            &mut conn,
+            &["hset"],
+            "upload",
+            self.commandstats_baseline.as_ref(),
+        )?;
+
+        Ok(UploadStats {
+            upload_time,
+            total_time,
+            upload_count: vectors.len(),
+            parallel: self.config.parallel,
+            batch_size: self.config.batch_size,
+            memory_usage: None,
+            index_coverage: None,
+        })
+    }
+
+    fn search(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        // `engine::search_workload` routes filter-only configs to
+        // `search_filter_only`; a vector search against an index built without
+        // a vector index would measure nothing, so arriving here is a bug.
+        if self.config.skip_vector_index {
+            return Err(
+                "vector search requested on an index built without a vector index \
+                 (skip_vector_index); filter-only configs must go through search_filter_only"
+                    .into(),
+            );
+        }
+        self.search_impl(false, dataset, params, num_queries)
+    }
+
+    fn search_filter_only(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        if !self.config.skip_vector_index {
+            return Err(
+                "filter-only search requested on an index built with a vector index; the \
+                 filter-only workload needs the no-vector layout (shared `full` schema is #344)"
+                    .into(),
+            );
+        }
+        self.search_impl(true, dataset, params, num_queries)
     }
 
     fn search_mixed(

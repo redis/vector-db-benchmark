@@ -298,7 +298,7 @@ impl MongoDBEngine {
     }
 
     /// Filter-only search: run collection.find(filter).limit(top) with no vector search.
-    fn search_filter_only(
+    fn search_filter_only_harness(
         &self,
         dataset: &Dataset,
         params: &SearchParams,
@@ -2050,168 +2050,12 @@ fn json_to_bson(value: &serde_json::Value) -> mongodb::bson::Bson {
 
 // ── Engine trait implementation ──────────────────────────────────────────
 
-impl Engine for MongoDBEngine {
-    /// Server-side corpus size, for the `--skip-upload` reuse precondition
-    /// (issue #238). `countDocuments({})` on the benchmark collection — an exact
-    /// count, not the metadata estimate, because the estimate can lag a drop and
-    /// report a corpus that is no longer there. A missing collection answers 0.
-    ///
-    /// #306 — why this stays a pure count and gained no identity marker. The
-    /// collection it counts is now per-config (see [`derive_collection_name`]),
-    /// so the "corpus built by a *different config*" case no longer reaches this
-    /// check as a plausible number: config B's collection does not exist, the
-    /// count is 0, and `classify_reuse_precondition` fails the run. An
-    /// upload-time marker document would answer the same question one layer
-    /// later and would itself be a row in the count.
-    ///
-    /// What remains unverified is the *dataset* dimension — one config reused
-    /// across two same-sized datasets still certifies. That is #279, it is
-    /// identical on every engine, and it wants one cross-engine mechanism rather
-    /// than a MongoDB-only marker that hides the gap on this engine alone.
-    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
-        let coll = self
-            .client
-            .database(&self.db_name)
-            .collection::<Document>(&self.collection_name);
-        // A missing collection is not an error in MongoDB — countDocuments
-        // answers 0 — so any Err here is a real probe failure (unreachable node,
-        // auth). Reporting that as a corpus of zero would send the user to
-        // re-upload a corpus that is still intact.
-        coll.count_documents(doc! {})
-            .run()
-            .map(|n| Some(CorpusCount::exact(n)))
-            .map_err(|e| {
-                format!(
-                    "countDocuments on {}.{} failed: {}",
-                    self.db_name, self.collection_name, e
-                )
-            })
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn search_params(&self) -> &[SearchParams] {
-        &self.search_params
-    }
-
-    fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
-        // Cache the schema field types so ingest can store numeric payload
-        // fields as native BSON numbers (see `metadata_value_to_bson`).
-        self.load_schema_types(dataset);
-        println!("Dropping existing collection...");
-        let _ = self.drop_collection();
-
-        // Create the collection explicitly so we can add the index
-        let db = self.client.database(&self.db_name);
-        db.create_collection(&self.collection_name)
-            .run()
-            .map_err(|e| format!("Failed to create collection: {}", e))?;
-
-        println!(
-            "Collection '{}.{}' created.",
-            self.db_name, self.collection_name
-        );
-
-        if self.config.skip_vector_index {
-            println!("Skipping vector index (filter-only mode)");
-            return Ok(());
-        }
-
-        // Insert a dummy document so the index has something to build on
-        let coll = db.collection::<Document>(&self.collection_name);
-        let dim = dataset.vector_size();
-        let dummy_vec: Vec<mongodb::bson::Bson> =
-            (0..dim).map(|_| mongodb::bson::Bson::Double(0.0)).collect();
-        coll.insert_one(doc! { "_id": -1i64, "vector": dummy_vec })
-            .run()
-            .map_err(|e| format!("Failed to insert dummy document: {}", e))?;
-
-        println!("Creating vector search index '{}'...", self.index_name);
-        self.create_vector_index(dataset)?;
-
-        // Remove dummy document
-        coll.delete_one(doc! { "_id": -1i64 })
-            .run()
-            .map_err(|e| format!("Failed to remove dummy document: {}", e))?;
-
-        Ok(())
-    }
-
-    fn upload(&mut self, dataset: &Dataset) -> Result<UploadStats, String> {
-        // Ensure schema types are loaded even if upload runs without configure.
-        self.load_schema_types(dataset);
-        let normalize = dataset.needs_normalization();
-        let dataset_path = dataset.get_path()?;
-        println!("Reading dataset from {}...", dataset_path.display());
-        let read_start = Instant::now();
-        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
-        let read_time = read_start.elapsed().as_secs_f64();
-
-        println!(
-            "Read {} vectors ({}d) in {:.3}s",
-            vectors.len(),
-            vectors.first().map(|v| v.len()).unwrap_or(0),
-            read_time,
-        );
-
-        println!(
-            "Starting upload with {} threads, batch size {}...",
-            self.config.parallel, self.config.batch_size
-        );
-        let upload_start = Instant::now();
-        self.upload_parallel(&ids, &vectors, &metadata)?;
-        let upload_time = upload_start.elapsed().as_secs_f64();
-
-        println!(
-            "Upload time: {:.3}s ({:.0} records/sec)",
-            upload_time,
-            vectors.len() as f64 / upload_time
-        );
-
-        let total_time;
-        // `None` means "not verified" — the only honest value when no vector
-        // index was built. It is NOT the same claim as a verified 1.0 (#305).
-        let mut index_coverage = None;
-        if self.config.skip_vector_index {
-            total_time = read_time + upload_time;
-            println!(
-                "Total time (read+upload): {:.3}s (no vector index)",
-                total_time
-            );
-        } else {
-            // Wait for the search index to finish indexing all uploaded documents
-            // Use the first vector as a probe query to verify actual search readiness
-            let probe_vector = vectors.first().ok_or("No vectors uploaded")?;
-            let index_start = Instant::now();
-            index_coverage = Some(self.wait_for_index_catchup(
-                vectors.len(),
-                probe_vector,
-                SearchDialect::for_dataset(dataset),
-            )?);
-            let index_time = index_start.elapsed().as_secs_f64();
-
-            total_time = read_time + upload_time + index_time;
-            println!(
-                "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
-                index_time, total_time
-            );
-        }
-
-        Ok(UploadStats {
-            upload_time,
-            total_time,
-            upload_count: vectors.len(),
-            parallel: self.config.parallel,
-            batch_size: self.config.batch_size,
-            memory_usage: None,
-            index_coverage,
-        })
-    }
-
-    fn search(
+impl MongoDBEngine {
+    /// Shared search entry for the vector and filter-only workloads; the
+    /// trait methods decide which one and guard the index layout.
+    fn search_impl(
         &mut self,
+        filter_only: bool,
         dataset: &Dataset,
         params: &SearchParams,
         num_queries: i64,
@@ -2228,8 +2072,8 @@ impl Engine for MongoDBEngine {
         // WRITE path (upload, and the update half of `search_mixed`). Kept so the
         // engine's state does not depend on which phases happened to run.
         self.load_schema_types(dataset);
-        if self.config.skip_vector_index {
-            return self.search_filter_only(dataset, params, num_queries);
+        if filter_only {
+            return self.search_filter_only_harness(dataset, params, num_queries);
         }
 
         let parallel = params.parallel.unwrap_or(1) as usize;
@@ -2445,6 +2289,202 @@ impl Engine for MongoDBEngine {
         crate::engine::compute_search_stats(
             &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
         )
+    }
+}
+
+impl Engine for MongoDBEngine {
+    /// Server-side corpus size, for the `--skip-upload` reuse precondition
+    /// (issue #238). `countDocuments({})` on the benchmark collection — an exact
+    /// count, not the metadata estimate, because the estimate can lag a drop and
+    /// report a corpus that is no longer there. A missing collection answers 0.
+    ///
+    /// #306 — why this stays a pure count and gained no identity marker. The
+    /// collection it counts is now per-config (see [`derive_collection_name`]),
+    /// so the "corpus built by a *different config*" case no longer reaches this
+    /// check as a plausible number: config B's collection does not exist, the
+    /// count is 0, and `classify_reuse_precondition` fails the run. An
+    /// upload-time marker document would answer the same question one layer
+    /// later and would itself be a row in the count.
+    ///
+    /// What remains unverified is the *dataset* dimension — one config reused
+    /// across two same-sized datasets still certifies. That is #279, it is
+    /// identical on every engine, and it wants one cross-engine mechanism rather
+    /// than a MongoDB-only marker that hides the gap on this engine alone.
+    fn corpus_row_count(&mut self) -> Result<Option<CorpusCount>, String> {
+        let coll = self
+            .client
+            .database(&self.db_name)
+            .collection::<Document>(&self.collection_name);
+        // A missing collection is not an error in MongoDB — countDocuments
+        // answers 0 — so any Err here is a real probe failure (unreachable node,
+        // auth). Reporting that as a corpus of zero would send the user to
+        // re-upload a corpus that is still intact.
+        coll.count_documents(doc! {})
+            .run()
+            .map(|n| Some(CorpusCount::exact(n)))
+            .map_err(|e| {
+                format!(
+                    "countDocuments on {}.{} failed: {}",
+                    self.db_name, self.collection_name, e
+                )
+            })
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn search_params(&self) -> &[SearchParams] {
+        &self.search_params
+    }
+
+    fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // Cache the schema field types so ingest can store numeric payload
+        // fields as native BSON numbers (see `metadata_value_to_bson`).
+        self.load_schema_types(dataset);
+        println!("Dropping existing collection...");
+        let _ = self.drop_collection();
+
+        // Create the collection explicitly so we can add the index
+        let db = self.client.database(&self.db_name);
+        db.create_collection(&self.collection_name)
+            .run()
+            .map_err(|e| format!("Failed to create collection: {}", e))?;
+
+        println!(
+            "Collection '{}.{}' created.",
+            self.db_name, self.collection_name
+        );
+
+        if self.config.skip_vector_index {
+            println!("Skipping vector index (filter-only mode)");
+            return Ok(());
+        }
+
+        // Insert a dummy document so the index has something to build on
+        let coll = db.collection::<Document>(&self.collection_name);
+        let dim = dataset.vector_size();
+        let dummy_vec: Vec<mongodb::bson::Bson> =
+            (0..dim).map(|_| mongodb::bson::Bson::Double(0.0)).collect();
+        coll.insert_one(doc! { "_id": -1i64, "vector": dummy_vec })
+            .run()
+            .map_err(|e| format!("Failed to insert dummy document: {}", e))?;
+
+        println!("Creating vector search index '{}'...", self.index_name);
+        self.create_vector_index(dataset)?;
+
+        // Remove dummy document
+        coll.delete_one(doc! { "_id": -1i64 })
+            .run()
+            .map_err(|e| format!("Failed to remove dummy document: {}", e))?;
+
+        Ok(())
+    }
+
+    fn upload(&mut self, dataset: &Dataset) -> Result<UploadStats, String> {
+        // Ensure schema types are loaded even if upload runs without configure.
+        self.load_schema_types(dataset);
+        let normalize = dataset.needs_normalization();
+        let dataset_path = dataset.get_path()?;
+        println!("Reading dataset from {}...", dataset_path.display());
+        let read_start = Instant::now();
+        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        let read_time = read_start.elapsed().as_secs_f64();
+
+        println!(
+            "Read {} vectors ({}d) in {:.3}s",
+            vectors.len(),
+            vectors.first().map(|v| v.len()).unwrap_or(0),
+            read_time,
+        );
+
+        println!(
+            "Starting upload with {} threads, batch size {}...",
+            self.config.parallel, self.config.batch_size
+        );
+        let upload_start = Instant::now();
+        self.upload_parallel(&ids, &vectors, &metadata)?;
+        let upload_time = upload_start.elapsed().as_secs_f64();
+
+        println!(
+            "Upload time: {:.3}s ({:.0} records/sec)",
+            upload_time,
+            vectors.len() as f64 / upload_time
+        );
+
+        let total_time;
+        // `None` means "not verified" — the only honest value when no vector
+        // index was built. It is NOT the same claim as a verified 1.0 (#305).
+        let mut index_coverage = None;
+        if self.config.skip_vector_index {
+            total_time = read_time + upload_time;
+            println!(
+                "Total time (read+upload): {:.3}s (no vector index)",
+                total_time
+            );
+        } else {
+            // Wait for the search index to finish indexing all uploaded documents
+            // Use the first vector as a probe query to verify actual search readiness
+            let probe_vector = vectors.first().ok_or("No vectors uploaded")?;
+            let index_start = Instant::now();
+            index_coverage = Some(self.wait_for_index_catchup(
+                vectors.len(),
+                probe_vector,
+                SearchDialect::for_dataset(dataset),
+            )?);
+            let index_time = index_start.elapsed().as_secs_f64();
+
+            total_time = read_time + upload_time + index_time;
+            println!(
+                "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
+                index_time, total_time
+            );
+        }
+
+        Ok(UploadStats {
+            upload_time,
+            total_time,
+            upload_count: vectors.len(),
+            parallel: self.config.parallel,
+            batch_size: self.config.batch_size,
+            memory_usage: None,
+            index_coverage,
+        })
+    }
+
+    fn search(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        // `engine::search_workload` routes filter-only configs to
+        // `search_filter_only`; a vector search against an index built without
+        // a vector index would measure nothing, so arriving here is a bug.
+        if self.config.skip_vector_index {
+            return Err(
+                "vector search requested on an index built without a vector index \
+                 (skip_vector_index); filter-only configs must go through search_filter_only"
+                    .into(),
+            );
+        }
+        self.search_impl(false, dataset, params, num_queries)
+    }
+
+    fn search_filter_only(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        if !self.config.skip_vector_index {
+            return Err(
+                "filter-only search requested on an index built with a vector index; the \
+                 filter-only workload needs the no-vector layout (shared `full` schema is #344)"
+                    .into(),
+            );
+        }
+        self.search_impl(true, dataset, params, num_queries)
     }
 
     fn search_mixed(

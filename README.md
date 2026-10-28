@@ -1,6 +1,6 @@
 # vector-db-benchmark
 
-A benchmarking tool for vector databases, written in Rust. Measures upload throughput, search QPS, latency percentiles (p50/p95/p99), and recall for vector search engines.
+A benchmarking tool for vector databases, written in Rust. Measures upload throughput, search QPS, latency percentiles (p50/p90/p95/p99), and recall for vector search engines.
 
 ## Supported Engines
 
@@ -288,8 +288,94 @@ Options:
     --describe <TYPE>          Describe available 'datasets' or 'engines'
     -v, --verbose              Verbose output for --describe
     --plot <OUTPUT.svg>        Render a QPS-vs-precision trade-off chart from results/
+    --dump-results <DIR>       Write every timed query's result (external ids,
+                               scores, exact total, latency) to DIR as JSONL
     -h, --help                 Print help
+
+Commands:
+    compare-results <A> <B> --reference <ENGINE> [--json F] [--markdown F]
+                               Score one engine's --dump-results output against a
+                               declared reference engine's
 ```
+
+### Workloads: one dispatch point per search config (#344)
+
+Every entry of an engine config's `search_params` may declare which query
+family it runs:
+
+```json
+{"parallel": 8, "top": 10, "workload": "filter-only"}
+```
+
+| `workload` | engine method | oracle |
+|---|---|---|
+| `vector` (default when omitted) | `search` | brute-forced ground truth |
+| `hybrid` | `search_hybrid` | brute-forced (filtered) ground truth |
+| `fulltext` | `search_fulltext` | the declared reference engine |
+| `filter-only` | `search_filter_only` | exact totals vs the reference engine |
+
+The runner resolves each config's workloads once, before anything is downloaded
+or connected (`vector_db_benchmark::workload::plan`), and every measured query
+goes through one function, `engine::search_workload`. An engine/workload pair
+without an implementation is a hard error, never a fallback to `vector`; today
+a declared `filter-only` exists on Redis and OpenSearch, and `hybrid` /
+`fulltext` exist nowhere yet. Valkey and MongoDB keep their legacy filter-only
+harness reachable only through `--skip-vector-index`, exactly as before; a
+config that declares `filter-only` for them is refused. The shared `full` index schema is not built yet,
+so one engine config cannot mix `filter-only` with another workload (they need
+different index layouts) — split them into two configs. `--skip-vector-index` is
+kept as an alias for "every search config is `filter-only`" (with its legacy
+`<engine>-no-vector` rename); combined with a config that declares another
+workload it is refused. Each result file's `params.workload` records the
+workload that ran.
+
+### Per-query results and `compare-results` (#343)
+
+`--dump-results DIR` writes one JSONL file per (config, dataset, workload,
+parallel, search config): a header line, then one record per timed query in
+dispatch order, failed queries included:
+
+```json
+{"kind":"header","schema_version":1,"engine":"redis","config":"redis-fo","dataset":"msmarco-cohere-1024-100K-cosine","workload":"filter-only","parallel":8,"top":10,"search_id":0,"id_space":{"kind":"field","field":"docid"}}
+{"kind":"query","query_id":3,"seq":0,"ids":["msmarco_v2.1_doc_…"],"total":1234,"latency":0.0011}
+```
+
+Ids are EXTERNAL: the dataset's `docid` payload field when the schema declares
+one (MS MARCO), else the corpus row id — never an engine key, `_id` or offset.
+Vector records also carry the ground-truth ids they were scored against
+(`expected`). Records are captured OUTSIDE each latency sample (after the
+timer stops) but INSIDE the throughput window when `--dump-results` is on: the
+id parsing and record push run in the measured worker loop, so they count
+toward `total_time` and therefore `rps`. Without `--dump-results` the filter-only
+loops build no id strings at all. The files are written after the search phase.
+An engine with no
+capture for the workload fails the run instead of writing an empty file, and a
+dump whose record count differs from the attempted query count is refused.
+Warm-ups and mixed (`--update-search-ratio`) phases are not dumped. Per-query
+capture exists for Redis and OpenSearch (vector and filter-only).
+
+```bash
+vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch \
+  --json report.json --markdown report.md
+```
+
+Dumps pair by (dataset, workload, parallel, k, id space), so a directory may
+hold one dump per key: a sweep of several search configs at the same
+(parallel, k) is refused as ambiguous — pass the two files explicitly. Per pair
+and query shape the
+report gives overlap@k (against the reference's list), Jaccard@k, Kendall rank
+correlation over the ids both lists share, exact-count agreement for
+`filter-only` (whose order is unspecified, so overlap/rank are not reported),
+and recall@k against the dump's ground truth for `vector`/`hybrid`. It exits
+non-zero when any query was answered by one engine and not by the other, or when
+either dump holds ANY failed attempt — including a query that failed once and
+was answered on a later cycle (`--queries N` above the query count, duration
+runs): that is the `--fail-on-dropped-queries` policy applied to the dumps. A
+dump with no counterpart on the other side also fails the comparison, unless
+`--allow-unpaired` is passed. `--dump-results` is refused at startup for any
+engine/workload without per-query capture (today: Redis and OpenSearch,
+vector and filter-only), and `calibration_param` on a declared non-vector
+workload is refused at startup.
 
 ### `--skip-upload`: reuse means reuse (issue #238)
 
@@ -666,6 +752,7 @@ Results JSON includes separate metrics for both operation types:
     "mean_precision_at_returned": 0.9785,
     "mean_recall": 0.9785,
     "p50_time": 0.00032,
+    "p90_time": 0.00071,
     "p95_time": 0.00089,
     "p99_time": 0.00142,
     "update_count": 5891,
@@ -676,6 +763,7 @@ Results JSON includes separate metrics for both operation types:
     "update_rps": 589.1,
     "update_mean_time": 0.00045,
     "update_p50_time": 0.00041,
+    "update_p90_time": 0.00082,
     "update_p95_time": 0.00098,
     "update_p99_time": 0.00156,
     "update_search_ratio": "1:10"

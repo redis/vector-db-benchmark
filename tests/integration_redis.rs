@@ -4599,3 +4599,156 @@ fn test_binary_redis_bounded_ranges_use_single_numeric_iterator() {
     }
     flush_db(&mut conn);
 }
+
+/// #343: `--dump-results` on the vector path writes one record per timed query
+/// naming corpus rows, and the recall `compare-results` derives from the dump
+/// equals the `mean_recall` the run published. Self-comparison passes with
+/// overlap 1.0.
+#[test]
+fn test_binary_redis_dump_results_vector() {
+    wait_for_redis();
+    let configs = serde_json::json!([{
+        "name": "redis-dump-vec", "engine": "redis",
+        "search_params": [{"parallel": 2, "search_params": {"ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dump-vec-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-dump-vec",
+        "dump-vec-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_vector_dump_matches_run(&proj.root, &dump, "redis", "redis-dump-vec");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #343 + #344: a config that DECLARES `"workload": "filter-only"` (no
+/// `--skip-vector-index`) builds the no-vector layout, keeps its own name,
+/// publishes the filter-only contract, and dumps exact per-query totals and
+/// row ids that `compare-results` agrees with itself on.
+#[test]
+fn test_binary_redis_dump_results_declared_filter_only() {
+    wait_for_redis();
+    let config = serde_json::json!([{
+        "name": "dump-fo-redis", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": [{"parallel": 2, "top": 3, "workload": "filter-only"}]
+    }]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "dump-fo-redis",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--queries",
+            "90",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "dump-fo-redis", total, returned);
+    common::assert_filter_only_dump(&dump, "redis", 90);
+    let (ok, report) = common::run_compare(&dump, &dump, "redis");
+    assert!(ok, "self-comparison must pass");
+    let counts = &report["pairs"][0]["shapes"][0]["count_agreement"];
+    assert_eq!(counts["fraction"], 1.0);
+    assert_eq!(counts["complete_page_set_agreement"], 1.0);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #343 review: `--target-qps` + `--dump-results`. An open-loop request that is
+/// dropped for lateness is never dispatched: it gets no record and is excluded
+/// from `requested_queries`, so the capture check (records == requested) holds
+/// with drops present, and records + drops account for every offered request.
+/// `--max-lateness-ms 0` at a rate one client cannot sustain forces drops.
+#[test]
+fn test_binary_redis_dump_results_open_loop_with_dropped_requests() {
+    wait_for_redis();
+    let configs = serde_json::json!([{
+        "name": "redis-dump-ol", "engine": "redis",
+        "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dump-ol-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-dump-ol",
+        "dump-ol-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--target-qps",
+            "50000",
+            "--search-duration",
+            "1",
+            "--max-lateness-ms",
+            "0",
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+        ]
+    ));
+    let results = common::read_results_obj(&proj.root, "redis-dump-ol");
+    let requested = results["requested_queries"].as_u64().unwrap();
+    let dropped = results["dropped_queries"].as_u64().unwrap();
+    let offered = results["offered_queries"].as_u64().unwrap();
+    assert!(
+        dropped > 0,
+        "the fixture must force open-loop drops: {results}"
+    );
+    let dumps = common::read_dumps(&dump);
+    assert_eq!(dumps.len(), 1);
+    let records = dumps[0].records.len() as u64;
+    assert_eq!(records, requested, "one record per dispatched request");
+    assert_eq!(records + dropped, offered, "records + drops = offered");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #343 review: end-to-end coverage of the `docid` id space. Rows carry a
+/// `docid` that is not their row id; the dump must name each returned
+/// document by the docid of the row Redis returned — an off-by-one in the
+/// row -> docid mapping gives valid docids of rows that do not match.
+#[test]
+fn test_binary_redis_dump_results_docid_id_space() {
+    wait_for_redis();
+    let config = serde_json::json!([{
+        "name": "dump-docid-redis", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": [{"parallel": 2, "top": 3, "workload": "filter-only"}]
+    }]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let docid = common::add_docids(&proj.root);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "dump-docid-redis",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--queries",
+            "18",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_docid_dump(&dump, docid);
+    fs::remove_dir_all(&proj.root).ok();
+}

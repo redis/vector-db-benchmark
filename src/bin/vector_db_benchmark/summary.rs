@@ -32,6 +32,7 @@ pub struct SearchEntry {
 struct PrecisionBucket {
     qps: f64,
     p50_ms: f64,
+    p90_ms: f64,
     p95_ms: f64,
     precision: f64,
     recall: f64,
@@ -69,6 +70,7 @@ fn analyze_precision_performance(entries: &[SearchEntry]) -> Vec<PrecisionBucket
         let candidate = PrecisionBucket {
             qps: entry.results.rps,
             p50_ms: entry.results.p50_time * 1000.0,
+            p90_ms: entry.results.p90_time * 1000.0,
             p95_ms: entry.results.p95_time * 1000.0,
             precision: entry.results.mean_precision_at_returned,
             recall: entry.results.mean_recall,
@@ -106,6 +108,7 @@ struct ConcurrencyPoint {
     parallel: i64,
     qps: f64,
     p50_ms: f64,
+    p90_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
     recall: f64,
@@ -151,6 +154,7 @@ fn concurrency_curves(entries: &[SearchEntry]) -> Vec<ConcurrencyCurve> {
             parallel: e.parallel,
             qps: e.results.rps,
             p50_ms: e.results.p50_time * 1000.0,
+            p90_ms: e.results.p90_time * 1000.0,
             p95_ms: e.results.p95_time * 1000.0,
             p99_ms: e.results.p99_time * 1000.0,
             recall: e.results.mean_recall,
@@ -223,15 +227,16 @@ fn print_concurrency_curves(curves: &[ConcurrencyCurve]) {
             }
         );
         println!(
-            "    {:>8}  {:>10}  {:>9}  {:>9}  {:>9}  {:>6}",
-            "parallel", "QPS", "p50 ms", "p95 ms", "p99 ms", "sat?"
+            "    {:>8}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>6}",
+            "parallel", "QPS", "p50 ms", "p90 ms", "p95 ms", "p99 ms", "sat?"
         );
         for p in &c.points {
             println!(
-                "    {:>8}  {:>10.1}  {:>9.3}  {:>9.3}  {:>9.3}  {:>6}",
+                "    {:>8}  {:>10.1}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>6}",
                 p.parallel,
                 p.qps,
                 p.p50_ms,
+                p.p90_ms,
                 p.p95_ms,
                 p.p99_ms,
                 if p.saturated { "YES" } else { "-" }
@@ -333,14 +338,18 @@ pub fn display_results_summary(engine_name: &str, dataset_name: &str, entries: &
 
     if filter_only {
         println!("{}", "-".repeat(40));
-        println!("{:<10} {:<12} {:<12}", "QPS", "P50 (ms)", "P95 (ms)");
+        println!(
+            "{:<10} {:<12} {:<12} {:<12}",
+            "QPS", "P50 (ms)", "P90 (ms)", "P95 (ms)"
+        );
         println!("{}", "-".repeat(40));
 
         for e in entries {
             println!(
-                "{:<10.1} {:<12.3} {:<12.3}",
+                "{:<10.1} {:<12.3} {:<12.3} {:<12.3}",
                 e.results.rps,
                 e.results.p50_time * 1000.0,
+                e.results.p90_time * 1000.0,
                 e.results.p95_time * 1000.0,
             );
         }
@@ -354,17 +363,17 @@ pub fn display_results_summary(engine_name: &str, dataset_name: &str, entries: &
     }
 
     // Print table
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(95));
     println!(
-        "{:<10} {:<10} {:<8} {:<8} {:<10} {:<12} {:<12}",
-        "Recall", "Precision", "MRR", "NDCG", "QPS", "P50 (ms)", "P95 (ms)"
+        "{:<10} {:<10} {:<8} {:<8} {:<10} {:<12} {:<12} {:<12}",
+        "Recall", "Precision", "MRR", "NDCG", "QPS", "P50 (ms)", "P90 (ms)", "P95 (ms)"
     );
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(95));
 
     for b in &buckets {
         println!(
-            "{:<10.4} {:<10.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3}",
-            b.recall, b.precision, b.mrr, b.ndcg, b.qps, b.p50_ms, b.p95_ms
+            "{:<10.4} {:<10.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3} {:<12.3}",
+            b.recall, b.precision, b.mrr, b.ndcg, b.qps, b.p50_ms, b.p90_ms, b.p95_ms
         );
     }
     println!();
@@ -391,9 +400,9 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
         return;
     }
 
-    println!("\n{}", "-".repeat(116));
+    println!("\n{}", "-".repeat(129));
     println!(
-        "{:<14} {:<8} {:<8} {:<8} {:<8} {:<10} {:<12} {:<12} {:<10} {:<12}",
+        "{:<14} {:<8} {:<8} {:<8} {:<8} {:<10} {:<12} {:<12} {:<12} {:<10} {:<12}",
         "Ratio",
         "Recall",
         "Prec",
@@ -401,11 +410,12 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
         "NDCG",
         "QPS",
         "P50 (ms)",
+        "P90 (ms)",
         "P95 (ms)",
         "Upd QPS",
         "Upd P50 (ms)"
     );
-    println!("{}", "-".repeat(116));
+    println!("{}", "-".repeat(129));
 
     // Sort: "search" first, then ratios by ascending numeric value
     let mut keys: Vec<String> = by_ratio.keys().cloned().collect();
@@ -435,7 +445,7 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
             .unwrap_or_else(|| "-".to_string());
 
         println!(
-            "{:<14} {:<8.4} {:<8.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3} {:<10} {:<12}",
+            "{:<14} {:<8.4} {:<8.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3} {:<12.3} {:<10} {:<12}",
             key,
             best.results.mean_recall,
             best.results.mean_precision_at_returned,
@@ -443,6 +453,7 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
             best.results.mean_ndcg,
             best.results.rps,
             best.results.p50_time * 1000.0,
+            best.results.p90_time * 1000.0,
             best.results.p95_time * 1000.0,
             upd_qps,
             upd_p50,
@@ -513,6 +524,7 @@ pub fn save_summary(
             json!({
                 "QPS": (b.qps * 10.0).round() / 10.0,
                 "P50 (ms)": (b.p50_ms * 1000.0).round() / 1000.0,
+                "P90 (ms)": (b.p90_ms * 1000.0).round() / 1000.0,
                 "P95 (ms)": (b.p95_ms * 1000.0).round() / 1000.0,
                 "recall": (b.recall * 10000.0).round() / 10000.0,
                 "mrr": (b.mrr * 10000.0).round() / 10000.0,
@@ -541,6 +553,7 @@ pub fn save_summary(
                 "rps": e.results.rps,
                 "mean_time": e.results.mean_time,
                 "p50_time": e.results.p50_time,
+                "p90_time": e.results.p90_time,
                 "p95_time": e.results.p95_time,
                 "p99_time": e.results.p99_time,
                 "client_saturated": e.results.client_saturated,
@@ -568,6 +581,7 @@ pub fn save_summary(
                     "parallel": p.parallel,
                     "qps": (p.qps * 10.0).round() / 10.0,
                     "p50_ms": (p.p50_ms * 1000.0).round() / 1000.0,
+                    "p90_ms": (p.p90_ms * 1000.0).round() / 1000.0,
                     "p95_ms": (p.p95_ms * 1000.0).round() / 1000.0,
                     "p99_ms": (p.p99_ms * 1000.0).round() / 1000.0,
                     "recall": (p.recall * 10000.0).round() / 10000.0,
@@ -1360,5 +1374,41 @@ mod tests {
         a.results.mean_precision_at_returned = -1.0;
         b.results.mean_precision_at_returned = -1.0;
         assert!(concurrency_curves(&[a, b]).is_empty());
+    }
+
+    /// #346: p90 must reach every place the summary publishes p50/p95 — the
+    /// per-search rows, the precision buckets and the concurrency-curve points —
+    /// carrying the run's OWN value (distinct from p50/p95 here, so a copy of a
+    /// neighbouring percentile is caught).
+    #[test]
+    fn summary_publishes_p90_alongside_the_other_percentiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = vec![
+            entry("64", 1, 100.0, 0.03, ""),
+            entry("64", 2, 200.0, 0.03, ""),
+        ];
+        for e in &mut entries {
+            e.results.mean_precision_at_returned = 0.9;
+            e.results.p50_time = 0.010;
+            e.results.p90_time = 0.017;
+            e.results.p99_time = 0.040;
+        }
+        save_summary("redis-test", "p90", &entries, None, dir.path(), &json!({})).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("redis-test-p90-summary.json")).unwrap(),
+        )
+        .unwrap();
+
+        for row in v["search_results"].as_array().unwrap() {
+            assert_eq!(row["p90_time"], 0.017, "{row}");
+            assert_eq!(row["p95_time"], 0.03, "back-compat field unchanged");
+        }
+        assert_eq!(v["precision_summary"]["0.90"]["P90 (ms)"], 17.0);
+        assert_eq!(v["precision_summary"]["0.90"]["P95 (ms)"], 30.0);
+        let points = v["concurrency_curve"][0]["points"].as_array().unwrap();
+        assert_eq!(points.len(), 2);
+        for p in points {
+            assert_eq!(p["p90_ms"], 17.0, "{p}");
+        }
     }
 }

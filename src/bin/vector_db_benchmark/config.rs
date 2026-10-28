@@ -111,6 +111,17 @@ pub struct SearchParams {
     pub calibration_param: Option<String>,
     /// Calibration: target precision to achieve
     pub calibration_precision: Option<f64>,
+    /// Query family this search config runs (#344). Undeclared means `vector`;
+    /// `--skip-vector-index` forces `filter-only`. Resolved once per engine
+    /// config by `vector_db_benchmark::workload::plan` before anything connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<vector_db_benchmark::workload::Workload>,
+    /// Runtime-only (never read from or written to a config file): set by the
+    /// runner under `--dump-results` so the engine records a
+    /// `results_dump::RawQueryResult` per timed query into
+    /// `SearchResults::query_records`.
+    #[serde(skip)]
+    pub capture_query_results: bool,
     /// Catch-all for engine-specific search params (e.g., OpenSearch "knn.algo_param.ef_search")
     #[serde(flatten)]
     pub extra: Option<HashMap<String, serde_json::Value>>,
@@ -1984,6 +1995,8 @@ mod shipped_config_knob_guard {
         "max_lateness_ms",
         "calibration_param",
         "calibration_precision",
+        // #344: resolved by the runner into the engine dispatch, not an engine knob.
+        "workload",
         // The inner `search_params` object itself is a container, not a knob.
         // `config` is #215's alias for that same container (upstream's spelling).
         "search_params",
