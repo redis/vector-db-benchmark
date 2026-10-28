@@ -530,8 +530,11 @@ the 100K MS MARCO corpus, segment-only parity agrees on about 94% of the top 10
 so they run side by side:
 
 ```bash
-vector-db-benchmark --engines '*-msmarco-fulltext-*' \
-  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/<engine> …
+# One run per engine, each into its own (new) dump directory.
+vector-db-benchmark --engines 'redis-msmarco-fulltext-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/redis
+vector-db-benchmark --engines 'opensearch-msmarco-fulltext-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/opensearch
 vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch
 ```
 

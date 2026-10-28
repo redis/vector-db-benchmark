@@ -388,23 +388,86 @@ pub fn index_profile<'a>(
     }))
 }
 
-/// Startup check: parity normalizes the uploaded text, which a Redis shared
-/// corpus (`REDIS_KEY_PREFIX`, reused by every config of the sweep) would
-/// impose on the other configs. `shared_corpus` is whether the prefix is set.
-pub fn check_parity_shared_corpus(
+/// Prefix of every Redis marker key ([`redis_marker_key`]).
+pub const REDIS_MARKER_NAMESPACE: &str = "vdbb:fulltext-profile:";
+
+/// `REDIS_KEY_PREFIX` as the Redis engine resolves it (trimmed, `:`-terminated,
+/// unset when blank).
+pub fn resolve_shared_prefix(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        None
+    } else if s.ends_with(':') {
+        Some(s.to_string())
+    } else {
+        Some(format!("{s}:"))
+    }
+}
+
+/// Startup (and configure) check for a Redis shared corpus (`REDIS_KEY_PREFIX`,
+/// reused by every config of a sweep), for an engine config with a fulltext
+/// profile:
+/// - parity normalizes the uploaded text, which the shared corpus would impose
+///   on every other config;
+/// - a shared prefix that covers the marker keys (e.g. `vdbb`) would make the
+///   corpus-completeness count (`SCAN <prefix>*`) count markers as documents.
+pub fn check_redis_shared_prefix(
     engine_type: &str,
     profile: Option<&IndexProfile>,
-    shared_corpus: bool,
+    shared_prefix: Option<&str>,
 ) -> Result<(), String> {
-    if engine_type == "redis" && shared_corpus && profile.is_some_and(|p| p.normalizes_whitespace())
-    {
+    let (Some(prefix), Some(profile)) = (shared_prefix, profile) else {
+        return Ok(());
+    };
+    if engine_type != "redis" {
+        return Ok(());
+    }
+    if profile.normalizes_whitespace() {
         return Err(
             "fulltext `analysis: parity` normalizes the uploaded text, which a shared corpus \
              (REDIS_KEY_PREFIX) would impose on every other config — unset REDIS_KEY_PREFIX"
                 .into(),
         );
     }
+    if REDIS_MARKER_NAMESPACE.starts_with(prefix) || prefix.starts_with(REDIS_MARKER_NAMESPACE) {
+        return Err(format!(
+            "REDIS_KEY_PREFIX '{prefix}' overlaps the fulltext marker keys \
+             ({REDIS_MARKER_NAMESPACE}…), which the shared-corpus completeness count would \
+             then count as documents — choose another prefix"
+        ));
+    }
     Ok(())
+}
+
+/// Redis commands that keep an index's marker in sync when `FT.CREATE`
+/// (re)builds it. Without a fulltext profile: none — a vector-only config never
+/// touches a key outside its own prefix (an ACL user limited to that prefix
+/// must keep working). With one: clear any stale marker, write the profile's.
+pub fn redis_marker_create_commands(
+    index_name: &str,
+    profile: Option<&IndexProfile>,
+) -> Vec<Vec<String>> {
+    let Some(p) = profile else {
+        return Vec::new();
+    };
+    let key = redis_marker_key(index_name);
+    vec![
+        vec!["DEL".into(), key.clone()],
+        vec!["SET".into(), key, p.marker().to_string()],
+    ]
+}
+
+/// Redis commands that remove an index's marker at teardown: only for an
+/// engine config that has a fulltext profile (see
+/// [`redis_marker_create_commands`]).
+pub fn redis_marker_teardown_commands(
+    index_name: &str,
+    profile: Option<&IndexProfile>,
+) -> Vec<Vec<String>> {
+    match profile {
+        Some(_) => vec![vec!["DEL".into(), redis_marker_key(index_name)]],
+        None => Vec::new(),
+    }
 }
 
 /// Whether `c` is whitespace that [`normalize_whitespace`] rewrites: every
@@ -464,7 +527,7 @@ pub fn normalize_metadata(
 /// Redis key holding an index's [`IndexProfile::marker`] (outside every
 /// config's key prefix, so it is neither indexed nor counted as corpus).
 pub fn redis_marker_key(index_name: &str) -> String {
-    format!("vdbb:fulltext-profile:{index_name}")
+    format!("{REDIS_MARKER_NAMESPACE}{index_name}")
 }
 
 /// Key of the profile marker inside OpenSearch `mappings._meta`.
@@ -2116,13 +2179,56 @@ mod tests {
         .unwrap()
         .unwrap();
         let eng = IndexProfile::english();
-        assert!(check_parity_shared_corpus("redis", Some(&par), true)
+        let shared = Some("bench:");
+        assert!(check_redis_shared_prefix("redis", Some(&par), shared)
             .unwrap_err()
             .contains("REDIS_KEY_PREFIX"));
-        assert!(check_parity_shared_corpus("redis", Some(&par), false).is_ok());
-        assert!(check_parity_shared_corpus("redis", Some(&eng), true).is_ok());
-        assert!(check_parity_shared_corpus("redis", None, true).is_ok());
-        assert!(check_parity_shared_corpus("opensearch", Some(&par), true).is_ok());
+        assert!(check_redis_shared_prefix("redis", Some(&par), None).is_ok());
+        assert!(check_redis_shared_prefix("redis", Some(&eng), shared).is_ok());
+        assert!(check_redis_shared_prefix("redis", None, shared).is_ok());
+        assert!(check_redis_shared_prefix("opensearch", Some(&par), shared).is_ok());
+        // A shared prefix covering the marker keys would count them as corpus.
+        for p in [
+            "vdbb:",
+            "vdbb:fulltext-profile:",
+            "vdbb:fulltext-profile:idx:",
+        ] {
+            let e = check_redis_shared_prefix("redis", Some(&eng), Some(p)).unwrap_err();
+            assert!(e.contains("overlaps the fulltext marker keys"), "{p}: {e}");
+        }
+        for p in ["v:", "vdbbx:", "vdb:", "bench:"] {
+            assert!(
+                check_redis_shared_prefix("redis", Some(&eng), Some(p)).is_ok(),
+                "{p}"
+            );
+        }
+        // Vector-only configs write no marker, so any prefix is fine for them.
+        assert!(check_redis_shared_prefix("redis", None, Some("vdbb:")).is_ok());
+        assert_eq!(resolve_shared_prefix(Some(" vdbb ")), Some("vdbb:".into()));
+        assert_eq!(resolve_shared_prefix(Some("a:")), Some("a:".into()));
+        assert_eq!(resolve_shared_prefix(Some("  ")), None);
+        assert_eq!(resolve_shared_prefix(None), None);
+    }
+
+    /// #358 review 3: a vector-only config never touches a key outside its
+    /// own prefix; a fulltext one clears a stale marker and writes its own.
+    #[test]
+    fn marker_commands_only_for_fulltext_configs() {
+        let eng = IndexProfile::english();
+        assert!(redis_marker_create_commands("idx:v", None).is_empty());
+        assert!(redis_marker_teardown_commands("idx:v", None).is_empty());
+        let key = "vdbb:fulltext-profile:idx:f".to_string();
+        assert_eq!(
+            redis_marker_create_commands("idx:f", Some(&eng)),
+            vec![
+                vec!["DEL".to_string(), key.clone()],
+                vec!["SET".to_string(), key.clone(), eng.marker().to_string()],
+            ]
+        );
+        assert_eq!(
+            redis_marker_teardown_commands("idx:f", Some(&eng)),
+            vec![vec!["DEL".to_string(), key]]
+        );
     }
 
     #[test]

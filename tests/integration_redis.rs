@@ -5004,3 +5004,73 @@ fn test_binary_redis_fulltext_parity() {
         .query::<()>(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #358 review 3: a vector-only config never touches a key outside its own
+/// prefix — the fulltext marker key in particular. Run it as an ACL user
+/// limited to `<config>:*`: any command on another key fails with NOPERM.
+#[test]
+fn test_binary_redis_vector_only_stays_inside_its_key_prefix() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-acl-vec";
+    redis::cmd("ACL")
+        .arg(
+            &[
+                "SETUSER",
+                "vdbb-acl-vec",
+                "reset",
+                "on",
+                ">acl-pw",
+                &format!("~{name}:*"),
+                "+@all",
+            ][..],
+        )
+        .query::<()>(&mut conn)
+        .unwrap();
+    let configs = serde_json::json!([{
+        "name": name, "engine": "redis",
+        "search_params": [{"parallel": 1, "top": 10}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    redis::cmd("ACL")
+        .arg(&["LOG", "RESET"][..])
+        .query::<()>(&mut conn)
+        .unwrap();
+    let proj = common::write_match_any_project("acl-vec-test", &configs.to_string(), 8);
+    let port = test_port().to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        name,
+        "acl-vec-test",
+        TEST_HOST,
+        &[
+            ("REDIS_PORT", port.as_str()),
+            ("REDIS_USER", "vdbb-acl-vec"),
+            ("REDIS_AUTH", "acl-pw"),
+        ],
+        &["--exit-on-error"],
+    );
+    // Denials the run swallowed (teardown ignores errors) still land in the
+    // ACL log: there must be none for this user.
+    let log: redis::Value = redis::cmd("ACL")
+        .arg(&["LOG", "128"][..])
+        .query(&mut conn)
+        .unwrap();
+    let denied = format!("{log:?}").contains("vdbb-acl-vec");
+    let _ = redis::cmd("ACL")
+        .arg(&["DELUSER", "vdbb-acl-vec"][..])
+        .query::<()>(&mut conn);
+    assert!(
+        !denied,
+        "a command outside the config's key prefix was denied: {log:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "vector-only run under a prefix ACL: {stderr}"
+    );
+    assert!(!stderr.contains("NOPERM"), "{stderr}");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

@@ -263,14 +263,18 @@ pub fn run(args: &Args) -> Result<(), String> {
             .collect::<Result<Vec<_>, String>>()?;
         let profile = vector_db_benchmark::fulltext::index_profile(profile_inputs)
             .map_err(|e| format!("config '{name}': {e}"))?;
-        // Before any download: parity on a Redis shared corpus (the engine
-        // re-checks it at configure).
-        vector_db_benchmark::fulltext::check_parity_shared_corpus(
+        // Before any download: a fulltext profile on a Redis shared corpus
+        // (parity, or a prefix overlapping the marker keys); the engine
+        // re-checks it at configure.
+        vector_db_benchmark::fulltext::check_redis_shared_prefix(
             &plan.engine_type,
             profile.as_ref(),
-            crate::effective_config::env_var("REDIS_KEY_PREFIX")
-                .ok()
-                .is_some_and(|s| !s.trim().is_empty()),
+            vector_db_benchmark::fulltext::resolve_shared_prefix(
+                crate::effective_config::env_var("REDIS_KEY_PREFIX")
+                    .ok()
+                    .as_deref(),
+            )
+            .as_deref(),
         )
         .map_err(|e| format!("config '{name}': {e}"))?;
         if args.target_qps > 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {

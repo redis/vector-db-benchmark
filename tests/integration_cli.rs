@@ -759,10 +759,23 @@ fn fulltext_parity_index_rules_are_refused_at_startup() {
         // Redis only: parity on a shared corpus, refused before the download
         // (run with REDIS_KEY_PREFIX set, below).
         (json!([par(json!({"segment": 1}))]), "REDIS_KEY_PREFIX"),
+        // Redis only: a shared prefix covering the marker keys (run with
+        // REDIS_KEY_PREFIX=vdbb, below), even in english mode.
+        (
+            json!([{"workload": "fulltext", "fulltext": {"fields": {"segment": 1}}}]),
+            "overlaps the fulltext marker keys",
+        ),
     ];
     for engine in ["redis", "opensearch"] {
         for (search_params, needle) in &cases {
-            if needle.contains("REDIS_KEY_PREFIX") && engine != "redis" {
+            let shared_prefix = if needle.contains("REDIS_KEY_PREFIX") {
+                Some("shared")
+            } else if needle.contains("overlaps the fulltext marker keys") {
+                Some("vdbb")
+            } else {
+                None
+            };
+            if shared_prefix.is_some() && engine != "redis" {
                 continue;
             }
             let root = tempfile::tempdir().unwrap();
@@ -793,8 +806,8 @@ fn fulltext_parity_index_rules_are_refused_at_startup() {
                 .arg(&engines_file)
                 .env("REDIS_PORT", &port)
                 .env("OPENSEARCH_PORT", &port);
-            if needle.contains("REDIS_KEY_PREFIX") {
-                cmd.env("REDIS_KEY_PREFIX", "shared");
+            if let Some(p) = shared_prefix {
+                cmd.env("REDIS_KEY_PREFIX", p);
             }
             let out = cmd.output().unwrap();
             let stderr = String::from_utf8_lossy(&out.stderr);

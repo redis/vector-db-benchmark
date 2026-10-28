@@ -37,27 +37,28 @@ impl RedisEngine {
                 sp.knob(fulltext::SPEC_KEY),
             )
         }))?;
-        fulltext::check_parity_shared_corpus("redis", profile.as_ref(), self.config.shared_corpus)?;
+        fulltext::check_redis_shared_prefix(
+            "redis",
+            profile.as_ref(),
+            self.config
+                .shared_corpus
+                .then_some(self.config.key_prefix.as_str()),
+        )?;
         Ok(profile)
     }
 
-    /// Record the profile next to the index (or clear a stale one), so a
-    /// `--skip-upload` reuse can verify how the corpus was uploaded.
+    /// Record the profile next to the index (clearing a stale one), so a
+    /// `--skip-upload` reuse can verify how the corpus was uploaded. Nothing
+    /// at all for a config without a fulltext profile.
     pub(super) fn write_fulltext_marker(
         &self,
         conn: &mut redis::Connection,
         profile: Option<&fulltext::IndexProfile>,
     ) -> Result<(), String> {
-        let key = fulltext::redis_marker_key(&self.config.index_name);
-        redis::cmd("DEL")
-            .arg(&key)
-            .query::<()>(conn)
-            .map_err(|e| format!("fulltext marker: {e}"))?;
-        if let Some(p) = profile {
-            redis::cmd("SET")
-                .arg(&key)
-                .arg(p.marker().to_string())
-                .query::<()>(conn)
+        for args in fulltext::redis_marker_create_commands(&self.config.index_name, profile) {
+            let mut cmd = redis::cmd(&args[0]);
+            cmd.arg(&args[1..]);
+            cmd.query::<()>(conn)
                 .map_err(|e| format!("fulltext marker: {e}"))?;
         }
         Ok(())

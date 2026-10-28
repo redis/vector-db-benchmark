@@ -2988,11 +2988,16 @@ impl Engine for RedisEngine {
             cmd.arg("DD");
         }
         let _ = cmd.query::<()>(&mut conn);
-        let _ = redis::cmd("DEL")
-            .arg(vector_db_benchmark::fulltext::redis_marker_key(
-                &self.config.index_name,
-            ))
-            .query::<()>(&mut conn);
+        // Only a fulltext config owns a marker (outside its key prefix).
+        let profile = self.fulltext_profile().ok().flatten();
+        for args in vector_db_benchmark::fulltext::redis_marker_teardown_commands(
+            &self.config.index_name,
+            profile.as_ref(),
+        ) {
+            let mut cmd = redis::cmd(&args[0]);
+            cmd.arg(&args[1..]);
+            let _ = cmd.query::<()>(&mut conn);
+        }
         Ok(())
     }
 
