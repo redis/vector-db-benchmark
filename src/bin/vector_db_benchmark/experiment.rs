@@ -231,8 +231,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         plans.insert(name.to_string(), plan);
     }
     if let Some(dir) = &args.dump_results {
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("--dump-results: cannot create {}: {e}", dir.display()))?;
+        vector_db_benchmark::results_dump::prepare_dump_dir(dir)?;
     }
 
     if args.target_qps > 0.0 || args.search_duration > 0.0 {
@@ -1970,15 +1969,23 @@ fn run_single_experiment(
         )?;
     }
 
-    // Per-query dumps (#343), written after every timed window has closed.
-    if let Some(dir) = &args.dump_results {
-        write_query_dumps(
+    // Per-query dumps (#343), written after every timed window has closed. A
+    // failure here is RECORDED, not returned: it must not replace a hard search
+    // failure or the dropped-query verdict below, nor skip summary and teardown.
+    // It is reported last (see `with_dump_failure`).
+    let dump_failure: Option<String> = match &args.dump_results {
+        Some(dir) => write_query_dumps(
             dir,
             &plan.engine_type,
             engine.name(),
             dataset,
             &mut pending_saves,
-        )?;
+        )
+        .err(),
+        None => None,
+    };
+    if let Some(e) = &dump_failure {
+        eprintln!("\t⚠ {e}");
     }
 
     // Only now that the completed points are on disk may a hard search failure
@@ -1990,7 +1997,7 @@ fn run_single_experiment(
                 pending_saves.len()
             );
         }
-        return Err(msg);
+        return Err(with_dump_failure(msg, dump_failure.as_deref()));
     }
 
     // Now that the evidence is on disk, honour --fail-on-dropped-queries. Every
@@ -1998,13 +2005,16 @@ fn run_single_experiment(
     // engine-agnostic by construction: it reads the `failed_queries` that
     // `compute_search_stats` derives for all of them.
     if args.fail_on_dropped_queries && !dropped_query_failures.is_empty() {
-        return Err(format!(
-            "{} search config(s) lost queries and --fail-on-dropped-queries is set: {}. \
-             Recall/latency for these cover the surviving subset only, which biases recall \
-             upward. Results were still written; re-run with less load, or drop the flag to \
-             accept a partial run.",
-            dropped_query_failures.len(),
-            dropped_query_failures.join("; ")
+        return Err(with_dump_failure(
+            format!(
+                "{} search config(s) lost queries and --fail-on-dropped-queries is set: {}. \
+                 Recall/latency for these cover the surviving subset only, which biases recall \
+                 upward. Results were still written; re-run with less load, or drop the flag to \
+                 accept a partial run.",
+                dropped_query_failures.len(),
+                dropped_query_failures.join("; ")
+            ),
+            dump_failure.as_deref(),
         ));
     }
 
@@ -2083,8 +2093,23 @@ fn run_single_experiment(
         engine.delete()?;
     }
 
+    // A failed dump write is surfaced only after summary and teardown ran.
+    if let Some(e) = dump_failure {
+        return Err(e);
+    }
+
     println!("Experiment stage: Done");
     Ok(())
+}
+
+/// An experiment's primary failure, with a secondary `--dump-results` write
+/// failure appended rather than substituted (#343 review): the search failure
+/// or dropped-query verdict is what the run is about, and must stay first.
+fn with_dump_failure(primary: String, dump_failure: Option<&str>) -> String {
+    match dump_failure {
+        Some(d) => format!("{primary}\n(also: {d})"),
+        None => primary,
+    }
 }
 
 /// Outcome of a calibration sweep, including whether it actually got there.
@@ -4516,6 +4541,24 @@ mod reuse_handler_tests {
         assert!(
             out.is_none(),
             "no verdict should be recorded for a run that measures nothing: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dump_failure_ordering_tests {
+    use super::with_dump_failure;
+
+    /// A late `--dump-results` write failure is appended to, never substituted
+    /// for, the experiment's primary failure (#343 review).
+    #[test]
+    fn the_primary_failure_stays_first_and_the_dump_failure_is_kept() {
+        let e = with_dump_failure("search failed".into(), Some("dump: disk full"));
+        assert!(e.starts_with("search failed"), "{e}");
+        assert!(e.contains("dump: disk full"), "{e}");
+        assert_eq!(
+            with_dump_failure("search failed".into(), None),
+            "search failed"
         );
     }
 }

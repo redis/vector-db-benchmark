@@ -229,11 +229,13 @@ pub struct Args {
     /// dataset, workload, parallel, search config), holding `query_id`, the
     /// returned EXTERNAL ids (`docid` where the dataset has one, else the corpus
     /// row id — never an engine key), scores, the exact total where the
-    /// workload requests one, and latency. Captured after each latency sample
-    /// and written after the search phase, so it is not inside the timed
-    /// window. An engine without per-query capture for the workload fails the
-    /// run instead of writing an empty dump. Feed two runs' dumps to
-    /// `compare-results`.
+    /// workload requests one, and latency. Captured outside each latency sample
+    /// but inside the throughput window when this flag is on (the capture runs
+    /// in the measured worker loop, so it counts toward `rps`); written after
+    /// the search phase. DIR must be empty or absent: a non-empty DIR is
+    /// refused at startup. An engine without per-query capture for the
+    /// workload fails the run instead of writing an empty dump. Feed two runs'
+    /// dumps to `compare-results`.
     #[arg(long, value_name = "DIR")]
     pub dump_results: Option<PathBuf>,
 }

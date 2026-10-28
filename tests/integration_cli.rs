@@ -394,3 +394,58 @@ fn compare_results_self_passes_and_a_one_sided_answer_fails() {
     );
     assert!(stderr.contains("answered by one engine"), "{stderr}");
 }
+
+/// #343 review: a non-empty `--dump-results` directory is refused at startup,
+/// before any download or connection, instead of after the whole timed run.
+#[test]
+fn a_non_empty_dump_dir_is_refused_before_download_or_connection() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let datasets = root.path().join("datasets");
+    std::fs::create_dir(&datasets).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    std::fs::write(
+        datasets.join("datasets.json"),
+        json!([{
+            "name":"dump-fixture", "type":"tar", "path":"missing-corpus",
+            "vector_size":1,"distance":"l2","schema":{"tag":"keyword"},
+            "link":format!("http://127.0.0.1:{port}/must-not-download.tar.gz")
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let engines_file = root.path().join("engines.json");
+    std::fs::write(
+        &engines_file,
+        json!([{"name":"dump-cfg","engine":"redis","search_params":[{}]}]).to_string(),
+    )
+    .unwrap();
+    let dump = root.path().join("dumps");
+    std::fs::create_dir(&dump).unwrap();
+    std::fs::write(dump.join("previous-run.jsonl"), "{}").unwrap();
+    let output = Command::new(common::binary_path())
+        .current_dir(root.path())
+        .args([
+            "--engines",
+            "dump-cfg",
+            "--datasets",
+            "dump-fixture",
+            "--host",
+            "127.0.0.1",
+            "--engines-file",
+        ])
+        .arg(&engines_file)
+        .arg("--dump-results")
+        .arg(&dump)
+        .env("REDIS_PORT", &port)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(stderr.contains("is not empty"), "{stderr}");
+    assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+    assert!(!datasets.join("missing-corpus").exists());
+}

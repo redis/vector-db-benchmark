@@ -224,6 +224,29 @@ pub struct Dump {
     pub records: Vec<QueryRecord>,
 }
 
+/// Prepare `--dump-results DIR` at startup, before any download or connection:
+/// create it if absent, refuse it if it holds anything. Dump files are opened
+/// with `create_new`, so a reused directory would otherwise only fail after the
+/// whole timed run (#343 review); and mixing two runs' dumps in one directory
+/// would let `compare-results` pair records from different runs.
+pub fn prepare_dump_dir(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("--dump-results: cannot create {}: {e}", dir.display()))?;
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("--dump-results: cannot read {}: {e}", dir.display()))?;
+    if let Some(entry) = entries.next() {
+        let name = entry
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .unwrap_or_else(|e| e.to_string());
+        return Err(format!(
+            "--dump-results: {} is not empty (contains {name:?}); use an empty or new \
+             directory per run",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 /// The runner's check that a capture covers every timed query: one record per
 /// attempted query, failures included. A shortfall means queries vanished from
 /// the dump, which is exactly what `compare-results` must be able to see.
@@ -485,6 +508,22 @@ mod tests {
         assert_eq!(recs[0].scores, None);
         assert_eq!(recs[0].expected, None);
         assert_eq!(recs[0].shape.as_deref(), Some("tag"));
+    }
+
+    #[test]
+    fn dump_dir_must_be_new_or_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("a/b");
+        assert!(prepare_dump_dir(&fresh).is_ok(), "absent dir is created");
+        assert!(fresh.is_dir());
+        assert!(prepare_dump_dir(&fresh).is_ok(), "empty dir is accepted");
+        std::fs::write(fresh.join("old.jsonl"), "x").unwrap();
+        let e = prepare_dump_dir(&fresh).unwrap_err();
+        assert!(e.contains("not empty") && e.contains("old.jsonl"), "{e}");
+        // Any entry counts, not just *.jsonl: a subdirectory is refused too.
+        let other = tmp.path().join("c");
+        std::fs::create_dir_all(other.join("sub")).unwrap();
+        assert!(prepare_dump_dir(&other).is_err());
     }
 
     #[test]
