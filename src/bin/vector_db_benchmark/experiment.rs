@@ -1275,7 +1275,7 @@ fn run_single_experiment(
             .iter()
             .enumerate()
             .filter(|(i, _)| plan.workload(*i).ok() == Some(Workload::Fulltext))
-            .map(|(_, sp)| sp.knob(vector_db_benchmark::fulltext::SPEC_KEY)),
+            .map(|(i, sp)| (i, sp.knob(vector_db_benchmark::fulltext::SPEC_KEY))),
         dataset.config.schema.as_ref(),
         &dataset.config.name,
     )?;

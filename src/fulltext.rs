@@ -271,15 +271,17 @@ pub fn count_text_field_queries(dir: &Path, text_fields: &[String]) -> Result<us
 /// Pre-connect check (#339 review): every fulltext search config's `fields`
 /// resolve against the dataset schema, so a typo is refused before configure
 /// and upload rather than after a corpus upload. `blocks` are the `fulltext`
-/// blocks of the engine config's fulltext search configs.
+/// blocks of the engine config's fulltext search configs, each paired with its
+/// index among all of the engine config's search configs, so the error names
+/// the same `search config #i` as the startup check.
 pub fn check_fields_before_connecting<'a>(
-    blocks: impl Iterator<Item = Option<&'a Value>>,
+    blocks: impl Iterator<Item = (usize, Option<&'a Value>)>,
     schema: Option<&Value>,
     dataset: &str,
 ) -> Result<(), String> {
-    for (i, block) in blocks.enumerate() {
+    for (i, block) in blocks {
         resolve_fields(&parse_spec(block)?, schema)
-            .map_err(|e| format!("fulltext search config {i} on dataset '{dataset}': {e}"))?;
+            .map_err(|e| format!("search config #{i} (fulltext) on dataset '{dataset}': {e}"))?;
     }
     Ok(())
 }
@@ -1434,6 +1436,22 @@ mod tests {
         assert!(resolve_fields(&FulltextSpec::default(), Some(&schema)).is_err());
         let spec = parse_spec(Some(&json!({"fields": {"body": 1.0}}))).unwrap();
         assert!(resolve_fields(&spec, Some(&schema)).is_ok());
+    }
+
+    #[test]
+    fn pre_connect_field_errors_name_the_search_config_by_its_original_index() {
+        // In a mixed engine config the fulltext configs are a filtered subset;
+        // the error must name the same `search config #i` as the startup check.
+        let schema = json!({"title": "text", "segment": "text"});
+        let good = json!({"fields": {"title": 1.0}});
+        let typo = json!({"fields": {"titel": 1.0}});
+        let blocks = [(1, Some(&good)), (3, Some(&typo))];
+        let e =
+            check_fields_before_connecting(blocks.into_iter(), Some(&schema), "ds").unwrap_err();
+        assert!(
+            e.starts_with("search config #3 (fulltext) on dataset 'ds'"),
+            "{e}"
+        );
     }
 
     #[test]
