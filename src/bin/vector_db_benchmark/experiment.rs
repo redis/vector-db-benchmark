@@ -240,6 +240,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         // #339: a `fulltext` block only on a fulltext search config, and well-formed.
         for (i, sp) in config.search_params.iter().flatten().enumerate() {
             vector_db_benchmark::fulltext::validate_declared(
+                &plan.engine_type,
                 plan.workload(i)?,
                 sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
             )
@@ -1261,6 +1262,17 @@ fn run_single_experiment(
             println!("Skipping (results exist): {}", glob_pattern);
             return Ok(());
         }
+    }
+
+    // #339: a fulltext search config pins the text analyzer for the whole
+    // index, so it may not share one with vector/hybrid configs whose dataset
+    // filters on text. Checked before anything touches the server.
+    if vector_db_benchmark::fulltext::mixes_with_filtered_workloads(&plan.workloads) {
+        vector_db_benchmark::fulltext::check_mixed_text_filters(
+            &plan.workloads,
+            vector_db_benchmark::fulltext::count_text_match_queries(&dataset.get_path()?)?,
+            &dataset.config.name,
+        )?;
     }
 
     // Snapshot server metadata BEFORE any upload/search so results are

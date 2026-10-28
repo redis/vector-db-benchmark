@@ -428,9 +428,16 @@ given it explicitly so the server reports it back (`FT.INFO stopwords_list`,
 
 These settings are applied only when an engine config declares a `fulltext`
 search config. Fulltext uses the vector index layout (the one that indexes
-`text` fields), so it may share an engine config with `vector` configs — which
-then also see the pinned analyzer in any text `match` filter — but not with
-`filter-only` (different layout, refused by `workload::plan`). The fulltext
+`text` fields), so it may share an engine config with `vector` configs, but not
+with `filter-only` (different layout, refused by `workload::plan`). Because the
+pinned analyzer then also governs the vector configs' text `match` filters (on
+OpenSearch it replaces `standard`, so `quick` would also match `quickly`), an
+engine config mixing `fulltext` with `vector`/`hybrid` configs is refused, before
+the server is touched, when the dataset's queries contain a text `match`
+condition — split the fulltext configs into their own engine config. No
+registered dataset has such queries today (H&M's and MS MARCO's `tests.jsonl`
+were checked); the rule applies to Redis too, where it is a no-op, so both
+engines follow one rule. The fulltext
 arm refuses to start when a searched field is missing from the live index, or
 when the live index differs from anything `params.fulltext.engine_settings`
 claims — e.g. an index built by a vector-only config and reused with
@@ -471,7 +478,14 @@ scorer / request, skipped queries, known differences). `--dump-results`
 records carry `docid`s and the engine's BM25 scores (not comparable across
 engines). Note that `compare-results` pairs dumps by (dataset, workload,
 parallel, k): two fulltext configs that differ only in boosts need different
-`parallel` or `top` to stay distinguishable.
+`parallel` or `top` to stay distinguishable (in directory mode a collision is
+refused, never silently replaced).
+
+Latency, as on the vector path: OpenSearch bills only the attempt that produced
+the result (retry backoff and discarded attempts are excluded and counted in
+`params.fulltext.retried_queries`), while Redis makes one attempt per query.
+Compare QPS columns only from runs with zero retries and no client-saturation
+warning.
 
 ### `--skip-upload`: reuse means reuse (issue #238)
 

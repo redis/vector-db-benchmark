@@ -261,6 +261,14 @@ fn unimplemented_or_mixed_workloads_fail_before_download_or_connection() {
             false,
             "finite number > 0",
         ),
+        // #339 review: an OpenSearch-only key on another engine is refused,
+        // not accepted and ignored.
+        (
+            "redis",
+            json!([{"workload":"fulltext","fulltext":{"allow_multi_shard":true}}]),
+            false,
+            "only applies to OpenSearch",
+        ),
         (
             "opensearch",
             json!([{"workload":"hybrid"}]),
@@ -598,4 +606,89 @@ fn calibration_on_declared_filter_only_is_refused_at_startup() {
     assert!(!output.status.success(), "{stdout}");
     assert!(stderr.contains("calibration_param"), "{stderr}");
     assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+}
+
+/// #339 review: an engine config mixing `fulltext` with a vector config is
+/// refused when the dataset's queries filter on text — the fulltext config
+/// would change the analyzer those filters run through — and is checked
+/// before anything touches the server (a closed port: the refusal must come
+/// first). The same mix on a dataset without text filters is not refused,
+/// and neither is a fulltext-only config.
+#[test]
+fn fulltext_mixed_with_text_filtered_vector_configs_is_refused_before_connecting() {
+    use serde_json::json;
+    let cases = [
+        (true, json!([{}, {"workload": "fulltext"}]), true),
+        (false, json!([{}, {"workload": "fulltext"}]), false),
+        (true, json!([{"workload": "fulltext"}]), false),
+    ];
+    // The non-refused cases go on to connect; only Redis fails fast against a
+    // closed port (OpenSearch retries), so they run on Redis only — the rule
+    // itself is engine-agnostic and unit-tested in `fulltext`.
+    for engine in ["redis", "opensearch"] {
+        for (text_filter, search_params, refused) in &cases {
+            if engine == "opensearch" && !*refused {
+                continue;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let ds = root.path().join("datasets/tm");
+            std::fs::create_dir_all(&ds).unwrap();
+            let condition = if *text_filter {
+                json!({"and": [{"body": {"match": {"text": "quick"}}}]})
+            } else {
+                json!({"and": [{"tag": {"match": {"value": "a"}}}]})
+            };
+            std::fs::write(
+                ds.join("tests.jsonl"),
+                json!({"query": [1.0, 0.0], "conditions": condition, "closest_ids": [0],
+                       "query_text": "quick fox"})
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("datasets/datasets.json"),
+                json!([{"name": "tm", "type": "tar", "path": "tm", "vector_size": 2,
+                        "distance": "l2", "schema": {"body": "text", "tag": "keyword"}}])
+                .to_string(),
+            )
+            .unwrap();
+            let engines_file = root.path().join("engines.json");
+            std::fs::write(
+                &engines_file,
+                json!([{"name": "mix", "engine": engine, "search_params": search_params}])
+                    .to_string(),
+            )
+            .unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port().to_string();
+            drop(listener);
+            let out = Command::new(common::binary_path())
+                .current_dir(root.path())
+                .args([
+                    "--engines",
+                    "mix",
+                    "--datasets",
+                    "tm",
+                    "--host",
+                    "127.0.0.1",
+                ])
+                .arg("--engines-file")
+                .arg(&engines_file)
+                .args(["--exit-on-error"])
+                .env("REDIS_PORT", &port)
+                .env("OPENSEARCH_PORT", &port)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let hit = stderr.contains("filter on text");
+            assert_eq!(
+                hit, *refused,
+                "{engine} text_filter={text_filter} {search_params}: {stderr}"
+            );
+            if *refused {
+                assert!(!out.status.success(), "{stderr}");
+                assert!(stderr.contains("1 queries of dataset 'tm'"), "{stderr}");
+            }
+        }
+    }
 }

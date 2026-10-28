@@ -136,15 +136,105 @@ pub struct FulltextSpec {
 pub const SPEC_KEY: &str = "fulltext";
 
 /// Startup check, before anything is downloaded or connected: a `fulltext`
-/// block is only legal on a `fulltext` search config, and must parse.
-pub fn validate_declared(workload: Workload, block: Option<&Value>) -> Result<(), String> {
+/// block is only legal on a `fulltext` search config, must parse, and may only
+/// carry a key the engine reads (`allow_multi_shard` is OpenSearch-only — on
+/// any other engine it would be accepted and do nothing).
+pub fn validate_declared(
+    engine_type: &str,
+    workload: Workload,
+    block: Option<&Value>,
+) -> Result<(), String> {
     match (workload, block) {
-        (Workload::Fulltext, b) => parse_spec(b).map(|_| ()),
+        (Workload::Fulltext, b) => {
+            let spec = parse_spec(b)?;
+            if spec.allow_multi_shard && engine_type != "opensearch" {
+                return Err(format!(
+                    "`{SPEC_KEY}.allow_multi_shard` only applies to OpenSearch; engine \
+                     '{engine_type}' has no shards to allow — remove it"
+                ));
+            }
+            Ok(())
+        }
         (w, Some(_)) => Err(format!(
             "a `{SPEC_KEY}` block is only valid on a fulltext search config, not workload \"{w}\""
         )),
         (_, None) => Ok(()),
     }
+}
+
+/// Whether a query's `conditions` contain a full-text `{"match": {"text": …}}`
+/// leaf anywhere (any nesting of `and` / `or` / groups).
+pub fn has_text_match(conditions: &Value) -> bool {
+    match conditions {
+        Value::Object(o) => o.values().any(|v| {
+            v.get("match")
+                .and_then(Value::as_object)
+                .is_some_and(|m| m.contains_key("text"))
+                || has_text_match(v)
+        }),
+        Value::Array(a) => a.iter().any(has_text_match),
+        _ => false,
+    }
+}
+
+/// Queries of `<dir>/tests.jsonl` whose `conditions` contain a text match. A
+/// dataset without `tests.jsonl` (HDF5 / JSONL formats) has no conditions.
+pub fn count_text_match_queries(dir: &Path) -> Result<usize, String> {
+    let path = dir.join("tests.jsonl");
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let file = std::fs::File::open(&path)
+        .map_err(|e| format!("fulltext: cannot open {}: {e}", path.display()))?;
+    let mut n = 0;
+    for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("fulltext: reading {}: {e}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(&line)
+            .map_err(|e| format!("fulltext: {} line {}: {e}", path.display(), i + 1))?;
+        if row.get("conditions").is_some_and(has_text_match) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Whether an engine config's workloads need [`check_mixed_text_filters`]: a
+/// fulltext config sharing the index with a vector or hybrid config.
+pub fn mixes_with_filtered_workloads(workloads: &[Workload]) -> bool {
+    workloads.contains(&Workload::Fulltext)
+        && workloads
+            .iter()
+            .any(|w| matches!(w, Workload::Vector | Workload::Hybrid))
+}
+
+/// Refuse an engine config that mixes `fulltext` with `vector` / `hybrid`
+/// search configs on a dataset whose queries filter on text.
+///
+/// A fulltext search config builds the index's text fields with the pinned
+/// analyzer. On OpenSearch that replaces `standard` (no stemming, no
+/// stopwords), so the vector configs' `{"match": {"text": …}}` filter would
+/// silently match more documents than a vector-only config of the same name —
+/// and recall would still be scored against the same filtered ground truth.
+/// On Redis the pinned settings equal the defaults, but one rule for both
+/// engines keeps the comparison symmetric. Split the configs instead.
+pub fn check_mixed_text_filters(
+    workloads: &[Workload],
+    text_match_queries: usize,
+    dataset: &str,
+) -> Result<(), String> {
+    if mixes_with_filtered_workloads(workloads) && text_match_queries > 0 {
+        return Err(format!(
+            "engine config mixes a fulltext search config with vector/hybrid search configs, \
+             and {text_match_queries} queries of dataset '{dataset}' filter on text \
+             (`match: {{text: …}}`): the fulltext config pins the text analyzer for the whole \
+             index, which would change what those filters match — split the fulltext search \
+             configs into their own engine config"
+        ));
+    }
+    Ok(())
 }
 
 /// Parse a search config's `fulltext` block (absent = defaults).
@@ -1125,12 +1215,71 @@ mod tests {
                 "{b}"
             );
         }
-        assert!(validate_declared(Workload::Fulltext, None).is_ok());
-        assert!(validate_declared(Workload::Vector, None).is_ok());
+        assert!(validate_declared("redis", Workload::Fulltext, None).is_ok());
+        assert!(validate_declared("redis", Workload::Vector, None).is_ok());
         for w in [Workload::Vector, Workload::Hybrid, Workload::FilterOnly] {
-            assert!(validate_declared(w, Some(&json!({}))).is_err(), "{w}");
+            assert!(
+                validate_declared("redis", w, Some(&json!({}))).is_err(),
+                "{w}"
+            );
         }
-        assert!(validate_declared(Workload::Fulltext, Some(&json!({"x":1}))).is_err());
+        assert!(validate_declared("redis", Workload::Fulltext, Some(&json!({"x":1}))).is_err());
+    }
+
+    #[test]
+    fn allow_multi_shard_is_opensearch_only() {
+        let b = json!({"allow_multi_shard": true});
+        assert!(validate_declared("opensearch", Workload::Fulltext, Some(&b)).is_ok());
+        let e = validate_declared("redis", Workload::Fulltext, Some(&b)).unwrap_err();
+        assert!(e.contains("only applies to OpenSearch"), "{e}");
+        let off = json!({"allow_multi_shard": false});
+        assert!(validate_declared("redis", Workload::Fulltext, Some(&off)).is_ok());
+    }
+
+    #[test]
+    fn text_match_conditions_are_found_at_any_depth() {
+        assert!(has_text_match(
+            &json!({"and":[{"body":{"match":{"text":"quick"}}}]})
+        ));
+        assert!(has_text_match(
+            &json!({"or":[{"n":{"range":{"gt":1}}},{"and":[{"b":{"match":{"text":"x"}}}]}]})
+        ));
+        assert!(!has_text_match(
+            &json!({"and":[{"color":{"match":{"value":"red"}}}]})
+        ));
+        assert!(!has_text_match(
+            &json!({"and":[{"color":{"match":{"any":["a"]}}}]})
+        ));
+        assert!(!has_text_match(&json!(null)));
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(count_text_match_queries(dir.path()).unwrap(), 0);
+        std::fs::write(
+            dir.path().join("tests.jsonl"),
+            "{\"conditions\":{\"and\":[{\"b\":{\"match\":{\"text\":\"q\"}}}]}}\n\
+             {\"conditions\":{\"and\":[{\"c\":{\"match\":{\"value\":\"r\"}}}]}}\n\
+             {\"query\":[1]}\n",
+        )
+        .unwrap();
+        assert_eq!(count_text_match_queries(dir.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn fulltext_may_not_share_an_index_with_text_filtered_vector_configs() {
+        use Workload::*;
+        for others in [vec![Vector], vec![Hybrid], vec![Vector, Hybrid]] {
+            let mut w = others.clone();
+            w.push(Fulltext);
+            assert!(mixes_with_filtered_workloads(&w));
+            let e = check_mixed_text_filters(&w, 3, "ds").unwrap_err();
+            assert!(e.contains("3 queries of dataset 'ds'"), "{e}");
+            // No text filter in the dataset: the analyzer change is invisible.
+            assert!(check_mixed_text_filters(&w, 0, "ds").is_ok());
+        }
+        // Fulltext alone, or no fulltext at all, is never refused.
+        for w in [vec![Fulltext, Fulltext], vec![Vector], vec![FilterOnly]] {
+            assert!(!mixes_with_filtered_workloads(&w));
+            assert!(check_mixed_text_filters(&w, 3, "ds").is_ok());
+        }
     }
 
     #[test]
