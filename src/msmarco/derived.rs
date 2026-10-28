@@ -532,28 +532,25 @@ fn unknown_field(field: &str) -> String {
     )
 }
 
-/// Every leaf field of `p` must be one the row type can represent. Checked up
-/// front because `and`/`or` short-circuit: a disjunct naming an unknown field
-/// after one every row satisfies would otherwise never be evaluated.
-fn check_fields_known<F: Fields>(rows: &[F], p: &Predicate) -> Result<(), String> {
+/// Evaluate every leaf of `p` on the first row, so an unknown field or a type
+/// mismatch is an error even where `and`/`or` short-circuiting would never
+/// reach that leaf (a disjunct behind one every row satisfies). On the compact
+/// row every field's type is fixed, so the first row speaks for all of them;
+/// payload maps can still vary per row and keep failing lazily.
+fn check_leaves<F: Fields>(rows: &[F], p: &Predicate) -> Result<(), String> {
     let Some(row) = rows.first() else {
         return Ok(());
     };
     match p {
-        Predicate::And(c) | Predicate::Or(c) => {
-            c.iter().try_for_each(|q| check_fields_known(rows, q))
-        }
-        Predicate::Leaf { field, .. } => match row.field(field) {
-            Some(FieldValue::Unknown) => Err(unknown_field(field)),
-            _ => Ok(()),
-        },
+        Predicate::And(c) | Predicate::Or(c) => c.iter().try_for_each(|q| check_leaves(rows, q)),
+        Predicate::Leaf { .. } => p.matches(row).map(drop),
     }
 }
 
 /// How many rows satisfy `p`. Parallel; the count does not depend on the
 /// thread count.
 pub fn count_matches<F: Fields + Sync>(rows: &[F], p: &Predicate) -> Result<u64, String> {
-    check_fields_known(rows, p)?;
+    check_leaves(rows, p)?;
     rows.par_iter()
         .map(|r| p.matches(r).map(u64::from))
         .try_reduce(|| 0, |a, b| Ok(a + b))
@@ -562,7 +559,7 @@ pub fn count_matches<F: Fields + Sync>(rows: &[F], p: &Predicate) -> Result<u64,
 /// The ids (positions in `rows`, which are the corpus ids) satisfying `p`, in
 /// ascending order. What a filtered brute-force ground truth (#341) iterates.
 pub fn matching_ids<F: Fields + Sync>(rows: &[F], p: &Predicate) -> Result<Vec<u64>, String> {
-    check_fields_known(rows, p)?;
+    check_leaves(rows, p)?;
     let hits: Vec<Option<u64>> = rows
         .par_iter()
         .enumerate()
@@ -1228,6 +1225,17 @@ mod tests {
                 .matches(&r)
                 .is_err()
         );
+        // A type mismatch behind a short-circuit is an error too: the first
+        // disjunct holds on every row, the first conjunct on none.
+        for p in [
+            json!({"or":[{"tier":{"range":{"gte":0}}},{"category":{"range":{"gte":0}}}]}),
+            json!({"and":[{"tier":{"match":{"value":99}}},{"category":{"range":{"gte":0}}}]}),
+            json!({"or":[{"tier":{"range":{"gte":0}}},{"doc_len":{"match":{"value":"x"}}}]}),
+        ] {
+            let p = Predicate::compile(&p).unwrap();
+            assert!(count_matches(std::slice::from_ref(&r), &p).is_err());
+            assert!(matching_ids(std::slice::from_ref(&r), &p).is_err());
+        }
         // On a payload object the same field is genuinely absent and matches
         // nothing, which is what both engines do.
         let payload: Map<String, Value> = json!({"tier": 4}).as_object().unwrap().clone();
