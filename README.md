@@ -468,7 +468,13 @@ claims — e.g. an index built by a vector-only config and reused with
 - RediSearch does not split tokens on `\n`/`\r` (only on its ASCII separator
   set, space and tab). MS MARCO `headings` are newline-joined — 180,249 of the
   299,892 text fields of the 100K corpus contain a newline — so Redis indexes a
-  merged token at every heading boundary that OpenSearch splits.
+  merged token at every heading boundary that OpenSearch splits. Parity
+  normalizes all such whitespace at upload.
+- RediSearch does not split on non-ASCII punctuation either (– — … “ ” • ·
+  stay inside the token); `standard` does. 49% of the 100K `segment` values
+  contain some, led by ’ (32,793 rows; kept between letters by both), “ ”
+  (~12,000 each), – (10,206), — (6,231) and … (3,397). Neither mode normalizes
+  punctuation, so this difference remains in parity too.
 - RediSearch splits on `.`, `-`, `'` inside words; `standard` keeps `u.s.a` and
   `3.5` whole and strips possessive `'s`.
 - RediSearch indexes a term and its stem and expands a query term to both, so a

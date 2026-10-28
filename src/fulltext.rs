@@ -143,11 +143,17 @@ pub const OPENSEARCH_MULTI_MATCH_TYPE: &str = "most_fields";
 
 /// Differences between the two engines' text pipelines that the pinned
 /// settings do NOT remove. Published in every fulltext result.
-pub const KD_NEWLINE_TOKENS: &str =
+pub const KD_WHITESPACE_TOKENS: &str =
     "tokenizer: RediSearch splits only on its ASCII separator set plus space and tab — NOT on \
-     newline or carriage return, so lines joined by '\\n' (e.g. MS MARCO `headings`) index as \
-     one token at each join; OpenSearch's standard tokenizer (UAX#29) splits on all whitespace \
-     and Unicode punctuation";
+     newline, carriage return or other Unicode whitespace (U+00A0, U+2028, …), so lines joined \
+     by '\\n' (e.g. MS MARCO `headings`) index as one token at each join; OpenSearch's standard \
+     tokenizer (UAX#29) splits on all whitespace. Parity normalizes this away at upload";
+pub const KD_UNICODE_PUNCTUATION: &str =
+    "tokenizer: RediSearch does not split on non-ASCII punctuation (e.g. – U+2013, — U+2014, \
+     … U+2026, “ ” U+201C/U+201D, • U+2022, · U+00B7), which stays inside the token \
+     ('word—word' is one token); OpenSearch's standard tokenizer (UAX#29) splits on it (it \
+     keeps ’ U+2019 between letters). Not normalized in either mode — 49% of the 100K MS MARCO \
+     `segment` values contain such punctuation";
 pub const KD_PUNCTUATION: &str =
     "tokenizer: RediSearch splits on '.', '-', '\\'' inside words ('u.s.a' -> u, s, a; \
      'e-mail' -> e, mail; '3.5' -> 3, 5; \"dog's\" -> dog, s; \"don't\" -> don, t); OpenSearch \
@@ -172,8 +178,9 @@ pub const KD_MIN_STEM_LEN: &str =
      has no length floor";
 
 /// Every difference that the pinned settings do not remove (english mode).
-pub const KNOWN_DIFFERENCES: [&str; 7] = [
-    KD_NEWLINE_TOKENS,
+pub const KNOWN_DIFFERENCES: [&str; 8] = [
+    KD_WHITESPACE_TOKENS,
+    KD_UNICODE_PUNCTUATION,
     KD_PUNCTUATION,
     KD_STEM_TWICE,
     KD_WHOLE_DOCUMENT,
@@ -185,7 +192,7 @@ pub const KNOWN_DIFFERENCES: [&str; 7] = [
 /// The known differences parity removes: whitespace is normalized at upload,
 /// and nothing is stemmed (so neither stem double counting nor the minimum
 /// stem length applies).
-pub const PARITY_REMOVES: [&str; 3] = [KD_NEWLINE_TOKENS, KD_STEM_TWICE, KD_MIN_STEM_LEN];
+pub const PARITY_REMOVES: [&str; 3] = [KD_WHITESPACE_TOKENS, KD_STEM_TWICE, KD_MIN_STEM_LEN];
 
 /// The `fulltext` block of a search config.
 ///
@@ -2427,13 +2434,25 @@ mod tests {
             for removed in PARITY_REMOVES {
                 assert!(!kd.contains(&removed), "{removed}");
             }
+            // Named, not via PARITY_REMOVES: what parity actually removes
+            // (whitespace normalized, nothing stemmed) must not be listed.
+            for removed in [KD_WHITESPACE_TOKENS, KD_STEM_TWICE, KD_MIN_STEM_LEN] {
+                assert!(!kd.contains(&removed), "{removed}");
+            }
             let kept: Vec<&str> = KNOWN_DIFFERENCES
                 .into_iter()
                 .filter(|d| !PARITY_REMOVES.contains(d))
                 .collect();
             assert_eq!(kd, kept);
             assert_eq!(kd.len(), KNOWN_DIFFERENCES.len() - PARITY_REMOVES.len());
-            for d in [KD_PUNCTUATION, KD_WHOLE_DOCUMENT, KD_SHARD_STATS, KD_TIES] {
+            // Parity normalizes whitespace only: the punctuation difference stays.
+            for d in [
+                KD_UNICODE_PUNCTUATION,
+                KD_PUNCTUATION,
+                KD_WHOLE_DOCUMENT,
+                KD_SHARD_STATS,
+                KD_TIES,
+            ] {
                 assert!(kd.contains(&d), "{d}");
             }
             // English reuse of an index built before markers existed: the
@@ -2918,7 +2937,10 @@ mod tests {
             assert_eq!(m["queries_skipped_no_terms"], json!([1]));
             assert_eq!(m["stopwords"]["list"], json!(STOPWORDS.as_slice()));
             assert_eq!(m["engine"], engine);
-            assert_eq!(m["known_differences"].as_array().unwrap().len(), 7);
+            assert_eq!(
+                m["known_differences"].as_array().unwrap().len(),
+                KNOWN_DIFFERENCES.len()
+            );
         }
         assert_eq!(
             result_metadata("opensearch", &fields, &set, 10).unwrap()["engine_settings"]["index"]
