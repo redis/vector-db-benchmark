@@ -361,7 +361,15 @@ const OUTPUTS: [&str; 5] = [
 
 /// What `--add-derived-fields` rewrites. `vectors.npy` and `tests.jsonl` are
 /// left alone.
-const DERIVED_OUTPUTS: [&str; 3] = ["payloads.jsonl", FILTER_QUERIES, "PREPARED.json"];
+///
+/// [`publish`] renames in REVERSE order, so `filter_queries.jsonl` (first
+/// here) is renamed LAST. Its presence is then a reliable sign that the
+/// upgraded payloads are already in place. `run()`'s refusal and the loader's
+/// `check_prepared_dir` both key on that file. If a run dies between renames,
+/// the directory still reads as "not upgraded", and a rerun of
+/// `--add-derived-fields` finishes the job. It never reads as upgraded over
+/// old payloads, and a plain build never falls through to the 259 GB rebuild.
+const DERIVED_OUTPUTS: [&str; 3] = [FILTER_QUERIES, "payloads.jsonl", "PREPARED.json"];
 
 /// Path a file is written to before it is published.
 fn staged(dir: &Path, name: &str) -> PathBuf {
@@ -1676,4 +1684,37 @@ fn add_derived_fields(args: &Args) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A publish that dies before every rename has landed must never leave
+    /// `filter_queries.jsonl` next to un-upgraded payloads. Simulated by a
+    /// missing staged payload file: `publish` errors at that rename, and the
+    /// query set must not have been published yet.
+    #[test]
+    fn filter_queries_is_published_after_the_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(staged(dir.path(), "PREPARED.json"), "{}").unwrap();
+        std::fs::write(staged(dir.path(), FILTER_QUERIES), "{}\n").unwrap();
+        // No payloads.jsonl.part: the "crash" happens at the payload rename.
+        assert!(publish(dir.path(), &DERIVED_OUTPUTS).is_err());
+        assert!(
+            !dir.path().join(FILTER_QUERIES).exists(),
+            "filter_queries.jsonl was published before the payloads it describes"
+        );
+        assert!(!dir.path().join(COMPLETE_MARKER).exists());
+
+        // With every file staged, all of them land and the marker is written.
+        // (PREPARED.json was already renamed by the failed attempt; restage it.)
+        std::fs::write(staged(dir.path(), "PREPARED.json"), "{}").unwrap();
+        std::fs::write(staged(dir.path(), "payloads.jsonl"), "{}\n").unwrap();
+        publish(dir.path(), &DERIVED_OUTPUTS).unwrap();
+        for name in DERIVED_OUTPUTS {
+            assert!(dir.path().join(name).exists(), "{name}");
+        }
+        assert!(dir.path().join(COMPLETE_MARKER).exists());
+    }
 }
