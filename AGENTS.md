@@ -170,6 +170,13 @@ auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
   global top-1k before anything is written; `--verify` re-runs that check against
   an already-prepared dataset.
 - `--discover-crc32` re-derives the sampling thresholds (26.9 GB metadata scan).
+- Payloads also carry four SYNTHETIC exact-match fields derived from `docid`
+  alone (`category`, `doc_len`, `tier`, `rand_key`; `src/msmarco/derived.rs`),
+  and `filter_queries.jsonl` holds the filter-only query set over them with an
+  exact `expected_count` per query. Filtered workloads (#340, #341) must reuse
+  `msmarco::derived` (`Predicate`, `count_matches`, `matching_ids`) rather than
+  re-implementing predicate evaluation. `--add-derived-fields` upgrades an
+  already-prepared corpus in place without the full rescan.
 
 ## Key Patterns
 

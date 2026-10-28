@@ -91,9 +91,23 @@ pub const NEIGHBOURS: usize = 1000;
 /// Queries in `queries_jsonl/queries.jsonl.gz` (TREC-DL 2021 + 2022 + 2023).
 pub const QUERY_COUNT: usize = 1677;
 
+pub mod derived;
+
 /// Payload fields carried over from the MS MARCO segmented-document records,
 /// with the `schema` type each is registered under in `datasets/datasets.json`.
-/// Kept here so the prepared payloads and the registered schema cannot drift.
+pub const PASSAGE_FIELDS: &[(&str, &str)] = &[
+    ("docid", "keyword"),
+    ("url", "keyword"),
+    ("title", "text"),
+    ("headings", "text"),
+    ("segment", "text"),
+    ("start_char", "int"),
+    ("end_char", "int"),
+];
+
+/// Every payload field the preparer writes: [`PASSAGE_FIELDS`] followed by
+/// [`derived::DERIVED_FIELDS`] (pinned by a test). Kept here so the prepared
+/// payloads and the registered schema cannot drift.
 pub const PAYLOAD_FIELDS: &[(&str, &str)] = &[
     ("docid", "keyword"),
     ("url", "keyword"),
@@ -102,6 +116,10 @@ pub const PAYLOAD_FIELDS: &[(&str, &str)] = &[
     ("segment", "text"),
     ("start_char", "int"),
     ("end_char", "int"),
+    ("category", "keyword"),
+    ("doc_len", "int"),
+    ("tier", "int"),
+    ("rand_key", "int"),
 ];
 
 /// Number of hash buckets the uniform sampler partitions the corpus into.
@@ -753,25 +771,48 @@ impl TopK {
 // Records -> on-disk rows
 // ---------------------------------------------------------------------------
 
-/// Project one `passages_jsonl` record onto the payload we store, keeping only
-/// [`PAYLOAD_FIELDS`] and in that order.
+/// Project one `passages_jsonl` record onto the payload we store: the
+/// [`PASSAGE_FIELDS`] it carries, plus the [`derived`] fields computed from its
+/// `docid`.
 ///
 /// A record missing `docid` is an error, not a `null` payload: `docid` is the
 /// key [`verify_head_against_shipped`] matches against `top1k_passage_ids`, and
-/// without it the npy↔jsonl alignment is unverifiable.
+/// without it the npy↔jsonl alignment is unverifiable (and nothing can be
+/// derived).
+///
+/// Also accepts an already-prepared payload, which is how
+/// `prepare-msmarco --add-derived-fields` upgrades a corpus in place: projecting
+/// a payload again yields the same passage fields, and derived fields already
+/// present must equal the derivation. Because the result is a sorted-key
+/// `serde_json` map either way, an upgraded corpus and a fresh build serialize
+/// to the same bytes.
 pub fn payload_from_passage(record: &serde_json::Value) -> Result<serde_json::Value, String> {
     let obj = record
         .as_object()
         .ok_or_else(|| "passage record is not a JSON object".to_string())?;
-    if !obj.contains_key("docid") {
-        return Err("passage record has no 'docid' field".to_string());
-    }
+    let docid = match obj.get("docid") {
+        None => return Err("passage record has no 'docid' field".to_string()),
+        Some(d) => d
+            .as_str()
+            .ok_or_else(|| format!("passage record's 'docid' is not a string: {d}"))?,
+    };
     let mut out = serde_json::Map::with_capacity(PAYLOAD_FIELDS.len());
-    for (field, _) in PAYLOAD_FIELDS {
+    for (field, _) in PASSAGE_FIELDS {
         if let Some(v) = obj.get(*field) {
             out.insert((*field).to_string(), v.clone());
         }
     }
+    let derived = derived::DerivedFields::from_docid(docid);
+    // Carry any derived field the record already holds so `insert_into` can
+    // refuse a value that disagrees with the derivation.
+    for (field, _) in derived::DERIVED_FIELDS {
+        if let Some(v) = obj.get(*field) {
+            out.insert((*field).to_string(), v.clone());
+        }
+    }
+    derived
+        .insert_into(&mut out)
+        .map_err(|e| format!("docid {docid:?}: {e}"))?;
     Ok(serde_json::Value::Object(out))
 }
 
@@ -1642,6 +1683,47 @@ mod tests {
 
     /// Every payload field must be declared in the dataset schema with the type
     /// the engines will build a column/index for.
+    #[test]
+    fn payload_fields_are_the_passage_fields_then_the_derived_ones() {
+        let joined: Vec<_> = PASSAGE_FIELDS
+            .iter()
+            .chain(derived::DERIVED_FIELDS)
+            .copied()
+            .collect();
+        assert_eq!(PAYLOAD_FIELDS, &joined[..]);
+    }
+
+    #[test]
+    fn payload_carries_the_derived_fields_and_reprojects_to_the_same_bytes() {
+        let rec = serde_json::json!({
+            "docid": "msmarco_v2.1_doc_00_0#0_0",
+            "url": "http://example.com/",
+            "start_char": 0,
+        });
+        let p = payload_from_passage(&rec).unwrap();
+        // Values from the Python reference in `derived`'s tests.
+        assert_eq!(p["category"], serde_json::json!("cat14"));
+        assert_eq!(p["doc_len"], serde_json::json!(4476));
+        assert_eq!(p["tier"], serde_json::json!(1));
+        assert_eq!(p["rand_key"], serde_json::json!(923_388_215_550u64));
+        // Upgrading an already-prepared payload is a byte-for-byte no-op.
+        let again = payload_from_passage(&p).unwrap();
+        assert_eq!(
+            serde_json::to_string(&again).unwrap(),
+            serde_json::to_string(&p).unwrap()
+        );
+        // ...and an old payload without derived fields upgrades to the fresh bytes.
+        assert_eq!(
+            serde_json::to_string(&payload_from_passage(&rec).unwrap()).unwrap(),
+            serde_json::to_string(&again).unwrap()
+        );
+        // A stored derived value that disagrees is refused, not overwritten.
+        let mut bad = p.clone();
+        bad["tier"] = serde_json::json!(7);
+        assert!(payload_from_passage(&bad).unwrap_err().contains("tier"));
+        assert!(payload_from_passage(&serde_json::json!({"docid": 5})).is_err());
+    }
+
     #[test]
     fn payload_fields_declare_a_schema_type_each() {
         for (name, ty) in PAYLOAD_FIELDS {

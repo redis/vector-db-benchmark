@@ -19,9 +19,13 @@
 //! * `vectors.npy`    — N x 1024 `float32`, the first N passages of the global
 //!   order, converted from the upstream `float16`.
 //! * `payloads.jsonl` — one JSON object per vector: `docid`, `url`, `title`,
-//!   `headings`, `segment`, `start_char`, `end_char`.
+//!   `headings`, `segment`, `start_char`, `end_char`, plus the derived
+//!   `category`, `doc_len`, `tier`, `rand_key` (a pure function of `docid`).
 //! * `tests.jsonl`    — the 1677 TREC-DL 2021-2023 queries, each with its
 //!   embedding and a brute-forced top-1000 over *this* prefix.
+//! * `filter_queries.jsonl` — the filter-only query set over the derived
+//!   exact-match fields (`msmarco::derived`), with each query's exact
+//!   `expected_count` on this corpus.
 //! * `PREPARED.json`  — provenance: source repo, sizes, and the verification
 //!   statistics from the pass described below.
 //!
@@ -148,6 +152,16 @@ struct Args {
     #[arg(long)]
     discover_crc32: bool,
 
+    /// Upgrade an ALREADY prepared dataset in place: add the derived exact-match
+    /// fields to `payloads.jsonl` and write `filter_queries.jsonl`, without the
+    /// 259 GB corpus rescan.
+    ///
+    /// Sound because the derived fields are a pure function of `docid`: the
+    /// payloads it rewrites are byte-identical to what a full rebuild writes.
+    /// `vectors.npy` and `tests.jsonl` are not touched.
+    #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "force"])]
+    add_derived_fields: bool,
+
     /// Hugging Face token, for rate-limited or gated access. Also read from
     /// `HF_TOKEN`.
     #[arg(long, env = "HF_TOKEN", hide_env_values = true)]
@@ -169,6 +183,9 @@ fn run(args: &Args) -> Result<(), String> {
     if args.verify {
         return verify_prepared(args);
     }
+    if args.add_derived_fields {
+        return add_derived_fields(args);
+    }
     let dataset = args
         .dataset
         .as_deref()
@@ -186,6 +203,18 @@ fn run(args: &Args) -> Result<(), String> {
     })?;
 
     let dir = args.out_dir.join(variant.dir);
+    // A corpus without the filter query set — typically an extracted tarball
+    // published before the derived fields existed (tarballs carry no COMPLETE
+    // marker either) — would otherwise fall through to a full 259 GB rebuild.
+    if !args.force && !dir.join(FILTER_QUERIES).exists() && has_corpus_files(&dir, variant) {
+        return Err(format!(
+            "{} holds a {} corpus prepared before the derived exact-match fields existed (no \
+             {FILTER_QUERIES}). Upgrade it in place with --add-derived-fields; pass --force only \
+             to rebuild from the full 259 GB corpus.",
+            dir.display(),
+            variant.dataset_name
+        ));
+    }
     if !args.force && is_complete(&dir, variant) {
         println!(
             "{} is already prepared at {} ({} passages). Pass --force to rebuild.",
@@ -273,11 +302,25 @@ fn run(args: &Args) -> Result<(), String> {
     msmarco::check_coverage(variant.limit, with_hits, total_hits)?;
     let (docid_at, max_field_bytes) = (corpus.docid_at, corpus.max_field_bytes);
 
+    // Derived fields and the filter query set, read back from the payload file
+    // just written, so the expected counts are computed over the exact bytes
+    // the engines will load.
+    let derived = derive_from_payloads(&staged(&dir, "payloads.jsonl"), variant)?;
+    let filter_rows = derived.filter_query_rows()?;
+    write_filter_queries(&staged(&dir, FILTER_QUERIES), &filter_rows)?;
+
     let ranked = brute_force_ground_truth(&dir, variant, &queries)?;
     let stats = verify(variant.limit, &queries, &ranked, &docid_at)?;
     write_tests(&dir, &queries, &ranked)?;
-    write_manifest(&dir, variant, &stats, &queries, &max_field_bytes)?;
-    publish(&dir)?;
+    write_manifest(
+        &dir,
+        variant,
+        &stats,
+        &queries,
+        &max_field_bytes,
+        &msmarco::derived::manifest_entry(&derived, &filter_rows),
+    )?;
+    publish(&dir, &OUTPUTS)?;
 
     println!(
         "Done in {:.1}s. Register-ready at {} — run with --datasets {}",
@@ -305,12 +348,20 @@ fn run(args: &Args) -> Result<(), String> {
 /// happy path into something the code enforces.
 const COMPLETE_MARKER: &str = "COMPLETE";
 
-const OUTPUTS: [&str; 4] = [
+/// The filter-only query set over the derived fields.
+const FILTER_QUERIES: &str = "filter_queries.jsonl";
+
+const OUTPUTS: [&str; 5] = [
     "vectors.npy",
     "payloads.jsonl",
+    FILTER_QUERIES,
     "tests.jsonl",
     "PREPARED.json",
 ];
+
+/// What `--add-derived-fields` rewrites. `vectors.npy` and `tests.jsonl` are
+/// left alone.
+const DERIVED_OUTPUTS: [&str; 3] = ["payloads.jsonl", FILTER_QUERIES, "PREPARED.json"];
 
 /// Path a file is written to before it is published.
 fn staged(dir: &Path, name: &str) -> PathBuf {
@@ -320,12 +371,12 @@ fn staged(dir: &Path, name: &str) -> PathBuf {
 /// Publish every staged file, replacing whatever was there. Renames within one
 /// directory, so each is atomic; the set as a whole is not, which is why
 /// `vectors.npy` (the one [`is_complete`] measures) goes last.
-fn publish(dir: &Path) -> Result<(), String> {
+fn publish(dir: &Path, names: &[&str]) -> Result<(), String> {
     // Clear any previous marker FIRST: from here until the last rename the
     // directory is a mix of old and new files and must not read as complete.
     let marker = dir.join(COMPLETE_MARKER);
     let _ = std::fs::remove_file(&marker);
-    for name in OUTPUTS.iter().rev() {
+    for name in names.iter().rev() {
         let from = staged(dir, name);
         if !from.exists() {
             return Err(format!("{} was never written", from.display()));
@@ -344,20 +395,28 @@ fn clear_staged(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(COMPLETE_MARKER));
 }
 
-/// A prepared directory is complete when all three files exist and `vectors.npy`
-/// declares exactly the variant's passage count. A half-written corpus from an
+/// A prepared directory is complete when the COMPLETE marker, the corpus files
+/// and `filter_queries.jsonl` exist and `vectors.npy` declares exactly the
+/// variant's passage count. A half-written corpus from an
 /// interrupted run must not be mistaken for a finished one.
 fn is_complete(dir: &Path, variant: &Variant) -> bool {
+    // The marker is written only after all renames land, so a run interrupted
+    // mid-publish leaves a directory that does NOT read as complete.
+    dir.join(COMPLETE_MARKER).exists()
+        && dir.join(FILTER_QUERIES).exists()
+        && has_corpus_files(dir, variant)
+}
+
+/// The three corpus files exist and `vectors.npy` holds the variant's row
+/// count. No marker required: the published tarballs do not carry one, and
+/// `--add-derived-fields` must be able to upgrade an extracted tarball (it
+/// re-checks the payload count itself).
+fn has_corpus_files(dir: &Path, variant: &Variant) -> bool {
     let (v, p, t) = (
         dir.join("vectors.npy"),
         dir.join("payloads.jsonl"),
         dir.join("tests.jsonl"),
     );
-    // The marker is written only after all four renames land, so a run
-    // interrupted mid-publish leaves a directory that does NOT read as complete.
-    if !dir.join(COMPLETE_MARKER).exists() {
-        return false;
-    }
     if !(v.exists() && p.exists() && t.exists()) {
         return false;
     }
@@ -531,6 +590,23 @@ fn verify_prepared(args: &Args) -> Result<(), String> {
         msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
     let dir = args.out_dir.join(variant.dir);
     let tol = args.tolerance.unwrap_or(COSINE_TOLERANCE);
+
+    // Local and cheap, so first: every payload's derived fields must equal the
+    // derivation, and filter_queries.jsonl must be exactly the set (predicates
+    // AND expected counts) this corpus regenerates.
+    let derived = derive_from_payloads(&dir.join("payloads.jsonl"), variant)?;
+    let regenerated = derived.filter_query_rows()?;
+    let on_disk = read_jsonl(&dir.join(FILTER_QUERIES))?;
+    let summary = msmarco::derived::check_filter_queries(&regenerated, &on_disk)?;
+    println!(
+        "{}: derived fields verified on {} payloads; {} filter queries match their expected \
+         counts ({}..{} passages).",
+        variant.dataset_name,
+        derived.len(),
+        summary.queries,
+        summary.min_count,
+        summary.max_count
+    );
 
     let client = http_client()?;
     let cache = args
@@ -1326,8 +1402,9 @@ fn write_manifest(
     stats: &VerifyStats,
     queries: &[Query],
     max_field_bytes: &HashMap<String, usize>,
+    derived: &serde_json::Value,
 ) -> Result<(), String> {
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "dataset": variant.dataset_name,
         "source": format!("https://huggingface.co/datasets/{}", msmarco::HF_REPO),
         "passages": variant.limit,
@@ -1366,20 +1443,41 @@ fn write_manifest(
         // what decides whether an engine can ingest the corpus at all. Empty on
         // the 100K prefix; the 1M one exceeds Milvus' ceiling (see below).
         "engine_cap_violations": msmarco::cap_violations(max_field_bytes),
-        "payload_fields": msmarco::PAYLOAD_FIELDS
-            .iter()
-            .map(|(name, ty)| serde_json::json!({
+        "payload_fields": payload_fields_manifest(max_field_bytes),
+        "prepared_at": chrono::Utc::now().to_rfc3339(),
+    });
+    merge_object(&mut manifest, derived)?;
+    write_manifest_value(dir, &manifest)
+}
+
+fn payload_fields_manifest(max_field_bytes: &HashMap<String, usize>) -> serde_json::Value {
+    msmarco::PAYLOAD_FIELDS
+        .iter()
+        .map(|(name, ty)| {
+            serde_json::json!({
                 "field": name,
                 "schema_type": ty,
                 "max_bytes": max_field_bytes.get(*name),
-            }))
-            .collect::<Vec<_>>(),
-        "prepared_at": chrono::Utc::now().to_rfc3339(),
-    });
+            })
+        })
+        .collect()
+}
+
+fn merge_object(into: &mut serde_json::Value, from: &serde_json::Value) -> Result<(), String> {
+    let (Some(into), Some(from)) = (into.as_object_mut(), from.as_object()) else {
+        return Err("PREPARED.json and the derived-fields entry must both be objects".into());
+    };
+    for (k, v) in from {
+        into.insert(k.clone(), v.clone());
+    }
+    Ok(())
+}
+
+fn write_manifest_value(dir: &Path, manifest: &serde_json::Value) -> Result<(), String> {
     let path = staged(dir, "PREPARED.json");
     std::fs::write(
         &path,
-        serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+        serde_json::to_string_pretty(manifest).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("write {}: {}", path.display(), e))
 }
@@ -1394,4 +1492,188 @@ fn progress(total: u64, what: &str) -> ProgressBar {
         .progress_chars("=> "),
     );
     bar
+}
+
+// ---------------------------------------------------------------------------
+// Derived exact-match fields (#340)
+// ---------------------------------------------------------------------------
+
+/// Stream a payload file into a [`msmarco::derived::DerivedCorpus`], checking
+/// every line's stored derived fields against the derivation and the line
+/// count against the registry.
+fn derive_from_payloads(
+    path: &Path,
+    variant: &Variant,
+) -> Result<msmarco::derived::DerivedCorpus, String> {
+    let f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut corpus = msmarco::derived::DerivedCorpus::new();
+    let bar = progress(variant.limit, "derived fields");
+    for (i, line) in BufReader::with_capacity(1 << 22, f).lines().enumerate() {
+        let line = line.map_err(|e| format!("read {}: {e}", path.display()))?;
+        let payload: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))?;
+        corpus
+            .push_payload(&payload)
+            .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))?;
+        if (i + 1) % 100_000 == 0 {
+            bar.inc(100_000);
+        }
+    }
+    bar.finish_and_clear();
+    if corpus.len() as u64 != variant.limit {
+        return Err(format!(
+            "{} holds {} payloads but the registry declares {}",
+            path.display(),
+            corpus.len(),
+            variant.limit
+        ));
+    }
+    Ok(corpus)
+}
+
+fn write_filter_queries(path: &Path, rows: &[serde_json::Value]) -> Result<(), String> {
+    let mut out =
+        BufWriter::new(File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?);
+    for row in rows {
+        serde_json::to_writer(&mut out, row)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        out.write_all(b"\n")
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
+    out.flush()
+        .map_err(|e| format!("flush {}: {e}", path.display()))
+}
+
+fn read_jsonl(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let f = File::open(path).map_err(|e| {
+        format!(
+            "open {}: {e} (a corpus prepared before the derived fields existed has none; \
+             upgrade it with --add-derived-fields)",
+            path.display()
+        )
+    })?;
+    let mut rows = Vec::new();
+    for (i, line) in BufReader::new(f).lines().enumerate() {
+        let line = line.map_err(|e| format!("read {}: {e}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(
+            serde_json::from_str(&line)
+                .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))?,
+        );
+    }
+    Ok(rows)
+}
+
+/// `--add-derived-fields`: rewrite `payloads.jsonl` through the same
+/// [`payload_from_passage`] a full build uses, write `filter_queries.jsonl`,
+/// and record both in `PREPARED.json`. Staged and published like a build, so
+/// an interruption leaves the previous corpus intact.
+fn add_derived_fields(args: &Args) -> Result<(), String> {
+    let dataset = args
+        .dataset
+        .as_deref()
+        .ok_or("--dataset is required with --add-derived-fields")?;
+    let variant =
+        msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
+    let dir = args.out_dir.join(variant.dir);
+    if !has_corpus_files(&dir, variant) {
+        return Err(format!(
+            "{} does not hold a complete {} corpus to upgrade",
+            dir.display(),
+            variant.dataset_name
+        ));
+    }
+    for name in DERIVED_OUTPUTS {
+        let _ = std::fs::remove_file(staged(&dir, name));
+    }
+    let started = Instant::now();
+
+    let src = dir.join("payloads.jsonl");
+    let dst = staged(&dir, "payloads.jsonl");
+    let f = File::open(&src).map_err(|e| format!("open {}: {e}", src.display()))?;
+    let mut out = BufWriter::with_capacity(
+        1 << 22,
+        File::create(&dst).map_err(|e| format!("create {}: {e}", dst.display()))?,
+    );
+    let mut max_field_bytes: HashMap<String, usize> = HashMap::new();
+    let bar = progress(variant.limit, "payloads");
+    let mut n = 0u64;
+    for line in BufReader::with_capacity(1 << 22, f).lines() {
+        let line = line.map_err(|e| format!("read {}: {e}", src.display()))?;
+        let stored: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|e| format!("{} line {}: {e}", src.display(), n + 1))?;
+        let payload = payload_from_passage(&stored)
+            .map_err(|e| format!("{} line {}: {e}", src.display(), n + 1))?;
+        for (field, value) in payload.as_object().into_iter().flatten() {
+            if let Some(text) = value.as_str() {
+                let e = max_field_bytes.entry(field.clone()).or_insert(0);
+                *e = (*e).max(text.len());
+            }
+        }
+        serde_json::to_writer(&mut out, &payload)
+            .map_err(|e| format!("write {}: {e}", dst.display()))?;
+        out.write_all(b"\n")
+            .map_err(|e| format!("write {}: {e}", dst.display()))?;
+        n += 1;
+        if n.is_multiple_of(100_000) {
+            bar.inc(100_000);
+        }
+    }
+    bar.finish_and_clear();
+    out.flush()
+        .map_err(|e| format!("flush {}: {e}", dst.display()))?;
+    drop(out);
+    if n != variant.limit {
+        return Err(format!(
+            "{} holds {n} payloads but the registry declares {}",
+            src.display(),
+            variant.limit
+        ));
+    }
+
+    // Read the rewritten file back, exactly as a full build does.
+    let derived = derive_from_payloads(&dst, variant)?;
+    let filter_rows = derived.filter_query_rows()?;
+    write_filter_queries(&staged(&dir, FILTER_QUERIES), &filter_rows)?;
+
+    let manifest_path = dir.join("PREPARED.json");
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("read {}: {e}", manifest_path.display()))?,
+    )
+    .map_err(|e| format!("parse {}: {e}", manifest_path.display()))?;
+    merge_object(
+        &mut manifest,
+        &msmarco::derived::manifest_entry(&derived, &filter_rows),
+    )?;
+    merge_object(
+        &mut manifest,
+        &serde_json::json!({
+            "payload_fields": payload_fields_manifest(&max_field_bytes),
+            "engine_cap_violations": msmarco::cap_violations(&max_field_bytes),
+            "derived_fields_added_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )?;
+    write_manifest_value(&dir, &manifest)?;
+    publish(&dir, &DERIVED_OUTPUTS)?;
+
+    println!(
+        "Added derived fields to {} passages and wrote {} filter queries to {} in {:.1}s.",
+        n,
+        filter_rows.len(),
+        dir.join(FILTER_QUERIES).display(),
+        started.elapsed().as_secs_f64()
+    );
+    for r in &filter_rows {
+        println!(
+            "  {} {:<22} {:>10}  {}",
+            r["query_id"].as_str().unwrap_or_default(),
+            r["shape"].as_str().unwrap_or_default(),
+            r["expected_count"].as_u64().unwrap_or_default(),
+            r["conditions"]
+        );
+    }
+    Ok(())
 }
