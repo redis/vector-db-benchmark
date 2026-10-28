@@ -6,8 +6,9 @@
 //! naming documents by their **corpus row id** (the id space the dataset's
 //! ground truth uses — the integer the engine stored the row under, recovered
 //! from its key / `_id`). Capture is opt-in (`SearchParams::capture_query_results`)
-//! and happens after the latency sample is taken, so it never sits inside the
-//! timed window.
+//! and happens after the latency sample is taken: outside each per-query
+//! latency, but inside the throughput window (`total_time`, hence `rps`) when
+//! on. Without it, engines must not build per-hit ids at all.
 //!
 //! After the search phase the runner turns those into [`QueryRecord`]s with
 //! [`resolve_records`], replacing row ids by EXTERNAL ids through

@@ -242,19 +242,27 @@ pub fn validate_page(total: u64, returned: usize, limit: usize) -> Result<(), St
     Ok(())
 }
 
-/// One validated filter-only page: the exact total and the returned ids, in
-/// response order (`_id` for OpenSearch, the full document key for Redis).
+/// One validated filter-only page: the exact total, the number of hits, and —
+/// only when asked for — the returned ids in response order (`_id` for
+/// OpenSearch, the full document key for Redis).
+///
+/// `ids` is `None` unless the caller passes `keep_ids = true`. The measured
+/// worker loops pass `--dump-results`' capture flag here, so a run that does
+/// not dump allocates nothing per hit beyond the duplicate check it always had
+/// (#343 review): the per-query parse sits after each latency sample but inside
+/// the throughput window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page {
     pub total: u64,
-    pub ids: Vec<String>,
+    pub returned: usize,
+    pub ids: Option<Vec<String>>,
 }
 
 pub fn opensearch_counts(body: &Value, limit: usize) -> Result<(u64, usize), String> {
-    opensearch_page(body, limit).map(|p| (p.total, p.ids.len()))
+    opensearch_page(body, limit, false).map(|p| (p.total, p.returned))
 }
 
-pub fn opensearch_page(body: &Value, limit: usize) -> Result<Page, String> {
+pub fn opensearch_page(body: &Value, limit: usize, keep_ids: bool) -> Result<Page, String> {
     if body["timed_out"] != false || body["_shards"]["failed"] != 0 {
         return Err("filter-only timed out, failed shards, or missing completion metadata".into());
     }
@@ -266,7 +274,7 @@ pub fn opensearch_page(body: &Value, limit: usize) -> Result<Page, String> {
         .ok_or("missing exact match count")?;
     let hits = body["hits"]["hits"].as_array().ok_or("missing hits")?;
     let mut seen = std::collections::HashSet::new();
-    let mut ids = Vec::with_capacity(hits.len());
+    let mut ids = keep_ids.then(|| Vec::with_capacity(hits.len()));
     for hit in hits {
         let id = hit["_id"]
             .as_str()
@@ -275,19 +283,26 @@ pub fn opensearch_page(body: &Value, limit: usize) -> Result<Page, String> {
         if !seen.insert(id) {
             return Err("duplicate filter-only hit ID".into());
         }
-        ids.push(id.to_string());
+        if let Some(ids) = ids.as_mut() {
+            ids.push(id.to_string());
+        }
     }
     validate_page(total, hits.len(), limit)?;
-    Ok(Page { total, ids })
+    Ok(Page {
+        total,
+        returned: hits.len(),
+        ids,
+    })
 }
 
 /// RESP3 exposes timeout warnings that RESP2 silently omits. Reject all
 /// warnings so partial replies cannot be published as exact match counts.
 pub fn redis_counts(value: &redis::Value, limit: usize) -> Result<(u64, usize), String> {
-    redis_page(value, limit).map(|p| (p.total, p.ids.len()))
+    redis_page(value, limit, false).map(|p| (p.total, p.returned))
 }
 
-pub fn redis_page(value: &redis::Value, limit: usize) -> Result<Page, String> {
+/// See [`Page`] for `keep_ids`.
+pub fn redis_page(value: &redis::Value, limit: usize, keep_ids: bool) -> Result<Page, String> {
     use redis::Value;
     let Value::Map(fields) = value else {
         return Err("filter-only requires a RESP3 FT.SEARCH map".into());
@@ -316,7 +331,7 @@ pub fn redis_page(value: &redis::Value, limit: usize) -> Result<Page, String> {
         return Err("missing Redis results".into());
     };
     let mut seen = std::collections::HashSet::new();
-    let mut ids = Vec::with_capacity(hits.len());
+    let mut ids = keep_ids.then(|| Vec::with_capacity(hits.len()));
     for hit in hits {
         let Value::Map(fields) = hit else {
             return Err("invalid Redis result".into());
@@ -327,10 +342,16 @@ pub fn redis_page(value: &redis::Value, limit: usize) -> Result<Page, String> {
         if !seen.insert(id) {
             return Err("duplicate Redis hit ID".into());
         }
-        ids.push(id.to_string());
+        if let Some(ids) = ids.as_mut() {
+            ids.push(id.to_string());
+        }
     }
     validate_page(total, hits.len(), limit)?;
-    Ok(Page { total, ids })
+    Ok(Page {
+        total,
+        returned: hits.len(),
+        ids,
+    })
 }
 
 /// Corpus row id from a Redis document key `<key_prefix><row>`. A key outside
@@ -377,12 +398,24 @@ mod tests {
             redis_counts(&reply(12, &["a", "b"], vec![]), 2).unwrap(),
             (12, 2)
         );
-        // The page keeps the ids, in reply order.
+        // The page keeps the ids, in reply order, only when asked to. The
+        // non-capturing path the measured loops take without --dump-results
+        // builds no id Strings at all (#343 review).
+        let two = reply(12, &["p:2", "p:1"], vec![]);
         assert_eq!(
-            redis_page(&reply(12, &["p:2", "p:1"], vec![]), 2).unwrap(),
+            redis_page(&two, 2, true).unwrap(),
             Page {
                 total: 12,
-                ids: vec!["p:2".into(), "p:1".into()]
+                returned: 2,
+                ids: Some(vec!["p:2".into(), "p:1".into()])
+            }
+        );
+        assert_eq!(
+            redis_page(&two, 2, false).unwrap(),
+            Page {
+                total: 12,
+                returned: 2,
+                ids: None
             }
         );
         assert_eq!(redis_counts(&reply(0, &[], vec![]), 2).unwrap(), (0, 0));
@@ -419,6 +452,12 @@ mod tests {
     fn rejects_partial_approximate_or_malformed_responses() {
         let good = json!({"timed_out":false,"_shards":{"failed":0},"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"a"},{"_id":"b"}]}});
         assert_eq!(opensearch_counts(&good, 10).unwrap(), (2, 2));
+        // Ids only when asked for (#343 review: no allocation without capture).
+        assert_eq!(opensearch_page(&good, 10, false).unwrap().ids, None);
+        assert_eq!(
+            opensearch_page(&good, 10, true).unwrap().ids,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
         for bad in [
             "timeout",
             "shard",

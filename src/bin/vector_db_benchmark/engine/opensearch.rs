@@ -1951,8 +1951,10 @@ impl OpenSearchEngine {
 
                         if filter_only {
                             match response.and_then(|(body, cost)| {
-                                vector_db_benchmark::filter_only::opensearch_page(&body, top)
-                                    .map(|page| (page, cost))
+                                vector_db_benchmark::filter_only::opensearch_page(
+                                    &body, top, capture,
+                                )
+                                .map(|page| (page, cost))
                             }) {
                                 Ok((page, cost)) => {
                                     retried += u64::from(cost.retried);
@@ -1960,12 +1962,12 @@ impl OpenSearchEngine {
                                     // Redis's scalar path makes a single attempt.
                                     t.push(elapsed.as_secs_f64());
                                     matched += page.total;
-                                    returned_count += page.ids.len() as u64;
-                                    if capture {
+                                    returned_count += page.returned as u64;
+                                    // `ids` is Some only when capturing.
+                                    if let Some(ids) = &page.ids {
                                         // An `_id` that is not a corpus row is a
                                         // harness bug: fail the run, never guess.
-                                        let hits = page
-                                            .ids
+                                        let hits = ids
                                             .iter()
                                             .map(|id| {
                                                 uuid_hex_to_int(id)

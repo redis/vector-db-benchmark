@@ -954,20 +954,20 @@ impl RedisEngine {
                             commands[seq % commands.len()].query::<redis::Value>(&mut conn);
                         let elapsed = start.elapsed().as_secs_f64();
                         let query_id = command_query_ids[seq % commands.len()];
-                        match response
-                            .map_err(|e| e.to_string())
-                            .and_then(|v| vector_db_benchmark::filter_only::redis_page(&v, top))
-                        {
+                        match response.map_err(|e| e.to_string()).and_then(|v| {
+                            vector_db_benchmark::filter_only::redis_page(&v, top, capture)
+                        }) {
                             Ok(page) => {
                                 samples.push(elapsed);
                                 matched += page.total;
-                                returned_count += page.ids.len() as u64;
-                                if capture {
+                                returned_count += page.returned as u64;
+                                // `ids` is Some only when capturing, so a run
+                                // without --dump-results parses no keys here.
+                                if let Some(ids) = &page.ids {
                                     // A key that does not map back to a corpus
                                     // row is a harness bug, not a dropped query:
                                     // fail the run rather than dump a guess.
-                                    let hits = page
-                                        .ids
+                                    let hits = ids
                                         .iter()
                                         .map(|key| {
                                             vector_db_benchmark::filter_only::redis_key_row(

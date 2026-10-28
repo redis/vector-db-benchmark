@@ -341,8 +341,12 @@ dispatch order, failed queries included:
 Ids are EXTERNAL: the dataset's `docid` payload field when the schema declares
 one (MS MARCO), else the corpus row id — never an engine key, `_id` or offset.
 Vector records also carry the ground-truth ids they were scored against
-(`expected`). Records are captured after each latency sample and written after
-the search phase, so the dump is not inside the timed window. An engine with no
+(`expected`). Records are captured OUTSIDE each latency sample (after the
+timer stops) but INSIDE the throughput window when `--dump-results` is on: the
+id parsing and record push run in the measured worker loop, so they count
+toward `total_time` and therefore `rps`. Without `--dump-results` the filter-only
+loops build no id strings at all. The files are written after the search phase.
+An engine with no
 capture for the workload fails the run instead of writing an empty file, and a
 dump whose record count differs from the attempted query count is refused.
 Warm-ups and mixed (`--update-search-ratio`) phases are not dumped. Per-query
