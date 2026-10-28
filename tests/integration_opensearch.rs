@@ -1764,7 +1764,7 @@ fn test_binary_opensearch_fulltext_refuses_unpinned_or_incomplete_index() {
 }
 
 /// #339 follow-up: `analysis: parity` end to end on OpenSearch — the nostem
-/// analyzer, newline normalization at upload (verified on `_source`), only
+/// analyzer, whitespace normalization at upload (verified on `_source`), only
 /// the searched fields indexed, and refusal of an index uploaded in the other
 /// mode when reused through `--skip-upload`, in both directions.
 #[test]
@@ -1842,7 +1842,7 @@ fn test_binary_opensearch_fulltext_parity() {
     write_config(&proj.root, common::bm25_parity_search_params());
     refused(
         run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
-        "without newline normalization",
+        "without whitespace normalization",
     );
     // A schema text field that is indexed but not searched is refused in
     // parity. Build the parity index while the schema does not declare

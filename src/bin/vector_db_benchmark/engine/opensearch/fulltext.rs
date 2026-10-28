@@ -59,10 +59,10 @@ impl OpenSearchEngine {
         metadata: &mut [Option<vector_db_benchmark::readers::metadata::MetadataItem>],
     ) -> Result<(), String> {
         if let Some(p) = self.fulltext_profile()? {
-            if p.normalizes_newlines() {
+            if p.normalizes_whitespace() {
                 let n = fulltext::normalize_metadata(metadata, &p.text_fields)?;
                 println!(
-                    "\tfulltext parity: normalized newlines in {n} values of {:?}",
+                    "\tfulltext parity: normalized whitespace in {n} values of {:?}",
                     p.text_fields
                 );
             }
@@ -76,7 +76,7 @@ impl OpenSearchEngine {
         allow_multi_shard: bool,
         profile: &fulltext::IndexProfile,
         schema_text_fields: &[String],
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, serde_json::Value), String> {
         let (mapping, settings) = self
             .rt
             .block_on(async {
@@ -102,7 +102,8 @@ impl OpenSearchEngine {
             })
             .map_err(|e| format!("fulltext: index check failed: {e}"))?;
         let mappings = &mapping[&self.index_name]["mappings"];
-        fulltext::validate_opensearch_index_for(
+        let recorded = mappings["_meta"][fulltext::OPENSEARCH_META_KEY].clone();
+        let shards = fulltext::validate_opensearch_index_for(
             &mappings["properties"],
             &settings[&self.index_name]["settings"]["index"],
             fields,
@@ -110,7 +111,8 @@ impl OpenSearchEngine {
             profile,
             &mappings["_meta"][fulltext::OPENSEARCH_META_KEY],
             schema_text_fields,
-        )
+        )?;
+        Ok((shards, recorded))
     }
 
     pub(super) fn search_fulltext_impl(
@@ -133,7 +135,7 @@ impl OpenSearchEngine {
         let profile = self
             .fulltext_profile()?
             .ok_or("fulltext: no fulltext search config resolved an index profile")?;
-        let shards = self.validate_fulltext_index(
+        let (shards, recorded_marker) = self.validate_fulltext_index(
             &fields,
             spec.allow_multi_shard,
             &profile,
@@ -304,7 +306,14 @@ impl OpenSearchEngine {
         )?;
         result.mean_precision_at_returned = -1.0;
         result.query_records = captured;
-        let mut meta = fulltext::result_metadata_for("opensearch", &fields, &set, top, &profile)?;
+        let mut meta = fulltext::result_metadata_for(
+            "opensearch",
+            &fields,
+            &set,
+            top,
+            &profile,
+            &recorded_marker,
+        )?;
         meta["retried_queries"] = serde_json::json!(retried_queries);
         // Read back from the live index (`_settings`), not from the config.
         meta["number_of_shards"] = serde_json::json!(shards);

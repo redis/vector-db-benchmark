@@ -69,10 +69,10 @@ impl RedisEngine {
         metadata: &mut [Option<vector_db_benchmark::readers::metadata::MetadataItem>],
     ) -> Result<(), String> {
         if let Some(p) = self.fulltext_profile()? {
-            if p.normalizes_newlines() {
+            if p.normalizes_whitespace() {
                 let n = fulltext::normalize_metadata(metadata, &p.text_fields)?;
                 println!(
-                    "\tfulltext parity: normalized newlines in {n} values of {:?}",
+                    "\tfulltext parity: normalized whitespace in {n} values of {:?}",
                     p.text_fields
                 );
             }
@@ -102,7 +102,7 @@ impl RedisEngine {
             .ok_or("fulltext: no fulltext search config resolved an index profile")?;
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
-        let min_stem_len = {
+        let (min_stem_len, recorded_marker) = {
             let mut conn = resp3_connection(&self.redis_url)
                 .map_err(|e| format!("fulltext: Redis RESP3 connection failed: {e}"))?;
             let info: redis::Value = redis::cmd("FT.INFO")
@@ -140,7 +140,7 @@ impl RedisEngine {
                     "MINSTEMLEN",
                 )
             });
-            fulltext::check_redis_min_stem_len(value)?
+            (fulltext::check_redis_min_stem_len(value)?, marker)
         };
 
         let texts = fulltext::read_query_texts(&dataset.get_path()?)?;
@@ -316,7 +316,8 @@ impl RedisEngine {
         // No ground truth: the -1 sentinel keeps it out of precision tables.
         result.mean_precision_at_returned = -1.0;
         result.query_records = captured;
-        let mut meta = fulltext::result_metadata_for("redis", &fields, &set, top, &profile)?;
+        let mut meta =
+            fulltext::result_metadata_for("redis", &fields, &set, top, &profile, &recorded_marker)?;
         meta["redis_min_stem_len"] = min_stem_len;
         result.fulltext = Some(meta);
         Ok(result)

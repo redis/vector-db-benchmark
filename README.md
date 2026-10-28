@@ -513,7 +513,7 @@ default English pipelines, not as a BM25 implementation difference.
 |---|---|---|
 | stemming | Porter2 on both, as pinned above | none: Redis `NOSTEM` + `VERBATIM` queries; OpenSearch `vdbb_english_nostem` (the english analyzer without porter2: same tokenizer, possessive, lowercase, stop list) |
 | text fields indexed | every schema `text` field | exactly the searched `fields` (OpenSearch maps the others `index: false`; Redis leaves them out of the schema), so BM25STD's whole-document statistics cover only those |
-| uploaded text | as is | `\r\n` / `\n` / `\r` → space in the indexed text fields, on both engines |
+| uploaded text | as is | every Unicode whitespace character other than U+0020 (`\n`, `\r`, `\t`, `\x0B`, `\x0C`, U+0085, U+00A0, U+2028, U+2029, …) → space in the indexed text fields, on both engines. RediSearch splits tokens only on space and tab, OpenSearch on all of them. In the 100K corpus `segment` carries `\n` (80,288 rows), U+00A0 (210 rows), `\t` (165), `\x0B` (4), U+2028 (3), U+0085 (3) and `\x0C` (2) |
 | use | headline numbers | agreement check against OpenSearch as source of truth |
 
 ```json
@@ -543,11 +543,11 @@ Parity changes the uploaded corpus, so it is guarded:
   - parity configs searching different field sets;
   - parity in the same engine config as any `vector`, `hybrid` or `filter-only` config. Normalization and the reduced text index never apply to other workloads.
 - **Redis shared corpus.** On Redis, parity also refuses a shared corpus (`REDIS_KEY_PREFIX`).
-- **Recorded in the index.** The mode is written into the index: a Redis key `vdbb:fulltext-profile:<index>`, and OpenSearch `mappings._meta.vdbb_fulltext` (`{"analysis", "normalize_newlines", "text_fields"}`).
+- **Recorded in the index.** The mode is written into the index: a Redis key `vdbb:fulltext-profile:<index>`, and OpenSearch `mappings._meta.vdbb_fulltext` (`{"analysis", "normalize_whitespace", "text_fields"}`).
 - **Verified on `--skip-upload` reuse,** together with the analyzer / `NOSTEM` / indexed-field checks:
   - an index uploaded without normalization (english, or built before markers existed) is refused in parity;
   - a parity index is refused in english.
-- **In the result.** `params.fulltext` records `analysis`, `normalize_newlines`, `indexed_text_fields`, `index_marker`, and the `known_differences` that remain in that mode.
+- **In the result.** `params.fulltext` records `analysis`, `normalize_whitespace`, `indexed_text_fields`, `index_marker` (the marker the live index actually carries, `null` when it has none) next to `index_marker_expected`, and the `known_differences` that remain in that mode.
 
 Result JSON: `params.workload: "fulltext"` and `params.fulltext` (fields and
 boosts, query-term method, stopword list and provenance, the engine's analyzer /

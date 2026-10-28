@@ -182,7 +182,7 @@ pub const KNOWN_DIFFERENCES: [&str; 7] = [
     KD_MIN_STEM_LEN,
 ];
 
-/// The known differences parity removes: newlines are normalized at upload,
+/// The known differences parity removes: whitespace is normalized at upload,
 /// and nothing is stemmed (so neither stem double counting nor the minimum
 /// stem length applies).
 pub const PARITY_REMOVES: [&str; 3] = [KD_NEWLINE_TOKENS, KD_STEM_TWICE, KD_MIN_STEM_LEN];
@@ -273,7 +273,7 @@ impl IndexProfile {
         self.analysis == Analysis::English
     }
 
-    pub fn normalizes_newlines(&self) -> bool {
+    pub fn normalizes_whitespace(&self) -> bool {
         self.analysis == Analysis::Parity
     }
 
@@ -282,7 +282,7 @@ impl IndexProfile {
     pub fn marker(&self) -> Value {
         json!({
             "analysis": self.analysis.as_str(),
-            "normalize_newlines": self.normalizes_newlines(),
+            "normalize_whitespace": self.normalizes_whitespace(),
             "text_fields": self.text_fields.iter().collect::<Vec<_>>(),
         })
     }
@@ -300,10 +300,10 @@ impl IndexProfile {
         } else {
             Err(format!(
                 "fulltext: the index records analysis {recorded} but this run needs {} — an \
-                 index uploaded {} newline normalization (or with a different text field set) \
+                 index uploaded {} whitespace normalization (or with a different text field set) \
                  cannot be reused; rebuild it without --skip-upload",
                 self.marker(),
-                if self.normalizes_newlines() {
+                if self.normalizes_whitespace() {
                     "without"
                 } else {
                     "with"
@@ -376,7 +376,7 @@ pub fn index_profile<'a>(
     if analysis == Analysis::Parity {
         if let Some(w) = other_workload {
             return Err(format!(
-                "`analysis: parity` changes the uploaded corpus (newlines normalized) and the \
+                "`analysis: parity` changes the uploaded corpus (whitespace normalized) and the \
                  text index, which must never apply to other workloads; this engine config \
                  also declares \"{w}\" — split it"
             ));
@@ -396,7 +396,8 @@ pub fn check_parity_shared_corpus(
     profile: Option<&IndexProfile>,
     shared_corpus: bool,
 ) -> Result<(), String> {
-    if engine_type == "redis" && shared_corpus && profile.is_some_and(|p| p.normalizes_newlines()) {
+    if engine_type == "redis" && shared_corpus && profile.is_some_and(|p| p.normalizes_whitespace())
+    {
         return Err(
             "fulltext `analysis: parity` normalizes the uploaded text, which a shared corpus \
              (REDIS_KEY_PREFIX) would impose on every other config — unset REDIS_KEY_PREFIX"
@@ -406,16 +407,29 @@ pub fn check_parity_shared_corpus(
     Ok(())
 }
 
-/// Replace `\r\n`, `\n` and `\r` by a space (parity mode, at upload).
-pub fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", " ").replace(['\n', '\r'], " ")
+/// Whether `c` is whitespace that [`normalize_whitespace`] rewrites: every
+/// Unicode `White_Space` character except U+0020 itself. RediSearch splits
+/// tokens only on space and tab (and its ASCII punctuation set), OpenSearch's
+/// standard tokenizer on all of them; in the 100K MS MARCO corpus `segment`
+/// carries `\n`, `\r`, U+00A0, U+2028, `\x0B`, `\x0C` and U+0085.
+pub fn is_normalized_whitespace(c: char) -> bool {
+    c.is_whitespace() && c != ' '
+}
+
+/// Replace every Unicode whitespace character other than U+0020 (newlines,
+/// tab, vertical tab, form feed, NEL, no-break space, line/paragraph
+/// separators, …) by a space (parity mode, at upload).
+pub fn normalize_whitespace(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_normalized_whitespace(c) { ' ' } else { c })
+        .collect()
 }
 
 /// Normalize the string values of `fields` in place; returns how many values
 /// changed (for the upload log). A value of an indexed text field that is not
 /// a string (a JSON array becomes `Labels`, which Redis joins with `;` and
 /// OpenSearch indexes as several values) is refused: parity could not claim
-/// `normalize_newlines` for it, and the two engines would not index it alike.
+/// `normalize_whitespace` for it, and the two engines would not index it alike.
 pub fn normalize_metadata(
     items: &mut [Option<crate::readers::metadata::MetadataItem>],
     fields: &BTreeSet<String>,
@@ -430,8 +444,8 @@ pub fn normalize_metadata(
             }
             match v {
                 MetadataValue::String(s) => {
-                    if s.contains(['\n', '\r']) {
-                        *s = normalize_newlines(s);
+                    if s.chars().any(is_normalized_whitespace) {
+                        *s = normalize_whitespace(s);
                         changed += 1;
                     }
                 }
@@ -1540,7 +1554,14 @@ pub fn result_metadata(
     set: &QuerySet,
     top: usize,
 ) -> Result<Value, String> {
-    result_metadata_for(engine, fields, set, top, &IndexProfile::english())
+    result_metadata_for(
+        engine,
+        fields,
+        set,
+        top,
+        &IndexProfile::english(),
+        &Value::Null,
+    )
 }
 
 /// The differences that remain in `analysis` mode. Parity removes the newline
@@ -1559,24 +1580,32 @@ pub fn known_differences(analysis: Analysis) -> Vec<&'static str> {
 
 /// [`result_metadata`] for an [`IndexProfile`]: records the analysis mode,
 /// whether the uploaded text was normalized and which text fields are indexed.
+///
+/// `recorded_marker` is the marker the live index actually carries (Redis
+/// marker key / OpenSearch `_meta`, `Null` when absent — an index built before
+/// markers existed, reused in english mode). It is published as
+/// `index_marker`; the profile's marker as `index_marker_expected`.
 pub fn result_metadata_for(
     engine: &str,
     fields: &[FieldBoost],
     set: &QuerySet,
     top: usize,
     profile: &IndexProfile,
+    recorded_marker: &Value,
 ) -> Result<Value, String> {
     let mut m = result_metadata_english(engine, fields, set, top)?;
     m["analysis"] = json!(profile.analysis.as_str());
-    m["normalize_newlines"] = json!(profile.normalizes_newlines());
-    m["index_marker"] = profile.marker();
+    m["normalize_whitespace"] = json!(profile.normalizes_whitespace());
+    m["index_marker"] = recorded_marker.clone();
+    m["index_marker_expected"] = profile.marker();
     m["known_differences"] = json!(known_differences(profile.analysis));
     if profile.analysis == Analysis::Parity {
         m["stemmer"] = json!("none on either engine (parity)");
         m["indexed_text_fields"] = json!(profile.text_fields);
         m["normalization"] = json!(
-            "'\\r\\n', '\\n' and '\\r' replaced by a space in the indexed text fields at \
-             upload, on both engines; recorded in the index and verified on reuse"
+            "every Unicode whitespace character other than U+0020 (\\n, \\r, \\t, \\x0B, \\x0C, \
+             U+0085, U+00A0, U+2028, U+2029, …) replaced by a space in the indexed text fields \
+             at upload, on both engines; recorded in the index and verified on reuse"
         );
         let settings = &mut m["engine_settings"];
         match engine {
@@ -2001,16 +2030,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(p, IndexProfile::english());
-        assert!(p.stems() && !p.normalizes_newlines() && p.indexes_text_field("anything"));
+        assert!(p.stems() && !p.normalizes_whitespace() && p.indexes_text_field("anything"));
         // Parity: exactly the searched fields, same set across configs (boosts may differ).
         let par2 = parity_block(json!({"segment": 5.0, "headings": 1.0}));
         let p = profile(vec![ft(&par), ft(&par2)]).unwrap().unwrap();
         assert_eq!(p.analysis, Analysis::Parity);
-        assert!(!p.stems() && p.normalizes_newlines());
+        assert!(!p.stems() && p.normalizes_whitespace());
         assert!(p.indexes_text_field("segment") && !p.indexes_text_field("title"));
         assert_eq!(
             p.marker(),
-            json!({"analysis":"parity","normalize_newlines":true,"text_fields":["headings","segment"]})
+            json!({"analysis":"parity","normalize_whitespace":true,"text_fields":["headings","segment"]})
         );
         // Refusals.
         let e = profile(vec![ft(&eng), ft(&par)]).unwrap_err();
@@ -2032,8 +2061,14 @@ mod tests {
     #[test]
     fn newline_normalization_touches_only_the_indexed_text_fields() {
         use crate::readers::metadata::{MetadataItem, MetadataValue};
-        assert_eq!(normalize_newlines("a\r\nb\nc\rd"), "a b c d");
-        assert_eq!(normalize_newlines("plain"), "plain");
+        assert_eq!(normalize_whitespace("a\r\nb\nc\rd"), "a  b c d");
+        // Every Unicode whitespace other than U+0020 seen in MS MARCO, and more.
+        assert_eq!(
+            normalize_whitespace("a\tb\x0Bc\x0Cd\u{85}e\u{A0}f\u{2028}g\u{2029}h\u{3000}i"),
+            "a b c d e f g h i"
+        );
+        assert_eq!(normalize_whitespace("plain text"), "plain text");
+        assert_eq!(normalize_whitespace("plain"), "plain");
         let item = |h: &str, t: &str| {
             Some(MetadataItem {
                 fields: vec![
@@ -2106,7 +2141,7 @@ mod tests {
         // Parity needs its own marker: an unnormalized upload is refused.
         assert!(par.check_marker(&par.marker()).is_ok());
         let e = par.check_marker(&Value::Null).unwrap_err();
-        assert!(e.contains("without newline normalization"), "{e}");
+        assert!(e.contains("without whitespace normalization"), "{e}");
         assert!(par.check_marker(&eng.marker()).is_err());
         let mut other = par.marker();
         other["text_fields"] = json!(["headings", "segment"]);
@@ -2268,9 +2303,11 @@ mod tests {
         .unwrap()
         .unwrap();
         for engine in ["redis", "opensearch"] {
-            let m = result_metadata_for(engine, &[fb("segment", 1.0)], &set, 10, &par).unwrap();
+            let m =
+                result_metadata_for(engine, &[fb("segment", 1.0)], &set, 10, &par, &par.marker())
+                    .unwrap();
             assert_eq!(m["analysis"], "parity");
-            assert_eq!(m["normalize_newlines"], true);
+            assert_eq!(m["normalize_whitespace"], true);
             assert_eq!(m["indexed_text_fields"], json!(["segment"]));
             assert_eq!(m["index_marker"], par.marker());
             // By identity, whatever the order of KNOWN_DIFFERENCES: parity
@@ -2293,27 +2330,51 @@ mod tests {
             for d in [KD_PUNCTUATION, KD_WHOLE_DOCUMENT, KD_SHARD_STATS, KD_TIES] {
                 assert!(kd.contains(&d), "{d}");
             }
+            // English reuse of an index built before markers existed: the
+            // result records what the index carries (nothing), not the
+            // marker this run would have written.
             let e = result_metadata_for(
                 engine,
                 &[fb("segment", 1.0)],
                 &set,
                 10,
                 &IndexProfile::english(),
+                &Value::Null,
             )
             .unwrap();
+            assert!(e["index_marker"].is_null(), "{}", e["index_marker"]);
+            assert_eq!(e["index_marker_expected"], IndexProfile::english().marker());
+            assert_eq!(m["index_marker"], par.marker());
+            assert_eq!(m["index_marker_expected"], par.marker());
             assert_eq!(e["analysis"], "english");
-            assert_eq!(e["normalize_newlines"], false);
+            assert_eq!(e["normalize_whitespace"], false);
             assert_eq!(
                 e["known_differences"].as_array().unwrap().len(),
                 KNOWN_DIFFERENCES.len()
             );
         }
-        let r = result_metadata_for("redis", &[fb("segment", 1.0)], &set, 10, &par).unwrap();
+        let r = result_metadata_for(
+            "redis",
+            &[fb("segment", 1.0)],
+            &set,
+            10,
+            &par,
+            &par.marker(),
+        )
+        .unwrap();
         assert!(r["engine_settings"]["command"]
             .as_str()
             .unwrap()
             .contains("VERBATIM"));
-        let o = result_metadata_for("opensearch", &[fb("segment", 1.0)], &set, 10, &par).unwrap();
+        let o = result_metadata_for(
+            "opensearch",
+            &[fb("segment", 1.0)],
+            &set,
+            10,
+            &par,
+            &par.marker(),
+        )
+        .unwrap();
         assert_eq!(
             o["engine_settings"]["index"]["analyzer"],
             OPENSEARCH_PARITY_ANALYZER

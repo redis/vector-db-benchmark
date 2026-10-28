@@ -3143,6 +3143,9 @@ pub fn assert_bm25_run(root: &Path, dump: &Path, engine: &str, config: &str) {
         assert_eq!(ft["queries_total"], 6);
         assert_eq!(ft["queries_skipped_no_terms"], serde_json::json!([2]));
         assert_eq!(ft["result_limit"], 5);
+        // A fresh index carries the marker this run wrote, read back.
+        assert_eq!(ft["index_marker"], ft["index_marker_expected"], "{ft}");
+        assert_eq!(ft["index_marker"]["analysis"], "english");
         assert!(!ft["known_differences"].as_array().unwrap().is_empty());
         match engine {
             "redis" => {
@@ -3250,7 +3253,7 @@ pub fn bm25_parity_search_params() -> serde_json::Value {
 /// Every claim parity makes, on one engine's run of
 /// [`bm25_parity_search_params`] with `--dump-results <dump>`:
 ///
-/// - result JSON records `analysis: parity`, the newline normalization, the
+/// - result JSON records `analysis: parity`, the whitespace normalization, the
 ///   indexed text fields and the index marker;
 /// - no stemming: "generously" finds nothing (d2 holds only "generous") and
 ///   "crossings" no longer finds "crossing" (d5) — both found in english mode;
@@ -3273,14 +3276,14 @@ pub fn assert_bm25_parity_run(root: &Path, dump: &Path, engine: &str, config: &s
         let ft = &doc["params"]["fulltext"];
         assert_eq!(doc["params"]["workload"], "fulltext");
         assert_eq!(ft["analysis"], "parity", "{ft}");
-        assert_eq!(ft["normalize_newlines"], true);
+        assert_eq!(ft["normalize_whitespace"], true);
         assert_eq!(
             ft["indexed_text_fields"],
             serde_json::json!(["headings", "segment"])
         );
         assert_eq!(
             ft["index_marker"],
-            serde_json::json!({"analysis": "parity", "normalize_newlines": true,
+            serde_json::json!({"analysis": "parity", "normalize_whitespace": true,
                                "text_fields": ["headings", "segment"]})
         );
         match engine {

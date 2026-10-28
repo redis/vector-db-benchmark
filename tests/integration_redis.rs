@@ -4897,18 +4897,32 @@ fn test_binary_redis_fulltext_refuses_unpinned_or_incomplete_index() {
         .arg(&index)
         .query::<()>(&mut conn);
     assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    // #358 review: an english index without a marker (built before markers
+    // existed) is reused, and the result records the marker the index
+    // actually carries — none — not the one this run would have written.
+    let _ = redis::cmd("DEL")
+        .arg(vector_db_benchmark::fulltext::redis_marker_key(&index))
+        .query::<()>(&mut conn);
+    common::clear_result_files(&proj.root);
     let ok = run(&["--skip-upload", "--exit-on-error"]);
     assert!(
         ok.status.success(),
         "{}",
         String::from_utf8_lossy(&ok.stderr)
     );
+    let doc = common::read_result_doc(&proj.root, name);
+    let ft = &doc["params"]["fulltext"];
+    assert!(ft["index_marker"].is_null(), "{}", ft["index_marker"]);
+    assert_eq!(
+        ft["index_marker_expected"],
+        vector_db_benchmark::fulltext::IndexProfile::english().marker()
+    );
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
 
 /// #339 follow-up: `analysis: parity` end to end on Redis — no stemming,
-/// newline normalization at upload (verified on the stored hash), only the
+/// whitespace normalization at upload (verified on the stored hash), only the
 /// searched fields indexed (`NOSTEM`), and refusal of an index uploaded in the
 /// other mode when reused through `--skip-upload`, in both directions.
 #[test]
@@ -4982,7 +4996,7 @@ fn test_binary_redis_fulltext_parity() {
     write_config(&proj.root, common::bm25_parity_search_params());
     refused(
         run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
-        "without newline normalization",
+        "without whitespace normalization",
     );
     flush_db(&mut conn);
     let _ = redis::cmd("DEL")
