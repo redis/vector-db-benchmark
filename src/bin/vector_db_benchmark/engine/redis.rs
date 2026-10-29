@@ -253,23 +253,22 @@ impl RedisEngine {
             .collection_params
             .as_ref()
             .and_then(|cp| cp.hnsw_config.as_ref());
-        // Env fallback only for HNSW configs with a vector index, so a stray
-        // REDIS_HNSW_* variable never affects flat/SVS configs.
-        let read_sq8_env =
-            algorithm.eq_ignore_ascii_case("hnsw") && !engine_config.skip_vector_index;
-        let hnsw_sq8 = Sq8Options::resolve(
+        // `resolve` reads the REDIS_HNSW_* env only for HNSW configs with a
+        // vector index (`redis_hnsw_sq8::env_applies`, unit-tested), so a stray
+        // variable never affects FLAT, SVS or no-vector configs.
+        let hnsw_sq8_resolution = Sq8Options::resolve(
             hnsw_config.and_then(|h| h.compression.as_deref()),
             hnsw_config.and_then(|h| h.training_threshold),
-            read_sq8_env
-                .then(|| crate::effective_config::env_var("REDIS_HNSW_COMPRESSION").ok())
-                .flatten(),
-            read_sq8_env
-                .then(|| crate::effective_config::env_var("REDIS_HNSW_TRAINING_THRESHOLD").ok())
-                .flatten(),
+            || crate::effective_config::env_var("REDIS_HNSW_COMPRESSION").ok(),
+            || crate::effective_config::env_var("REDIS_HNSW_TRAINING_THRESHOLD").ok(),
             &algorithm,
             &data_type,
             engine_config.skip_vector_index,
         )?;
+        if let Some(notice) = hnsw_sq8_resolution.env_notice(&engine_config.name) {
+            eprintln!("{notice}");
+        }
+        let hnsw_sq8 = hnsw_sq8_resolution.options;
         crate::effective_config::record_effective(
             "hnsw_compression",
             hnsw_sq8
@@ -278,12 +277,14 @@ impl RedisEngine {
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
         );
+        // The declared threshold, else the server default the index is built
+        // with (`SERVER_DEFAULT_TRAINING_THRESHOLD`, from RediSearch source);
+        // `verify_ft_info` checks it against FT.INFO after FT.CREATE.
         crate::effective_config::record_effective(
             "hnsw_training_threshold",
             hnsw_sq8
-                .compression
-                .as_ref()
-                .map(|_| serde_json::Value::from(hnsw_sq8.training_threshold.unwrap_or(10_240)))
+                .effective_training_threshold()
+                .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null),
         );
 

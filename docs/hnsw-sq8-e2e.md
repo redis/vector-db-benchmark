@@ -47,13 +47,20 @@ Providing a threshold without compression from either source is an error.
 The resolved compression and threshold are recorded in result metadata as
 `hnsw_compression` and `hnsw_training_threshold`. The raw environment variables
 appear in the result's `env` record, only for HNSW configurations that build a
-vector index (the variables are not read otherwise).
+vector index (the variables are not read otherwise). Whenever a variable
+supplies a value the configuration does not declare, the run prints a one-line
+`notice:` to stderr naming the variable and the configuration, because the
+results are still labeled with that configuration's name. When only
+`COMPRESSION` is set, the recorded threshold is RediSearch's own default, 10240
+(`HNSW_QUANT_DEFAULT_TRAINING_THRESHOLD`, `10 * DEFAULT_BLOCK_SIZE`), and the
+`FT.INFO` read-back confirms it at index creation.
 
 The `verify_ft_info` read-back runs only when the index is created. This guide's
 workflow is two invocations (`--skip-search` upload, then `--skip-upload`
 search). Export identical values for both invocations; otherwise the search
 results record `hnsw_compression` for an index that was built differently, and
-nothing on the search path detects it.
+nothing on the search path detects it (tracked in
+[#374](https://github.com/redis/vector-db-benchmark/issues/374)).
 
 The variables apply to every HNSW configuration that lacks `COMPRESSION`,
 including the `-plain` baselines in `redis-hnsw-sq8-k10.json` and

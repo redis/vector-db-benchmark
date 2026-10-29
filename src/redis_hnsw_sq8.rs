@@ -3,6 +3,70 @@
 use redis::Value as RedisValue;
 use serde::{Deserialize, Deserializer};
 
+/// The training threshold RediSearch applies when `COMPRESSION SQ8` is given
+/// without `TRAINING_THRESHOLD`. This is the server's default, not a value
+/// this harness invents. RediSearch `src/vector_index.h` defines
+/// `HNSW_QUANT_DEFAULT_TRAINING_THRESHOLD (10 * DEFAULT_BLOCK_SIZE)`, and
+/// `src/spec.c` applies it when compression is set and the threshold is not.
+/// VectorSimilarity `src/VecSim/vec_sim_common.h` defines `DEFAULT_BLOCK_SIZE`
+/// as 1024. RediSearch `tests/pytests/test_vecsim_hnsw_sq8.py` asserts that
+/// `FT.INFO` reports 10240 for such an index. `verify_ft_info` checks the
+/// value against `FT.INFO` at index creation, so a server whose default
+/// differs fails the run instead of being recorded wrongly.
+pub const SERVER_DEFAULT_TRAINING_THRESHOLD: u64 = 10 * 1024;
+
+/// Upper bound accepted by RediSearch (`HNSW_QUANT_MAX_TRAINING_THRESHOLD`,
+/// `100 * DEFAULT_BLOCK_SIZE`).
+pub const MAX_TRAINING_THRESHOLD: u64 = 100 * 1024;
+
+/// Whether the `REDIS_HNSW_*` env vars may apply to a config. They apply only
+/// to HNSW configs that build a vector index, so an exported variable never
+/// changes a FLAT, SVS-VAMANA or no-vector (filter-only) config.
+pub fn env_applies(algorithm: &str, skip_vector_index: bool) -> bool {
+    algorithm.eq_ignore_ascii_case("hnsw") && !skip_vector_index
+}
+
+/// The outcome of [`Sq8Options::resolve`]: the options, plus which env vars
+/// supplied a value the config did not declare.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sq8Resolution {
+    pub options: Sq8Options,
+    /// `REDIS_HNSW_*` variables whose value was used, in field order.
+    pub from_env: Vec<&'static str>,
+}
+
+impl Sq8Resolution {
+    /// A one-line stderr notice when any SQ8 setting came from the env rather
+    /// than the config. The run still completes and its results carry the
+    /// config's name, so a config without SQ8 keys that was built as SQ8 must
+    /// at least say so.
+    pub fn env_notice(&self, config_name: &str) -> Option<String> {
+        if self.from_env.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.from_env.contains(&"REDIS_HNSW_COMPRESSION") {
+            parts.push(format!(
+                "COMPRESSION {} from REDIS_HNSW_COMPRESSION",
+                self.options.compression.as_deref().unwrap_or("?")
+            ));
+        }
+        if self.from_env.contains(&"REDIS_HNSW_TRAINING_THRESHOLD") {
+            parts.push(format!(
+                "TRAINING_THRESHOLD {} from REDIS_HNSW_TRAINING_THRESHOLD",
+                self.options
+                    .training_threshold
+                    .map_or_else(|| "?".to_string(), |n| n.to_string())
+            ));
+        }
+        Some(format!(
+            "notice: Redis config '{config_name}' builds its HNSW index with {}, not from \
+             the config; its results are labeled '{config_name}'",
+            parts.join(" and ")
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sq8Options {
     pub compression: Option<String>,
@@ -31,7 +95,7 @@ impl Sq8Options {
             None => None,
         };
         if let Some(n) = training_threshold {
-            if n > 102_400 {
+            if n > MAX_TRAINING_THRESHOLD {
                 return Err("collection_params.hnsw_config.TRAINING_THRESHOLD must be an integer from 0 to 102400".into());
             }
             if compression.is_none() {
@@ -54,17 +118,26 @@ impl Sq8Options {
     }
 
     /// Merge config and env values (config wins per field), then validate via
-    /// `from_hnsw_fields`. Env text is trimmed; empty or whitespace-only env is
+    /// `from_hnsw_fields`. The env readers are called only when
+    /// [`env_applies`] holds, so FLAT, SVS-VAMANA and no-vector configs never
+    /// see `REDIS_HNSW_*`. Env text is trimmed; empty or whitespace-only env is
     /// treated as unset. Invalid env text errors naming the variable.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         config_compression: Option<&str>,
         config_training_threshold: Option<u64>,
-        env_compression: Option<String>,
-        env_training_threshold: Option<String>,
+        env_compression: impl FnOnce() -> Option<String>,
+        env_training_threshold: impl FnOnce() -> Option<String>,
         algorithm: &str,
         data_type: &str,
         skip_vector_index: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Sq8Resolution, String> {
+        let (env_compression, env_training_threshold) = if env_applies(algorithm, skip_vector_index)
+        {
+            (env_compression(), env_training_threshold())
+        } else {
+            (None, None)
+        };
         let env_compression = env_compression
             .as_deref()
             .map(str::trim)
@@ -84,10 +157,16 @@ impl Sq8Options {
             }
             (None, None) => None,
         };
+        let threshold_from_env =
+            config_training_threshold.is_none() && env_training_threshold.is_some();
         let training_threshold = match (config_training_threshold, env_training_threshold) {
             (Some(n), _) => Some(n),
             (None, Some(e)) => {
-                let n = e.parse::<u64>().ok().filter(|&n| n <= 102_400).ok_or_else(|| {
+                let n = e
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&n| n <= MAX_TRAINING_THRESHOLD)
+                    .ok_or_else(|| {
                     format!(
                         "REDIS_HNSW_TRAINING_THRESHOLD must be an integer from 0 to 102400, got {e:?}"
                     )
@@ -101,7 +180,7 @@ impl Sq8Options {
             }
             (None, None) => None,
         };
-        Self::from_hnsw_fields(
+        let options = Self::from_hnsw_fields(
             compression,
             training_threshold,
             algorithm,
@@ -114,6 +193,24 @@ impl Sq8Options {
             } else {
                 e
             }
+        })?;
+        let mut from_env = Vec::new();
+        if compression_from_env {
+            from_env.push("REDIS_HNSW_COMPRESSION");
+        }
+        if threshold_from_env {
+            from_env.push("REDIS_HNSW_TRAINING_THRESHOLD");
+        }
+        Ok(Sq8Resolution { options, from_env })
+    }
+
+    /// The threshold the server builds with: the declared one, else the
+    /// server default ([`SERVER_DEFAULT_TRAINING_THRESHOLD`]). `None` without
+    /// compression, where the server has no training threshold.
+    pub fn effective_training_threshold(&self) -> Option<u64> {
+        self.compression.as_ref().map(|_| {
+            self.training_threshold
+                .unwrap_or(SERVER_DEFAULT_TRAINING_THRESHOLD)
         })
     }
 
@@ -139,7 +236,9 @@ impl Sq8Options {
                 actual_compression, self.compression
             ));
         }
-        let expected_threshold = self.training_threshold.unwrap_or(10_240);
+        let expected_threshold = self
+            .training_threshold
+            .unwrap_or(SERVER_DEFAULT_TRAINING_THRESHOLD);
         let actual_threshold = field(vector, "training_threshold")
             .and_then(as_string)
             .and_then(|s| s.parse::<u64>().ok());
@@ -221,19 +320,127 @@ mod tests {
         }
     }
 
-    fn resolve(
+    fn resolve_full(
         config: (Option<&str>, Option<u64>),
         env: (Option<&str>, Option<&str>),
-    ) -> Result<Sq8Options, String> {
+    ) -> Result<Sq8Resolution, String> {
         Sq8Options::resolve(
             config.0,
             config.1,
-            env.0.map(String::from),
-            env.1.map(String::from),
+            || env.0.map(String::from),
+            || env.1.map(String::from),
             "hnsw",
             "FLOAT32",
             false,
         )
+    }
+
+    fn resolve(
+        config: (Option<&str>, Option<u64>),
+        env: (Option<&str>, Option<&str>),
+    ) -> Result<Sq8Options, String> {
+        resolve_full(config, env).map(|r| r.options)
+    }
+
+    #[test]
+    fn env_applies_only_to_hnsw_with_a_vector_index() {
+        assert!(env_applies("hnsw", false));
+        assert!(env_applies("HNSW", false));
+        for (algorithm, skip) in [
+            ("flat", false),
+            ("FLAT", false),
+            ("svs-vamana", false),
+            ("SVS-VAMANA", false),
+            ("hnsw", true),
+        ] {
+            assert!(!env_applies(algorithm, skip), "{algorithm} skip={skip}");
+        }
+    }
+
+    /// The `REDIS_HNSW_*` env must never reach a FLAT, SVS-VAMANA or
+    /// no-vector config: the readers are not even called, and an env value
+    /// that would be invalid there (SQ8 on FLAT) does not error.
+    #[test]
+    fn resolve_never_reads_env_outside_hnsw_with_a_vector_index() {
+        for (algorithm, skip) in [
+            ("flat", false),
+            ("svs-vamana", false),
+            ("SVS-VAMANA", false),
+            ("hnsw", true),
+        ] {
+            let r = Sq8Options::resolve(
+                None,
+                None,
+                || panic!("REDIS_HNSW_COMPRESSION read for {algorithm} skip={skip}"),
+                || panic!("REDIS_HNSW_TRAINING_THRESHOLD read for {algorithm} skip={skip}"),
+                algorithm,
+                "FLOAT32",
+                skip,
+            )
+            .unwrap();
+            assert_eq!(r, Sq8Resolution::default(), "{algorithm} skip={skip}");
+            let r = Sq8Options::resolve(
+                None,
+                None,
+                || Some("SQ8".into()),
+                || Some("4".into()),
+                algorithm,
+                "FLOAT32",
+                skip,
+            )
+            .unwrap();
+            assert_eq!(r, Sq8Resolution::default(), "{algorithm} skip={skip}");
+        }
+        // The same env does apply to an HNSW vector index.
+        let r = resolve_full((None, None), (Some("SQ8"), Some("4"))).unwrap();
+        assert_eq!(r.options.compression.as_deref(), Some("SQ8"));
+        assert_eq!(r.options.training_threshold, Some(4));
+    }
+
+    #[test]
+    fn resolve_reports_which_fields_came_from_env() {
+        let r = resolve_full((None, None), (Some("SQ8"), Some("4"))).unwrap();
+        assert_eq!(
+            r.from_env,
+            ["REDIS_HNSW_COMPRESSION", "REDIS_HNSW_TRAINING_THRESHOLD"]
+        );
+        let notice = r.env_notice("redis-m-16-ef-128").unwrap();
+        assert!(!notice.contains('\n'), "{notice}");
+        assert!(notice.contains("'redis-m-16-ef-128'"), "{notice}");
+        assert!(
+            notice.contains("COMPRESSION SQ8 from REDIS_HNSW_COMPRESSION"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("TRAINING_THRESHOLD 4 from REDIS_HNSW_TRAINING_THRESHOLD"),
+            "{notice}"
+        );
+
+        let r = resolve_full((Some("SQ8"), None), (None, Some("4"))).unwrap();
+        assert_eq!(r.from_env, ["REDIS_HNSW_TRAINING_THRESHOLD"]);
+        let notice = r.env_notice("c").unwrap();
+        assert!(!notice.contains("REDIS_HNSW_COMPRESSION"), "{notice}");
+
+        let r = resolve_full((None, Some(7)), (Some("SQ8"), Some("4"))).unwrap();
+        assert_eq!(r.from_env, ["REDIS_HNSW_COMPRESSION"]);
+
+        // Config declares both: env is unused, nothing to report.
+        let r = resolve_full((Some("SQ8"), Some(0)), (Some("SQ8"), Some("4"))).unwrap();
+        assert!(r.from_env.is_empty());
+        assert_eq!(r.env_notice("c"), None);
+        let r = resolve_full((None, None), (None, None)).unwrap();
+        assert_eq!(r.env_notice("c"), None);
+    }
+
+    #[test]
+    fn effective_threshold_is_the_server_default_only_with_compression() {
+        assert_eq!(SERVER_DEFAULT_TRAINING_THRESHOLD, 10_240);
+        let o = Sq8Options::from_hnsw_fields(Some("SQ8"), None, "hnsw", "FLOAT32", false).unwrap();
+        assert_eq!(o.effective_training_threshold(), Some(10_240));
+        let o =
+            Sq8Options::from_hnsw_fields(Some("SQ8"), Some(0), "hnsw", "FLOAT32", false).unwrap();
+        assert_eq!(o.effective_training_threshold(), Some(0));
+        assert_eq!(Sq8Options::default().effective_training_threshold(), None);
     }
 
     #[test]
@@ -284,8 +491,16 @@ mod tests {
 
     #[test]
     fn resolve_env_compression_dtype_error_names_the_variable() {
-        let e = Sq8Options::resolve(None, None, Some("SQ8".into()), None, "hnsw", "INT8", false)
-            .unwrap_err();
+        let e = Sq8Options::resolve(
+            None,
+            None,
+            || Some("SQ8".into()),
+            || None,
+            "hnsw",
+            "INT8",
+            false,
+        )
+        .unwrap_err();
         assert!(e.contains("REDIS_HNSW_COMPRESSION"), "{e}");
     }
 
