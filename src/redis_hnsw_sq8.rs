@@ -233,6 +233,24 @@ impl Sq8Options {
         Ok(Sq8Resolution { options, from_env })
     }
 
+    /// The `(hnsw_compression, hnsw_training_threshold)` pair recorded in a
+    /// result's effective config. It reflects the RESOLVED options, i.e. what
+    /// FT.CREATE built (env included), never only what the config declared;
+    /// the threshold is the server default when only compression is set. Both
+    /// are `null` without compression. The docs tell users to check these
+    /// fields before comparing runs, so this is pinned by unit tests.
+    pub fn effective_record(&self) -> (serde_json::Value, serde_json::Value) {
+        (
+            self.compression
+                .clone()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+            self.effective_training_threshold()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        )
+    }
+
     /// The threshold the server builds with: the declared one, else the
     /// server default ([`SERVER_DEFAULT_TRAINING_THRESHOLD`]). `None` without
     /// compression, where the server has no training threshold.
@@ -474,6 +492,43 @@ mod tests {
         assert_eq!(r.env_notice("c"), None);
     }
 
+    /// What the result metadata says was built, for each way the options can
+    /// be resolved. Goes through `resolve`, so an env-built SQ8 index on a
+    /// plain config must be recorded as SQ8.
+    #[test]
+    fn effective_record_reflects_what_was_built() {
+        use serde_json::{json, Value};
+        let record = |config: (Option<&str>, Option<u64>), env: (Option<&str>, Option<&str>)| {
+            resolve(config, env).unwrap().effective_record()
+        };
+        // Plain config, no env.
+        assert_eq!(
+            record((None, None), (None, None)),
+            (Value::Null, Value::Null)
+        );
+        // Config SQ8 without a threshold: the server default.
+        assert_eq!(
+            record((Some("SQ8"), None), (None, None)),
+            (json!("SQ8"), json!(SERVER_DEFAULT_TRAINING_THRESHOLD))
+        );
+        assert_eq!(record((Some("sq8"), None), (None, None)).1, json!(10_240));
+        // Config SQ8 with threshold 0: the declared zero, not the default.
+        assert_eq!(
+            record((Some("SQ8"), Some(0)), (None, None)),
+            (json!("SQ8"), json!(0))
+        );
+        // Env compression on a plain config: what was built, not declared.
+        assert_eq!(
+            record((None, None), (Some("SQ8"), None)),
+            (json!("SQ8"), json!(10_240))
+        );
+        // Env threshold with config compression.
+        assert_eq!(
+            record((Some("SQ8"), None), (None, Some("8"))),
+            (json!("SQ8"), json!(8))
+        );
+    }
+
     #[test]
     fn effective_threshold_is_the_server_default_only_with_compression() {
         assert_eq!(SERVER_DEFAULT_TRAINING_THRESHOLD, 10_240);
@@ -555,6 +610,47 @@ mod tests {
         );
         let e = resolve((None, None), (Some("SQ4"), None)).unwrap_err();
         assert!(e.contains("REDIS_HNSW_COMPRESSION"), "{e}");
+    }
+
+    /// A server that ignored or changed COMPRESSION must fail the read-back,
+    /// and compression without a declared threshold must expect the server
+    /// default.
+    #[test]
+    fn read_back_rejects_wrong_compression_and_expects_default_threshold() {
+        let s = |s: &str| RedisValue::BulkString(s.as_bytes().to_vec());
+        let info = |fields: &[&str]| {
+            let mut attr = vec![s("identifier"), s("vector")];
+            attr.extend(fields.iter().map(|f| s(f)));
+            RedisValue::Array(vec![
+                s("attributes"),
+                RedisValue::Array(vec![RedisValue::Array(attr)]),
+            ])
+        };
+        let sq8 =
+            Sq8Options::from_hnsw_fields(Some("SQ8"), Some(0), "hnsw", "FLOAT32", false).unwrap();
+        // Compression absent (accepted and ignored) or different.
+        let e = sq8
+            .verify_ft_info(&info(&["training_threshold", "0"]))
+            .unwrap_err();
+        assert!(e.contains("compression"), "{e}");
+        let e = sq8
+            .verify_ft_info(&info(&["compression", "LVQ8", "training_threshold", "0"]))
+            .unwrap_err();
+        assert!(e.contains("compression"), "{e}");
+        // No declared threshold: FT.INFO must report the server default.
+        let default =
+            Sq8Options::from_hnsw_fields(Some("SQ8"), None, "hnsw", "FLOAT32", false).unwrap();
+        assert!(default
+            .verify_ft_info(&info(&[
+                "compression",
+                "SQ8",
+                "training_threshold",
+                "10240"
+            ]))
+            .is_ok());
+        assert!(default
+            .verify_ft_info(&info(&["compression", "SQ8", "training_threshold", "0"]))
+            .is_err());
     }
 
     #[test]

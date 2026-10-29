@@ -269,23 +269,14 @@ impl RedisEngine {
             eprintln!("{notice}");
         }
         let hnsw_sq8 = hnsw_sq8_resolution.options;
-        crate::effective_config::record_effective(
-            "hnsw_compression",
-            hnsw_sq8
-                .compression
-                .clone()
-                .map(serde_json::Value::from)
-                .unwrap_or(serde_json::Value::Null),
-        );
-        // The declared threshold, else the server default the index is built
-        // with (`SERVER_DEFAULT_TRAINING_THRESHOLD`, from RediSearch source);
-        // `verify_ft_info` checks it against FT.INFO after FT.CREATE.
+        // Recorded from the RESOLVED options (env included), via the unit-tested
+        // `Sq8Options::effective_record`: the threshold is the declared one,
+        // else the server default; `verify_ft_info` checks both after FT.CREATE.
+        let (hnsw_compression, hnsw_training_threshold) = hnsw_sq8.effective_record();
+        crate::effective_config::record_effective("hnsw_compression", hnsw_compression);
         crate::effective_config::record_effective(
             "hnsw_training_threshold",
-            hnsw_sq8
-                .effective_training_threshold()
-                .map(serde_json::Value::from)
-                .unwrap_or(serde_json::Value::Null),
+            hnsw_training_threshold,
         );
 
         // SVS-VAMANA build params: `collection_params.svs-vamana_config` block
@@ -4175,6 +4166,64 @@ mod tests {
         assert_eq!(c.svs_graph_max_degree, None);
         assert_eq!(c.svs_compression, None);
         assert_eq!(c.svs_reduce, None);
+    }
+
+    /// The engine records what it BUILT: on a plain config with
+    /// `REDIS_HNSW_COMPRESSION=SQ8` exported, the result metadata must say SQ8
+    /// (the docs tell users to check it before comparing runs), and a config
+    /// that declares SQ8 with no threshold records the server default.
+    #[test]
+    fn records_resolved_hnsw_sq8_in_effective_config() {
+        use super::RedisEngine;
+        let _lock = crate::effective_config::test_lock();
+        struct Env(&'static str, Option<String>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let set = |name: &'static str, value: Option<&str>| {
+            let prev = std::env::var(name).ok();
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+            Env(name, prev)
+        };
+        let record = |hnsw: serde_json::Value| {
+            let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+                "name": "redis-hnsw-plain",
+                "engine": "redis",
+                "algorithm": "hnsw",
+                "collection_params": { "hnsw_config": hnsw }
+            }))
+            .unwrap();
+            crate::effective_config::reset();
+            RedisEngine::new(&ec, "localhost").unwrap();
+            let effective = crate::effective_config::snapshot()["effective"].clone();
+            (
+                effective["hnsw_compression"].clone(),
+                effective["hnsw_training_threshold"].clone(),
+            )
+        };
+        let null = serde_json::Value::Null;
+        let _threshold = set("REDIS_HNSW_TRAINING_THRESHOLD", None);
+        {
+            let _compression = set("REDIS_HNSW_COMPRESSION", None);
+            assert_eq!(record(serde_json::json!({ "M": 16 })), (null.clone(), null));
+            assert_eq!(
+                record(serde_json::json!({ "M": 16, "COMPRESSION": "SQ8" })),
+                (serde_json::json!("SQ8"), serde_json::json!(10_240))
+            );
+        }
+        let _compression = set("REDIS_HNSW_COMPRESSION", Some("SQ8"));
+        assert_eq!(
+            record(serde_json::json!({ "M": 16 })),
+            (serde_json::json!("SQ8"), serde_json::json!(10_240))
+        );
     }
 
     #[test]
