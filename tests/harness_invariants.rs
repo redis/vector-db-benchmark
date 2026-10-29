@@ -1639,6 +1639,97 @@ fn every_repo_path_named_in_the_agent_docs_exists() {
     }
 }
 
+/// INV-A5: the deb/rpm package workflow builds with the SAME Rust toolchain
+/// release-binaries.yml pins, only through the scripts its PR check runs, from
+/// packaging sources built `--locked --features release-static`, and its PR
+/// trigger covers every packaging input. A package built with a different
+/// toolchain than the archives of the same release, or by an inline `cargo
+/// build` no PR exercised, is exactly what the release pipeline must not ship.
+#[test]
+fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_scripts() {
+    fn pinned_toolchain(wf: &str, name: &str) -> String {
+        let line = wf
+            .lines()
+            .find(|l| l.trim_start().starts_with("RELEASE_RUST_TOOLCHAIN:"))
+            .unwrap_or_else(|| panic!("{name} must pin RELEASE_RUST_TOOLCHAIN"));
+        line.split_once(':')
+            .unwrap()
+            .1
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string()
+    }
+    let archives = repo_file(".github/workflows/release-binaries.yml");
+    let packages = repo_file(".github/workflows/release-packages.yml");
+    assert_eq!(
+        pinned_toolchain(&packages, "release-packages.yml"),
+        pinned_toolchain(&archives, "release-binaries.yml"),
+        "release-packages.yml and release-binaries.yml pin different Rust toolchains"
+    );
+    for needed in [
+        "scripts/release/build-deb.sh",
+        "scripts/release/build-rpm.sh",
+        "scripts/release/test-package.sh",
+        "scripts/release/publish-apt.sh",
+        "scripts/release/publish-yum.sh",
+        "VDB_BUILD_GIT_SHA",
+    ] {
+        assert!(
+            packages.contains(needed),
+            "release-packages.yml no longer uses `{needed}`"
+        );
+    }
+    for line in packages.lines() {
+        let line = line.trim();
+        assert!(
+            !(line.starts_with("run:") && (line.contains("cargo build") || line.contains("dpkg-buildpackage") || line.contains("rpmbuild"))),
+            "release-packages.yml builds inline:\n    {line}\n\
+             Go through scripts/release/build-deb.sh / build-rpm.sh, so a PR builds what a release ships."
+        );
+    }
+    // Both package sources build the tag's lockfile with the static feature,
+    // so a package depends on glibc alone (what test-package.sh installs on).
+    for (file, build_line) in [
+        ("debian/rules", "cargo build"),
+        ("rpm/vector-db-benchmark.spec", "cargo build"),
+    ] {
+        let src = repo_file(file);
+        let build = src
+            .lines()
+            .find(|l| l.trim_start().starts_with(build_line))
+            .unwrap_or_else(|| panic!("{file} has no `{build_line}` line"));
+        for flag in [
+            "--release",
+            "--locked",
+            "--features release-static",
+            "--bins",
+        ] {
+            assert!(build.contains(flag), "{file}: `{build}` lacks {flag}");
+        }
+    }
+    let pr = packages
+        .split_once("  pull_request:")
+        .expect("release-packages.yml must run on pull_request")
+        .1
+        .split_once("\npermissions:")
+        .expect("the pull_request block must precede `permissions:`")
+        .0;
+    for input in [
+        "'debian/**'",
+        "'rpm/**'",
+        "'scripts/release/build-deb.sh'",
+        "'scripts/release/build-rpm.sh'",
+        "'scripts/release/test-package.sh'",
+        "'scripts/release/lib.sh'",
+        "'.github/workflows/release-packages.yml'",
+    ] {
+        assert!(
+            pr.contains(input),
+            "release-packages.yml's pull_request paths no longer include {input}"
+        );
+    }
+}
+
 /// INV-A4 (#366): the release-archive workflow builds through the Makefile and
 /// the scripts its PR check runs, and its PR trigger covers every input of the
 /// archive. The PR run is the only time the archive path executes before a

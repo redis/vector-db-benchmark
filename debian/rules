@@ -1,0 +1,55 @@
+#!/usr/bin/make -f
+# vector-db-benchmark Debian packaging. Driven by scripts/release/build-deb.sh
+# (which writes debian/changelog, installs rustup and runs dpkg-buildpackage);
+# the same rules build on every codename the package is published for.
+#
+# The binaries are built with --features release-static, so the package links
+# HDF5, zlib and OpenSSL in and depends on nothing but glibc (dh_shlibdeps
+# computes that). --locked: the tag's Cargo.lock, never a re-resolve.
+
+#export DH_VERBOSE = 1
+export CARGO_HOME ?= $(HOME)/.cargo
+export PATH := $(CARGO_HOME)/bin:$(PATH)
+# hdf5-sys links the system libhdf5 when HDF5_DIR is set (the Makefile exports it
+# for normal builds); the package must get the bundled static one.
+unexport HDF5_DIR HDF5_VERSION
+# A build tree without a usable .git (a container running as another uid, a
+# source tarball) would otherwise report the commit as unknown.
+VDB_BUILD_GIT_SHA ?= $(shell git -c safe.directory='*' rev-parse HEAD 2>/dev/null)
+export VDB_BUILD_GIT_SHA
+
+PKG    := vector-db-benchmark
+DESTD  := debian/$(PKG)
+BINS   := vector-db-benchmark prepare-msmarco generate-dataset
+LIBEX  := bench_npy bench_jsonl bench_hdf5
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	@command -v cargo >/dev/null || { echo "cargo not found on PATH; run scripts/release/build-deb.sh (installs rustup)" >&2; exit 1; }
+	cargo --version && rustc --version
+
+override_dh_auto_build:
+	cargo build --release --locked --features release-static --bins
+
+# cargo's own tests need Docker-backed engines; CI runs them elsewhere.
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -d $(DESTD)/usr/bin $(DESTD)/usr/lib/$(PKG) $(DESTD)/usr/share/$(PKG)/datasets $(DESTD)/usr/share/$(PKG)/experiments
+	for b in $(BINS);  do install -m 0755 target/release/$$b $(DESTD)/usr/bin/$$b; done
+	for b in $(LIBEX); do install -m 0755 target/release/$$b $(DESTD)/usr/lib/$(PKG)/$$b; done
+	install -m 0644 datasets/datasets.json $(DESTD)/usr/share/$(PKG)/datasets/
+	cp -R datasets/random-100 $(DESTD)/usr/share/$(PKG)/datasets/
+	cp -R experiments/configurations $(DESTD)/usr/share/$(PKG)/experiments/
+	find $(DESTD)/usr/share/$(PKG) -type f -exec chmod 0644 {} + -o -type d -exec chmod 0755 {} +
+
+# Keep target/ between dist builds on the same tree; dpkg-buildpackage calls
+# clean first and `cargo clean` would throw the dependency cache away.
+override_dh_auto_clean:
+	rm -rf $(DESTD) debian/files debian/*.substvars debian/*.debhelper debian/.debhelper
+
+# Release binaries carry no debug info worth a -dbgsym package.
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym

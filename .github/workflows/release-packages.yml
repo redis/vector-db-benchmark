@@ -1,0 +1,422 @@
+name: Release packages (deb/rpm)
+
+# Native .deb and .rpm packages for a release, published to the Redis APT and
+# YUM repositories (packages.redis.io, or its staging bucket) in the same
+# layout memtier-benchmark uses:
+#   deb/dists/<codename>/...   one build per codename (focal..resolute,
+#                              bullseye..trixie), amd64 + arm64, via deb-s3
+#   rpm/<distro>/<arch>/       el8, el9, el10, amzn2023 x x86_64, aarch64,
+#                              createrepo_c metadata, public-read objects
+#
+# Every package is built natively INSIDE a container of the distribution it is
+# for (memtier's model), with --features release-static from #366 and the Rust
+# toolchain release-binaries.yml pins, so a package depends on nothing but that
+# distro's glibc. The packages are served by the repositories, not attached to
+# the GitHub release (the release's assets are #366's archives + SHA256SUMS). Then it is installed and run on a
+# bare container of that distribution, both from the file and from a local
+# repository laid out like packages.redis.io (scripts/release/test-package.sh).
+#
+# Where it publishes is the GitHub ENVIRONMENT, and nothing else differs:
+#   staging  the staging bucket (redis-test-package-repository, us-east-2)
+#            — workflow_dispatch with release_type=internal (the default)
+#   build    production, packages.redis.io — a published non-prerelease
+#            release, or workflow_dispatch with release_type=public
+# Each environment carries the same secret names as memtier-benchmark's `build`
+# environment: APT_S3_BUCKET, APT_S3_REGION, APT_SIGNING_KEY and either
+# APT_S3_IAM_ARN (OIDC role to assume) or APT_S3_ACCESS_KEY_ID +
+# APT_S3_SECRET_ACCESS_KEY. Pull requests build and test, never publish.
+#
+# The matrix comes from repository variables when set (as in memtier):
+#   vars.DEB_DISTS   JSON list of codenames   default: see the plan job
+#   vars.RPM_DISTROS JSON list of el8/el9/el10/amzn2023
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build packages for
+        required: true
+        type: string
+      release_type:
+        description: Where to publish (internal = staging bucket, public = packages.redis.io, none = build and test only)
+        type: choice
+        options: [internal, public, none]
+        default: internal
+      overwrite:
+        description: Allow replacing a version already in the repository (staging only)
+        type: boolean
+        default: false
+      deb_dists:
+        description: Override codenames, comma-separated (e.g. jammy,noble); empty = all
+        required: false
+        type: string
+      rpm_distros:
+        description: Override RPM distros, comma-separated (e.g. el9,amzn2023); empty = all
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'debian/**'
+      - 'rpm/**'
+      - 'scripts/release/build-deb.sh'
+      - 'scripts/release/build-rpm.sh'
+      - 'scripts/release/test-package.sh'
+      - 'scripts/release/publish-apt.sh'
+      - 'scripts/release/publish-yum.sh'
+      - 'scripts/release/lib.sh'
+      - '.github/workflows/release-packages.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-packages-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Same pin as release-binaries.yml (tests/harness_invariants.rs checks they agree):
+  # the packages are built with the toolchain the release archives are.
+  RELEASE_RUST_TOOLCHAIN: '1.99.1'
+  DEFAULT_DEB_DISTS: '["focal","jammy","noble","resolute","bullseye","bookworm","trixie"]'
+  DEFAULT_RPM_DISTROS: '["el8","el9","el10","amzn2023"]'
+
+jobs:
+  plan:
+    name: Resolve tag, commit and matrix
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      release: ${{ steps.plan.outputs.release }}
+      publish_to: ${{ steps.plan.outputs.publish_to }}
+      deb_matrix: ${{ steps.matrix.outputs.deb_matrix }}
+      rpm_matrix: ${{ steps.matrix.outputs.rpm_matrix }}
+      deb_dists: ${{ steps.matrix.outputs.deb_dists }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request)
+              tag=""; sha="$PR_SHA"; release=false; publish_to=none ;;
+            release|workflow_dispatch)
+              tag="${RELEASE_TAG:-$INPUT_TAG}"
+              [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "::error::invalid tag '$tag'"; exit 1; }
+              gh release view "$tag" -R "$GITHUB_REPOSITORY" --json tagName >/dev/null ||
+                { echo "::error::no release for tag '$tag'"; exit 1; }
+              sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha)"
+              release=true
+              if [[ "$EVENT" == release ]]; then
+                # A pre-release is built and tested but never published.
+                if [[ "$PRERELEASE" == true ]]; then publish_to=none; else publish_to=build; fi
+              else
+                case "$RELEASE_TYPE" in
+                  public) publish_to=build ;;
+                  internal) publish_to=staging ;;
+                  *) publish_to=none ;;
+                esac
+              fi ;;
+            *) echo "::error::unexpected event $EVENT"; exit 1 ;;
+          esac
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve a commit"; exit 1; }
+          {
+            echo "tag=$tag"; echo "sha=$sha"; echo "release=$release"; echo "publish_to=$publish_to"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${tag:-PR} from $sha; publish to: $publish_to" >> "$GITHUB_STEP_SUMMARY"
+      - id: matrix
+        env:
+          VAR_DEB_DISTS: ${{ vars.DEB_DISTS }}
+          VAR_RPM_DISTROS: ${{ vars.RPM_DISTROS }}
+          IN_DEB_DISTS: ${{ inputs.deb_dists }}
+          IN_RPM_DISTROS: ${{ inputs.rpm_distros }}
+        run: |
+          set -euo pipefail
+          to_json_list() { printf '%s' "$1" | tr -d ' ' | jq -R -c 'split(",") | map(select(length > 0))'; }
+          if [[ -n "$IN_DEB_DISTS" ]]; then deb="$(to_json_list "$IN_DEB_DISTS")"
+          elif [[ -n "$VAR_DEB_DISTS" ]]; then deb="$(printf '%s' "$VAR_DEB_DISTS" | jq -c .)"
+          else deb="$DEFAULT_DEB_DISTS"; fi
+          if [[ -n "$IN_RPM_DISTROS" ]]; then rpm="$(to_json_list "$IN_RPM_DISTROS")"
+          elif [[ -n "$VAR_RPM_DISTROS" ]]; then rpm="$(printf '%s' "$VAR_RPM_DISTROS" | jq -c .)"
+          else rpm="$DEFAULT_RPM_DISTROS"; fi
+          # codename -> container image; distro -> container image. Unknown
+          # names fail here, not twenty minutes into a build.
+          deb_matrix="$(printf '%s' "$deb" | jq -c '
+            def image: if . == "focal" or . == "jammy" or . == "noble" or . == "resolute" then "ubuntu:\(.)"
+                       elif . == "bullseye" or . == "bookworm" or . == "trixie" then "debian:\(.)"
+                       else error("unknown codename \(.)") end;
+            {include: [ .[] as $d | ("amd64","arm64") as $a |
+              {dist: $d, arch: $a, image: ($d|image),
+               runner: (if $a == "arm64" then "ubuntu-24.04-arm" else "ubuntu-latest" end)} ]}')"
+          rpm_matrix="$(printf '%s' "$rpm" | jq -c '
+            def image: if . == "el8" then "rockylinux:8" elif . == "el9" then "rockylinux:9"
+                       elif . == "el10" then "rockylinux/rockylinux:10" elif . == "amzn2023" then "amazonlinux:2023"
+                       else error("unknown rpm distro \(.)") end;
+            {include: [ .[] as $d | ("x86_64","aarch64") as $a |
+              {distro: $d, arch: $a, image: ($d|image),
+               runner: (if $a == "aarch64" then "ubuntu-24.04-arm" else "ubuntu-latest" end)} ]}')"
+          {
+            echo "deb_matrix=$deb_matrix"; echo "rpm_matrix=$rpm_matrix"; echo "deb_dists=$deb"
+          } >> "$GITHUB_OUTPUT"
+          echo "deb: $deb" >> "$GITHUB_STEP_SUMMARY"; echo "rpm: $rpm" >> "$GITHUB_STEP_SUMMARY"
+
+  build-deb:
+    name: deb ${{ matrix.dist }} ${{ matrix.arch }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.deb_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      # actions/checkout needs git in the container, and a newer one than
+      # focal's for sparse-checkout-free full clones to behave; apt's is fine.
+      - name: Container prerequisites
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Confirm the checkout is the planned commit
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE" && test "$(git rev-parse HEAD)" = "$SHA"
+      - name: Build (scripts/release/build-deb.sh)
+        run: |
+          set -euo pipefail
+          args=(--dist "${{ matrix.dist }}" --out dist --install-deps)
+          [[ "${{ needs.plan.outputs.release }}" == true ]] && args+=(--release --tag "$TAG")
+          VDB_BUILD_GIT_SHA="$SHA" bash scripts/release/build-deb.sh "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.dist }}-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  build-rpm:
+    name: rpm ${{ matrix.distro }} ${{ matrix.arch }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.rpm_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - name: Container prerequisites
+        run: |
+          if command -v dnf >/dev/null; then dnf install -y git tar gzip findutils; else yum install -y git tar gzip findutils; fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Confirm the checkout is the planned commit
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE" && test "$(git rev-parse HEAD)" = "$SHA"
+      - name: Build (scripts/release/build-rpm.sh)
+        run: |
+          set -euo pipefail
+          args=(--out dist --install-deps)
+          [[ "${{ needs.plan.outputs.release }}" == true ]] && args+=(--release --tag "$TAG")
+          VDB_BUILD_GIT_SHA="$SHA" bash scripts/release/build-rpm.sh "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
+          path: dist/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+  test-deb:
+    name: install deb ${{ matrix.dist }} ${{ matrix.arch }}
+    needs: [plan, build-deb]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.deb_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.dist }}-${{ matrix.arch }}
+          path: pkg
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          sparse-checkout: scripts/release
+          path: src
+      - name: Install and run on a bare ${{ matrix.image }} (scripts/release/test-package.sh)
+        run: bash src/scripts/release/test-package.sh pkg/*.deb --expect-sha "${{ needs.plan.outputs.sha }}"
+
+  test-rpm:
+    name: install rpm ${{ matrix.distro }} ${{ matrix.arch }}
+    needs: [plan, build-rpm]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.rpm_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    steps:
+      - name: Container prerequisites
+        run: |
+          if command -v dnf >/dev/null; then dnf install -y findutils tar gzip; else yum install -y findutils tar gzip; fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
+          path: pkg
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          sparse-checkout: scripts/release
+          path: src
+      - name: Install and run on a bare ${{ matrix.image }} (scripts/release/test-package.sh)
+        run: bash src/scripts/release/test-package.sh pkg/*.rpm --expect-sha "${{ needs.plan.outputs.sha }}" --repo-id "${{ matrix.distro }}"
+
+  publish:
+    name: Publish to ${{ needs.plan.outputs.publish_to }}
+    needs: [plan, build-deb, build-rpm, test-deb, test-rpm]
+    if: needs.plan.outputs.publish_to != 'none'
+    runs-on: ubuntu-22.04
+    environment: ${{ needs.plan.outputs.publish_to }}
+    permissions:
+      contents: read
+      id-token: write   # OIDC role assumption (APT_S3_IAM_ARN)
+    env:
+      DEB_S3_VERSION: "0.11.3"
+      TAG: ${{ needs.plan.outputs.tag }}
+      PUBLISH_TO: ${{ needs.plan.outputs.publish_to }}
+    steps:
+      - name: Check the environment is configured
+        env:
+          BUCKET: ${{ secrets.APT_S3_BUCKET }}
+          REGION: ${{ secrets.APT_S3_REGION }}
+          ROLE: ${{ secrets.APT_S3_IAM_ARN }}
+          KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
+          SIGNING: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$BUCKET" && -n "$REGION" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_S3_BUCKET / APT_S3_REGION"; exit 1; }
+          [[ -n "$ROLE" || -n "$KEY_ID" ]] || { echo "::error::environment '$PUBLISH_TO' has neither APT_S3_IAM_ARN nor APT_S3_ACCESS_KEY_ID"; exit 1; }
+          if [[ "$PUBLISH_TO" == build && -z "$SIGNING" ]]; then echo "::error::refusing to publish to production unsigned (no APT_SIGNING_KEY)"; exit 1; fi
+          echo "use_oidc=$([[ -n "$ROLE" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          sparse-checkout: scripts/release
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: debs
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rpm-*
+          path: rpms
+      - name: Every matrix cell produced a package
+        run: |
+          set -euo pipefail
+          find debs rpms -type f | sort
+          want_deb=$(echo '${{ needs.plan.outputs.deb_matrix }}' | jq '.include | length')
+          want_rpm=$(echo '${{ needs.plan.outputs.rpm_matrix }}' | jq '.include | length')
+          test "$(find debs -name '*.deb' | wc -l)" -eq "$want_deb" || { echo "::error::expected $want_deb .deb files"; exit 1; }
+          test "$(find rpms -name '*.rpm' | wc -l)" -eq "$want_rpm" || { echo "::error::expected $want_rpm .rpm files"; exit 1; }
+      - name: AWS credentials (OIDC role)
+        if: env.use_oidc == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.APT_S3_IAM_ARN }}
+          aws-region: ${{ secrets.APT_S3_REGION }}
+      - name: AWS credentials (access key)
+        if: env.use_oidc != 'true'
+        run: |
+          {
+            echo "AWS_ACCESS_KEY_ID=${{ secrets.APT_S3_ACCESS_KEY_ID }}"
+            echo "AWS_SECRET_ACCESS_KEY=${{ secrets.APT_S3_SECRET_ACCESS_KEY }}"
+            echo "AWS_DEFAULT_REGION=${{ secrets.APT_S3_REGION }}"
+          } >> "$GITHUB_ENV"
+      - name: Import the signing key (if the environment has one)
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          if [[ -z "$APT_SIGNING_KEY" ]]; then echo "::warning::no APT_SIGNING_KEY in '$PUBLISH_TO': packages and indexes will be unsigned"; exit 0; fi
+          mkdir -m 0700 -p ~/.gnupg
+          echo "$APT_SIGNING_KEY" | gpg --batch --import
+      - name: Install deb-s3, createrepo_c, rpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends createrepo-c rpm dpkg-dev
+          aws --version
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "2.7"
+      - name: Install deb-s3 ${{ env.DEB_S3_VERSION }}
+        run: |
+          curl -sLO "https://github.com/deb-s3/deb-s3/releases/download/$DEB_S3_VERSION/deb-s3-$DEB_S3_VERSION.gem"
+          gem install "deb-s3-$DEB_S3_VERSION.gem"
+      - name: Publish APT (scripts/release/publish-apt.sh)
+        env:
+          BUCKET: ${{ secrets.APT_S3_BUCKET }}
+          REGION: ${{ secrets.APT_S3_REGION }}
+          OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}
+        run: |
+          set -euo pipefail
+          args=(--bucket "$BUCKET" --region "$REGION" --in debs --prefix deb --origin packages.redis.io)
+          [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
+          bash scripts/release/publish-apt.sh "${args[@]}"
+      - name: Publish YUM (scripts/release/publish-yum.sh)
+        env:
+          BUCKET: ${{ secrets.APT_S3_BUCKET }}
+          OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}
+        run: |
+          set -euo pipefail
+          args=(--bucket "$BUCKET" --in rpms --prefix rpm)
+          [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
+          bash scripts/release/publish-yum.sh "${args[@]}"
+      - name: Verify what the repository now serves
+        env:
+          BUCKET: ${{ secrets.APT_S3_BUCKET }}
+          REGION: ${{ secrets.APT_S3_REGION }}
+          DEB_DISTS: ${{ needs.plan.outputs.deb_dists }}
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_TO" == build ]]; then base="https://packages.redis.io"; else base="https://$BUCKET.s3.$REGION.amazonaws.com"; fi
+          for d in $(echo "$DEB_DISTS" | jq -r '.[]'); do
+            for a in amd64 arm64; do
+              index="$(curl -fsSL "$base/deb/dists/$d/main/binary-$a/Packages")"
+              grep -q "^Package: vector-db-benchmark$" <<<"$index" ||
+                { echo "::error::$base/deb/dists/$d/main/binary-$a/Packages does not list vector-db-benchmark"; exit 1; }
+            done
+            echo "ok: $base/deb/dists/$d"
+          done
+          # The index must LIST the package (not just exist): another product's
+          # publish racing ours could have regenerated repodata without it.
+          while IFS= read -r -d '' f; do
+            rel="$(rpm -qp --queryformat '%{RELEASE}' "$f")"; arch="$(rpm -qp --queryformat '%{ARCH}' "$f")"
+            case "$rel" in *.amzn2023*) distro=amzn2023 ;; *) distro="el${rel##*.el}"; distro="${distro%%_*}" ;; esac
+            dir="$base/rpm/$distro/$arch"
+            repomd="$(curl -fsSL -H 'Cache-Control: no-cache' "$dir/repodata/repomd.xml")" || { echo "::error::no repomd.xml at $dir"; exit 1; }
+            primary="$(sed -n 's/.*href="\(repodata\/[^"]*primary\.xml\.gz\)".*/\1/p' <<<"$repomd" | head -n1)"
+            [[ -n "$primary" ]] || { echo "::error::$dir/repodata/repomd.xml names no primary.xml.gz"; exit 1; }
+            listed="$(curl -fsSL -H 'Cache-Control: no-cache' "$dir/$primary" | gzip -dc | sed -n 's/.*<location href="\([^"]*\)".*/\1/p')"
+            grep -qxF "$(basename "$f")" <<<"$listed" || { echo "::error::$dir/$primary does not list $(basename "$f") (concurrent publish into the shared directory?)"; exit 1; }
+            curl -fsSI "$dir/$(basename "$f")" >/dev/null || { echo "::error::$dir/$(basename "$f") not served"; exit 1; }
+            echo "ok: $dir/$(basename "$f") (indexed)"
+          done < <(find rpms -name '*.rpm' -print0)
+      - name: Summary
+        env:
+          BUCKET: ${{ secrets.APT_S3_BUCKET }}
+        run: |
+          {
+            echo "## Packages for ${TAG} published to \`$PUBLISH_TO\` (s3://$BUCKET)"
+            echo; echo '```'; find debs rpms -type f -printf '%f\n' | sort; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

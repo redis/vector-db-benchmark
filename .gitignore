@@ -22,3 +22,6 @@ target/
 
 
 v0/results/
+
+# Written per build by scripts/release/build-deb.sh (version~codename)
+debian/changelog

@@ -275,6 +275,62 @@ digests differ from the ones already on the release, and the run refuses to
 mix builds. Rebuilding a tag on purpose is a `workflow_dispatch` with `tag`
 and `clobber: true`, which replaces the whole set.
 
+### Linux packages (APT / YUM)
+
+Native packages are built for every release from the same commit as the archives
+above, one per distribution, and published to the Redis package repositories
+(`.github/workflows/release-packages.yml`). They install `vector-db-benchmark`,
+`prepare-msmarco` and `generate-dataset` into `/usr/bin`, the reader
+micro-benchmarks under `/usr/lib/vector-db-benchmark` (`/usr/libexec` on RPM
+systems), and the dataset catalogue plus engine configurations under
+`/usr/share/vector-db-benchmark`. HDF5, zlib and OpenSSL are linked in; the
+package depends on glibc only.
+
+**Debian 11/12/13 and Ubuntu 20.04/22.04/24.04/26.04** (amd64, arm64), from the
+[packages.redis.io](https://packages.redis.io) APT repository:
+
+```bash
+sudo apt install lsb-release curl gpg
+curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+sudo apt-get update
+sudo apt-get install vector-db-benchmark
+```
+
+**RHEL 8/9/10 compatible** (Rocky, Alma; x86_64, aarch64):
+
+```bash
+sudo curl -fsSL https://packages.redis.io/gpg -o /etc/pki/rpm-gpg/redis-archive-keyring.gpg
+sudo tee /etc/yum.repos.d/redis.repo <<'EOF'
+[redis]
+name=Redis
+baseurl=https://packages.redis.io/rpm/el$releasever/$basearch
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/redis-archive-keyring.gpg
+EOF
+sudo dnf install -y vector-db-benchmark
+```
+
+**Amazon Linux 2023** uses its own path, because its `$releasever` is `2023`:
+replace the `baseurl` above with `https://packages.redis.io/rpm/amzn2023/$basearch`.
+
+The CLI looks for `datasets/datasets.json` in the working directory (and up to
+five parents) and writes `results/` next to it, so work from a copy of the
+packaged tree:
+
+```bash
+cp -r /usr/share/vector-db-benchmark ~/vdb && cd ~/vdb
+vector-db-benchmark --version            # vector-db-benchmark 0.2.0 (git <commit the package was built from>)
+vector-db-benchmark --describe datasets
+vector-db-benchmark --host localhost --engines 'redis-single*' --datasets glove-25-angular
+```
+
+To build the packages yourself, on the target distribution:
+`make release-deb DIST=$(lsb_release -cs) INSTALL_DEPS=1` or
+`make release-rpm INSTALL_DEPS=1`, then
+`make release-test-package PKG=dist/<file>` installs and runs the result.
+
 ### Docker (recommended)
 
 ```bash

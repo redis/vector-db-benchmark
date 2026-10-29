@@ -4,6 +4,7 @@
 #   make setup               - Install system deps and Rust toolchain
 #   make install             - Build and install binary to PREFIX (/usr/local)
 #   make install-release     - Download + verify a prebuilt release for this host
+#   make release-deb/rpm     - Build the native .deb / .rpm on the target distro
 #   make vector-db-benchmark - Build the main CLI binary
 #   make test                - Run Rust unit tests (no docker needed)
 #   make integration-test    - Run integration tests (requires redis:8.6.0 docker)
@@ -131,6 +132,27 @@ release-selftest:
 release-checksums:
 	bash scripts/release/checksums.sh write "$(RELEASE_OUT)"
 	bash scripts/release/checksums.sh check "$(RELEASE_OUT)"
+
+# Native .deb / .rpm packages (.github/workflows/release-packages.yml builds
+# these inside a container of every codename / distro they are published for).
+# Run ON the target distribution; DIST is the Debian/Ubuntu codename. Add
+# INSTALL_DEPS=1 to apt-get/dnf the build dependencies and rustup first (what
+# the CI containers do). Output: RELEASE_OUT/*.deb or *.rpm.
+.PHONY: release-deb
+release-deb:
+	@test -n "$(DIST)" || { echo "usage: make release-deb DIST=<codename> [INSTALL_DEPS=1] [TAG=<tag>]"; exit 2; }
+	bash scripts/release/build-deb.sh --dist "$(DIST)" --out "$(RELEASE_OUT)" $(if $(INSTALL_DEPS),--install-deps) $(if $(TAG),--release --tag "$(TAG)")
+
+.PHONY: release-rpm
+release-rpm:
+	bash scripts/release/build-rpm.sh --out "$(RELEASE_OUT)" $(if $(INSTALL_DEPS),--install-deps) $(if $(TAG),--release --tag "$(TAG)")
+
+# Install a built package on this (bare) host and run it, from the file and
+# from a local repository laid out like packages.redis.io.
+.PHONY: release-test-package
+release-test-package:
+	@test -n "$(PKG)" || { echo "usage: make release-test-package PKG=<file.deb|file.rpm> [SHA=<40-hex>]"; exit 2; }
+	bash scripts/release/test-package.sh "$(PKG)" --expect-sha "$(or $(SHA),$(shell git rev-parse HEAD))"
 
 # ============================================================
 # TEST - Run Rust unit tests with dataset coverage
@@ -510,6 +532,9 @@ help:
 	@echo "  make release-archive   - Package a prebuilt release archive TAG=<tag> [RELEASE_TARGET=]"
 	@echo "  make release-checksums - Write + check SHA256SUMS over RELEASE_OUT (default: dist)"
 	@echo "  make release-selftest  - Self-test the release scripts (publish logic vs a fake gh)"
+	@echo "  make release-deb       - Build the .deb for this host's codename DIST=<codename> [INSTALL_DEPS=1]"
+	@echo "  make release-rpm       - Build the RPM on this el8/el9/el10/AL2023 host [INSTALL_DEPS=1]"
+	@echo "  make release-test-package - Install + run a built package on this host PKG=<file>"
 	@echo "  make test              - Run Rust unit tests (no docker needed)"
 	@echo "  make check             - Linting + formatting ONLY (no tests; see agent-check)"
 	@echo "  make check-strict      - Run linting with warnings as errors"

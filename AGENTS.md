@@ -111,6 +111,13 @@ tests/                # integration_<engine>.rs, plus harness_invariants +
                       #   overhead_invariants (both run in CI, no Docker)
 datasets/datasets.json        # Dataset registry
 experiments/configurations/   # Engine configs (HNSW params, search params)
+debian/, rpm/                 # Native package sources (.deb per codename, .rpm per
+                              #   el8/el9/el10/amzn2023); built with --features
+                              #   release-static, depend on glibc only
+scripts/release/              # package.sh/verify.sh/checksums.sh/publish.sh/selftest.sh
+                              #   (#366 archives), build-deb.sh/build-rpm.sh/test-package.sh
+                              #   (packages), publish-apt.sh/publish-yum.sh (deb-s3 /
+                              #   createrepo_c into the S3 package repository)
 ```
 
 ## Cutting a release (prebuilt binaries, #366)
