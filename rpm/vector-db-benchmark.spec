@@ -74,13 +74,16 @@ export VDB_BUILD_GIT_SHA="%{vdb_git_sha}"
 cargo build --release --locked --features release-static --bins
 
 %install
+# build-rpm.sh exports CARGO_TARGET_DIR (shared with plain builds and the PR
+# cache); a bare rpmbuild builds into ./target.
+bindir="${CARGO_TARGET_DIR:-target}/release"
 install -d %{buildroot}%{_bindir} %{buildroot}%{_libexecdir}/%{name} \
            %{buildroot}%{_datadir}/%{name}/datasets %{buildroot}%{_datadir}/%{name}/experiments
 for b in vector-db-benchmark prepare-msmarco generate-dataset; do
-  install -m 0755 target/release/$b %{buildroot}%{_bindir}/$b
+  install -m 0755 "$bindir/$b" %{buildroot}%{_bindir}/$b
 done
 for b in bench_npy bench_jsonl bench_hdf5; do
-  install -m 0755 target/release/$b %{buildroot}%{_libexecdir}/%{name}/$b
+  install -m 0755 "$bindir/$b" %{buildroot}%{_libexecdir}/%{name}/$b
 done
 install -m 0644 datasets/datasets.json %{buildroot}%{_datadir}/%{name}/datasets/
 cp -R datasets/random-100 %{buildroot}%{_datadir}/%{name}/datasets/
@@ -89,7 +92,7 @@ find %{buildroot}%{_datadir}/%{name} -type f -exec chmod 0644 {} + -o -type d -e
 
 %check
 # A binary that cannot report its version is not worth packaging.
-target/release/vector-db-benchmark --version
+"${CARGO_TARGET_DIR:-target}/release/vector-db-benchmark" --version
 
 %files
 %license LICENSE
