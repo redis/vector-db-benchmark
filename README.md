@@ -1576,6 +1576,12 @@ Neither side of the run loads it:
   `memory.stat` is not counted as used),
   so a container's limit counts, not the host's RAM. The figure and how it was
   derived are recorded as `results.upload_reader.available_memory`.
+  `auto` decides **once per dataset per invocation**: memory is read the
+  first time a dataset is used and that reading is reused for every later
+  config. That way an MxEF sweep against a server that grows on the same host
+  never loads the first config in memory and streams a later one, which
+  would mix two meanings of `upload_time` / `read_time` in one sweep. A
+  separate invocation decides afresh.
   Everything else keeps the pre-#342 in-memory reader — including the
   100K, 1M and 10M MS MARCO variants on a host that can load them, so their
   published `upload_time` keeps meaning upload only (on the streaming path,

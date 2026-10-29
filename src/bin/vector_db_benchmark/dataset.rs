@@ -32,10 +32,11 @@ pub struct Dataset {
     /// (never by the engine) and written to the upload result as
     /// `results.upload_reader`.
     upload_report: Mutex<Option<serde_json::Value>>,
-    /// Memory this process can use (`upload_stream::mem_available`:
-    /// `MemAvailable` capped by the cgroup limit), read once at construction.
-    /// Overridable for tests.
-    mem_available: upload_stream::AvailableMemory,
+    /// Memory readings (`upload_stream::mem_available`: `MemAvailable`
+    /// capped by the cgroup limit) shared by every `Dataset` of one
+    /// invocation, so `auto` decides once per dataset (#361 review): see
+    /// `upload_stream::MemorySnapshots`. Read lazily, on first use.
+    memory: std::sync::Arc<upload_stream::MemorySnapshots>,
 }
 
 /// The corpus as an upload receives it (#342): the three arrays of the
@@ -57,18 +58,37 @@ impl Dataset {
             filter_query_file: std::sync::OnceLock::new(),
             upload_reader: UploadReader::default(),
             upload_report: Mutex::new(None),
-            mem_available: upload_stream::mem_available(),
+            memory: Default::default(),
         }
     }
 
-    /// Replace the measured `MemAvailable` (tests).
+    /// Replace the measured `MemAvailable` (tests): a fresh snapshot set
+    /// already holding `bytes` for this dataset.
     #[cfg(test)]
     pub fn with_mem_available(mut self, bytes: Option<u64>) -> Self {
-        self.mem_available = upload_stream::AvailableMemory {
-            bytes,
-            source: "set by test".into(),
-        };
+        self.memory = Default::default();
+        self.memory
+            .get_or_measure(&self.config.name, || upload_stream::AvailableMemory {
+                bytes,
+                source: "set by test".into(),
+            });
         self
+    }
+
+    /// Share the invocation's memory readings (one per dataset), so every
+    /// config of a sweep gets the same `auto` decision for a dataset.
+    pub fn with_memory_snapshots(
+        mut self,
+        memory: std::sync::Arc<upload_stream::MemorySnapshots>,
+    ) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// This dataset's memory reading for the invocation (measured on first use).
+    fn mem_available(&self) -> upload_stream::AvailableMemory {
+        self.memory
+            .get_or_measure(&self.config.name, upload_stream::mem_available)
     }
 
     /// Set the `--upload-reader` mode.
@@ -113,14 +133,26 @@ impl Dataset {
         self.validate_vector_count()?;
         let compound =
             (self.config.dataset_type.as_deref() == Some("tar")).then_some(path.as_path());
-        match upload_stream::plan(self.upload_reader, compound, self.mem_available.bytes)? {
+        // `memory` and `stream` never read memory; `auto` uses the
+        // invocation's reading for this dataset.
+        let mem = match self.upload_reader {
+            UploadReader::Auto => self.mem_available(),
+            _ => upload_stream::AvailableMemory {
+                bytes: None,
+                source: format!(
+                    "not consulted (--upload-reader {})",
+                    self.upload_reader.as_str()
+                ),
+            },
+        };
+        match upload_stream::plan(self.upload_reader, compound, mem.bytes)? {
             UploadPlan::Stream { layout, reason } => {
                 let stream = CompoundStream::open(&path, normalize)?;
                 self.record_upload_reader(serde_json::json!({
                     "reader": "stream",
                     "flag": self.upload_reader.as_str(),
                     "reason": reason,
-                    "available_memory": self.mem_available.source,
+                    "available_memory": mem.source,
                     "rows": layout.rows,
                     "vector_bytes": layout.data_bytes(),
                 }));
@@ -132,7 +164,7 @@ impl Dataset {
                     "reader": "memory",
                     "flag": self.upload_reader.as_str(),
                     "reason": reason,
-                    "available_memory": self.mem_available.source,
+                    "available_memory": mem.source,
                 }));
                 Ok(UploadSource::InMemory {
                     ids,
@@ -592,7 +624,7 @@ impl Dataset {
             if let Some(layout) =
                 vector_db_benchmark::readers::streamable_layout(&path.join("vectors.npy"))
             {
-                upload_stream::in_memory_fits(layout.data_bytes(), self.mem_available.bytes)
+                upload_stream::in_memory_fits(layout.data_bytes(), self.mem_available().bytes)
                     .map_err(|e| {
                         format!(
                             "'{}': {e}; this path reads the whole corpus (only the redis and \
@@ -1260,10 +1292,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("MemAvailable"));
-        assert_eq!(
-            ds.upload_reader_report().unwrap()["available_memory"],
-            "set by test"
-        );
+        assert!(ds.upload_reader_report().unwrap()["available_memory"]
+            .as_str()
+            .unwrap()
+            .starts_with("set by test"));
         let e = ds.read_vectors(false).unwrap_err();
         assert!(
             e.contains("MemAvailable") && e.contains("--upload-reader memory"),
@@ -1276,6 +1308,33 @@ mod tests {
             .with_upload_reader(UploadReader::Memory)
             .with_mem_available(Some(1));
         assert_eq!(ds.read_vectors(false).unwrap().1, vectors);
+
+        // One invocation, two configs (#361 review): `Dataset`s sharing the
+        // run's snapshots get the reading taken at the dataset's first use —
+        // the second config streams too, rather than re-reading this host's
+        // (larger) memory and loading in memory. The pre-flight agrees.
+        let snaps = std::sync::Arc::new(upload_stream::MemorySnapshots::default());
+        snaps.get_or_measure("count-unit", || upload_stream::AvailableMemory {
+            bytes: Some(119),
+            source: "set by test".into(),
+        });
+        let reports: Vec<_> = (0..2)
+            .map(|_| {
+                let ds =
+                    dataset_at(dir.path(), "tar", Some(5)).with_memory_snapshots(snaps.clone());
+                assert!(matches!(
+                    ds.open_upload(false).unwrap(),
+                    UploadSource::Stream(_)
+                ));
+                assert!(ds.read_vectors(false).is_err());
+                ds.upload_reader_report().unwrap()
+            })
+            .collect();
+        assert_eq!(reports[0], reports[1]);
+        assert!(reports[1]["available_memory"]
+            .as_str()
+            .unwrap()
+            .contains("first use"));
 
         // stream on a dataset the streaming reader cannot read is refused.
         let jsonl = tempfile::tempdir().unwrap();

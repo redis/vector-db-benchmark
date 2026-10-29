@@ -160,6 +160,46 @@ pub fn mem_available() -> AvailableMemory {
     available_memory(&MemoryFiles::read())
 }
 
+/// One memory reading per dataset for a whole invocation (#361 review).
+///
+/// `auto`'s choice of reader ([`plan`]) and the non-streaming pre-flight
+/// ([`in_memory_fits`]) are pure functions of the dataset's files and the
+/// memory reading. A sweep builds a fresh `Dataset` for every engine config,
+/// so reading memory per config let an MxEF sweep against a local server load
+/// the first config in memory and stream a later one once the server had
+/// grown: one sweep with two meanings of `upload_time` / `read_time`. Taking
+/// the reading the first time a dataset is used and reusing it for every
+/// later config of the invocation makes the decision once per dataset.
+/// `--upload-reader memory|stream` never consults it.
+#[derive(Debug, Default)]
+pub struct MemorySnapshots {
+    taken: Mutex<std::collections::HashMap<String, AvailableMemory>>,
+}
+
+impl MemorySnapshots {
+    /// The reading for `dataset`: `measure()`d on its first use in this
+    /// invocation, the same value on every later one.
+    pub fn get_or_measure(
+        &self,
+        dataset: &str,
+        measure: impl FnOnce() -> AvailableMemory,
+    ) -> AvailableMemory {
+        let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        taken
+            .entry(dataset.to_string())
+            .or_insert_with(|| {
+                let mut m = measure();
+                m.source = format!(
+                    "{}; measured at the first use of '{dataset}' in this invocation and \
+                     reused for every later config",
+                    m.source
+                );
+                m
+            })
+            .clone()
+    }
+}
+
 /// `MemAvailable` capped by the cgroup's headroom: `/proc/meminfo` reports the
 /// host, not a container's limit, so inside a 16 GiB container on a 512 GiB
 /// host it alone would let the in-memory reader start and be OOM-killed. The
@@ -537,6 +577,44 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// #361 review: `auto` decides once per dataset per invocation. The
+    /// reading taken at a dataset's first use is reused by every later config
+    /// even when memory has since changed enough to flip the decision; each
+    /// dataset gets its own reading.
+    #[test]
+    fn auto_decides_once_per_dataset_per_invocation() {
+        use super::{auto_streams, AvailableMemory, MemorySnapshots};
+        let at = |bytes| AvailableMemory {
+            bytes: Some(bytes),
+            source: "test".into(),
+        };
+        let snaps = MemorySnapshots::default();
+        let vector_bytes = 100;
+        // First config: plenty of memory -> the in-memory reader.
+        let first = snaps.get_or_measure("ds", || at(1_000));
+        assert!(auto_streams(vector_bytes, first.bytes).is_err());
+        // A later config, after the server grew: a fresh reading would stream.
+        assert!(auto_streams(vector_bytes, Some(150)).is_ok());
+        let measured = std::cell::Cell::new(false);
+        let later = snaps.get_or_measure("ds", || {
+            measured.set(true);
+            at(150)
+        });
+        assert!(
+            !measured.get(),
+            "re-measured memory for a dataset already decided"
+        );
+        assert_eq!(later, first);
+        assert!(auto_streams(vector_bytes, later.bytes).is_err());
+        assert!(
+            first.source.contains("first use of 'ds'"),
+            "{}",
+            first.source
+        );
+        // Another dataset is measured on its own first use.
+        assert_eq!(snaps.get_or_measure("other", || at(7)).bytes, Some(7));
+        assert_eq!(snaps.get_or_measure("ds", || at(1)).bytes, Some(1_000));
+    }
     /// #342 x #344: a streamed ingest reports its phases on one clock — the
     /// upload phase is the streaming upload, the index wait follows it, the
     /// phases pass `check_legacy_fields` against the `upload_time` /
