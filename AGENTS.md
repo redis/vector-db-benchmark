@@ -111,6 +111,13 @@ tests/                # integration_<engine>.rs, plus harness_invariants +
                       #   overhead_invariants (both run in CI, no Docker)
 datasets/datasets.json        # Dataset registry
 experiments/configurations/   # Engine configs (HNSW params, search params)
+debian/, rpm/                 # Native package sources (.deb per codename, .rpm per
+                              #   el8/el9/el10/amzn2023); built with --features
+                              #   release-static, depend on glibc only
+scripts/release/              # package.sh/verify.sh/checksums.sh/publish.sh/selftest.sh
+                              #   (#366 archives), build-deb.sh/build-rpm.sh/test-package.sh
+                              #   (packages), publish-apt.sh/publish-yum.sh (deb-s3 /
+                              #   createrepo_c into the S3 package repository)
 ```
 
 ## Cutting a release (prebuilt binaries, #366)
@@ -132,6 +139,61 @@ digests differ and the run refuses. Rebuild a tag on purpose only with
 `workflow_dispatch` (`tag` plus `clobber: true`, which replaces the whole set). Everything except the upload also runs on PRs that
 touch the archive's inputs: `make release-selftest` and
 `scripts/release/install-test.sh` run there.
+
+### Packages (`release-packages.yml`)
+
+The same `release: published` event also builds a .deb per codename and an
+.rpm per el8/el9/el10/amzn2023, both architectures, installs each on a bare
+container, and publishes them to packages.redis.io (the `build` environment).
+
+- **Production is off until `vars.PACKAGES_PRODUCTION` is `true`.** Until
+  then a final release builds and tests the packages, publishes nothing, and
+  says so in a `::notice::` (the run stays green; no `build` environment is
+  created); `release_type=public` is refused. Before setting the variable:
+  create the `build` environment, add required reviewers, limit deployment
+  branches/tags to `master`, `[0-9]*.[0-9]*.[0-9]*` and `v[0-9]*.[0-9]*.[0-9]*`
+  (and add a tag ruleset restricting who may push those tags: a dispatch runs
+  the dispatched ref's copy of the workflow's guards), then add the five
+  secrets (as memtier-benchmark's `build`) and the environment variable
+  `APT_SIGNING_FPR=54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C`
+  (packages.redis.io/gpg). A key with another fingerprint is refused, and so
+  is a codename whose existing InRelease another key signed.
+- **Crate version stays `X.Y.Z`, also for an rc.** The build scripts refuse a
+  `-` in it. Packages carry that version without a suffix, so production only
+  ever takes a final tag (`X.Y.Z` / `vX.Y.Z`, `check_production_tag`). An rc
+  release MUST be marked as a pre-release: then it is built and tested and
+  never published. Once production is on, an rc NOT marked as one fails the
+  package run at the plan job, before anything is built or tested.
+- **A pre-release later promoted to final** gets no packages from the
+  `published` event (it already fired). Dispatch `release_type=public
+  tag=<tag>` from `master`.
+- **Re-running a failed publish:** use **Re-run failed jobs**. It reuses the
+  run's build artifacts (unsigned; the publish job signs them each time, and
+  the identity check ignores signatures), so what is already published is
+  skipped as the same build and the rest completes (this is also the fix when
+  publish-yum.sh's index check reports another product's RPM missing). It
+  re-runs the run's OWN scripts, so it cannot pick up a fix to them.
+  **Re-run all jobs**, or any new dispatch, rebuilds: the rebuilt packages
+  are not byte-identical (changelog date, build time), deb-s3 and
+  publish-yum.sh refuse them as a different build, and production has no
+  `--overwrite`. So a new dispatch (`deb_dists` / `rpm_distros` limited to
+  what is missing) can only publish targets that nothing of this version
+  reached yet; both lists must name at least one target, and APT publishes
+  before YUM. A release whose APT side, or one arch of an RPM distro, is
+  already published cannot be finished by the workflow once the run can no
+  longer be re-run (or when the fix is in the scripts): that needs a manual
+  publish of the remaining artifacts with the packaging team.
+- **Stale deb-s3 lock:** a job killed mid-publish leaves
+  `deb/dists/<codename>/main/binary-/lockfile`; the next run waits ten
+  minutes logging "Repository is locked by another user", then fails with
+  `uncaught throw "Unable to obtain a lock after 60, giving up."`. Delete that
+  object by hand after checking nothing else is publishing.
+- **Before tagging,** a green full-matrix staging rehearsal of the commit is
+  the check that every codename/distro still builds (PRs build jammy and el9
+  only): `gh workflow run release-packages.yml --ref <branch>
+  -f release_type=internal -f overwrite=true`.
+- **After the first production publish,** remove the "Coming soon" note from
+  the README's "Linux packages" section.
 
 ## Dataset Formats
 

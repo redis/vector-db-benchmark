@@ -1,0 +1,35 @@
+Source: vector-db-benchmark
+Section: utils
+Priority: optional
+Maintainer: Redis Ltd. <oss@redislabs.com>
+# cargo and rustc are NOT listed: the distros' own are too old for this crate
+# and its lock file. scripts/release/build-deb.sh installs a current stable
+# toolchain with rustup before calling dpkg-buildpackage, and checks it is on
+# PATH. cmake and perl build the statically linked HDF5 / zlib / OpenSSL
+# (--features release-static), so the package needs none of those libraries
+# at run time, on any codename.
+# lintian's embedded-library (zlib/openssl/hdf5) is intentional: see above.
+Build-Depends: debhelper-compat (= 12), cmake, perl, pkg-config, ca-certificates, git
+Standards-Version: 4.6.2
+Homepage: https://github.com/redis/vector-db-benchmark
+Vcs-Browser: https://github.com/redis/vector-db-benchmark
+Vcs-Git: https://github.com/redis/vector-db-benchmark.git
+Rules-Requires-Root: no
+
+Package: vector-db-benchmark
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Framework for benchmarking vector search engines
+ vector-db-benchmark runs upload and search workloads against vector
+ databases (Redis Query Engine and Vector Sets, Valkey, Dragonfly, KiviDB,
+ Qdrant, Elasticsearch, OpenSearch, pgvector, MongoDB, Turbopuffer, and
+ more), with filtered, hybrid, sparse and full-text variants, and writes
+ per-run JSON results with recall, throughput and latency percentiles.
+ .
+ The package installs the CLI (vector-db-benchmark), the dataset tools
+ (prepare-msmarco, generate-dataset) and the reader micro-benchmarks
+ (bench_npy, bench_jsonl, bench_hdf5 under /usr/lib/vector-db-benchmark).
+ The dataset catalogue and the engine configurations the CLI reads from
+ its working directory are installed under /usr/share/vector-db-benchmark.
+ .
+ HDF5, zlib and OpenSSL are linked statically; the binaries need only glibc.

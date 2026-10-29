@@ -150,18 +150,17 @@ echo "ok: generate-dataset + bench_npy"
 grep -q 'Throughput' bench_jsonl.out || fail "bench_jsonl printed no result"
 echo "ok: bench_jsonl"
 
-if in_list bench_hdf5 "${listed[@]}"; then
-  # No HDF5 file ships in the archive, so this checks the statically linked
-  # library loads and initialises, and that the error is HDF5's own.
-  # (The full read path, DEFLATE included, is a unit test the release build
-  # job runs under `--features release-static`.)
-  set +e
-  ./bench_hdf5 does-not-exist.hdf5 1 > bench_hdf5.out 2>&1
-  rc=$?
-  set -e
-  grep -q 'Failed to open HDF5 file' bench_hdf5.out ||
-    fail "bench_hdf5 did not reach HDF5 (exit $rc): $(cat bench_hdf5.out)"
-  echo "ok: bench_hdf5 initialised HDF5"
-fi
+# bench_hdf5 is a REQUIRED_BINS member (checked present above). No HDF5 file
+# ships in the archive, so this checks the statically linked library loads
+# and initialises, and that the error is HDF5's own. (The full read path,
+# DEFLATE included, is a unit test the release build job runs under
+# `--features release-static`.)
+set +e
+./bench_hdf5 does-not-exist.hdf5 1 > bench_hdf5.out 2>&1
+rc=$?
+set -e
+grep -q 'Failed to open HDF5 file' bench_hdf5.out ||
+  fail "bench_hdf5 did not reach HDF5 (exit $rc): $(cat bench_hdf5.out)"
+echo "ok: bench_hdf5 initialised HDF5"
 
 echo "verify.sh: $base OK ($(uname -sm))"

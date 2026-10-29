@@ -1,0 +1,702 @@
+name: Release packages (deb/rpm)
+
+# Native .deb and .rpm packages for a release, published to the Redis APT and
+# YUM repositories (packages.redis.io, or its staging bucket) in the same
+# layout memtier-benchmark uses:
+#   deb/dists/<codename>/...   one build per codename (focal..resolute,
+#                              bullseye..trixie), amd64 + arm64, via deb-s3
+#   rpm/<distro>/<arch>/       el8, el9, el10, amzn2023 x x86_64, aarch64,
+#                              createrepo_c metadata, public-read objects
+#
+# Every package is built natively INSIDE a container of the distribution it is
+# for (memtier's model), with --features release-static from #366 and the Rust
+# toolchain release-binaries.yml pins, so a package depends on nothing but that
+# distro's glibc. Then it is installed and run on a bare container of that
+# distribution, both from the file and from a local repository laid out like
+# packages.redis.io (scripts/release/test-package.sh). The packages are served
+# by the repositories, not attached to the GitHub release (the release's
+# assets are #366's archives + SHA256SUMS).
+#
+# Where it publishes is the GitHub ENVIRONMENT, and nothing else differs:
+#   staging  our own rehearsal bucket (vdb-package-staging, us-east-2, AWS
+#            account 726902207197), the production layout at its root (deb/,
+#            rpm/, and the throwaway signing key's public half as gpg) —
+#            workflow_dispatch with release_type=internal (the default),
+#            with or without a release tag (without one, the dispatched ref
+#            is built). An optional repo_prefix puts everything under a
+#            sub-path. The Redis-wide staging bucket
+#            (redis-test-package-repository) is accepted only under a
+#            prefix: its deb/ and rpm/ are signed with the PRODUCTION key,
+#            so publishing there would re-sign indexes other products rely on.
+#   build    production, packages.redis.io, no prefix — a published
+#            non-prerelease release, or workflow_dispatch release_type=public;
+#            only once vars.PACKAGES_PRODUCTION is 'true', final tags only
+# Each environment carries the same secret names as memtier-benchmark's `build`
+# environment: APT_S3_BUCKET, APT_S3_REGION, APT_SIGNING_KEY and either
+# APT_S3_IAM_ARN (OIDC role to assume) or APT_S3_ACCESS_KEY_ID +
+# APT_S3_SECRET_ACCESS_KEY. The publish job checks the bucket it was handed
+# matches the environment (staging MUST be the staging bucket, build MUST NOT
+# be), so a repository-level secret inherited by an environment cannot send a
+# rehearsal to production. Pull requests build, test and dry-run the publish
+# scripts; they never publish.
+#
+# PRODUCTION IS OFF until the repository variable PACKAGES_PRODUCTION is
+# 'true'. Until then a published final release builds and tests every
+# package and publishes nothing (a ::notice:: says so; no `build` environment
+# is created), and release_type=public is refused. Switch it on only after:
+#   1. creating the `build` environment and protecting it: required reviewers,
+#      and deployment branches/tags limited to `master` plus the release tags
+#      (`[0-9]*.[0-9]*.[0-9]*`, `v[0-9]*.[0-9]*.[0-9]*`). workflow_dispatch runs
+#      the workflow file of the DISPATCHED ref, so a branch that edits the
+#      guards below out of its copy would otherwise reach `build`'s secrets.
+#      The tag rule alone does not stop that either: anyone who can push a
+#      matching tag can tag a modified workflow. Required reviewers are the
+#      real gate; also add a tag ruleset restricting who may create
+#      release-pattern tags;
+#   2. adding the five secrets, and the environment VARIABLE APT_SIGNING_FPR =
+#      54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C (the key packages.redis.io/gpg
+#      serves). The publish job refuses a key with another fingerprint, and
+#      publish-apt.sh refuses a codename whose InRelease is not already signed
+#      by the key in use: deb-s3 re-signs every product's index of a codename.
+# Production takes final tags only (X.Y.Z / vX.Y.Z, lib.sh
+# check_production_tag): packages carry the crate version without any
+# pre-release suffix, so an rc published there would be labelled as the final
+# release and block it.
+#
+# One publish runs per environment (the `concurrency` group on the publish
+# job). GitHub keeps one running and ONE pending: a third queued publish
+# cancels the pending one, which then shows as cancelled, not published.
+#
+# YUM has no cross-product lock: publish-yum.sh re-lists each directory before
+# uploading repodata/ and checks afterwards that every RPM there is indexed.
+# The residual risk is one-directional: another product's tool, with no such
+# check, can still upload a repodata/ built before our RPM landed, after our
+# check, and drop our RPM from the index while this run stays green.
+#
+# Size of a production YUM publish: publish-yum.sh downloads every object in
+# each rpm/<distro>/<arch>/ it touches (createrepo_c --update needs them on
+# disk); a release touches 8. On 2026-10-29 each of those directories indexed
+# 27 RPMs, about 20 MB (from its public primary.xml.gz; objects that no index
+# lists are not visible without bucket listing rights), so roughly 160 MB of
+# downloads per release plus our own uploads.
+#
+# The matrix comes from repository variables when set (as in memtier):
+#   vars.DEB_DISTS / vars.RPM_DISTROS        JSON lists, release + dispatch
+#   vars.PR_DEB_DISTS / vars.PR_RPM_DISTROS  JSON lists for pull requests
+#                                            (default: one codename, one distro)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build packages for (required for release_type=public; a rehearsal may leave it empty and build the dispatched ref)
+        required: false
+        type: string
+      release_type:
+        description: Where to publish (internal = staging bucket, public = packages.redis.io, none = build and test only)
+        type: choice
+        options: [internal, public, none]
+        default: internal
+      overwrite:
+        description: Allow replacing a version already in the repository (staging only)
+        type: boolean
+        default: false
+      repo_prefix:
+        description: Staging only - optional bucket prefix to publish under (deb/, rpm/ and gpg below it)
+        required: false
+        type: string
+      deb_dists:
+        description: Override codenames, comma-separated (e.g. jammy,noble); empty = all
+        required: false
+        type: string
+      rpm_distros:
+        description: Override RPM distros, comma-separated (e.g. el9,amzn2023); empty = all
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'LICENSE'
+      - 'debian/**'
+      - 'rpm/**'
+      - 'scripts/release/build-deb.sh'
+      - 'scripts/release/build-rpm.sh'
+      - 'scripts/release/test-package.sh'
+      - 'scripts/release/publish-apt.sh'
+      - 'scripts/release/publish-yum.sh'
+      - 'scripts/release/selftest-packages.sh'
+      - 'scripts/release/lib.sh'
+      - '.github/workflows/release-packages.yml'
+      # What the packages ship besides compiled code, and the binary set (the
+      # rest of src/ is built --features release-static by release-binaries.yml).
+      - 'src/bin/**'
+      - 'README.md'
+      - 'datasets/datasets.json'
+      - 'datasets/random-100/**'
+      - 'experiments/configurations/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-packages-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Same pin as release-binaries.yml (tests/harness_invariants.rs checks they agree):
+  # the packages are built with the toolchain the release archives are.
+  RELEASE_RUST_TOOLCHAIN: '1.99.1'
+  DEFAULT_DEB_DISTS: '["focal","jammy","noble","resolute","bullseye","bookworm","trixie"]'
+  DEFAULT_RPM_DISTROS: '["el8","el9","el10","amzn2023"]'
+  # A pull request builds one codename and one distro on both architectures:
+  # enough to prove the packaging, not 22 cold static builds per push.
+  DEFAULT_PR_DEB_DISTS: '["jammy"]'
+  DEFAULT_PR_RPM_DISTROS: '["el9"]'
+  STAGING_BUCKET: vdb-package-staging
+  SHARED_STAGING_BUCKET: redis-test-package-repository
+
+# Container steps otherwise run under `sh`, which is dash on Debian/Ubuntu
+# images: every step here may use bash (pipefail, [[ ]], arrays).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Resolve tag, commit and matrix
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      release: ${{ steps.plan.outputs.release }}
+      publish_to: ${{ steps.plan.outputs.publish_to }}
+      repo_prefix: ${{ steps.plan.outputs.repo_prefix }}
+      deb_matrix: ${{ steps.matrix.outputs.deb_matrix }}
+      rpm_matrix: ${{ steps.matrix.outputs.rpm_matrix }}
+      deb_dists: ${{ steps.matrix.outputs.deb_dists }}
+    steps:
+      # lib.sh only (check_production_tag), at the workflow's own commit.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/release
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT_PRERELEASE: ${{ github.event.release.prerelease }}
+          PACKAGES_PRODUCTION: ${{ vars.PACKAGES_PRODUCTION }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          IN_PREFIX: ${{ inputs.repo_prefix }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/release/lib.sh
+          source scripts/release/lib.sh
+          repo_prefix=""
+          case "$EVENT" in
+            pull_request)
+              tag=""; sha="$PR_SHA"; release=false; publish_to=none ;;
+            release|workflow_dispatch)
+              tag="${RELEASE_TAG:-$INPUT_TAG}"
+              if [[ -z "$tag" ]]; then
+                # A rehearsal of the dispatched ref: no release, crate version only.
+                [[ "$RELEASE_TYPE" != public ]] || { echo "::error::release_type=public needs the release tag to publish"; exit 1; }
+                sha="$GITHUB_SHA"; release=false; prerelease=true
+              else
+                [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "::error::invalid tag '$tag'"; exit 1; }
+                view="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isPrerelease,isDraft)" ||
+                  { echo "::error::no release for tag '$tag'"; exit 1; }
+                sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha)"
+                release=true
+                prerelease="$(jq -r '.isPrerelease or .isDraft' <<<"$view")"
+              fi
+              if [[ "$EVENT" == release ]]; then
+                # A pre-release is built and tested but never published.
+                if [[ "$EVENT_PRERELEASE" == true || "$prerelease" == true ]]; then publish_to=none; else publish_to=build; fi
+              else
+                case "$RELEASE_TYPE" in
+                  public)
+                    # The packages carry the crate version, with no pre-release
+                    # suffix: an rc published to production would be labelled
+                    # as the final release and block the final one for good.
+                    [[ "$prerelease" != true ]] || { echo "::error::'$tag' is a pre-release or draft; release_type=public is for final releases (use internal to rehearse)"; exit 1; }
+                    publish_to=build ;;
+                  internal)
+                    publish_to=staging
+                    repo_prefix="${IN_PREFIX#/}"; repo_prefix="${repo_prefix%/}"
+                    if [[ -n "$repo_prefix" ]]; then
+                      [[ "$repo_prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
+                        { echo "::error::repo_prefix '$IN_PREFIX' is not a plain path"; exit 1; }
+                      [[ "$repo_prefix" != deb && "$repo_prefix" != rpm && "$repo_prefix" != deb/* && "$repo_prefix" != rpm/* ]] ||
+                        { echo "::error::repo_prefix '$repo_prefix' points into the repositories themselves"; exit 1; }
+                    fi ;;
+                  *) publish_to=none ;;
+                esac
+                [[ "$publish_to" != build || -z "$IN_PREFIX" ]] || { echo "::error::repo_prefix is for staging rehearsals; production publishes at the bucket root"; exit 1; }
+              fi ;;
+            *) echo "::error::unexpected event $EVENT"; exit 1 ;;
+          esac
+          if [[ "$publish_to" == build ]]; then
+            # Production is switched on by a repository variable, set only once
+            # `build` exists and is protected (see the header): until then a
+            # release builds and tests, and publishes nothing.
+            publish_to="$(production_gate "$EVENT" "$PACKAGES_PRODUCTION")" || { echo "::error::release_type=public needs vars.PACKAGES_PRODUCTION=true"; exit 1; }
+            [[ "$publish_to" == build ]] || echo "::notice::vars.PACKAGES_PRODUCTION is not 'true': packages built and tested, not published to production"
+          fi
+          if [[ "$publish_to" == build ]]; then
+            # Packages carry the crate version with no pre-release suffix, so an
+            # rc tag would publish as the final version and block it for good:
+            # whatever GitHub's pre-release flag says, only X.Y.Z / vX.Y.Z go out.
+            check_production_tag "$tag" || { echo "::error::refusing to publish '$tag' to production"; exit 1; }
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve a commit"; exit 1; }
+          {
+            echo "tag=$tag"; echo "sha=$sha"; echo "release=$release"; echo "publish_to=$publish_to"; echo "repo_prefix=$repo_prefix"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${tag:-PR} from $sha; publish to: $publish_to${repo_prefix:+ under $repo_prefix/}" >> "$GITHUB_STEP_SUMMARY"
+      - id: matrix
+        env:
+          EVENT: ${{ github.event_name }}
+          VAR_DEB_DISTS: ${{ vars.DEB_DISTS }}
+          VAR_RPM_DISTROS: ${{ vars.RPM_DISTROS }}
+          VAR_PR_DEB_DISTS: ${{ vars.PR_DEB_DISTS }}
+          VAR_PR_RPM_DISTROS: ${{ vars.PR_RPM_DISTROS }}
+          IN_DEB_DISTS: ${{ inputs.deb_dists }}
+          IN_RPM_DISTROS: ${{ inputs.rpm_distros }}
+        run: |
+          set -euo pipefail
+          to_json_list() { printf '%s' "$1" | tr -d ' ' | jq -R -c 'split(",") | map(select(length > 0))'; }
+          if [[ "$EVENT" == pull_request ]]; then
+            deb="${VAR_PR_DEB_DISTS:-$DEFAULT_PR_DEB_DISTS}"; rpm="${VAR_PR_RPM_DISTROS:-$DEFAULT_PR_RPM_DISTROS}"
+          else
+            if [[ -n "$IN_DEB_DISTS" ]]; then deb="$(to_json_list "$IN_DEB_DISTS")"; else deb="${VAR_DEB_DISTS:-$DEFAULT_DEB_DISTS}"; fi
+            if [[ -n "$IN_RPM_DISTROS" ]]; then rpm="$(to_json_list "$IN_RPM_DISTROS")"; else rpm="${VAR_RPM_DISTROS:-$DEFAULT_RPM_DISTROS}"; fi
+          fi
+          deb="$(jq -c . <<<"$deb")"; rpm="$(jq -c . <<<"$rpm")"
+          [[ "$(jq 'length' <<<"$deb")" -gt 0 && "$(jq 'length' <<<"$rpm")" -gt 0 ]] ||
+            { echo "::error::both the codename list ($deb) and the RPM distro list ($rpm) must be non-empty"; exit 1; }
+          # codename -> container image; distro -> container image. Unknown
+          # names fail here, not twenty minutes into a build.
+          deb_matrix="$(jq -c '
+            def image: if . == "focal" or . == "jammy" or . == "noble" or . == "resolute" then "ubuntu:\(.)"
+                       elif . == "bullseye" or . == "bookworm" or . == "trixie" then "debian:\(.)"
+                       else error("unknown codename \(.)") end;
+            {include: [ .[] as $d | ("amd64","arm64") as $a |
+              {dist: $d, arch: $a, image: ($d|image),
+               runner: (if $a == "arm64" then "ubuntu-24.04-arm" else "ubuntu-latest" end)} ]}' <<<"$deb")"
+          rpm_matrix="$(jq -c '
+            def image: if . == "el8" then "rockylinux:8" elif . == "el9" then "rockylinux:9"
+                       elif . == "el10" then "rockylinux/rockylinux:10" elif . == "amzn2023" then "amazonlinux:2023"
+                       else error("unknown rpm distro \(.)") end;
+            {include: [ .[] as $d | ("x86_64","aarch64") as $a |
+              {distro: $d, arch: $a, image: ($d|image),
+               runner: (if $a == "aarch64" then "ubuntu-24.04-arm" else "ubuntu-latest" end)} ]}' <<<"$rpm")"
+          {
+            echo "deb_matrix=$deb_matrix"; echo "rpm_matrix=$rpm_matrix"; echo "deb_dists=$deb"
+          } >> "$GITHUB_OUTPUT"
+          echo "deb: $deb" >> "$GITHUB_STEP_SUMMARY"; echo "rpm: $rpm" >> "$GITHUB_STEP_SUMMARY"
+
+  selftest:
+    # The publish scripts' decisions (codename grouping, dist-tag -> directory,
+    # refuse-if-exists / same-build skip / overwrite, RPMs before repodata)
+    # against fake aws / deb-s3, on every run. No network, no credentials.
+    name: Self-test the publish scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm createrepo-c dpkg-dev
+      - run: make release-selftest-packages
+
+  build-deb:
+    name: deb ${{ matrix.dist }} ${{ matrix.arch }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.deb_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      RELEASE: ${{ needs.plan.outputs.release }}
+      DIST: ${{ matrix.dist }}
+    steps:
+      - name: Container prerequisites
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          # Debian 11 left LTS on 2026-08-31 and its pool is gone from
+          # deb.debian.org: read it from archive.debian.org instead.
+          if grep -qx 'VERSION_CODENAME=bullseye' /etc/os-release; then
+            sed -i 's|deb.debian.org|archive.debian.org|' /etc/apt/sources.list
+          fi
+          apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Confirm the checkout is the planned commit
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE" && test "$(git rev-parse HEAD)" = "$SHA"
+      # Cached on pull requests only: a release builds from scratch.
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name == 'pull_request'
+        with:
+          key: deb-${{ matrix.dist }}-${{ matrix.arch }}-${{ env.RELEASE_RUST_TOOLCHAIN }}
+      - name: Build (scripts/release/build-deb.sh)
+        run: |
+          set -euo pipefail
+          args=(--dist "$DIST" --out dist --install-deps)
+          [[ "$RELEASE" == true ]] && args+=(--release --tag "$TAG")
+          VDB_BUILD_GIT_SHA="$SHA" bash scripts/release/build-deb.sh "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.dist }}-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  build-rpm:
+    name: rpm ${{ matrix.distro }} ${{ matrix.arch }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.rpm_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      RELEASE: ${{ needs.plan.outputs.release }}
+    steps:
+      - name: Container prerequisites
+        run: |
+          if command -v dnf >/dev/null; then dnf install -y git tar gzip findutils; else yum install -y git tar gzip findutils; fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - name: Confirm the checkout is the planned commit
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE" && test "$(git rev-parse HEAD)" = "$SHA"
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name == 'pull_request'
+        with:
+          key: rpm-${{ matrix.distro }}-${{ matrix.arch }}-${{ env.RELEASE_RUST_TOOLCHAIN }}
+      - name: Build (scripts/release/build-rpm.sh)
+        run: |
+          set -euo pipefail
+          args=(--out dist --install-deps)
+          [[ "$RELEASE" == true ]] && args+=(--release --tag "$TAG")
+          VDB_BUILD_GIT_SHA="$SHA" bash scripts/release/build-rpm.sh "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
+          path: dist/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+  test-deb:
+    name: install deb ${{ matrix.dist }} ${{ matrix.arch }}
+    needs: [plan, build-deb]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.deb_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-${{ matrix.dist }}-${{ matrix.arch }}
+          path: pkg
+      # Only the test script is needed; without git in the image checkout
+      # falls back to a tarball of the whole tree, so fetch the one file.
+      - name: Fetch scripts/release/test-package.sh at the planned commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Debian 11 left LTS on 2026-08-31 and its pool is gone from
+          # deb.debian.org: read it from archive.debian.org instead.
+          if grep -qx 'VERSION_CODENAME=bullseye' /etc/os-release; then
+            sed -i 's|deb.debian.org|archive.debian.org|' /etc/apt/sources.list
+          fi
+          apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+          mkdir -p src/scripts/release
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/scripts/release/test-package.sh?ref=$SHA" \
+            -o src/scripts/release/test-package.sh
+      - name: Install and run on a bare ${{ matrix.image }} (scripts/release/test-package.sh)
+        run: bash src/scripts/release/test-package.sh pkg/*.deb --expect-sha "$SHA"
+
+  test-rpm:
+    name: install rpm ${{ matrix.distro }} ${{ matrix.arch }}
+    needs: [plan, build-rpm]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.rpm_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    env:
+      SHA: ${{ needs.plan.outputs.sha }}
+      DISTRO: ${{ matrix.distro }}
+    steps:
+      - name: Container prerequisites
+        run: |
+          # el9 and Amazon Linux 2023 ship curl-minimal, which conflicts with
+          # the curl package: only add curl where no curl binary is present.
+          pkgs=(findutils tar gzip ca-certificates)
+          command -v curl >/dev/null || pkgs+=(curl)
+          if command -v dnf >/dev/null; then dnf install -y "${pkgs[@]}"; else yum install -y "${pkgs[@]}"; fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
+          path: pkg
+      - name: Fetch scripts/release/test-package.sh at the planned commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p src/scripts/release
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/scripts/release/test-package.sh?ref=$SHA" \
+            -o src/scripts/release/test-package.sh
+      - name: Install and run on a bare ${{ matrix.image }} (scripts/release/test-package.sh)
+        run: bash src/scripts/release/test-package.sh pkg/*.rpm --expect-sha "$SHA" --repo-id "$DISTRO"
+
+  publish-dry-run:
+    # The publish scripts, in --dry-run, against the packages this run built:
+    # what a release would upload, printed, on every pull request.
+    name: Publish (dry run)
+    needs: [plan, build-deb, build-rpm, test-deb, test-rpm]
+    if: needs.plan.outputs.publish_to == 'none'
+    runs-on: ubuntu-latest
+    steps:
+      # The publish scripts at the workflow's own commit, as `publish` runs them.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/release
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: debs
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rpm-*
+          path: rpms
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm createrepo-c dpkg-dev
+      - run: bash scripts/release/publish-apt.sh --bucket example-bucket --region us-east-2 --in debs --dry-run
+      - run: bash scripts/release/publish-yum.sh --bucket example-bucket --in rpms --dry-run
+
+  publish:
+    name: Publish to ${{ needs.plan.outputs.publish_to }}
+    needs: [plan, selftest, build-deb, build-rpm, test-deb, test-rpm]
+    if: needs.plan.outputs.publish_to != 'none'
+    runs-on: ubuntu-22.04
+    environment: ${{ needs.plan.outputs.publish_to }}
+    # One publish at a time per repository: two runs regenerating the same
+    # shared repodata/ or Release concurrently would lose one run's packages.
+    concurrency:
+      group: release-packages-publish-${{ needs.plan.outputs.publish_to }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write   # OIDC role assumption (APT_S3_IAM_ARN)
+    env:
+      # Ruby 2.7 on ubuntu-22.04 is what memtier-benchmark publishes with today.
+      DEB_S3_VERSION: "0.11.3"
+      # sha256 of deb-s3-0.11.3.gem from the deb-s3 GitHub release, recorded 2026-10-29.
+      DEB_S3_GEM_SHA256: b052d7f028ec4b0fe06aaf77f4eb8f6dcd22ce65fbe56698ca56667fda423b16
+      TAG: ${{ needs.plan.outputs.tag }}
+      PUBLISH_TO: ${{ needs.plan.outputs.publish_to }}
+      REPO_PREFIX: ${{ needs.plan.outputs.repo_prefix }}
+      BUCKET: ${{ secrets.APT_S3_BUCKET }}
+      REGION: ${{ secrets.APT_S3_REGION }}
+    steps:
+      - name: Check the environment is configured, and is the one it claims to be
+        env:
+          ROLE: ${{ secrets.APT_S3_IAM_ARN }}
+          KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
+          SIGNING: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$BUCKET" && -n "$REGION" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_S3_BUCKET / APT_S3_REGION"; exit 1; }
+          [[ -n "$ROLE" || -n "$KEY_ID" ]] || { echo "::error::environment '$PUBLISH_TO' has neither APT_S3_IAM_ARN nor APT_S3_ACCESS_KEY_ID"; exit 1; }
+          # Repository-level secrets are inherited by every environment: make
+          # sure 'staging' really points at the staging bucket and 'build' never does.
+          case "$PUBLISH_TO" in
+            staging)
+              case "$BUCKET" in
+                "$STAGING_BUCKET") ;;
+                "$SHARED_STAGING_BUCKET")
+                  # Its deb/ and rpm/ are the shared, production-signed repositories.
+                  [[ -n "$REPO_PREFIX" ]] || { echo "::error::$SHARED_STAGING_BUCKET is shared with every Redis product; a rehearsal there needs repo_prefix"; exit 1; } ;;
+                *) echo "::error::environment 'staging' has APT_S3_BUCKET set to '$BUCKET', not a staging bucket; refusing to rehearse against it"; exit 1 ;;
+              esac ;;
+            build)
+              [[ "$BUCKET" != "$STAGING_BUCKET" && "$BUCKET" != "$SHARED_STAGING_BUCKET" ]] || { echo "::error::environment 'build' points at a staging bucket"; exit 1; }
+              [[ -z "$REPO_PREFIX" ]] || { echo "::error::production publishes at the bucket root, got prefix '$REPO_PREFIX'"; exit 1; } ;;
+            *) echo "::error::unexpected publish target '$PUBLISH_TO'"; exit 1 ;;
+          esac
+          # Unsigned publishing is refused by the scripts; say so up front.
+          [[ -n "$SIGNING" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_SIGNING_KEY (staging takes a throwaway key, see the workflow header)"; exit 1; }
+          echo "use_oidc=$([[ -n "$ROLE" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+      # The publish scripts come from the workflow's OWN commit (github.sha),
+      # the same one as the guards in this file and the selftest job, while
+      # the packages were built from the planned commit (the tag), so the
+      # scripts that run are always the ones the selftest just tested. A
+      # dispatch from master REBUILDS the packages, and a rebuild is not
+      # byte-identical (changelog date, build time): it can publish only targets
+      # nothing of this version reached yet. It cannot finish a release whose
+      # APT side, or one RPM arch, is already published (see AGENTS.md).
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/release
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: debs
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rpm-*
+          path: rpms
+      - name: Every matrix cell produced a package
+        env:
+          DEB_MATRIX: ${{ needs.plan.outputs.deb_matrix }}
+          RPM_MATRIX: ${{ needs.plan.outputs.rpm_matrix }}
+        run: |
+          set -euo pipefail
+          find debs rpms -type f | sort
+          want_deb=$(jq '.include | length' <<<"$DEB_MATRIX")
+          want_rpm=$(jq '.include | length' <<<"$RPM_MATRIX")
+          test "$(find debs -name '*.deb' | wc -l)" -eq "$want_deb" || { echo "::error::expected $want_deb .deb files"; exit 1; }
+          test "$(find rpms -name '*.rpm' | wc -l)" -eq "$want_rpm" || { echo "::error::expected $want_rpm .rpm files"; exit 1; }
+      # Third-party tooling is installed BEFORE any credential or key is in the
+      # job: nothing it runs at install time can see them.
+      - name: Install createrepo_c, rpm, dpkg-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends createrepo-c rpm dpkg-dev
+          aws --version
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a  # v1.329.0
+        with:
+          ruby-version: "2.7"
+      - name: Install deb-s3 ${{ env.DEB_S3_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://github.com/deb-s3/deb-s3/releases/download/$DEB_S3_VERSION/deb-s3-$DEB_S3_VERSION.gem"
+          echo "$DEB_S3_GEM_SHA256  deb-s3-$DEB_S3_VERSION.gem" | sha256sum -c -
+          gem install "deb-s3-$DEB_S3_VERSION.gem"
+      - name: AWS credentials (OIDC role)
+        if: env.use_oidc == 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.APT_S3_IAM_ARN }}
+          aws-region: ${{ secrets.APT_S3_REGION }}
+      - name: AWS credentials (access key)
+        if: env.use_oidc != 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.APT_S3_REGION }}
+      - name: Import the signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          # The fingerprint the environment's repositories are signed with
+          # (environment variable, not a secret). Required for `build`, where
+          # it is production's 54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
+          # (https://packages.redis.io/gpg); optional for staging.
+          EXPECTED_FPR: ${{ vars.APT_SIGNING_FPR }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.gnupg && chmod 0700 ~/.gnupg
+          echo "$APT_SIGNING_KEY" | gpg --batch --import
+          n="$(gpg --list-secret-keys --with-colons | grep -c '^sec:' || true)"
+          [[ "$n" -eq 1 ]] || { echo "::error::APT_SIGNING_KEY must hold exactly one secret key (found $n)"; exit 1; }
+          fpr="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          # shellcheck source=scripts/release/lib.sh
+          source scripts/release/lib.sh
+          check_signing_fpr "$EXPECTED_FPR" "$fpr" "$PUBLISH_TO" || { echo "::error::signing key does not match the environment's APT_SIGNING_FPR (see above)"; exit 1; }
+          echo "signing_fpr=$fpr" >> "$GITHUB_ENV"
+      - name: Publish APT (scripts/release/publish-apt.sh)
+        env:
+          OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}
+        run: |
+          set -euo pipefail
+          args=(--bucket "$BUCKET" --region "$REGION" --in debs --prefix "${REPO_PREFIX:+$REPO_PREFIX/}deb" --origin packages.redis.io)
+          [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
+          bash scripts/release/publish-apt.sh "${args[@]}"
+      - name: Publish YUM (scripts/release/publish-yum.sh)
+        env:
+          OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}
+        run: |
+          set -euo pipefail
+          args=(--bucket "$BUCKET" --in rpms --prefix "${REPO_PREFIX:+$REPO_PREFIX/}rpm")
+          [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
+          bash scripts/release/publish-yum.sh "${args[@]}"
+      - name: Publish the public key next to the rehearsal repositories (staging only)
+        # Production's /gpg is the packaging team's; the staging bucket gets
+        # its own, so the README's install steps work against it verbatim with
+        # the base URL swapped.
+        if: needs.plan.outputs.publish_to == 'staging'
+        run: |
+          set -euo pipefail
+          gpg --export --armor "$signing_fpr" > gpg.asc
+          aws s3 cp gpg.asc "s3://$BUCKET/${REPO_PREFIX:+$REPO_PREFIX/}gpg" --acl public-read --content-type text/plain --only-show-errors
+          echo "ok: s3://$BUCKET/${REPO_PREFIX:+$REPO_PREFIX/}gpg ($signing_fpr)"
+      - name: Verify what the repository now serves
+        # Against the S3 origin, not the CDN: CloudFront may still cache the
+        # previous index for hours, and the objects are public-read either way.
+        env:
+          DEB_DISTS: ${{ needs.plan.outputs.deb_dists }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/release/lib.sh
+          source scripts/release/lib.sh
+          # Path-style (lib.sh): production's bucket name has dots, which the
+          # virtual-hosted form's one-label wildcard certificate does not cover.
+          base="$(s3_origin_url "$BUCKET" "$REGION" "$REPO_PREFIX")"
+          while IFS= read -r -d '' f; do
+            dist="$(dpkg-deb -f "$f" Version)"; dist="${dist##*~}"
+            arch="$(dpkg-deb -f "$f" Architecture)"; version="$(dpkg-deb -f "$f" Version)"
+            curl -fsSL "$base/deb/dists/$dist/main/binary-$arch/Packages" -o "packages-$dist-$arch"
+            # OUR stanza (package + version + arch), carrying THIS .deb's
+            # digest, and the pool file it names is served.
+            entry="$(deb_index_entry "packages-$dist-$arch" vector-db-benchmark "$version" "$arch")"
+            [[ -n "$entry" && "$entry" != *$'\n'* ]] ||
+              { echo "::error::$base/deb/dists/$dist/main/binary-$arch/Packages has $(grep -c . <<<"$entry") vector-db-benchmark $version $arch stanzas, expected 1"; exit 1; }
+            [[ "${entry%% *}" == "$(sha256sum "$f" | cut -c1-64)" ]] ||
+              { echo "::error::the vector-db-benchmark $version $arch stanza's SHA256 is not this run's .deb ($(basename "$f"))"; exit 1; }
+            curl -fsSI "$base/deb/${entry#* }" >/dev/null || { echo "::error::$base/deb/${entry#* } (named by the index) is not served"; exit 1; }
+            # The index we just published is signed by our key, and the
+            # signed Release names this Packages file's digest.
+            curl -fsSL "$base/deb/dists/$dist/InRelease" -o "inrelease-$dist"
+            status="$(gpg --batch --status-fd 1 --verify "inrelease-$dist" 2>/dev/null || true)"
+            gpg_status_signed_by "$signing_fpr" <<<"$status" ||
+              { echo "::error::$base/deb/dists/$dist/InRelease is not signed by $signing_fpr"; exit 1; }
+            grep -qF " $(sha256sum "packages-$dist-$arch" | cut -c1-64) " "inrelease-$dist" ||
+              { echo "::error::$base/deb/dists/$dist/InRelease does not carry the digest of the served binary-$arch/Packages"; exit 1; }
+            echo "ok: $dist/$arch lists $version, InRelease signed by $signing_fpr"
+          done < <(find debs -name '*.deb' -print0)
+          # The index must LIST the package (not just exist): another product's
+          # publish racing ours could have regenerated repodata without it.
+          while IFS= read -r -d '' f; do
+            distro="$(rpm_release_to_distro "$(rpm -qp --queryformat '%{RELEASE}' "$f")")"
+            arch="$(rpm -qp --queryformat '%{ARCH}' "$f")"
+            dir="$base/rpm/$distro/$arch"
+            repomd="$(curl -fsSL "$dir/repodata/repomd.xml")" || { echo "::error::no repomd.xml at $dir"; exit 1; }
+            primary="$(sed -n 's/.*href="\(repodata\/[^"]*primary\.xml\.gz\)".*/\1/p' <<<"$repomd" | head -n1)"
+            [[ -n "$primary" ]] || { echo "::error::$dir/repodata/repomd.xml names no primary.xml.gz"; exit 1; }
+            listed="$(curl -fsSL "$dir/$primary" | gzip -dc | sed -n 's/.*<location href="\([^"]*\)".*/\1/p')"
+            grep -qxF "$(basename "$f")" <<<"$listed" || { echo "::error::$dir/$primary does not list $(basename "$f") (concurrent publish into the shared directory?)"; exit 1; }
+            curl -fsSI "$dir/$(basename "$f")" >/dev/null || { echo "::error::$dir/$(basename "$f") not served"; exit 1; }
+            echo "ok: $dir/$(basename "$f") (indexed)"
+          done < <(find rpms -name '*.rpm' -print0)
+      - name: Summary
+        run: |
+          {
+            echo "## Packages for ${TAG} published to \`$PUBLISH_TO\` (s3://$BUCKET)"
+            echo; echo '```'; find debs rpms -type f -printf '%f\n' | sort; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
