@@ -305,6 +305,16 @@ expect "a publish racing another product's metadata upload" 0 \
       bash "$here/publish-yum.sh" --bucket race --in "$t/rpms-race"
 check "... leaves the other product's hashed metadata in place" test -f "$FAKE_S3/race/rpm/el9/x86_64/repodata/0123abcd-primary.xml.gz"
 
+# A directory whose metadata another product SIGNS: regenerating repomd.xml
+# would leave repomd.xml.asc stale, so the publish refuses before writing.
+mkdir -p "$FAKE_S3/signedmd/rpm/el9/x86_64/repodata"
+echo '<repomd/>' > "$FAKE_S3/signedmd/rpm/el9/x86_64/repodata/repomd.xml"
+echo 'sig' > "$FAKE_S3/signedmd/rpm/el9/x86_64/repodata/repomd.xml.asc"
+: > "$FAKE_LOG"
+expect "a directory with signed metadata (repomd.xml.asc) is refused" 1 bash "$here/publish-yum.sh" --bucket signedmd --in "$t/rpms-race"
+check "... naming the signature" grep -q 'repomd.xml.asc exists' "$t/last.out"
+check "... before anything was uploaded" bash -c "! grep -qE '^aws s3 (cp|sync) [^ ]+ s3://' '$FAKE_LOG'"
+
 echo "lib.sh s3_origin_url"
 # Path-style only: production's bucket (packages.redis.io) has dots, and the
 # virtual-hosted host <bucket>.s3.<region>.amazonaws.com is not covered by

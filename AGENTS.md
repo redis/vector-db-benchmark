@@ -167,8 +167,9 @@ container, and publishes them to packages.redis.io (the `build` environment).
   `published` event (it already fired). Dispatch `release_type=public
   tag=<tag>` from `master`.
 - **Re-running a failed publish:** use **Re-run failed jobs**. It reuses the
-  signed build artifacts, so what is already published is skipped as the same
-  build and the rest completes (this is also the fix when publish-yum.sh's
+  run's build artifacts (unsigned; the publish job signs them each time, and
+  the identity check ignores signatures), so what is already published is
+  skipped as the same build and the rest completes (this is also the fix when publish-yum.sh's
   index check reports another product's RPM missing). **Re-run all jobs**
   rebuilds: the new packages differ (build time, digest), deb-s3 and
   publish-yum.sh refuse them as a different build, and production has no

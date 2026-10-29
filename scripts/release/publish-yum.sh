@@ -17,10 +17,16 @@
 #  * never deletes anything: RPMs are uploaded first, then the new hashed
 #    metadata files, then repomd.xml LAST, so no index ever names a file that
 #    is not there yet. Old metadata generations are left in repodata/ and
-#    accumulate (createrepo_c --update --keep-all-metadata keeps them; a
-#    `sync --delete` could only ever remove files ANOTHER product uploaded
-#    after our sync, which its cached repomd.xml may still name). Pruning old
-#    generations, if ever needed, is by age, never by a delete-sync.
+#    accumulate in S3 (createrepo_c's `--retain-old-md 1` prunes only the
+#    LOCAL copy, and nothing deletes remotely: a `sync --delete` could only
+#    ever remove files ANOTHER product uploaded after our sync, which its
+#    cached repomd.xml may still name). Pruning old generations, if ever
+#    needed, is by age, never by a delete-sync.
+#  * refuses a directory whose metadata is SIGNED (repodata/repomd.xml.asc):
+#    regenerating repomd.xml would leave that detached signature stale and
+#    break `repo_gpgcheck=1` for every product there. None is signed today
+#    (2026-10-29); if one becomes so, this must learn to re-sign repomd.xml
+#    first.
 # There is no cross-product lock on rpm/ (deb-s3's --lock covers only deb/),
 # so the sync -> createrepo_c -> upload sequence is a read-modify-write that
 # another product's publish can race. Two guards, per directory:
@@ -157,6 +163,13 @@ for d in $(printf '%s\n' "${!dirs[@]}" | LC_ALL=C sort); do
   # error is a real error: without the existing files, --update would publish
   # metadata that forgets the other products' RPMs in this directory.
   run aws s3 sync "$remote/" "$local_dir/" --only-show-errors
+  for sig in "$local_dir"/repodata/repomd.xml.*; do
+    [[ -e "$sig" ]] || continue
+    echo "publish-yum.sh: $remote/repodata/$(basename "$sig") exists: this directory's metadata is signed, and regenerating" >&2
+    echo "  repomd.xml would leave that signature stale (repo_gpgcheck=1 users of every product here would fail). Refusing;" >&2
+    echo "  nothing was written. publish-yum.sh must re-sign repomd.xml before it can publish here." >&2
+    exit 1
+  done
   upload=()
   for f in "$work/$d"/*.rpm; do
     b="$(basename "$f")"
