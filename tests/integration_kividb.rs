@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use redis::Connection;
-use vector_db_benchmark::kividb_caps::KividbServer;
+use vector_db_benchmark::kividb_caps::{tag_literal, KividbServer};
 
 mod common;
 
@@ -644,6 +644,181 @@ fn test_binary_kividb_keyword_value_with_comma() {
         "kividb-comma-test",
         common::write_comma_keyword_project,
     );
+}
+
+/// Run a TAG-value fixture with `--fail-on-dropped-queries` (a value the
+/// server rejects as a syntax error would otherwise be dropped with a log line
+/// and leave the recall of the surviving queries looking fine) and require a
+/// near-exact recall.
+///
+/// Each fixture's ten queries all target a value that KiviDB 1.1.2 matches
+/// exactly only once escaped, next to the decoy a raw value would match
+/// instead, so a single mis-encoded value costs a whole query (recall <= 0.9).
+fn run_kividb_tag_value_test(
+    name: &str,
+    dataset: &str,
+    build: impl Fn(&str, &str, usize) -> common::FilterProject,
+) {
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": name, "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = build(dataset, &configs.to_string(), dim);
+    assert!(proj.matching_docs >= proj.top);
+    let port = test_port().to_string();
+    let run = common::run_binary_capture_extra(
+        &proj.root,
+        name,
+        dataset,
+        TEST_HOST,
+        &[("KIVIDB_PORT", port.as_str())],
+        &["--fail-on-dropped-queries"],
+    );
+    assert!(run.ok, "kividb {name} run failed:\n{}", run.combined);
+    let recall = common::read_recall(&proj.root, name);
+    println!("kividb {name} recall={recall:.3}");
+    assert!(
+        recall >= 0.95,
+        "kividb {name} recall {recall:.3} < 0.95: a TAG value was encoded wrongly (see \
+         kividb_caps::tag_literal)"
+    );
+}
+
+/// Backslash, braces, a double quote and a comma in TAG filter values
+/// (shipped arxiv shape), each escaped.
+#[test]
+fn test_binary_kividb_tag_values_with_backslash_and_braces() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    assert_server_supports_tags(&mut conn);
+    run_kividb_tag_value_test(
+        "kividb-tag-escape",
+        "kividb-tag-escape-test",
+        common::write_tag_escape_project,
+    );
+}
+
+/// `(`, `)`, `|` and `@` in TAG filter values, each escaped. (Before 1.0.5
+/// these four were inexpressible; on 1.1.2 they are exact.)
+#[test]
+fn test_binary_kividb_tag_values_with_parens_pipe_and_at() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    assert_server_supports_tags(&mut conn);
+    run_kividb_tag_value_test(
+        "kividb-tag-paren",
+        "kividb-tag-paren-test",
+        common::write_tag_paren_pipe_project,
+    );
+}
+
+/// The number of documents `FT.SEARCH` matches for `query`, and their ids.
+fn ft_search_ids(conn: &mut Connection, index: &str, prefix: &str, query: &str) -> Vec<usize> {
+    let reply: Vec<redis::Value> = redis::cmd("FT.SEARCH")
+        .arg(index)
+        .arg(query)
+        .arg("RETURN")
+        .arg(0)
+        .arg("LIMIT")
+        .arg(0)
+        .arg(1000)
+        .arg("DIALECT")
+        .arg(2)
+        .query(conn)
+        .unwrap_or_else(|e| panic!("FT.SEARCH {query:?} failed: {e}"));
+    let total = match &reply[0] {
+        redis::Value::Int(n) => *n as usize,
+        other => panic!("FT.SEARCH {query:?}: unexpected count {other:?}"),
+    };
+    let mut ids: Vec<usize> = reply[1..]
+        .iter()
+        .map(|v| {
+            let key: String = redis::from_redis_value(v.clone()).unwrap();
+            key.strip_prefix(prefix)
+                .and_then(|id| id.parse().ok())
+                .unwrap_or_else(|| panic!("unexpected key {key:?}"))
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), total, "FT.SEARCH {query:?}: count vs ids");
+    ids
+}
+
+/// EXACT counts, on the index the engine built, for TAG values containing
+/// `\`, `{`, `}`, `"`, `,`, `(`, `)` and `|`, queried with exactly the TAG
+/// literal the engine sends (`kividb_caps::tag_literal`). Every value is
+/// stored on a distinct number of documents (`common::tag_count_docs`) next to
+/// the decoy a wrong encoding hits, so a mis-encoded value fails on its count
+/// and on its document ids; one that is a syntax error fails the `FT.SEARCH`.
+/// Each value is checked bare and in the grouped, AND'd shape the engine's
+/// filters take. The engine run itself (`--fail-on-dropped-queries`) must also
+/// reach full recall.
+#[test]
+fn test_binary_kividb_tag_values_exact_counts() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let info: String = redis::cmd("INFO").arg("server").query(&mut conn).unwrap();
+    let server = KividbServer::from_info(&info);
+    assert!(server.tags_supported(), "{}", server.describe());
+
+    let name = "kividb-tag-count";
+    let dataset = "kividb-tag-count-test";
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": name, "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = common::write_tag_count_project(dataset, &configs.to_string(), dim);
+    let port = test_port().to_string();
+    let run = common::run_binary_capture_extra(
+        &proj.root,
+        name,
+        dataset,
+        TEST_HOST,
+        &[("KIVIDB_PORT", port.as_str())],
+        &["--fail-on-dropped-queries", "--keep-data"],
+    );
+    assert!(run.ok, "kividb {name} run failed:\n{}", run.combined);
+    let recall = common::read_recall(&proj.root, name);
+    println!("kividb {name} recall={recall:.3}");
+    assert!(recall >= 0.95, "kividb {name} recall {recall:.3} < 0.95");
+
+    let index = format!("idx:{name}");
+    let prefix = format!("{name}:");
+    for (i, value) in common::TAG_COUNT_VALUES.iter().enumerate() {
+        let want: Vec<usize> = (0..common::N_DOCS)
+            .filter(|&id| common::tag_count_value_index(id) == Some(i))
+            .collect();
+        assert_eq!(want.len(), common::tag_count_docs(i));
+        let lit = tag_literal("author", value, server.tags_supported())
+            .unwrap_or_else(|e| panic!("{value:?} must be expressible on KiviDB 1.1.2: {e}"));
+        for query in [
+            format!("@author:{{{lit}}}"),
+            format!("(@author:{{{lit}}} | @author:{{no\\ such\\ value}}) @author:{{{lit}}}"),
+        ] {
+            let got = ft_search_ids(&mut conn, &index, &prefix, &query);
+            println!(
+                "kividb exact count {value:?} {query:?}: {} of {}",
+                got.len(),
+                want.len()
+            );
+            assert_eq!(
+                got,
+                want,
+                "{value:?} via {query:?}: matched {} documents, expected exactly {}",
+                got.len(),
+                want.len()
+            );
+        }
+    }
 }
 
 /// `--skip-upload` must not measure a reused index whose TAG fields the server
