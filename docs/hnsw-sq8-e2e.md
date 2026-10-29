@@ -36,7 +36,9 @@ baseline separately from FLOAT32.
 
 Set `REDIS_HNSW_COMPRESSION` to `SQ8` and `REDIS_HNSW_TRAINING_THRESHOLD` to an
 integer from 0 to 102400. These variables apply only to HNSW configurations, not
-flat or SVS. Values in `collection_params.hnsw_config` (`COMPRESSION`,
+flat or SVS. The `COMPRESSION` and `TRAINING_THRESHOLD` config keys are read
+only by the `redis` engine; any other engine refuses a config that declares
+them. Values in `collection_params.hnsw_config` (`COMPRESSION`,
 `TRAINING_THRESHOLD`) override the environment variables for each field.
 Whitespace is trimmed; an empty variable is treated as unset. An unparseable or
 out-of-range threshold value fails the run with an error naming the variable
@@ -98,8 +100,9 @@ Before search, inspect `FT.INFO idx:<config-name>` and
 - record `vector_index_sz_mb`, total `used_memory`, and the wait duration.
 
 The harness's existing `wait_for_indexing` checks document indexing, not the
-complete tiered vector migration. Its timeout also returns success. Therefore
-its upload time alone is not proof that the SQ8 backend finished building.
+complete tiered vector migration (its timeout is an error, never a pass).
+Therefore its upload time alone is not proof that the SQ8 backend finished
+building.
 Record upload plus the additional backend-drain duration as a separate quantity.
 Do not time dataset downloads as ingestion.
 

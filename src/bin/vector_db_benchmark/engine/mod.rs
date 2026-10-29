@@ -1002,6 +1002,18 @@ pub fn resolved_number_of_shards(
 pub fn create_engine(engine_config: &EngineConfig, host: &str) -> Result<Box<dyn Engine>, String> {
     let engine_type = engine_config.engine.as_deref().unwrap_or("unknown");
 
+    // HNSW SQ8 keys are typed on the shared HnswConfig and read only by Redis;
+    // anywhere else they would be dropped without a trace (#325 review).
+    let hnsw = engine_config
+        .collection_params
+        .as_ref()
+        .and_then(|c| c.hnsw_config.as_ref());
+    vector_db_benchmark::redis_hnsw_sq8::check_engine_reads_sq8_keys(
+        engine_type,
+        hnsw.is_some_and(|h| h.compression.is_some()),
+        hnsw.is_some_and(|h| h.training_threshold.is_some()),
+    )?;
+
     match engine_type {
         "redis" => Ok(Box::new(RedisEngine::new(engine_config, host)?)),
         "vectorsets" => Ok(Box::new(VectorSetsEngine::new(engine_config, host)?)),
@@ -1921,5 +1933,31 @@ mod hybrid_driver_tests {
         // Engines without the arm are refused by the table before any call.
         let mut f = HybridFake(pass_result(4, 0.01, 1.0, false));
         assert!(search_workload(&mut f, "valkey", Workload::Hybrid, &d, &p, -1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sq8_engine_guard_tests {
+    use super::create_engine;
+
+    /// A copied `*-sq8-*` config on an engine that does not read the SQ8 keys
+    /// must fail before an engine exists, not build an uncompressed index
+    /// under the SQ8 name (#325 review).
+    #[test]
+    fn create_engine_refuses_sq8_keys_outside_redis() {
+        for engine in ["valkey", "dragonfly", "kividb"] {
+            let cfg: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+                "name": format!("{engine}-hnsw-sq8"),
+                "engine": engine,
+                "collection_params": {
+                    "hnsw_config": { "M": 16, "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 0 }
+                }
+            }))
+            .unwrap();
+            match create_engine(&cfg, "localhost") {
+                Ok(_) => panic!("{engine} accepted HNSW SQ8 keys it does not read"),
+                Err(e) => assert!(e.contains("read only by the redis engine"), "{engine}: {e}"),
+            }
+        }
     }
 }

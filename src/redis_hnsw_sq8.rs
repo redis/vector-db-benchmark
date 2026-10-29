@@ -26,6 +26,35 @@ pub fn env_applies(algorithm: &str, skip_vector_index: bool) -> bool {
     algorithm.eq_ignore_ascii_case("hnsw") && !skip_vector_index
 }
 
+/// Refuse `collection_params.hnsw_config.COMPRESSION` / `TRAINING_THRESHOLD`
+/// on any engine but `redis`. The keys are typed on the shared `HnswConfig`,
+/// so they no longer reach its catch-all and would not be reported as
+/// ignored: a copied `*-sq8-*` config on valkey, dragonfly or kividb would
+/// build an uncompressed index under an SQ8 name, with nothing in the result
+/// to say so. Only the Redis engine reads them, so anywhere else they are an
+/// error before anything is built.
+pub fn check_engine_reads_sq8_keys(
+    engine: &str,
+    compression_declared: bool,
+    threshold_declared: bool,
+) -> Result<(), String> {
+    if engine == "redis" || (!compression_declared && !threshold_declared) {
+        return Ok(());
+    }
+    let keys: Vec<&str> = [
+        (compression_declared, "COMPRESSION"),
+        (threshold_declared, "TRAINING_THRESHOLD"),
+    ]
+    .into_iter()
+    .filter_map(|(declared, key)| declared.then_some(key))
+    .collect();
+    Err(format!(
+        "collection_params.hnsw_config.{} is read only by the redis engine; engine \
+         '{engine}' would build an uncompressed index under this config's name",
+        keys.join(" / ")
+    ))
+}
+
 /// The outcome of [`Sq8Options::resolve`]: the options, plus which env vars
 /// supplied a value the config did not declare.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -340,6 +369,19 @@ mod tests {
         env: (Option<&str>, Option<&str>),
     ) -> Result<Sq8Options, String> {
         resolve_full(config, env).map(|r| r.options)
+    }
+
+    #[test]
+    fn sq8_keys_are_refused_on_every_engine_but_redis() {
+        assert!(check_engine_reads_sq8_keys("redis", true, true).is_ok());
+        for engine in ["valkey", "dragonfly", "kividb", "qdrant", "unknown"] {
+            assert!(check_engine_reads_sq8_keys(engine, false, false).is_ok());
+            let e = check_engine_reads_sq8_keys(engine, true, false).unwrap_err();
+            assert!(e.contains("COMPRESSION") && e.contains(engine), "{e}");
+            let e = check_engine_reads_sq8_keys(engine, false, true).unwrap_err();
+            assert!(e.contains("TRAINING_THRESHOLD"), "{e}");
+            assert!(!e.contains("COMPRESSION"), "{e}");
+        }
     }
 
     #[test]
