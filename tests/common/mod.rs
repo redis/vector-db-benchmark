@@ -706,7 +706,8 @@ pub fn write_comma_keyword_project(
 /// `Bj{\o}rk` is a syntax error (a dropped query).
 ///
 /// Every query targets one of those values (one is a `match_any` over two of
-/// them), so any wrong encoding fails at least one of the ten queries outright.
+/// them), so any wrong encoding fails at least one of the `N_QUERIES` (10)
+/// queries outright; the queries cycle through the targets.
 pub const TAG_ESCAPE_VALUES: [&str; 9] = [
     r#"J\"org Hennig"#,
     r#"J"org Hennig"#,
