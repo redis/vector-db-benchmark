@@ -1654,6 +1654,448 @@ fn test_binary_redis_svs_vamana() {
     fs::remove_dir_all(&project_root).ok();
 }
 
+/// Search result files a run wrote for `engine_name`.
+fn count_search_results(root: &std::path::Path, engine_name: &str) -> usize {
+    let prefix = format!("{engine_name}-");
+    fs::read_dir(root.join("results"))
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.starts_with(&prefix) && n.contains("-search-")
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// The search-path compression check (#325 review, #374): an index this
+/// invocation did not build (`--skip-upload`) must carry the compression this
+/// run resolves, in BOTH directions, or the run fails before any search
+/// result is written. Runs on the CI `redis:8.8.0` image, which has no HNSW
+/// SQ8 and builds `GlobalSQ8` for any SVS compression; neither matters,
+/// because only the mismatch between the index and the resolved settings is
+/// tested.
+///
+/// 1. Plain HNSW uploaded, then searched with `REDIS_HNSW_COMPRESSION=SQ8`:
+///    the index reports no compression, the run resolves SQ8, so it must fail.
+///    The same search without the variable is the positive control.
+/// 2. An SVS index built out of band with `COMPRESSION LVQ8` (so the server
+///    reports `GlobalSQ8` or `LVQ8`), searched by a plain SVS config: the run
+///    resolves no compression, so it must fail rather than label a compressed
+///    index uncompressed.
+#[test]
+fn test_binary_redis_skip_upload_compression_mismatch_fails() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 16;
+    let count = 100;
+    let top = 5;
+    let (_, vectors) = generate_test_vectors(count, dim);
+    let queries: Vec<Vec<f32>> = vectors[..10].to_vec();
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors(q, &vectors, top))
+        .collect();
+    let engine_config = serde_json::json!([
+        {
+            "name": "redis-cmp-hnsw",
+            "engine": "redis",
+            "algorithm": "hnsw",
+            "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 64 } },
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 64 }, "top": top }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 64 }
+        },
+        {
+            "name": "redis-cmp-svs",
+            "engine": "redis",
+            "algorithm": "svs-vamana",
+            "collection_params": {
+                "svs-vamana_config": { "GRAPH_MAX_DEGREE": 32, "CONSTRUCTION_WINDOW_SIZE": 64 }
+            },
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 64 }, "top": top }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 64 }
+        }
+    ]);
+    let root = create_test_project(
+        "test-cmp",
+        &serde_json::to_string_pretty(&engine_config).unwrap(),
+        &vectors,
+        &queries,
+        &neighbors,
+        "l2",
+        dim,
+    );
+    let port = test_port().to_string();
+    let run = |engine: &str, extra: &[&str], env: &[(&str, &str)]| {
+        let mut cmd = Command::new(binary_path());
+        cmd.args([
+            "--engines",
+            engine,
+            "--datasets",
+            "test-cmp",
+            "--host",
+            "localhost",
+            "--keep-data",
+            "--skip-if-exists",
+            "false",
+        ])
+        .args(extra)
+        .env("REDIS_PORT", &port)
+        .env_remove("REDIS_HNSW_COMPRESSION")
+        .env_remove("REDIS_HNSW_TRAINING_THRESHOLD")
+        .env_remove("REDIS_SVS_COMPRESSION")
+        .env_remove("REDIS_SVS_REDUCE")
+        .current_dir(&root);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("run vector-db-benchmark");
+        (
+            out.status.success(),
+            format!(
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    // 1. HNSW: plain upload, then a search that resolves SQ8.
+    let (ok, log) = run("redis-cmp-hnsw", &["--skip-search"], &[]);
+    assert!(ok, "plain HNSW upload failed.\n{log}");
+    let (ok, log) = run(
+        "redis-cmp-hnsw",
+        &["--skip-upload"],
+        &[("REDIS_HNSW_COMPRESSION", "SQ8")],
+    );
+    assert!(
+        !ok,
+        "SQ8-resolving search of a plain index must fail.\n{log}"
+    );
+    assert!(
+        log.contains("index compression check") && log.contains("differs from requested"),
+        "expected the search-path compression error.\n{log}"
+    );
+    assert_eq!(
+        count_search_results(&root, "redis-cmp-hnsw"),
+        0,
+        "no search result may be written for a mismatched index.\n{log}"
+    );
+    let (ok, log) = run("redis-cmp-hnsw", &["--skip-upload"], &[]);
+    assert!(
+        ok,
+        "positive control: the matching search must pass.\n{log}"
+    );
+    assert!(count_search_results(&root, "redis-cmp-hnsw") > 0, "{log}");
+
+    // 2. SVS: a compressed index built out of band, searched by a plain config.
+    let mut create = redis::cmd("FT.CREATE");
+    create
+        .arg("idx:redis-cmp-svs")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("redis-cmp-svs:")
+        .arg("SCHEMA")
+        .arg("vector")
+        .arg("VECTOR")
+        .arg("SVS-VAMANA")
+        .arg(8)
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg(dim)
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .arg("COMPRESSION")
+        .arg("LVQ8");
+    let _: () = create.query(&mut conn).expect("out-of-band SVS FT.CREATE");
+    for (i, v) in vectors.iter().enumerate() {
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let _: () = redis::cmd("HSET")
+            .arg(format!("redis-cmp-svs:{i}"))
+            .arg("vector")
+            .arg(bytes)
+            .query(&mut conn)
+            .expect("HSET");
+    }
+    let (ok, log) = run("redis-cmp-svs", &["--skip-upload"], &[]);
+    assert!(
+        !ok,
+        "a plain SVS search of a compressed index must fail.\n{log}"
+    );
+    assert!(
+        log.contains("index compression check") && log.contains("resolves no SVS COMPRESSION"),
+        "expected the search-path compression error.\n{log}"
+    );
+    assert_eq!(count_search_results(&root, "redis-cmp-svs"), 0, "{log}");
+
+    // 3. Another algorithm under this config's name: an uncompressed SVS
+    // index (FT.INFO `compression NO_COMPRESSION`) over the HNSW config's
+    // documents, searched by the plain HNSW config, must be refused rather
+    // than publish SVS numbers under the HNSW label.
+    let _: () = redis::cmd("FT.DROPINDEX")
+        .arg("idx:redis-cmp-hnsw")
+        .query(&mut conn)
+        .expect("drop the HNSW index, keeping its documents");
+    let _: () = redis::cmd("FT.CREATE")
+        .arg("idx:redis-cmp-hnsw")
+        .arg(
+            &[
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "redis-cmp-hnsw:",
+                "SCHEMA",
+                "vector",
+            ][..],
+        )
+        .arg(&["VECTOR", "SVS-VAMANA", "6", "TYPE", "FLOAT32", "DIM"][..])
+        .arg(dim)
+        .arg(&["DISTANCE_METRIC", "L2"][..])
+        .query(&mut conn)
+        .expect("out-of-band uncompressed SVS FT.CREATE");
+    let before = count_search_results(&root, "redis-cmp-hnsw");
+    let (ok, log) = run("redis-cmp-hnsw", &["--skip-upload"], &[]);
+    assert!(!ok, "an HNSW search of an SVS index must fail.\n{log}");
+    assert!(
+        log.contains("index compression check")
+            && log.contains("builds HNSW")
+            && log.contains("SVS-VAMANA"),
+        "expected the algorithm mismatch error.\n{log}"
+    );
+    assert_eq!(
+        count_search_results(&root, "redis-cmp-hnsw"),
+        before,
+        "{log}"
+    );
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The `compression` of the `vector` attribute in a RESP2 `FT.INFO` reply,
+/// parsed here independently of the library's read-back.
+fn svs_vector_compression(info: &redis::Value) -> Option<String> {
+    let text = |v: &redis::Value| match v {
+        redis::Value::BulkString(b) => String::from_utf8(b.clone()).ok(),
+        redis::Value::SimpleString(s) => Some(s.clone()),
+        _ => None,
+    };
+    let get = |v: &redis::Value, key: &str| -> Option<redis::Value> {
+        let redis::Value::Array(items) = v else {
+            return None;
+        };
+        items
+            .chunks(2)
+            .find(|kv| kv.len() == 2 && text(&kv[0]).as_deref() == Some(key))
+            .map(|kv| kv[1].clone())
+    };
+    let redis::Value::Array(attributes) = get(info, "attributes")? else {
+        return None;
+    };
+    attributes
+        .iter()
+        .find(|a| get(a, "identifier").and_then(|v| text(&v)).as_deref() == Some("vector"))
+        .and_then(|a| get(a, "compression"))
+        .and_then(|v| text(&v))
+}
+
+/// SVS `COMPRESSION` create-time read-back (#325), once per compression
+/// spelling the shipped configs use: `LVQ8` (cohere calibration,
+/// `redis-svs-sq8-comparison.json`), `LVQ4X8` (both calibration files; the
+/// server reports it as `LVQ4x8`) and `LeanVec4x8` with `REDUCE` (the
+/// dbpedia `-div4` cases; REDUCE = dim/4 here as there).
+///
+/// Without LVQ/LeanVec support RediSearch builds `GlobalSQ8` for any
+/// requested compression and FT.INFO says so; such a config must fail with
+/// the read-back error instead of publishing scalar-quantised results under
+/// its name. Platform-agnostic: a probe index shows what THIS server builds
+/// for each spelling, and the run must fail with the read-back error exactly
+/// when that is `GlobalSQ8`, and succeed when the server builds the
+/// requested type.
+///
+/// What CI actually covers: the official `redis:8.8.0` image is built with a
+/// plain `make all` (redis/docker-library-redis `debian/Dockerfile` at
+/// `8.8.0`), without `BUILD_INTEL_SVS_OPT`, which RediSearch's `build.sh`
+/// defaults to 0. Its `isLVQSupported()` is therefore false on every CPU,
+/// Intel included, so CI exercises only the `GlobalSQ8` path. It also pins
+/// that `FT.CREATE` accepts each shipped spelling and that the fallback is
+/// handled per type. The LVQ-capable branch (and with it the
+/// `LVQ4X8 -> LVQ4x8` spelling table) runs only against a server built with
+/// Intel's SVS optimisations on an Intel CPU: an RSALv2 build made with
+/// `BUILD_INTEL_SVS_OPT=yes`, or a Redis distribution that ships them. Redis
+/// docs (`vectors/svs-compression.md`) say Redis Open Source falls back to
+/// 8-bit scalar quantization even on Intel.
+#[test]
+fn test_binary_redis_svs_compression_read_back() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    let dim = 16;
+    let count = 100;
+    let top = 5;
+    let (_, vectors) = generate_test_vectors(count, dim);
+    let queries: Vec<Vec<f32>> = vectors[..10].to_vec();
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors(q, &vectors, top))
+        .collect();
+
+    for (compression, reduce) in [
+        ("LVQ8", None),
+        ("LVQ4X8", None),
+        ("LeanVec4x8", Some(dim / 4)),
+    ] {
+        flush_db(&mut conn);
+        let mut probe_cmd = redis::cmd("FT.CREATE");
+        probe_cmd
+            .arg("svs-probe")
+            .arg("ON")
+            .arg("HASH")
+            .arg("PREFIX")
+            .arg("1")
+            .arg("svs-probe:")
+            .arg("SCHEMA")
+            .arg("vector")
+            .arg("VECTOR")
+            .arg("SVS-VAMANA")
+            .arg(if reduce.is_some() { 10 } else { 8 })
+            .arg("TYPE")
+            .arg("FLOAT32")
+            .arg("DIM")
+            .arg(dim)
+            .arg("DISTANCE_METRIC")
+            .arg("L2")
+            .arg("COMPRESSION")
+            .arg(compression);
+        if let Some(r) = reduce {
+            probe_cmd.arg("REDUCE").arg(r);
+        }
+        let _: () = probe_cmd
+            .query(&mut conn)
+            .unwrap_or_else(|e| panic!("probe FT.CREATE with SVS COMPRESSION {compression}: {e}"));
+        let probe: redis::Value = redis::cmd("FT.INFO")
+            .arg("svs-probe")
+            .query(&mut conn)
+            .expect("probe FT.INFO");
+        // Read the probe's compression directly, NOT through the
+        // `verify_svs_compression` under test, so a broken check cannot also
+        // fool the probe.
+        let built = svs_vector_compression(&probe).unwrap_or_else(|| {
+            panic!("{compression}: probe FT.INFO has no compression: {probe:?}")
+        });
+        flush_db(&mut conn);
+
+        let tag = compression.to_ascii_lowercase();
+        let engine_name = format!("test-redis-svs-{tag}");
+        let dataset_name = format!("test-svs-{tag}");
+        let mut svs_config = serde_json::json!({
+            "GRAPH_MAX_DEGREE": 32,
+            "CONSTRUCTION_WINDOW_SIZE": 200,
+            "compression": compression
+        });
+        if let Some(r) = reduce {
+            svs_config["REDUCE"] = serde_json::json!(r);
+        }
+        let engine_config = serde_json::json!([{
+            "name": engine_name,
+            "engine": "redis",
+            "algorithm": "svs-vamana",
+            "collection_params": { "svs-vamana_config": svs_config },
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 200 }, "top": top }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 64 }
+        }]);
+        let project_root = create_test_project(
+            &dataset_name,
+            &serde_json::to_string_pretty(&engine_config).unwrap(),
+            &vectors,
+            &queries,
+            &neighbors,
+            "l2",
+            dim,
+        );
+        let output = Command::new(binary_path())
+            .args([
+                "--engines",
+                &engine_name,
+                "--datasets",
+                &dataset_name,
+                "--host",
+                "localhost",
+            ])
+            .env("REDIS_PORT", test_port().to_string())
+            .env_remove("REDIS_SVS_COMPRESSION")
+            .env_remove("REDIS_SVS_REDUCE")
+            .current_dir(&project_root)
+            .output()
+            .expect("Failed to run vector-db-benchmark");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let prefix = format!("{engine_name}-");
+        let search_results = fs::read_dir(project_root.join("results"))
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        n.starts_with(&prefix) && n.contains("-search-")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let expected_error = format!("requested {compression}, server built GlobalSQ8");
+        match built.as_str() {
+            // This server falls back to GlobalSQ8: the run must refuse it.
+            "GlobalSQ8" => {
+                assert!(
+                    !output.status.success(),
+                    "{compression} on a GlobalSQ8-only server must fail.\nstdout: {stdout}\nstderr: {stderr}"
+                );
+                assert!(
+                    stderr.contains(&expected_error) || stdout.contains(&expected_error),
+                    "{compression}: expected the SVS read-back error.\nstdout: {stdout}\nstderr: {stderr}"
+                );
+                assert_eq!(
+                    search_results, 0,
+                    "{compression}: no search result may be published"
+                );
+                // Refused right after FT.CREATE, before uploading: the
+                // search-path check alone would also refuse it, but only
+                // after a full upload.
+                let uploads = fs::read_dir(project_root.join("results"))
+                    .map(|d| {
+                        d.filter_map(Result::ok)
+                            .filter(|e| {
+                                let n = e.file_name().to_string_lossy().to_string();
+                                n.starts_with(&prefix) && n.contains("-upload-")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                assert_eq!(uploads, 0, "{compression}: must fail before the upload");
+            }
+            // This server builds the requested type: the read-back must accept it.
+            b if b.eq_ignore_ascii_case(compression) => {
+                assert!(
+                    output.status.success(),
+                    "{compression} on an LVQ-capable server must pass.\nstdout: {stdout}\nstderr: {stderr}"
+                );
+                assert!(
+                    search_results > 0,
+                    "{compression}: expected a search result"
+                );
+            }
+            other => panic!("{compression}: probe index reported compression {other:?}"),
+        }
+        flush_db(&mut conn);
+        fs::remove_dir_all(&project_root).ok();
+    }
+}
+
 #[test]
 fn test_binary_redis_open_loop_fixed_qps() {
     wait_for_redis();
@@ -1879,6 +2321,151 @@ fn read_search_result_field(
         }
     }
     None
+}
+
+#[test]
+#[ignore = "requires a Redis Search build with HNSW SQ8 support (merged #11330)"]
+fn test_binary_redis_hnsw_sq8_reaches_server() {
+    use vector_db_benchmark::redis_hnsw_sq8::Sq8Options;
+
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let dim = 16;
+    let (_, vectors) = generate_test_vectors(32, dim);
+    let queries = vectors[..4].to_vec();
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors(q, &vectors, 3))
+        .collect();
+    let engine_config = serde_json::json!([
+        {
+            "name": "redis-sq8-zero",
+            "engine": "redis",
+            "algorithm": "hnsw",
+            "collection_params": { "hnsw_config": {
+                "M": 16, "EF_CONSTRUCTION": 64,
+                "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 0
+            }},
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 32 }, "top": 3 }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 32 }
+        },
+        {
+            "name": "redis-sq8-trained",
+            "engine": "redis",
+            "algorithm": "hnsw",
+            "collection_params": { "hnsw_config": {
+                "M": 16, "EF_CONSTRUCTION": 64,
+                "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 4
+            }},
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 32 }, "top": 3 }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 32 }
+        },
+        {
+            "name": "redis-sq8-env",
+            "engine": "redis",
+            "algorithm": "hnsw",
+            "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 64 }},
+            "search_params": [{ "parallel": 1, "search_params": { "ef": 32 }, "top": 3 }],
+            "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 32 }
+        }
+    ]);
+    let root = create_test_project(
+        "test-sq8",
+        &serde_json::to_string_pretty(&engine_config).unwrap(),
+        &vectors,
+        &queries,
+        &neighbors,
+        "l2",
+        dim,
+    );
+    let output = Command::new(binary_path())
+        .args([
+            "--engines",
+            "redis-sq8-*",
+            "--datasets",
+            "test-sq8",
+            "--host",
+            "localhost",
+            "--keep-data",
+            "--skip-if-exists",
+            "false",
+        ])
+        .env("REDIS_PORT", test_port().to_string())
+        // redis-sq8-zero (config 0) and redis-sq8-trained (config 4) prove the
+        // config threshold wins over the env value 8; redis-sq8-env has no SQ8
+        // config and must pick up both env variables (threshold 8).
+        .env("REDIS_HNSW_COMPRESSION", "SQ8")
+        .env("REDIS_HNSW_TRAINING_THRESHOLD", "8")
+        .current_dir(&root)
+        .output()
+        .expect("run SQ8 benchmark");
+    assert!(
+        output.status.success(),
+        "SQ8 benchmark failed. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (name, threshold) in [
+        ("redis-sq8-zero", 0),
+        ("redis-sq8-trained", 4),
+        ("redis-sq8-env", 8),
+    ] {
+        let info: redis::Value = redis::cmd("FT.INFO")
+            .arg(format!("idx:{name}"))
+            .query(&mut conn)
+            .expect("FT.INFO for SQ8 index");
+        Sq8Options {
+            compression: Some("SQ8".into()),
+            training_threshold: Some(threshold),
+        }
+        .verify_ft_info(&info)
+        .unwrap_or_else(|error| panic!("{name}: {error}; server reply: {info:?}"));
+        assert_eq!(ft_info_num_docs(&mut conn, &format!("idx:{name}")), 32);
+        // The result metadata names what was built (the docs tell users to
+        // check it before comparing runs), including the env-built config.
+        let effective =
+            &common::read_result_doc(&root, name)["params"]["engine_params"]["effective"];
+        assert_eq!(effective["hnsw_compression"], "SQ8", "{name}");
+        assert_eq!(effective["hnsw_training_threshold"], threshold, "{name}");
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("notice: Redis config 'redis-sq8-env' resolves HNSW COMPRESSION SQ8"),
+        "the env-sourced SQ8 notice is missing: {stderr}"
+    );
+    // The search half of the guide's two-invocation workflow, run without the
+    // env that built redis-sq8-env's SQ8 index: refused before searching, on
+    // a server that really reports HNSW `compression`.
+    let before = count_search_results(&root, "redis-sq8-env");
+    let output = Command::new(binary_path())
+        .args([
+            "--engines",
+            "redis-sq8-env",
+            "--datasets",
+            "test-sq8",
+            "--host",
+            "localhost",
+            "--keep-data",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+        ])
+        .env("REDIS_PORT", test_port().to_string())
+        .env_remove("REDIS_HNSW_COMPRESSION")
+        .env_remove("REDIS_HNSW_TRAINING_THRESHOLD")
+        .current_dir(&root)
+        .output()
+        .expect("run the SQ8 search without env");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "must refuse: {stderr}");
+    assert!(
+        stderr.contains("resolves no HNSW COMPRESSION"),
+        "expected the search-path compression error: {stderr}"
+    );
+    assert_eq!(count_search_results(&root, "redis-sq8-env"), before);
+    fs::remove_dir_all(root).ok();
 }
 
 #[test]

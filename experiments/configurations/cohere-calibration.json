@@ -59,6 +59,134 @@
       "data_type": "FLOAT32"
     }
   },
+  {
+    "name": "cohere-cal-hnsw-sq8-zero-float16",
+    "engine": "redis",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "hnsw",
+      "data_type": "FLOAT16",
+      "hnsw_config": {
+        "M": 32,
+        "DISTANCE_METRIC": "IP",
+        "EF_CONSTRUCTION": 200,
+        "COMPRESSION": "SQ8",
+        "TRAINING_THRESHOLD": 0
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 100,
+        "calibration_param": "ef",
+        "calibration_precision": 0.95,
+        "search_params": {
+          "data_type": "FLOAT16"
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "algorithm": "hnsw",
+      "data_type": "FLOAT16"
+    }
+  },
+  {
+    "name": "cohere-cal-hnsw-sq8-zero-float32",
+    "engine": "redis",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "hnsw",
+      "data_type": "FLOAT32",
+      "hnsw_config": {
+        "M": 32,
+        "DISTANCE_METRIC": "IP",
+        "EF_CONSTRUCTION": 200,
+        "COMPRESSION": "SQ8",
+        "TRAINING_THRESHOLD": 0
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 100,
+        "calibration_param": "ef",
+        "calibration_precision": 0.95,
+        "search_params": {
+          "data_type": "FLOAT32"
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "algorithm": "hnsw",
+      "data_type": "FLOAT32"
+    }
+  },
+  {
+    "name": "cohere-cal-hnsw-sq8-trained-float16",
+    "engine": "redis",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "hnsw",
+      "data_type": "FLOAT16",
+      "hnsw_config": {
+        "M": 32,
+        "DISTANCE_METRIC": "IP",
+        "EF_CONSTRUCTION": 200,
+        "COMPRESSION": "SQ8",
+        "TRAINING_THRESHOLD": 10240
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 100,
+        "calibration_param": "ef",
+        "calibration_precision": 0.95,
+        "search_params": {
+          "data_type": "FLOAT16"
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "algorithm": "hnsw",
+      "data_type": "FLOAT16"
+    }
+  },
+  {
+    "name": "cohere-cal-hnsw-sq8-trained-float32",
+    "engine": "redis",
+    "connection_params": {},
+    "collection_params": {
+      "algorithm": "hnsw",
+      "data_type": "FLOAT32",
+      "hnsw_config": {
+        "M": 32,
+        "DISTANCE_METRIC": "IP",
+        "EF_CONSTRUCTION": 200,
+        "COMPRESSION": "SQ8",
+        "TRAINING_THRESHOLD": 10240
+      }
+    },
+    "search_params": [
+      {
+        "parallel": 100,
+        "top": 100,
+        "calibration_param": "ef",
+        "calibration_precision": 0.95,
+        "search_params": {
+          "data_type": "FLOAT32"
+        }
+      }
+    ],
+    "upload_params": {
+      "parallel": 100,
+      "algorithm": "hnsw",
+      "data_type": "FLOAT32"
+    }
+  },
 {
     "name": "cohere-cal-svs-noquant-float16",
     "engine": "redis",
