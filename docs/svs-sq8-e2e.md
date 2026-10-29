@@ -5,7 +5,9 @@ Redis instance with HNSW SQ8 support. These are client-to-Redis benchmarks.
 The two `redis-compare-*-svs-lvq8` cases also need a server built with Intel's
 SVS optimisations on an Intel CPU (see below). On any other server, including
 the SQ8-capable Arm Neoverse-V2 build this guide was smoke-tested on, those 2
-of the 8 indexes fail at `FT.CREATE` time by design, and the other 6 run.
+of the 8 indexes are created as `GlobalSQ8`, then refused by the harness's
+`FT.INFO` read-back right after `FT.CREATE` (before upload, by design); drop
+the leftover `idx:<case>` afterwards. The other 6 run.
 The [SQ8 execution guide](hnsw-sq8-e2e.md) covers binary provenance, schema
 readback, complete backend drain, cleanup, and repeated independent builds.
 
@@ -115,7 +117,8 @@ with `FT.DROPINDEX idx:$CASE DD` before the next case. Repeat for both HNSW
 controls and the FLOAT16 counterparts. Run `redis-compare-float32-svs-lvq8` and
 `redis-compare-float16-svs-lvq8` only on a server built with the Intel SVS
 optimisations; elsewhere they stop with a `GlobalSQ8` compression mismatch
-before uploading, and no result is written.
+before uploading, and no result is written. `FT.CREATE` itself succeeds, so
+drop the leftover `idx:$CASE` with `FT.DROPINDEX idx:$CASE DD`.
 
 ## Compare results
 
