@@ -303,11 +303,20 @@ pub struct Variant {
 /// briefly and was removed — see [`Sampling`] for why position-based selection
 /// is the wrong default for a corpus whose point is its metadata.
 ///
-/// The thresholds nest (886 < 8805 < 88075), so each variant is a strict subset
-/// of the larger ones and results stay comparable across sizes.
+/// The thresholds nest (886 < 8805 < 88075 < 880865), so each variant is a
+/// strict subset of the larger ones and results stay comparable across sizes.
+///
+/// The 100M variant (#342) is larger than any benchmark client's RAM: ~410 GB
+/// of float32 vectors and ~184 GB of payloads. `prepare-msmarco` builds it
+/// with the same streaming passes as the others (peak RSS is O(per-passage
+/// derived fields + title vocabulary), ~4 GB, not O(corpus)), and the
+/// benchmark streams it into Redis / OpenSearch (`upload_stream`). It has no
+/// published tarball: build it on the client host.
 pub const VARIANTS: &[Variant] = &[
     // Realized counts measured by `--discover-crc32` over all 113,520,750
-    // docids at revision e78737fe: 99,964 / 1,000,044 / 9,999,959.
+    // docids at revision e78737fe: 99,964 / 1,000,044 / 9,999,959, and
+    // 100,000,027 at 880865 (#342; reproduced the first three exactly in the
+    // same scan, 2026-10-28).
     Variant {
         dataset_name: "msmarco-cohere-1024-100K-cosine",
         dir: "msmarco-cohere-1024/crc32-t886",
@@ -326,7 +335,17 @@ pub const VARIANTS: &[Variant] = &[
         limit: 9_999_959,
         threshold: 88_075,
     },
+    Variant {
+        dataset_name: "msmarco-cohere-1024-100M-cosine",
+        dir: "msmarco-cohere-1024/crc32-t880865",
+        limit: 100_000_027,
+        threshold: 880_865,
+    },
 ];
+
+/// Sizes `--discover-crc32` reports a threshold for: one per registered
+/// variant, so a rescan re-derives every constant above.
+pub const DISCOVERY_TARGETS: [u64; 4] = [100_000, 1_000_000, 10_000_000, 100_000_000];
 
 /// Revision suffix of the prepared tarballs in S3. Bumped whenever the files a
 /// tarball holds change shape (v2: payloads gain the derived fields and
@@ -342,6 +361,19 @@ pub const TARBALL_REVISION: &str = "v2";
 /// `msmarco-cohere-1024-1M-cosine-v2`, the stem of a variant's published tarball.
 pub fn tarball_stem(v: &Variant) -> String {
     format!("{}-{}", v.dataset_name, TARBALL_REVISION)
+}
+
+/// What to tell someone whose MS MARCO dataset directory is missing and has
+/// no download link (the 100M, #342): the exact build command. `None` for a
+/// name that is not an MS MARCO variant.
+pub fn build_hint(dataset_name: &str) -> Option<String> {
+    variant(dataset_name).map(|v| {
+        format!(
+            "build it on this host with `make prepare-msmarco MSMARCO_DATASET={}` (see the \
+             README's MS MARCO section for disk and time)",
+            v.dataset_name
+        )
+    })
 }
 
 /// Look a variant up by its registered dataset name.
@@ -1137,8 +1169,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_missing_variant_names_its_build_command() {
+        let h = build_hint("msmarco-cohere-1024-100M-cosine").unwrap();
+        assert!(
+            h.contains("make prepare-msmarco MSMARCO_DATASET=msmarco-cohere-1024-100M-cosine"),
+            "{h}"
+        );
+        assert!(build_hint("glove-100-angular").is_none());
+    }
+
+    #[test]
     fn variants_are_registered_under_their_own_names_and_dirs() {
-        assert_eq!(VARIANTS.len(), 3);
+        assert_eq!(VARIANTS.len(), 4);
+        // `--discover-crc32` sizes exactly the registered round numbers.
+        let rounds: Vec<u64> = VARIANTS
+            .iter()
+            .map(|v| {
+                let round = DISCOVERY_TARGETS
+                    .iter()
+                    .copied()
+                    .min_by_key(|t| t.abs_diff(v.limit))
+                    .unwrap();
+                // Within 0.1% of its round size, like every realized count.
+                assert!(round.abs_diff(v.limit) * 1000 < round, "{v:?}");
+                round
+            })
+            .collect();
+        assert_eq!(rounds, DISCOVERY_TARGETS.to_vec());
         // One family only. A position-based prefix family existed and was
         // removed: selection must be by hash, or the metadata distribution is an
         // artefact of how the corpus happens to be ordered.

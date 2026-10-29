@@ -112,6 +112,10 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
     }
 
+    // A set but unparsable INDEXING_WAIT_SECS refuses the run here, before
+    // any download, connection or upload (#361 review, #219).
+    crate::effective_config::indexing_wait_override()?;
+
     let dataset_configs = read_dataset_configs()?;
     // A configuration file that fails to load takes EVERY configuration it
     // defines with it, and under a wildcard `--engines` that silently shrinks the
@@ -500,6 +504,11 @@ pub fn run(args: &Args) -> Result<(), String> {
             num_engine_configs
         );
     }
+    // `--upload-reader auto` decides once per dataset for the whole
+    // invocation (#361 review): every config's `Dataset` shares these
+    // readings, so one sweep never mixes the in-memory and streaming readers.
+    let memory_snapshots =
+        std::sync::Arc::new(vector_db_benchmark::upload_stream::MemorySnapshots::default());
     'experiments: for (engine_idx, (engine_name, engine_config)) in engines.iter().enumerate() {
         // With --reset-between-configs, only the LAST config keeps its data under
         // --keep-data; earlier configs tear down after finishing so at most one
@@ -552,7 +561,9 @@ pub fn run(args: &Args) -> Result<(), String> {
                 println!("{}", "=".repeat(60));
             });
 
-            let dataset = Dataset::new((*dataset_config).clone());
+            let dataset = Dataset::new((*dataset_config).clone())
+                .with_upload_reader(args.upload_reader)
+                .with_memory_snapshots(memory_snapshots.clone());
 
             // Hybrid (#341): the query set must exist and be valid before the
             // engine is built, so a corpus without `hybrid_queries.jsonl` fails
@@ -665,6 +676,9 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
         "dump_raw_latencies": args.dump_raw_latencies,
         // Non-boolean: where per-query result dumps went (#343).
         "dump_results": args.dump_results,
+        // Non-boolean: how the upload read the corpus (#342). The reader that
+        // actually ran is recorded per upload as `results.upload_reader`.
+        "upload_reader": args.upload_reader.as_str(),
         "exit_on_error": args.exit_on_error,
         "fail_on_dropped_queries": args.fail_on_dropped_queries,
         "keep_data": args.keep_data,
@@ -1462,6 +1476,7 @@ fn run_single_experiment(
             &upload_stats,
             number_of_shards,
             plan,
+            dataset.upload_reader_report().as_ref(),
         )?;
     } else {
         // `--skip-upload` means: the server already holds the corpus I want —
@@ -3129,6 +3144,7 @@ fn save_upload_results(
     stats: &crate::engine::UploadStats,
     number_of_shards: Option<&serde_json::Value>,
     plan: &WorkloadPlan,
+    upload_reader: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let filename = format!(
@@ -3146,6 +3162,11 @@ fn save_upload_results(
         &crate::effective_config::snapshot(),
     );
     stamp_shared_index(&mut result, plan);
+    // Which reader fed the upload (#342), as recorded by the reader itself:
+    // `stream` (bounded client memory) or `memory`, with the flag and why.
+    if let Some(reader) = upload_reader {
+        result["results"]["upload_reader"] = reader.clone();
+    }
 
     let path = results_dir().join(&filename);
     fs::write(&path, serde_json::to_string_pretty(&result).unwrap())
@@ -3252,6 +3273,37 @@ mod tests {
     use super::parse_update_search_ratio;
     use super::run_with_search_watchdog;
     use crate::engine::UpdateSearchRatio;
+
+    /// #361 review: every `Dataset` the run builds shares ONE
+    /// `MemorySnapshots`, created once before the config loop, so
+    /// `--upload-reader auto` decides once per dataset for the whole
+    /// invocation (the decision itself is unit-tested in `upload_stream` and
+    /// `dataset`). Reads this file's own non-test source.
+    #[test]
+    fn every_config_shares_the_invocations_memory_snapshots() {
+        let src = include_str!("experiment.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let sites: Vec<usize> = prod
+            .match_indices("Dataset::new(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(sites.len(), 1, "one Dataset construction in the run loop");
+        let stmt = &prod[sites[0]..sites[0] + prod[sites[0]..].find(';').unwrap()];
+        assert!(
+            stmt.contains(".with_memory_snapshots(memory_snapshots.clone())"),
+            "the run's Dataset does not share the invocation's snapshots: {stmt}"
+        );
+        let created: Vec<usize> = prod
+            .match_indices("MemorySnapshots::default()")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(created.len(), 1, "one snapshot set per invocation");
+        let config_loop = prod.find("'experiments: for").unwrap();
+        assert!(
+            created[0] < config_loop,
+            "the snapshots must be created before the config loop, not per config"
+        );
+    }
 
     // Watchdog disabled (timeout <= 0, non-finite): must run `f` inline on the
     // current thread and return its value verbatim — the default, unchanged path.
@@ -3741,6 +3793,7 @@ mod tests {
                 "warmup_seconds",
                 "configurations_dir",
                 "results_dir",
+                "upload_reader",
             ] {
                 assert!(
                     recorded.contains_key(required),
@@ -3757,6 +3810,8 @@ mod tests {
                 "results_dir",
                 // #343: where per-query dumps went (an Option<PathBuf> flag).
                 "dump_results",
+                // #342: `--upload-reader` (an enum flag).
+                "upload_reader",
             ];
             let fabricated: Vec<&String> = recorded
                 .keys()

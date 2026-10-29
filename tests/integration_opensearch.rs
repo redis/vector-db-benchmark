@@ -2403,3 +2403,121 @@ fn test_binary_opensearch_hybrid_and_filter_only_share_one_full_index() {
         .send();
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #342: the STREAMING upload (`--upload-reader stream`) on OpenSearch, with a
+/// batch size and thread count that do not divide the corpus: the hybrid
+/// buckets reach the same recall floor as the in-memory upload's test above,
+/// every row is counted, and the upload result records the stream reader.
+#[test]
+fn test_binary_opensearch_streaming_upload_hybrid_recall() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-hyb-stream", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                           "search_params": {"ef": 200}}],
+        "upload_params": {"parallel": 3, "batch_size": 333}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-stream", &configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-hyb-stream",
+        "hybrid-stream",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_hybrid_stream")
+        ],
+        &[
+            "--upload-reader",
+            "stream",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_hybrid_run(&proj, "os-hyb-stream", &dump, 0.8, "vector");
+    let upload = common::read_upload_doc(&proj.root, "os-hyb-stream");
+    let reader = &upload["results"]["upload_reader"];
+    assert_eq!(reader["reader"], "stream", "{upload}");
+    assert_eq!(reader["rows"], common::HYBRID_N as u64, "{upload}");
+    assert_eq!(upload["results"]["upload_count"], common::HYBRID_N as u64);
+    // #344 on the streamed path: one-clock phases, checked against the
+    // legacy fields the upload file also carries.
+    let r = &upload["results"];
+    let ph = &r["ingest_phases"];
+    assert_eq!(
+        ph["index_wait"], "opensearch_force_merge_refresh",
+        "{upload}"
+    );
+    assert_eq!(ph["documents"], common::HYBRID_N as u64, "{upload}");
+    let f = |k: &str| r[k].as_f64().unwrap_or_else(|| panic!("results.{k}: {r}"));
+    assert!(f("upload_time") > 0.0 && f("index_wait_time") >= 0.0, "{r}");
+    assert!(
+        (f("upload_time") + f("index_wait_time") - f("total_ingest_time")).abs() < 1e-3,
+        "{r}"
+    );
+    assert!(
+        (f("read_time") + f("total_ingest_time") - f("total_time")).abs() < 1e-3,
+        "{r}"
+    );
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+/// #361 review: the streamed upload's payload pre-flight. A `payloads.jsonl`
+/// one row short is refused before the first bulk request, as on the
+/// in-memory path, rather than after the whole corpus was sent.
+#[test]
+fn test_binary_opensearch_streaming_upload_refuses_a_short_payload_file_before_writing() {
+    wait_for_opensearch();
+    let index = "bench_stream_short";
+    let configs = serde_json::json!([{
+        "name": "os-stream-short", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 3, "batch_size": 333}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("stream-short", &configs.to_string());
+    // Drop the last payload row: the stream would only find it after every
+    // batch had been sent.
+    let payloads = proj.root.join("datasets/stream-short/payloads.jsonl");
+    let text = std::fs::read_to_string(&payloads).unwrap();
+    let keep = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0;
+    std::fs::write(&payloads, format!("{keep}\n")).unwrap();
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let out = common::run_binary_output(
+        &proj.root,
+        "os-stream-short",
+        "stream-short",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &["--upload-reader", "stream"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let all = format!("{stdout}\n{stderr}");
+    assert!(
+        all.contains("payload pre-flight failed") && all.contains("doesn't match vector count"),
+        "{all}"
+    );
+    // No document reached the index (a missing index counts as none).
+    let resp = os_client()
+        .get(format!("{}/{index}/_count", os_base_url()))
+        .send()
+        .unwrap();
+    if resp.status().is_success() {
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(
+            body["count"], 0,
+            "documents were written before the check: {body}"
+        );
+    } else {
+        assert_eq!(resp.status().as_u16(), 404);
+    }
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}

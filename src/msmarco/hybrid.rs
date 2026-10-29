@@ -20,7 +20,7 @@
 //! document frequency is nearest 1% and 0.1% of the corpus among the terms on
 //! which Redis and OpenSearch provably agree on every document
 //! ([`super::text_match::choose_term`]). They therefore differ between the
-//! 100K, 1M and 10M variants; `PREPARED.json` records them.
+//! 100K, 1M, 10M and 100M variants; `PREPARED.json` records them.
 //!
 //! Every query vector of `tests.jsonl` is used once: query `i` is paired with
 //! predicate `i % 12`. The bucket of a row is the bucket of its REALIZED
@@ -74,7 +74,21 @@ impl Fields for TitledRow {
     }
 }
 
-/// Every passage's predicate-visible fields, in corpus-id order.
+/// One stored payload as a hybrid predicate sees it. Its derived fields must
+/// equal the derivation; a non-string `title` is an error.
+pub fn titled_row(payload: &Value) -> Result<TitledRow, String> {
+    let d = derived::check_payload(payload)?;
+    let title = match payload.get(TEXT_FIELD) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(other) => return Err(format!("payload {TEXT_FIELD} is not a string: {other}")),
+    };
+    Ok(TitledRow { derived: d, title })
+}
+
+/// Every passage's predicate-visible fields, in corpus-id order, held in
+/// memory. The reference implementation for tests; `prepare` uses
+/// [`StreamedCorpus`], which keeps nothing per row but the predicate masks.
 #[derive(Debug, Default, Clone)]
 pub struct HybridCorpus {
     rows: Vec<TitledRow>,
@@ -88,13 +102,7 @@ impl HybridCorpus {
     /// Append a stored payload (the next corpus id). Its derived fields must
     /// equal the derivation; a non-string `title` is an error.
     pub fn push_payload(&mut self, payload: &Value) -> Result<(), String> {
-        let d = derived::check_payload(payload)?;
-        let title = match payload.get(TEXT_FIELD) {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(other) => return Err(format!("payload {TEXT_FIELD} is not a string: {other}")),
-        };
-        self.rows.push(TitledRow { derived: d, title });
+        self.rows.push(titled_row(payload)?);
         Ok(())
     }
 
@@ -148,11 +156,292 @@ impl HybridCorpus {
             counter.add_doc(self.title(i));
         }
         let common =
-            text_match::choose_term(&counter, n.div_ceil(100), &[], |t| self.scan_term(t))?;
+            text_match::choose_term(&counter, n.div_ceil(100), &[], |t| Ok(self.scan_term(t)))?;
         let rare = text_match::choose_term(&counter, n.div_ceil(1000), &[&common.0], |t| {
+            Ok(self.scan_term(t))
+        })?;
+        Ok(TextTerms { common, rare })
+    }
+}
+
+/// One bit per corpus row: whether the row satisfies a predicate. 1 bit, not
+/// the 1 byte of a `Vec<bool>`, so the twelve masks of a 113.5M-passage corpus
+/// are 170 MB rather than 1.4 GB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowMask {
+    len: usize,
+    words: Vec<u64>,
+}
+
+impl RowMask {
+    /// `len` rows, none set.
+    pub fn new(len: usize) -> Self {
+        Self {
+            len,
+            words: vec![0; len.div_ceil(64)],
+        }
+    }
+
+    /// `len` rows, all set.
+    pub fn all(len: usize) -> Self {
+        let mut m = Self::new(len);
+        for i in 0..len {
+            m.set(i);
+        }
+        m
+    }
+
+    pub fn from_bools(bits: &[bool]) -> Self {
+        let mut m = Self::new(bits.len());
+        for (i, b) in bits.iter().enumerate() {
+            if *b {
+                m.set(i);
+            }
+        }
+        m
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether row `i` is set; `false` beyond the end.
+    pub fn get(&self, i: usize) -> bool {
+        i < self.len && (self.words[i / 64] >> (i % 64)) & 1 == 1
+    }
+
+    /// Set row `i`. Panics beyond the end, like an out-of-range index.
+    pub fn set(&mut self, i: usize) {
+        assert!(i < self.len, "row {i} outside a {}-row mask", self.len);
+        self.words[i / 64] |= 1 << (i % 64);
+    }
+
+    pub fn count_ones(&self) -> u64 {
+        self.words.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
+}
+
+/// Rows of `payloads.jsonl` read per chunk by [`StreamedCorpus`]. A chunk's
+/// lines are parsed in parallel and dropped before the next is read, so this
+/// (times the line length, ~1.8 KB on MS MARCO: ~120 MB) is the scan's
+/// working set at any corpus size.
+pub const SCAN_CHUNK_ROWS: usize = 1 << 16;
+
+/// The hybrid corpus streamed from `payloads.jsonl` (#342): every pass reads
+/// the file again, in chunks, and nothing per row survives a pass except the
+/// predicate bits. Memory is O(chunk + title vocabulary + masks), not
+/// O(corpus) — the in-memory [`HybridCorpus`] holds every title (~70 B/row,
+/// ~8 GB at 113.5M passages) and a byte per row per predicate.
+#[derive(Debug, Clone)]
+pub struct StreamedCorpus {
+    path: PathBuf,
+    rows: u64,
+    chunk_rows: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct TitleOnly {
+    #[serde(default)]
+    title: Option<Value>,
+}
+
+impl StreamedCorpus {
+    /// The validating pass: every payload must carry the derived fields the
+    /// derivation gives and a string-or-absent `title`. Returns the corpus and
+    /// the raw-view title term counts [`StreamedCorpus::choose_terms`] ranks.
+    pub fn scan(path: &Path) -> Result<(Self, text_match::TermCounter), String> {
+        Self::scan_with_chunk(path, SCAN_CHUNK_ROWS)
+    }
+
+    /// [`StreamedCorpus::scan`] with an explicit chunk size (tests use a small
+    /// one so every pass crosses chunk boundaries).
+    pub fn scan_with_chunk(
+        path: &Path,
+        chunk_rows: usize,
+    ) -> Result<(Self, text_match::TermCounter), String> {
+        if chunk_rows == 0 {
+            return Err("scan chunk must hold at least one row".into());
+        }
+        let mut counter = text_match::TermCounter::new();
+        let rows = for_each_chunk(path, chunk_rows, |first, lines| {
+            let titles: Vec<Option<String>> = lines
+                .par_iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let at = || format!("{} line {}", path.display(), first + i as u64 + 1);
+                    let v: Value =
+                        serde_json::from_str(line).map_err(|e| format!("{}: {e}", at()))?;
+                    titled_row(&v)
+                        .map(|r| r.title)
+                        .map_err(|e| format!("{}: {e}", at()))
+                })
+                .collect::<Result<_, String>>()?;
+            for t in &titles {
+                counter.add_doc(t.as_deref().unwrap_or(""));
+            }
+            Ok(())
+        })?;
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                rows,
+                chunk_rows,
+            },
+            counter,
+        ))
+    }
+
+    pub fn len(&self) -> u64 {
+        self.rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    /// (documents `Yes`, documents `Ambiguous`) for `term` over every title:
+    /// one streamed pass that parses only `title`.
+    pub fn scan_term(&self, term: &str) -> Result<(u64, u64), String> {
+        let mut total = (0u64, 0u64);
+        let rows = for_each_chunk(&self.path, self.chunk_rows, |first, lines| {
+            let (y, a) = lines
+                .par_iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let t: TitleOnly = serde_json::from_str(line).map_err(|e| {
+                        format!("{} line {}: {e}", self.path.display(), first + i as u64 + 1)
+                    })?;
+                    let title = match &t.title {
+                        Some(Value::String(s)) => s.as_str(),
+                        _ => "",
+                    };
+                    Ok::<_, String>(match text_match::classify(title, term) {
+                        TextMatch::Yes => (1u64, 0u64),
+                        TextMatch::Ambiguous => (0, 1),
+                        TextMatch::No => (0, 0),
+                    })
+                })
+                .try_reduce(|| (0u64, 0u64), |a, b| Ok((a.0 + b.0, a.1 + b.1)))?;
+            total = (total.0 + y, total.1 + a);
+            Ok(())
+        })?;
+        self.check_rows(rows)?;
+        Ok(total)
+    }
+
+    /// The COMMON and RARE terms, exactly as [`HybridCorpus::choose_terms`]
+    /// picks them, from the counter [`StreamedCorpus::scan`] returned.
+    pub fn choose_terms(&self, counter: &text_match::TermCounter) -> Result<TextTerms, String> {
+        let n = self.rows;
+        let common = text_match::choose_term(counter, n.div_ceil(100), &[], |t| self.scan_term(t))?;
+        let rare = text_match::choose_term(counter, n.div_ceil(1000), &[&common.0], |t| {
             self.scan_term(t)
         })?;
         Ok(TextTerms { common, rare })
+    }
+
+    /// [`evaluate`], streamed: one pass evaluates every predicate on every
+    /// row and keeps only the bits.
+    pub fn evaluate(&self, templates: Vec<HybridTemplate>) -> Result<EvaluatedPredicates, String> {
+        let compiled = compile_templates(templates)?;
+        if compiled.len() > 64 {
+            return Err(format!(
+                "{} predicates; the streamed evaluation packs at most 64 per row",
+                compiled.len()
+            ));
+        }
+        let n = usize::try_from(self.rows).map_err(|_| "corpus too large for this host")?;
+        let mut masks: Vec<RowMask> = compiled.iter().map(|_| RowMask::new(n)).collect();
+        let rows = for_each_chunk(&self.path, self.chunk_rows, |first, lines| {
+            let bits: Vec<u64> = lines
+                .par_iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    let at = || format!("{} line {}", self.path.display(), first + i as u64 + 1);
+                    let v: Value =
+                        serde_json::from_str(line).map_err(|e| format!("{}: {e}", at()))?;
+                    let row = titled_row(&v).map_err(|e| format!("{}: {e}", at()))?;
+                    let mut b = 0u64;
+                    for (pi, (t, p)) in compiled.iter().enumerate() {
+                        if p.matches(&row)
+                            .map_err(|e| format!("{}: {e}", t.predicate_id))?
+                        {
+                            b |= 1 << pi;
+                        }
+                    }
+                    Ok(b)
+                })
+                .collect::<Result<_, String>>()?;
+            for (i, b) in bits.iter().enumerate() {
+                let row = first as usize + i;
+                if row >= n {
+                    return Err(format!(
+                        "{} grew while it was being read (more than {n} rows)",
+                        self.path.display()
+                    ));
+                }
+                for (pi, mask) in masks.iter_mut().enumerate() {
+                    if (b >> pi) & 1 == 1 {
+                        mask.set(row);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        self.check_rows(rows)?;
+        finish_evaluation(compiled, masks, self.rows)
+    }
+
+    /// Every pass must see the row count the validating pass saw.
+    fn check_rows(&self, rows: u64) -> Result<(), String> {
+        if rows != self.rows {
+            return Err(format!(
+                "{} held {} rows on the first pass and {rows} on a later one; it changed while \
+                 the hybrid query set was being built",
+                self.path.display(),
+                self.rows
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read `path` line by line in chunks of `chunk_rows`, calling
+/// `on_chunk(first_row, lines)`; the buffer is reused, so one chunk is alive
+/// at a time. Returns the row count.
+pub fn for_each_chunk(
+    path: &Path,
+    chunk_rows: usize,
+    mut on_chunk: impl FnMut(u64, &[String]) -> Result<(), String>,
+) -> Result<u64, String> {
+    let f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut reader = BufReader::with_capacity(1 << 22, f);
+    let mut lines: Vec<String> = Vec::with_capacity(chunk_rows);
+    let mut rows = 0u64;
+    loop {
+        lines.clear();
+        while lines.len() < chunk_rows {
+            let mut line = String::new();
+            let got = reader
+                .read_line(&mut line)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            if got == 0 {
+                break;
+            }
+            lines.push(line);
+        }
+        if lines.is_empty() {
+            return Ok(rows);
+        }
+        on_chunk(rows, &lines)?;
+        rows += lines.len() as u64;
+        if lines.len() < chunk_rows {
+            return Ok(rows);
+        }
     }
 }
 
@@ -263,37 +552,42 @@ pub struct EvaluatedPredicates {
     pub templates: Vec<HybridTemplate>,
     pub predicates: Vec<Predicate>,
     pub counts: Vec<u64>,
-    /// `masks[p][row]`: whether corpus row `row` satisfies predicate `p`.
-    pub masks: Vec<Vec<bool>>,
+    /// `masks[p].get(row)`: whether corpus row `row` satisfies predicate `p`.
+    pub masks: Vec<RowMask>,
 }
 
-/// Compile, type-check and evaluate every template over the corpus. Errors
-/// when a predicate is outside the grammar or schema, matches fewer than
-/// [`MIN_MATCHES`] rows, or lands outside its designed bucket.
-pub fn evaluate(
-    corpus: &HybridCorpus,
+/// Compile and type-check every template, in order.
+fn compile_templates(
     templates: Vec<HybridTemplate>,
-) -> Result<EvaluatedPredicates, String> {
-    let n = corpus.len() as u64;
+) -> Result<Vec<(HybridTemplate, Predicate)>, String> {
     let schema = predicate_schema();
+    templates
+        .into_iter()
+        .map(|t| {
+            let id = &t.predicate_id;
+            let p = Predicate::compile(&t.conditions).map_err(|e| format!("{id}: {e}"))?;
+            crate::hybrid::validate_against_schema(&p, Some(&schema))
+                .map_err(|e| format!("{id}: {e}"))?;
+            Ok((t, p))
+        })
+        .collect()
+}
+
+/// Count each mask and hold it to its bucket and to [`MIN_MATCHES`].
+fn finish_evaluation(
+    compiled: Vec<(HybridTemplate, Predicate)>,
+    masks: Vec<RowMask>,
+    n: u64,
+) -> Result<EvaluatedPredicates, String> {
     let mut out = EvaluatedPredicates {
         templates: Vec::new(),
         predicates: Vec::new(),
         counts: Vec::new(),
         masks: Vec::new(),
     };
-    for t in templates {
+    for ((t, p), mask) in compiled.into_iter().zip(masks) {
         let id = &t.predicate_id;
-        let p = Predicate::compile(&t.conditions).map_err(|e| format!("{id}: {e}"))?;
-        crate::hybrid::validate_against_schema(&p, Some(&schema))
-            .map_err(|e| format!("{id}: {e}"))?;
-        let mask: Vec<bool> = corpus
-            .rows()
-            .par_iter()
-            .map(|r| p.matches(r))
-            .collect::<Result<_, _>>()
-            .map_err(|e| format!("{id}: {e}"))?;
-        let count = mask.iter().filter(|&&m| m).count() as u64;
+        let count = mask.count_ones();
         if count < MIN_MATCHES {
             return Err(format!(
                 "{id} ({}) matches {count} of {n} rows, fewer than {MIN_MATCHES}",
@@ -314,6 +608,28 @@ pub fn evaluate(
         out.templates.push(t);
     }
     Ok(out)
+}
+
+/// Compile, type-check and evaluate every template over the corpus. Errors
+/// when a predicate is outside the grammar or schema, matches fewer than
+/// [`MIN_MATCHES`] rows, or lands outside its designed bucket.
+pub fn evaluate(
+    corpus: &HybridCorpus,
+    templates: Vec<HybridTemplate>,
+) -> Result<EvaluatedPredicates, String> {
+    let n = corpus.len() as u64;
+    let compiled = compile_templates(templates)?;
+    let mut masks = Vec::with_capacity(compiled.len());
+    for (t, p) in &compiled {
+        let mask: Vec<bool> = corpus
+            .rows()
+            .par_iter()
+            .map(|r| p.matches(r))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("{}: {e}", t.predicate_id))?;
+        masks.push(RowMask::from_bools(&mask));
+    }
+    finish_evaluation(compiled, masks, n)
 }
 
 /// The query vectors and unfiltered truth read from `tests.jsonl`.
@@ -438,7 +754,7 @@ pub fn filtered_ground_truth(
     vectors: &Path,
     queries: &[Vec<f32>],
     assign: &[usize],
-    masks: &[Vec<bool>],
+    masks: &[RowMask],
     depth: usize,
 ) -> Result<Vec<Vec<(f32, i64)>>, String> {
     let (mut reader, rows, dim) = open_f32_npy(vectors)?;
@@ -481,7 +797,9 @@ pub fn filtered_ground_truth(
         for row in block.chunks_exact_mut(dim) {
             super::normalize_in_place(row);
         }
-        acc.add_block_where(&block, done as i64, |qi, id| masks[assign[qi]][id as usize])?;
+        acc.add_block_where(&block, done as i64, |qi, id| {
+            masks[assign[qi]].get(id as usize)
+        })?;
         done += n as u64;
     }
     let mut trailing = [0u8; 1];
@@ -499,12 +817,12 @@ pub fn filtered_ground_truth(
 pub fn cross_check(
     filtered: &[(f32, i64)],
     unfiltered: &[i64],
-    mask: &[bool],
+    mask: &RowMask,
 ) -> Result<usize, String> {
     let head: Vec<i64> = unfiltered
         .iter()
         .copied()
-        .filter(|&id| mask.get(id as usize).copied().unwrap_or(false))
+        .filter(|&id| id >= 0 && mask.get(id as usize))
         .collect();
     if head.len() > filtered.len() {
         return Err(format!(
@@ -551,9 +869,13 @@ pub struct PreparedHybrid {
 
 /// Build the hybrid query set for a prepared corpus. `expect_rows` is the
 /// registered passage count, when known.
+///
+/// Streams `payloads.jsonl` ([`StreamedCorpus`]) and `vectors.npy`, so memory
+/// is O(title vocabulary + 12 bits per row + the per-query top-k), never
+/// O(corpus): ~0.2 GB of masks at 113.5M passages.
 pub fn prepare(inputs: &HybridInputs, expect_rows: Option<u64>) -> Result<PreparedHybrid, String> {
-    let corpus = HybridCorpus::from_payloads(&inputs.payloads)?;
-    let n = corpus.len() as u64;
+    let (corpus, counter) = StreamedCorpus::scan(&inputs.payloads)?;
+    let n = corpus.len();
     if let Some(want) = expect_rows {
         if n != want {
             return Err(format!(
@@ -566,8 +888,9 @@ pub fn prepare(inputs: &HybridInputs, expect_rows: Option<u64>) -> Result<Prepar
     if tests.vectors.is_empty() {
         return Err(format!("{} holds no queries", inputs.tests.display()));
     }
-    let terms = corpus.choose_terms()?;
-    let ev = evaluate(&corpus, templates(&terms))?;
+    let terms = corpus.choose_terms(&counter)?;
+    drop(counter);
+    let ev = corpus.evaluate(templates(&terms))?;
     let p = ev.templates.len();
     let assign: Vec<usize> = (0..tests.vectors.len()).map(|i| i % p).collect();
     let gt = filtered_ground_truth(
@@ -809,7 +1132,7 @@ pub fn write_fixture_corpus(
         &dir.join("vectors.npy"),
         &qs,
         &vec![0; qs.len()],
-        &[vec![true; n]],
+        &[RowMask::all(n)],
         GT_DEPTH,
     )?;
     let mut tests = String::new();
@@ -1066,7 +1389,7 @@ mod tests {
             plain.add_block(&block, (i * BLOCK_ROWS) as i64).unwrap();
         }
         let plain = plain.finish();
-        let all = vec![vec![true; N]];
+        let all = vec![RowMask::all(N)];
         let assign = vec![0; tests.vectors.len()];
         let gt = filtered_ground_truth(
             &dir.path().join("vectors.npy"),
@@ -1082,7 +1405,7 @@ mod tests {
             assert_eq!(ids, tests.unfiltered[i]);
         }
         // A mask that drops rows drops exactly those rows from each ranking.
-        let even: Vec<bool> = (0..N).map(|i| i % 2 == 0).collect();
+        let even = RowMask::from_bools(&(0..N).map(|i| i % 2 == 0).collect::<Vec<_>>());
         let gt = filtered_ground_truth(
             &dir.path().join("vectors.npy"),
             &tests.vectors,
@@ -1105,7 +1428,7 @@ mod tests {
 
     #[test]
     fn cross_check_catches_a_misaligned_mask_or_ranking() {
-        let mask = vec![true, false, true, true];
+        let mask = RowMask::from_bools(&[true, false, true, true]);
         let filtered = vec![(0.9, 2), (0.8, 0), (0.1, 3)];
         assert_eq!(cross_check(&filtered, &[1, 2, 0], &mask).unwrap(), 2);
         assert!(cross_check(&filtered, &[0, 2], &mask).is_err());
@@ -1152,14 +1475,86 @@ mod tests {
         let bytes = std::fs::read(&npy).unwrap();
         std::fs::write(&npy, &bytes[..bytes.len() - 4]).unwrap();
         let q = vec![vec![1.0f32, 0., 0., 0., 0., 0., 0., 0.]];
-        assert!(filtered_ground_truth(&npy, &q, &[0], &[vec![true; N]], 10).is_err());
+        assert!(filtered_ground_truth(&npy, &q, &[0], &[RowMask::all(N)], 10).is_err());
         let mut longer = bytes.clone();
         longer.extend_from_slice(&[0u8; 4]);
         std::fs::write(&npy, &longer).unwrap();
-        assert!(filtered_ground_truth(&npy, &q, &[0], &[vec![true; N]], 10).is_err());
+        assert!(filtered_ground_truth(&npy, &q, &[0], &[RowMask::all(N)], 10).is_err());
         std::fs::write(&npy, &bytes).unwrap();
-        assert!(filtered_ground_truth(&npy, &q, &[0], &[vec![true; N - 1]], 10).is_err());
-        assert!(filtered_ground_truth(&npy, &q, &[0], &[vec![true; N]], 10).is_ok());
-        assert!(filtered_ground_truth(&npy, &[vec![1.0f32]], &[0], &[vec![true; N]], 10).is_err());
+        assert!(filtered_ground_truth(&npy, &q, &[0], &[RowMask::all(N - 1)], 10).is_err());
+        assert!(filtered_ground_truth(&npy, &q, &[0], &[RowMask::all(N)], 10).is_ok());
+        assert!(
+            filtered_ground_truth(&npy, &[vec![1.0f32]], &[0], &[RowMask::all(N)], 10).is_err()
+        );
+    }
+
+    #[test]
+    fn row_mask_is_a_bitset_over_exactly_its_rows() {
+        let bools: Vec<bool> = (0..130).map(|i| i % 3 == 0 || i == 129).collect();
+        let m = RowMask::from_bools(&bools);
+        assert_eq!(m.len(), 130);
+        for (i, b) in bools.iter().enumerate() {
+            assert_eq!(m.get(i), *b, "row {i}");
+        }
+        assert!(!m.get(130) && !m.get(10_000), "beyond the end reads unset");
+        assert_eq!(m.count_ones(), bools.iter().filter(|b| **b).count() as u64);
+        assert_eq!(RowMask::all(65).count_ones(), 65);
+        assert_eq!(RowMask::new(65).count_ones(), 0);
+        assert!(RowMask::new(0).is_empty());
+        assert!(std::panic::catch_unwind(|| RowMask::new(3).set(3)).is_err());
+    }
+
+    /// What `prepare` runs — the corpus streamed from disk in chunks — must
+    /// give exactly the in-memory reference's terms, counts and masks. Chunks
+    /// of 997 rows make every pass cross ~20 chunk boundaries at odd offsets.
+    #[test]
+    fn the_streamed_corpus_matches_the_in_memory_reference() {
+        let dir = fixture();
+        let path = dir.path().join("payloads.jsonl");
+        let mem = HybridCorpus::from_payloads(&path).unwrap();
+        let mem_terms = mem.choose_terms().unwrap();
+        for chunk in [997, SCAN_CHUNK_ROWS] {
+            let (s, counter) = StreamedCorpus::scan_with_chunk(&path, chunk).unwrap();
+            assert_eq!(s.len(), N as u64);
+            let terms = s.choose_terms(&counter).unwrap();
+            assert_eq!(terms, mem_terms, "chunk {chunk}");
+            for t in ["quora", "ancient", "nature", "guide", "zebra"] {
+                assert_eq!(s.scan_term(t).unwrap(), mem.scan_term(t), "{t}");
+            }
+            let streamed = s.evaluate(templates(&terms)).unwrap();
+            let reference = evaluate(&mem, templates(&terms)).unwrap();
+            assert_eq!(streamed.counts, reference.counts, "chunk {chunk}");
+            assert_eq!(streamed.masks, reference.masks, "chunk {chunk}");
+            assert_eq!(streamed.templates, reference.templates);
+        }
+        // The streamed evaluation refuses what the reference refuses.
+        let (s, _) = StreamedCorpus::scan_with_chunk(&path, 997).unwrap();
+        let t = |design, conditions| HybridTemplate {
+            predicate_id: "x".into(),
+            shape: "numeric_range",
+            design,
+            conditions,
+        };
+        let half = json!({"and":[rand_key_below(500_000)]});
+        assert!(s.evaluate(vec![t(Bucket::S50, half.clone())]).is_ok());
+        assert!(s.evaluate(vec![t(Bucket::S10, half)]).is_err());
+        let amb = json!({"and":[{"title":{"match":{"text":"nature"}}}]});
+        assert!(s
+            .evaluate(vec![t(Bucket::S10, amb)])
+            .unwrap_err()
+            .contains("tokenizer"));
+        // A file that changes between passes is an error, not a mixed result.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let first = text.lines().next().unwrap().to_string();
+        std::fs::write(&path, format!("{text}{first}\n")).unwrap();
+        assert!(s.scan_term("quora").unwrap_err().contains("changed"));
+        // A payload whose derived fields are not the derivation's is refused,
+        // with its line number.
+        let mut bad: Value = serde_json::from_str(&first).unwrap();
+        bad["tier"] = json!(99);
+        std::fs::write(&path, format!("{text}{bad}\n")).unwrap();
+        let e = StreamedCorpus::scan_with_chunk(&path, 997).err().unwrap();
+        assert!(e.contains(&format!("line {}", N + 1)), "{e}");
+        assert!(StreamedCorpus::scan_with_chunk(&path, 0).is_err());
     }
 }

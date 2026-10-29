@@ -124,7 +124,8 @@ const fn category_total() -> u64 {
 pub const CATEGORY_WEIGHT_TOTAL: u64 = category_total();
 
 /// One passage's derived values, compactly (16 bytes, so 10M rows fit in
-/// 160 MB for counting).
+/// 160 MB for counting and the 100M variant in 1.6 GB: the one per-passage
+/// term of `prepare-msmarco`'s memory, #342).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DerivedFields {
     /// Index into [`CATEGORY_NAMES`].
@@ -677,13 +678,13 @@ fn rand_key_below(per_million: u64) -> Value {
 /// differ. Approximate selectivities (by construction) are noted per row; the
 /// realized ones are what `expected_count` records.
 ///
-/// # Why the zero-count guard cannot newly fire on the 1M / 10M variants
+/// # Why the zero-count guard cannot newly fire on the 1M / 10M / 100M variants
 ///
 /// [`DerivedCorpus::filter_query_rows`] refuses a query that matches nothing.
 /// The rarest constant predicate, `doc_len == 3000`, expects ~4 rows at 100K
 /// (P(0) ~ 1.6%), and it realized 6. Two facts make that result carry over to
-/// the larger sizes. The variants nest (crc32 thresholds 886 < 8805 < 88075),
-/// so every 100K passage is also in 1M and 10M. The derived values depend only
+/// the larger sizes. The variants nest (crc32 thresholds 886 < 8805 < 88075 <
+/// 880865), so every 100K passage is also in 1M, 10M and 100M. The derived values depend only
 /// on `docid`, so each such passage carries the same values there. Every
 /// predicate is therefore satisfied by a superset of its 100K matches, and its
 /// count can only grow. The `rand_key` lookups use the same keys at every

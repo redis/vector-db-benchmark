@@ -374,7 +374,13 @@ impl DragonflyEngine {
     /// Wait until FT.INFO reports num_docs >= expected and indexing is done.
     fn wait_for_indexing(&self, expected: usize) -> Result<(), String> {
         let mut conn = self.get_connection()?;
-        let max_wait = 600; // seconds – large HNSW indices can take minutes
+        // Scales with the corpus; INDEXING_WAIT_SECS overrides. Expiry is an
+        // error (#361), never a pass on a partly built index.
+        let max_wait = crate::effective_config::indexing_wait_budget_secs(
+            vector_db_benchmark::indexing_wait::WaitPhase::UploadTail,
+            600,
+            expected,
+        )?;
         let start = Instant::now();
 
         loop {
@@ -383,107 +389,29 @@ impl DragonflyEngine {
                 .query(&mut conn)
                 .map_err(|e| format!("FT.INFO error: {}", e))?;
 
-            let mut num_docs: usize = 0;
-            let mut indexing: bool = false;
-            // Default 1.0 (fully indexed) so an FT.INFO that omits the field does
-            // not stall the wait; Dragonfly DOES expose percent_indexed.
-            let mut percent_indexed: f64 = 1.0;
-
-            fn extract_usize(val: &redis::Value) -> usize {
-                match val {
-                    redis::Value::BulkString(s) => String::from_utf8_lossy(s).parse().unwrap_or(0),
-                    redis::Value::Int(n) => *n as usize,
-                    redis::Value::Double(f) => *f as usize,
-                    redis::Value::SimpleString(s) => s.parse().unwrap_or(0),
-                    _ => 0,
-                }
-            }
-
-            fn extract_bool_nonzero(val: &redis::Value) -> bool {
-                match val {
-                    redis::Value::BulkString(s) => s != b"0",
-                    redis::Value::Int(n) => *n != 0,
-                    redis::Value::Double(f) => *f != 0.0,
-                    redis::Value::SimpleString(s) => s != "0",
-                    redis::Value::Boolean(b) => *b,
-                    _ => false,
-                }
-            }
-
-            fn extract_f64(val: &redis::Value) -> f64 {
-                match val {
-                    redis::Value::BulkString(s) => {
-                        String::from_utf8_lossy(s).parse().unwrap_or(1.0)
-                    }
-                    redis::Value::Int(n) => *n as f64,
-                    redis::Value::Double(f) => *f,
-                    redis::Value::SimpleString(s) => s.parse().unwrap_or(1.0),
-                    _ => 1.0,
-                }
-            }
-
-            let mut handle_pair = |key: &str, val: &redis::Value| match key {
-                "num_docs" => num_docs = extract_usize(val),
-                "indexing" => indexing = indexing || extract_bool_nonzero(val),
-                "backfill_in_progress" => indexing = indexing || extract_bool_nonzero(val),
-                "percent_indexed" => percent_indexed = extract_f64(val),
-                _ => {}
-            };
-
-            match &info {
-                redis::Value::Array(arr) => {
-                    for i in (0..arr.len()).step_by(2) {
-                        let key_str = match &arr[i] {
-                            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
-                            redis::Value::SimpleString(s) => s.clone(),
-                            _ => continue,
-                        };
-                        if let Some(val) = arr.get(i + 1) {
-                            handle_pair(&key_str, val);
-                        }
-                    }
-                }
-                redis::Value::Map(map) => {
-                    for (k, v) in map {
-                        let key_str = match k {
-                            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
-                            redis::Value::SimpleString(s) => s.clone(),
-                            _ => continue,
-                        };
-                        handle_pair(&key_str, v);
-                    }
-                }
-                _ => {
-                    eprintln!("Unexpected FT.INFO response type: {:?}", info);
-                }
-            }
-
-            // Require the HNSW graph to be fully built (percent_indexed >= 1.0),
-            // not just the doc count, so the search sweep never runs against a
-            // partially-backfilled graph (which would depress recall).
-            if num_docs >= expected && !indexing && percent_indexed >= 1.0 {
+            // Shared parser (#361): an absent num_docs fails fast instead of
+            // being read as 0 and waiting out the whole budget.
+            let progress = vector_db_benchmark::indexing_wait::parse_ft_info(&info)
+                .map_err(|e| format!("dragonfly: {e}"))?;
+            let state = progress.describe(expected as u64);
+            if dragonfly_index_ready(&progress, expected)? {
                 println!(
-                    "Indexing complete: {} docs in {:.1}s",
-                    num_docs,
+                    "Indexing complete ({state}) in {:.1}s",
                     start.elapsed().as_secs_f64()
                 );
                 return Ok(());
             }
 
-            if start.elapsed().as_secs() > max_wait {
-                println!(
-                    "Warning: indexing timeout after {}s (num_docs={}/{}, indexing={}, percent_indexed={:.2})",
-                    max_wait, num_docs, expected, indexing, percent_indexed
-                );
-                return Ok(());
-            }
+            vector_db_benchmark::indexing_wait::verdict(
+                "dragonfly",
+                start.elapsed(),
+                std::time::Duration::from_secs(max_wait),
+                &state,
+            )?;
 
-            if start.elapsed().as_secs().is_multiple_of(10) && start.elapsed().as_secs() > 0 {
+            if start.elapsed().as_secs() > 0 && start.elapsed().as_secs().is_multiple_of(10) {
                 println!(
-                    "Waiting for indexing: {} docs, indexing={}, percent_indexed={:.2} ({:.0}s)",
-                    num_docs,
-                    indexing,
-                    percent_indexed,
+                    "  indexing... {state} ({:.0}s)",
                     start.elapsed().as_secs_f64()
                 );
             }
@@ -1456,5 +1384,53 @@ mod tests {
         let info = "# Memory\r\nused_memory:1048576\r\nused_memory_rss:2097152\r\n";
         assert_eq!(parse_used_memory(info), 1048576);
         assert_eq!(parse_used_memory("no memory line here"), 0);
+    }
+}
+
+/// dragonfly's readiness rule over the shared FT.INFO parse (#361).
+fn dragonfly_index_ready(
+    p: &vector_db_benchmark::indexing_wait::FtInfoProgress,
+    expected: usize,
+) -> Result<bool, String> {
+    vector_db_benchmark::indexing_wait::ft_info_ready("dragonfly", p, expected as u64, false)
+}
+
+#[cfg(test)]
+mod dragonfly_index_ready_tests {
+    use super::*;
+    use vector_db_benchmark::indexing_wait::parse_ft_info;
+
+    fn bulk(s: &str) -> redis::Value {
+        redis::Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    /// #361 review: a dragonfly FT.INFO without `num_docs` fails fast (absent is
+    /// not 0), an unparsable one names the field, and a complete reply is ready.
+    #[test]
+    fn dragonfly_wait_treats_absent_num_docs_as_an_error_not_zero() {
+        let missing = redis::Value::Array(vec![bulk("indexing"), bulk("0")]);
+        let e = dragonfly_index_ready(&parse_ft_info(&missing).unwrap(), 5).unwrap_err();
+        assert!(
+            e.starts_with("dragonfly: FT.INFO reports no num_docs"),
+            "{e}"
+        );
+        let garbage = redis::Value::Array(vec![bulk("num_docs"), bulk("n/a")]);
+        assert!(parse_ft_info(&garbage).is_err());
+        let done = redis::Value::Array(vec![
+            bulk("num_docs"),
+            bulk("5"),
+            bulk("indexing"),
+            bulk("0"),
+            bulk("percent_indexed"),
+            bulk("1"),
+        ]);
+        assert_eq!(
+            dragonfly_index_ready(&parse_ft_info(&done).unwrap(), 5),
+            Ok(true)
+        );
+        assert_eq!(
+            dragonfly_index_ready(&parse_ft_info(&done).unwrap(), 6),
+            Ok(false)
+        );
     }
 }

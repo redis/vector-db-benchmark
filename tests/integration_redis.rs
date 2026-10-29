@@ -5840,3 +5840,112 @@ fn test_binary_redis_hybrid_and_filter_only_share_one_full_index() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #342: the STREAMING upload (`--upload-reader stream`) on the MS MARCO-shaped
+/// fixture, with a batch size and thread count that do not divide the corpus.
+/// `ADHOC_BF` is an exact filtered search, so recall 0.999 in every bucket
+/// means every row arrived with its vector AND the payload fields the
+/// predicates read (derived numerics, category tag, title text). The upload
+/// result records the reader that ran, and the run states the flag.
+#[test]
+fn test_binary_redis_streaming_upload_is_exact_on_hybrid() {
+    wait_for_redis();
+    let configs = serde_json::json!([
+        {"name": "redis-hyb-stream", "engine": "redis",
+         "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                            "hybrid_policy": "ADHOC_BF", "search_params": {"ef": 200}}],
+         "upload_params": {"parallel": 3, "batch_size": 333}}
+    ]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-stream", &configs.to_string());
+    let port = test_port().to_string();
+    let dump = proj.root.join("dumps-stream");
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-hyb-stream",
+        "hybrid-stream",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--upload-reader",
+            "stream",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_hybrid_run(&proj, "redis-hyb-stream", &dump, 0.999, "vector");
+    let upload = common::read_upload_doc(&proj.root, "redis-hyb-stream");
+    let reader = &upload["results"]["upload_reader"];
+    assert_eq!(reader["reader"], "stream", "{upload}");
+    assert_eq!(reader["flag"], "stream", "{upload}");
+    assert_eq!(reader["rows"], common::HYBRID_N as u64, "{upload}");
+    assert_eq!(upload["results"]["upload_count"], common::HYBRID_N as u64);
+    // #344 on the streamed path: one-clock phases, checked against the
+    // legacy fields the upload file also carries.
+    let r = &upload["results"];
+    let ph = &r["ingest_phases"];
+    assert_eq!(
+        ph["index_wait"], "redis_ft_info_percent_indexed",
+        "{upload}"
+    );
+    assert_eq!(ph["documents"], common::HYBRID_N as u64, "{upload}");
+    let f = |k: &str| r[k].as_f64().unwrap_or_else(|| panic!("results.{k}: {r}"));
+    assert!(f("upload_time") > 0.0 && f("index_wait_time") >= 0.0, "{r}");
+    assert!(
+        (f("upload_time") + f("index_wait_time") - f("total_ingest_time")).abs() < 1e-3,
+        "{r}"
+    );
+    assert!(
+        (f("read_time") + f("total_ingest_time") - f("total_time")).abs() < 1e-3,
+        "{r}"
+    );
+    let doc = common::read_result_doc(&proj.root, "redis-hyb-stream");
+    let invocation = &doc["params"]["engine_params"]["invocation"];
+    assert_eq!(invocation["upload_reader"], "stream", "{invocation}");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #361 review: the streamed upload's payload pre-flight. A `payloads.jsonl`
+/// one row short is refused before the first HSET, as on the in-memory path,
+/// rather than after the whole corpus was sent: the server holds no keys.
+#[test]
+fn test_binary_redis_streaming_upload_refuses_a_short_payload_file_before_writing() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([
+        {"name": "redis-stream-short", "engine": "redis",
+         "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+         "upload_params": {"parallel": 3, "batch_size": 333}}
+    ]);
+    let proj = common::write_msmarco_hybrid_project("stream-short", &configs.to_string());
+    // Drop the last payload row: the stream would only find it after every
+    // batch had been sent.
+    let payloads = proj.root.join("datasets/stream-short/payloads.jsonl");
+    let text = std::fs::read_to_string(&payloads).unwrap();
+    let keep = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0;
+    std::fs::write(&payloads, format!("{keep}\n")).unwrap();
+    let port = test_port().to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        "redis-stream-short",
+        "stream-short",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &["--upload-reader", "stream"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let all = format!("{stdout}\n{stderr}");
+    assert!(
+        all.contains("payload pre-flight failed") && all.contains("doesn't match vector count"),
+        "{all}"
+    );
+    let keys: i64 = redis::cmd("DBSIZE").query(&mut conn).unwrap();
+    assert_eq!(
+        keys, 0,
+        "documents were written before the payload file was checked"
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

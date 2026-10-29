@@ -1043,6 +1043,57 @@ pub fn record_effective(key: &str, value: impl Into<Value>) {
     recorder().record_effective(key, value.into());
 }
 
+/// The indexing wait budget, in seconds, for `expected` documents in `phase`
+/// over an engine floor (`vector_db_benchmark::indexing_wait::budget`), with
+/// `INDEXING_WAIT_SECS` as the override. Records the budget the wait ACTUALLY
+/// uses as the effective value (#361 review), not the `0` that stands for
+/// "unset", and which phase's slope applied as `indexing_wait_phase`.
+pub fn indexing_wait_budget_secs(
+    phase: vector_db_benchmark::indexing_wait::WaitPhase,
+    floor_secs: u64,
+    expected: usize,
+) -> Result<u64, String> {
+    // Observe the raw text for this experiment's artifact; the value used is
+    // the one parsed (strictly) once per process.
+    let _ = env_var(vector_db_benchmark::indexing_wait::INDEXING_WAIT_ENV);
+    Ok(record_indexing_wait_budget(
+        indexing_wait_override()?,
+        phase,
+        floor_secs,
+        expected,
+    ))
+}
+
+/// The budget for a given (already parsed) override, recorded as the
+/// effective value with the phase whose slope applied.
+fn record_indexing_wait_budget(
+    override_secs: Option<u64>,
+    phase: vector_db_benchmark::indexing_wait::WaitPhase,
+    floor_secs: u64,
+    expected: usize,
+) -> u64 {
+    use vector_db_benchmark::indexing_wait::{budget, INDEXING_WAIT_ENV};
+    let secs = budget(phase, floor_secs, expected, override_secs).as_secs();
+    record_effective(INDEXING_WAIT_ENV, secs);
+    record_effective("indexing_wait_phase", phase.as_str());
+    secs
+}
+
+/// `INDEXING_WAIT_SECS`, parsed once per process
+/// (`vector_db_benchmark::indexing_wait::parse_override`). `run()` calls this
+/// at startup, before any download or connection, so a value that is set but
+/// does not parse refuses the run up front (#361 review, #219) rather than
+/// at the first indexing wait, after an upload.
+pub fn indexing_wait_override() -> Result<Option<u64>, String> {
+    static PARSED: std::sync::OnceLock<Result<Option<u64>, String>> = std::sync::OnceLock::new();
+    PARSED
+        .get_or_init(|| {
+            use vector_db_benchmark::indexing_wait::{parse_override, INDEXING_WAIT_ENV};
+            parse_override(std::env::var(INDEXING_WAIT_ENV).ok().as_deref())
+        })
+        .clone()
+}
+
 /// Record that a declared value was not the one used.
 pub fn note_override(
     key: &str,
@@ -2147,6 +2198,40 @@ mod tests {
         assert_eq!(s["effective"]["VDBB_TEST_BUDGET_MS"], 250);
         assert_eq!(s["env"]["VDBB_TEST_BUDGET_MS"], "250");
         assert!(s["overridden"].as_array().unwrap().is_empty());
+    }
+
+    /// #361 review: the snapshot records the indexing-wait budget the run used,
+    /// computed or overridden, never the `0` that means "unset".
+    #[test]
+    fn the_indexing_wait_budget_recorded_is_the_one_used() {
+        let _l = test_lock();
+        let _g = EnvGuard::set("INDEXING_WAIT_SECS", None);
+        reset();
+        use vector_db_benchmark::indexing_wait::WaitPhase::{FullBuild, UploadTail};
+        assert_eq!(
+            indexing_wait_budget_secs(UploadTail, 120, 100_000_027).unwrap(),
+            10_120
+        );
+        let s = snapshot();
+        assert_eq!(s["effective"]["INDEXING_WAIT_SECS"], 10_120);
+        assert_eq!(s["effective"]["indexing_wait_phase"], "upload_tail");
+        assert_eq!(s["env"]["INDEXING_WAIT_SECS"], Value::Null);
+        reset();
+        assert_eq!(
+            indexing_wait_budget_secs(FullBuild, 120, 1_000_044).unwrap(),
+            1_120
+        );
+        let s = snapshot();
+        assert_eq!(s["effective"]["INDEXING_WAIT_SECS"], 1_120);
+        assert_eq!(s["effective"]["indexing_wait_phase"], "full_build");
+        // An override (parsed once per process, so given directly here) is
+        // the budget used and recorded.
+        reset();
+        assert_eq!(
+            record_indexing_wait_budget(Some(45), FullBuild, 600, 10_000_000),
+            45
+        );
+        assert_eq!(snapshot()["effective"]["INDEXING_WAIT_SECS"], 45);
     }
 
     #[test]

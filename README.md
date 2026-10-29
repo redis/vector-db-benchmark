@@ -438,7 +438,7 @@ which a pre-#344 `vector` ingest never did (`no-vector` always did). Compare
 
 | key | meaning |
 |---|---|
-| `results.read_time` | client-side dataset read, before the first batch; on a `full` or `no-vector` index it includes the filter-only metadata-domain scan of the corpus |
+| `results.read_time` | client-side dataset read, before the first batch; on a `full` or `no-vector` index it includes the filter-only metadata-domain scan of the corpus. Under the streaming reader (`results.upload_reader.reader` = `stream`, #342) it is the payload pre-flight (every `payloads.jsonl` row parsed and counted, carrying that scan when it applies): the corpus is read and decoded inside `upload_time` |
 | `results.index_wait_time` | last batch acknowledged → index searchable |
 | `results.total_ingest_time` | `upload_time + index_wait_time`: first batch → index-ready |
 | `results.upload_docs_per_sec` / `ingest_docs_per_sec` | `upload_count` over each |
@@ -1337,6 +1337,7 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | [MS MARCO v2.1-100K: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |      99,964 |     1,677 |   1,000 ‡ | Cosine    |
 | [MS MARCO v2.1-1M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3)  |      1,024 |   1,000,044 |     1,677 |   1,000 ‡ | Cosine    |
 | [MS MARCO v2.1-10M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |   9,999,959 |     1,677 |   1,000 ‡ | Cosine    |
+| MS MARCO v2.1-100M (build on host, no download — see [Larger than RAM](#the-100m-variant-larger-than-client-ram)) |      1,024 | 100,000,027 |     1,677 |   1,000 ‡ | Cosine    |
 | **Sparse Vectors** (learned/lexical sparse embeddings — Qdrant is the only engine with a sparse path)        |            |             |           |           |           |
 | [MS MARCO Sparse-100K: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                |   *sparse* |     100,000 |     6,980 |        10 | Dot       |
 | [MS MARCO Sparse-1M: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                  |   *sparse* |   1,000,000 |     6,980 |        10 | Dot       |
@@ -1569,6 +1570,98 @@ benchmarking at scale in the first place.
 the `Array2` and the `Vec<Vec<f32>>` it is converting into at once — 2 x 40 GB.
 The 17 GB of payloads are read *after* that copy is dropped, so the two peaks
 never coincide. Budget **2x the vector bytes**, plus Redis in its own process.
+
+### The 100M variant: larger than client RAM
+
+`msmarco-cohere-1024-100M-cosine` is the passages with
+`crc32(docid) % 1,000,000 < 880,865` — **100,000,027** of the 113,520,750,
+measured over all 60 upstream shards (2026-10-28). It nests: it contains the
+10M, 1M and 100K variants. On disk it is ~410 GB of float32 vectors plus
+~184 GB of payloads, so it has no download link; build it on the client host
+with `make prepare-msmarco MSMARCO_DATASET=msmarco-cohere-1024-100M-cosine`.
+
+Neither side of the run loads it:
+
+- **Preparation** streams every pass. Selection, conversion and the
+  brute-force ground truth (filtered and unfiltered) were already chunked; the
+  hybrid query set now scans `payloads.jsonl` in 65,536-row chunks and keeps a
+  12-bit predicate mask per row (~150 MB at 100M). The one O(N) structure left
+  is the derived-field table, 16 B/passage (1.6 GB). Expect ~4-5 GB peak RSS.
+  Choosing the COMMON and RARE text-match terms confirms candidates
+  nearest-first, and each confirmation is one more full pass over
+  `payloads.jsonl` (~184 GB at 100M; minutes per pass at NVMe speed): at
+  least two passes, plus one per candidate rejected as ambiguous. The number
+  of candidates scanned is not recorded in `PREPARED.json` yet.
+- **Upload** reads `vectors.npy` and `payloads.jsonl` in batches with
+  `--upload-reader stream` (Redis and OpenSearch). The default `auto` streams
+  a compound corpus only when the in-memory reader could not hold it: at
+  least 128 GiB of vectors (so the 100M, on any host), or a corpus whose
+  in-memory peak (2x the vector bytes) exceeds the memory available to the
+  process — `MemAvailable` capped by the cgroup limit (v2 `memory.max` minus
+  `memory.current`, `max` = unlimited; else v1 `limit_in_bytes` minus usage;
+  in both, the cgroup's reclaimable `inactive_file` page cache from
+  `memory.stat` is not counted as used),
+  so a container's limit counts, not the host's RAM. The figure and how it was
+  derived are recorded as `results.upload_reader.available_memory`.
+  `auto` decides **once per dataset per invocation**: memory is read the
+  first time a dataset is used and that reading is reused for every later
+  config. That way an MxEF sweep against a server that grows on the same host
+  never loads the first config in memory and streams a later one, which
+  would mix two meanings of `upload_time` / `read_time` in one sweep. A
+  separate invocation decides afresh.
+  Everything else keeps the pre-#342 in-memory reader — including the
+  100K, 1M and 10M MS MARCO variants on a host that can load them, so their
+  published `upload_time` keeps meaning upload only (on the streaming path,
+  disk read and decode run inside the upload window instead of `read_time`).
+  Before the first batch, a streamed upload makes one pass over
+  `payloads.jsonl` that parses every row and counts the rows against
+  `vectors.npy`, so a truncated or malformed file fails up front, with
+  nothing written, as it does on the in-memory path. This pass, which also
+  carries the filter-only metadata-domain check when the index serves
+  filter-only, is the streaming path's `read_time`.
+  `memory` forces the old path. An engine without a streaming upload refuses,
+  under `auto`, a compound corpus the host cannot load, instead of being
+  OOM-killed; `--upload-reader memory` overrides. The check covers the
+  reader's own peak against memory available when the dataset is opened; an
+  engine on the same host grows by its index during the upload, so leave it
+  room yourself. Peak client memory is bounded by
+  `parallel x batch_size x (24 x dim + 4 x payload_bytes)` plus 2 MiB of read
+  buffers — about **1.0 GB** for MS MARCO at `parallel` 32, `batch_size` 1000,
+  and 260 MB at 16 x 500 — independent of corpus size. Other engines refuse
+  `--upload-reader stream` instead of silently loading the corpus. The upload
+  result records which reader ran, and why, under `results.upload_reader`.
+- **Indexing wait.** After the upload, Redis, Valkey, Dragonfly and KiviDB poll
+  `FT.INFO` until the index holds every document. The budget is the engine's
+  floor (120 s Redis, 600 s the others) plus 1 s per 10,000 documents
+  (~2.8 h extra at 100M) — the asynchronous tail after an upload that built
+  the index as it went. A Redis shared-corpus backfill (`REDIS_KEY_PREFIX`,
+  configs 2..N) builds the WHOLE index inside the wait, so it gets 1 s per
+  1,000 documents (1M: 1,120 s; 100M: ~27.8 h). That slope is an UNMEASURED,
+  conservative estimate (the one measured rate is the 10M upload with its
+  index build, 2,277 docs/s; a backfill was not timed).
+  `INDEXING_WAIT_SECS=<seconds>` replaces either budget, and the run records
+  the budget it used and which slope applied (`INDEXING_WAIT_SECS`,
+  `indexing_wait_phase` in the effective config). It must be a whole number
+  of seconds above zero: a value that is set but does not parse (`100000s`,
+  `-1`, `0`) refuses the run at startup, before any download or connection,
+  instead of falling back to the computed budget. On Redis, transient
+  connection errors during the wait (a dropped socket, a coordinator
+  restart) are retried for at most 120 s in a row, whatever the budget, so
+  a server that died mid-wait fails in minutes rather than hours; any
+  answered poll restarts that window. An
+  expired budget is an error: the run does not go on to search a partly built
+  index. Recovery at 100M: the failed run leaves the uploaded data in place
+  (an upload error returns before cleanup), but `--skip-upload` does NOT
+  re-enter the wait — it only checks the server's document count before
+  searching — so it is not a recovery route. On Redis, a run in shared-corpus
+  mode (`REDIS_KEY_PREFIX=<prefix>`) is: re-running with the same prefix and a
+  larger `INDEXING_WAIT_SECS` finds the corpus complete, skips the re-upload,
+  recreates the index over the existing hashes (dropped without `DD`) and
+  waits for that backfill under the full-build budget (1 s per 1,000
+  documents, ~27.8 h at 100M — an unmeasured conservative estimate;
+  `INDEXING_WAIT_SECS` overrides it). Without shared-corpus mode, and on the other
+  engines, the only route is a full re-upload — so size `INDEXING_WAIT_SECS`
+  for the 100M up front.
 
 ### How much memory does Redis itself need?
 

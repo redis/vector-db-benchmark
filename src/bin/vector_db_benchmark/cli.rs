@@ -242,6 +242,20 @@ pub struct Args {
     /// dumps to `compare-results`.
     #[arg(long, value_name = "DIR")]
     pub dump_results: Option<PathBuf>,
+
+    /// How the upload reads the corpus (#342): `auto` (default) streams a
+    /// compound (`vectors.npy` + `payloads.jsonl`) corpus from disk, a batch at
+    /// a time, only when the in-memory reader could not hold it (>= 128 GiB of
+    /// vectors, or 2x the vectors above MemAvailable capped by the cgroup
+    /// limit), and loads everything
+    /// else into memory as before — so the 100K/1M/10M MS MARCO upload numbers
+    /// keep their meaning; `stream` always streams (compound datasets only;
+    /// engines without a streaming upload refuse it); `memory` always loads.
+    /// Streaming bounds client memory by parallel x batch_size instead of the
+    /// corpus size, and uploads the same rows. Only the Redis and OpenSearch
+    /// uploads stream. The reader used is recorded as `results.upload_reader`.
+    #[arg(long, value_name = "MODE", default_value = "auto")]
+    pub upload_reader: vector_db_benchmark::upload_stream::UploadReader,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -353,6 +367,21 @@ mod tests {
 
     // Raw-array dump (#151-8): opt-in, defaults to false so result files carry
     // only the compact digests, and parses when explicitly requested.
+    #[test]
+    fn upload_reader_parses_and_defaults_to_auto() {
+        use vector_db_benchmark::upload_stream::UploadReader;
+        assert_eq!(parse(&[]).upload_reader, UploadReader::Auto);
+        assert_eq!(
+            parse(&["--upload-reader", "stream"]).upload_reader,
+            UploadReader::Stream
+        );
+        assert_eq!(
+            parse(&["--upload-reader", "memory"]).upload_reader,
+            UploadReader::Memory
+        );
+        assert!(Args::try_parse_from(["vdbb", "--upload-reader", "mmap"]).is_err());
+    }
+
     #[test]
     fn dump_results_and_compare_results_parse() {
         assert_eq!(parse(&[]).dump_results, None);

@@ -769,6 +769,7 @@ fn inv_p7_the_scanned_test_target_set_is_pinned() {
         "integration_vertex.rs",
         "integration_weaviate.rs",
         "overhead_invariants.rs",
+        "streaming_memory.rs",
     ];
     assert_eq!(
         found, expected,
