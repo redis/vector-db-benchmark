@@ -4119,6 +4119,9 @@ mod tests {
     // must resolve all of them so the config actually selects + configures SVS.
     #[test]
     fn resolves_nested_svs_collection_params() {
+        // RedisEngine::new reads REDIS_HNSW_* and writes the process-wide
+        // recorder; records_resolved_hnsw_sq8_in_effective_config sets both.
+        let _lock = crate::effective_config::test_lock();
         use super::{is_svs, RedisEngine};
         let cfg_json = serde_json::json!({
             "name": "dbpedia-cal-svs-LeanVec4x8-div4-float16",
@@ -4152,6 +4155,9 @@ mod tests {
     // (no svs block) leaves the SVS fields None + derives nothing.
     #[test]
     fn hnsw_config_leaves_svs_fields_unset() {
+        // RedisEngine::new reads REDIS_HNSW_* and writes the process-wide
+        // recorder; records_resolved_hnsw_sq8_in_effective_config sets both.
+        let _lock = crate::effective_config::test_lock();
         use super::RedisEngine;
         let cfg_json = serde_json::json!({
             "name": "redis-hnsw",
