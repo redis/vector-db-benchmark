@@ -61,7 +61,6 @@ make integration-test                 # Redis
 make integration-test-{valkey,dragonfly,kividb,chroma}
 make integration-test-{pgvector,qdrant,elasticsearch,opensearch}
 make integration-test-{weaviate,milvus,mongodb}
-make integration-test-kividb-legacy   # KiviDB < 1.0.5 (v1.0.2); run it too after a KiviDB change
 make integration-test-vertex          # cloud-only, needs real GCP credentials
 make integration-test-no-docker
 ```

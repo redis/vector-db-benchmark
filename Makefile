@@ -308,15 +308,6 @@ integration-test-kividb:
 	KIVIDB_PORT=6386 cargo test --test integration_kividb --release -- --test-threads=1; \
 	  status=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$status
 
-# The same suite against the pre-1.0.5 image (`kividb-legacy`), where TAG
-# fields are atomic and `SEPARATOR` is rejected: see kividb_caps.
-.PHONY: integration-test-kividb-legacy
-integration-test-kividb-legacy:
-	@echo "=== Starting KiviDB (pre-1.0.5) for integration tests ==="
-	docker compose -f tests/docker-compose.test.yml up -d kividb-legacy --wait
-	KIVIDB_PORT=6387 KIVIDB_EXPECT_TAG_SEMANTICS=atomic cargo test --test integration_kividb --release -- --test-threads=1; \
-	  status=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$status
-
 .PHONY: integration-test-chroma
 integration-test-chroma:
 	@echo "=== Starting Chroma for integration tests ==="
@@ -577,8 +568,7 @@ help:
 	@echo "  make integration-test-mongodb         - MongoDB Atlas Local 8.0.4"
 	@echo "  make integration-test-valkey          - Valkey Bundle (latest)"
 	@echo "  make integration-test-dragonfly       - Dragonfly"
-	@echo "  make integration-test-kividb          - KiviDB"
-	@echo "  make integration-test-kividb-legacy   - KiviDB < 1.0.5 (v1.0.2)"
+	@echo "  make integration-test-kividb          - KiviDB 1.1.2"
 	@echo "  make integration-test-chroma          - Chroma"
 	@echo "  make integration-test-vertex          - Vertex AI (cloud-only, needs GCP creds)"
 	@echo ""

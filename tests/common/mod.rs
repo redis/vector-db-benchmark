@@ -669,7 +669,7 @@ fn write_filter_project_multi(
 ///
 /// Guards the TAG declaration, not the filter syntax: an engine whose index
 /// splits a scalar on `,` (a bare RediSearch-style TAG, whose default
-/// separator is `,`, and KiviDB >= 1.0.5's) indexes `Smith, John` as `Smith` +
+/// separator is `,`, as is KiviDB's) indexes `Smith, John` as `Smith` +
 /// `John`, so the even queries match nothing and the odd ones also match every
 /// `Smith, John` document. Either way recall collapses.
 pub fn write_comma_keyword_project(
@@ -699,14 +699,11 @@ pub fn write_comma_keyword_project(
 }
 
 /// Keyword values carrying the backslash / brace / comma / quote characters
-/// whose TAG encoding differs by KiviDB version, each next to the decoy a
-/// wrong encoding would hit instead. Shaped on the shipped arxiv `submitter`
-/// values (`J\"org Hennig`, `Rasmus Bj{\o}rk`):
-///
-/// * sent raw to KiviDB >= 1.0.5 (which honours escapes), `J\"org Hennig`
-///   matches the decoy `J"org Hennig`, `a\b` matches `ab`, `C:\dir` matches
-///   nothing and `Bj{\o}rk` is a syntax error (a dropped query);
-/// * sent escaped to KiviDB 1.0.2 (which does not), every one matches nothing.
+/// that KiviDB 1.1.2 only matches exactly once escaped, each next to the decoy
+/// a raw value would hit instead. Shaped on the shipped arxiv `submitter`
+/// values (`J\"org Hennig`, `Rasmus Bj{\o}rk`). Sent raw (measured on 1.1.2),
+/// `J\"org Hennig` matches the decoy `J"org Hennig`, `a\b` matches `ab`, and
+/// `Bj{\o}rk` is a syntax error (a dropped query).
 ///
 /// Every query targets one of those values (one is a `match_any` over two of
 /// them), so any wrong encoding fails at least one of the ten queries outright.
@@ -737,9 +734,9 @@ pub fn write_tag_escape_project(
 }
 
 /// Keyword values with `(`, `)`, `|` and `@`, next to the decoys a mis-parse
-/// would hit. KiviDB >= 1.0.5 expresses all four exactly once escaped;
-/// KiviDB 1.0.2 cannot express any of them, so the run must be refused there.
-/// `Francisco (Paco) Guinea` is a shipped arxiv `submitter` value.
+/// would hit. KiviDB 1.1.2 expresses all four exactly once escaped (raw, `x|y`
+/// matches `x` and `y`). `Francisco (Paco) Guinea` is a shipped arxiv
+/// `submitter` value.
 pub const TAG_PAREN_PIPE_VALUES: [&str; 7] = [
     "Francisco (Paco) Guinea",
     "Francisco",
@@ -2461,7 +2458,7 @@ fn display_id(id: &str) -> &str {
 /// redis:8.8.0 (`db0:keys=1,expires=0,avg_ttl=0,subexpiry=0`), valkey-bundle
 /// (`...,keys_with_volatile_items=0`), dragonfly df-v1.40.1
 /// (`db0:keys=1,expires=0,hits=0,misses=0,hit_ratio=0.00,avg_ttl=-1`) and kividb
-/// v1.0.2-full (`db0:keys=1,expires=0,avg_ttl=0`) — so parse by name. All four
+/// 1.1.2 (`db0:keys=1,expires=0,avg_ttl=0`) — so parse by name. All four
 /// emit the `# Keyspace` header (measured).
 pub fn sum_keyspace_keys(info: &str) -> Option<i64> {
     if !info
@@ -2505,7 +2502,7 @@ pub fn info_field(info: &str, field: &str) -> String {
 /// is not honoured for a different one that later took the port.
 ///
 /// `run_id` from `INFO server` where available (redis:8.8.0, valkey-bundle,
-/// kividb v1.0.2-full), falling back to `master_replid` from `INFO replication`
+/// kividb 1.1.2), falling back to `master_replid` from `INFO replication`
 /// (dragonfly df-v1.40.1 reports no `run_id`; all four checked live). Empty when
 /// neither is present — an empty identity never matches a prior claim.
 ///
@@ -2574,7 +2571,7 @@ pub fn probe_server(host: &str, port: u16, wait: std::time::Duration) -> Probe {
     // still filling, so "0 keys" would be a lie.
     //
     // Best-effort by design: an engine whose `INFO persistence` errors, or that
-    // omits `loading` entirely (kividb v1.0.2-full does — measured), simply gets
+    // omits `loading` entirely (an early kividb release did; 1.1.2 reports it), simply gets
     // no loading check. Making a missing section fatal would refuse those engines
     // outright, and a server so locked down that INFO fails is caught two lines
     // below by `INFO keyspace` anyway.

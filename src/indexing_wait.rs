@@ -354,8 +354,9 @@ pub fn kividb_ready(algorithm: &str, p: &KividbProgress, expected: u64) -> Resul
         Ok(match p.num_docs.or(p.hnsw_live_count) {
             Some(n) => n >= expected,
             // Verified against KiviDB source (kividbio/kividb src/commands/search.rs,
-            // v1.1.0 and main: `hnsw_*` only for HNSW fields) and CI on the pinned
-            // quay.io/kividbio/kividb:v1.0.2-full image (#361, d682fb6).
+            // v1.1.0 and main: `hnsw_*` only for HNSW fields) and in CI (#361,
+            // d682fb6). KiviDB 1.1.2 reports `num_docs` (measured), so this arm is
+            // only reached by a server that reports neither.
             None => true,
         })
     } else {

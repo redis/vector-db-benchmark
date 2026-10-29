@@ -1315,7 +1315,7 @@ fn keyspace_sum_covers_every_database_on_all_four_engines() {
             1,
         ),
         (
-            "kividb v1.0.2-full",
+            "kividb 1.1.2",
             "# Keyspace\r\ndb0:keys=1,expires=0,avg_ttl=0\r\n",
             1,
         ),
