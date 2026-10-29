@@ -1,6 +1,6 @@
 # vector-db-benchmark
 
-A benchmarking tool for vector databases, written in Rust. Measures upload throughput, search QPS, latency percentiles (p50/p95/p99), and recall for vector search engines.
+A benchmarking tool for vector databases, written in Rust. Measures upload throughput, search QPS, latency percentiles (p50/p90/p95/p99), and recall for vector search engines.
 
 ## Supported Engines
 
@@ -127,23 +127,23 @@ Pick one file per run — they are exact and survive future renames:
 
 Avoid selecting by glob here: `--engines 'opensearch-m-*'` matches only 6 of the 7 sweep points — it silently drops the `opensearch-default` (m=16, ef_construction=100) baseline, whose name lacks the `opensearch-m-` prefix — and a bare `--engines 'opensearch-*'` matches both files, sweeping two different shard counts into one report.
 
-**Retries against a managed domain.** Amazon OpenSearch Service returns states an open-source single-node cluster never produces: HTTP 429 on bulk (its `knn.algo_param.index_thread_qty` defaults to 1, so HNSW graph building is single-threaded and cannot drain as fast as a parallel uploader pushes), 400 `snapshot_in_progress_exception` on delete (automated snapshots cannot be disabled), 503 `process_cluster_event_timeout_exception` on create, and 502/504 from the front door on force-merge. All four paths retry with jittered exponential backoff, tunable with:
+**Retries against a managed domain.** Amazon OpenSearch Service can return HTTP 429 on bulk, `snapshot_in_progress_exception` on delete, and transient cluster-state errors on create. These paths retry with jittered exponential backoff. Force merge uses `wait_for_completion=false` and polls the Tasks API, so a long merge does not hold one HTTP request open through the managed gateway. Transient submission and task GET failures retry with capped exponential backoff. An ambiguous submission can leave a merge running; on the read-only benchmark index, a repeated merge queues behind it and finds nothing left to merge. Healthy unfinished tasks do not consume retries. Missing tasks, denied task access, task errors, malformed responses and partial shard success fail the benchmark before search. This requires an OpenSearch version supporting asynchronous force merge (2.7+) and permission to read its tasks.
 
 | Variable | Default | Applies to |
 |---|---|---|
 | `OPENSEARCH_BULK_MAX_RETRIES` | `8` | bulk upload |
 | `OPENSEARCH_BULK_RETRY_BASE_MS` | `500` | bulk upload |
-| `OPENSEARCH_INDEX_OP_MAX_RETRIES` | `10` | create / delete / refresh / force-merge |
-| `OPENSEARCH_INDEX_OP_RETRY_BASE_MS` | `2000` | create / delete / refresh / force-merge |
+| `OPENSEARCH_INDEX_OP_MAX_RETRIES` | `10` | create / delete / refresh / force-merge submission / consecutive task poll failures |
+| `OPENSEARCH_INDEX_OP_RETRY_BASE_MS` | `2000` | create / delete / refresh / force-merge submission / consecutive task poll failures |
 | `OPENSEARCH_SEARCH_MAX_RETRIES` | `5` | search |
 | `OPENSEARCH_SEARCH_RETRY_BASE_MS` | `50` | search |
 | `OPENSEARCH_SEARCH_RETRY_BUDGET_MS` | `2000` | search (total wall-clock ceiling per query) |
-| `OPENSEARCH_FORCE_MERGE_TIMEOUT` | `max(OPENSEARCH_TIMEOUT, 3600)` | force-merge (seconds, per attempt; `0` = no client-side deadline) |
-| `OPENSEARCH_FORCE_MERGE_BUDGET` | `2x OPENSEARCH_FORCE_MERGE_TIMEOUT` | force-merge (seconds, total wall-clock ceiling across all attempts; `0` = unlimited) |
+| `OPENSEARCH_FORCE_MERGE_TIMEOUT` | `max(OPENSEARCH_TIMEOUT, 3600)` | force-merge (seconds, per HTTP request ceiling, also capped by `OPENSEARCH_TIMEOUT`; also determines the default total budget at twice this value; `0` = no merge-specific ceiling) |
+| `OPENSEARCH_FORCE_MERGE_BUDGET` | `2x OPENSEARCH_FORCE_MERGE_TIMEOUT` | force-merge (seconds, total wall-clock ceiling across submission and task polling; `0` = unlimited) |
 
-Force-merge needs its own two bounds because it is not sized like the other requests. It merges the index down to a single segment, which rewrites the whole corpus: measured at 1,077–1,312 s for 1.18M vectors, well past the 300 s client-wide `OPENSEARCH_TIMEOUT`. Sharing that bound would abort every attempt client-side while the merge kept running on the server, and spend the whole `OPENSEARCH_INDEX_OP_MAX_RETRIES` budget failing a merge that was always going to succeed — discarding a completed multi-hour ingest at the last step. The wall-clock budget then bounds the retrying itself, since a per-attempt bound of an hour and eleven attempts is otherwise an ~11 h worst case. Both reject a malformed value loudly rather than silently falling back to the default.
+Force merge pins the read-only benchmark to one Lucene segment per shard, avoiding segment-count variation from ingestion timing. It is preparation for an optimized static-index measurement, not a requirement for query correctness or a simulation of concurrent updates. The adapter refreshes after merge so queries use the merged segment. The total `OPENSEARCH_FORCE_MERGE_BUDGET` includes HTTP calls, body reads, retries and poll sleeps; exceeding it fails the run but cannot cancel the server-side merge. Both timeout variables reject malformed values before ingest. Task IDs and progress are printed for diagnosis.
 
-Search retries are deliberately short and additionally bounded by a wall-clock budget, because a single transport attempt can block for `OPENSEARCH_TIMEOUT`. **Backoff is excluded from the reported latency**: a retried query is billed only for the attempt that produced its result, so the percentiles stay comparable with engines that do not retry. Queries that needed a retry are counted and reported separately (`⚠ N of M search queries succeeded only after a retry`), since clean latency figures would otherwise hide that the server was shedding load.
+In vector mode, search retries are deliberately short and additionally bounded by a wall-clock budget, because a single transport attempt can block for `OPENSEARCH_TIMEOUT`. **Backoff is excluded from the reported latency**: a retried query is billed only for the attempt that produced its result, so the percentiles stay comparable with engines that do not retry. Queries that needed a retry are counted and reported separately (`⚠ N of M search queries succeeded only after a retry`), since clean latency figures would otherwise hide that the server was shedding load.
 
 Dropped queries are handled uniformly across all engines, not here: `failed_queries` is recorded in the results JSON and warned about, and `--fail-on-dropped-queries` makes it fatal. See that flag's help for why it is off by default.
 
@@ -203,6 +203,77 @@ Experiment stage: Done
 > [View published results](https://redis.io/blog/benchmarking-results-for-vector-databases/)
 
 ## Quick Start
+
+### Prebuilt binaries (no toolchain, no Docker)
+
+Every release after 0.1.0 carries `vector-db-benchmark-<tag>-linux-x86_64.tar.gz`,
+`…-linux-aarch64.tar.gz`, `…-macos-aarch64.tar.gz` and a `SHA256SUMS` file. The
+Linux archives run on glibc 2.34 or newer (Amazon Linux 2023, RHEL 9, Ubuntu 22.04+,
+Debian 12+) with nothing else installed: HDF5, zlib and OpenSSL are linked in.
+CI runs each one on bare `ubuntu:22.04` and `amazonlinux:2023` containers. Each archive is flat. It
+holds all the binaries next to `datasets/datasets.json` and
+`experiments/configurations/`, which the CLI reads from the working directory.
+
+```bash
+# Latest release for this host's OS/arch, checksum-verified, into ./vector-db-benchmark-<tag>
+curl -fsSL https://raw.githubusercontent.com/redis/vector-db-benchmark/master/scripts/install-release.sh | bash
+# A given tag and destination:   … | bash -s -- 0.2.0 /opt/vdb      (or: make install-release TAG=0.2.0 DEST=/opt/vdb)
+
+# Or by hand, on Linux (on a Mac use …-macos-aarch64.tar.gz): extract here
+TAG=0.2.0; ARCH=$(uname -m)
+curl -fsSL "https://github.com/redis/vector-db-benchmark/releases/download/$TAG/vector-db-benchmark-$TAG-linux-$ARCH.tar.gz" | tar xz
+./vector-db-benchmark --version   # vector-db-benchmark 0.2.0 (git <commit the archive was built from>)
+./vector-db-benchmark --help
+```
+
+`--version` prints the commit each binary was built from. Every result file
+records the whole build under `params.build`, and `--describe build` prints the
+same block:
+
+| Field | What it says |
+|---|---|
+| `crate_version`, `git_sha`, `git_tree`, `git_sha_source` | the source: version, commit (`null` if unknown), `clean`/`dirty`, and whether git or `VDB_BUILD_GIT_SHA` named it |
+| `target`, `profile`, `features`, `rustc` | how it was compiled; a release archive says `["release-static"]` |
+| `openssl`, `hdf5` | the library versions actually loaded when the run started |
+
+The last two matter because TLS sits in the timed path of the managed and cloud
+engines. A release archive runs its own OpenSSL (3.x, vendored) and HDF5 (1.10.7,
+bundled), while the Docker image and a `cargo build` use the system's (OpenSSL 3.0
+and HDF5 1.10.8 on Debian 12). So two results from the same commit can differ in
+client overhead, and `params.build` shows which. The vendored OpenSSL also ignores
+the host's crypto-policies (`/etc/crypto-policies`, a FIPS provider); it still
+uses the host's CA certificates.
+
+A source build without `.git` (such as the Docker image) reports the commit as
+unknown unless you build with `VDB_BUILD_GIT_SHA=<full sha>`.
+
+The macOS archive is not signed. The `curl | tar` path above sets no quarantine
+flag, so it runs as is; an archive downloaded through a browser is blocked by
+Gatekeeper until you run `xattr -d com.apple.quarantine <file>` on it.
+
+#### Cutting a release
+
+The release workflow builds the archives from the tag's commit and checks,
+before building anything, that **the tag names the crate version**.
+
+1. Bump `[package].version` in `Cargo.toml` (it is still `0.1.0`), and merge that.
+2. Tag the merged commit `X.Y.Z`, `vX.Y.Z` or a pre-release `X.Y.Z-rc.N`, matching
+   that version. Don't use `+`: GitHub may rename assets named after it.
+3. Publish a GitHub release for the tag. `Release binaries` attaches the three
+   archives and `SHA256SUMS`, then re-downloads them and runs the installer
+   against them.
+
+If the workflow refuses the tag, delete the release, fix the version or the tag,
+and publish again. A published release without archives becomes "latest", and
+the installer one-liner refuses it.
+
+If the upload fails, or the check after it fails, open the workflow run and
+use **Re-run failed jobs**. That reuses the run's build artifacts, and
+`publish.sh` finishes the upload; it also replaces any upload that never
+finished. Don't use **Re-run all jobs**: it rebuilds, the new archives'
+digests differ from the ones already on the release, and the run refuses to
+mix builds. Rebuilding a tag on purpose is a `workflow_dispatch` with `tag`
+and `clobber: true`, which replaces the whole set.
 
 ### Docker (recommended)
 
@@ -288,8 +359,475 @@ Options:
     --describe <TYPE>          Describe available 'datasets' or 'engines'
     -v, --verbose              Verbose output for --describe
     --plot <OUTPUT.svg>        Render a QPS-vs-precision trade-off chart from results/
+    --dump-results <DIR>       Write every timed query's result (external ids,
+                               scores, exact total, latency) to DIR as JSONL
     -h, --help                 Print help
+
+Commands:
+    compare-results <A> <B> --reference <ENGINE> [--json F] [--markdown F]
+                               Score one engine's --dump-results output against a
+                               declared reference engine's
 ```
+
+### Workloads: one dispatch point per search config (#344)
+
+Every entry of an engine config's `search_params` may declare which query
+family it runs:
+
+```json
+{"parallel": 8, "top": 10, "workload": "filter-only"}
+```
+
+| `workload` | engine method | oracle |
+|---|---|---|
+| `vector` (default when omitted) | `search` | brute-forced ground truth |
+| `hybrid` | `search_hybrid` | brute-forced (filtered) ground truth |
+| `fulltext` | `search_fulltext` | the declared reference engine |
+| `filter-only` | `search_filter_only` | exact totals vs the reference engine |
+
+The runner resolves each config's workloads once, before anything is downloaded
+or connected (`vector_db_benchmark::workload::plan`), and every measured query
+goes through one function, `engine::search_workload`. An engine/workload pair
+without an implementation is a hard error, never a fallback to `vector`; today
+a declared `filter-only` and `fulltext` exist on Redis and OpenSearch, and
+`hybrid` on Redis and OpenSearch (see below). Valkey and MongoDB keep their legacy filter-only
+harness reachable only through `--skip-vector-index`, exactly as before; a
+config that declares `filter-only` for them is refused. `--skip-vector-index` is
+kept as an alias for "every search config is `filter-only`" (with its legacy
+`<engine>-no-vector` rename); combined with a config that declares another
+workload it is refused. Each result file's `params.workload` records the
+workload that ran.
+
+#### One ingest, many workloads (#344)
+
+All search configs of one engine config run against one index, uploaded and
+built once. The plan picks the layout that index needs:
+
+| search configs declare | index layout (`params.index_layout`) |
+|---|---|
+| only `vector` / `hybrid` / `fulltext` | `vector` (unchanged) |
+| only `filter-only`, or `--skip-vector-index` | `no-vector` (unchanged) |
+| `filter-only` **and** any of the others | `full` |
+
+`full` is the union, built on Redis and OpenSearch: the vector field and text
+fields exactly as in `vector`, and the scalar fields typed as filter-only needs
+them — Redis `TAG SEPARATOR ; CASESENSITIVE` + `NUMERIC`, OpenSearch `keyword`
++ `long` + `double` next to `knn_vector` + `text`. So one invocation runs all
+four workloads on one corpus:
+
+```json
+{"name": "redis-msmarco-all", "engine": "redis", "search_params": [
+  {"parallel": 8, "top": 10},
+  {"parallel": 8, "top": 10, "workload": "hybrid"},
+  {"parallel": 8, "top": 10, "workload": "fulltext"},
+  {"parallel": 8, "top": 10, "workload": "filter-only"}]}
+```
+
+- Filter-only on a `full` index still sends no vector clause: every request is
+  checked, exactly as it will be sent, before the timed run — on Redis the
+  finished `FT.SEARCH` arguments must be the metadata shape (query without
+  `=>` / `VECTOR_RANGE`, then only `LIMIT`, `NOCONTENT`, `DIALECT`, `TIMEOUT`,
+  `PARAMS`); on OpenSearch the request body may hold no `knn`, `neural` or
+  `script_score` key at any depth. Its result records
+  `filter_only.index_layout: "full"`.
+  - That body scan matches key NAMES, case-insensitively, so a schema field named
+    `knn`, `neural` or `script_score` (or `KNN`, `Neural`, ...) is refused as a vector clause (loudly,
+    before anything is timed). Rename the field in the dataset to run
+    filter-only on it.
+- The realized index is read back (`FT.INFO` / `_mapping` + `_settings`) once,
+  after configure (or the `--skip-upload` reuse check) and before ANY search
+  config runs, and must match the planned layout — so the order of the search
+  configs does not matter:
+  - `full` plan: the index must be a `full` one. Reusing a `vector`-layout
+    index under `--skip-upload` is refused (its tags are case-insensitive /
+    its floats are 32-bit).
+  - `vector` plan: an index built for filter-only (`CASESENSITIVE` tags on
+    Redis, `double` floats on OpenSearch) is refused, so a vector result is
+    never labelled `vector` while matching tags case-sensitively.
+- On `full`, a vector or hybrid filter on a tag matches case-sensitively, like
+  filter-only and like OpenSearch `keyword`; on `vector` it does not. That is
+  why every search file (and every `--dump-results` header) records
+  `index_layout`, and `compare-results` warns when one side ran on `vector`
+  and the other on `full` / `no-vector` (which type scalars alike). A dump
+  written before #344 has no `index_layout`; its layout is inferred from its
+  workload (filter-only ran on `no-vector`, everything else on `vector`).
+- An engine that cannot build `full` refuses the mix at startup, naming it.
+- `--update-search-ratio` (a ratio with updates) interleaves VECTOR searches
+  with updates, so an engine config holding any other workload — filter-only
+  on `full`, or fulltext / hybrid next to vector — is refused at startup,
+  before any download. Run those search configs in a separate engine config.
+  (The `no-vector` layout keeps skipping its mixed phases.)
+- Filter-only QPS and latency on `full` are **not yet established as
+  comparable** to the same queries on `no-vector`: the `full` index also holds
+  the HNSW vector index (memory, cache pressure), and no A/B has been run.
+  Compare filter-only numbers within one layout until one is (tracked in #363).
+- `--ef-runtime` never drops a filter-only search config (EF is a
+  vector-index knob), on `no-vector` and on `full` alike.
+- Filter-only search configs follow one rule on `no-vector` and on `full`:
+  the first per `parallel` runs, a repeat with the same result limit is
+  collapsed, and a different `top` at the same `parallel` is refused.
+- The summary of a mixed config lists `workloads` and labels each row with its
+  `workload`; precision buckets and concurrency curves cover the vector/hybrid
+  rows only. The top-level `workload` key stays reserved for single-workload
+  summaries. This applies to every mix, including vector + fulltext (allowed
+  since #339, on the `vector` layout): its summary now lists `workloads` too,
+  and its fulltext rows no longer enter the precision buckets or curves.
+
+**Ingest phases.** The upload file (`*-upload-*.json`) keeps `upload_time`,
+`total_time` (= read + upload + index wait) and `upload_count`, and on Redis and
+OpenSearch adds the keys below. `total_time` is not comparable across layouts:
+on a `full` index its read now includes filter-only's metadata-domain scan,
+which a pre-#344 `vector` ingest never did (`no-vector` always did). Compare
+`total_ingest_time`, which excludes the read.
+
+| key | meaning |
+|---|---|
+| `results.read_time` | client-side dataset read, before the first batch; on a `full` or `no-vector` index it includes the filter-only metadata-domain scan of the corpus. Under the streaming reader (`results.upload_reader.reader` = `stream`, #342) it is the payload pre-flight (every `payloads.jsonl` row parsed and counted, carrying that scan when it applies): the corpus is read and decoded inside `upload_time` |
+| `results.index_wait_time` | last batch acknowledged → index searchable |
+| `results.total_ingest_time` | `upload_time + index_wait_time`: first batch → index-ready |
+| `results.upload_docs_per_sec` / `ingest_docs_per_sec` | `upload_count` over each |
+| `results.ingest_phases` | `upload_started_at`, `upload_finished_at`, `index_ready_at` (unix epoch seconds), `index_wait` (`redis_ft_info_percent_indexed` or `opensearch_force_merge_refresh`), `documents` |
+| `params.index_layout`, `params.index_workloads` | the index built, and the workloads it serves |
+
+Both phases come from one monotonic clock, so they sum to the wall time between
+the timestamps; a report that does not (or whose `upload_time` / `total_time`
+disagree with the legacy keys) is refused rather than written. Other engines
+write the legacy keys only. A config that reuses a corpus another config
+uploaded (Redis shared-corpus mode) only waits for its index to backfill: its
+`upload_time` is exactly `0.0`, `upload_docs_per_sec` is `null`, and the whole
+ingest is `index_wait_time`. When its index serves filter-only (`full` or
+`no-vector`), that path still streams the corpus metadata once to check
+filter-only's metadata domain before any result is written — the corpus may
+have been uploaded by a `vector` config, which does not check it. That read
+happens before the ingest clock starts, so it is not counted in any phase.
+
+### Hybrid prefilter + KNN (#341)
+
+`"workload": "hybrid"` runs the dataset's `hybrid_queries.jsonl` (written by
+`prepare-msmarco`; `--add-hybrid-queries` upgrades an existing corpus in place,
+and must be re-run after `--add-derived-fields`, which removes the set because its
+truth was computed from the payloads it rewrites):
+each query vector of `tests.jsonl` paired with a predicate over the derived
+exact-match fields and/or a full-text match on `title`, with the exact number
+of matching rows and the brute-forced top-1000 OVER THOSE ROWS ONLY.
+
+```json
+{"parallel": 8, "top": 10, "workload": "hybrid", "hybrid_policy": "ADHOC_BF", "search_params": {"ef": 128}}
+```
+
+- **Buckets.** Predicates are designed for ~50%, 10%, 1% and 0.1% selectivity
+  and bucketed by their REALIZED selectivity (boundaries at 25% / 2.5% /
+  0.25%). Each bucket runs as its own timed pass, so `results.hybrid.buckets[]`
+  reports a measured QPS, p50/p90/p99 and recall@k against the filtered truth
+  per bucket; the top-level numbers are the union of the passes (total queries
+  over summed pass time, so dominated by the slowest bucket — compare hybrid runs
+  per bucket, not by `results.rps` against vector runs). `top` is required (the
+  truth is up to 1000 wide) and may not exceed the narrowest predicate's
+  filtered truth (refused at startup); open-loop / duration modes and
+  `--queries N` (which would silently apply per bucket) are refused, so a
+  hybrid run always runs the whole query set. A fast
+  bucket's pass can be very short (Redis 0.1% on the 100K corpus: ~420 queries
+  in ~26 ms), so worker start-up and tail drain are a real share of it: each
+  bucket publishes its `total_time` next to `rps`, and sub-100 ms passes should
+  not be compared across runs. With `--repetitions N` (default 3) the kept
+  repetition is the one with the best union `rps`, which the slowest (50%)
+  bucket dominates, so every per-bucket figure comes from that one repetition
+  rather than being a per-bucket best-of-N.
+- **Fails before anything is uploaded.** At startup, a Redis `hybrid_policy`
+  that contradicts `REDIS_HYBRID_POLICY` is refused (before any download or
+  connection); once the dataset is on disk and before the engine is built,
+  `hybrid_queries.jsonl` must exist, every row must be consistent and every
+  predicate must fit the schema.
+- **Expressibility is checked, not assumed.** Every predicate is compiled by
+  the oracle's evaluator (`msmarco::derived::Predicate`), typed against the
+  dataset schema, and after the engine's builder ran the rendered filter must be
+  the predicate STRUCTURALLY: OpenSearch's bool query is compared node by node;
+  Redis's RediSearch expression is parsed back (AND = juxtaposition, OR = `|`,
+  groups) and compared node by node with its `PARAMS` resolved — group kind and
+  arity, tag value sets, text term, range bounds and their inclusivity. A
+  predicate an engine cannot express is a hard error.
+- **Redis** sends `FT.SEARCH ... VERBATIM` (text terms must not be
+  stem-expanded) with `=>{$HYBRID_POLICY: …}` when `hybrid_policy` (search
+  knob) or `REDIS_HYBRID_POLICY` is set (`ADHOC_BF` | `BATCHES`; conflicting
+  values are an error). After each pass a fixed sample of the bucket (see
+  below) is `FT.PROFILE`d with the policy the pass actually sent. Through a cluster coordinator the reply holds
+  one profile per shard, so the tally is per shard: every shard must report
+  exactly one `Vector search mode`, every mode must match the configured
+  policy, and the tally must be profiled queries x shards. Profiling replays
+  queries serially outside the timed window, so it uses a fixed sample — the
+  first 4 queries of each predicate in the bucket (12 per bucket) — published
+  as `profiled_queries` next to the tally, `bucket_queries` and `shards`.
+  With the policy unset, the tally only shows that a hybrid mode ran on the
+  sampled queries; it is not the bucket's mode distribution (e.g. queries that
+  switch `HYBRID_BATCHES_TO_ADHOC_BF` mid-query can be absent from the sample).
+- **OpenSearch** sends lucene `knn` with the predicate as its `filter` and
+  `k = top`. The k-NN plugin's `knn_query_with_filter_requests`, summed over
+  nodes and read before and after each pass, must grow by at least one per
+  ANSWERED query (requested minus failed; a failed query may never have reached
+  the plugin), i.e. the filter reached the k-NN query. The delta is a cluster-wide LOWER BOUND —
+  concurrent clients on a shared domain inflate it — and the result says so.
+  Whether Lucene fell back to exact search is not observable and is reported as
+  such.
+- **Text match semantics** (`src/msmarco/text_match.rs`). Redis (RediSearch
+  tokenizer, stemming, `\` escapes) and OpenSearch (`standard` analyzer, UAX#29)
+  do NOT tokenize alike, so exact agreement is impossible for arbitrary terms.
+  A text term is one lowercase ASCII word, not a RediSearch stopword, and a
+  document counts as matching only when the term occurs as a whole ASCII run
+  delimited by contexts both tokenizers split on; any other context (`'`, `.`
+  or `:` before a letter, `\`, non-ASCII neighbours, characters that fold to
+  ASCII, >255-char runs) is *ambiguous*. Ground truth is never computed for an
+  ambiguous document: preparation picks the 1% / 0.1% title terms only among
+  terms with ZERO ambiguous documents in the corpus (100K: `quora`, `ancient`).
+
+### Per-query results and `compare-results` (#343)
+
+`--dump-results DIR` writes one JSONL file per (config, dataset, workload,
+parallel, search config): a header line, then one record per timed query in
+dispatch order, failed queries included:
+
+```json
+{"kind":"header","schema_version":1,"engine":"redis","config":"redis-fo","dataset":"msmarco-cohere-1024-100K-cosine","workload":"filter-only","parallel":8,"top":10,"search_id":0,"id_space":{"kind":"field","field":"docid"}}
+{"kind":"query","query_id":3,"seq":0,"ids":["msmarco_v2.1_doc_…"],"total":1234,"latency":0.0011}
+```
+
+Ids are EXTERNAL: the dataset's `docid` payload field when the schema declares
+one (MS MARCO), else the corpus row id — never an engine key, `_id` or offset.
+Vector records also carry the ground-truth ids they were scored against
+(`expected`). Records are captured OUTSIDE each latency sample (after the
+timer stops) but INSIDE the throughput window when `--dump-results` is on: the
+id parsing and record push run in the measured worker loop, so they count
+toward `total_time` and therefore `rps`. Without `--dump-results` the filter-only
+loops build no id strings at all. The files are written after the search phase.
+An engine with no
+capture for the workload fails the run instead of writing an empty file, and a
+dump whose record count differs from the attempted query count is refused.
+Warm-ups and mixed (`--update-search-ratio`) phases are not dumped. Per-query
+capture exists for Redis and OpenSearch (vector, filter-only, fulltext and
+hybrid); hybrid records carry the filtered ground truth as `expected` and their
+selectivity bucket as `shape`, so `compare-results` reports recall per bucket.
+
+```bash
+vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch \
+  --json report.json --markdown report.md
+```
+
+Dumps pair by (dataset, workload, parallel, k, id space), so a directory may
+hold one dump per key: a sweep of several search configs at the same
+(parallel, k) is refused as ambiguous — pass the two files explicitly. Per pair
+and query shape the
+report gives overlap@k (against the reference's list), Jaccard@k, Kendall rank
+correlation over the ids both lists share, exact-count agreement for
+`filter-only` (whose order is unspecified, so overlap/rank are not reported),
+and recall@k against the dump's ground truth for `vector`/`hybrid`. It exits
+non-zero when any query was answered by one engine and not by the other, or when
+either dump holds ANY failed attempt — including a query that failed once and
+was answered on a later cycle (`--queries N` above the query count, duration
+runs): that is the `--fail-on-dropped-queries` policy applied to the dumps. A
+dump with no counterpart on the other side also fails the comparison, unless
+`--allow-unpaired` is passed. `--dump-results` is refused at startup for any
+engine/workload without per-query capture (today: Redis and OpenSearch,
+vector and filter-only), and `calibration_param` on a declared non-vector
+workload is refused at startup.
+
+### Ranked full-text (BM25): `"workload": "fulltext"` (#339)
+
+Redis `FT.SEARCH` vs OpenSearch `multi_match` over a dataset's `text` fields,
+queried with the `query_text` of every `tests.jsonl` line (MS MARCO:
+`title` / `headings` / `segment`, 1677 TREC-DL queries). Logic and every pinned
+setting live in `src/fulltext.rs`.
+
+```json
+{"parallel": 8, "top": 10, "workload": "fulltext",
+ "fulltext": {"fields": {"title": 5.0, "headings": 3.0, "segment": 1.0}}}
+```
+
+`fields` maps each searched field to its boost; omitted, every schema `text`
+field is searched at boost 1.0. An unknown key, a boost that is not a finite
+number > 0, or a `fulltext` block on another workload is refused at startup; a
+field that is not a `text` field of the dataset schema is refused per dataset
+before configure/upload, i.e. before the server is touched. `top` defaults to
+10 and is never derived from ground truth. There is no ground truth: quality is
+`compare-results` against a reference engine (use OpenSearch), and the result
+files carry no recall/precision keys.
+
+**Queries.** Both engines receive the same term list, derived client-side:
+drop possessive `'s`, split on RediSearch's separator set and all whitespace, lowercase, drop the
+pinned stopwords and duplicates. Terms are OR-ed. A query with no term left is
+skipped on both engines and listed in `params.fulltext.queries_skipped_no_terms`.
+Boosts are applied at query time on both sides, so one index serves every
+search config: Redis `(@title:(t1|t2)) => {$weight: 5.0;} | (@segment:(t1|t2)) => {$weight: 1.0;}`
+with `NOCONTENT WITHSCORES SCORER BM25STD DIALECT 2` (RESP3, any warning is an
+error); OpenSearch `multi_match` `type: most_fields`, `operator: or`,
+`fields: ["title^5.0", …]`, `_source: false`, `track_total_hits: false`.
+Both sum boost × per-field-clause BM25 over the fields a document matches.
+
+**Analyzers (pinned, verified on the live index before the timed window).**
+
+| | Redis | OpenSearch |
+|---|---|---|
+| tokenizer | RediSearch default | `standard` |
+| stopwords | `FT.CREATE … STOPWORDS 33 <list>` | `stop` with the same list |
+| stemmer | RediSearch default, Snowball English (Porter2) | `stemmer` `porter2` |
+| other | — | `possessive_english`, `lowercase` |
+
+The custom OpenSearch analyzer (`vdbb_english_porter2`) is the built-in
+`english` analyzer with `porter2` in place of `porter`: the built-in one stems
+with the original Porter algorithm (`generously` → `gener`), RediSearch with
+Porter2 (`generously` → `generous`). The stopword list is RediSearch's
+`DEFAULT_STOPWORDS` (`src/stopwords.h`), which is the same 33 words as Lucene's
+`EnglishAnalyzer.ENGLISH_STOP_WORDS_SET` (`_english_`); both engines are still
+given it explicitly so the server reports it back (`FT.INFO stopwords_list`,
+`_settings`). A unit test pins the list against both sources.
+
+These settings are applied only when an engine config declares a `fulltext`
+search config. Fulltext uses the vector index layout (the one that indexes
+`text` fields), so it may share an engine config with `vector` configs, but not
+with `filter-only` (different layout, refused by `workload::plan`). Because the
+pinned analyzer then also governs the vector configs' filters on text fields (on
+OpenSearch it replaces `standard`: a `match.text` / `match.value` filter would
+also match `quickly` for `quick`, and `match.any` becomes a `terms` query over
+stemmed tokens), an engine config mixing `fulltext` with `vector`/`hybrid`
+configs is refused, before the server is touched, when any query condition of
+the dataset — of any type — targets a schema `text` field. Split the fulltext
+configs into their own engine config. No registered dataset has such queries
+today: H&M's 10,000 queries all filter with `match.value` on keyword fields,
+never its text field `detail_desc`, and MS MARCO's `tests.jsonl` has no
+conditions. The rule applies to Redis too, where it is a no-op, so both engines
+follow one rule. A mixed engine config that is allowed still uploads through the
+pinned analyzer on OpenSearch, so its upload time is not comparable to a
+vector-only config's. The fulltext
+arm refuses to start when a searched field is missing from the live index, or
+when the live index differs from anything `params.fulltext.engine_settings`
+claims — e.g. an index built by a vector-only config and reused with
+`--skip-upload`:
+
+- Redis (`FT.INFO`): each searched field TEXT, index WEIGHT 1, no
+  NOSTEM / NOINDEX / PHONETIC; default language absent or English; no
+  LANGUAGE_FIELD / SCORE_FIELD / PAYLOAD_FIELD; default score 1; no NOFREQS /
+  NOOFFSETS / NOFIELDS; `stopwords_list` equal to the pinned list.
+- OpenSearch (`_mapping`, `_settings`): each searched field `text`, indexed,
+  analyzed (and search-analyzed) by `vdbb_english_porter2`, similarity absent
+  or `BM25`; the analyzer's tokenizer and filters as pinned and no
+  `char_filter`; `index.similarity` absent or a parameterless default BM25;
+  one shard. Lucene IDF and length norms are per shard, so a multi-shard index
+  is refused unless the search config sets `"allow_multi_shard": true` in its
+  `fulltext` block; the live shard count is recorded as
+  `params.fulltext.number_of_shards` either way. (`dfs_query_then_fetch` would
+  globalize IDF but adds a round trip to every timed query, so it is not used.)
+
+**What cannot be pinned** (published as `params.fulltext.known_differences`):
+
+- RediSearch does not split tokens on `\n`/`\r` (only on its ASCII separator
+  set, space and tab). MS MARCO `headings` are newline-joined — 180,249 of the
+  299,892 text fields of the 100K corpus contain a newline — so Redis indexes a
+  merged token at every heading boundary that OpenSearch splits. Parity
+  normalizes all such whitespace at upload.
+- RediSearch does not split on non-ASCII punctuation either (– — … “ ” • ·
+  stay inside the token); `standard` does. 49% of the 100K `segment` values
+  contain some, led by ’ (32,793 rows; kept between letters by both), “ ”
+  (~12,000 each), – (10,206), — (6,231) and … (3,397). Neither mode normalizes
+  punctuation, so this difference remains in parity too.
+- RediSearch splits on `.`, `-`, `'` inside words; `standard` keeps `u.s.a` and
+  `3.5` whole and strips possessive `'s`.
+- RediSearch indexes a term and its stem and expands a query term to both, so a
+  term whose stem differs is scored twice; Lucene indexes the stem only.
+- RediSearch BM25STD uses one term frequency and one document length for the
+  whole document (field restriction is a mask), Lucene per-field frequencies
+  and norms; Lucene statistics are per shard/segment.
+- Equal scores may be ordered differently.
+
+**How much each difference costs** (100K MS MARCO, 1677 queries, one
+OpenSearch shard, `compare-results` with OpenSearch as reference, overlap@10 /
+Jaccard@10 / rank correlation). Each variant changes only the uploaded copy of
+the corpus or, for "stemming off", the analyzers of both engines (Redis
+`NOSTEM` + `VERBATIM`, OpenSearch without the porter2 filter); none is a
+shipped setting:
+
+| Variant | title 5, headings 3, segment 1 | segment |
+|---|---|---|
+| as shipped | 0.399 / 0.275 / 0.348 | 0.413 / 0.283 / 0.326 |
+| newlines → spaces | 0.425 / 0.299 / 0.340 | 0.431 / 0.300 / 0.340 |
+| only `segment` indexed | — | 0.440 / 0.307 / 0.369 |
+| only `segment` indexed, newlines → spaces | — | 0.470 / 0.337 / 0.389 |
+| stemming off | 0.610 / 0.465 / 0.455 | 0.691 / 0.549 / 0.565 |
+| stemming off, only `segment` indexed, newlines → spaces | — | 0.943 / 0.903 / 0.907 |
+
+So most of the gap goes with stemming: turning it off on both engines is worth
+21–28 points of overlap@10, against about 2–3 for newline tokenization and
+about 3 for whole-document BM25STD statistics. With all three removed the
+engines agree on about 94% of the top 10. The "stemming off" rows change
+several things at once — RediSearch indexing a term together with its stem and
+expanding each query term to both, any difference between RediSearch's Snowball
+and Lucene's `porter2` output, RediSearch's minimum stem length, and
+`VERBATIM` on the query side — so they do not say which of these mechanisms
+accounts for the gap. Treat the as-shipped overlap as the agreement of two
+default English pipelines, not as a BM25 implementation difference.
+
+#### Two analysis modes: `english` (headline) and `parity` (agreement check)
+
+`fulltext.analysis` selects how both engines analyze text:
+
+| | `english` (default) | `parity` |
+|---|---|---|
+| stemming | Porter2 on both, as pinned above | none: Redis `NOSTEM` + `VERBATIM` queries; OpenSearch `vdbb_english_nostem` (the english analyzer without porter2: same tokenizer, possessive, lowercase, stop list) |
+| text fields indexed | every schema `text` field | exactly the searched `fields` (OpenSearch maps the others `index: false`; Redis leaves them out of the schema), so BM25STD's whole-document statistics cover only those |
+| uploaded text | as is | every Unicode whitespace character other than U+0020 (`\n`, `\r`, `\t`, `\x0B`, `\x0C`, U+0085, U+00A0, U+2028, U+2029, …) → space in the indexed text fields, on both engines. RediSearch splits tokens only on space and tab, OpenSearch on all of them. In the 100K corpus `segment` carries `\n` (80,288 rows), U+00A0 (210 rows), `\t` (165), `\x0B` (4), U+2028 (3), U+0085 (3) and `\x0C` (2) |
+| use | headline numbers | agreement check against OpenSearch as source of truth |
+
+```json
+{"parallel": 1, "top": 10, "workload": "fulltext",
+ "fulltext": {"analysis": "parity", "fields": {"segment": 1.0}}}
+```
+
+Report the **english** run as the headline: it is what each engine does with
+its default English pipeline. Report **parity** next to it to show how closely
+Redis matches OpenSearch once the known pipeline differences are removed. On
+the 100K MS MARCO corpus, segment-only parity agrees on about 94% of the top 10
+(see below). `experiments/configurations/redis-msmarco-fulltext.json` and
+`opensearch-msmarco-fulltext.json` ship both modes as separate engine configs,
+so they run side by side:
+
+```bash
+# One run per engine, each into its own (new) dump directory.
+vector-db-benchmark --engines 'redis-msmarco-fulltext-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/redis
+vector-db-benchmark --engines 'opensearch-msmarco-fulltext-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/opensearch
+vector-db-benchmark compare-results dumps/opensearch dumps/redis --reference opensearch
+```
+
+Parity changes the uploaded corpus, so it is guarded:
+
+- **Startup rules.** Refused before anything is downloaded or connected:
+  - an engine config whose fulltext configs mix `english` and `parity` (they need different indexes);
+  - parity without explicit `fields`;
+  - parity configs searching different field sets;
+  - parity in the same engine config as any `vector`, `hybrid` or `filter-only` config. Normalization and the reduced text index never apply to other workloads.
+- **Redis shared corpus.** On Redis, parity also refuses a shared corpus (`REDIS_KEY_PREFIX`).
+- **Recorded in the index.** The mode is written into the index: a Redis key `vdbb:fulltext-profile:<index>`, and OpenSearch `mappings._meta.vdbb_fulltext` (`{"analysis", "normalize_whitespace", "text_fields"}`).
+- **Marker access on Redis.** The marker key lives outside the config's key prefix.
+  - In english mode, a denied marker write or read (e.g. NOPERM for an ACL user limited to `~<config>:*`) is a printed note, and the result records `index_marker: null`.
+  - In parity mode it is a hard error: the marker is what proves the normalization, so the user needs access to `vdbb:fulltext-profile:*`.
+  - Vector-only configs never touch the marker key.
+- **Verified on `--skip-upload` reuse,** together with the analyzer / `NOSTEM` / indexed-field checks:
+  - an index uploaded without normalization (english, or built before markers existed) is refused in parity;
+  - a parity index is refused in english.
+- **In the result.** `params.fulltext` records `analysis`, `normalize_whitespace`, `indexed_text_fields`, `index_marker` (the marker the live index actually carries, `null` when it has none) next to `index_marker_expected`, and the `known_differences` that remain in that mode.
+
+Result JSON: `params.workload: "fulltext"` and `params.fulltext` (fields and
+boosts, query-term method, stopword list and provenance, the engine's analyzer /
+scorer / request, skipped queries, known differences). `--dump-results`
+records carry `docid`s and the engine's BM25 scores (not comparable across
+engines). Note that `compare-results` pairs dumps by (dataset, workload,
+parallel, k): two fulltext configs that differ only in boosts need different
+`parallel` or `top` to stay distinguishable (in directory mode a collision is
+refused, never silently replaced).
+
+Latency, as on the vector path: OpenSearch bills only the attempt that produced
+the result (retry backoff and discarded attempts are excluded and counted in
+`params.fulltext.retried_queries`), while Redis makes one attempt per query.
+Compare QPS columns only from runs with zero retries and no client-saturation
+warning.
 
 ### `--skip-upload`: reuse means reuse (issue #238)
 
@@ -416,8 +954,141 @@ check uses `ANALYZE` + `reltuples` and can therefore only warn, never abort.
 Two-phase workflows are unchanged, and now provably non-destructive: upload with
 `--keep-data`, then re-run with `--skip-upload --skip-if-exists false`. A
 filter-only two-phase run must pass `--skip-vector-index` in **both** phases —
-the flag renames the config to `<engine>-no-vector`, so phase 1 writes exactly the
-schema-only index phase 2 reuses.
+the flag renames the config to `<engine>-no-vector`. Redis derives its default
+index name from that config. OpenSearch uses `OPENSEARCH_INDEX` (default `bench`);
+both engines validate the realized scalar schema before reusing an index.
+
+### Redis / OpenSearch pure numeric and tag benchmarks
+
+`--skip-vector-index` also supports OpenSearch. On Redis and OpenSearch this
+mode measures metadata predicates with **IDs-only results, an exact total count,
+and unspecified result order**. `search_params.top` is the result limit (default
+10); it is independent of the vector ground-truth width. Vectors remain stored
+but are not indexed. OpenSearch maps scalar floats to `double` in this mode to
+preserve the precision of Redis NUMERIC values.
+
+Redis uses `FT.SEARCH ... NOCONTENT DIALECT 2`; OpenSearch uses `bool.filter`,
+`track_total_hits: true`, `_source: false`, and `_doc` order. Both exclude worker
+connection setup and one priming query from the timed window. OpenSearch scalar
+latency includes its bounded retries/backoff. Redis scalar queries use one attempt
+without reconnect/retry; a connection failure can fail subsequent queries on that
+worker. The downstream paired workflow fails on any dropped or retried query.
+This retry-policy difference must be considered when interpreting results under failures.
+This is a warm, immutable-corpus benchmark;
+results do not describe a mixed write workload or vector retrieval.
+
+Only queries with explicit predicates run. `--queries N` cycles those queries,
+and the experiment is named `<engine>-no-vector`. Select one engine config
+with one point per client count. Selecting multiple configs for the same engine
+with `--skip-vector-index` fails before download or connection; the runner never
+silently keeps the first. Adapters without scalar support are warned about and
+skipped before duplicate-selection and namespace checks. All `--skip-vector-index` engines reject
+conflicting `top` values at the same client count instead of silently picking one.
+Only Redis/OpenSearch treat omitted `top` as 10; legacy Valkey/MongoDB derive
+it from ground truth, so mixing an omitted and explicit limit is rejected.
+Use `--fail-on-dropped-queries --repetitions 1` for paired
+runs. Search and summary JSONs carry `workload: filter-only`, the result limit,
+and sums of exact match and returned-ID counts. The Redis and OpenSearch scalar
+contract also records `filter_only.retried_queries`: successful measured queries
+requiring retries, excluding priming queries. Redis always reports zero. A clean
+paired comparison requires zero dropped queries and zero retried queries. The
+driver records retries and warns, but `--fail-on-dropped-queries` checks dropped
+queries only. Retry rejection is enforced by the downstream
+[paired workflow validator](https://github.com/redis-performance/cloud-benchmarks-private/pull/76);
+a standalone driver invocation can succeed with a nonzero retry count.
+These two engines omit vector-quality fields; legacy filter-only engines keep
+their existing output format.
+The count sums let paired runs detect disagreement; they are not a substitute
+for validating predicates against an independent oracle. Integration tests use
+unequal category populations, exact numeric/tag values, floating-point range
+boundaries, AND/OR, and an empty result, and inspect the realized server schema.
+
+Redis filter-only workers require RESP3 and reject replies with any warning,
+including partial results from query timeouts. Replies must include the complete
+RESP3 warning metadata; missing metadata fails closed. No server configuration
+changes are required. Managed deployments must expose that response contract;
+the Redis Cloud benchmark has not yet validated it.
+
+The realized index schema is checked before timing, including index reuse:
+vector indexes are rejected, numeric fields retain double precision, and tags
+are case-sensitive; reused OpenSearch keyword fields cannot set `ignore_above`
+or enable `split_queries_on_whitespace`.
+OpenSearch does not require `_id` fielddata. The common
+numeric/tag mode accepts predicates only on explicitly declared `keyword`, `int`,
+or `float` fields. Unknown fields, missing schema declarations, and text, geo,
+datetime, or other field types are rejected in predicates, including inside
+boolean groups. Groups must contain nonempty arrays of predicate objects and
+cannot have sibling field leaves; `and` and `or` may coexist. Match criteria
+must contain exactly one of `value` or `any`, and ranges allow at most one lower
+and one upper bound. Ambiguous or malformed clauses are rejected instead of
+silently dropped. Unqueried extra metadata may remain stored. KNN modes retain
+their existing predicate support.
+The common domain also rejects empty tags, tags containing `;` or edge whitespace,
+integers outside +/-2^53, and negative floating-point zero (whose equality
+semantics differ between the engines). Floating-point keyword metadata is also
+rejected because the upload paths stringify it differently; provide explicit
+strings for those tokens. Integer keyword tokens remain supported. Numeric operands must be JSON numbers; numeric
+`match.any` accepts integer lists. These checks run before upload/search timing. On reuse, payloads are validated
+one row at a time and corpus size is checked from the NPY header; vector values
+are neither loaded nor decoded.
+
+This changes Redis filter-only response shaping from full documents to IDs only
+and uses DIALECT 2 instead of 4 to avoid optimizations that can skip exact counting;
+old filter-only timings and Valkey's legacy filter-only path are not directly
+comparable. KNN behavior is unchanged.
+
+#### Filter-only on MS MARCO: prepared queries and the per-query count gate (#340)
+
+```bash
+vector-db-benchmark --engines redis-fo --datasets msmarco-cohere-1024-1M-cosine \
+  --skip-vector-index --fail-on-dropped-queries --repetitions 1 --dump-results dumps/redis
+```
+
+- **Queries.** A compound dataset that ships `filter_queries.jsonl` runs exactly
+  those queries (`query_id`, `shape`, `conditions`, `expected_count`,
+  `corpus_size`; see `src/filter_only/query_set.rs`); others fall back to the
+  predicates in `tests.jsonl`. `--queries N` cycles the set. Each per-query
+  record's `shape` comes from the file, so `compare-results` reports per shape.
+- **Index layout.** Without a prepared query set (H&M, the synthetic
+  `*-filters` datasets) filter-only builds exactly the index it built before
+  #340: every declared field, `text` included, and every declared scalar field
+  validated. With a prepared set the index holds only the `keyword`/`int`/`float`
+  fields its predicates reference: for MS MARCO `category` (TAG / keyword) and
+  `doc_len`, `tier`, `rand_key` (NUMERIC / long). `docid`, `url` (which holds `;`
+  and edge whitespace) and the text fields are stored in the document,
+  unindexed, and OpenSearch maps with `dynamic: false`. The shared-domain
+  metadata checks apply to every indexed field exactly as before.
+  On the shared `full` index (#344: filter-only mixed with other workloads in
+  one engine config) the index also serves those workloads, so it indexes
+  every declared field as the `vector` layout does, with filter-only's
+  CASESENSITIVE tags / `double` floats, and OpenSearch leaves `dynamic` alone.
+  Filter-only itself is unchanged: its realized-schema, metadata-domain and
+  predicate checks still use the narrowed field set, so `url`'s `;` does not
+  stop the upload, and the per-query count gate applies.
+- **Per-query count gate.** Every answered query's exact total must equal its
+  prepared `expected_count`, or the run fails naming the queries; the sum alone
+  lets two compensating errors pass. The artifact records the answers checked
+  in `filter_only.per_query_counts_checked`. That count covers ANSWERED queries
+  only: with `--queries N` below the set size, or with dropped queries when
+  `--fail-on-dropped-queries` is off, it is below the set size, and
+  `failed_queries` reports the drops. Exact totals, `--fail-on-dropped-queries`
+  and the zero-retry rule are unchanged.
+- **Stale corpora.** An MS MARCO directory whose registry entry declares the
+  derived fields but which has no `filter_queries.jsonl`, or whose payloads lack
+  the fields — an S3 tarball prepared before #340 — is refused by the dataset
+  loader for every workload, naming `prepare-msmarco --add-derived-fields`; it
+  never runs over empty columns or falls back to `tests.jsonl`.
+
+Verified on `msmarco-cohere-1024-100K-cosine` (31 queries × 3 repetitions):
+Redis and OpenSearch both pass the gate, and `compare-results` reports 1.0 count
+agreement with max Δ 0 for every shape. CI exercises the same paths on a
+2,000-row MS MARCO-shaped fixture (`write_msmarco_filter_project`).
+
+Run `make agent-check`, `make integration-test`, and
+`make integration-test-opensearch` to verify the contract. For instrumented
+library, CLI, and real-server coverage, install `cargo-llvm-cov` and the Rust
+`llvm-tools-preview` component, then run `make coverage-filter-only`. JSON and
+LCOV reports are written under `target/filter-only-coverage/reports/`.
 
 ### Per-config index isolation (Redis / Valkey / Dragonfly / KiviDB / VectorSets)
 
@@ -580,6 +1251,7 @@ Results JSON includes separate metrics for both operation types:
     "mean_precision_at_returned": 0.9785,
     "mean_recall": 0.9785,
     "p50_time": 0.00032,
+    "p90_time": 0.00071,
     "p95_time": 0.00089,
     "p99_time": 0.00142,
     "update_count": 5891,
@@ -590,6 +1262,7 @@ Results JSON includes separate metrics for both operation types:
     "update_rps": 589.1,
     "update_mean_time": 0.00045,
     "update_p50_time": 0.00041,
+    "update_p90_time": 0.00082,
     "update_p95_time": 0.00098,
     "update_p99_time": 0.00156,
     "update_search_ratio": "1:10"
@@ -708,6 +1381,7 @@ Most datasets are automatically downloaded on first use. The image includes `ran
 | [MS MARCO v2.1-100K: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |      99,964 |     1,677 |   1,000 ‡ | Cosine    |
 | [MS MARCO v2.1-1M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3)  |      1,024 |   1,000,044 |     1,677 |   1,000 ‡ | Cosine    |
 | [MS MARCO v2.1-10M: TREC-RAG passages, Cohere embed-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) |      1,024 |   9,999,959 |     1,677 |   1,000 ‡ | Cosine    |
+| MS MARCO v2.1-100M (build on host, no download — see [Larger than RAM](#the-100m-variant-larger-than-client-ram)) |      1,024 | 100,000,027 |     1,677 |   1,000 ‡ | Cosine    |
 | **Sparse Vectors** (learned/lexical sparse embeddings — Qdrant is the only engine with a sparse path)        |            |             |           |           |           |
 | [MS MARCO Sparse-100K: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                |   *sparse* |     100,000 |     6,980 |        10 | Dot       |
 | [MS MARCO Sparse-1M: SPLADE-style sparse embeddings](https://microsoft.github.io/msmarco/)                  |   *sparse* |   1,000,000 |     6,980 |        10 | Dot       |
@@ -940,6 +1614,98 @@ benchmarking at scale in the first place.
 the `Array2` and the `Vec<Vec<f32>>` it is converting into at once — 2 x 40 GB.
 The 17 GB of payloads are read *after* that copy is dropped, so the two peaks
 never coincide. Budget **2x the vector bytes**, plus Redis in its own process.
+
+### The 100M variant: larger than client RAM
+
+`msmarco-cohere-1024-100M-cosine` is the passages with
+`crc32(docid) % 1,000,000 < 880,865` — **100,000,027** of the 113,520,750,
+measured over all 60 upstream shards (2026-10-28). It nests: it contains the
+10M, 1M and 100K variants. On disk it is ~410 GB of float32 vectors plus
+~184 GB of payloads, so it has no download link; build it on the client host
+with `make prepare-msmarco MSMARCO_DATASET=msmarco-cohere-1024-100M-cosine`.
+
+Neither side of the run loads it:
+
+- **Preparation** streams every pass. Selection, conversion and the
+  brute-force ground truth (filtered and unfiltered) were already chunked; the
+  hybrid query set now scans `payloads.jsonl` in 65,536-row chunks and keeps a
+  12-bit predicate mask per row (~150 MB at 100M). The one O(N) structure left
+  is the derived-field table, 16 B/passage (1.6 GB). Expect ~4-5 GB peak RSS.
+  Choosing the COMMON and RARE text-match terms confirms candidates
+  nearest-first, and each confirmation is one more full pass over
+  `payloads.jsonl` (~184 GB at 100M; minutes per pass at NVMe speed): at
+  least two passes, plus one per candidate rejected as ambiguous. The number
+  of candidates scanned is not recorded in `PREPARED.json` yet.
+- **Upload** reads `vectors.npy` and `payloads.jsonl` in batches with
+  `--upload-reader stream` (Redis and OpenSearch). The default `auto` streams
+  a compound corpus only when the in-memory reader could not hold it: at
+  least 128 GiB of vectors (so the 100M, on any host), or a corpus whose
+  in-memory peak (2x the vector bytes) exceeds the memory available to the
+  process — `MemAvailable` capped by the cgroup limit (v2 `memory.max` minus
+  `memory.current`, `max` = unlimited; else v1 `limit_in_bytes` minus usage;
+  in both, the cgroup's reclaimable `inactive_file` page cache from
+  `memory.stat` is not counted as used),
+  so a container's limit counts, not the host's RAM. The figure and how it was
+  derived are recorded as `results.upload_reader.available_memory`.
+  `auto` decides **once per dataset per invocation**: memory is read the
+  first time a dataset is used and that reading is reused for every later
+  config. That way an MxEF sweep against a server that grows on the same host
+  never loads the first config in memory and streams a later one, which
+  would mix two meanings of `upload_time` / `read_time` in one sweep. A
+  separate invocation decides afresh.
+  Everything else keeps the pre-#342 in-memory reader — including the
+  100K, 1M and 10M MS MARCO variants on a host that can load them, so their
+  published `upload_time` keeps meaning upload only (on the streaming path,
+  disk read and decode run inside the upload window instead of `read_time`).
+  Before the first batch, a streamed upload makes one pass over
+  `payloads.jsonl` that parses every row and counts the rows against
+  `vectors.npy`, so a truncated or malformed file fails up front, with
+  nothing written, as it does on the in-memory path. This pass, which also
+  carries the filter-only metadata-domain check when the index serves
+  filter-only, is the streaming path's `read_time`.
+  `memory` forces the old path. An engine without a streaming upload refuses,
+  under `auto`, a compound corpus the host cannot load, instead of being
+  OOM-killed; `--upload-reader memory` overrides. The check covers the
+  reader's own peak against memory available when the dataset is opened; an
+  engine on the same host grows by its index during the upload, so leave it
+  room yourself. Peak client memory is bounded by
+  `parallel x batch_size x (24 x dim + 4 x payload_bytes)` plus 2 MiB of read
+  buffers — about **1.0 GB** for MS MARCO at `parallel` 32, `batch_size` 1000,
+  and 260 MB at 16 x 500 — independent of corpus size. Other engines refuse
+  `--upload-reader stream` instead of silently loading the corpus. The upload
+  result records which reader ran, and why, under `results.upload_reader`.
+- **Indexing wait.** After the upload, Redis, Valkey, Dragonfly and KiviDB poll
+  `FT.INFO` until the index holds every document. The budget is the engine's
+  floor (120 s Redis, 600 s the others) plus 1 s per 10,000 documents
+  (~2.8 h extra at 100M) — the asynchronous tail after an upload that built
+  the index as it went. A Redis shared-corpus backfill (`REDIS_KEY_PREFIX`,
+  configs 2..N) builds the WHOLE index inside the wait, so it gets 1 s per
+  1,000 documents (1M: 1,120 s; 100M: ~27.8 h). That slope is an UNMEASURED,
+  conservative estimate (the one measured rate is the 10M upload with its
+  index build, 2,277 docs/s; a backfill was not timed).
+  `INDEXING_WAIT_SECS=<seconds>` replaces either budget, and the run records
+  the budget it used and which slope applied (`INDEXING_WAIT_SECS`,
+  `indexing_wait_phase` in the effective config). It must be a whole number
+  of seconds above zero: a value that is set but does not parse (`100000s`,
+  `-1`, `0`) refuses the run at startup, before any download or connection,
+  instead of falling back to the computed budget. On Redis, transient
+  connection errors during the wait (a dropped socket, a coordinator
+  restart) are retried for at most 120 s in a row, whatever the budget, so
+  a server that died mid-wait fails in minutes rather than hours; any
+  answered poll restarts that window. An
+  expired budget is an error: the run does not go on to search a partly built
+  index. Recovery at 100M: the failed run leaves the uploaded data in place
+  (an upload error returns before cleanup), but `--skip-upload` does NOT
+  re-enter the wait — it only checks the server's document count before
+  searching — so it is not a recovery route. On Redis, a run in shared-corpus
+  mode (`REDIS_KEY_PREFIX=<prefix>`) is: re-running with the same prefix and a
+  larger `INDEXING_WAIT_SECS` finds the corpus complete, skips the re-upload,
+  recreates the index over the existing hashes (dropped without `DD`) and
+  waits for that backfill under the full-build budget (1 s per 1,000
+  documents, ~27.8 h at 100M — an unmeasured conservative estimate;
+  `INDEXING_WAIT_SECS` overrides it). Without shared-corpus mode, and on the other
+  engines, the only route is a full re-upload — so size `INDEXING_WAIT_SECS`
+  for the 100M up front.
 
 ### How much memory does Redis itself need?
 
@@ -1333,3 +2099,16 @@ tests/
   integration_mongodb.rs              # MongoDB integration tests
   integration_valkey.rs               # Valkey integration tests
 ```
+
+### OpenSearch query-level search effort
+
+For Lucene indexes on OpenSearch 2.16+, use `"search_params": {"ef": 512}`
+(or the accepted `config` / `EF` aliases) in a search entry. The driver sends
+`query.knn.vector.method_parameters.ef_search` while keeping both `k` and `size`
+at the requested `top`, so recall remains recall@K. `ef` must be a positive
+32-bit integer, validated for every search entry before upload. When query-level effort is requested, the driver verifies the server version before deleting or creating an index; unsupported or unreadable versions fail before ingestion. Omitting it preserves the existing request body. OpenSearch Lucene uses `max(k, ef_search)` as its candidate budget; values below K do not represent distinct effective effort settings. The bundled OpenSearch sweeps now use the query-level control.
+
+The legacy `knn.algo_param.ef_search` knob is rejected before client setup or
+upload because Lucene ignores it. Migrate custom configs to `search_params.ef`
+to avoid measuring identical requests under different effort settings. See the
+[OpenSearch k-NN query documentation](https://docs.opensearch.org/latest/query-dsl/specialized/k-nn/index/).

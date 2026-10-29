@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use serde_json::json;
 
 use crate::engine::SearchResults;
+use vector_db_benchmark::workload::Workload;
 
 /// A single search result entry for precision analysis.
 #[derive(Debug, Clone)]
@@ -27,11 +28,38 @@ pub struct SearchEntry {
     pub calibration: Option<serde_json::Value>,
 }
 
+/// The workload a summary row ran (#344): what the dispatch point stamped,
+/// else its result's fingerprint (filter-only stats, fulltext metadata).
+fn entry_workload(e: &SearchEntry) -> Workload {
+    if let Some(w) = e.results.workload {
+        return w;
+    }
+    if e.results.filter_only.is_some() {
+        Workload::FilterOnly
+    } else if e.results.fulltext.is_some() {
+        Workload::Fulltext
+    } else {
+        Workload::Vector
+    }
+}
+
+/// The distinct workloads of `entries`, in first-seen order.
+fn distinct_workloads(entries: &[SearchEntry]) -> Vec<Workload> {
+    let mut seen = Vec::new();
+    for w in entries.iter().map(entry_workload) {
+        if !seen.contains(&w) {
+            seen.push(w);
+        }
+    }
+    seen
+}
+
 /// Precision analysis result for a single precision bucket.
 #[derive(Debug, Clone)]
 struct PrecisionBucket {
     qps: f64,
     p50_ms: f64,
+    p90_ms: f64,
     p95_ms: f64,
     precision: f64,
     recall: f64,
@@ -64,11 +92,16 @@ fn analyze_precision_performance(entries: &[SearchEntry]) -> Vec<PrecisionBucket
     let mut buckets: BTreeMap<String, PrecisionBucket> = BTreeMap::new();
 
     for entry in entries {
+        // #339: fulltext has no ground truth, so no precision bucket.
+        if entry.results.fulltext.is_some() {
+            continue;
+        }
         let key = format_precision_key(entry.results.mean_precision_at_returned);
 
         let candidate = PrecisionBucket {
             qps: entry.results.rps,
             p50_ms: entry.results.p50_time * 1000.0,
+            p90_ms: entry.results.p90_time * 1000.0,
             p95_ms: entry.results.p95_time * 1000.0,
             precision: entry.results.mean_precision_at_returned,
             recall: entry.results.mean_recall,
@@ -106,6 +139,7 @@ struct ConcurrencyPoint {
     parallel: i64,
     qps: f64,
     p50_ms: f64,
+    p90_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
     recall: f64,
@@ -151,6 +185,7 @@ fn concurrency_curves(entries: &[SearchEntry]) -> Vec<ConcurrencyCurve> {
             parallel: e.parallel,
             qps: e.results.rps,
             p50_ms: e.results.p50_time * 1000.0,
+            p90_ms: e.results.p90_time * 1000.0,
             p95_ms: e.results.p95_time * 1000.0,
             p99_ms: e.results.p99_time * 1000.0,
             recall: e.results.mean_recall,
@@ -223,15 +258,16 @@ fn print_concurrency_curves(curves: &[ConcurrencyCurve]) {
             }
         );
         println!(
-            "    {:>8}  {:>10}  {:>9}  {:>9}  {:>9}  {:>6}",
-            "parallel", "QPS", "p50 ms", "p95 ms", "p99 ms", "sat?"
+            "    {:>8}  {:>10}  {:>9}  {:>9}  {:>9}  {:>9}  {:>6}",
+            "parallel", "QPS", "p50 ms", "p90 ms", "p95 ms", "p99 ms", "sat?"
         );
         for p in &c.points {
             println!(
-                "    {:>8}  {:>10.1}  {:>9.3}  {:>9.3}  {:>9.3}  {:>6}",
+                "    {:>8}  {:>10.1}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>6}",
                 p.parallel,
                 p.qps,
                 p.p50_ms,
+                p.p90_ms,
                 p.p95_ms,
                 p.p99_ms,
                 if p.saturated { "YES" } else { "-" }
@@ -333,14 +369,18 @@ pub fn display_results_summary(engine_name: &str, dataset_name: &str, entries: &
 
     if filter_only {
         println!("{}", "-".repeat(40));
-        println!("{:<10} {:<12} {:<12}", "QPS", "P50 (ms)", "P95 (ms)");
+        println!(
+            "{:<10} {:<12} {:<12} {:<12}",
+            "QPS", "P50 (ms)", "P90 (ms)", "P95 (ms)"
+        );
         println!("{}", "-".repeat(40));
 
         for e in entries {
             println!(
-                "{:<10.1} {:<12.3} {:<12.3}",
+                "{:<10.1} {:<12.3} {:<12.3} {:<12.3}",
                 e.results.rps,
                 e.results.p50_time * 1000.0,
+                e.results.p90_time * 1000.0,
                 e.results.p95_time * 1000.0,
             );
         }
@@ -354,17 +394,17 @@ pub fn display_results_summary(engine_name: &str, dataset_name: &str, entries: &
     }
 
     // Print table
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(95));
     println!(
-        "{:<10} {:<10} {:<8} {:<8} {:<10} {:<12} {:<12}",
-        "Recall", "Precision", "MRR", "NDCG", "QPS", "P50 (ms)", "P95 (ms)"
+        "{:<10} {:<10} {:<8} {:<8} {:<10} {:<12} {:<12} {:<12}",
+        "Recall", "Precision", "MRR", "NDCG", "QPS", "P50 (ms)", "P90 (ms)", "P95 (ms)"
     );
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(95));
 
     for b in &buckets {
         println!(
-            "{:<10.4} {:<10.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3}",
-            b.recall, b.precision, b.mrr, b.ndcg, b.qps, b.p50_ms, b.p95_ms
+            "{:<10.4} {:<10.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3} {:<12.3}",
+            b.recall, b.precision, b.mrr, b.ndcg, b.qps, b.p50_ms, b.p90_ms, b.p95_ms
         );
     }
     println!();
@@ -391,9 +431,9 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
         return;
     }
 
-    println!("\n{}", "-".repeat(116));
+    println!("\n{}", "-".repeat(129));
     println!(
-        "{:<14} {:<8} {:<8} {:<8} {:<8} {:<10} {:<12} {:<12} {:<10} {:<12}",
+        "{:<14} {:<8} {:<8} {:<8} {:<8} {:<10} {:<12} {:<12} {:<12} {:<10} {:<12}",
         "Ratio",
         "Recall",
         "Prec",
@@ -401,11 +441,12 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
         "NDCG",
         "QPS",
         "P50 (ms)",
+        "P90 (ms)",
         "P95 (ms)",
         "Upd QPS",
         "Upd P50 (ms)"
     );
-    println!("{}", "-".repeat(116));
+    println!("{}", "-".repeat(129));
 
     // Sort: "search" first, then ratios by ascending numeric value
     let mut keys: Vec<String> = by_ratio.keys().cloned().collect();
@@ -435,7 +476,7 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
             .unwrap_or_else(|| "-".to_string());
 
         println!(
-            "{:<14} {:<8.4} {:<8.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3} {:<10} {:<12}",
+            "{:<14} {:<8.4} {:<8.4} {:<8.4} {:<8.4} {:<10.1} {:<12.3} {:<12.3} {:<12.3} {:<10} {:<12}",
             key,
             best.results.mean_recall,
             best.results.mean_precision_at_returned,
@@ -443,6 +484,7 @@ pub fn display_mixed_summary(entries: &[SearchEntry]) {
             best.results.mean_ndcg,
             best.results.rps,
             best.results.p50_time * 1000.0,
+            best.results.p90_time * 1000.0,
             best.results.p95_time * 1000.0,
             upd_qps,
             upd_p50,
@@ -502,7 +544,22 @@ pub fn save_summary(
     results_dir: &Path,
     engine_params: &serde_json::Value,
 ) -> Result<(), String> {
-    let buckets = analyze_precision_performance(entries);
+    // #344: one engine config may run several workloads against one shared
+    // index. Precision buckets and concurrency curves are vector-quality
+    // views, so in a mixed config they cover only the rows that have ground
+    // truth; a single-workload config keeps every row, exactly as before.
+    let workloads = distinct_workloads(entries);
+    let mixed = workloads.len() > 1;
+    let quality_entries: Vec<SearchEntry> = if mixed {
+        entries
+            .iter()
+            .filter(|e| entry_workload(e).has_ground_truth())
+            .cloned()
+            .collect()
+    } else {
+        entries.to_vec()
+    };
+    let buckets = analyze_precision_performance(&quality_entries);
 
     // Build precision_summary matching Python v0 format
     let mut precision_summary = serde_json::Map::new();
@@ -513,6 +570,7 @@ pub fn save_summary(
             json!({
                 "QPS": (b.qps * 10.0).round() / 10.0,
                 "P50 (ms)": (b.p50_ms * 1000.0).round() / 1000.0,
+                "P90 (ms)": (b.p90_ms * 1000.0).round() / 1000.0,
                 "P95 (ms)": (b.p95_ms * 1000.0).round() / 1000.0,
                 "recall": (b.recall * 10000.0).round() / 10000.0,
                 "mrr": (b.mrr * 10000.0).round() / 10000.0,
@@ -541,6 +599,7 @@ pub fn save_summary(
                 "rps": e.results.rps,
                 "mean_time": e.results.mean_time,
                 "p50_time": e.results.p50_time,
+                "p90_time": e.results.p90_time,
                 "p95_time": e.results.p95_time,
                 "p99_time": e.results.p99_time,
                 "client_saturated": e.results.client_saturated,
@@ -555,7 +614,7 @@ pub fn save_summary(
 
     // Throughput-vs-concurrency curves (only present when the config swept >= 2
     // parallel levels at some ef). Surfaces max_qps + the saturation knee.
-    let curves = concurrency_curves(entries);
+    let curves = concurrency_curves(&quality_entries);
     let concurrency_curve: Vec<serde_json::Value> = curves
         .iter()
         .map(|c| {
@@ -568,6 +627,7 @@ pub fn save_summary(
                     "parallel": p.parallel,
                     "qps": (p.qps * 10.0).round() / 10.0,
                     "p50_ms": (p.p50_ms * 1000.0).round() / 1000.0,
+                    "p90_ms": (p.p90_ms * 1000.0).round() / 1000.0,
                     "p95_ms": (p.p95_ms * 1000.0).round() / 1000.0,
                     "p99_ms": (p.p99_ms * 1000.0).round() / 1000.0,
                     "recall": (p.recall * 10000.0).round() / 10000.0,
@@ -648,6 +708,95 @@ pub fn save_summary(
         // exactly like a complete one.
         "rejected_experiments": rejected_experiments(),
     });
+
+    // #344: a mixed config labels every row with its workload and lists the
+    // set; the top-level `workload` key stays reserved for single-workload
+    // summaries, so a consumer keyed on it never mistakes a mix for one.
+    if mixed {
+        summary["workloads"] = json!(workloads.iter().map(|w| w.as_str()).collect::<Vec<_>>());
+        for (row, entry) in summary["search_results"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(entries)
+        {
+            row["workload"] = json!(entry_workload(entry).as_str());
+        }
+    }
+
+    if entries.iter().any(|e| e.results.filter_only.is_some()) {
+        if !mixed {
+            summary["workload"] = json!("filter-only");
+            summary["metrics_definitions"] = json!({"vector_quality":"not applicable", "returned_fields":"IDs only", "total_count":"exact", "result_order":"unspecified"});
+            summary.as_object_mut().unwrap().remove("precision_summary");
+        }
+        for (row, entry) in summary["search_results"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(entries)
+        {
+            // Only the filter-only rows lose vector quality; in a mixed
+            // config the vector rows beside them keep theirs (#344).
+            if entry.results.filter_only.is_none() {
+                continue;
+            }
+            for key in [
+                "mean_precision_at_returned",
+                "mean_recall",
+                "recall_p10",
+                "mean_mrr",
+                "mean_ndcg",
+            ] {
+                row.as_object_mut().unwrap().remove(key);
+            }
+            row["filter_only"] = json!(entry.results.filter_only);
+            row["requested_queries"] = json!(entry.results.requested_queries);
+            row["failed_queries"] = json!(entry.results.failed_queries);
+        }
+        // Mixed: the curves were built from the ground-truth rows only, so
+        // their recall is real and stays.
+        if !mixed {
+            for curve in summary["concurrency_curve"].as_array_mut().unwrap() {
+                for point in curve["points"].as_array_mut().unwrap() {
+                    point.as_object_mut().unwrap().remove("recall");
+                }
+            }
+        }
+    }
+
+    // #339: fulltext rows carry no vector quality (no ground truth); quality
+    // comes from compare-results against a reference engine.
+    if entries.iter().any(|e| e.results.fulltext.is_some()) {
+        for (row, entry) in summary["search_results"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(entries)
+        {
+            let Some(meta) = &entry.results.fulltext else {
+                continue;
+            };
+            for key in [
+                "mean_precision_at_returned",
+                "mean_recall",
+                "recall_p10",
+                "mean_mrr",
+                "mean_ndcg",
+            ] {
+                row.as_object_mut().unwrap().remove(key);
+            }
+            row["workload"] = json!("fulltext");
+            row["fulltext"] =
+                json!({"fields": meta["fields"], "result_limit": meta["result_limit"]});
+            row["requested_queries"] = json!(entry.results.requested_queries);
+            row["failed_queries"] = json!(entry.results.failed_queries);
+        }
+        if entries.iter().all(|e| e.results.fulltext.is_some()) {
+            summary["workload"] = json!("fulltext");
+            summary.as_object_mut().unwrap().remove("precision_summary");
+        }
+    }
 
     if let Some(upload) = upload_json {
         summary
@@ -748,6 +897,84 @@ fn create_ascii_scatter_plot(engine_name: &str, dataset_name: &str, buckets: &[P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_summary_keeps_two_clients_and_exact_counts_without_quality_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries: Vec<_> = [1, 100]
+            .into_iter()
+            .enumerate()
+            .map(|(id, parallel)| {
+                let mut e = entry("n/a", parallel, 100.0 * parallel as f64, 0.002, "");
+                e.search_id = id;
+                e.results.mean_precision_at_returned = -1.0;
+                e.results.mean_recall = 0.5;
+                e.results.requested_queries = 9;
+                e.results.num_queries = 9;
+                e.results.filter_only = Some(vector_db_benchmark::filter_only::Stats {
+                    result_limit: 10,
+                    matched_documents_sum: 123,
+                    returned_documents_sum: 80,
+                    retried_queries: 0,
+                    per_query_counts_checked: None,
+                    index_layout: None,
+                });
+                e
+            })
+            .collect();
+        save_summary(
+            "scalar",
+            "fixture",
+            &entries,
+            None,
+            dir.path(),
+            &json!({"test":true}),
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("scalar-fixture-summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc["workload"], "filter-only");
+        assert_eq!(doc["metrics_definitions"]["total_count"], "exact");
+        assert_eq!(doc["engine_params"], json!({"test":true}));
+        assert!(doc.get("precision_summary").is_none());
+        let rows = doc["search_results"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, expected_parallel) in rows.iter().zip([1, 100]) {
+            assert_eq!(row["parallel"], expected_parallel);
+            assert_eq!(row["requested_queries"], 9);
+            assert_eq!(row["failed_queries"], 0);
+            assert_eq!(
+                row["filter_only"],
+                json!({"result_limit":10,"matched_documents_sum":123,"returned_documents_sum":80,"retried_queries":0})
+            );
+            assert!(row["rps"].as_f64().unwrap() > 0.0);
+            assert_eq!(row["p95_time"], 0.002);
+            for key in [
+                "mean_precision_at_returned",
+                "mean_recall",
+                "recall_p10",
+                "mean_mrr",
+                "mean_ndcg",
+                "precision_at_returned_dist",
+                "recall_dist",
+                "mrr_dist",
+                "ndcg_dist",
+                "precisions_at_returned",
+                "recalls",
+                "mrrs",
+                "ndcgs",
+            ] {
+                assert!(
+                    row.get(key).is_none(),
+                    "unexpected scalar quality field {key}"
+                );
+            }
+        }
+        // Scalar workloads deliberately do not participate in recall curves.
+        assert_eq!(doc["concurrency_curve"], json!([]));
+    }
 
     /// The summary is what `--chart` and external dashboards read, so the #217
     /// definitions have to travel with it too: no upstream key name, an explicit
@@ -951,6 +1178,174 @@ mod tests {
             },
             calibration: None,
         }
+    }
+
+    /// #339: a fulltext row publishes no vector-quality key and lands in no
+    /// precision bucket; a vector row next to it keeps both.
+    #[test]
+    fn fulltext_rows_carry_no_vector_quality() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vector = entry("64", 1, 100.0, 0.002, "");
+        vector.results.mean_precision_at_returned = 0.9;
+        vector.results.mean_recall = 0.9;
+        let mut text = entry("n/a", 4, 400.0, 0.003, "");
+        text.search_id = 1;
+        text.results.mean_precision_at_returned = -1.0;
+        text.results.requested_queries = 7;
+        text.results.num_queries = 7;
+        text.results.fulltext = Some(json!({"fields": {"title": 5.0}, "result_limit": 10}));
+        for (name, entries, all_text) in [
+            ("mixed", vec![vector.clone(), text.clone()], false),
+            ("text", vec![text.clone()], true),
+        ] {
+            save_summary(name, "fx", &entries, None, dir.path(), &json!({})).unwrap();
+            let doc: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(dir.path().join(format!("{name}-fx-summary.json"))).unwrap(),
+            )
+            .unwrap();
+            let rows = doc["search_results"].as_array().unwrap();
+            let t = rows.last().unwrap();
+            assert_eq!(t["workload"], "fulltext");
+            assert_eq!(t["fulltext"]["fields"], json!({"title": 5.0}));
+            assert_eq!(t["requested_queries"], 7);
+            for key in [
+                "mean_precision_at_returned",
+                "mean_recall",
+                "mean_mrr",
+                "mean_ndcg",
+            ] {
+                assert!(t.get(key).is_none(), "{name}: {key}");
+            }
+            assert_eq!(doc.get("precision_summary").is_none(), all_text, "{name}");
+            if !all_text {
+                assert!(rows[0].get("mean_recall").is_some());
+                let buckets = doc["precision_summary"].as_object().unwrap();
+                assert_eq!(buckets.len(), 1, "{buckets:?}");
+            }
+            assert_eq!(doc["workload"] == "fulltext", all_text, "{name}");
+        }
+    }
+
+    /// #344: one engine config running vector + filter-only (+ fulltext) on
+    /// one shared index. Only the filter-only row loses vector quality; the
+    /// vector rows keep theirs, the precision buckets and the concurrency
+    /// curve (with recall), and the summary lists the mix instead of
+    /// claiming one workload.
+    #[test]
+    fn mixed_workload_summary_keeps_vector_quality_on_vector_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let vector = |id: usize, parallel: i64| {
+            let mut e = entry("64", parallel, 100.0 * parallel as f64, 0.002, "");
+            e.search_id = id;
+            e.results.mean_precision_at_returned = 0.9;
+            e.results.mean_recall = 0.9;
+            e.results.workload = Some(Workload::Vector);
+            e
+        };
+        let mut scalar = entry("n/a", 8, 900.0, 0.001, "");
+        scalar.search_id = 2;
+        scalar.results.mean_precision_at_returned = -1.0;
+        scalar.results.requested_queries = 9;
+        scalar.results.workload = Some(Workload::FilterOnly);
+        scalar.results.filter_only = Some(vector_db_benchmark::filter_only::Stats {
+            result_limit: 10,
+            matched_documents_sum: 5,
+            returned_documents_sum: 5,
+            retried_queries: 0,
+            per_query_counts_checked: None,
+            index_layout: Some("full".into()),
+        });
+        let mut text = entry("n/a", 2, 400.0, 0.003, "");
+        text.search_id = 3;
+        text.results.workload = Some(Workload::Fulltext);
+        text.results.fulltext = Some(json!({"fields": {"title": 1.0}, "result_limit": 10}));
+        let entries = vec![vector(0, 1), vector(1, 4), scalar, text];
+        save_summary("mix", "fx", &entries, None, dir.path(), &json!({})).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("mix-fx-summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(doc.get("workload").is_none(), "{doc}");
+        assert_eq!(
+            doc["workloads"],
+            json!(["vector", "filter-only", "fulltext"])
+        );
+        // Vector metric definitions stay: the vector rows use them.
+        assert!(doc["metrics_definitions"].get("mean_recall").is_some());
+        let rows = doc["search_results"].as_array().unwrap();
+        for row in &rows[..2] {
+            assert_eq!(row["workload"], "vector");
+            assert_eq!(row["mean_recall"], 0.9);
+            assert!(row.get("filter_only").is_none());
+        }
+        assert_eq!(rows[2]["workload"], "filter-only");
+        assert!(rows[2].get("mean_recall").is_none());
+        assert_eq!(rows[2]["filter_only"]["index_layout"], "full");
+        assert_eq!(rows[3]["workload"], "fulltext");
+        assert!(rows[3].get("mean_recall").is_none());
+        // Buckets and curves from the vector rows only.
+        let buckets = doc["precision_summary"].as_object().unwrap();
+        assert_eq!(buckets.len(), 1, "{buckets:?}");
+        let curves = doc["concurrency_curve"].as_array().unwrap();
+        assert_eq!(curves.len(), 1, "{curves:?}");
+        let points = curves[0]["points"].as_array().unwrap();
+        assert_eq!(
+            points
+                .iter()
+                .map(|p| p["parallel"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(1), json!(4)]
+        );
+        assert!(points.iter().all(|p| p["recall"] == 0.9), "{points:?}");
+    }
+
+    /// Vector + fulltext was already a valid mix before #344 (it shares the
+    /// `vector` layout). Its summary now has the mixed shape too: a
+    /// `workloads` list, `workload` per row, and the fulltext rows (no ground
+    /// truth, so `mean_precision_at_returned` -1) kept out of the precision
+    /// buckets and the concurrency curve instead of being folded into them.
+    #[test]
+    fn vector_and_fulltext_summary_has_the_mixed_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let vector = |id: usize, parallel: i64| {
+            let mut e = entry("64", parallel, 100.0 * parallel as f64, 0.002, "");
+            e.search_id = id;
+            e.results.mean_precision_at_returned = 0.9;
+            e.results.mean_recall = 0.9;
+            e.results.workload = Some(Workload::Vector);
+            e
+        };
+        let mut text = entry("n/a", 2, 400.0, 0.003, "");
+        text.search_id = 2;
+        text.results.mean_precision_at_returned = -1.0;
+        text.results.workload = Some(Workload::Fulltext);
+        text.results.fulltext = Some(json!({"fields": {"title": 1.0}, "result_limit": 10}));
+        let entries = vec![vector(0, 1), vector(1, 4), text];
+        save_summary("vt", "fx", &entries, None, dir.path(), &json!({})).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("vt-fx-summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(doc.get("workload").is_none(), "{doc}");
+        assert_eq!(doc["workloads"], json!(["vector", "fulltext"]));
+        let rows = doc["search_results"].as_array().unwrap();
+        assert_eq!(rows[0]["workload"], "vector");
+        assert_eq!(rows[1]["workload"], "vector");
+        assert_eq!(rows[2]["workload"], "fulltext");
+        assert!(rows[2].get("mean_recall").is_none());
+        let buckets = doc["precision_summary"].as_object().unwrap();
+        assert_eq!(buckets.len(), 1, "{buckets:?}");
+        let curves = doc["concurrency_curve"].as_array().unwrap();
+        assert_eq!(curves.len(), 1, "{curves:?}");
+        let points = curves[0]["points"].as_array().unwrap();
+        assert_eq!(
+            points
+                .iter()
+                .map(|p| p["parallel"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(1), json!(4)],
+            "the fulltext row is not a curve point"
+        );
     }
 
     #[test]
@@ -1254,5 +1649,41 @@ mod tests {
         a.results.mean_precision_at_returned = -1.0;
         b.results.mean_precision_at_returned = -1.0;
         assert!(concurrency_curves(&[a, b]).is_empty());
+    }
+
+    /// #346: p90 must reach every place the summary publishes p50/p95 — the
+    /// per-search rows, the precision buckets and the concurrency-curve points —
+    /// carrying the run's OWN value (distinct from p50/p95 here, so a copy of a
+    /// neighbouring percentile is caught).
+    #[test]
+    fn summary_publishes_p90_alongside_the_other_percentiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries = vec![
+            entry("64", 1, 100.0, 0.03, ""),
+            entry("64", 2, 200.0, 0.03, ""),
+        ];
+        for e in &mut entries {
+            e.results.mean_precision_at_returned = 0.9;
+            e.results.p50_time = 0.010;
+            e.results.p90_time = 0.017;
+            e.results.p99_time = 0.040;
+        }
+        save_summary("redis-test", "p90", &entries, None, dir.path(), &json!({})).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("redis-test-p90-summary.json")).unwrap(),
+        )
+        .unwrap();
+
+        for row in v["search_results"].as_array().unwrap() {
+            assert_eq!(row["p90_time"], 0.017, "{row}");
+            assert_eq!(row["p95_time"], 0.03, "back-compat field unchanged");
+        }
+        assert_eq!(v["precision_summary"]["0.90"]["P90 (ms)"], 17.0);
+        assert_eq!(v["precision_summary"]["0.90"]["P95 (ms)"], 30.0);
+        let points = v["concurrency_curve"][0]["points"].as_array().unwrap();
+        assert_eq!(points.len(), 2);
+        for p in points {
+            assert_eq!(p["p90_ms"], 17.0, "{p}");
+        }
     }
 }

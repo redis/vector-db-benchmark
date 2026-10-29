@@ -179,6 +179,28 @@ pub fn npy_row_count(path: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{}: NPY 'shape' tuple is empty", path))
 }
 
+/// The header of an NPY file for the streaming reader (#342): the dict text,
+/// where the data starts, and the file's length. `Ok(None)` when the file is
+/// too short or lacks the NPY magic.
+pub(crate) struct StreamingHeader {
+    pub dict: String,
+    pub data_start: u64,
+    pub file_len: u64,
+}
+
+pub(crate) fn read_header_for_streaming(path: &str) -> Result<Option<StreamingHeader>, String> {
+    Ok(read_npy_header(path)?.map(|h| StreamingHeader {
+        dict: h.dict,
+        data_start: h.data_start,
+        file_len: h.file_len,
+    }))
+}
+
+/// The integer dimensions of an NPY header's `shape` tuple.
+pub(crate) fn shape_dims(dict: &str) -> Option<Vec<u64>> {
+    parse_npy_shape_dims(dict)
+}
+
 /// Read vectors from NPY file, returning (ids, vectors).
 /// If normalize is true, each vector is divided by its L2 norm.
 pub fn read_npy_vectors(path: &str, normalize: bool) -> Result<(Vec<i64>, Vec<Vec<f32>>), String> {
@@ -196,12 +218,7 @@ pub fn read_npy_vectors(path: &str, normalize: bool) -> Result<(Vec<i64>, Vec<Ve
 
     if normalize {
         for vec in vectors.iter_mut() {
-            let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for x in vec.iter_mut() {
-                    *x /= norm;
-                }
-            }
+            super::stream_reader::normalize_row(vec);
         }
     }
 

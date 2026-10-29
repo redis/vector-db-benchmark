@@ -716,6 +716,7 @@ impl QdrantEngine {
             batch_size: self.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: None,
         })
     }
 
@@ -776,6 +777,7 @@ impl QdrantEngine {
             batch_size: self.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: None,
         })
     }
 
@@ -840,6 +842,7 @@ impl QdrantEngine {
             batch_size: self.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: None,
         })
     }
 
@@ -1960,6 +1963,7 @@ impl Engine for QdrantEngine {
             batch_size: self.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: None,
         })
     }
 

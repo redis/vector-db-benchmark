@@ -7,8 +7,8 @@
     },
     "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 16, "ef_construction": 100 } } },
     "search_params": [
-      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
-      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
+      { "parallel": 1, "search_params": { "ef": 128 } }, { "parallel": 1, "search_params": { "ef": 256 } }, { "parallel": 1, "search_params": { "ef": 512 } },
+      { "parallel": 100, "search_params": { "ef": 128 } }, { "parallel": 100, "search_params": { "ef": 256 } }, { "parallel": 100, "search_params": { "ef": 512 } }
     ],
     "upload_params": { "parallel": 16 }
   },
@@ -20,8 +20,8 @@
     },
     "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 16, "ef_construction": 128 } } },
     "search_params": [
-      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
-      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
+      { "parallel": 1, "search_params": { "ef": 128 } }, { "parallel": 1, "search_params": { "ef": 256 } }, { "parallel": 1, "search_params": { "ef": 512 } },
+      { "parallel": 100, "search_params": { "ef": 128 } }, { "parallel": 100, "search_params": { "ef": 256 } }, { "parallel": 100, "search_params": { "ef": 512 } }
     ],
     "upload_params": { "parallel": 16 }
   },
@@ -33,8 +33,8 @@
     },
     "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 32, "ef_construction": 128 } } },
     "search_params": [
-      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
-      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
+      { "parallel": 1, "search_params": { "ef": 128 } }, { "parallel": 1, "search_params": { "ef": 256 } }, { "parallel": 1, "search_params": { "ef": 512 } },
+      { "parallel": 100, "search_params": { "ef": 128 } }, { "parallel": 100, "search_params": { "ef": 256 } }, { "parallel": 100, "search_params": { "ef": 512 } }
     ],
     "upload_params": { "parallel": 16 }
   },
@@ -46,8 +46,8 @@
     },
     "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 32, "ef_construction": 256 } } },
     "search_params": [
-      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
-      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
+      { "parallel": 1, "search_params": { "ef": 128 } }, { "parallel": 1, "search_params": { "ef": 256 } }, { "parallel": 1, "search_params": { "ef": 512 } },
+      { "parallel": 100, "search_params": { "ef": 128 } }, { "parallel": 100, "search_params": { "ef": 256 } }, { "parallel": 100, "search_params": { "ef": 512 } }
     ],
     "upload_params": { "parallel": 16 }
   },
@@ -59,8 +59,8 @@
     },
     "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 32, "ef_construction": 512 } } },
     "search_params": [
-      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
-      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
+      { "parallel": 1, "search_params": { "ef": 128 } }, { "parallel": 1, "search_params": { "ef": 256 } }, { "parallel": 1, "search_params": { "ef": 512 } },
+      { "parallel": 100, "search_params": { "ef": 128 } }, { "parallel": 100, "search_params": { "ef": 256 } }, { "parallel": 100, "search_params": { "ef": 512 } }
     ],
     "upload_params": { "parallel": 16 }
   },
@@ -72,8 +72,8 @@
     },
     "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 64, "ef_construction": 256 } } },
     "search_params": [
-      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
-      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
+      { "parallel": 1, "search_params": { "ef": 128 } }, { "parallel": 1, "search_params": { "ef": 256 } }, { "parallel": 1, "search_params": { "ef": 512 } },
+      { "parallel": 100, "search_params": { "ef": 128 } }, { "parallel": 100, "search_params": { "ef": 256 } }, { "parallel": 100, "search_params": { "ef": 512 } }
     ],
     "upload_params": { "parallel": 16 }
   },
@@ -85,8 +85,8 @@
     },
     "collection_params": { "number_of_shards": 5, "method": { "parameters": { "m": 64, "ef_construction": 512 } } },
     "search_params": [
-      { "parallel": 1, "knn.algo_param.ef_search": 128 }, { "parallel": 1, "knn.algo_param.ef_search": 256 }, { "parallel": 1, "knn.algo_param.ef_search": 512 },
-      { "parallel": 100, "knn.algo_param.ef_search": 128 }, { "parallel": 100, "knn.algo_param.ef_search": 256 }, { "parallel": 100, "knn.algo_param.ef_search": 512 }
+      { "parallel": 1, "search_params": { "ef": 128 } }, { "parallel": 1, "search_params": { "ef": 256 } }, { "parallel": 1, "search_params": { "ef": 512 } },
+      { "parallel": 100, "search_params": { "ef": 128 } }, { "parallel": 100, "search_params": { "ef": 256 } }, { "parallel": 100, "search_params": { "ef": 512 } }
     ],
     "upload_params": { "parallel": 16 }
   }

@@ -16,18 +16,26 @@ use super::redis_utils;
 use redis::Connection;
 
 use crate::config::{EngineConfig, SearchParams};
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, UploadSource};
 use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{
     attach_open_loop_metrics, closed_loop_duration, zero_search_results, CorpusCount, Engine,
     OpenLoopPlan, SearchResults, UpdateSearchRatio, UploadStats,
 };
 use crate::metrics::compute_metrics;
+use vector_db_benchmark::indexing_wait::WaitPhase;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, parse_ft_search_response};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
 use vector_db_benchmark::redis_hnsw_sq8::Sq8Options;
+use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
+use vector_db_benchmark::workload::{IndexLayout, Workload};
+
+/// Ranked full-text workload (#339).
+mod fulltext;
+/// Streaming upload from disk (#342).
+mod stream_upload;
 
 /// Redis engine configuration
 #[derive(Clone)]
@@ -44,6 +52,11 @@ pub struct RedisEngineConfig {
     /// (`REDIS_HNSW_COMPRESSION` / `REDIS_HNSW_TRAINING_THRESHOLD`) > unset.
     /// The env vars are read only for HNSW configs that build a vector index.
     pub hnsw_sq8: Sq8Options,
+    /// The index layout `configure()` builds (#344), resolved once from the
+    /// engine flags: `vector`, `no-vector` (`skip_vector_index`) or the shared
+    /// `full` one (the vector layout with TAG fields `CASESENSITIVE` as
+    /// filter-only needs them). Every layout-dependent decision reads this.
+    pub layout: vector_db_benchmark::workload::IndexLayout,
     /// SVS-VAMANA build params, resolved once in `new()` with precedence
     /// `collection_params.svs-vamana_config` > env (`REDIS_SVS_*`) > derived.
     /// `None` graph/window → derive from `m`*2 / `ef_construction` at FT.CREATE.
@@ -153,6 +166,7 @@ fn shared_corpus_is_complete(existing: usize, expected: u64) -> bool {
 }
 
 pub struct RedisEngine {
+    scalar_metadata_validated: bool,
     name: String,
     redis_url: String,
     config: RedisEngineConfig,
@@ -168,6 +182,23 @@ pub struct RedisEngine {
     /// server started — failing a search in which nothing actually failed. This
     /// flag disambiguates so `search()` can prime the baseline exactly once.
     commandstats_primed: bool,
+    /// One hybrid bucket pass (#341), consumed by the next `search()` in place
+    /// of the dataset's vector query set. Set only by `search_hybrid`, which
+    /// calls `search()` immediately; `take()`n at the single read site so it
+    /// can never leak into a later vector run.
+    hybrid_pass: Option<HybridPass>,
+    /// The `HYBRID_POLICY` the last `search()` actually sent for a hybrid
+    /// pass — what the post-pass `FT.PROFILE` replays, so the profile checks
+    /// the timed commands rather than the configuration.
+    hybrid_policy_sent: Option<String>,
+}
+
+/// The query subset, filters and request options of one hybrid bucket pass.
+struct HybridPass {
+    queries: Vec<Vec<f32>>,
+    neighbors: Vec<Vec<i64>>,
+    filters: Vec<QueryFilter<ParsedFilter>>,
+    policy: String,
 }
 
 impl RedisEngine {
@@ -325,6 +356,7 @@ impl RedisEngine {
             .unwrap_or(64) as usize;
 
         Ok(Self {
+            scalar_metadata_validated: false,
             name: engine_config.name.clone(),
             redis_url,
             config: RedisEngineConfig {
@@ -336,6 +368,10 @@ impl RedisEngine {
                 parallel,
                 skip_vector_index: engine_config.skip_vector_index,
                 hnsw_sq8,
+                layout: vector_db_benchmark::workload::layout_from_flags(
+                    engine_config.skip_vector_index,
+                    engine_config.full_index_layout,
+                )?,
                 svs_graph_max_degree,
                 svs_construction_window_size,
                 svs_compression,
@@ -353,6 +389,8 @@ impl RedisEngine {
             search_params: engine_config.search_params.clone().unwrap_or_default(),
             commandstats_baseline: None,
             commandstats_primed: false,
+            hybrid_pass: None,
+            hybrid_policy_sent: None,
         })
     }
 
@@ -391,6 +429,16 @@ impl RedisEngine {
             .arg("PREFIX")
             .arg("1")
             .arg(&self.config.key_prefix);
+
+        // #339: a config that runs the fulltext workload pins the stopword list
+        // explicitly (it equals the RediSearch default) so FT.INFO reports it
+        // and the fulltext arm can refuse an index built any other way.
+        let ft_profile = self.fulltext_profile()?;
+        if ft_profile.is_some() {
+            for a in vector_db_benchmark::fulltext::redis_stopword_args() {
+                cmd.arg(a);
+            }
+        }
 
         cmd.arg("SCHEMA");
 
@@ -490,8 +538,16 @@ impl RedisEngine {
             }
         }
 
-        // Add schema fields from dataset config for filtering
-        if let Some(schema) = &dataset.config.schema {
+        // Add schema fields from dataset config for filtering. With a prepared
+        // query set, filter-only indexes only the fields its predicates
+        // reference (#340); the rest stay stored in the hash, unindexed.
+        // Without one the layout is the declared schema.
+        let schema = if self.config.skip_vector_index {
+            dataset.filter_only_index_schema()?
+        } else {
+            dataset.config.schema.clone()
+        };
+        if let Some(schema) = &schema {
             if let Some(schema_obj) = schema.as_object() {
                 for (field_name, field_type) in schema_obj {
                     let ft = field_type.as_str().unwrap_or("");
@@ -501,12 +557,13 @@ impl RedisEngine {
                         // "true"/"false"); SEPARATOR ; + SORTABLE UNF matches the
                         // keyword treatment so exact TAG matching works.
                         "keyword" | "uuid" | "bool" => {
-                            cmd.arg(field_name)
-                                .arg("TAG")
-                                .arg("SEPARATOR")
-                                .arg(";")
-                                .arg("SORTABLE")
-                                .arg("UNF");
+                            cmd.arg(field_name).arg("TAG").arg("SEPARATOR").arg(";");
+                            // Filter-only's exact-match contract, on its own
+                            // index or on the shared `full` one (#344).
+                            if self.config.layout.serves(Workload::FilterOnly) {
+                                cmd.arg("CASESENSITIVE");
+                            }
+                            cmd.arg("SORTABLE").arg("UNF");
                         }
                         "int" | "float" => {
                             cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
@@ -517,9 +574,20 @@ impl RedisEngine {
                         "datetime" => {
                             cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
                         }
-                        "text" => {
-                            cmd.arg(field_name).arg("TEXT").arg("SORTABLE");
-                        }
+                        // #339 parity: only the searched text fields are
+                        // indexed, NOSTEM; english / no fulltext: all, stemmed.
+                        "text" => match &ft_profile {
+                            Some(p) if !p.indexes_text_field(field_name) => {}
+                            Some(p) if !p.stems() => {
+                                cmd.arg(field_name)
+                                    .arg("TEXT")
+                                    .arg("NOSTEM")
+                                    .arg("SORTABLE");
+                            }
+                            _ => {
+                                cmd.arg(field_name).arg("TEXT").arg("SORTABLE");
+                            }
+                        },
                         "geo" => {
                             cmd.arg(field_name).arg("GEO").arg("SORTABLE");
                         }
@@ -531,6 +599,7 @@ impl RedisEngine {
 
         cmd.query::<()>(conn)
             .map_err(|e| format!("Failed to create index: {}", e))?;
+        self.write_fulltext_marker(conn, ft_profile.as_ref())?;
 
         if self.config.hnsw_sq8.compression.is_some() {
             let info: redis::Value = redis::cmd("FT.INFO")
@@ -615,45 +684,15 @@ impl RedisEngine {
                         }
                         let (batch_start, batch_end) = batches[idx];
 
-                        // Upload the batch, reconnecting + retrying on a TRANSIENT
-                        // connection error (broken pipe / reset / EOF / timeout —
-                        // common under heavy index-build load behind a managed-Redis
-                        // proxy). Without this a single dropped socket aborted the
-                        // whole sweep (#160). Genuine command errors (WRONGTYPE,
-                        // syntax, …) are NOT transient and fail fast.
-                        let mut attempt = 0usize;
-                        let batch_result = loop {
-                            match upload_batch_internal(
-                                &mut conn,
-                                &config,
-                                &ids[batch_start..batch_end],
-                                &vectors[batch_start..batch_end],
-                                &metadata[batch_start..batch_end],
-                            ) {
-                                Ok(()) => break Ok(()),
-                                Err(e) => {
-                                    if !is_transient_conn_error(&e) || attempt >= MAX_UPLOAD_RETRIES
-                                    {
-                                        break Err(format!(
-                                            "batch {idx} failed after {attempt} \
-                                             reconnect attempt(s): {e}"
-                                        ));
-                                    }
-                                    attempt += 1;
-                                    // Bounded exponential backoff: 100·2^(n-1) ms,
-                                    // capped at 2s.
-                                    let backoff_ms = (100u64 << (attempt - 1)).min(2000);
-                                    std::thread::sleep(std::time::Duration::from_millis(
-                                        backoff_ms,
-                                    ));
-                                    // Re-open the connection; if that also fails
-                                    // transiently we retry again next iteration.
-                                    if let Ok(c) = client.get_connection() {
-                                        conn = c;
-                                    }
-                                }
-                            }
-                        };
+                        let batch_result = upload_batch_with_retry(
+                            &client,
+                            &mut conn,
+                            &config,
+                            &format!("batch {idx}"),
+                            &ids[batch_start..batch_end],
+                            &vectors[batch_start..batch_end],
+                            &metadata[batch_start..batch_end],
+                        );
                         if let Err(e) = batch_result {
                             *error.lock().unwrap() = Some(e);
                             break;
@@ -683,17 +722,31 @@ impl RedisEngine {
     }
 
     /// Wait until FT.INFO reports num_docs >= expected.
-    fn wait_for_indexing(&self, expected: usize) -> Result<(), String> {
+    /// `phase`: [`WaitPhase::FullBuild`] when the whole index is built inside
+    /// this wait (the shared-corpus skip path), else
+    /// [`WaitPhase::UploadTail`]. It picks the budget's per-document slope.
+    fn wait_for_indexing(&self, expected: usize, phase: WaitPhase) -> Result<(), String> {
         let mut conn = self.get_connection()?;
-        let max_wait = 120; // seconds
+        // Scales with the corpus; INDEXING_WAIT_SECS overrides. Expiry is an
+        // error (#361), never a pass on a partly built index.
+        let max_wait = crate::effective_config::indexing_wait_budget_secs(phase, 120, expected)?;
         let start = Instant::now();
+        // Consecutive transient errors are retried for the 120 s reconnect
+        // window, not the corpus-scaled budget (#361 review): a server that
+        // died mid-wait fails in minutes, not hours.
+        let mut retry = vector_db_benchmark::indexing_wait::TransientRetry::new(
+            std::time::Duration::from_secs(max_wait),
+        );
 
         loop {
             let info: redis::Value = match redis::cmd("FT.INFO")
                 .arg(&self.config.index_name)
                 .query(&mut conn)
             {
-                Ok(v) => v,
+                Ok(v) => {
+                    retry.on_success();
+                    v
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     // A momentary blip right after a successful upload (a dropped
@@ -702,11 +755,15 @@ impl RedisEngine {
                     // the whole sweep (#198). While there is still budget, drop
                     // the (possibly dead) connection, reconnect, and retry —
                     // mirroring the #160 upload-retry philosophy on the verify
-                    // path. Only a terminal error, or exhausting the budget,
-                    // propagates.
-                    if is_transient_conn_error(&msg) && start.elapsed().as_secs() < max_wait {
+                    // path. Only a terminal error, an outage longer than the
+                    // reconnect window, or exhausting the budget propagates.
+                    if is_transient_conn_error(&msg) {
+                        let outage = retry.on_transient(start, Instant::now(), &msg)?;
                         eprintln!(
-                            "wait_for_indexing: transient FT.INFO error ({msg}); reconnecting and retrying (elapsed {}s/{}s)",
+                            "wait_for_indexing: transient FT.INFO error ({msg}); reconnecting and \
+                             retrying (outage {}s/{}s, elapsed {}s/{}s)",
+                            outage.as_secs(),
+                            vector_db_benchmark::indexing_wait::RECONNECT_WINDOW.as_secs(),
                             start.elapsed().as_secs(),
                             max_wait
                         );
@@ -716,7 +773,8 @@ impl RedisEngine {
                         match self.get_connection() {
                             Ok(c) => conn = c,
                             Err(ce) => eprintln!(
-                                "wait_for_indexing: reconnect failed ({ce}); will retry within budget"
+                                "wait_for_indexing: reconnect failed ({ce}); will retry within the \
+                                 reconnect window"
                             ),
                         }
                         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -726,116 +784,30 @@ impl RedisEngine {
                 }
             };
 
-            // Parse num_docs, indexing, and percent_indexed from FT.INFO response.
-            // The response can be a flat array (RESP2) or a Map (RESP3).
-            let mut num_docs: usize = 0;
-            let mut indexing: bool = false;
-            let mut percent_indexed: f64 = 1.0;
-
-            fn extract_usize(val: &redis::Value) -> usize {
-                match val {
-                    redis::Value::BulkString(s) => String::from_utf8_lossy(s).parse().unwrap_or(0),
-                    redis::Value::Int(n) => *n as usize,
-                    redis::Value::Double(f) => *f as usize,
-                    redis::Value::SimpleString(s) => s.parse().unwrap_or(0),
-                    _ => 0,
-                }
-            }
-
-            fn extract_bool_nonzero(val: &redis::Value) -> bool {
-                match val {
-                    redis::Value::BulkString(s) => s != b"0",
-                    redis::Value::Int(n) => *n != 0,
-                    redis::Value::Double(f) => *f != 0.0,
-                    redis::Value::SimpleString(s) => s != "0",
-                    redis::Value::Boolean(b) => *b,
-                    _ => false,
-                }
-            }
-
-            fn extract_f64(val: &redis::Value) -> f64 {
-                match val {
-                    redis::Value::BulkString(s) => {
-                        String::from_utf8_lossy(s).parse().unwrap_or(1.0)
-                    }
-                    redis::Value::Int(n) => *n as f64,
-                    redis::Value::Double(f) => *f,
-                    redis::Value::SimpleString(s) => s.parse().unwrap_or(1.0),
-                    _ => 1.0,
-                }
-            }
-
-            match &info {
-                redis::Value::Array(arr) => {
-                    // RESP2: alternating key-value pairs (keys can be BulkString or SimpleString)
-                    for i in (0..arr.len()).step_by(2) {
-                        let key_str = match &arr[i] {
-                            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
-                            redis::Value::SimpleString(s) => s.clone(),
-                            _ => continue,
-                        };
-                        if key_str == "num_docs" {
-                            if let Some(val) = arr.get(i + 1) {
-                                num_docs = extract_usize(val);
-                            }
-                        }
-                        if key_str == "indexing" {
-                            if let Some(val) = arr.get(i + 1) {
-                                indexing = extract_bool_nonzero(val);
-                            }
-                        }
-                        if key_str == "percent_indexed" {
-                            if let Some(val) = arr.get(i + 1) {
-                                percent_indexed = extract_f64(val);
-                            }
-                        }
-                    }
-                }
-                redis::Value::Map(map) => {
-                    // RESP3: key-value map
-                    for (k, v) in map {
-                        let key_str = match k {
-                            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
-                            redis::Value::SimpleString(s) => s.clone(),
-                            _ => continue,
-                        };
-                        if key_str == "num_docs" {
-                            num_docs = extract_usize(v);
-                        }
-                        if key_str == "indexing" {
-                            indexing = extract_bool_nonzero(v);
-                        }
-                        if key_str == "percent_indexed" {
-                            percent_indexed = extract_f64(v);
-                        }
-                    }
-                }
-                _ => {
-                    eprintln!("Unexpected FT.INFO response type: {:?}", info);
-                }
-            }
-
-            if num_docs >= expected && !indexing && percent_indexed >= 1.0 {
+            // Shared parser (#361): an absent num_docs fails fast instead of
+            // being read as 0 and waiting out the whole budget.
+            let progress = vector_db_benchmark::indexing_wait::parse_ft_info(&info)
+                .map_err(|e| format!("redis: {e}"))?;
+            let state = progress.describe(expected as u64);
+            if redis_index_ready(&progress, expected)? {
                 println!(
-                    "Indexing complete: {} docs in {:.1}s",
-                    num_docs,
+                    "Indexing complete ({state}) in {:.1}s",
                     start.elapsed().as_secs_f64()
                 );
                 return Ok(());
             }
 
-            if start.elapsed().as_secs() > max_wait {
-                println!(
-                    "Warning: indexing timeout after {}s (num_docs={}/{}, percent_indexed={:.2})",
-                    max_wait, num_docs, expected, percent_indexed
-                );
-                return Ok(());
-            }
+            vector_db_benchmark::indexing_wait::verdict(
+                "redis",
+                start.elapsed(),
+                std::time::Duration::from_secs(max_wait),
+                &state,
+            )?;
 
             if start.elapsed().as_secs() > 0 && start.elapsed().as_secs().is_multiple_of(10) {
                 println!(
-                    "  indexing... num_docs={}/{}, percent_indexed={:.2}, indexing={}",
-                    num_docs, expected, percent_indexed, indexing
+                    "  indexing... {state} ({:.0}s)",
+                    start.elapsed().as_secs_f64()
                 );
             }
 
@@ -872,177 +844,283 @@ impl RedisEngine {
         None
     }
 
+    /// Search-phase preconditions shared by every workload, outside any timed
+    /// window.
+    fn prepare_search(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // configure() normally resets the server's command counters and
+        // establishes the commandstats baseline; on the `--skip-upload` path it
+        // never runs (#238), so check_commandstats below would compare this run's
+        // failure count against zero while the counters still hold every failure
+        // since the server started — failing a run in which nothing failed.
+        // Idempotent no-op once primed; outside every timed window.
+        self.prime_commandstats_if_needed()?;
+
+        // Prime the datetime field-type map from the schema so datetime range
+        // filters are built with the correct field type even on the
+        // `--skip-upload` path, where configure() (which normally primes it) is
+        // never called. Idempotent: on the upload path this reproduces exactly
+        // what configure() already set.
+        self.config.datetime_fields = Arc::new(datetime_fields_from_schema(dataset));
+        Ok(())
+    }
+
     /// Filter-only search: run FT.SEARCH with filter conditions only (no KNN).
     /// No precision calculation (no ground truth for filter-only queries).
-    fn search_filter_only(
+    fn search_filter_only_harness(
         &mut self,
         dataset: &Dataset,
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        // Index-existence guard (#151-4): hard-error on a missing/mismatched index
-        // instead of writing a silent recall-0.0 file on the --skip-upload path.
+        let index_schema = dataset.filter_only_index_schema()?;
         {
             let mut conn = self.get_connection()?;
-            redis_utils::ensure_index_exists(&mut conn, &self.config.index_name)?;
+            let info: redis::Value = redis::cmd("FT.INFO")
+                .arg(&self.config.index_name)
+                .query(&mut conn)
+                .map_err(|e| format!("filter-only schema check failed: {e}"))?;
+            // The realized layout must be the one this config built: no VECTOR
+            // on the no-vector index, a VECTOR plus filter-only scalar typing
+            // on the shared `full` one (#344).
+            let validate = if self.config.layout == IndexLayout::Full {
+                vector_db_benchmark::filter_only::validate_redis_full_schema
+            } else {
+                vector_db_benchmark::filter_only::validate_redis_schema
+            };
+            validate(&redis_value_to_json(&info), index_schema.as_ref())?;
         }
-
+        if !self.scalar_metadata_validated {
+            dataset.validate_scalar_metadata()?;
+            self.scalar_metadata_validated = true;
+        }
         let parallel = params.parallel.unwrap_or(1) as usize;
         let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
-
-        // Read queries (we only need the filter conditions)
-        let query_path = dataset.get_path()?;
-        println!("\tReading queries from {}...", query_path.display());
-        let (_queries, neighbors, conditions) = dataset.read_queries()?;
-
-        // Parse all conditions up front
-        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
-            conditions.resolve_all("Redis", parse_conditions)?;
-
-        let explicit_top: Option<usize> = params.top.map(|t| t as usize);
-
-        // Only queries that have filter conditions
-        let runnable_indices: Vec<usize> = (0..parsed_filters.len())
-            .filter(|&i| parsed_filters[i].is_filtered())
-            .collect();
-
-        if runnable_indices.is_empty() {
-            return Err("No queries with filter conditions for filter-only search".to_string());
+        let query_set = dataset.filter_only_queries()?;
+        let parsed_filters = query_set.try_resolve_all("Redis", |condition| {
+            vector_db_benchmark::filter_only::domain::validate_predicate(
+                condition,
+                index_schema.as_ref(),
+            )?;
+            Ok(parse_conditions(condition))
+        })?;
+        record_numeric_range_encoding(&parsed_filters);
+        // A metadata result limit must not be derived from vector ground truth.
+        let top = params
+            .top
+            .map(|t| t as usize)
+            .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT);
+        // `command_query_ids[i]` is the dataset query index `commands[i]` was
+        // built from, so a per-query record names the query, not its position
+        // among the filtered ones.
+        let (command_query_ids, commands): (Vec<usize>, Vec<redis::Cmd>) = parsed_filters
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                f.as_ref().map(|f| {
+                    (
+                        i,
+                        build_filter_only_command(&self.config.index_name, top, query_timeout, f),
+                    )
+                })
+            })
+            .unzip();
+        // No filter-only command may carry a vector clause — on the `full`
+        // layout the index would serve it (#344). Every command exactly as it
+        // will be sent, checked before anything is timed.
+        for cmd in &commands {
+            check_filter_only_command(cmd)?;
         }
-
-        // Round-robin: if num_queries > available queries, cycle through them
+        let capture = params.capture_query_results;
+        let key_prefix = self.config.key_prefix.as_str();
+        let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
+        let mut capture_failure: Option<String> = None;
+        if commands.is_empty() {
+            return Err("No queries with filter conditions for filter-only search".into());
+        }
         let num_to_run = if num_queries > 0 {
             num_queries as usize
         } else {
-            runnable_indices.len()
+            commands.len()
         };
-
-        // Each worker accumulates latencies into a thread-local buffer and returns
-        // it on join; the main thread concatenates. This keeps the timed hot loop
-        // free of the per-query cross-thread Mutex<Vec> push that serialized
-        // workers at high parallelism (matching the main search() path). The work
-        // counter uses Relaxed (only its own monotonicity matters). Progress is
-        // advanced in batches so the atomic isn't contended once per query.
-        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let query_idx = Arc::new(AtomicUsize::new(0));
-
-        // Resolve the index name once (env lookup) instead of per query.
-        let index_name = self.config.index_name.clone();
-
+        let query_idx = AtomicUsize::new(0);
+        let mut matched_sum = 0u64;
+        let mut returned_sum = 0u64;
+        let mut errors = Vec::new();
+        let mut times = Vec::with_capacity(num_to_run);
+        let mut observed_totals: Vec<(usize, u64)> = Vec::with_capacity(num_to_run);
         let pb = self.create_progress_bar(num_to_run);
-        let start_time = Instant::now();
-
-        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
-
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(parallel);
+        let measured_start = std::thread::scope(|scope| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(scope, "redis-filter-only", parallel);
             for _ in 0..parallel {
-                let redis_url = self.redis_url.clone();
-                let parsed_filters = &parsed_filters;
-                let runnable_indices = &runnable_indices;
-                let neighbors = &neighbors;
-                let errors = Arc::clone(&errors);
-                let query_idx = Arc::clone(&query_idx);
-                let index_name = index_name.as_str();
+                let redis_url = &self.redis_url;
+                let commands = &commands;
+                let command_query_ids = &command_query_ids;
+                let query_idx = &query_idx;
                 let pb = &pb;
-
-                handles.push(s.spawn(move || {
-                    // Thread-local sample buffer — no cross-thread lock per query.
-                    let mut t: Vec<f64> = Vec::new();
-                    let mut local_errs: Vec<String> = Vec::new();
-                    let mut pb_pending: u64 = 0;
-
-                    let client = match redis::Client::open(redis_url.as_str()) {
+                pool.spawn(move |ticket| {
+                    let mut samples = Vec::new();
+                    let mut matched = 0u64;
+                    let mut returned_count = 0u64;
+                    let mut errors = Vec::new();
+                    let mut pending = 0u64;
+                    let mut cap: Vec<RawQueryResult> = Vec::new();
+                    let mut capture_error: Option<String> = None;
+                    let mut totals: Vec<(usize, u64)> = Vec::new();
+                    let mut conn = match redis::Client::open(redis_url.as_str()).and_then(|c| {
+                        let info = c.get_connection_info();
+                        let settings = info
+                            .redis_settings()
+                            .clone()
+                            .set_protocol(redis::ProtocolVersion::RESP3);
+                        redis::Client::open(info.clone().set_redis_settings(settings))?
+                            .get_connection()
+                    }) {
                         Ok(c) => c,
-                        Err(_) => return t,
+                        Err(e) => {
+                            ticket.fail(format!("Redis filter-only connection failed: {e}"));
+                            return (
+                                samples,
+                                matched,
+                                returned_count,
+                                errors,
+                                cap,
+                                capture_error,
+                                totals,
+                            );
+                        }
                     };
-                    let mut conn = match client.get_connection() {
-                        Ok(c) => c,
-                        Err(_) => return t,
-                    };
-
+                    let deadline =
+                        std::time::Duration::from_millis(query_timeout.max(0) as u64 + 30_000);
+                    if let Err(e) = conn
+                        .set_read_timeout(Some(deadline))
+                        .and_then(|_| conn.set_write_timeout(Some(deadline)))
+                    {
+                        ticket.fail(format!(
+                            "Redis filter-only socket deadline setup failed: {e}"
+                        ));
+                        return (
+                            samples,
+                            matched,
+                            returned_count,
+                            errors,
+                            cap,
+                            capture_error,
+                            totals,
+                        );
+                    }
+                    let _ = commands[0].query::<redis::Value>(&mut conn);
+                    if ticket.arrive_and_wait().is_none() {
+                        return (
+                            samples,
+                            matched,
+                            returned_count,
+                            errors,
+                            cap,
+                            capture_error,
+                            totals,
+                        );
+                    }
                     loop {
                         let seq = query_idx.fetch_add(1, Ordering::Relaxed);
                         if seq >= num_to_run {
                             break;
                         }
-                        // Round-robin over available filter queries
-                        let idx = runnable_indices[seq % runnable_indices.len()];
-
-                        let top = explicit_top.unwrap_or_else(|| {
-                            let n = neighbors[idx].len();
-                            if n > 0 {
-                                n
-                            } else {
-                                10
+                        let start = Instant::now();
+                        let response =
+                            commands[seq % commands.len()].query::<redis::Value>(&mut conn);
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let query_id = command_query_ids[seq % commands.len()];
+                        match response.map_err(|e| e.to_string()).and_then(|v| {
+                            vector_db_benchmark::filter_only::redis_page(&v, top, capture)
+                        }) {
+                            Ok(page) => {
+                                samples.push(elapsed);
+                                totals.push((query_id, page.total));
+                                matched += page.total;
+                                returned_count += page.returned as u64;
+                                // `ids` is Some only when capturing, so a run
+                                // without --dump-results parses no keys here.
+                                if let Some(ids) = &page.ids {
+                                    // A key that does not map back to a corpus
+                                    // row is a harness bug, not a dropped query:
+                                    // fail the run rather than dump a guess.
+                                    let hits = ids
+                                        .iter()
+                                        .map(|key| {
+                                            vector_db_benchmark::filter_only::redis_key_row(
+                                                key, key_prefix,
+                                            )
+                                            .map(|row| RawHit { row, score: None })
+                                        })
+                                        .collect::<Result<Vec<_>, _>>();
+                                    match hits {
+                                        Ok(hits) => cap.push(RawQueryResult::ok(
+                                            query_id,
+                                            seq,
+                                            hits,
+                                            Some(page.total),
+                                            elapsed,
+                                        )),
+                                        Err(e) => {
+                                            capture_error = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                        });
-
-                        let query_start = Instant::now();
-                        let result = ft_search_filter_only(
-                            &mut conn,
-                            index_name,
-                            top,
-                            query_timeout,
-                            parsed_filters[idx].as_ref().unwrap(),
-                        );
-                        let query_time = query_start.elapsed().as_secs_f64();
-
-                        // Record a latency sample only for successful queries, so a
-                        // failed FT.SEARCH is counted as a failure (num_to_run minus
-                        // successes) rather than folded into RPS/percentiles — parity
-                        // with the main search() path.
-                        match result {
-                            Ok(_) => t.push(query_time),
                             Err(e) => {
-                                if local_errs.len() < 3 {
-                                    local_errs.push(e);
+                                if capture {
+                                    cap.push(RawQueryResult::failed(query_id, seq, elapsed, &e));
+                                }
+                                if errors.len() < 3 {
+                                    errors.push(format!("Filter-only query {seq} failed: {e}"));
                                 }
                             }
                         }
-                        pb_pending += 1;
-                        if pb_pending >= 256 {
-                            pb.inc(pb_pending);
-                            pb_pending = 0;
+                        pending += 1;
+                        if pending == 256 {
+                            pb.inc(pending);
+                            pending = 0;
                         }
                     }
-                    if pb_pending > 0 {
-                        pb.inc(pb_pending);
-                    }
-                    if !local_errs.is_empty() {
-                        let mut errs = errors.lock().unwrap();
-                        for e in local_errs {
-                            if errs.len() < 3 {
-                                errs.push(e);
-                            }
-                        }
-                    }
-                    t
-                }));
+                    pb.inc(pending);
+                    (
+                        samples,
+                        matched,
+                        returned_count,
+                        errors,
+                        cap,
+                        capture_error,
+                        totals,
+                    )
+                })?;
             }
-
-            for h in handles {
-                times.extend(h.join().unwrap());
-            }
-        });
-
-        {
-            let logged_errors = errors.lock().unwrap();
-            if !logged_errors.is_empty() {
-                for e in logged_errors.iter() {
-                    eprintln!("\tFilter-only search error: {}", e);
+            let (workers, start) = pool.start()?;
+            for (samples, matched, returned, worker_errors, cap, capture_error, totals) in workers {
+                observed_totals.extend(totals);
+                if let Some(e) = capture_error {
+                    capture_failure.get_or_insert(e);
                 }
+                if let Some(records) = captured.as_mut() {
+                    records.extend(cap);
+                }
+                times.extend(samples);
+                matched_sum += matched;
+                returned_sum += returned;
+                errors.extend(worker_errors);
             }
-        }
-
+            Ok(start)
+        })?;
+        let total_time = measured_start.elapsed().as_secs_f64();
         pb.finish_and_clear();
-        let total_time = start_time.elapsed().as_secs_f64();
-
-        if times.is_empty() {
-            return Err("No filter-only searches completed".to_string());
+        for error in errors.iter().take(3) {
+            eprintln!("{error}");
         }
-
-        // Verify no FT.SEARCH failures occurred
+        // Checked before anything else can fail, as OpenSearch does: the
+        // specific capture cause must not be masked by a later error.
+        if let Some(e) = capture_failure {
+            return Err(format!("--dump-results: {e}"));
+        }
         let mut check_conn = self.get_connection()?;
         redis_utils::check_commandstats(
             &mut check_conn,
@@ -1050,25 +1128,35 @@ impl RedisEngine {
             "search",
             self.commandstats_baseline.as_ref(),
         )?;
-
-        // Route latency stats through the shared percentile path (linear
-        // interpolation) so filter-only is measured on the same footing as the
-        // main search(). Filter-only has no precision/recall: signal that with the
-        // mean_precision_at_returned == -1 sentinel, an empty precisions vec,
-        // and top == 0.
-        let mut results = crate::engine::compute_search_stats(
+        let mut result = crate::engine::compute_search_stats(
             &times,
             &[],
             &[],
             &[],
             &[],
             total_time,
-            0,
+            top,
             parallel,
             num_to_run,
         )?;
-        results.mean_precision_at_returned = -1.0;
-        Ok(results)
+        // Per-query count gate (#340): every answer against its prepared count.
+        let per_query_counts_checked = query_set.check_counts(&observed_totals, times.len())?;
+        result.mean_precision_at_returned = -1.0;
+        result.query_records = captured;
+        result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
+            result_limit: top,
+            matched_documents_sum: matched_sum,
+            returned_documents_sum: returned_sum,
+            retried_queries: 0,
+            per_query_counts_checked,
+            index_layout: Some(self.index_layout().as_str().to_string()),
+        });
+        Ok(result)
+    }
+
+    /// The layout `configure()` builds for this config (#344).
+    fn index_layout(&self) -> vector_db_benchmark::workload::IndexLayout {
+        self.config.layout
     }
 
     fn create_progress_bar(&self, total: usize) -> ProgressBar {
@@ -1161,6 +1249,45 @@ fn is_transient_conn_error(msg: &str) -> bool {
         "uninitialized cluster state",
     ];
     SIGNATURES.iter().any(|sig| m.contains(sig))
+}
+
+/// Upload one batch, reconnecting + retrying on a TRANSIENT connection error
+/// (broken pipe / reset / EOF / timeout — common under heavy index-build load
+/// behind a managed-Redis proxy). Without this a single dropped socket aborted
+/// the whole sweep (#160). Genuine command errors (WRONGTYPE, syntax, …) are
+/// NOT transient and fail fast. Shared by the in-memory and the streaming
+/// (#342) uploads, so both have the same retry policy.
+fn upload_batch_with_retry(
+    client: &redis::Client,
+    conn: &mut Connection,
+    config: &RedisEngineConfig,
+    label: &str,
+    ids: &[i64],
+    vectors: &[Vec<f32>],
+    metadata: &[Option<MetadataItem>],
+) -> Result<(), String> {
+    let mut attempt = 0usize;
+    loop {
+        match upload_batch_internal(conn, config, ids, vectors, metadata) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !is_transient_conn_error(&e) || attempt >= MAX_UPLOAD_RETRIES {
+                    return Err(format!(
+                        "{label} failed after {attempt} reconnect attempt(s): {e}"
+                    ));
+                }
+                attempt += 1;
+                // Bounded exponential backoff: 100·2^(n-1) ms, capped at 2s.
+                let backoff_ms = (100u64 << (attempt - 1)).min(2000);
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                // Re-open the connection; if that also fails transiently we
+                // retry again next iteration.
+                if let Ok(c) = client.get_connection() {
+                    *conn = c;
+                }
+            }
+        }
+    }
 }
 
 fn upload_batch_internal(
@@ -1296,6 +1423,28 @@ pub(crate) fn parse_conditions(conditions: &serde_json::Value) -> Option<ParsedF
 
     let mut counter: usize = 0;
     build_group(obj, &mut counter)
+}
+
+/// Record only after successful resolution and before any timed search work.
+/// Range PARAMS names are distinct from match/geo names; the library recognizes
+/// that convention without making pure filter parsing mutate global telemetry.
+pub(crate) fn record_numeric_range_encoding(filters: &[QueryFilter<ParsedFilter>]) {
+    use vector_db_benchmark::redis_numeric_range;
+
+    if filters
+        .iter()
+        .filter_map(QueryFilter::as_ref)
+        .any(|(_, params)| {
+            params
+                .keys()
+                .any(|name| redis_numeric_range::is_bound_parameter(name))
+        })
+    {
+        crate::effective_config::record_effective(
+            "numeric_range_encoding",
+            redis_numeric_range::ENCODING,
+        );
+    }
 }
 
 /// Build one boolean GROUP (a `{and:[...], or:[...]}` object) into a parenthesised
@@ -1516,44 +1665,44 @@ fn build_text_filter(field_name: &str, text: &str, counter: &mut usize) -> Parse
     (format!("@{}:(${})", field_name, param_name), params)
 }
 
-/// Build range filter: @field:[-inf ($param_lt], @field:[($param_gt +inf], etc.
+/// Render each range leaf as bounded intervals, retaining its parameter names.
 fn build_range_filter(
     field_name: &str,
     criteria: &serde_json::Value,
     counter: &mut usize,
 ) -> Option<ParsedFilter> {
+    use vector_db_benchmark::redis_numeric_range::{self, Bound, Operator};
+
     let param_prefix = format!("{}_{}", field_name, counter);
     *counter += 1;
 
     let mut params = HashMap::new();
-    let mut clauses = Vec::new();
-
-    // (suffix, condition key, clause template). `gt` is EXCLUSIVE (`[($p +inf]`),
-    // `gte` inclusive; `lt` exclusive, `lte` inclusive.
-    let bounds = [
-        ("lt", "lt", "@{f}:[-inf (${p}]"),
-        ("gt", "gt", "@{f}:[(${p} +inf]"),
-        ("lte", "lte", "@{f}:[-inf ${p}]"),
-        ("gte", "gte", "@{f}:[${p} +inf]"),
-    ];
-    for (key, suffix, tmpl) in bounds {
+    let mut parsed = Vec::new();
+    // Keep conversion order and names stable; only the query encoding changes.
+    for (key, operator) in [
+        ("lt", Operator::Lt),
+        ("gt", Operator::Gt),
+        ("lte", Operator::Lte),
+        ("gte", Operator::Gte),
+    ] {
         if let Some(v) = criteria.get(key) {
-            let pname = format!("{}_{}", param_prefix, suffix);
+            let pname = format!("{}_{}", param_prefix, key);
             insert_number_param(&mut params, &pname, v);
-            // Only emit the clause when the bound actually parsed into a param —
-            // otherwise a `$param` with no PARAMS entry makes FT.SEARCH
-            // hard-error ("Parameter not found").
+            // A rejected bound must not leave an unbound query parameter.
             if params.contains_key(&pname) {
-                clauses.push(tmpl.replace("{f}", field_name).replace("{p}", &pname));
+                parsed.push((operator, pname));
             }
         }
     }
-
-    if clauses.is_empty() {
-        return None;
-    }
-
-    Some((clauses.join(" "), params))
+    let bounds: Vec<_> = parsed
+        .iter()
+        .map(|(operator, parameter)| Bound {
+            operator: *operator,
+            parameter,
+        })
+        .collect();
+    let query = redis_numeric_range::render(field_name, &bounds)?;
+    Some((query, params))
 }
 
 /// Build geo filter: @field:[$lon $lat $radius m]
@@ -1654,14 +1803,28 @@ fn build_condition(
 
 // ── FT.SEARCH ────────────────────────────────────────────────────────────
 
+/// [`vector_db_benchmark::filter_only::check_redis_command`] over a built
+/// command's arguments, exactly as they go on the wire.
+fn check_filter_only_command(cmd: &redis::Cmd) -> Result<(), String> {
+    let args: Vec<&[u8]> = cmd
+        .args_iter()
+        .map(|a| match a {
+            redis::Arg::Simple(bytes) => bytes,
+            // A cursor (or any future non-literal) argument is not part of
+            // the metadata shape: the placeholder fails the check.
+            _ => b"<non-literal argument>".as_slice(),
+        })
+        .collect();
+    vector_db_benchmark::filter_only::check_redis_command(&args)
+}
+
 /// Execute filter-only FT.SEARCH (no KNN vector query).
-fn ft_search_filter_only(
-    conn: &mut Connection,
+fn build_filter_only_command(
     index_name: &str,
     top: usize,
     query_timeout: i64,
     filter: &ParsedFilter,
-) -> Result<usize, String> {
+) -> redis::Cmd {
     let (filter_expr, params) = filter;
 
     let mut cmd = redis::cmd("FT.SEARCH");
@@ -1670,8 +1833,9 @@ fn ft_search_filter_only(
         .arg("LIMIT")
         .arg(0)
         .arg(top)
+        .arg("NOCONTENT")
         .arg("DIALECT")
-        .arg(4)
+        .arg(2)
         .arg("TIMEOUT")
         .arg(query_timeout);
 
@@ -1694,20 +1858,7 @@ fn ft_search_filter_only(
         }
     }
 
-    let response: Vec<redis::Value> = cmd
-        .query(conn)
-        .map_err(|e| format!("FT.SEARCH filter-only error: {}", e))?;
-
-    // First element is the total count
-    if let Some(first) = response.first() {
-        match first {
-            redis::Value::Int(n) => Ok(*n as usize),
-            redis::Value::BulkString(s) => Ok(String::from_utf8_lossy(s).parse().unwrap_or(0)),
-            _ => Ok(0),
-        }
-    } else {
-        Ok(0)
-    }
+    cmd
 }
 
 /// Build the FT.SEARCH KNN query string for the given filter.
@@ -2017,6 +2168,231 @@ fn prime_datetime_fields(schema: Option<&serde_json::Value>) -> HashSet<String> 
 
 // ── Engine trait implementation ──────────────────────────────────────────
 
+/// The hybrid workload (#341).
+impl RedisEngine {
+    /// One timed KNN pass per selectivity bucket over the dataset's hybrid
+    /// query set, through the vector arm's own loop (`search()` with
+    /// `hybrid_pass` set). Every predicate is checked to have survived the
+    /// filter builder intact; `HYBRID_POLICY` is explicit when configured
+    /// (`hybrid_policy` search knob, or `REDIS_HYBRID_POLICY`). After each
+    /// pass a fixed sample of the bucket — the first
+    /// `hybrid::PROFILE_SAMPLE_PER_PREDICATE` queries of each predicate — is
+    /// `FT.PROFILE`d (outside the timed window) with the policy the pass sent,
+    /// and the vector search mode every shard reports is recorded — and must
+    /// match the configured policy.
+    fn search_hybrid_buckets(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        use vector_db_benchmark::hybrid as hy;
+        if self.config.skip_vector_index {
+            return Err("hybrid search requested on an index built without a vector field".into());
+        }
+        let top = hy::check_params(
+            params.top,
+            params.target_qps,
+            params.duration_seconds,
+            num_queries,
+        )?;
+        // Also resolved at startup (experiment.rs), before anything is
+        // downloaded or connected; resolved again here from the same inputs.
+        let policy = hy::resolve_redis_policy(
+            params.knob("hybrid_policy"),
+            &crate::effective_config::env_or("REDIS_HYBRID_POLICY", ""),
+        )?;
+        crate::effective_config::record_effective("hybrid_policy", policy.unwrap_or("unset"));
+
+        let set = dataset.read_hybrid_query_set()?;
+        for (i, p) in set.predicates.iter().enumerate() {
+            hy::validate_against_schema(p, dataset.config.schema.as_ref())
+                .map_err(|e| format!("{}: {e}", set.meta[i].query_id))?;
+        }
+        let parsed: Vec<QueryFilter<ParsedFilter>> =
+            set.conditions.resolve_all("Redis", parse_conditions)?;
+        for (i, f) in parsed.iter().enumerate() {
+            let filter = f.as_ref().ok_or_else(|| {
+                format!("{}: hybrid query without a filter", set.meta[i].query_id)
+            })?;
+            check_hybrid_filter(&set.predicates[i], filter)
+                .map_err(|e| format!("{}: {e}", set.meta[i].query_id))?;
+        }
+        record_numeric_range_encoding(&parsed);
+
+        let text_match = serde_json::json!({
+            "rule": vector_db_benchmark::msmarco::text_match::RULE_VERSION,
+            "redis": "@field:($term), FT.SEARCH ... VERBATIM (no stemming expansion)",
+        });
+        let engine_note = serde_json::json!({
+            "hybrid_policy": policy.unwrap_or("unset (Redis chooses per query)"),
+            "verbatim": true,
+            "mode_source": format!(
+                "FT.PROFILE of a fixed sample (the first {} queries of each predicate) after \
+                 each bucket's timed pass, with the policy the pass sent; one mode per shard",
+                hy::PROFILE_SAMPLE_PER_PREDICATE
+            ),
+        });
+        let ef = resolve_ef(params);
+        let policy_str = policy.unwrap_or("").to_string();
+        crate::engine::run_hybrid_buckets(&set, top, text_match, engine_note, |_, subset| {
+            let filters: Vec<QueryFilter<ParsedFilter>> =
+                subset.iter().map(|&i| parsed[i].clone()).collect();
+            let queries: Vec<Vec<f32>> = subset.iter().map(|&i| set.queries[i].clone()).collect();
+            self.hybrid_pass = Some(HybridPass {
+                queries: queries.clone(),
+                neighbors: subset.iter().map(|&i| set.neighbors[i].clone()).collect(),
+                filters: filters.clone(),
+                policy: policy_str.clone(),
+            });
+            self.hybrid_policy_sent = None;
+            let r = self.search(dataset, params, num_queries);
+            self.hybrid_pass = None;
+            let r = r?;
+            let sent = self
+                .hybrid_policy_sent
+                .take()
+                .ok_or("search() did not run the hybrid pass it was given")?;
+            // A fixed per-predicate sample, not the whole bucket (profiling
+            // is serial and untimed; a brute-force bucket on 10M would
+            // otherwise take tens of minutes here).
+            let ids: Vec<&str> = subset
+                .iter()
+                .map(|&i| set.meta[i].predicate_id.as_str())
+                .collect();
+            let sample = hy::profile_sample(&ids, hy::PROFILE_SAMPLE_PER_PREDICATE);
+            let sq: Vec<Vec<f32>> = sample.iter().map(|&i| queries[i].clone()).collect();
+            let sf: Vec<QueryFilter<ParsedFilter>> =
+                sample.iter().map(|&i| filters[i].clone()).collect();
+            let (modes, shards) = self.profile_vector_modes(&sq, &sf, top, ef, &sent)?;
+            hy::check_redis_modes(policy, &modes, sq.len() as u64, shards)?;
+            Ok((
+                r,
+                serde_json::json!({
+                    "vector_search_modes": modes,
+                    "profiled_queries": sq.len(),
+                    "profile_sample_per_predicate": hy::PROFILE_SAMPLE_PER_PREDICATE,
+                    "bucket_queries": queries.len(),
+                    "shards": shards,
+                }),
+            ))
+        })
+    }
+
+    /// `FT.PROFILE` each query through the exact command the timed loop sends
+    /// (plus `VERBATIM`) and tally the `Vector search mode` every shard
+    /// reports (one per shard through a cluster coordinator). Returns the
+    /// tally and the shard count, which must be the same for every query.
+    fn profile_vector_modes(
+        &self,
+        queries: &[Vec<f32>],
+        filters: &[QueryFilter<ParsedFilter>],
+        top: usize,
+        ef: i64,
+        hybrid_policy: &str,
+    ) -> Result<(std::collections::BTreeMap<String, u64>, u64), String> {
+        let mut conn = self.get_connection()?;
+        let mut shards: Option<u64> = None;
+        let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
+        let mut modes = std::collections::BTreeMap::new();
+        for (q, f) in queries.iter().zip(filters) {
+            let query_str = build_knn_query_str(&self.config.algorithm, hybrid_policy, f.as_ref());
+            let mut search = build_ft_search_cmd(
+                &self.config.index_name,
+                &encode_vector(&self.config.data_type, q),
+                &query_str,
+                top,
+                ef,
+                &self.config.algorithm,
+                hybrid_policy,
+                query_timeout,
+                f.as_ref(),
+            );
+            search.arg("VERBATIM");
+            let reply: redis::Value = profile_cmd(&search)?
+                .query(&mut conn)
+                .map_err(|e| format!("FT.PROFILE failed: {e}"))?;
+            let mut flat = Vec::new();
+            flatten_reply(&reply, &mut flat);
+            let per_shard = vector_db_benchmark::hybrid::redis_profile_modes(&flat)?;
+            let n = per_shard.len() as u64;
+            if *shards.get_or_insert(n) != n {
+                return Err(format!(
+                    "FT.PROFILE replies disagree on the shard count ({} vs {n})",
+                    shards.unwrap_or_default()
+                ));
+            }
+            for m in per_shard {
+                *modes.entry(m).or_insert(0) += 1;
+            }
+        }
+        Ok((modes, shards.unwrap_or(0)))
+    }
+}
+
+/// The rendered filter must express the predicate structurally
+/// (`hybrid::check_redis_filter`), with its `PARAMS` resolved.
+fn check_hybrid_filter(
+    p: &vector_db_benchmark::msmarco::derived::Predicate,
+    (expr, params): &ParsedFilter,
+) -> Result<(), String> {
+    use vector_db_benchmark::hybrid::RedisParam;
+    let params = params
+        .iter()
+        .map(|(k, v)| {
+            let v = match v {
+                FilterParamValue::Str(s) => RedisParam::Str(s.clone()),
+                FilterParamValue::Int(i) => RedisParam::Num(*i as f64),
+                FilterParamValue::Float(f) => RedisParam::Num(*f),
+            };
+            (k.clone(), v)
+        })
+        .collect();
+    vector_db_benchmark::hybrid::check_redis_filter(p, expr, &params)
+}
+
+/// `FT.SEARCH idx <args...>` -> `FT.PROFILE idx SEARCH QUERY <args...>`.
+fn profile_cmd(search: &redis::Cmd) -> Result<redis::Cmd, String> {
+    let mut args = search.args_iter();
+    match args.next() {
+        Some(redis::Arg::Simple(b"FT.SEARCH")) => {}
+        _ => return Err("profile_cmd expects an FT.SEARCH command".into()),
+    }
+    let mut profile = redis::cmd("FT.PROFILE");
+    match args.next() {
+        Some(redis::Arg::Simple(index)) => profile.arg(index),
+        _ => return Err("FT.SEARCH command has no index".into()),
+    };
+    profile.arg("SEARCH").arg("QUERY");
+    for a in args {
+        match a {
+            redis::Arg::Simple(b) => profile.arg(b),
+            _ => return Err("FT.SEARCH command holds a non-literal arg".into()),
+        };
+    }
+    Ok(profile)
+}
+
+/// Every scalar of a (nested) reply, as strings, in order — what
+/// `hybrid::redis_vector_search_modes` scans for `Vector search mode`.
+fn flatten_reply(v: &redis::Value, out: &mut Vec<String>) {
+    match v {
+        redis::Value::BulkString(b) => out.push(String::from_utf8_lossy(b).into_owned()),
+        redis::Value::SimpleString(s) => out.push(s.clone()),
+        redis::Value::Int(i) => out.push(i.to_string()),
+        redis::Value::Double(d) => out.push(d.to_string()),
+        redis::Value::Array(a) | redis::Value::Set(a) => {
+            a.iter().for_each(|x| flatten_reply(x, out))
+        }
+        redis::Value::Map(m) => m.iter().for_each(|(k, x)| {
+            flatten_reply(k, out);
+            flatten_reply(x, out);
+        }),
+        redis::Value::Attribute { data, .. } => flatten_reply(data, out),
+        _ => {}
+    }
+}
+
 /// Establish the commandstats baseline if configure() did not (issue #238).
 impl RedisEngine {
     /// Idempotent and a no-op on the normal configure -> upload -> search path,
@@ -2054,6 +2430,7 @@ impl Engine for RedisEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        self.scalar_metadata_validated = false;
         let mut conn = self.get_connection()?;
 
         // Record which schema fields are `datetime` so upload can convert their
@@ -2067,6 +2444,16 @@ impl Engine for RedisEngine {
                 "Using algorithm {} with config {{'M': {}, 'EF_CONSTRUCTION': {}}}",
                 self.config.algorithm, self.config.m, self.config.ef_construction
             );
+            if self.config.layout == IndexLayout::Full {
+                println!(
+                    "Building the shared `full` index (#344): vector + text + CASESENSITIVE \
+                     TAG + NUMERIC, one ingest for every workload of this config"
+                );
+                println!(
+                    "  note: on this index vector/hybrid tag filters match CASE-SENSITIVELY \
+                     (unlike the `vector` layout); results record params.index_layout=full"
+                );
+            }
         }
 
         self.create_index(&mut conn, dataset)?;
@@ -2093,6 +2480,18 @@ impl Engine for RedisEngine {
                 let mut conn = self.get_connection()?;
                 let existing = count_prefix_keys(&mut conn, &self.config.key_prefix);
                 if shared_corpus_is_complete(existing, expected) {
+                    // The same pre-upload gate as the upload path below (#344
+                    // review): an earlier config (e.g. a `vector` one, which
+                    // does not check filter-only's metadata domain) may have
+                    // uploaded this corpus. Streams the metadata only — the
+                    // one extra read on this path — so a bad token is refused
+                    // here, before this config writes any result.
+                    if self.config.layout.serves(Workload::FilterOnly)
+                        && !self.scalar_metadata_validated
+                    {
+                        dataset.validate_scalar_metadata()?;
+                        self.scalar_metadata_validated = true;
+                    }
                     println!(
                         "Shared corpus already populated ({existing}/{expected} keys under prefix \
                          '{}'); skipping re-upload (#188 upload-once/build-many).",
@@ -2111,21 +2510,30 @@ impl Engine for RedisEngine {
                     // time is part of ingest cost for every other config, so it
                     // is counted in total_time here too (upload_time stays 0 —
                     // the corpus really was uploaded once).
-                    let index_start = Instant::now();
-                    self.wait_for_indexing(existing)?;
-                    let index_time = index_start.elapsed().as_secs_f64();
+                    // Phases (#344): an explicitly zero-length upload phase,
+                    // then the backfill. `upload_time` is exactly 0.0, so
+                    // `upload_docs_per_sec` is null rather than docs / ~1µs.
+                    let clock = vector_db_benchmark::ingest::IngestClock::without_upload();
+                    dataset.record_no_upload("shared corpus already populated (#188)");
+                    self.wait_for_indexing(existing, WaitPhase::FullBuild)?;
+                    let phases = clock.index_ready(
+                        existing,
+                        0.0,
+                        vector_db_benchmark::ingest::IndexWait::RedisPercentIndexed,
+                    )?;
                     println!(
                         "Index time (backfill over the shared corpus): {:.3}s",
-                        index_time
+                        phases.index_wait_time
                     );
                     return Ok(UploadStats {
                         upload_time: 0.0,
-                        total_time: index_time,
+                        total_time: phases.total_ingest_time,
                         upload_count: existing,
                         parallel: self.config.parallel,
                         batch_size: self.config.batch_size,
                         memory_usage: None,
                         index_coverage: None,
+                        ingest_phases: Some(phases),
                     });
                 }
             }
@@ -2136,7 +2544,32 @@ impl Engine for RedisEngine {
         let dataset_path = dataset.get_path()?;
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
-        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        // #342: a corpus too large to hold in client memory is streamed from
+        // disk instead (`--upload-reader`); everything below is the in-memory
+        // path, unchanged.
+        let (ids, vectors, mut metadata) = match dataset.open_upload(normalize)? {
+            UploadSource::InMemory {
+                ids,
+                vectors,
+                metadata,
+            } => (ids, vectors, metadata),
+            UploadSource::Stream(stream) => return self.upload_streamed(dataset, stream),
+        };
+        // #339 parity: normalize newlines in the indexed text fields before
+        // anything is sent (recorded in the index marker by configure()).
+        self.normalize_fulltext_upload(&mut metadata)?;
+        // Filter-only's metadata domain (no `;` / edge whitespace in tags, no
+        // -0.0, ...) is checked before anything is sent whenever the index
+        // will serve filter-only — on `no-vector` AND on the shared `full`
+        // index (#344), so a bad token is refused before the upload, not at
+        // the first filter-only search after other configs wrote results.
+        if self.config.layout.serves(Workload::FilterOnly) {
+            vector_db_benchmark::filter_only::domain::validate_metadata(
+                &metadata,
+                dataset.filter_only_index_schema()?.as_ref(),
+            )?;
+            self.scalar_metadata_validated = true;
+        }
         let read_time = read_start.elapsed().as_secs_f64();
 
         println!(
@@ -2151,7 +2584,9 @@ impl Engine for RedisEngine {
             "Starting upload with {} threads, batch size {}...",
             self.config.parallel, self.config.batch_size
         );
-        let upload_start = Instant::now();
+        // One clock for both ingest phases (#344), so they sum to the wall time
+        // from the first batch to index-ready.
+        let mut clock = vector_db_benchmark::ingest::IngestClock::start();
 
         if self.config.parallel <= 1 {
             self.upload_sequential(&ids, &vectors, &metadata)?;
@@ -2159,7 +2594,7 @@ impl Engine for RedisEngine {
             self.upload_parallel(&ids, &vectors, &metadata)?;
         }
 
-        let upload_time = upload_start.elapsed().as_secs_f64();
+        let upload_time = clock.upload_done();
 
         println!(
             "Upload time: {:.3}s ({:.0} records/sec)",
@@ -2173,11 +2608,15 @@ impl Engine for RedisEngine {
         // post_upload()). Excluding it made every engine but mongodb look
         // artificially fast to index.
         let expected = vectors.len();
-        let index_start = Instant::now();
-        self.wait_for_indexing(expected)?;
-        let index_time = index_start.elapsed().as_secs_f64();
+        self.wait_for_indexing(expected, WaitPhase::UploadTail)?;
+        let phases = clock.index_ready(
+            expected,
+            read_time,
+            vector_db_benchmark::ingest::IndexWait::RedisPercentIndexed,
+        )?;
+        let index_time = phases.index_wait_time;
 
-        let total_time = read_time + upload_time + index_time;
+        let total_time = read_time + phases.total_ingest_time;
         println!(
             "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
             index_time, total_time
@@ -2200,7 +2639,46 @@ impl Engine for RedisEngine {
             batch_size: self.config.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: Some(phases),
         })
+    }
+
+    fn search_filter_only(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        if !self
+            .index_layout()
+            .serves(vector_db_benchmark::workload::Workload::FilterOnly)
+        {
+            return Err(
+                "filter-only search requested on an index built in the vector layout; the \
+                 filter-only workload needs the no-vector or the shared `full` layout (#344)"
+                    .into(),
+            );
+        }
+        self.prepare_search(dataset)?;
+        self.search_filter_only_harness(dataset, params, num_queries)
+    }
+
+    fn search_fulltext(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_fulltext_harness(dataset, params, num_queries)
+    }
+
+    fn search_hybrid(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_hybrid_buckets(dataset, params, num_queries)
     }
 
     fn search(
@@ -2209,24 +2687,17 @@ impl Engine for RedisEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        // configure() normally resets the server's command counters and
-        // establishes the commandstats baseline; on the `--skip-upload` path it
-        // never runs (#238), so check_commandstats below would compare this run's
-        // failure count against zero while the counters still hold every failure
-        // since the server started — failing a run in which nothing failed.
-        // Idempotent no-op once primed; outside every timed window.
-        self.prime_commandstats_if_needed()?;
-
-        // Prime the datetime field-type map from the schema so datetime range
-        // filters are built with the correct field type even on the
-        // `--skip-upload` path, where configure() (which normally primes it) is
-        // never called. Idempotent: on the upload path this reproduces exactly
-        // what configure() already set.
-        self.config.datetime_fields = Arc::new(datetime_fields_from_schema(dataset));
-
+        // The vector workload against an index built without a vector field
+        // would measure nothing; `engine::search_workload` routes filter-only
+        // configs to `search_filter_only`, so arriving here is a dispatch bug.
         if self.config.skip_vector_index {
-            return self.search_filter_only(dataset, params, num_queries);
+            return Err(
+                "vector search requested on an index built without a vector field \
+                 (skip_vector_index); filter-only configs must go through search_filter_only"
+                    .into(),
+            );
         }
+        self.prepare_search(dataset)?;
 
         // Index-existence guard (#151-4): on the --skip-upload path a missing or
         // mismatched index would otherwise write a silent recall-0.0 result file.
@@ -2237,20 +2708,33 @@ impl Engine for RedisEngine {
 
         let ef = resolve_ef(params);
         let parallel = params.parallel.unwrap_or(1) as usize;
-        let hybrid_policy = crate::effective_config::env_or("REDIS_HYBRID_POLICY", "");
         let query_timeout: i64 = crate::effective_config::env_parsed("REDIS_QUERY_TIMEOUT", 90_000);
 
-        // Read queries, ground truth, and filter conditions
-        let query_path = dataset.get_path()?;
-        println!("\tReading queries from {}...", query_path.display());
-        let (queries, neighbors, conditions) = dataset.read_queries()?;
+        // A hybrid bucket pass (#341) brings its own queries, filters and
+        // policy, and sends every FT.SEARCH `VERBATIM` (text predicates must
+        // not be stem-expanded; see `msmarco::text_match`).
+        let verbatim = self.hybrid_pass.is_some();
+        let (queries, neighbors, parsed_filters, hybrid_policy) = match self.hybrid_pass.take() {
+            Some(pass) => {
+                self.hybrid_policy_sent = Some(pass.policy.clone());
+                (pass.queries, pass.neighbors, pass.filters, pass.policy)
+            }
+            None => {
+                let hybrid_policy = crate::effective_config::env_or("REDIS_HYBRID_POLICY", "");
+                // Read queries, ground truth, and filter conditions
+                let query_path = dataset.get_path()?;
+                println!("\tReading queries from {}...", query_path.display());
+                let (queries, neighbors, conditions) = dataset.read_queries()?;
+                // Parse all conditions up front (before timing begins)
+                let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
+                    conditions.resolve_all("Redis", parse_conditions)?;
+                record_numeric_range_encoding(&parsed_filters);
+                (queries, neighbors, parsed_filters, hybrid_policy)
+            }
+        };
         if queries.is_empty() {
             return Err("dataset contains no search queries".to_string());
         }
-
-        // Parse all conditions up front (before timing begins)
-        let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
-            conditions.resolve_all("Redis", parse_conditions)?;
 
         // When top is explicitly set, use it for all queries.
         // When not set, use per-query ground truth count (matches Python v0 behavior
@@ -2329,6 +2813,8 @@ impl Engine for RedisEngine {
         let mut dropped_queries = 0usize;
         let mut late_queries = 0usize;
         let query_count = queries.len();
+        let capture = params.capture_query_results;
+        let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
 
         // Workers recycle queries with `query_pos = idx % query_count` and index
         // `neighbors[query_pos]` in lock-step; a ground-truth set shorter than the
@@ -2365,6 +2851,9 @@ impl Engine for RedisEngine {
                     let mut dropped = 0usize;
                     let mut late = 0usize;
                     let mut pb_pending: u64 = 0;
+                    // Per-query capture for --dump-results, filled AFTER each
+                    // latency sample is taken.
+                    let mut cap: Vec<RawQueryResult> = Vec::new();
 
                     let client = match redis::Client::open(redis_url.as_str()) {
                         Ok(c) => c,
@@ -2374,14 +2863,14 @@ impl Engine for RedisEngine {
                             // reported as `parallel`. Settle the ticket with the
                             // reason; the coordinator turns it into a hard error.
                             ticket.fail(format!("redis client open failed: {e}"));
-                            return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
                         }
                     };
                     let mut conn = match client.get_connection() {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("redis connect failed: {e}"));
-                            return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
                         }
                     };
                     // Bound a blackholed endpoint to a finite wait instead of the
@@ -2395,7 +2884,7 @@ impl Engine for RedisEngine {
                     // effort: errors are ignored and its sample is NOT recorded.
                     {
                         let prime_top = explicit_top.unwrap_or(10);
-                        let prime_cmd = build_ft_search_cmd(
+                        let mut prime_cmd = build_ft_search_cmd(
                             index_name,
                             &encoded_queries[0],
                             &query_strs[0],
@@ -2406,13 +2895,16 @@ impl Engine for RedisEngine {
                             query_timeout,
                             parsed_filters[0].as_ref(),
                         );
+                        if verbatim {
+                            prime_cmd.arg("VERBATIM");
+                        }
                         let _ = exec_ft_search(&mut conn, &prime_cmd);
                     }
 
                     // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
                     let Some(start_time) = ticket.arrive_and_wait() else {
-                        return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                        return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
                     };
 
                     loop {
@@ -2470,7 +2962,7 @@ impl Engine for RedisEngine {
                         // Build the FT.SEARCH command OUTSIDE the timer — pure
                         // client-side arg assembly on precomputed inputs (blob,
                         // query string, resolved index name). `top` is known here.
-                        let cmd = build_ft_search_cmd(
+                        let mut cmd = build_ft_search_cmd(
                             index_name,
                             &encoded_queries[query_pos],
                             &query_strs[query_pos],
@@ -2481,6 +2973,9 @@ impl Engine for RedisEngine {
                             query_timeout,
                             parsed_filters[query_pos].as_ref(),
                         );
+                        if verbatim {
+                            cmd.arg("VERBATIM");
+                        }
 
                         // Timed window: ONLY the RPC round-trip + reply parse,
                         // matching the Vertex engine's boundary.
@@ -2498,6 +2993,21 @@ impl Engine for RedisEngine {
                                 let ordered_ids: Vec<i64> =
                                     result_ids.iter().map(|(id, _)| *id).collect();
                                 let m = compute_metrics(&ordered_ids, &neighbors[query_pos], top);
+                                if capture {
+                                    cap.push(RawQueryResult::ok(
+                                        query_pos,
+                                        idx,
+                                        result_ids
+                                            .iter()
+                                            .map(|&(row, score)| RawHit {
+                                                row,
+                                                score: Some(score),
+                                            })
+                                            .collect(),
+                                        None,
+                                        query_time,
+                                    ));
+                                }
                                 t.push(query_time);
                                 p.push(m.precision);
                                 r.push(m.recall);
@@ -2513,6 +3023,9 @@ impl Engine for RedisEngine {
                             }
                             Err(e) => {
                                 eprintln!("Search query {} failed: {}", idx, e);
+                                if capture {
+                                    cap.push(RawQueryResult::failed(query_pos, idx, query_time, e));
+                                }
                             }
                         }
                         // Batch progress updates so the highest-QPS runs don't pay a
@@ -2526,7 +3039,7 @@ impl Engine for RedisEngine {
                     if pb_pending > 0 {
                         pb.inc(pb_pending);
                     }
-                    (t, p, r, mr, nd, sd, e2e, dropped, late)
+                    (t, p, r, mr, nd, sd, e2e, dropped, late, cap)
                 })?;
             }
 
@@ -2535,7 +3048,10 @@ impl Engine for RedisEngine {
             // offset is needed now — the cold setup is already behind the gate.
             let (per_worker, measured_start) = pool.start()?;
 
-            for (t, p, r, mr, nd, sd, e2e, dropped, late) in per_worker {
+            for (t, p, r, mr, nd, sd, e2e, dropped, late, cap) in per_worker {
+                if let Some(records) = captured.as_mut() {
+                    records.extend(cap);
+                }
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
@@ -2569,6 +3085,7 @@ impl Engine for RedisEngine {
                 return Err("No searches completed".to_string());
             }
             let mut results = zero_search_results(total_time, top, parallel, attempted_queries);
+            results.query_records = captured;
             if let Some(plan) = open_loop {
                 attach_open_loop_metrics(
                     &mut results,
@@ -2602,6 +3119,7 @@ impl Engine for RedisEngine {
             parallel,
             attempted_queries,
         )?;
+        results.query_records = captured;
         // In open-loop mode, drops are distinct from attempted request failures.
         if let Some(plan) = open_loop {
             attach_open_loop_metrics(
@@ -2654,6 +3172,7 @@ impl Engine for RedisEngine {
 
         let parsed_filters: Vec<QueryFilter<ParsedFilter>> =
             conditions.resolve_all("Redis", parse_conditions)?;
+        record_numeric_range_encoding(&parsed_filters);
 
         // Read vectors for updates
         let normalize = dataset.needs_normalization();
@@ -2889,6 +3408,39 @@ impl Engine for RedisEngine {
         Ok(results)
     }
 
+    fn check_index_layout(
+        &mut self,
+        dataset: &Dataset,
+        layout: vector_db_benchmark::workload::IndexLayout,
+    ) -> Result<(), String> {
+        use vector_db_benchmark::filter_only as fo;
+        use vector_db_benchmark::workload::IndexLayout;
+        let schema = dataset.config.schema.as_ref();
+        let validate = match layout {
+            IndexLayout::Full => fo::validate_redis_full_schema,
+            // Only tag fields can tell the layouts apart; a schema without
+            // them has nothing to check, so skip the round trip.
+            IndexLayout::Vector
+                if schema.and_then(|s| s.as_object()).is_some_and(|fields| {
+                    fields
+                        .values()
+                        .any(|k| matches!(k.as_str(), Some("keyword" | "uuid" | "bool")))
+                }) =>
+            {
+                fo::validate_redis_vector_layout
+            }
+            // No-vector: filter-only reads it back before every run.
+            _ => return Ok(()),
+        };
+        let mut conn = self.get_connection()?;
+        let info: redis::Value = redis::cmd("FT.INFO")
+            .arg(&self.config.index_name)
+            .query(&mut conn)
+            .map_err(|e| format!("index layout check ({layout}): FT.INFO failed: {e}"))?;
+        validate(&redis_value_to_json(&info), schema)
+            .map_err(|e| format!("index layout check ({layout}): {e}"))
+    }
+
     fn delete(&mut self) -> Result<(), String> {
         let mut conn = self.get_connection()?;
         // Normally DD (drop index + this config's docs). In shared-corpus mode
@@ -2901,6 +3453,16 @@ impl Engine for RedisEngine {
             cmd.arg("DD");
         }
         let _ = cmd.query::<()>(&mut conn);
+        // Only a fulltext config owns a marker (outside its key prefix).
+        let profile = self.fulltext_profile().ok().flatten();
+        for args in vector_db_benchmark::fulltext::redis_marker_teardown_commands(
+            &self.config.index_name,
+            profile.as_ref(),
+        ) {
+            let mut cmd = redis::cmd(&args[0]);
+            cmd.arg(&args[1..]);
+            let _ = cmd.query::<()>(&mut conn);
+        }
         Ok(())
     }
 
@@ -2957,6 +3519,30 @@ mod tests {
     use crate::config::DatasetConfig;
     use crate::dataset::Dataset;
     use vector_db_benchmark::readers::write_npy_vectors;
+
+    /// #361 review: the FT.INFO wait retries transient errors through
+    /// `TransientRetry` (unit-tested in `indexing_wait`): an answered poll
+    /// resets the outage, and the retry gives up through its verdict, not the
+    /// budget alone. Reads this file's own `wait_for_indexing`.
+    #[test]
+    fn indexing_wait_caps_transient_outages_and_resets_on_an_answer() {
+        let src = include_str!("redis.rs");
+        let start = src.find("fn wait_for_indexing(").unwrap();
+        let body = &src[start..start + src[start..].find("\n    }\n").unwrap()];
+        let squeezed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            squeezed.contains("Ok(v) => { retry.on_success(); v }"),
+            "an answered FT.INFO poll must reset the outage: {body}"
+        );
+        assert!(
+            squeezed.contains("retry.on_transient(start, Instant::now(), &msg)?"),
+            "transient errors must go through the reconnect window: {body}"
+        );
+        assert!(
+            !squeezed.contains("start.elapsed().as_secs() < max_wait"),
+            "the transient retry must not be bounded by the budget alone: {body}"
+        );
+    }
 
     /// A compound ("tar") dataset rooted at an absolute temp dir holding a real
     /// `vectors.npy` of `rows` rows, declaring `declared` in datasets.json.
@@ -3210,6 +3796,37 @@ mod tests {
         assert!(matches!(params.get("color_1"), Some(FilterParamValue::Str(s)) if s == "blue"));
     }
 
+    /// #344: the filter-only check runs on the command the builder produces,
+    /// so a builder that grew a vector clause (or any non-metadata option)
+    /// fails here, not only a filter expression that carried one.
+    #[test]
+    fn filter_only_commands_as_built_are_metadata_only() {
+        for cond in [
+            serde_json::json!({"and":[{"color":{"match":{"value":"KNN"}}}]}),
+            serde_json::json!({"and":[{"size":{"range":{"gte":1,"lt":5}}},
+                                      {"color":{"match":{"any":["a","=>[KNN 1 @v $v]"]}}}]}),
+        ] {
+            let filter = parse_conditions(&cond).unwrap();
+            let cmd = super::build_filter_only_command("idx:t", 10, 1000, &filter);
+            super::check_filter_only_command(&cmd).unwrap_or_else(|e| panic!("{cond}: {e}"));
+            let wire = cmd.get_packed_command();
+            assert!(
+                String::from_utf8_lossy(&wire).contains("PARAMS"),
+                "operands travel as PARAMS"
+            );
+        }
+        // The same check refuses a command carrying a KNN clause.
+        let mut knn = super::build_filter_only_command(
+            "idx:t",
+            10,
+            1000,
+            &parse_conditions(&serde_json::json!({"and":[{"color":{"match":{"value":"r"}}}]}))
+                .unwrap(),
+        );
+        knn.arg("SORTBY").arg("__vector_score");
+        assert!(super::check_filter_only_command(&knn).is_err());
+    }
+
     #[test]
     fn match_any_int_list_emits_numeric_or() {
         let cond = serde_json::json!({"and":[{"size":{"match":{"any":[1,2]}}}]});
@@ -3305,8 +3922,7 @@ mod tests {
             "lt":  "2022-01-01T00:00:00Z"
         }}}]});
         let (q, params) = parse_conditions(&cond).unwrap();
-        assert!(q.contains("@ts:[$ts_0_gte +inf]"), "q={}", q);
-        assert!(q.contains("@ts:[-inf ($ts_0_lt]"), "q={}", q);
+        assert!(q.contains("@ts:[$ts_0_gte ($ts_0_lt]"), "q={}", q);
         // 2021-01-01T00:00:00Z == 1609459200, 2022-01-01T00:00:00Z == 1640995200.
         // Emitted as integer epoch params.
         assert!(matches!(
@@ -3317,6 +3933,78 @@ mod tests {
             params.get("ts_0_lt"),
             Some(FilterParamValue::Int(1640995200))
         ));
+    }
+
+    #[test]
+    fn range_encoding_preserves_parameters() {
+        let mut counter = 7;
+        let (query, params) = super::build_range_filter(
+            "n",
+            &serde_json::json!({"gte": "1.25", "lt": 9, "gt": "invalid"}),
+            &mut counter,
+        )
+        .unwrap();
+        assert_eq!(query, "@n:[$n_7_gte ($n_7_lt]");
+        assert_eq!(counter, 8);
+        assert_eq!(params.len(), 2);
+        assert!(matches!(params.get("n_7_gte"), Some(FilterParamValue::Float(v)) if *v == 1.25));
+        assert!(matches!(
+            params.get("n_7_lt"),
+            Some(FilterParamValue::Int(9))
+        ));
+    }
+
+    #[test]
+    fn only_emitted_range_parameters_identify_range_encoding() {
+        use vector_db_benchmark::redis_numeric_range::is_bound_parameter;
+
+        for (condition, expected) in [
+            (
+                serde_json::json!({"and": [{"n": {"range": {"gte": 1}}}]}),
+                true,
+            ),
+            (
+                serde_json::json!({"and": [{"n": {"range": {"gte": "invalid"}}}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"and": [{"n_lt": {"match": {"value": 1}}}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"and": [{"n_gte": {"match": {"value": "tag"}}}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"and": [
+                    {"n": {"range": {"gt": "invalid"}}},
+                    {"n_gt": {"match": {"value": 1}}}
+                ]}),
+                false,
+            ),
+            (
+                serde_json::json!({"and": [{"loc_lt": {"geo": {"lon": 0, "lat": 0, "radius": 1}}}]}),
+                false,
+            ),
+            (serde_json::json!({}), false),
+        ] {
+            let parsed = parse_conditions(&condition);
+            let has_range = parsed
+                .as_ref()
+                .is_some_and(|(_, params)| params.keys().any(|name| is_bound_parameter(name)));
+            assert_eq!(has_range, expected, "{condition}");
+        }
+    }
+
+    #[test]
+    fn ranges_on_separate_leaves_remain_separate() {
+        let (query, params) = parse_conditions(&serde_json::json!({"and": [
+            {"n": {"range": {"gte": 10}}},
+            {"n": {"range": {"lt": 20}}}
+        ]}))
+        .unwrap();
+        assert_eq!(query, "(@n:[$n_0_gte +inf] @n:[-inf ($n_1_lt])");
+        assert_eq!(params.len(), 2);
     }
 
     #[test]
@@ -3404,6 +4092,7 @@ mod tests {
             parallel: 1,
             skip_vector_index: false,
             hnsw_sq8: vector_db_benchmark::redis_hnsw_sq8::Sq8Options::default(),
+            layout: vector_db_benchmark::workload::IndexLayout::Vector,
             svs_graph_max_degree: None,
             svs_construction_window_size: None,
             svs_compression: None,
@@ -3953,10 +4642,10 @@ mod tests {
 
     #[test]
     fn range_two_sided_gte_lt() {
-        // Bounds are emitted in the fixed order lt, gt, lte, gte (space-joined).
+        // A single range leaf uses a single bounded iterator.
         assert_eq!(
             range_q(serde_json::json!({"gte":10,"lt":20})).unwrap(),
-            "@n:[-inf ($n_0_lt] @n:[$n_0_gte +inf]"
+            "@n:[$n_0_gte ($n_0_lt]"
         );
     }
 
@@ -4051,5 +4740,85 @@ mod tests {
     fn exact_match_array_value_is_none() {
         // A non-scalar (array) value matches no scalar arm → dropped → None.
         assert!(exact_q(serde_json::json!({"value":[1,2]})).is_none());
+    }
+}
+
+/// #341: every hybrid predicate the MS MARCO generator emits renders, through
+/// the real builder, to an expression the structural check accepts — so a
+/// builder regression (e.g. `or` emitted as implicit AND) is a test failure,
+/// not a recall dip.
+#[cfg(test)]
+mod hybrid_filter_tests {
+    use super::*;
+    use vector_db_benchmark::msmarco::derived::Predicate;
+    use vector_db_benchmark::msmarco::hybrid::{templates, TextTerms};
+
+    #[test]
+    fn the_builder_renders_every_hybrid_predicate_structurally() {
+        let terms = TextTerms {
+            common: ("quora".into(), 1),
+            rare: ("ancient".into(), 1),
+        };
+        let mut cases: Vec<serde_json::Value> = templates(&terms)
+            .into_iter()
+            .map(|t| t.conditions)
+            .collect();
+        // Shapes the generator does not emit today but the grammar allows.
+        cases.push(serde_json::json!({"and":[{"tier":{"match":{"any":[1,3]}}}]}));
+        cases.push(serde_json::json!({"and":[{"tier":{"match":{"value":3}}}]}));
+        cases.push(
+            serde_json::json!({"or":[{"and":[{"category":{"match":{"value":"cat00"}}},
+            {"tier":{"range":{"gt":2,"lte":7}}}]},{"title":{"match":{"text":"quora"}}}]}),
+        );
+        for c in cases {
+            let p = Predicate::compile(&c).unwrap();
+            let f = parse_conditions(&c).expect("builder renders a filter");
+            check_hybrid_filter(&p, &f).unwrap_or_else(|e| panic!("{c}: {e}"));
+        }
+    }
+}
+
+/// redis's readiness rule over the shared FT.INFO parse (#361).
+fn redis_index_ready(
+    p: &vector_db_benchmark::indexing_wait::FtInfoProgress,
+    expected: usize,
+) -> Result<bool, String> {
+    vector_db_benchmark::indexing_wait::ft_info_ready("redis", p, expected as u64, false)
+}
+
+#[cfg(test)]
+mod redis_index_ready_tests {
+    use super::*;
+    use vector_db_benchmark::indexing_wait::parse_ft_info;
+
+    fn bulk(s: &str) -> redis::Value {
+        redis::Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    /// #361 review: a redis FT.INFO without `num_docs` fails fast (absent is
+    /// not 0), an unparsable one names the field, and a complete reply is ready.
+    #[test]
+    fn redis_wait_treats_absent_num_docs_as_an_error_not_zero() {
+        let missing = redis::Value::Array(vec![bulk("indexing"), bulk("0")]);
+        let e = redis_index_ready(&parse_ft_info(&missing).unwrap(), 5).unwrap_err();
+        assert!(e.starts_with("redis: FT.INFO reports no num_docs"), "{e}");
+        let garbage = redis::Value::Array(vec![bulk("num_docs"), bulk("n/a")]);
+        assert!(parse_ft_info(&garbage).is_err());
+        let done = redis::Value::Array(vec![
+            bulk("num_docs"),
+            bulk("5"),
+            bulk("indexing"),
+            bulk("0"),
+            bulk("percent_indexed"),
+            bulk("1"),
+        ]);
+        assert_eq!(
+            redis_index_ready(&parse_ft_info(&done).unwrap(), 5),
+            Ok(true)
+        );
+        assert_eq!(
+            redis_index_ready(&parse_ft_info(&done).unwrap(), 6),
+            Ok(false)
+        );
     }
 }

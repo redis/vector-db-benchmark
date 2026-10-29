@@ -8,9 +8,11 @@ pub mod metadata;
 mod multivector_reader;
 mod npy_reader;
 mod sparse_reader;
+pub mod stream_reader;
 
 pub use compound_reader::{
     read_compound_data, read_compound_queries, read_compound_vectors_only, read_payloads_jsonl,
+    visit_compound_metadata,
 };
 pub use hdf5_reader::{hdf5_train_row_count, read_hdf5_vectors};
 pub use jsonl_reader::{read_jsonl_queries, read_jsonl_vectors};
@@ -22,6 +24,9 @@ pub use npy_reader::{npy_row_count, read_npy_vectors, write_npy_vectors};
 pub use sparse_reader::{
     csr_row_count, read_gt_neighbours, read_sparse_matrix, write_gt_neighbours,
     write_sparse_matrix, SparseVector,
+};
+pub use stream_reader::{
+    f32_npy_layout, normalize_row, streamable_layout, Batch, CompoundStream, F32NpyLayout, RawBatch,
 };
 
 #[cfg(test)]

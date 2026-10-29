@@ -1,0 +1,67 @@
+[
+  {
+    "name": "redis-msmarco-fulltext-english",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 64
+    },
+    "search_params": [
+      {
+        "parallel": 8,
+        "top": 10,
+        "workload": "fulltext",
+        "fulltext": {
+          "fields": {
+            "title": 5.0,
+            "headings": 3.0,
+            "segment": 1.0
+          }
+        }
+      },
+      {
+        "parallel": 1,
+        "top": 10,
+        "workload": "fulltext",
+        "fulltext": {
+          "fields": {
+            "segment": 1.0
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "redis-msmarco-fulltext-parity",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 64
+    },
+    "search_params": [
+      {
+        "parallel": 1,
+        "top": 10,
+        "workload": "fulltext",
+        "fulltext": {
+          "analysis": "parity",
+          "fields": {
+            "segment": 1.0
+          }
+        }
+      }
+    ]
+  }
+]

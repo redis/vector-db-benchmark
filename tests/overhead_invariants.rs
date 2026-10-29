@@ -665,17 +665,12 @@ fn fan_out_harnesses() -> Vec<FanOut> {
 const UNGATED_FANOUT_DEBT: &[(&str, &str, &str)] = &[
     (
         "redis.rs",
-        "search_filter_only",
-        "#266: --skip-vector-index path never converted to WorkerPool",
-    ),
-    (
-        "redis.rs",
         "search_mixed",
         "#266: --update-search-ratio path never converted to WorkerPool",
     ),
     (
         "valkey.rs",
-        "search_filter_only",
+        "search_filter_only_harness",
         "#266: --skip-vector-index path never converted to WorkerPool",
     ),
     (
@@ -873,7 +868,7 @@ fn inv4_search_harnesses_route_through_the_start_gate() {
 ///
 /// Pins the two properties INV-4b's correctness rests on:
 /// 1. brace-matched bodies do not bleed into the next function (mongodb's
-///    `search`, `search_mixed` and `search_filter_only` are three separate
+///    `search_impl`, `search_mixed` and `search_filter_only_harness` are three separate
 ///    harnesses, and each must see only its own gate);
 /// 2. upload fan-outs are classified untimed, timed ones are not.
 #[test]
@@ -894,7 +889,9 @@ fn fan_out_census_separates_each_harness_from_its_neighbours() {
 
     // mongodb has three search fan-outs in one file; brace matching must keep
     // each one's gate to itself. If bodies bled, all three would look gated.
-    for func in ["search", "search_mixed", "search_filter_only"] {
+    // #344 moved these bodies behind the trait's workload arms: `search_impl`
+    // (vector) and `search_filter_only_harness` are the fan-outs now.
+    for func in ["search_impl", "search_mixed", "search_filter_only_harness"] {
         let h = find("mongodb_engine.rs", func);
         assert!(
             h.body.contains("WorkerPool::new("),

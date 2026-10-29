@@ -3,6 +3,7 @@
 # Targets:
 #   make setup               - Install system deps and Rust toolchain
 #   make install             - Build and install binary to PREFIX (/usr/local)
+#   make install-release     - Download + verify a prebuilt release for this host
 #   make vector-db-benchmark - Build the main CLI binary
 #   make test                - Run Rust unit tests (no docker needed)
 #   make integration-test    - Run integration tests (requires redis:8.6.0 docker)
@@ -97,6 +98,41 @@ install: build
 	@echo "Installed: $(PREFIX)/bin/vector-db-benchmark"
 
 # ============================================================
+# PREBUILT RELEASE ARCHIVES (#366) — .github/workflows/release-binaries.yml
+# runs these on every release and on PRs that touch the build.
+# ============================================================
+
+# Download the prebuilt archive for this host from a GitHub release, verify its
+# checksum and extract it. TAG defaults to the latest release, DEST to
+# ./vector-db-benchmark-<tag>.
+.PHONY: install-release
+install-release:
+	bash scripts/install-release.sh "$(TAG)" "$(DEST)"
+
+# Build + package one target: dist/vector-db-benchmark-<TAG>-<platform>.tar.gz.
+# Statically links HDF5/zlib/OpenSSL (--features release-static), needs cmake
+# and a clean tree. RELEASE=1 also requires TAG to name the crate version.
+RELEASE_TARGET ?= $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+RELEASE_OUT ?= dist
+.PHONY: release-archive
+release-archive:
+	@test -n "$(TAG)" || { echo "usage: make release-archive TAG=<tag> [RELEASE_TARGET=<triple>] [RELEASE=1]"; exit 2; }
+	bash scripts/release/package.sh --target "$(RELEASE_TARGET)" --tag "$(TAG)" --out "$(RELEASE_OUT)" $(if $(RELEASE),--release)
+
+# Self-test of the release shell logic (tag/version policy, SHA256SUMS checks,
+# unsafe-archive refusal, and publish.sh's refuse / resume / clobber decisions
+# against a fake gh). No network, no cargo; runs in the PR check.
+.PHONY: release-selftest
+release-selftest:
+	bash scripts/release/selftest.sh
+
+# Write, then re-check, SHA256SUMS over every archive in RELEASE_OUT.
+.PHONY: release-checksums
+release-checksums:
+	bash scripts/release/checksums.sh write "$(RELEASE_OUT)"
+	bash scripts/release/checksums.sh check "$(RELEASE_OUT)"
+
+# ============================================================
 # TEST - Run Rust unit tests with dataset coverage
 # ============================================================
 
@@ -104,6 +140,21 @@ install: build
 test:
 	@echo "=== Running Rust unit tests ==="
 	cargo test --lib --release -- --nocapture
+
+.PHONY: test-filter-only-debug
+test-filter-only-debug:
+	cargo test --lib filter_only::
+
+.PHONY: test-redis-numeric-range
+test-redis-numeric-range:
+	cargo test --lib redis_numeric_range:: --release
+	cargo test --lib redis_numeric_range::
+
+.PHONY: test-opensearch-maintenance
+test-opensearch-maintenance:
+	cargo test --bin vector-db-benchmark merge_bounds_are_resolved_when_the_engine_is_constructed --release
+	cargo test --lib opensearch_maintenance:: --release
+	cargo test --lib opensearch_maintenance::
 
 .PHONY: test-verbose
 test-verbose:
@@ -117,7 +168,7 @@ test-verbose:
 .PHONY: integration-test
 integration-test:
 	@echo "=== Starting redis:8.6.0 for integration tests ==="
-	docker compose -f tests/docker-compose.test.yml up -d --wait
+	docker compose -f tests/docker-compose.test.yml up -d redis --wait
 	@echo "=== Running integration tests ==="
 	cargo test --test integration_redis --release -- --nocapture --test-threads=1; \
 	EXIT_CODE=$$?; \
@@ -355,6 +406,8 @@ agent-check-test:
 	cargo test --test integration_cli --release
 	cargo test --test overhead_invariants --release
 	cargo test --test harness_invariants --release
+	@echo "=== streaming peak-memory suite (#342, counting allocator, no container) ==="
+	cargo test --test streaming_memory --release
 
 .PHONY: check-strict
 check-strict: fmt-check lint-strict
@@ -460,6 +513,10 @@ help:
 	@echo "                           Use this, not 'make check' — 'check' runs NO tests."
 	@echo "  make build             - Build Rust code in release mode"
 	@echo "  make install           - Build and install binary to PREFIX (default: /usr/local)"
+	@echo "  make install-release   - Download a prebuilt release for this host [TAG=] [DEST=]"
+	@echo "  make release-archive   - Package a prebuilt release archive TAG=<tag> [RELEASE_TARGET=]"
+	@echo "  make release-checksums - Write + check SHA256SUMS over RELEASE_OUT (default: dist)"
+	@echo "  make release-selftest  - Self-test the release scripts (publish logic vs a fake gh)"
 	@echo "  make test              - Run Rust unit tests (no docker needed)"
 	@echo "  make check             - Linting + formatting ONLY (no tests; see agent-check)"
 	@echo "  make check-strict      - Run linting with warnings as errors"
@@ -499,3 +556,26 @@ help:
 	@echo "Environment variables:"
 	@echo "  HDF5_DIR          - Path to HDF5 library (default: /usr/lib/<arch>/hdf5/serial)"
 
+
+# Instrument the actual CLI used by the integration harness, as well as library
+# and binary unit tests. Requires cargo-llvm-cov and rustup llvm-tools-preview.
+# Keep coverage artifacts separate from normal builds and emit portable reports.
+COVERAGE_DIR ?= $(CURDIR)/target/filter-only-coverage
+.PHONY: coverage-filter-only
+coverage-filter-only:
+	@set -eu; \
+	export CARGO_TARGET_DIR="$(COVERAGE_DIR)"; \
+	eval "$$(cargo llvm-cov show-env --sh)"; \
+	cargo llvm-cov clean --workspace; \
+	$(MAKE) agent-check-test; \
+	$(MAKE) integration-test; \
+	$(MAKE) integration-test-opensearch; \
+	mkdir -p "$(COVERAGE_DIR)/reports"; \
+	cargo llvm-cov report --release --json --output-path "$(COVERAGE_DIR)/reports/coverage.json"; \
+	cargo llvm-cov report --release --lcov --output-path "$(COVERAGE_DIR)/reports/lcov.info"
+
+.PHONY: test-opensearch-query
+test-opensearch-query:
+	cargo test --bin vector-db-benchmark engine::opensearch:: --release
+	cargo test --lib opensearch_query:: --release
+	cargo test --lib opensearch_query::

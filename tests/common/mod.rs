@@ -12,6 +12,9 @@
 
 #![allow(dead_code)]
 
+/// One ingest, many workloads (#344) fixture and assertions.
+pub mod shared_index;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1812,10 +1815,7 @@ fn write_neighbours(ds_dir: &Path, neighbours: &[Vec<i64>]) {
 /// Path to the compiled binary under test. Cargo exports
 /// `CARGO_BIN_EXE_vector-db-benchmark` to integration tests automatically.
 pub fn binary_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("CARGO_BIN_EXE_vector-db-benchmark") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/vector-db-benchmark")
+    PathBuf::from(env!("CARGO_BIN_EXE_vector-db-benchmark"))
 }
 
 /// Run the benchmark binary once for `engine`/`dataset`, with extra env vars
@@ -1994,6 +1994,23 @@ pub fn read_params_obj(root: &Path, engine: &str) -> serde_json::Value {
     read_result_doc(root, engine)["params"].clone()
 }
 
+/// The one result file under `results/` whose name matches `pattern` (a glob).
+pub fn read_result_file(root: &Path, pattern: &str) -> serde_json::Value {
+    let glob = glob::Pattern::new(pattern).unwrap();
+    let paths: Vec<_> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| glob.matches(&p.file_name().unwrap().to_string_lossy()))
+        .collect();
+    assert_eq!(
+        paths.len(),
+        1,
+        "expected one result file for {pattern}: {paths:?}"
+    );
+    serde_json::from_str(&fs::read_to_string(&paths[0]).unwrap()).unwrap()
+}
+
 /// The whole search-result document for `engine`.
 pub fn read_result_doc(root: &Path, engine: &str) -> serde_json::Value {
     let pattern = format!("{}-*-search-*.json", engine);
@@ -2008,6 +2025,22 @@ pub fn read_result_doc(root: &Path, engine: &str) -> serde_json::Value {
                 .matches(&p.file_name().unwrap().to_string_lossy())
         })
         .unwrap_or_else(|| panic!("no search result for {}", engine));
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The whole upload-result document for `engine` (#342: `results.upload_reader`).
+pub fn read_upload_doc(root: &Path, engine: &str) -> serde_json::Value {
+    let pattern = format!("{}-*-upload-*.json", engine);
+    let path = fs::read_dir(root.join("results"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            glob::Pattern::new(&pattern)
+                .unwrap()
+                .matches(&p.file_name().unwrap().to_string_lossy())
+        })
+        .unwrap_or_else(|| panic!("no upload result for {}", engine));
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -2559,4 +2592,1499 @@ fn claim_outcome(
             None
         }
     }
+}
+
+/// Pure scalar workload: exact keyword/int, strict/inclusive ranges, AND, OR,
+/// and an empty match. No vector ground truth is needed for these queries.
+pub fn write_filter_only_project(engine_configs_json: &str) -> (MatchAnyProject, u64, u64) {
+    let project = write_match_any_project("scalar-test", engine_configs_json, 4);
+    // Unequal bucket populations prevent a wrong equality value from passing
+    // merely because all categories happen to have the same cardinality.
+    let color = |id: usize| {
+        if id % 7 < 2 {
+            "red"
+        } else if id % 7 == 2 {
+            "Red"
+        } else {
+            "blue"
+        }
+    };
+    let payloads = (0..N_DOCS)
+        .map(|id| {
+            serde_json::json!({"color":color(id),"size":id % 11 + 1,"price": ([1.0,1.00000001,1.00000002][id % 3])})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        project.root.join("datasets/scalar-test/payloads.jsonl"),
+        payloads,
+    )
+    .unwrap();
+    let registry_path = project.root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["schema"]["price"] = serde_json::json!("float");
+    fs::write(registry_path, registry.to_string()).unwrap();
+    let queries = [
+        serde_json::json!({"and":[{"color":{"match":{"value":"red"}}}]}),
+        serde_json::json!({"and":[{"size":{"match":{"value":2}}}]}),
+        serde_json::json!({"and":[{"size":{"range":{"gt":1,"lte":2}}}]}),
+        serde_json::json!({"and":[{"size":{"range":{"gte":1,"lt":3}}}]}),
+        serde_json::json!({"and":[{"color":{"match":{"value":"red"}}},{"size":{"range":{"gte":2}}}]}),
+        serde_json::json!({"or":[{"color":{"match":{"value":"red"}}},{"size":{"match":{"value":2}}}]}),
+        serde_json::json!({"and":[{"color":{"match":{"value":"absent"}}}]}),
+        serde_json::json!({"and":[{"price":{"range":{"gt":1.0,"lte":1.000000015}}}]}),
+        serde_json::json!({"and":[{"color":{"match":{"value":"Red"}}}]}),
+    ];
+    let counts = filter_only_expected_counts();
+    let rows = queries
+        .iter()
+        .map(|condition| {
+            serde_json::json!({"query":[1.,0.,0.,0.],"conditions":condition,"closest_ids":[]})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(project.root.join("datasets/scalar-test/tests.jsonl"), rows).unwrap();
+    (
+        project,
+        counts.iter().sum(),
+        counts.iter().map(|n| (*n).min(3)).sum(),
+    )
+}
+
+pub fn assert_filter_only_results(root: &Path, engine: &str, total: u64, returned: u64) {
+    let doc = read_result_doc(root, engine);
+    let result = &doc["results"];
+    assert_eq!(doc["params"]["workload"], "filter-only");
+    assert_eq!(result["requested_queries"], 90);
+    assert_eq!(result["failed_queries"], 0);
+    assert_eq!(result["filter_only"]["result_limit"], 3);
+    assert_eq!(result["filter_only"]["retried_queries"], 0);
+    assert_eq!(result["filter_only"]["matched_documents_sum"], total * 10);
+    assert_eq!(
+        result["filter_only"]["returned_documents_sum"],
+        returned * 10
+    );
+    assert!(result.get("mean_recall").is_none());
+    assert!(result.get("mean_precision_at_returned").is_none());
+    for key in ["precisions_at_returned", "recalls", "mrrs", "ndcgs"] {
+        assert!(result.get(key).is_none(), "scalar result contains {key}");
+    }
+    let summaries: Vec<_> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with("-summary.json"))
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(summaries[0].path()).unwrap()).unwrap();
+    assert_eq!(summary["workload"], "filter-only");
+    assert!(summary.get("precision_summary").is_none());
+    assert!(summary["search_results"][0].get("mean_recall").is_none());
+}
+
+/// Independent oracle, using the fixture's document ids rather than the query
+/// translators. Each predicate is checked alone to prevent cancellation between
+/// wrong predicates from preserving the aggregate count.
+pub fn filter_only_expected_counts() -> [u64; 9] {
+    let mut counts = [0; 9];
+    for id in 0..N_DOCS {
+        let red = id % 7 < 2;
+        let size = id % 11 + 1;
+        let matches = [
+            red,
+            size == 2,
+            size > 1 && size <= 2,
+            (1..3).contains(&size),
+            red && size >= 2,
+            red || size == 2,
+            false,
+            id % 3 == 1,
+            id % 7 == 2,
+        ];
+        for (count, yes) in counts.iter_mut().zip(matches) {
+            *count += u64::from(yes);
+        }
+    }
+    counts
+}
+
+pub fn clear_result_files(root: &Path) {
+    for entry in fs::read_dir(root.join("results")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+pub fn assert_filter_only_predicates(
+    root: &Path,
+    config: &str,
+    engine: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+) {
+    let path = root.join("datasets/scalar-test/tests.jsonl");
+    let original = fs::read_to_string(&path).unwrap();
+    let rows: Vec<_> = original.lines().collect();
+    let counts = filter_only_expected_counts();
+    assert_eq!(rows.len(), counts.len());
+    for (predicate, (row, expected)) in rows.iter().zip(counts).enumerate() {
+        fs::write(&path, row).unwrap();
+        clear_result_files(root);
+        assert!(
+            run_binary_extra(
+                root,
+                config,
+                "scalar-test",
+                host,
+                envs,
+                &[
+                    "--skip-vector-index",
+                    "--skip-upload",
+                    "--queries",
+                    "1",
+                    "--keep-data",
+                    "--fail-on-dropped-queries"
+                ]
+            ),
+            "predicate {predicate}"
+        );
+        let doc = read_result_doc(root, engine);
+        assert_eq!(doc["results"]["requested_queries"], 1);
+        assert_eq!(doc["results"]["failed_queries"], 0);
+        assert_eq!(
+            doc["results"]["filter_only"]["matched_documents_sum"], expected,
+            "predicate {predicate}: {row}"
+        );
+        assert_eq!(
+            doc["results"]["filter_only"]["returned_documents_sum"],
+            expected.min(3),
+            "predicate {predicate}: {row}"
+        );
+    }
+    fs::write(path, original).unwrap();
+    clear_result_files(root);
+}
+
+/// Resize both corpus and query vectors so the scalar high-dimensional test
+/// remains a valid dataset; merely changing registry metadata would not do so.
+pub fn resize_filter_only_vectors(root: &Path, dimension: usize, distance: &str) {
+    let ds_dir = root.join("datasets/scalar-test");
+    let vectors = vec![vec![0.5f32; dimension]; N_DOCS];
+    write_npy_vectors(ds_dir.join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+    let path = ds_dir.join("tests.jsonl");
+    let rows = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            row["query"] = serde_json::json!(vec![0.5f32; dimension]);
+            row.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, rows).unwrap();
+    let registry_path = root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["vector_size"] = serde_json::json!(dimension);
+    registry[0]["distance"] = serde_json::json!(distance);
+    fs::write(registry_path, registry.to_string()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Per-query result dumps + compare-results (#343)
+// ---------------------------------------------------------------------------
+
+/// Every dump the run wrote into `dir`, parsed with the library reader.
+pub fn read_dumps(dir: &Path) -> Vec<vector_db_benchmark::results_dump::Dump> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("no dump dir {}: {e}", dir.display()))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|f| {
+            vector_db_benchmark::results_dump::read_dump(std::io::BufReader::new(
+                fs::File::open(f).unwrap(),
+            ))
+            .unwrap_or_else(|e| panic!("{}: {e}", f.display()))
+        })
+        .collect()
+}
+
+/// Run `compare-results a b --reference <reference>`; returns (exit ok, JSON report).
+pub fn run_compare(a: &Path, b: &Path, reference: &str) -> (bool, serde_json::Value) {
+    let json = a
+        .parent()
+        .unwrap()
+        .join(format!("compare-{reference}.json"));
+    let out = std::process::Command::new(binary_path())
+        .arg("compare-results")
+        .arg(a)
+        .arg(b)
+        .args(["--reference", reference, "--json"])
+        .arg(&json)
+        .output()
+        .expect("run compare-results");
+    if !out.status.success() {
+        eprintln!(
+            "compare-results stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let report = serde_json::from_str(&fs::read_to_string(&json).unwrap()).unwrap();
+    (out.status.success(), report)
+}
+
+/// Filter-only dump of [`write_filter_only_project`] at `top: 3`: one record per
+/// attempted query, the exact total the independent oracle expects, a complete
+/// page, and ids that are corpus ROW ids satisfying the predicate (checked for
+/// the `color == "red"` query, whose oracle is `id % 7 < 2`) — not engine keys.
+pub fn assert_filter_only_dump(dir: &Path, engine: &str, queries: usize) {
+    let dumps = read_dumps(dir);
+    assert_eq!(dumps.len(), 1, "one dump per (config, workload, parallel)");
+    let d = &dumps[0];
+    assert_eq!(d.header.engine, engine);
+    assert_eq!(d.header.workload.as_str(), "filter-only");
+    assert_eq!(d.header.top, 3);
+    assert_eq!(d.records.len(), queries, "a record per timed query");
+    let expected = filter_only_expected_counts();
+    for r in &d.records {
+        assert!(
+            r.error.is_none(),
+            "query {} failed: {:?}",
+            r.query_id,
+            r.error
+        );
+        let total = r.total.expect("filter-only records carry the exact total");
+        assert_eq!(total, expected[r.query_id], "query {}", r.query_id);
+        assert_eq!(r.ids.len() as u64, total.min(3), "query {}", r.query_id);
+        assert!(r.scores.is_none());
+        for id in &r.ids {
+            let row: usize = id
+                .parse()
+                .unwrap_or_else(|_| panic!("id {id:?} is not a corpus row id"));
+            assert!(row < N_DOCS, "row {row} outside the corpus");
+            if r.query_id == 0 {
+                assert!(row % 7 < 2, "row {row} does not satisfy color == red");
+            }
+        }
+    }
+}
+
+/// Vector dump: one record per query, ids are corpus rows, and the recall
+/// `compare-results` derives from the dump's own ground truth equals the
+/// `mean_recall` the run published — the dump describes the measured run.
+pub fn assert_vector_dump_matches_run(root: &Path, dir: &Path, engine: &str, result_prefix: &str) {
+    let dumps = read_dumps(dir);
+    assert_eq!(dumps.len(), 1);
+    let d = &dumps[0];
+    assert_eq!(d.header.engine, engine);
+    assert_eq!(d.header.workload.as_str(), "vector");
+    let results = read_results_obj(root, result_prefix);
+    assert_eq!(
+        d.records.len() as u64,
+        results["requested_queries"].as_u64().unwrap()
+    );
+    for r in &d.records {
+        assert!(r.error.is_none());
+        assert!(r.expected.is_some(), "vector records carry ground truth");
+        assert_eq!(r.scores.as_ref().map(Vec::len), Some(r.ids.len()));
+        for id in &r.ids {
+            assert!(id.parse::<usize>().unwrap() < N_DOCS);
+        }
+    }
+    let (ok, report) = run_compare(dir, dir, engine);
+    assert!(ok, "self-comparison must pass");
+    let shape = &report["pairs"][0]["shapes"][0];
+    assert_eq!(shape["overlap_at_k"], 1.0);
+    assert_eq!(shape["jaccard_at_k"], 1.0);
+    let recall = shape["recall_at_k_reference"].as_f64().unwrap();
+    let published = results["mean_recall"].as_f64().unwrap();
+    assert!(
+        (recall - published).abs() < 1e-9,
+        "dump recall {recall} != published mean_recall {published}"
+    );
+}
+
+/// Give every row of a [`write_filter_only_project`] fixture a `text` field
+/// `note` (declared in the schema) and return the declared field names, sorted.
+/// Datasets without a prepared query set must keep the pre-#340 filter-only
+/// layout: every declared field indexed, `text` included.
+pub fn add_text_field(root: &Path) -> Vec<String> {
+    let path = root.join("datasets/scalar-test/payloads.jsonl");
+    let lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(row, line)| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["note"] = serde_json::json!(format!("note {row}; free text"));
+            v.to_string()
+        })
+        .collect();
+    fs::write(&path, lines.join("\n")).unwrap();
+    let registry_path = root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["schema"]["note"] = serde_json::json!("text");
+    fs::write(&registry_path, registry.to_string()).unwrap();
+    let mut names: Vec<String> = registry[0]["schema"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Give every corpus row of a [`write_filter_only_project`] fixture a `docid`
+/// payload field (`doc-<row*3+7>`, deliberately not the row id) and declare it
+/// in the schema, so `--dump-results` resolves rows through the docid id space.
+/// Returns the row -> docid function the dump must agree with.
+pub fn add_docids(root: &Path) -> fn(usize) -> String {
+    fn docid(row: usize) -> String {
+        format!("doc-{}", row * 3 + 7)
+    }
+    let path = root.join("datasets/scalar-test/payloads.jsonl");
+    let lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(row, line)| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["docid"] = serde_json::json!(docid(row));
+            v.to_string()
+        })
+        .collect();
+    assert_eq!(lines.len(), N_DOCS);
+    fs::write(&path, lines.join("\n")).unwrap();
+    let registry_path = root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["schema"]["docid"] = serde_json::json!("keyword");
+    fs::write(registry_path, registry.to_string()).unwrap();
+    docid
+}
+
+/// The docid-space dump of a filter-only run over [`add_docids`]: header says
+/// `docid`, every id is the docid of a row that satisfies the predicate (for
+/// the `color == "red"` query, oracle `row % 7 < 2`), and totals match.
+pub fn assert_filter_only_docid_dump(dir: &Path, docid: fn(usize) -> String) {
+    use vector_db_benchmark::results_dump::IdSpace;
+    let dumps = read_dumps(dir);
+    assert_eq!(dumps.len(), 1);
+    let d = &dumps[0];
+    assert_eq!(
+        d.header.id_space,
+        IdSpace::Field {
+            field: "docid".into()
+        }
+    );
+    let red: std::collections::HashSet<String> =
+        (0..N_DOCS).filter(|r| r % 7 < 2).map(docid).collect();
+    let all: std::collections::HashSet<String> = (0..N_DOCS).map(docid).collect();
+    let expected = filter_only_expected_counts();
+    for r in &d.records {
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.total, Some(expected[r.query_id]));
+        for id in &r.ids {
+            assert!(all.contains(id), "{id} is not a corpus docid");
+            if r.query_id == 0 {
+                assert!(red.contains(id), "{id} is not the docid of a red row");
+            }
+        }
+    }
+    assert!(
+        d.records
+            .iter()
+            .any(|r| r.query_id == 0 && !r.ids.is_empty()),
+        "the red query must return ids for this check to mean anything"
+    );
+}
+
+// ── #339: ranked full-text (BM25) fixture ─────────────────────────────────
+
+/// Dataset name of [`write_bm25_project`].
+pub const BM25_DATASET: &str = "bm25-test";
+
+/// `(docid, title, headings, segment)`. Each row exists to make one claim
+/// observable on a live server; see [`assert_bm25_run`].
+const BM25_DOCS: [(&str, &str, &str, &str); 8] = [
+    // Boost direction: "apple" only in the title of d0, only in the segment of
+    // d1. A title boost ranks d0 first, a segment boost d1.
+    (
+        "d0",
+        "Apple orchard guide",
+        "Seasons",
+        "Planting trees in spring and autumn.",
+    ),
+    (
+        "d1",
+        "Orchard guide",
+        "Seasons",
+        "Apple trees in spring and autumn.",
+    ),
+    // Stemmer: "generously" is "generous" under Porter2 (Snowball English) and
+    // "gener" under Porter. "generation" is "generat" under Porter2 and also
+    // "gener" under Porter — so d3 is returned iff an engine stems with Porter.
+    ("d2", "Generous donors", "Charity", "A generous gift helps."),
+    ("d3", "Generation gap", "Family", "Each generation differs."),
+    // Tokenizer: RediSearch does not split on '\n', OpenSearch does.
+    ("d4", "Notes", "alpha\nbeta", "Greek letters."),
+    // Plural/stem match on both engines ("crossing" in title AND segment, so a
+    // parity index of headings + segment still holds it, unstemmed).
+    (
+        "d5",
+        "Zebra crossing rules",
+        "Roads",
+        "Pedestrians use the crossing here.",
+    ),
+    // Stopword-only text.
+    ("d6", "The Who", "To be", "to be or not to be"),
+    ("d7", "Lorem ipsum", "Dolor", "Sit amet consectetur."),
+];
+
+/// `query_text` of each `tests.jsonl` line. Line 2 has no searchable term.
+pub const BM25_QUERIES: [&str; 6] = [
+    "apple",
+    "generously",
+    "the of and",
+    "beta",
+    "Zebra crossings!",
+    "crossings",
+];
+
+/// Write the BM25 fixture: 4-d random vectors (only so the corpus uploads
+/// through the vector layout), `docid` + three `text` fields, and a
+/// `query_text` on every test line.
+pub fn write_bm25_project(engine_configs_json: &str) -> MatchAnyProject {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let ds = root.join("datasets").join(BM25_DATASET);
+    fs::create_dir_all(&ds).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+    let mut rng = StdRng::seed_from_u64(0xB325);
+    let vectors: Vec<Vec<f32>> = (0..BM25_DOCS.len())
+        .map(|_| (0..4).map(|_| rng.gen_range(-1.0f32..1.0)).collect())
+        .collect();
+    write_npy_vectors(ds.join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+    let payloads = BM25_DOCS
+        .iter()
+        .map(|(docid, title, headings, segment)| {
+            serde_json::json!({"docid": docid, "title": title, "headings": headings, "segment": segment})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds.join("payloads.jsonl"), payloads).unwrap();
+    let tests = BM25_QUERIES
+        .iter()
+        .map(|q| {
+            serde_json::json!({"query": [1.0, 0.0, 0.0, 0.0], "closest_ids": [0], "query_text": q})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds.join("tests.jsonl"), tests).unwrap();
+    write_bm25_registry(&root, false);
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+    MatchAnyProject {
+        root,
+        dataset_name: BM25_DATASET.to_string(),
+        top: 5,
+        matching_docs: BM25_DOCS.len(),
+    }
+}
+
+/// (Re)write the fixture's dataset registry. `with_body` declares a fourth
+/// `text` field that no index built from the 3-field schema has.
+pub fn write_bm25_registry(root: &Path, with_body: bool) {
+    let mut schema = serde_json::json!({
+        "docid": "keyword", "title": "text", "headings": "text", "segment": "text"
+    });
+    if with_body {
+        schema["body"] = serde_json::json!("text");
+    }
+    let registry = serde_json::json!([{
+        "name": BM25_DATASET, "type": "tar", "path": format!("{BM25_DATASET}/"),
+        "distance": "l2", "vector_size": 4, "vector_count": BM25_DOCS.len(),
+        "schema": schema,
+    }]);
+    fs::write(root.join("datasets/datasets.json"), registry.to_string()).unwrap();
+}
+
+/// The two fulltext search configs [`assert_bm25_run`] expects: title-boosted
+/// (search config 0) and segment-boosted (search config 1).
+pub fn bm25_search_params() -> serde_json::Value {
+    serde_json::json!([
+        {"parallel": 2, "top": 5, "workload": "fulltext",
+         "fulltext": {"fields": {"title": 5.0, "headings": 1.0, "segment": 1.0}}},
+        {"parallel": 1, "top": 5, "workload": "fulltext",
+         "fulltext": {"fields": {"title": 1.0, "headings": 1.0, "segment": 5.0}}}
+    ])
+}
+
+/// Run the binary and return its full output (for refusal assertions).
+pub fn run_binary_output(
+    root: &Path,
+    engine: &str,
+    dataset: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+    extra: &[&str],
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(binary_path());
+    cmd.args([
+        "--engines",
+        engine,
+        "--datasets",
+        dataset,
+        "--host",
+        host,
+        "--skip-if-exists",
+        "false",
+    ])
+    .args(extra)
+    .current_dir(root);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run vector-db-benchmark")
+}
+
+/// Every claim the BM25 fixture makes, checked on one engine's run of
+/// [`bm25_search_params`] with `--dump-results <dump>`:
+///
+/// - result JSON: `workload: fulltext`, the configured boosts, the pinned
+///   stopword list and the engine's analyzer settings, the skipped query, no
+///   vector-quality keys;
+/// - dump: one record per eligible query (the termless one skipped), docids
+///   (not engine keys), descending scores;
+/// - boosts reach the server: "apple" ranks d0 first under the title boost
+///   and d1 first under the segment boost;
+/// - Porter2 on both engines: "generously" returns d2 and never d3;
+/// - "crossings" matches "crossing" (stemming applied at query and index time);
+/// - the newline tokenizer difference recorded in `known_differences`: "beta"
+///   (second line of d4's headings) is found by OpenSearch only.
+pub fn assert_bm25_run(root: &Path, dump: &Path, engine: &str, config: &str) {
+    use vector_db_benchmark::fulltext::STOPWORDS;
+    let docs: Vec<serde_json::Value> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().to_string();
+            n.starts_with(&format!("{config}-")) && n.contains("-search-")
+        })
+        .map(|p| serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(docs.len(), 2, "one result file per search config");
+    let boosts = [
+        serde_json::json!({"title": 5.0, "headings": 1.0, "segment": 1.0}),
+        serde_json::json!({"title": 1.0, "headings": 1.0, "segment": 5.0}),
+    ];
+    for doc in &docs {
+        let p = &doc["params"];
+        assert_eq!(p["workload"], "fulltext", "{doc}");
+        let ft = &p["fulltext"];
+        assert!(boosts.contains(&ft["fields"]), "{ft}");
+        assert_eq!(ft["engine"], engine);
+        assert_eq!(
+            ft["stopwords"]["list"],
+            serde_json::json!(STOPWORDS.as_slice())
+        );
+        assert_eq!(ft["queries_total"], 6);
+        assert_eq!(ft["queries_skipped_no_terms"], serde_json::json!([2]));
+        assert_eq!(ft["result_limit"], 5);
+        // A fresh index carries the marker this run wrote, read back.
+        assert_eq!(ft["index_marker"], ft["index_marker_expected"], "{ft}");
+        assert_eq!(ft["index_marker"]["analysis"], "english");
+        assert!(!ft["known_differences"].as_array().unwrap().is_empty());
+        match engine {
+            "redis" => {
+                assert_eq!(ft["engine_settings"]["scorer"], "BM25STD");
+                // Read back from the server, not assumed.
+                assert_eq!(
+                    ft["redis_min_stem_len"],
+                    serde_json::json!({"value": 4, "verified": true})
+                );
+            }
+            _ => {
+                assert_eq!(
+                    ft["engine_settings"]["index"]["analysis"]["filter"]
+                        ["vdbb_english_porter2_stemmer"]["language"],
+                    "porter2"
+                );
+                // Read back from the live index, not the config.
+                assert_eq!(ft["number_of_shards"], 1);
+            }
+        }
+        let r = &doc["results"];
+        assert_eq!(r["requested_queries"], 5, "termless query not dispatched");
+        assert_eq!(r["failed_queries"], 0);
+        for key in ["mean_recall", "mean_precision_at_returned", "mean_ndcg"] {
+            assert!(r.get(key).is_none(), "fulltext result carries {key}");
+        }
+        assert_eq!(doc["metrics_schema"]["workload"], "fulltext");
+    }
+
+    let dumps = read_dumps(dump);
+    assert_eq!(dumps.len(), 2, "one dump per search config");
+    let mut by_config: std::collections::BTreeMap<usize, _> = Default::default();
+    for d in &dumps {
+        assert_eq!(d.header.engine, engine);
+        assert_eq!(d.header.workload.as_str(), "fulltext");
+        assert_eq!(d.header.top, 5);
+        assert_eq!(d.records.len(), 5, "a record per eligible query");
+        let mut per_query = std::collections::BTreeMap::new();
+        for r in &d.records {
+            assert!(
+                r.error.is_none(),
+                "query {} failed: {:?}",
+                r.query_id,
+                r.error
+            );
+            assert_ne!(r.query_id, 2, "the termless query must not be dispatched");
+            // An empty answer has no scores (results_dump omits the key).
+            let empty = Vec::new();
+            let scores = match &r.scores {
+                Some(s) => s,
+                None if r.ids.is_empty() => &empty,
+                None => panic!("fulltext records carry scores: {:?}", r.ids),
+            };
+            assert_eq!(scores.len(), r.ids.len());
+            assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+            assert!(r.ids.iter().all(|id| id.starts_with('d')), "{:?}", r.ids);
+            per_query.insert(r.query_id, r.ids.clone());
+        }
+        by_config.insert(d.header.search_id, per_query);
+    }
+    let title = &by_config[&0];
+    let segment = &by_config[&1];
+    assert_eq!(
+        &title[&0][..2],
+        ["d0", "d1"],
+        "title boost: {:?}",
+        title[&0]
+    );
+    assert_eq!(
+        &segment[&0][..2],
+        ["d1", "d0"],
+        "segment boost: {:?}",
+        segment[&0]
+    );
+    for q in [title, segment] {
+        assert_eq!(q[&1], ["d2"], "Porter2 on {engine}: {:?}", q[&1]);
+        assert_eq!(q[&4].first().map(String::as_str), Some("d5"), "{:?}", q[&4]);
+        // Stemmed: "crossings" finds "crossing".
+        assert_eq!(q[&5], ["d5"], "stemming on {engine}: {:?}", q[&5]);
+        let beta: &[&str] = if engine == "redis" { &[] } else { &["d4"] };
+        assert_eq!(q[&3], beta, "newline tokenization on {engine}");
+    }
+    // compare-results accepts fulltext dumps (self-comparison is perfect).
+    let (ok, report) = run_compare(dump, dump, engine);
+    assert!(ok, "self-comparison must pass: {report}");
+    for pair in report["pairs"].as_array().unwrap() {
+        assert_eq!(pair["workload"], "fulltext", "{pair}");
+    }
+}
+
+// ── #339 follow-up: parity analysis on the BM25 fixture ───────────────────
+
+/// Two parity search configs over the same field set (headings + segment;
+/// title is NOT indexed), differing in boosts and `parallel` (the
+/// compare-results pairing key).
+pub fn bm25_parity_search_params() -> serde_json::Value {
+    serde_json::json!([
+        {"parallel": 2, "top": 5, "workload": "fulltext",
+         "fulltext": {"analysis": "parity", "fields": {"headings": 1.0, "segment": 1.0}}},
+        {"parallel": 1, "top": 5, "workload": "fulltext",
+         "fulltext": {"analysis": "parity", "fields": {"headings": 1.0, "segment": 3.0}}}
+    ])
+}
+
+/// Every claim parity makes, on one engine's run of
+/// [`bm25_parity_search_params`] with `--dump-results <dump>`:
+///
+/// - result JSON records `analysis: parity`, the whitespace normalization, the
+///   indexed text fields and the index marker;
+/// - no stemming: "generously" finds nothing (d2 holds only "generous") and
+///   "crossings" no longer finds "crossing" (d5) — both found in english mode;
+/// - newlines split identically: "beta" (second line of d4's headings) is
+///   found on BOTH engines (english: OpenSearch only);
+/// - only the searched fields are indexed: "apple" finds d1 (segment) but not
+///   d0 (title only), and "zebra crossings" (zebra: title only) finds nothing.
+pub fn assert_bm25_parity_run(root: &Path, dump: &Path, engine: &str, config: &str) {
+    let docs: Vec<serde_json::Value> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().to_string();
+            n.starts_with(&format!("{config}-")) && n.contains("-search-")
+        })
+        .map(|p| serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(docs.len(), 2, "one result file per search config");
+    for doc in &docs {
+        let ft = &doc["params"]["fulltext"];
+        assert_eq!(doc["params"]["workload"], "fulltext");
+        assert_eq!(ft["analysis"], "parity", "{ft}");
+        assert_eq!(ft["normalize_whitespace"], true);
+        assert_eq!(
+            ft["indexed_text_fields"],
+            serde_json::json!(["headings", "segment"])
+        );
+        assert_eq!(
+            ft["index_marker"],
+            serde_json::json!({"analysis": "parity", "normalize_whitespace": true,
+                               "text_fields": ["headings", "segment"]})
+        );
+        match engine {
+            "redis" => assert!(ft["engine_settings"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("VERBATIM")),
+            _ => assert_eq!(
+                ft["engine_settings"]["index"]["analyzer"],
+                "vdbb_english_nostem"
+            ),
+        }
+        assert_eq!(doc["results"]["failed_queries"], 0);
+        assert_eq!(doc["results"]["requested_queries"], 5);
+    }
+    let dumps = read_dumps(dump);
+    assert_eq!(dumps.len(), 2, "one dump per search config");
+    for d in &dumps {
+        assert_eq!(d.header.engine, engine);
+        let q: std::collections::BTreeMap<usize, Vec<String>> = d
+            .records
+            .iter()
+            .map(|r| {
+                assert!(
+                    r.error.is_none(),
+                    "query {} failed: {:?}",
+                    r.query_id,
+                    r.error
+                );
+                (r.query_id, r.ids.clone())
+            })
+            .collect();
+        let none: Vec<String> = Vec::new();
+        assert_eq!(q[&0], ["d1"], "only the searched fields: {:?}", q[&0]);
+        assert_eq!(
+            q[&1], none,
+            "no stemming: generously ≠ generous: {:?}",
+            q[&1]
+        );
+        assert_eq!(
+            q[&3],
+            ["d4"],
+            "newlines normalized on {engine}: {:?}",
+            q[&3]
+        );
+        assert_eq!(q[&4], none, "zebra is in the unindexed title: {:?}", q[&4]);
+        assert_eq!(
+            q[&5], none,
+            "no stemming: crossings ≠ crossing: {:?}",
+            q[&5]
+        );
+    }
+    let (ok, report) = run_compare(dump, dump, engine);
+    assert!(ok, "self-comparison must pass: {report}");
+}
+
+// ---------------------------------------------------------------------------
+// MS MARCO-shaped filter-only fixture (#340 query side)
+// ---------------------------------------------------------------------------
+
+/// Rows in [`write_msmarco_filter_project`]'s corpus.
+pub const MSM_DOCS: usize = 2000;
+/// Dataset name of [`write_msmarco_filter_project`]: a registered MS MARCO
+/// variant name (in the fixture's own registry, at 2,000 rows), so the
+/// loader's stale-directory check (`derived::check_prepared_dir`) applies to
+/// it exactly as to the real corpus.
+pub const MSM_DATASET: &str = "msmarco-cohere-1024-100K-cosine";
+
+/// A small corpus with the MS MARCO schema — real-looking metadata (`docid`,
+/// `url` with `;` and edge whitespace as the real corpus has, `text` fields,
+/// offsets) plus the four derived fields from `msmarco::derived` — and a
+/// prepared `filter_queries.jsonl` covering all six shapes, whose
+/// `expected_count`s come from an INDEPENDENT oracle over the derived values
+/// (plain comparisons here, not `derived::Predicate`).
+pub struct MsmarcoFilterProject {
+    pub root: PathBuf,
+    /// Per prepared query, in file order: (shape, expected_count).
+    pub queries: Vec<(String, u64)>,
+}
+
+impl MsmarcoFilterProject {
+    pub fn dataset_dir(&self) -> PathBuf {
+        self.root.join("datasets").join(MSM_DATASET)
+    }
+
+    /// Exact total expected for the run's `n`-query cycle over the set.
+    pub fn cycled_total(&self, n: usize) -> u64 {
+        (0..n).map(|i| self.queries[i % self.queries.len()].1).sum()
+    }
+
+    /// Rewrite payloads.jsonl WITHOUT the derived fields, as a pre-#340
+    /// tarball has them.
+    pub fn strip_derived_payload_fields(&self) {
+        let path = self.dataset_dir().join("payloads.jsonl");
+        let stripped = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+                for (name, _) in vector_db_benchmark::msmarco::derived::DERIVED_FIELDS {
+                    v.as_object_mut().unwrap().remove(*name);
+                }
+                v.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, stripped).unwrap();
+    }
+
+    /// Shift the expected counts of the listed queries by their deltas,
+    /// keeping every other row byte-identical.
+    pub fn tamper_expected_counts(&self, deltas: &[(usize, i64)]) {
+        let path = self.dataset_dir().join("filter_queries.jsonl");
+        let rows = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+                if let Some((_, d)) = deltas.iter().find(|(q, _)| *q == i) {
+                    let n = v["expected_count"].as_i64().unwrap() + d;
+                    v["expected_count"] = serde_json::json!(n);
+                }
+                v.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, rows + "\n").unwrap();
+    }
+}
+
+pub fn write_msmarco_filter_project(engine_configs_json: &str) -> MsmarcoFilterProject {
+    use vector_db_benchmark::msmarco::derived::{DerivedFields, CATEGORY_NAMES, RAND_KEY_SPAN};
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let ds_dir = root.join("datasets").join(MSM_DATASET);
+    fs::create_dir_all(&ds_dir).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+
+    let mut rng = StdRng::seed_from_u64(0x340);
+    let dim = 4;
+    let vectors: Vec<Vec<f32>> = (0..MSM_DOCS)
+        .map(|_| (0..dim).map(|_| rng.gen_range(-1.0f32..1.0)).collect())
+        .collect();
+    write_npy_vectors(ds_dir.join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+
+    let docid = |i: usize| format!("msmarco_v2.1_doc_fx_{}#{}_{}", i / 7, i % 7, i * 31);
+    let rows: Vec<DerivedFields> = (0..MSM_DOCS)
+        .map(|i| DerivedFields::from_docid(&docid(i)))
+        .collect();
+    let payloads = (0..MSM_DOCS)
+        .map(|i| {
+            // The real corpus has `;` and edge whitespace in `url`; neither
+            // may stop a run whose predicates never touch `url`.
+            let url = match i % 50 {
+                0 => format!("http://fx.example/{i};jsessionid=1"),
+                1 => format!(" http://fx.example/{i}"),
+                _ => format!("http://fx.example/{i}"),
+            };
+            let title = if i % 9 == 0 {
+                String::new()
+            } else {
+                format!("Title {i}; part")
+            };
+            let mut p = serde_json::json!({
+                "docid": docid(i),
+                "url": url,
+                "title": title,
+                "headings": format!("Heading {i}\nSub; heading\n"),
+                "segment": format!("Passage {i} text, with punctuation; and spaces "),
+                "start_char": (i * 13) as i64,
+                "end_char": (i * 13 + 400) as i64,
+            });
+            for (k, v) in rows[i].to_json_fields() {
+                p[k] = v;
+            }
+            p.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds_dir.join("payloads.jsonl"), payloads).unwrap();
+    // Query vectors with no conditions, exactly like the real tests.jsonl:
+    // a filter-only run that fell back to it would find no predicate.
+    let tests = (0..4)
+        .map(|i| {
+            serde_json::json!({"query": vectors[i], "conditions": null, "closest_ids": [i]})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds_dir.join("tests.jsonl"), tests).unwrap();
+
+    let key17 = rows[17].rand_key;
+    let tenth = RAND_KEY_SPAN / 10;
+    type Oracle = Box<dyn Fn(&DerivedFields) -> bool>;
+    let cat = |c: &DerivedFields| CATEGORY_NAMES[c.category as usize];
+    let cases: Vec<(&str, serde_json::Value, Oracle)> = vec![
+        (
+            "tag_eq",
+            serde_json::json!({"and":[{"category":{"match":{"value":"cat00"}}}]}),
+            Box::new(move |r| cat(r) == "cat00"),
+        ),
+        (
+            "tag_eq",
+            serde_json::json!({"and":[{"category":{"match":{"any":["cat02","cat05"]}}}]}),
+            Box::new(move |r| cat(r) == "cat02" || cat(r) == "cat05"),
+        ),
+        (
+            "numeric_point",
+            serde_json::json!({"and":[{"rand_key":{"match":{"value":key17}}}]}),
+            Box::new(move |r| r.rand_key == key17),
+        ),
+        (
+            "numeric_point",
+            serde_json::json!({"and":[{"tier":{"match":{"value":3}}}]}),
+            Box::new(|r| r.tier == 3),
+        ),
+        (
+            "numeric_range",
+            serde_json::json!({"and":[{"rand_key":{"range":{"lt":tenth}}}]}),
+            Box::new(move |r| r.rand_key < tenth),
+        ),
+        (
+            "numeric_range",
+            serde_json::json!({"and":[{"doc_len":{"range":{"gte":1024,"lt":4096}}}]}),
+            Box::new(|r| (1024..4096).contains(&r.doc_len)),
+        ),
+        (
+            "repeated_value_range",
+            serde_json::json!({"and":[{"tier":{"range":{"gte":2,"lte":3}}}]}),
+            Box::new(|r| (2..=3).contains(&r.tier)),
+        ),
+        (
+            "tag_and_range",
+            serde_json::json!({"and":[{"category":{"match":{"value":"cat01"}}},{"tier":{"range":{"lte":4}}}]}),
+            Box::new(move |r| cat(r) == "cat01" && r.tier <= 4),
+        ),
+        (
+            "range_or_range",
+            serde_json::json!({"or":[{"tier":{"range":{"lte":0}}},{"doc_len":{"range":{"gte":32768}}}]}),
+            Box::new(|r| r.tier == 0 || r.doc_len >= 32768),
+        ),
+    ];
+    let mut queries = Vec::new();
+    let lines = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (shape, conditions, oracle))| {
+            let count = rows.iter().filter(|r| oracle(r)).count() as u64;
+            assert!(count > 0, "fixture query {i} matches nothing");
+            queries.push((shape.to_string(), count));
+            serde_json::json!({
+                "query_id": format!("fx-filter-{i:03}"), "shape": shape,
+                "conditions": conditions, "expected_count": count,
+                "corpus_size": MSM_DOCS,
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds_dir.join("filter_queries.jsonl"), lines + "\n").unwrap();
+
+    let datasets_json = serde_json::json!([{
+        "name": MSM_DATASET, "type": "tar", "path": format!("{MSM_DATASET}/"),
+        "distance": "cosine", "vector_size": dim, "vector_count": MSM_DOCS,
+        "schema": {
+            "docid": "keyword", "url": "keyword", "title": "text", "headings": "text",
+            "segment": "text", "start_char": "int", "end_char": "int",
+            "category": "keyword", "doc_len": "int", "tier": "int", "rand_key": "int"
+        },
+    }]);
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+    MsmarcoFilterProject { root, queries }
+}
+
+/// A `--queries n` filter-only run over [`write_msmarco_filter_project`]
+/// passed the per-query count gate: every answer checked, exact totals, no
+/// drops, no retries; and its dump carries each query's prepared shape and
+/// expected total, with `docid` external ids.
+pub fn assert_msmarco_filter_run(p: &MsmarcoFilterProject, engine: &str, n: usize, dump: &Path) {
+    let doc = read_result_doc(&p.root, engine);
+    let dumps = read_dumps(dump);
+    assert_eq!(dumps.len(), 1);
+    assert_msmarco_filter_result(p, &doc, n, &dumps[0]);
+}
+
+/// [`assert_msmarco_filter_run`] for a mixed engine config on the shared
+/// `full` index (#344): among its search results and dumps, the filter-only
+/// ones pass the same checks and say they ran on `full`, beside a vector
+/// result on the same index. Returns the filter-only result document.
+pub fn assert_msmarco_full_run(
+    p: &MsmarcoFilterProject,
+    n: usize,
+    dump: &Path,
+) -> serde_json::Value {
+    let docs: Vec<serde_json::Value> = fs::read_dir(p.root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|f| {
+            f.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("-search-")
+        })
+        .map(|f| serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap())
+        .collect();
+    assert_eq!(docs.len(), 2, "one vector and one filter-only result");
+    let by = |w: &str| {
+        docs.iter()
+            .find(|d| d["params"]["workload"] == w)
+            .unwrap_or_else(|| panic!("no {w} result"))
+            .clone()
+    };
+    let (vector, filter) = (by("vector"), by("filter-only"));
+    assert_eq!(vector["params"]["index_layout"], "full", "{vector}");
+    assert_eq!(filter["params"]["index_layout"], "full", "{filter}");
+    assert_eq!(filter["results"]["filter_only"]["index_layout"], "full");
+    let dumps = read_dumps(dump);
+    let d = dumps
+        .iter()
+        .find(|d| d.header.workload == vector_db_benchmark::workload::Workload::FilterOnly)
+        .expect("a filter-only dump");
+    assert_eq!(d.header.index_layout.as_deref(), Some("full"));
+    assert_msmarco_filter_result(p, &filter, n, d);
+    filter
+}
+
+fn assert_msmarco_filter_result(
+    p: &MsmarcoFilterProject,
+    doc: &serde_json::Value,
+    n: usize,
+    d: &vector_db_benchmark::results_dump::Dump,
+) {
+    let r = &doc["results"];
+    assert_eq!(doc["params"]["workload"], "filter-only");
+    assert_eq!(r["requested_queries"], n as u64);
+    assert_eq!(r["failed_queries"], 0);
+    assert_eq!(r["filter_only"]["retried_queries"], 0);
+    assert_eq!(r["filter_only"]["per_query_counts_checked"], n as u64);
+    assert_eq!(r["filter_only"]["matched_documents_sum"], p.cycled_total(n));
+    assert_eq!(d.records.len(), n);
+    assert_eq!(
+        d.header.id_space,
+        vector_db_benchmark::results_dump::IdSpace::Field {
+            field: "docid".into()
+        }
+    );
+    for rec in &d.records {
+        let (shape, expected) = &p.queries[rec.query_id];
+        assert_eq!(
+            rec.shape.as_deref(),
+            Some(shape.as_str()),
+            "{}",
+            rec.query_id
+        );
+        assert_eq!(rec.total, Some(*expected), "query {}", rec.query_id);
+        assert!(rec
+            .ids
+            .iter()
+            .all(|id| id.starts_with("msmarco_v2.1_doc_fx_")));
+    }
+}
+
+/// Run the binary expecting failure; returns stderr. Asserts no search result
+/// was written, so a refused run cannot leave a plausible artifact behind.
+pub fn run_binary_expect_failure(
+    root: &Path,
+    engine: &str,
+    dataset: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+    extra: &[&str],
+) -> String {
+    let out = std::process::Command::new(binary_path())
+        .args(["--engines", engine, "--datasets", dataset, "--host", host])
+        .args(["--skip-if-exists", "false"])
+        .args(extra)
+        .current_dir(root)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("run vector-db-benchmark");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "expected failure; stderr:\n{stderr}");
+    let searched = fs::read_dir(root.join("results"))
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().contains("-search-"));
+    assert!(!searched, "a refused run wrote a search result");
+    stderr
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid prefilter + KNN (#341)
+// ---------------------------------------------------------------------------
+
+/// Passages in the hybrid fixture: the smallest corpus on which the 0.1%
+/// bucket still matches >= `hybrid::MIN_MATCHES` rows.
+pub const HYBRID_N: usize = 20_000;
+/// Query vectors in the hybrid fixture: 4 per predicate, 12 per bucket.
+pub const HYBRID_QUERIES: usize = 48;
+
+/// A compound dataset shaped like the prepared MS MARCO corpus — real derived
+/// fields, titles with the agreement-safe text terms, cosine vectors — whose
+/// `hybrid_queries.jsonl` is written by the SAME library code
+/// `prepare-msmarco --add-hybrid-queries` runs (`msmarco::hybrid::prepare`).
+pub fn write_msmarco_hybrid_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+) -> MatchAnyProject {
+    use vector_db_benchmark::msmarco::hybrid as mh;
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let root = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+    let ds_dir = root.join("datasets").join(dataset_name);
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+    mh::write_fixture_corpus(&ds_dir, HYBRID_N, 16, HYBRID_QUERIES).unwrap();
+    let prepared = mh::prepare(&mh::HybridInputs::in_dir(&ds_dir), Some(HYBRID_N as u64)).unwrap();
+    mh::write_rows(
+        &ds_dir.join(vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE),
+        &prepared.rows,
+    )
+    .unwrap();
+    let datasets_json = serde_json::json!([{
+        "name": dataset_name,
+        "type": "tar",
+        "path": format!("{}/", dataset_name),
+        "distance": "cosine",
+        "vector_size": 16,
+        "vector_count": HYBRID_N,
+        "schema": {
+            "docid": "keyword", "title": "text", "category": "keyword",
+            "doc_len": "int", "tier": "int", "rand_key": "int"
+        },
+    }]);
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::to_string_pretty(&datasets_json).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        engine_configs_json,
+    )
+    .unwrap();
+    MatchAnyProject {
+        root,
+        dataset_name: dataset_name.to_string(),
+        top: TOP,
+        matching_docs: HYBRID_N,
+    }
+}
+
+/// The run published a per-bucket hybrid report (all four buckets, every
+/// query answered, recall@k at least `min_recall` in each), and its dump
+/// carries the bucket as each record's shape, the filtered truth as
+/// `expected`, docids as ids — and `compare-results` derives, per bucket, the
+/// same recall the run published. Returns the per-bucket engine evidence.
+///
+/// `layout` is the index layout the run must record (#344) in the hybrid
+/// search file's `params.index_layout` and in its dump header: `vector` for a
+/// hybrid-only config, `full` when the config also holds filter-only. Other
+/// workloads' search files and dumps in the same run are ignored here.
+pub fn assert_hybrid_run(
+    proj: &MatchAnyProject,
+    config: &str,
+    dump_dir: &Path,
+    min_recall: f64,
+    layout: &str,
+) -> Vec<serde_json::Value> {
+    let docs = search_docs_of_workload(&proj.root, config, "hybrid");
+    assert_eq!(docs.len(), 1, "{config}: one hybrid search file");
+    assert_eq!(
+        docs[0]["params"]["index_layout"], layout,
+        "{config}: {}",
+        docs[0]["params"]
+    );
+    let results = docs[0]["results"].clone();
+    let hybrid = &results["hybrid"];
+    let buckets = hybrid["buckets"]
+        .as_array()
+        .expect("results.hybrid.buckets");
+    let names: Vec<&str> = buckets
+        .iter()
+        .map(|b| b["bucket"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["50%", "10%", "1%", "0.1%"], "{config}");
+    assert_eq!(results["requested_queries"], HYBRID_QUERIES as u64);
+    let mut published = std::collections::HashMap::new();
+    for b in buckets {
+        let name = b["bucket"].as_str().unwrap();
+        assert_eq!(b["requested_queries"], 12, "{config} {name}");
+        assert_eq!(b["failed_queries"], 0, "{config} {name}");
+        let recall = b["mean_recall"].as_f64().unwrap();
+        eprintln!(
+            "{config} bucket {name}: recall@{}={recall:.4} rps={:.1} p50={:.3}ms p90={:.3}ms p99={:.3}ms evidence={}",
+            hybrid["top"],
+            b["rps"].as_f64().unwrap(),
+            b["p50_time"].as_f64().unwrap() * 1e3,
+            b["p90_time"].as_f64().unwrap() * 1e3,
+            b["p99_time"].as_f64().unwrap() * 1e3,
+            b["engine"]
+        );
+        assert!(recall >= min_recall, "{config} {name}: recall {recall}");
+        assert!(b["rps"].as_f64().unwrap() > 0.0);
+        let (p50, p90, p99) = (
+            b["p50_time"].as_f64().unwrap(),
+            b["p90_time"].as_f64().unwrap(),
+            b["p99_time"].as_f64().unwrap(),
+        );
+        assert!(0.0 < p50 && p50 <= p90 && p90 <= p99, "{config} {name}");
+        published.insert(name.to_string(), recall);
+    }
+    // The headline mean is the union of the four passes (12 queries each).
+    let mean: f64 = published.values().sum::<f64>() / 4.0;
+    assert!((results["mean_recall"].as_f64().unwrap() - mean).abs() < 1e-9);
+
+    let rows = vector_db_benchmark::hybrid::read_rows(
+        &proj
+            .root
+            .join("datasets")
+            .join(&proj.dataset_name)
+            .join(vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE),
+    )
+    .unwrap();
+    // Only the hybrid dump: a mixed config also dumps its other workloads.
+    let hybrid_dir = dump_dir.join("hybrid-only");
+    fs::create_dir_all(&hybrid_dir).unwrap();
+    for entry in fs::read_dir(dump_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|x| x == "jsonl") {
+            let dump = vector_db_benchmark::results_dump::read_dump(std::io::BufReader::new(
+                fs::File::open(&path).unwrap(),
+            ))
+            .unwrap();
+            if dump.header.workload.as_str() == "hybrid" {
+                fs::copy(&path, hybrid_dir.join(path.file_name().unwrap())).unwrap();
+            }
+        }
+    }
+    let dumps = read_dumps(&hybrid_dir);
+    assert_eq!(dumps.len(), 1);
+    let d = &dumps[0];
+    assert_eq!(d.header.workload.as_str(), "hybrid");
+    assert_eq!(d.header.index_layout.as_deref(), Some(layout), "{config}");
+    assert_eq!(d.records.len(), HYBRID_QUERIES);
+    for r in &d.records {
+        assert!(r.error.is_none(), "{:?}", r.error);
+        let row = &rows[r.query_id];
+        assert_eq!(r.shape.as_deref(), Some(row.bucket.as_str()));
+        let expected = r.expected.as_ref().expect("hybrid records carry truth");
+        assert_eq!(expected.len(), row.closest_ids.len().min(d.header.top));
+        for id in r.ids.iter().chain(expected) {
+            assert!(id.starts_with("fixture_doc_"), "{id} is not a docid");
+        }
+    }
+    let (ok, report) = run_compare(&hybrid_dir, &hybrid_dir, config);
+    assert!(ok, "self-comparison must pass");
+    let shapes = report["pairs"][0]["shapes"].as_array().unwrap();
+    assert_eq!(shapes.len(), 4);
+    for s in shapes {
+        let name = s["shape"].as_str().unwrap();
+        let recall = s["recall_at_k_reference"].as_f64().unwrap();
+        assert!(
+            (recall - published[name]).abs() < 1e-9,
+            "{config} {name}: dump recall {recall} != published {}",
+            published[name]
+        );
+    }
+    buckets.iter().map(|b| b["engine"].clone()).collect()
+}
+
+/// Every search result file of `config` whose `params.workload` is `workload`.
+pub fn search_docs_of_workload(
+    root: &Path,
+    config: &str,
+    workload: &str,
+) -> Vec<serde_json::Value> {
+    let pattern = glob::Pattern::new(&format!("{config}-*-search-*.json")).unwrap();
+    fs::read_dir(root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| pattern.matches(&p.file_name().unwrap().to_string_lossy()))
+        .map(|p| {
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(p).unwrap()).unwrap()
+        })
+        .filter(|d| d["params"]["workload"] == workload)
+        .collect()
+}
+
+/// Give [`write_msmarco_hybrid_project`]'s corpus a prepared
+/// `filter_queries.jsonl` (#340) over its derived fields, so one engine config
+/// can run hybrid AND filter-only on one shared `full` index (#344). Exact
+/// counts come from the oracle (`msmarco::derived::count_matches`) over the
+/// payloads as written. The full MS MARCO set needs more corpus than the
+/// fixture has (its rarest constant predicate would match nothing at 20K), so
+/// these are four of its shapes at fixture-sized selectivities. Returns the
+/// expected count per query, in file order.
+pub fn add_hybrid_filter_queries(proj: &MatchAnyProject) -> Vec<u64> {
+    use vector_db_benchmark::msmarco::derived::{count_matches, DerivedCorpus, Predicate};
+    let dir = proj.root.join("datasets").join(&proj.dataset_name);
+    let mut corpus = DerivedCorpus::new();
+    for line in fs::read_to_string(dir.join("payloads.jsonl"))
+        .unwrap()
+        .lines()
+    {
+        corpus
+            .push_payload(&serde_json::from_str(line).unwrap())
+            .unwrap();
+    }
+    let cases = [
+        (
+            "tag_eq",
+            serde_json::json!({"and":[{"category":{"match":{"value":"cat03"}}}]}),
+        ),
+        (
+            "numeric_range",
+            serde_json::json!({"and":[{"tier":{"range":{"gte":2,"lte":3}}}]}),
+        ),
+        (
+            "tag_and_range",
+            serde_json::json!({"and":[{"category":{"match":{"any":["cat01","cat07"]}}},{"doc_len":{"range":{"gte":1024}}}]}),
+        ),
+        (
+            "range_or_range",
+            serde_json::json!({"or":[{"tier":{"range":{"lte":0}}},{"doc_len":{"range":{"gte":32768}}}]}),
+        ),
+    ];
+    let mut counts = Vec::new();
+    let mut lines = String::new();
+    for (i, (shape, conditions)) in cases.iter().enumerate() {
+        let n = count_matches(corpus.rows(), &Predicate::compile(conditions).unwrap()).unwrap();
+        assert!(n > 0, "fixture filter query {i} matches nothing");
+        counts.push(n);
+        lines.push_str(
+            &serde_json::json!({
+                "query_id": format!("hyb-filter-{i:03}"), "shape": shape,
+                "conditions": conditions, "expected_count": n, "corpus_size": HYBRID_N,
+            })
+            .to_string(),
+        );
+        lines.push('\n');
+    }
+    fs::write(dir.join("filter_queries.jsonl"), lines).unwrap();
+    counts
+}
+
+/// The filter-only half of a hybrid + filter-only run on one shared `full`
+/// index (#341 x #344): ONE upload for both workloads, stamped `full` and
+/// naming both; the filter-only search file on `full` (params and stats) with
+/// every prepared query's count gate passed and the exact total.
+pub fn assert_hybrid_mix_filter_only(
+    proj: &MatchAnyProject,
+    config: &str,
+    stdout: &str,
+    counts: &[u64],
+) {
+    assert_eq!(
+        stdout.matches("Experiment stage: Upload").count(),
+        1,
+        "one ingest for hybrid and filter-only: {stdout}"
+    );
+    let pattern = glob::Pattern::new(&format!("{config}-*-upload-*.json")).unwrap();
+    let uploads: Vec<serde_json::Value> = fs::read_dir(proj.root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| pattern.matches(&p.file_name().unwrap().to_string_lossy()))
+        .map(|p| serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(uploads.len(), 1, "{config}: one upload file");
+    assert_eq!(uploads[0]["params"]["index_layout"], "full");
+    assert_eq!(
+        uploads[0]["params"]["index_workloads"],
+        serde_json::json!(["hybrid", "filter-only"])
+    );
+    let fo = search_docs_of_workload(&proj.root, config, "filter-only");
+    assert_eq!(fo.len(), 1, "{config}: one filter-only search file");
+    assert_eq!(fo[0]["params"]["index_layout"], "full");
+    let r = &fo[0]["results"];
+    assert_eq!(r["failed_queries"], 0, "{r}");
+    assert_eq!(r["requested_queries"], counts.len() as u64, "{r}");
+    assert_eq!(r["filter_only"]["index_layout"], "full", "{r}");
+    assert_eq!(
+        r["filter_only"]["per_query_counts_checked"],
+        counts.len() as u64,
+        "{r}"
+    );
+    assert_eq!(
+        r["filter_only"]["matched_documents_sum"],
+        counts.iter().sum::<u64>(),
+        "{r}"
+    );
+}
+
+/// Run the benchmark binary; returns (exit ok, stdout, stderr) so a test can
+/// assert WHY a run failed, not only that it did.
+pub fn run_binary_text(
+    root: &Path,
+    engine: &str,
+    dataset: &str,
+    host: &str,
+    envs: &[(&str, &str)],
+) -> (bool, String, String) {
+    let mut cmd = std::process::Command::new(binary_path());
+    cmd.args([
+        "--engines",
+        engine,
+        "--datasets",
+        dataset,
+        "--host",
+        host,
+        "--skip-if-exists",
+        "false",
+    ])
+    .current_dir(root);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("run vector-db-benchmark");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }

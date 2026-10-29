@@ -57,6 +57,11 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # The build context has no .git: name the commit for `--version` and
+          # `params.build.git_sha` (#366). Declared after the dependency layer
+          # in the Dockerfile, so it does not invalidate the cache.
+          build-args: |
+            VDB_BUILD_GIT_SHA=${{ github.sha }}
           tags: ${{ steps.docker_meta.outputs.tags }}
           labels: ${{ steps.docker_meta.outputs.labels }}
           cache-from: type=gha

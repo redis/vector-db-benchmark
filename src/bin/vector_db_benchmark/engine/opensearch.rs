@@ -12,22 +12,36 @@ use opensearch::cluster::ClusterHealthParts;
 use opensearch::http::request::JsonBody;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::indices::{
-    IndicesCreateParts, IndicesDeleteParts, IndicesForcemergeParts, IndicesPutSettingsParts,
+    IndicesCreateParts, IndicesDeleteParts, IndicesGetMappingParts, IndicesGetSettingsParts,
     IndicesRefreshParts,
 };
 use opensearch::params::WaitForStatus;
 use opensearch::{BulkParts, CountParts, OpenSearch, SearchParts};
 use uuid::Uuid;
+
+use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
+use vector_db_benchmark::workload::{IndexLayout, Workload};
 
 use crate::config::{EngineConfig, SearchParams};
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, UploadSource};
 use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
+/// Ranked full-text workload (#339).
+mod fulltext;
+/// Streaming upload from disk (#342).
+mod stream_upload;
+
 #[derive(Clone)]
 struct OpenSearchConfig {
+    skip_vector_index: bool,
+    /// The shared `full` index (#344): the k-NN mapping with `float` fields
+    /// mapped `double`, as filter-only needs them.
+    /// The index layout `configure()` builds (#344), resolved once from the
+    /// engine flags; every layout-dependent decision reads this.
+    layout: vector_db_benchmark::workload::IndexLayout,
     m: i64,
     ef_construction: i64,
     batch_size: usize,
@@ -37,14 +51,14 @@ struct OpenSearchConfig {
 }
 
 pub struct OpenSearchEngine {
+    scalar_metadata_validated: bool,
     name: String,
     index_name: String,
-    #[allow(dead_code)]
     timeout: u64,
     config: OpenSearchConfig,
     search_params: Vec<SearchParams>,
-    /// Per-attempt deadline for a force merge, and the wall-clock ceiling across
-    /// all its attempts. Both resolved in [`Self::new`] rather than inside
+    /// Per-request deadline for force merge, and the wall-clock ceiling across
+    /// asynchronous submission and task polling. Both resolved in [`Self::new`] rather than inside
     /// `force_merge`, because `force_merge` runs AFTER the whole upload: a
     /// malformed `OPENSEARCH_FORCE_MERGE_BUDGET=2h` parsed there would throw away
     /// a multi-hour ingest at the last step, which is the opposite of what
@@ -59,10 +73,29 @@ pub struct OpenSearchEngine {
     rt: tokio::runtime::Runtime,
     /// Shared OpenSearch client
     client: Arc<OpenSearch>,
+    /// One hybrid bucket pass (#341), consumed by the next `search_impl` in
+    /// place of the dataset's vector query set. Set only by `search_hybrid`
+    /// right before it calls `search_impl`; `take()`n at the read site.
+    hybrid_pass: Option<HybridPass>,
+}
+
+/// The query subset and its (already checked) filters for one hybrid pass.
+struct HybridPass {
+    queries: Vec<Vec<f32>>,
+    neighbors: Vec<Vec<i64>>,
+    filters: Vec<QueryFilter<serde_json::Value>>,
 }
 
 impl OpenSearchEngine {
     pub fn new(engine_config: &EngineConfig, host: &str) -> Result<Self, String> {
+        for params in engine_config.search_params.iter().flatten() {
+            if params.knob("knn.algo_param.ef_search").is_some() {
+                return Err("OpenSearch Lucene ignores knn.algo_param.ef_search; use search_params.ef for query-level effort".into());
+            }
+            vector_db_benchmark::opensearch_query::validate_ef(
+                params.search_params.as_ref().and_then(|p| p.ef),
+            )?;
+        }
         let port: u16 = crate::effective_config::env_parsed("OPENSEARCH_PORT", 9200);
 
         let index_name = crate::effective_config::env_or("OPENSEARCH_INDEX", "bench");
@@ -114,12 +147,18 @@ impl OpenSearchEngine {
         let client = create_os_client(&base_url, timeout)?;
 
         Ok(Self {
+            scalar_metadata_validated: false,
             name: engine_config.name.clone(),
             index_name,
             timeout,
             force_merge_deadline,
             force_merge_budget,
             config: OpenSearchConfig {
+                skip_vector_index: engine_config.skip_vector_index,
+                layout: vector_db_benchmark::workload::layout_from_flags(
+                    engine_config.skip_vector_index,
+                    engine_config.full_index_layout,
+                )?,
                 m,
                 ef_construction,
                 batch_size,
@@ -130,6 +169,7 @@ impl OpenSearchEngine {
             base_url,
             rt,
             client: Arc::new(client),
+            hybrid_pass: None,
         })
     }
 
@@ -181,12 +221,70 @@ impl OpenSearchEngine {
         )
     }
 
+    fn validate_filter_only_schema(&self, dataset: &Dataset) -> Result<(), String> {
+        let (properties, index) = self.realized_schema("filter-only")?;
+        // The realized layout must be the one this config built: `index.knn`
+        // off and the vector unindexed on the no-vector index, a k-NN index
+        // with filter-only scalar mappings on the shared `full` one (#344).
+        let validate = if self.config.layout == IndexLayout::Full {
+            vector_db_benchmark::filter_only::validate_opensearch_full_schema
+        } else {
+            vector_db_benchmark::filter_only::validate_opensearch_schema
+        };
+        validate(
+            &properties,
+            &index,
+            dataset.filter_only_index_schema()?.as_ref(),
+        )
+    }
+
+    /// The realized index: its mapping `properties` and its `settings.index`.
+    fn realized_schema(
+        &self,
+        what: &str,
+    ) -> Result<(serde_json::Value, serde_json::Value), String> {
+        let mapping = self
+            .rt
+            .block_on(async {
+                self.client
+                    .indices()
+                    .get_mapping(IndicesGetMappingParts::Index(&[&self.index_name]))
+                    .send()
+                    .await?
+                    .error_for_status_code()?
+                    .json::<serde_json::Value>()
+                    .await
+            })
+            .map_err(|e| format!("{what} mapping check failed: {e}"))?;
+        let settings = self
+            .rt
+            .block_on(async {
+                self.client
+                    .indices()
+                    .get_settings(IndicesGetSettingsParts::Index(&[&self.index_name]))
+                    .send()
+                    .await?
+                    .error_for_status_code()?
+                    .json::<serde_json::Value>()
+                    .await
+            })
+            .map_err(|e| format!("{what} settings check failed: {e}"))?;
+        Ok((
+            mapping[&self.index_name]["mappings"]["properties"].clone(),
+            settings[&self.index_name]["settings"]["index"].clone(),
+        ))
+    }
+
     fn create_index(&self, dataset: &Dataset) -> Result<(), String> {
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
 
         let dist_lower = distance.to_lowercase();
-        let space_type = resolve_index_space_type(&dist_lower, vector_size)?;
+        let space_type = if self.config.skip_vector_index {
+            "l2"
+        } else {
+            resolve_index_space_type(&dist_lower, vector_size)?
+        };
 
         // Build properties with knn_vector type
         let mut properties = serde_json::json!({
@@ -205,14 +303,26 @@ impl OpenSearchEngine {
             }
         });
 
-        // Add schema fields from dataset config
-        if let Some(schema) = &dataset.config.schema {
+        // Add schema fields from dataset config. With a prepared query set,
+        // filter-only maps only the fields its predicates reference (#340);
+        // with `dynamic: false` below, every other payload field stays in
+        // `_source`, unindexed. Without one the layout is the declared schema.
+        let narrowed = self.config.skip_vector_index && dataset.filter_query_file()?.is_some();
+        let schema = if self.config.skip_vector_index {
+            dataset.filter_only_index_schema()?
+        } else {
+            dataset.config.schema.clone()
+        };
+        if let Some(schema) = &schema {
             if let Some(schema_obj) = schema.as_object() {
                 let props = properties.as_object_mut().unwrap();
                 for (field_name, field_type) in schema_obj {
                     let ft = field_type.as_str().unwrap_or("");
                     let os_type = match ft {
                         "int" => "long",
+                        // Filter-only compares binary64 values, on its own
+                        // index or on the shared `full` one (#344).
+                        "float" if self.config.layout.serves(Workload::FilterOnly) => "double",
                         "geo" => "geo_point",
                         // "bool"/"datetime" are not valid OS types; map to the real
                         // ones. OS coerces the reader's "true"/"false" string into a
@@ -240,14 +350,31 @@ impl OpenSearchEngine {
             }
         }
 
-        let index_settings = build_index_settings(self.config.number_of_shards);
+        let mut index_settings = build_index_settings(self.config.number_of_shards);
+        // #339: a config that runs the fulltext workload analyzes its text
+        // fields with the pinned analyzer of its analysis mode (see
+        // `vector_db_benchmark::fulltext`); otherwise they keep `standard`.
+        let fulltext_meta = self
+            .fulltext_profile()?
+            .map(|p| self.pin_fulltext_analyzer(dataset, &p, &mut properties, &mut index_settings));
+        if self.config.skip_vector_index {
+            vector_db_benchmark::filter_only::disable_vector_index(
+                &mut properties,
+                &mut index_settings,
+            );
+        }
 
-        let body = serde_json::json!({
+        let mut mappings = serde_json::json!({ "properties": properties });
+        if narrowed {
+            mappings["dynamic"] = serde_json::json!(false);
+        }
+        let mut body = serde_json::json!({
             "settings": { "index": index_settings },
-            "mappings": {
-                "properties": properties,
-            }
+            "mappings": mappings,
         });
+        if let Some(meta) = fulltext_meta {
+            body["mappings"]["_meta"] = meta;
+        }
 
         // Same transient-state problem as delete_index: a cluster whose manager
         // thread pool is busy answers create-index with
@@ -398,43 +525,19 @@ impl OpenSearchEngine {
     /// policy's answer depends on ingest timing, batch size and thread count, so
     /// two runs of the *same* config can land on different segment counts. (#210)
     ///
-    /// Retried on the same transient states as the other index ops. This is the op
-    /// that most needs them: it is the longest-running of the four, it is what a
-    /// managed front door most often answers with 504, and it runs *after* the
-    /// whole ingest (see `upload`). Failing it un-retried discards a multi-hour
-    /// upload at the very last step — so the bulk-upload retries above would buy
-    /// nothing on the runs they were written for. `elasticsearch.rs` already
-    /// retries force-merge for exactly this reason.
-    ///
-    /// Merging to one segment makes this call substantially longer, which makes
-    /// the retry budget and the request timeout load-bearing together — see
-    /// [`resolve_force_merge_timeout`] for why the shared `OPENSEARCH_TIMEOUT` is
-    /// not the right bound here.
+    /// Submit an asynchronous merge and poll its task. A synchronous request can
+    /// receive a gateway 504 while the merge keeps running; retrying that POST
+    /// only waits on the same work. Transient requests retry; unfinished tasks do not
+    /// consume retries, and the total wall-clock budget bounds the entire wait.
     fn force_merge(&self) -> Result<(), String> {
         println!("Forcing merge into 1 segment...");
 
-        // Named for what it is rather than after the transport setter: a local
-        // called `request_timeout` is indistinguishable, to the shipped-config
-        // knob guard's token search, from an engine reading
-        // `connection_params.request_timeout` — which this does not do.
-        let merge_deadline = self.force_merge_deadline;
-        retry_index_op(
-            &self.rt,
-            "Force merge",
-            index_op_policy().with_budget(self.force_merge_budget),
-            |status| (200..300).contains(&status),
-            index_maintenance_retryable,
-            || {
-                self.rt.block_on(
-                    self.client
-                        .indices()
-                        .forcemerge(IndicesForcemergeParts::Index(&[&self.index_name]))
-                        .max_num_segments(1)
-                        .request_timeout(merge_deadline)
-                        .send(),
-                )
-            },
-        )?;
+        self.rt
+            .block_on(vector_db_benchmark::opensearch_maintenance::force_merge(
+                &self.client,
+                &self.index_name,
+                &self.merge_options(),
+            ))?;
 
         // A force merge alone does NOT change what queries search — without this
         // refresh the whole merge is a no-op that costs 20 minutes and 2x disk.
@@ -477,6 +580,17 @@ impl OpenSearchEngine {
         self.refresh()?;
 
         self.wait_for_cluster_health()
+    }
+
+    fn merge_options(&self) -> vector_db_benchmark::opensearch_maintenance::MergeOptions {
+        let policy = index_op_policy();
+        vector_db_benchmark::opensearch_maintenance::MergeOptions::from_resolved(
+            std::time::Duration::from_secs(self.timeout),
+            self.force_merge_deadline,
+            self.force_merge_budget,
+            policy.max_retries,
+            std::time::Duration::from_millis(policy.base_delay_ms),
+        )
     }
 
     /// Wait for the index to report at least yellow before the search phase runs.
@@ -584,43 +698,6 @@ impl OpenSearchEngine {
             backoff_sleep(policy.base_delay_ms, attempt);
             attempt += 1;
         }
-    }
-
-    /// Apply search-time settings (e.g., knn.algo_param.ef_search)
-    fn setup_search(&self, params: &SearchParams) -> Result<(), String> {
-        // Cold-cache graph loading is warmed uniformly by the per-worker prime
-        // query in `search` (mirrors redis/vertex), so no engine-specific
-        // server-side `_knn/warmup` call is needed here.
-        // Accepted flat (our configs) or nested under `search_params`/`config`
-        // (upstream's) — see SearchParams::knob.
-        let ef_search = params
-            .knob("knn.algo_param.ef_search")
-            .and_then(|v| v.as_i64());
-
-        if let Some(ef) = ef_search {
-            let body = serde_json::json!({
-                "index": {
-                    "knn.algo_param.ef_search": ef,
-                }
-            });
-
-            let resp = self
-                .rt
-                .block_on(
-                    self.client
-                        .indices()
-                        .put_settings(IndicesPutSettingsParts::Index(&[&self.index_name]))
-                        .body(body)
-                        .send(),
-                )
-                .map_err(|e| format!("Failed to apply search settings: {}", e))?;
-
-            if !resp.status_code().is_success() {
-                let text = self.rt.block_on(resp.text()).unwrap_or_default();
-                eprintln!("Warning: failed to set ef_search={}: {}", ef, text);
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1091,9 +1168,6 @@ fn backoff_sleep(base_delay_ms: u64, attempt: u32) -> std::time::Duration {
 struct RetryPolicy {
     max_retries: u32,
     base_delay_ms: u64,
-    /// Optional wall-clock ceiling across *all* attempts. `None` = bounded by
-    /// attempt count alone, which is only safe while each attempt is short.
-    budget: Option<std::time::Duration>,
 }
 
 impl RetryPolicy {
@@ -1101,13 +1175,7 @@ impl RetryPolicy {
         Self {
             max_retries: crate::effective_config::env_parsed(max_var, default_max),
             base_delay_ms: crate::effective_config::env_parsed(base_var, default_base_ms),
-            // #246's per-policy budget; kept as it landed.
-            budget: None,
         }
-    }
-
-    fn with_budget(self, budget: Option<std::time::Duration>) -> Self {
-        Self { budget, ..self }
     }
 }
 
@@ -1133,7 +1201,6 @@ fn retry_index_op<S>(
 where
     S: FnMut() -> Result<opensearch::http::response::Response, opensearch::Error>,
 {
-    let started = std::time::Instant::now();
     let mut attempt: u32 = 0;
     loop {
         let last_error = match send() {
@@ -1171,23 +1238,6 @@ where
                 "{} failed after {} retries: {}",
                 what, attempt, last_error
             ));
-        }
-        // Attempt count alone stops bounding anything once a single attempt may
-        // run for an hour (force merge), so an operation that asked for a
-        // wall-clock ceiling gets one. Checked before sleeping: there is no point
-        // backing off into a budget that is already spent.
-        if let Some(budget) = policy.budget {
-            let elapsed = started.elapsed();
-            if elapsed >= budget {
-                return Err(format!(
-                    "{} exceeded its {:.0}s wall-clock budget after {} retries ({:.0}s elapsed): {}",
-                    what,
-                    budget.as_secs_f64(),
-                    attempt,
-                    elapsed.as_secs_f64(),
-                    last_error
-                ));
-            }
         }
         backoff_sleep(policy.base_delay_ms, attempt);
         attempt += 1;
@@ -1338,25 +1388,9 @@ fn parse_env_secs(var: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// How long one force-merge attempt may block before the transport gives up.
-///
-/// `OPENSEARCH_TIMEOUT` (300 s) is the *client-wide* transport timeout, sized for
-/// queries and bulk requests. Applying it to a merge-to-one-segment of a large
-/// corpus guarantees a self-inflicted failure loop: every attempt aborts
-/// client-side at 300 s while the merge is still running server-side, the retry
-/// re-issues it, and all 11 attempts (10 retries) are spent on a merge that was
-/// always going to succeed — discarding the ingest the retries exist to protect.
-/// So force-merge gets its own, much larger bound.
-///
-/// Retrying is cheap when it does happen, measured rather than assumed: the
-/// client aborted at 3.0 s, the server kept merging for 108 s (`force_merge` pool
-/// `active=1` across 36 consecutive samples), and the re-issued request returned
-/// in 0.0 s. The pool is `fixed, size=1, queue_size=-1`, so a retry queues behind
-/// the running merge rather than being rejected, and then finds nothing left to
-/// do. Retries are therefore not N× the merge cost.
-///
-/// A free function so the rule is testable without an engine, a cluster, or
-/// environment mutation; the value is resolved once in `OpenSearchEngine::new`.
+/// Per-HTTP-request timeout for asynchronous merge submission and task polling.
+/// Retains the existing environment knob and default; the total operation is
+/// separately bounded by `resolve_force_merge_budget`.
 fn resolve_force_merge_timeout(
     client_timeout_secs: u64,
     override_secs: Option<u64>,
@@ -1373,22 +1407,9 @@ fn resolve_force_merge_timeout(
     }
 }
 
-/// Wall-clock ceiling on `force_merge` *including* its retries.
-///
-/// Per-attempt bounds stop bounding anything once the per-attempt bound is an
-/// hour: `retry_index_op` treats every transport error as retryable, so 11
-/// attempts × 3600 s is an ~11 h worst case for a single call. The search path
-/// has carried a wall-clock budget for exactly this reason (`SearchRetryPolicy`);
-/// raising the index path's per-attempt bound 12× without one would have left
-/// force-merge as the only unbounded operation in the engine.
-///
-/// Default: twice the per-attempt deadline — room for one full-length attempt
-/// plus one full-length retry, and no more. `OPENSEARCH_FORCE_MERGE_BUDGET`
-/// overrides it, with `0` meaning unlimited (the same convention as
-/// `OPENSEARCH_FORCE_MERGE_TIMEOUT`).
-///
-/// A free function, like [`resolve_force_merge_timeout`], so the knob has
-/// coverage that does not need an engine or a cluster.
+/// Wall-clock ceiling across asynchronous submission, polling and sleeps.
+/// Defaults to twice the per-request deadline for compatibility. Zero explicitly
+/// disables the total limit; malformed environment values fail before upload.
 fn resolve_force_merge_budget(
     per_attempt: std::time::Duration,
     override_secs: Option<u64>,
@@ -1587,43 +1608,19 @@ fn item_is_retryable(item: &serde_json::Value) -> bool {
     )
 }
 
-/// OpenSearch KNN search (different format from Elasticsearch).
-/// Uses {"query": {"knn": {"vector": {"vector": [...], "k": top}}}} format.
-/// Build the OpenSearch kNN search body.
-///
-/// Efficient (pre-)filtering: the filter is pushed *inside* the kNN clause so the
-/// Lucene engine applies it during graph traversal. Wrapping the kNN query in an
-/// outer `bool.must` + `filter` instead performs post-filtering, which collapses
-/// recall on filtered datasets (see qdrant/vector-db-benchmark#167). Requires the
-/// `lucene` engine, which our index mapping uses (see `configure`).
+/// Resolve the typed search knob on the actual request construction path.
 fn build_knn_body(
     query_vector: &[f32],
     top: usize,
     filter: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let mut query = serde_json::json!({
-        "knn": {
-            "vector": {
-                "vector": query_vector,
-                "k": top,
-            }
-        }
-    });
-
-    if let Some(f) = filter {
-        query["knn"]["vector"]["filter"] = f.clone();
-    }
-
-    // Response trimming: the benchmark only needs each hit's id, so skip loading
-    // `_source` and stored fields and return `_id` via a doc-value field. This
-    // trims the response payload for a fairer QPS/latency measurement.
-    serde_json::json!({
-        "query": query,
-        "size": top,
-        "_source": false,
-        "docvalue_fields": ["_id"],
-        "stored_fields": "_none_",
-    })
+    params: &SearchParams,
+) -> Result<serde_json::Value, String> {
+    vector_db_benchmark::opensearch_query::build_knn_body(
+        query_vector,
+        top,
+        filter,
+        params.search_params.as_ref().and_then(|p| p.ef),
+    )
 }
 
 /// Extract the document id from a search hit. With response trimming the id is
@@ -1767,6 +1764,563 @@ fn extract_knn_hits(resp_body: &serde_json::Value) -> Result<Vec<(i64, f64)>, St
 
 // ── Engine trait implementation ──────────────────────────────────────────
 
+impl OpenSearchEngine {
+    /// Sum over nodes of the k-NN plugin's `knn_query_with_filter_requests`.
+    fn knn_filter_requests(&self) -> Result<u64, String> {
+        let body: serde_json::Value = self
+            .rt
+            .block_on(async {
+                self.client
+                    .send(
+                        opensearch::http::Method::Get,
+                        "/_plugins/_knn/stats",
+                        opensearch::http::headers::HeaderMap::new(),
+                        None::<&()>,
+                        None::<JsonBody<serde_json::Value>>,
+                        None,
+                    )
+                    .await?
+                    .error_for_status_code()?
+                    .json::<serde_json::Value>()
+                    .await
+            })
+            .map_err(|e| format!("k-NN stats request failed: {e}"))?;
+        vector_db_benchmark::hybrid::opensearch_filter_requests(&body)
+    }
+
+    /// The KNN and filter-only search loop. One loop for both so the two
+    /// workloads share the timing boundary, priming and retry accounting.
+    fn search_impl(
+        &mut self,
+        filter_only: bool,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        let parallel = params.parallel.unwrap_or(1) as usize;
+
+        let index_schema = if filter_only {
+            self.validate_filter_only_schema(dataset)?;
+            if !self.scalar_metadata_validated {
+                dataset.validate_scalar_metadata()?;
+                self.scalar_metadata_validated = true;
+            }
+            dataset.filter_only_index_schema()?
+        } else {
+            None
+        };
+
+        // A hybrid bucket pass (#341) brings its own queries and filters.
+        // Otherwise filter-only runs the dataset's filter query set (the
+        // prepared `filter_queries.jsonl` when it ships one, #340) and needs no
+        // vectors, and KNN reads the dataset's queries.
+        let (query_set, mut queries, mut neighbors, mut parsed_filters) =
+            match self.hybrid_pass.take() {
+                Some(pass) if !filter_only => (None, pass.queries, pass.neighbors, pass.filters),
+                Some(_) => return Err("a hybrid pass reached the filter-only loop".into()),
+                None => {
+                    let query_path = dataset.get_path()?;
+                    println!("\tReading queries from {}...", query_path.display());
+                    if filter_only {
+                        let set = dataset.filter_only_queries()?;
+                        let parsed: Vec<QueryFilter<serde_json::Value>> =
+                            set.try_resolve_all("OpenSearch", |condition| {
+                                vector_db_benchmark::filter_only::domain::validate_predicate(
+                                    condition,
+                                    index_schema.as_ref(),
+                                )?;
+                                Ok(parse_os_conditions(condition))
+                            })?;
+                        let n = set.len();
+                        (Some(set), vec![Vec::new(); n], vec![Vec::new(); n], parsed)
+                    } else {
+                        let (queries, neighbors, conditions) = dataset.read_queries()?;
+                        let parsed: Vec<QueryFilter<serde_json::Value>> = conditions
+                            .try_resolve_all("OpenSearch", |condition| {
+                                Ok(parse_os_conditions(condition))
+                            })?;
+                        (None, queries, neighbors, parsed)
+                    }
+                }
+            };
+
+        // Dataset query index of each position below (identity for KNN; the
+        // selected, cycled predicates for filter-only), so per-query records name
+        // the query rather than its position.
+        let mut query_ids: Vec<usize> = (0..queries.len()).collect();
+        if filter_only {
+            // Match Redis: only explicit predicates, cycle them for --queries N.
+            let indices = vector_db_benchmark::filter_only::query_indices(
+                parsed_filters.iter().map(|f| f.is_filtered()),
+                num_queries,
+            )?;
+            query_ids = indices.clone();
+            queries = indices.iter().map(|&i| queries[i].clone()).collect();
+            neighbors = indices.iter().map(|&i| neighbors[i].clone()).collect();
+            parsed_filters = indices.iter().map(|&i| parsed_filters[i].clone()).collect();
+        }
+        let mut matched_sum = 0u64;
+        let mut returned_sum = 0u64;
+        let mut scalar_errors = Vec::new();
+        let explicit_top: Option<usize> = if filter_only {
+            Some(
+                params
+                    .top
+                    .map(|n| n as usize)
+                    .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT),
+            )
+        } else {
+            params.top.map(|t| t as usize)
+        };
+        let num_to_run = if num_queries > 0 {
+            (num_queries as usize).min(queries.len())
+        } else {
+            queries.len()
+        };
+
+        // Precompute per-query `top` and the fully serialized request bodies
+        // BEFORE the parallel region so the timed window wraps only the RPC
+        // round-trip. `build_knn_body` builds the DOM and `to_raw_value`
+        // performs the vector-to-JSON ryu formatting (client CPU work) once here;
+        // the timed send only copies the already-formatted bytes. `tops[idx]`
+        // reproduces the same k the request embeds, so recall is unchanged.
+        let tops: Vec<usize> = (0..num_to_run)
+            .map(|idx| {
+                explicit_top.unwrap_or_else(|| {
+                    let n = neighbors[idx].len();
+                    if n > 0 {
+                        n
+                    } else {
+                        10
+                    }
+                })
+            })
+            .collect();
+        let raw_bodies: Vec<Box<serde_json::value::RawValue>> = (0..num_to_run)
+            .map(|idx| {
+                let body = if filter_only {
+                    let body = vector_db_benchmark::filter_only::opensearch_body(
+                        parsed_filters[idx].as_ref().unwrap(),
+                        tops[idx],
+                    );
+                    // No filter-only request may carry a vector clause — on
+                    // the `full` layout the index would serve it (#344).
+                    vector_db_benchmark::filter_only::check_opensearch_body(&body)?;
+                    body
+                } else {
+                    build_knn_body(
+                        &queries[idx],
+                        tops[idx],
+                        parsed_filters[idx].as_ref(),
+                        params,
+                    )?
+                };
+                serde_json::value::to_raw_value(&body).map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        // Per-thread sample buffers merged on join — no per-query Mutex<Vec>
+        // contention in the timed loop (see redis.rs::search). Metrics are
+        // order-independent so results are unchanged; work counter uses Relaxed.
+        let query_idx = Arc::new(AtomicUsize::new(0));
+        // Successful measured queries needing more than one attempt. Merge local
+        // worker counters after joining, avoiding a shared hot-path atomic.
+        let mut retried_queries = 0u64;
+        // Resolved here rather than per query: `knn_send` runs inside the measured
+        // window, where an env lookup is avoidable client CPU work.
+        let search_policy = SearchRetryPolicy::from_env();
+
+        let pb = self.create_progress_bar(num_to_run);
+        let base_url = self.base_url.clone();
+        let timeout = self.timeout;
+        let index_name = self.index_name.clone();
+
+        // Gate-synchronized start so connection setup AND the cold first query
+        // fall OUTSIDE the measured window. Every worker connects + primes, then
+        // parks at the gate; `WorkerPool::start` stamps the shared start instant and
+        // releases everyone, so the measurement clock starts only once all workers
+        // are warm and poised. The gate is count-agnostic: a worker that fails to
+        // set up, panics, or is never started by the OS settles its ticket and turns
+        // the run into a hard error instead of a hang (#214).
+
+        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
+        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
+        let capture = params.capture_query_results;
+        let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
+        let mut capture_failure: Option<String> = None;
+        let mut observed_totals: Vec<(usize, u64)> = Vec::new();
+
+        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
+            let mut pool = WorkerPool::new(s, "opensearch-search", parallel);
+            for _ in 0..parallel {
+                let base_url = base_url.clone();
+                let index_name = index_name.clone();
+                let neighbors = &neighbors;
+                let tops = &tops;
+                let raw_bodies = &raw_bodies;
+                let query_ids = &query_ids;
+                let query_idx = Arc::clone(&query_idx);
+                let pb = &pb;
+
+                pool.spawn(move |ticket| {
+                    let mut t = Vec::new();
+                    let mut p = Vec::new();
+                    let mut r = Vec::new();
+                    let mut mr = Vec::new();
+                    let mut nd = Vec::new();
+                    let mut matched = 0u64;
+                    let mut returned_count = 0u64;
+                    let mut errors = Vec::new();
+                    let mut pending = 0u64;
+                    let mut retried = 0u64;
+                    let mut cap: Vec<RawQueryResult> = Vec::new();
+                    let mut capture_error: Option<String> = None;
+                    let mut totals: Vec<(usize, u64)> = Vec::new();
+
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
+                            return (
+                                t,
+                                p,
+                                r,
+                                mr,
+                                nd,
+                                matched,
+                                returned_count,
+                                errors,
+                                retried,
+                                cap,
+                                capture_error,
+                                totals,
+                            );
+                        }
+                    };
+                    let client = match create_os_client(&base_url, timeout) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // A worker that cannot set itself up would leave the run at a
+                            // lower real concurrency than the `parallel` it reports. Settle
+                            // the ticket with the reason; the coordinator makes it an error.
+                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
+                            return (
+                                t,
+                                p,
+                                r,
+                                mr,
+                                nd,
+                                matched,
+                                returned_count,
+                                errors,
+                                retried,
+                                cap,
+                                capture_error,
+                                totals,
+                            );
+                        }
+                    };
+
+                    // Prime this connection with ONE discarded query so the cold
+                    // first round-trip is not inside the measured window. Best
+                    // effort: errors are ignored and its sample is NOT recorded.
+                    if num_to_run > 0 {
+                        let _ = knn_send(&rt, &client, &index_name, &raw_bodies[0], search_policy);
+                    }
+
+                    // Signal "connected + primed", then block until the coordinator
+                    // stamps the shared measurement start and releases everyone.
+                    if ticket.arrive_and_wait().is_none() {
+                        return (
+                            t,
+                            p,
+                            r,
+                            mr,
+                            nd,
+                            matched,
+                            returned_count,
+                            errors,
+                            retried,
+                            cap,
+                            capture_error,
+                            totals,
+                        );
+                    }
+
+                    loop {
+                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= num_to_run {
+                            break;
+                        }
+
+                        let top = tops[idx];
+                        let query_id = query_ids[idx];
+
+                        // Timed window: network send + receive + decode of the
+                        // response into a structured value. Body is pre-serialized
+                        // (out); id/score extraction runs after `elapsed` (out).
+                        let query_start = Instant::now();
+                        let response =
+                            knn_send(&rt, &client, &index_name, &raw_bodies[idx], search_policy);
+                        let elapsed = query_start.elapsed();
+
+                        if filter_only {
+                            match response.and_then(|(body, cost)| {
+                                vector_db_benchmark::filter_only::opensearch_page(
+                                    &body, top, capture,
+                                )
+                                .map(|page| (page, cost))
+                            }) {
+                                Ok((page, cost)) => {
+                                    retried += u64::from(cost.retried);
+                                    // Scalar latency includes every attempt and backoff;
+                                    // Redis's scalar path makes a single attempt.
+                                    t.push(elapsed.as_secs_f64());
+                                    totals.push((query_id, page.total));
+                                    matched += page.total;
+                                    returned_count += page.returned as u64;
+                                    // `ids` is Some only when capturing.
+                                    if let Some(ids) = &page.ids {
+                                        // An `_id` that is not a corpus row is a
+                                        // harness bug: fail the run, never guess.
+                                        let hits = ids
+                                            .iter()
+                                            .map(|id| {
+                                                uuid_hex_to_int(id)
+                                                    .map(|row| RawHit { row, score: None })
+                                            })
+                                            .collect::<Result<Vec<_>, _>>();
+                                        match hits {
+                                            Ok(hits) => cap.push(RawQueryResult::ok(
+                                                query_id,
+                                                idx,
+                                                hits,
+                                                Some(page.total),
+                                                elapsed.as_secs_f64(),
+                                            )),
+                                            Err(e) => {
+                                                capture_error = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if capture {
+                                        cap.push(RawQueryResult::failed(
+                                            query_id,
+                                            idx,
+                                            elapsed.as_secs_f64(),
+                                            &e,
+                                        ));
+                                    }
+                                    if errors.len() < 3 {
+                                        errors.push(format!("Filter-only query {idx} failed: {e}"));
+                                    }
+                                }
+                            }
+                            pending += 1;
+                            if pending == 256 {
+                                pb.inc(pending);
+                                pending = 0;
+                            }
+                            continue;
+                        }
+
+                        match response.and_then(|(resp_body, cost)| {
+                            extract_knn_hits(&resp_body).map(|hits| (hits, cost))
+                        }) {
+                            Ok((result_ids, cost)) => {
+                                // Bill only the attempt that produced the result:
+                                // discarded round-trips and backoff sleeps are
+                                // client-side cost, not OpenSearch latency.
+                                let query_time =
+                                    elapsed.saturating_sub(cost.overhead).as_secs_f64();
+                                if cost.retried {
+                                    retried += 1;
+                                }
+                                let ordered_ids: Vec<i64> =
+                                    result_ids.iter().map(|(id, _)| *id).collect();
+                                let m = crate::metrics::compute_metrics(
+                                    &ordered_ids,
+                                    &neighbors[idx],
+                                    top,
+                                );
+                                t.push(query_time);
+                                p.push(m.precision);
+                                r.push(m.recall);
+                                mr.push(m.mrr);
+                                nd.push(m.ndcg);
+                                if capture {
+                                    cap.push(RawQueryResult::ok(
+                                        query_id,
+                                        idx,
+                                        result_ids
+                                            .iter()
+                                            .map(|&(row, score)| RawHit {
+                                                row,
+                                                score: Some(score),
+                                            })
+                                            .collect(),
+                                        None,
+                                        query_time,
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                // Not counted here: `compute_search_stats` derives
+                                // failed_queries as requested - succeeded, uniformly
+                                // for every engine.
+                                eprintln!("Search query {} failed: {}", idx, e);
+                                if capture {
+                                    cap.push(RawQueryResult::failed(
+                                        query_id,
+                                        idx,
+                                        elapsed.as_secs_f64(),
+                                        e,
+                                    ));
+                                }
+                            }
+                        }
+                        pb.inc(1);
+                    }
+                    pb.inc(pending);
+                    (
+                        t,
+                        p,
+                        r,
+                        mr,
+                        nd,
+                        matched,
+                        returned_count,
+                        errors,
+                        retried,
+                        cap,
+                        capture_error,
+                        totals,
+                    )
+                })?;
+            }
+
+            // Every worker is connected + primed and parked at the gate.
+            // Stamp the shared measurement start and release them together.
+            let (per_worker, measured_start) = pool.start()?;
+
+            for (
+                t,
+                p,
+                r,
+                mr,
+                nd,
+                matched,
+                returned_count,
+                errors,
+                retried,
+                cap,
+                capture_error,
+                totals,
+            ) in per_worker
+            {
+                observed_totals.extend(totals);
+                if let Some(records) = captured.as_mut() {
+                    records.extend(cap);
+                }
+                if let Some(e) = capture_error {
+                    capture_failure.get_or_insert(e);
+                }
+                retried_queries += retried;
+                matched_sum += matched;
+                returned_sum += returned_count;
+                scalar_errors.extend(errors);
+                times.extend(t);
+                precs.extend(p);
+                recs.extend(r);
+                mrr_vals.extend(mr);
+                ndcg_vals.extend(nd);
+            }
+            Ok(measured_start)
+        })?;
+
+        pb.finish_and_clear();
+        // Measure from the post-gate start stamp (workers already primed), so
+        // total_time excludes connection setup and the cold first query.
+        let total_time = measured_start.elapsed().as_secs_f64();
+        for error in scalar_errors.iter().take(3) {
+            eprintln!("{error}");
+        }
+
+        // Dropped queries are NOT refused here. `compute_search_stats` derives
+        // `failed_queries` as `requested_queries - times.len()` for every engine,
+        // experiment.rs prints the ⚠ warning and persists the count to the results
+        // JSON, and `--fail-on-dropped-queries` makes it fatal across all engines
+        // at once. An engine-local refusal would be redundant with that, would make
+        // OpenSearch the only one of 15 engines that reports nothing instead of
+        // reporting a partial run with its overload signal intact, and — because a
+        // refused rep is skipped by the `--repetitions` loop — would silently
+        // select the rep that happened not to hit back-pressure.
+        //
+        // Queries that succeeded only after a retry are surfaced separately: they
+        // are not losses, but they identify load shedding. Scalar latency includes
+        // backoff; the existing KNN contract excludes it.
+        let retried = retried_queries;
+        if retried > 0 {
+            eprintln!(
+                "⚠  {} of {} search queries succeeded only after a retry ({:.2}%) — the server \
+                 was shedding load; backoff is {} the reported latency",
+                retried,
+                num_to_run,
+                100.0 * retried as f64 / num_to_run.max(1) as f64,
+                if filter_only {
+                    "included in"
+                } else {
+                    "excluded from"
+                }
+            );
+        }
+
+        let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
+        if let Some(e) = capture_failure {
+            return Err(format!("--dump-results: {e}"));
+        }
+        let mut result = crate::engine::compute_search_stats(
+            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
+        )?;
+        result.query_records = captured;
+        if filter_only {
+            // Per-query count gate (#340): every answer against its prepared
+            // count. `query_set` is always `Some` on this path.
+            let per_query_counts_checked = match &query_set {
+                Some(set) => set.check_counts(&observed_totals, times.len())?,
+                None => None,
+            };
+            result.mean_precision_at_returned = -1.0;
+            result.filter_only = Some(vector_db_benchmark::filter_only::Stats {
+                result_limit: top,
+                matched_documents_sum: matched_sum,
+                returned_documents_sum: returned_sum,
+                retried_queries: retried,
+                per_query_counts_checked,
+                index_layout: Some(self.index_layout().as_str().to_string()),
+            });
+        }
+        Ok(result)
+    }
+
+    /// The layout `configure()` builds for this config (#344).
+    fn index_layout(&self) -> vector_db_benchmark::workload::IndexLayout {
+        self.config.layout
+    }
+}
+
 impl Engine for OpenSearchEngine {
     /// Server-side corpus size, for the `--skip-upload` reuse precondition
     /// (issue #238). `GET /<index>/_count`; a missing index (404) answers 0.
@@ -1828,6 +2382,34 @@ impl Engine for OpenSearchEngine {
     }
 
     fn configure(&mut self, dataset: &Dataset) -> Result<(), String> {
+        // Probe before any index deletion, creation, upload, or force merge.
+        if !self.config.skip_vector_index
+            && self
+                .search_params
+                .iter()
+                .any(|p| p.search_params.as_ref().and_then(|p| p.ef).is_some())
+        {
+            let response = self
+                .rt
+                .block_on(self.client.info().send())
+                .map_err(|e| format!("Unable to verify OpenSearch query-effort support: {e}"))?;
+            if !response.status_code().is_success() {
+                return Err(format!(
+                    "Unable to verify OpenSearch query-effort support: HTTP {}",
+                    response.status_code()
+                ));
+            }
+            let info: serde_json::Value = self
+                .rt
+                .block_on(response.json())
+                .map_err(|e| format!("Unable to parse OpenSearch version response: {e}"))?;
+            let version = info
+                .pointer("/version/number")
+                .and_then(|v| v.as_str())
+                .ok_or("OpenSearch version response is missing version.number")?;
+            vector_db_benchmark::opensearch_query::validate_server_version(version)?;
+        }
+        self.scalar_metadata_validated = false;
         // Shard count is printed alongside the HNSW knobs so a sweep point is
         // honestly labelled rather than silently measured at whatever the cluster
         // defaults to (same fairness gate as vertex.rs's effective-knob line).
@@ -1840,6 +2422,17 @@ impl Engine for OpenSearchEngine {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "cluster-default".to_string()),
         );
+        if self.config.layout == IndexLayout::Full {
+            println!(
+                "Building the shared `full` index (#344): knn_vector + text + keyword + \
+                 long/double, one ingest for every workload of this config"
+            );
+            println!(
+                "  note: on this index vector/hybrid range filters compare float fields as \
+                 binary64 `double` (unlike the `vector` layout's `float`); results record \
+                 params.index_layout=full"
+            );
+        }
 
         println!("Ensuring index does not exist...");
         self.delete_index()?;
@@ -1856,7 +2449,30 @@ impl Engine for OpenSearchEngine {
         let dataset_path = dataset.get_path()?;
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
-        let (ids, vectors, metadata) = dataset.read_vectors(normalize)?;
+        // #342: a corpus too large to hold in client memory is streamed from
+        // disk instead (`--upload-reader`); everything below is the in-memory
+        // path, unchanged.
+        let (ids, vectors, mut metadata) = match dataset.open_upload(normalize)? {
+            UploadSource::InMemory {
+                ids,
+                vectors,
+                metadata,
+            } => (ids, vectors, metadata),
+            UploadSource::Stream(stream) => return self.upload_streamed(dataset, stream),
+        };
+        // #339 parity: normalize newlines in the indexed text fields before
+        // anything is sent (recorded in the index `_meta` by configure()).
+        self.normalize_fulltext_upload(&mut metadata)?;
+        // Filter-only's metadata domain is checked before anything is sent
+        // whenever the index will serve filter-only: `no-vector` AND the
+        // shared `full` index (#344).
+        if self.config.layout.serves(Workload::FilterOnly) {
+            vector_db_benchmark::filter_only::domain::validate_metadata(
+                &metadata,
+                dataset.filter_only_index_schema()?.as_ref(),
+            )?;
+            self.scalar_metadata_validated = true;
+        }
         let read_time = read_start.elapsed().as_secs_f64();
 
         println!(
@@ -1870,9 +2486,11 @@ impl Engine for OpenSearchEngine {
             "Starting upload with {} threads, batch size {}...",
             self.config.parallel, self.config.batch_size
         );
-        let upload_start = Instant::now();
+        // One clock for both ingest phases (#344), so they sum to the wall time
+        // from the first batch to index-ready.
+        let mut clock = vector_db_benchmark::ingest::IngestClock::start();
         self.upload_parallel(&ids, &vectors, &metadata)?;
-        let upload_time = upload_start.elapsed().as_secs_f64();
+        let upload_time = clock.upload_done();
 
         println!(
             "Upload time: {:.3}s ({:.0} records/sec)",
@@ -1910,11 +2528,15 @@ impl Engine for OpenSearchEngine {
         // Include the merge time in total_time for cross-engine comparability
         // (mirrors mongodb; matches v0's post_upload() timing). Pinning the merge
         // to one segment makes this phase much longer than it used to be (#210).
-        let index_start = Instant::now();
         self.force_merge()?;
-        let index_time = index_start.elapsed().as_secs_f64();
+        let phases = clock.index_ready(
+            vectors.len(),
+            read_time,
+            vector_db_benchmark::ingest::IndexWait::OpenSearchForceMergeRefresh,
+        )?;
+        let index_time = phases.index_wait_time;
 
-        let total_time = read_time + upload_time + index_time;
+        let total_time = read_time + phases.total_ingest_time;
         println!(
             "Index time: {:.3}s, Total time (read+upload+index): {:.3}s",
             index_time, total_time
@@ -1928,6 +2550,7 @@ impl Engine for OpenSearchEngine {
             batch_size: self.config.batch_size,
             memory_usage: None,
             index_coverage: None,
+            ingest_phases: Some(phases),
         })
     }
 
@@ -1937,238 +2560,160 @@ impl Engine for OpenSearchEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        let parallel = params.parallel.unwrap_or(1) as usize;
-
-        // Apply search-time settings (ef_search)
-        self.setup_search(params)?;
-
-        let query_path = dataset.get_path()?;
-        println!("\tReading queries from {}...", query_path.display());
-        let (queries, neighbors, conditions) = dataset.read_queries()?;
-
-        let parsed_filters: Vec<QueryFilter<serde_json::Value>> =
-            conditions.resolve_all("OpenSearch", parse_os_conditions)?;
-
-        let explicit_top: Option<usize> = params.top.map(|t| t as usize);
-        let num_to_run = if num_queries > 0 {
-            (num_queries as usize).min(queries.len())
-        } else {
-            queries.len()
-        };
-
-        // Precompute per-query `top` and the fully serialized request bodies
-        // BEFORE the parallel region so the timed window wraps only the RPC
-        // round-trip. `build_knn_body` builds the DOM and `to_raw_value`
-        // performs the vector-to-JSON ryu formatting (client CPU work) once here;
-        // the timed send only copies the already-formatted bytes. `tops[idx]`
-        // reproduces the same k the request embeds, so recall is unchanged.
-        let tops: Vec<usize> = (0..num_to_run)
-            .map(|idx| {
-                explicit_top.unwrap_or_else(|| {
-                    let n = neighbors[idx].len();
-                    if n > 0 {
-                        n
-                    } else {
-                        10
-                    }
-                })
-            })
-            .collect();
-        let raw_bodies: Vec<Box<serde_json::value::RawValue>> = (0..num_to_run)
-            .map(|idx| {
-                let body = build_knn_body(&queries[idx], tops[idx], parsed_filters[idx].as_ref());
-                serde_json::value::to_raw_value(&body).expect("serialize KNN search body")
-            })
-            .collect();
-
-        // Per-thread sample buffers merged on join — no per-query Mutex<Vec>
-        // contention in the timed loop (see redis.rs::search). Metrics are
-        // order-independent so results are unchanged; work counter uses Relaxed.
-        let query_idx = Arc::new(AtomicUsize::new(0));
-        // Queries that needed more than one attempt. Their backoff is excluded from
-        // the latency samples (see `knn_send`), so without this the reported figures
-        // would look clean with no trace that the server was shedding load.
-        let retried_queries = Arc::new(AtomicUsize::new(0));
-        // Resolved here rather than per query: `knn_send` runs inside the measured
-        // window, where an env lookup is avoidable client CPU work.
-        let search_policy = SearchRetryPolicy::from_env();
-
-        let pb = self.create_progress_bar(num_to_run);
-        let base_url = self.base_url.clone();
-        let timeout = self.timeout;
-        let index_name = self.index_name.clone();
-
-        // Gate-synchronized start so connection setup AND the cold first query
-        // fall OUTSIDE the measured window. Every worker connects + primes, then
-        // parks at the gate; `WorkerPool::start` stamps the shared start instant and
-        // releases everyone, so the measurement clock starts only once all workers
-        // are warm and poised. The gate is count-agnostic: a worker that fails to
-        // set up, panics, or is never started by the OS settles its ticket and turns
-        // the run into a hard error instead of a hang (#214).
-
-        let mut times: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut precs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut recs: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut mrr_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-        let mut ndcg_vals: Vec<f64> = Vec::with_capacity(num_to_run);
-
-        let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
-            let mut pool = WorkerPool::new(s, "opensearch-search", parallel);
-            for _ in 0..parallel {
-                let base_url = base_url.clone();
-                let index_name = index_name.clone();
-                let neighbors = &neighbors;
-                let tops = &tops;
-                let raw_bodies = &raw_bodies;
-                let query_idx = Arc::clone(&query_idx);
-                let retried_queries = Arc::clone(&retried_queries);
-                let pb = &pb;
-
-                pool.spawn(move |ticket| {
-                    let mut t = Vec::new();
-                    let mut p = Vec::new();
-                    let mut r = Vec::new();
-                    let mut mr = Vec::new();
-                    let mut nd = Vec::new();
-
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            // A worker that cannot set itself up would leave the run at a
-                            // lower real concurrency than the `parallel` it reports. Settle
-                            // the ticket with the reason; the coordinator makes it an error.
-                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
-                            return (t, p, r, mr, nd);
-                        }
-                    };
-                    let client = match create_os_client(&base_url, timeout) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            // A worker that cannot set itself up would leave the run at a
-                            // lower real concurrency than the `parallel` it reports. Settle
-                            // the ticket with the reason; the coordinator makes it an error.
-                            ticket.fail(format!("opensearch-search worker setup failed: {e}"));
-                            return (t, p, r, mr, nd);
-                        }
-                    };
-
-                    // Prime this connection with ONE discarded query so the cold
-                    // first round-trip is not inside the measured window. Best
-                    // effort: errors are ignored and its sample is NOT recorded.
-                    if num_to_run > 0 {
-                        let _ = knn_send(&rt, &client, &index_name, &raw_bodies[0], search_policy);
-                    }
-
-                    // Signal "connected + primed", then block until the coordinator
-                    // stamps the shared measurement start and releases everyone.
-                    if ticket.arrive_and_wait().is_none() {
-                        return (t, p, r, mr, nd);
-                    }
-
-                    loop {
-                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= num_to_run {
-                            break;
-                        }
-
-                        let top = tops[idx];
-
-                        // Timed window: network send + receive + decode of the
-                        // response into a structured value. Body is pre-serialized
-                        // (out); id/score extraction runs after `elapsed` (out).
-                        let query_start = Instant::now();
-                        let response =
-                            knn_send(&rt, &client, &index_name, &raw_bodies[idx], search_policy);
-                        let elapsed = query_start.elapsed();
-
-                        match response.and_then(|(resp_body, cost)| {
-                            extract_knn_hits(&resp_body).map(|hits| (hits, cost))
-                        }) {
-                            Ok((result_ids, cost)) => {
-                                // Bill only the attempt that produced the result:
-                                // discarded round-trips and backoff sleeps are
-                                // client-side cost, not OpenSearch latency.
-                                let query_time =
-                                    elapsed.saturating_sub(cost.overhead).as_secs_f64();
-                                if cost.retried {
-                                    retried_queries.fetch_add(1, Ordering::Relaxed);
-                                }
-                                let ordered_ids: Vec<i64> =
-                                    result_ids.iter().map(|(id, _)| *id).collect();
-                                let m = crate::metrics::compute_metrics(
-                                    &ordered_ids,
-                                    &neighbors[idx],
-                                    top,
-                                );
-                                t.push(query_time);
-                                p.push(m.precision);
-                                r.push(m.recall);
-                                mr.push(m.mrr);
-                                nd.push(m.ndcg);
-                            }
-                            Err(e) => {
-                                // Not counted here: `compute_search_stats` derives
-                                // failed_queries as requested - succeeded, uniformly
-                                // for every engine.
-                                eprintln!("Search query {} failed: {}", idx, e);
-                            }
-                        }
-                        pb.inc(1);
-                    }
-                    (t, p, r, mr, nd)
-                })?;
-            }
-
-            // Every worker is connected + primed and parked at the gate.
-            // Stamp the shared measurement start and release them together.
-            let (per_worker, measured_start) = pool.start()?;
-
-            for (t, p, r, mr, nd) in per_worker {
-                times.extend(t);
-                precs.extend(p);
-                recs.extend(r);
-                mrr_vals.extend(mr);
-                ndcg_vals.extend(nd);
-            }
-            Ok(measured_start)
-        })?;
-
-        pb.finish_and_clear();
-        // Measure from the post-gate start stamp (workers already primed), so
-        // total_time excludes connection setup and the cold first query.
-        let total_time = measured_start.elapsed().as_secs_f64();
-
-        // Dropped queries are NOT refused here. `compute_search_stats` derives
-        // `failed_queries` as `requested_queries - times.len()` for every engine,
-        // experiment.rs prints the ⚠ warning and persists the count to the results
-        // JSON, and `--fail-on-dropped-queries` makes it fatal across all engines
-        // at once. An engine-local refusal would be redundant with that, would make
-        // OpenSearch the only one of 15 engines that reports nothing instead of
-        // reporting a partial run with its overload signal intact, and — because a
-        // refused rep is skipped by the `--repetitions` loop — would silently
-        // select the rep that happened not to hit back-pressure.
-        //
-        // Queries that succeeded only after a retry are surfaced separately: they
-        // are not losses, but they mean the server was shedding, which the clean
-        // latency figures no longer show now that the backoff is subtracted out.
-        let retried = retried_queries.load(Ordering::Relaxed);
-        if retried > 0 {
-            eprintln!(
-                "⚠  {} of {} search queries succeeded only after a retry ({:.2}%) — the server \
-                 was shedding load; backoff is excluded from the reported latency",
-                retried,
-                num_to_run,
-                100.0 * retried as f64 / num_to_run.max(1) as f64
+        // `engine::search_workload` routes filter-only configs to
+        // `search_filter_only`; a vector search against an index whose vector
+        // field is unindexed would measure nothing, so arriving here is a bug.
+        if self.config.skip_vector_index {
+            return Err(
+                "vector search requested on an index built without a vector field \
+                 (skip_vector_index); filter-only configs must go through search_filter_only"
+                    .into(),
             );
         }
+        self.search_impl(false, dataset, params, num_queries)
+    }
 
-        let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
-        crate::engine::compute_search_stats(
-            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
-        )
+    fn search_fulltext(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_fulltext_impl(dataset, params, num_queries)
+    }
+
+    /// The hybrid workload (#341): lucene `knn` with the predicate as its
+    /// `filter` (efficient filtering, explicit `k` = `top`), one timed pass per
+    /// selectivity bucket through the vector arm's own loop. Every predicate
+    /// is checked to have been rendered exactly (`hybrid::check_opensearch_filter`)
+    /// and, per pass, the k-NN plugin's `knn_query_with_filter_requests`
+    /// counter must grow by at least the number of ANSWERED queries
+    /// (requested - failed; a cluster-wide lower bound). Whether
+    /// Lucene fell back to exact search for a query is NOT observable from
+    /// OpenSearch (neither the stats API nor `profile` reports it); the report
+    /// says so instead of guessing.
+    fn search_hybrid(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        use vector_db_benchmark::hybrid as hy;
+        if self.config.skip_vector_index {
+            return Err("hybrid search requested on an index built without a vector field".into());
+        }
+        let top = hy::check_params(
+            params.top,
+            params.target_qps,
+            params.duration_seconds,
+            num_queries,
+        )?;
+        let set = dataset.read_hybrid_query_set()?;
+        let mut filters = Vec::with_capacity(set.meta.len());
+        let parsed: Vec<QueryFilter<serde_json::Value>> = set
+            .conditions
+            .resolve_all("OpenSearch", parse_os_conditions)?;
+        for (i, f) in parsed.into_iter().enumerate() {
+            let id = &set.meta[i].query_id;
+            hy::validate_against_schema(&set.predicates[i], dataset.config.schema.as_ref())
+                .map_err(|e| format!("{id}: {e}"))?;
+            let rendered = f
+                .as_ref()
+                .ok_or_else(|| format!("{id}: hybrid query without a filter"))?;
+            let conditions = hy::conditions_of(&set, i)?;
+            hy::check_opensearch_filter(conditions, rendered).map_err(|e| format!("{id}: {e}"))?;
+            filters.push(f);
+        }
+        let text_match = serde_json::json!({
+            "rule": vector_db_benchmark::msmarco::text_match::RULE_VERSION,
+            "opensearch": "{\"match\": {field: term}} on a default `text` field (standard analyzer)",
+        });
+        let engine_note = serde_json::json!({
+            "method": "lucene knn with `filter` inside the knn clause (efficient filtering), k = top",
+            "exact_search_fallback": "not observable: OpenSearch reports neither per-query nor \
+                                      aggregate Lucene exact-search fallback",
+            "filtered_request_counter": "knn_query_with_filter_requests delta summed over every \
+                                         node: a cluster-wide LOWER BOUND on this run's filtered \
+                                         requests, not isolated from concurrent clients",
+        });
+        crate::engine::run_hybrid_buckets(&set, top, text_match, engine_note, |_, subset| {
+            self.hybrid_pass = Some(HybridPass {
+                queries: subset.iter().map(|&i| set.queries[i].clone()).collect(),
+                neighbors: subset.iter().map(|&i| set.neighbors[i].clone()).collect(),
+                filters: subset.iter().map(|&i| filters[i].clone()).collect(),
+            });
+            // Fetched (and failed on) BEFORE the timed pass: an unreadable
+            // stats endpoint must not cost a full pass first.
+            let before = match self.knn_filter_requests() {
+                Ok(v) => v,
+                Err(e) => {
+                    self.hybrid_pass = None;
+                    return Err(e);
+                }
+            };
+            let r = self.search_impl(false, dataset, params, num_queries);
+            self.hybrid_pass = None;
+            let r = r?;
+            let after = self.knn_filter_requests()?;
+            let delta = after.saturating_sub(before);
+            hy::check_opensearch_filtered_requests(
+                delta,
+                r.requested_queries as u64,
+                r.failed_queries as u64,
+            )?;
+            Ok((
+                r,
+                serde_json::json!({"knn_query_with_filter_requests_delta": delta}),
+            ))
+        })
+    }
+
+    fn search_filter_only(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        if !self
+            .index_layout()
+            .serves(vector_db_benchmark::workload::Workload::FilterOnly)
+        {
+            return Err(
+                "filter-only search requested on an index built in the vector layout; the \
+                 filter-only workload needs the no-vector or the shared `full` layout (#344)"
+                    .into(),
+            );
+        }
+        self.search_impl(true, dataset, params, num_queries)
+    }
+
+    fn check_index_layout(
+        &mut self,
+        dataset: &Dataset,
+        layout: vector_db_benchmark::workload::IndexLayout,
+    ) -> Result<(), String> {
+        use vector_db_benchmark::filter_only as fo;
+        use vector_db_benchmark::workload::IndexLayout;
+        let schema = dataset.config.schema.as_ref();
+        let (properties, index) = match layout {
+            IndexLayout::Full => self.realized_schema("index layout check")?,
+            // Only float fields (`float` vs `double`) tell the layouts apart; a
+            // schema without them has nothing to check.
+            IndexLayout::Vector
+                if schema
+                    .and_then(|s| s.as_object())
+                    .is_some_and(|fields| fields.values().any(|k| k == "float")) =>
+            {
+                self.realized_schema("index layout check")?
+            }
+            // No-vector: filter-only reads it back before every run.
+            _ => return Ok(()),
+        };
+        match layout {
+            IndexLayout::Full => fo::validate_opensearch_full_schema(&properties, &index, schema),
+            _ => fo::validate_opensearch_vector_layout(&properties, schema),
+        }
+        .map_err(|e| format!("index layout check ({layout}): {e}"))
     }
 
     fn delete(&mut self) -> Result<(), String> {
@@ -2190,18 +2735,98 @@ mod tests {
         let top = 2usize;
         let filter = json!({"term": {"color": "red"}});
 
-        let body = build_knn_body(&vec, top, Some(&filter));
+        let params = serde_json::from_value(json!({})).unwrap();
+        let body = build_knn_body(&vec, top, Some(&filter), &params).unwrap();
         let to_vec_bytes = serde_json::to_vec(&body).unwrap();
         let raw = serde_json::value::to_raw_value(&body).unwrap();
         assert_eq!(raw.get().as_bytes(), to_vec_bytes.as_slice());
 
         // Unfiltered variant.
-        let body_nf = build_knn_body(&vec, top, None);
+        let body_nf = build_knn_body(&vec, top, None, &params).unwrap();
         let raw_nf = serde_json::value::to_raw_value(&body_nf).unwrap();
         assert_eq!(
             raw_nf.get().as_bytes(),
             serde_json::to_vec(&body_nf).unwrap().as_slice()
         );
+    }
+
+    #[test]
+    fn legacy_query_effort_is_rejected_before_client_or_upload() {
+        for entry in [
+            json!({"knn.algo_param.ef_search": 128}),
+            json!({"search_params": {"knn.algo_param.ef_search": 128}}),
+            json!({"config": {"knn.algo_param.ef_search": 128}}),
+        ] {
+            let config: EngineConfig = serde_json::from_value(json!({
+                "name": "legacy-effort", "engine": "opensearch",
+                "search_params": [{"search_params": {"ef": 128}}, entry]
+            }))
+            .unwrap();
+            let error = OpenSearchEngine::new(&config, "invalid host")
+                .err()
+                .unwrap();
+            assert!(error.contains("use search_params.ef"), "{error}");
+        }
+    }
+
+    #[test]
+    fn invalid_query_effort_is_rejected_before_client_or_upload() {
+        let config: EngineConfig = serde_json::from_value(json!({
+            "name": "invalid-effort", "engine": "opensearch",
+            "search_params": [{"search_params": {"ef": 128}}, {"search_params": {"ef": 0}}]
+        }))
+        .unwrap();
+        let error = OpenSearchEngine::new(&config, "invalid host")
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("query ef must be a positive 32-bit integer"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shipped_sweeps_send_query_effort_instead_of_ignored_index_settings() {
+        for file in ["opensearch-single-node.json", "opensearch-5-shard.json"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("experiments/configurations")
+                .join(file);
+            let configs: Vec<EngineConfig> =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert!(!configs.is_empty());
+            for config in configs {
+                for params in config.search_params.unwrap() {
+                    assert!(params.knob("knn.algo_param.ef_search").is_none());
+                    let ef = params.search_params.as_ref().and_then(|p| p.ef).unwrap();
+                    let body = build_knn_body(&[0.1], 25, None, &params).unwrap();
+                    assert_eq!(
+                        body["query"]["knn"]["vector"]["method_parameters"]["ef_search"],
+                        ef
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn query_effort_reaches_the_request_without_changing_k_or_filter() {
+        let filter = json!({"range": {"price": {"gte": 3, "lte": 7}}});
+        for key in ["search_params", "config"] {
+            for ef_key in ["ef", "EF"] {
+                let params: SearchParams = serde_json::from_value(json!({
+                    "top": 25, key: {ef_key: 512}
+                }))
+                .unwrap();
+                let body = build_knn_body(&[0.1, 0.2], 25, Some(&filter), &params).unwrap();
+                assert_eq!(
+                    body["query"]["knn"]["vector"]["method_parameters"]["ef_search"],
+                    512
+                );
+                assert_eq!(body["query"]["knn"]["vector"]["k"], 25);
+                assert_eq!(body["size"], 25);
+                assert_eq!(body["query"]["knn"]["vector"]["filter"], filter);
+            }
+        }
     }
 
     #[test]
@@ -2275,7 +2900,13 @@ mod tests {
     #[test]
     fn knn_filter_is_pushed_inside_knn_clause() {
         let filter = json!({"bool": {"must": [{"match": {"a": 1}}]}});
-        let body = build_knn_body(&[0.1, 0.2, 0.3], 10, Some(&filter));
+        let body = build_knn_body(
+            &[0.1, 0.2, 0.3],
+            10,
+            Some(&filter),
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
 
         // Filter lives at query.knn.vector.filter ...
         assert_eq!(body["query"]["knn"]["vector"]["filter"], filter);
@@ -2290,14 +2921,26 @@ mod tests {
 
     #[test]
     fn knn_body_without_filter_has_no_filter_key() {
-        let body = build_knn_body(&[0.1, 0.2], 5, None);
+        let body = build_knn_body(
+            &[0.1, 0.2],
+            5,
+            None,
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
         assert!(body["query"]["knn"]["vector"].get("filter").is_none());
     }
 
     #[test]
     fn knn_body_trims_the_response() {
         // Response trimming: no _source, ids via doc-value, no stored fields.
-        let body = build_knn_body(&[0.1, 0.2], 5, None);
+        let body = build_knn_body(
+            &[0.1, 0.2],
+            5,
+            None,
+            &serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["_source"], serde_json::json!(false));
         assert_eq!(body["docvalue_fields"], serde_json::json!(["_id"]));
         assert_eq!(body["stored_fields"], serde_json::json!("_none_"));
@@ -2843,6 +3486,10 @@ mod tests {
             // default. Deliberately NOT the ES constant: this file exists to
             // measure the other shard count, not to pair with Elasticsearch.
             ("opensearch-5-shard.json", (5_i64, 7)),
+            // #339: the fulltext arm refuses more than one shard (Lucene BM25
+            // statistics are per shard) unless a config opts in; these
+            // english/parity configs compare against Redis on one shard.
+            ("opensearch-msmarco-fulltext.json", (1_i64, 2)),
         ]);
 
         let dir = crate::config::project_root().join("experiments/configurations");
@@ -3157,6 +3804,15 @@ mod tests {
             Some(std::time::Duration::from_secs(7_200))
         );
 
+        let options = e.merge_options();
+        assert_eq!(options.budget, Some(std::time::Duration::from_secs(7_200)));
+        assert_eq!(options.http_deadline, std::time::Duration::from_secs(300));
+        assert_eq!(options.max_retries, index_op_policy().max_retries);
+        assert_eq!(
+            options.retry_base,
+            std::time::Duration::from_millis(index_op_policy().base_delay_ms)
+        );
+
         // Both knobs reach the stored values — if either were dropped, the run
         // would silently use the default while the operator believed otherwise.
         let e = engine(&[
@@ -3169,6 +3825,15 @@ mod tests {
         assert_eq!(
             e.force_merge_budget,
             Some(std::time::Duration::from_secs(300))
+        );
+
+        assert_eq!(
+            e.merge_options().budget,
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            e.merge_options().http_deadline,
+            std::time::Duration::from_secs(120)
         );
 
         // 0 = unlimited on both, not "expire immediately" / "no retries".
@@ -3354,95 +4019,6 @@ mod tests {
         );
     }
 
-    // Raising the per-attempt force-merge bound 12x (300 s -> 3600 s) without a
-    // wall-clock ceiling would leave an ~11 h worst case for one force_merge,
-    // since retry_index_op treats every transport error as retryable.
-    //
-    // Reads the REAL default from `index_op_policy()` rather than a hand-built
-    // literal. An earlier version of this test constructed a `RetryPolicy { budget:
-    // None, .. }` and then asserted the field it had just set — a tautology that
-    // stayed green even if every index op were given a 1 s budget.
-    #[test]
-    fn retry_policy_budget_defaults_off_and_is_opt_in() {
-        let shipped = index_op_policy();
-        assert_eq!(
-            shipped.budget, None,
-            "create/delete/refresh keep count-only bounds; only force merge opts in"
-        );
-
-        let bounded = shipped.with_budget(Some(std::time::Duration::from_secs(7_200)));
-        assert_eq!(bounded.budget, Some(std::time::Duration::from_secs(7_200)));
-        // The budget must not disturb the rest of the policy.
-        assert_eq!(bounded.max_retries, shipped.max_retries);
-        assert_eq!(bounded.base_delay_ms, shipped.base_delay_ms);
-        // Explicitly unlimited stays unlimited.
-        assert_eq!(shipped.with_budget(None).budget, None);
-    }
-
-    // WIRING, not predicate: does `retry_index_op` actually enforce the budget it
-    // is handed? Every predicate in this file can be correct while the budget is
-    // computed and then dropped on the floor, which restores the ~11 h unbounded
-    // force merge. Driving an always-failing `send` proves the loop consults it.
-    //
-    // No cluster needed: `send` is an `FnMut` closure, so a synthesized transport
-    // error is enough, and `base_delay_ms: 1` keeps the whole test in milliseconds.
-    #[test]
-    fn retry_index_op_stops_at_the_wall_clock_budget_not_just_the_attempt_count() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut calls = 0usize;
-
-        let policy = RetryPolicy {
-            // High enough that the budget is what ends a correct run, low enough
-            // that a broken one still ENDS. An earlier version used 1_000_000
-            // here; with the budget mutated off that does not fail the test, it
-            // hangs for hours (1M attempts x capped backoff), which in CI is a
-            // timeout rather than a diagnosis. A mutation must fail fast.
-            max_retries: 60,
-            base_delay_ms: 1,
-            budget: Some(std::time::Duration::from_millis(150)),
-        };
-
-        let started = std::time::Instant::now();
-        let err = retry_index_op(
-            &rt,
-            "Force merge",
-            policy,
-            |status| (200..300).contains(&status),
-            index_maintenance_retryable,
-            || {
-                calls += 1;
-                // A transport-level failure: the case `retry_index_op` treats as
-                // retryable forever, which is exactly why the budget must exist.
-                Err(opensearch::Error::from(std::io::Error::other(
-                    "connection reset",
-                )))
-            },
-        )
-        .expect_err("an always-failing op must not report success");
-
-        assert!(
-            err.contains("wall-clock budget"),
-            "the error must name the bound that stopped it, got: {err}"
-        );
-        assert!(err.starts_with("Force merge"), "must name the op: {err}");
-        assert!(
-            calls > 1,
-            "must actually have retried before giving up, got {calls} call(s)"
-        );
-        // Stopped by time, well short of the 60-retry ceiling.
-        assert!(
-            calls <= 60,
-            "budget did not bound the loop; {calls} attempts"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(30),
-            "budget did not bound the wall clock"
-        );
-    }
-
-    // The count-only policies must NOT acquire a time bound by accident: the same
-    // loop serves create/delete/refresh, and a budget leaking into them would cut
-    // short the snapshot windows #208 added the patient retries for.
     #[test]
     fn retry_index_op_without_a_budget_is_bounded_only_by_attempts() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3450,7 +4026,6 @@ mod tests {
         let policy = RetryPolicy {
             max_retries: 3,
             base_delay_ms: 1,
-            budget: None,
         };
         let err = retry_index_op(
             &rt,
@@ -3509,5 +4084,31 @@ mod tests {
             seen.windows(2).any(|w| w[0] != w[1]),
             "generator is not advancing"
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "opensearch_retry_tests.rs"]
+mod scalar_retry_tests;
+
+/// #341: every hybrid predicate the MS MARCO generator emits renders, through
+/// the real builder, to exactly the structure `hybrid::check_opensearch_filter`
+/// requires.
+#[cfg(test)]
+mod hybrid_filter_tests {
+    use super::parse_os_conditions;
+    use vector_db_benchmark::msmarco::hybrid::{templates, TextTerms};
+
+    #[test]
+    fn the_builder_renders_every_hybrid_predicate_structurally() {
+        let terms = TextTerms {
+            common: ("quora".into(), 1),
+            rare: ("ancient".into(), 1),
+        };
+        for t in templates(&terms) {
+            let f = parse_os_conditions(&t.conditions).expect("builder renders a filter");
+            vector_db_benchmark::hybrid::check_opensearch_filter(&t.conditions, &f)
+                .unwrap_or_else(|e| panic!("{}: {e}", t.conditions));
+        }
     }
 }

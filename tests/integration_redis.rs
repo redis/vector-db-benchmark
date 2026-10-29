@@ -1441,19 +1441,7 @@ fn create_test_project(
 
 /// Find the release binary path
 fn binary_path() -> PathBuf {
-    let mut path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    path.push("vector-db-benchmark");
-    if path.exists() {
-        return path;
-    }
-    // Fallback: look relative to manifest dir
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/vector-db-benchmark")
+    common::binary_path()
 }
 
 /// Parse the search result JSON and return mean_precision_at_returned
@@ -2189,7 +2177,7 @@ fn test_binary_redis_filter_only() {
 
     // --skip-vector-index renames the engine to "<type>-no-vector".
     let r = common::read_results_obj(&proj.root, "redis-no-vector");
-    let mp = r["mean_precision_at_returned"].as_f64().unwrap();
+    let mp = r.get("mean_precision_at_returned");
     let rps = r["rps"].as_f64().unwrap();
     let p50 = r["p50_time"].as_f64().unwrap();
     let p95 = r["p95_time"].as_f64().unwrap();
@@ -2198,10 +2186,11 @@ fn test_binary_redis_filter_only() {
     let succeeded = r["succeeded_queries"].as_u64().unwrap();
     let failed = r["failed_queries"].as_u64().unwrap();
     println!(
-        "redis filter-only: mean_precision_at_returned={mp} rps={rps:.1} p50={p50} p95={p95} p99={p99} \
+        "redis filter-only: mean_precision_at_returned={mp:?} rps={rps:.1} p50={p50} p95={p95} p99={p99} \
          requested={requested} succeeded={succeeded} failed={failed}"
     );
-    assert_eq!(mp, -1.0, "filter-only sentinel lost");
+    assert!(mp.is_none(), "filter-only must not emit vector precision");
+    assert_eq!(r["filter_only"]["result_limit"], 10);
     assert_eq!(requested, 1000, "requested_queries");
     assert_eq!(failed, 0, "healthy run must have no failed queries");
     assert_eq!(succeeded, 1000, "all queries should succeed");
@@ -2704,6 +2693,36 @@ fn test_binary_redis_shared_corpus_upload_once() {
          backfill before searching; stdout:\n{}",
         stdout
     );
+
+    // Ingest phases (#344). Whichever config ran second skipped the upload: it
+    // has no upload phase at all — `upload_time` exactly 0.0 (how a consumer
+    // tells "backfill, no upload" from a real upload) and no upload rate, not
+    // `documents / (time between two clock reads)` ≈ 10^11/s. The config that
+    // uploaded has a real upload phase and rate.
+    let (mut backfill, mut uploaded) = (Vec::new(), Vec::new());
+    for config in ["redis-sc-a", "redis-sc-b"] {
+        let doc = common::read_result_file(&proj.root, &format!("{config}-sc-test-upload-*.json"));
+        let r = doc["results"].clone();
+        if r["upload_time"].as_f64() == Some(0.0) {
+            backfill.push(r);
+        } else {
+            uploaded.push(r);
+        }
+    }
+    assert_eq!(
+        (backfill.len(), uploaded.len()),
+        (1, 1),
+        "{backfill:?} {uploaded:?}"
+    );
+    let r = &backfill[0];
+    assert!(r["upload_docs_per_sec"].is_null(), "{r}");
+    assert_eq!(
+        r["ingest_phases"]["upload_finished_at"], r["ingest_phases"]["upload_started_at"],
+        "{r}"
+    );
+    assert!(r["index_wait_time"].as_f64().unwrap() > 0.0, "{r}");
+    assert!(r["ingest_docs_per_sec"].as_f64().unwrap() > 0.0, "{r}");
+    assert!(uploaded[0]["upload_docs_per_sec"].as_f64().unwrap() > 0.0);
 
     // Both configs' indexes work over the shared corpus.
     let ra = common::read_recall(&proj.root, "redis-sc-a");
@@ -4332,6 +4351,1705 @@ fn test_binary_redis_mixed_update_onto_a_partially_populated_document_still_coun
          can never be satisfied (e.g. a wrong `written_fields`)"
     );
 
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+#[test]
+fn test_binary_redis_filter_only_contract() {
+    let config = serde_json::json!([{"name":"scalar-redis","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":4,"top":3}]}]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-redis",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--skip-vector-index",
+            "--queries",
+            "90",
+            "--dump-raw-latencies",
+            "--keep-data",
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "redis-no-vector", total, returned);
+    let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+    let mut conn = client.get_connection().unwrap();
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("idx:redis-no-vector")
+        .query(&mut conn)
+        .unwrap();
+    assert!(
+        !format!("{info:?}").contains("VECTOR"),
+        "scalar index unexpectedly contains VECTOR"
+    );
+    common::assert_filter_only_predicates(
+        &proj.root,
+        "scalar-redis",
+        "redis-no-vector",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+    );
+    let _: redis::Value = redis::cmd("FT.DROPINDEX")
+        .arg("idx:redis-no-vector")
+        .arg("DD")
+        .query(&mut conn)
+        .unwrap();
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+#[test]
+fn test_binary_redis_filter_only_rejects_vector_index_reuse() {
+    let config = serde_json::json!([{"name":"scalar-reuse","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":3}]}]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let port = test_port().to_string();
+    let index = "scalar-reuse-exact";
+    let envs = [
+        ("REDIS_PORT", port.as_str()),
+        ("REDIS_INDEX_NAME", index),
+        ("REDIS_INDEX_NAME_EXACT", "1"),
+    ];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-reuse",
+        "scalar-test",
+        "localhost",
+        &envs,
+        &["--skip-search", "--keep-data"]
+    ));
+    common::clear_result_files(&proj.root);
+    let out = Command::new(binary_path())
+        .current_dir(&proj.root)
+        .envs(envs)
+        .args([
+            "--engines",
+            "scalar-reuse",
+            "--datasets",
+            "scalar-test",
+            "--host",
+            "localhost",
+            "--skip-vector-index",
+            "--skip-upload",
+            "--queries",
+            "1",
+            "--fail-on-dropped-queries",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("filter-only cannot reuse an index containing VECTOR"),
+        "{stderr}"
+    );
+    assert!(fs::read_dir(proj.root.join("results")).unwrap().all(|e| !e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("-search-")));
+    let mut conn = redis::Client::open(format!("redis://127.0.0.1:{port}"))
+        .unwrap()
+        .get_connection()
+        .unwrap();
+    let _: redis::Value = redis::cmd("FT.DROPINDEX")
+        .arg(index)
+        .arg("DD")
+        .query(&mut conn)
+        .unwrap();
+    fs::remove_dir_all(proj.root).unwrap();
+}
+
+/// Inspect what the CLI actually sent, not a separately hand-written range.
+/// Restoring logging before any assertions prevents a failed regression from
+/// changing how subsequent tests exercise the isolated Redis instance.
+fn capture_bounded_range_search(conn: &mut Connection, run: impl FnOnce() -> bool) -> Vec<Vec<u8>> {
+    let old: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("slowlog-log-slower-than")
+        .arg("slowlog-max-len")
+        .query(conn)
+        .unwrap();
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("slowlog-log-slower-than")
+        .arg(0)
+        .arg("slowlog-max-len")
+        .arg(256)
+        .query::<()>(conn)
+        .unwrap();
+    redis::cmd("SLOWLOG")
+        .arg("RESET")
+        .query::<()>(conn)
+        .unwrap();
+    let succeeded = run();
+    let entries = redis::cmd("SLOWLOG")
+        .arg("GET")
+        .arg(256)
+        .query::<Vec<redis::Value>>(conn);
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg(&old)
+        .query::<()>(conn)
+        .unwrap();
+    assert!(succeeded, "bounded range CLI query failed");
+    let searches: Vec<Vec<Vec<u8>>> = entries
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| {
+            let redis::Value::Array(fields) = entry else {
+                panic!("unexpected SLOWLOG entry: {entry:?}");
+            };
+            let args: Vec<Vec<u8>> = redis::from_redis_value(fields[3].clone()).unwrap();
+            // Upload/reuse validation also sends FT.SEARCH * LIMIT 0 0.
+            // Select the driver's parameterized numeric predicate, captured
+            // before this test sends any replay or EXPLAIN request of its own.
+            let is_range_search = args
+                .first()
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"FT.SEARCH"))
+                && args
+                    .get(2)
+                    .is_some_and(|query| String::from_utf8_lossy(query).contains("@price:["))
+                && args.iter().any(|arg| arg.eq_ignore_ascii_case(b"PARAMS"));
+            is_range_search.then_some(args)
+        })
+        .collect();
+    assert!(
+        !searches.is_empty(),
+        "CLI did not execute the price range query"
+    );
+    // Warmups/repeats use the same request, but HashMap iteration may reorder
+    // PARAMS pairs between searches. Compare their contents, preserving each
+    // original command for byte-for-byte replay below.
+    let normalized = |args: &Vec<Vec<u8>>| {
+        let at = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case(b"PARAMS"))
+            .unwrap();
+        let count = std::str::from_utf8(&args[at + 1])
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(count % 2, 0);
+        let mut pairs: Vec<_> = args[at + 2..at + 2 + count]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .collect();
+        pairs.sort();
+        let mut result = args[..at + 2].to_vec();
+        result.extend(pairs.into_iter().flatten().cloned());
+        result.extend_from_slice(&args[at + 2 + count..]);
+        result
+    };
+    assert!(searches
+        .iter()
+        .all(|args| normalized(args) == normalized(&searches[0])));
+    searches[0].clone()
+}
+
+#[test]
+fn test_binary_redis_bounded_ranges_use_single_numeric_iterator() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ds = root.join("datasets/bounded-test");
+    fs::create_dir_all(&ds).unwrap();
+    fs::create_dir_all(root.join("experiments/configurations")).unwrap();
+    fs::create_dir_all(root.join("results")).unwrap();
+    // Values at and on both sides of zero make each endpoint inclusion visible.
+    // The ID oracle below is literal and independent of the renderer/parser.
+    let values = [-2, -1, 0, 1, 2, 3, 4, 5];
+    let vectors: Vec<Vec<f32>> = (0..values.len())
+        .map(|id| vec![1.0, id as f32 / 10.0])
+        .collect();
+    vector_db_benchmark::readers::write_npy_vectors(
+        ds.join("vectors.npy").to_str().unwrap(),
+        &vectors,
+    )
+    .unwrap();
+    fs::write(
+        ds.join("payloads.jsonl"),
+        values
+            .iter()
+            .map(|price| serde_json::json!({"price":price}).to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("datasets/datasets.json"),
+        serde_json::json!([{
+            "name":"bounded-test", "type":"tar", "path":"bounded-test/",
+            "distance":"angular", "vector_size":2, "vector_count":values.len(),
+            "schema":{"price":"int"}
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("experiments/configurations/test.json"),
+        serde_json::json!([{
+            "name":"bounded-redis", "engine":"redis",
+            "upload_params":{"parallel":1},
+            "search_params":[{"parallel":1,"top":8,"search_params":{"ef":100}}]
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let cases: Vec<(serde_json::Value, Vec<i64>)> = vec![
+        (serde_json::json!({"gte":0,"lte":3}), vec![2, 3, 4, 5]),
+        (serde_json::json!({"gt":0,"lte":3}), vec![3, 4, 5]),
+        (serde_json::json!({"gte":0,"lt":3}), vec![2, 3, 4]),
+        (serde_json::json!({"gt":0,"lt":3}), vec![3, 4]),
+        (serde_json::json!({"gte":0,"lte":0}), vec![2]),
+        (serde_json::json!({"gt":0,"lte":0}), vec![]),
+        (serde_json::json!({"gte":0,"lt":0}), vec![]),
+        (serde_json::json!({"gt":0,"lt":0}), vec![]),
+        (serde_json::json!({"gte":3,"lte":0}), vec![]),
+        (serde_json::json!({"gte":0}), vec![2, 3, 4, 5, 6, 7]),
+        (serde_json::json!({"gt":0}), vec![3, 4, 5, 6, 7]),
+        (serde_json::json!({"lte":0}), vec![0, 1, 2]),
+        (serde_json::json!({"lt":0}), vec![0, 1]),
+    ];
+    let port = test_port().to_string();
+    for scalar in [true, false] {
+        flush_db(&mut conn);
+        for (case, (bounds, expected)) in cases.iter().enumerate() {
+            fs::write(
+                ds.join("tests.jsonl"),
+                serde_json::json!({
+                    "query":[1.0,0.0], "closest_ids":expected,
+                    "conditions":{"and":[{"price":{"range":bounds}}]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            common::clear_result_files(root);
+            let mut extra = vec![
+                "--queries",
+                "1",
+                "--keep-data",
+                "--dump-raw-latencies",
+                "--fail-on-dropped-queries",
+            ];
+            if scalar {
+                extra.push("--skip-vector-index");
+            }
+            if case != 0 {
+                extra.push("--skip-upload");
+            }
+            let args = capture_bounded_range_search(&mut conn, || {
+                common::run_binary_extra(
+                    root,
+                    "bounded-redis",
+                    "bounded-test",
+                    "localhost",
+                    &[("REDIS_PORT", &port)],
+                    &extra,
+                )
+            });
+            let query = String::from_utf8(args[2].clone()).unwrap();
+            let label = format!("scalar={scalar}, bounds={bounds}, actual query={query}");
+            // Replay the captured request byte-for-byte, including vector and
+            // numeric PARAMS. This detects wrong IDs even for empty ground truth,
+            // and avoids aggregate-count cancellation between predicates.
+            let response: Vec<redis::Value> = redis::cmd("FT.SEARCH")
+                .arg(&args[1..])
+                .query(&mut conn)
+                .unwrap();
+            let total: usize = redis::from_redis_value(response[0].clone()).unwrap();
+            assert_eq!(total, expected.len(), "{label}");
+            let stride = if scalar { 1 } else { 2 };
+            assert_eq!(response.len(), 1 + expected.len() * stride, "{label}");
+            let mut ids: Vec<i64> = response[1..]
+                .iter()
+                .step_by(stride)
+                .map(|value| {
+                    let key: String = redis::from_redis_value(value.clone()).unwrap();
+                    key.rsplit(':').next().unwrap().parse().unwrap()
+                })
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(&ids, expected, "{label}");
+            let engine = if scalar {
+                "redis-no-vector"
+            } else {
+                "bounded-redis"
+            };
+            let document = common::read_result_doc(root, engine);
+            assert_eq!(
+                document["params"]["engine_params"]["effective"]["numeric_range_encoding"],
+                "bounded_leaf_v1",
+                "{label}"
+            );
+            let result = &document["results"];
+            assert_eq!(result["failed_queries"], 0, "{label}");
+            if scalar {
+                assert_eq!(
+                    result["filter_only"]["matched_documents_sum"],
+                    expected.len(),
+                    "{label}"
+                );
+                assert_eq!(
+                    result["filter_only"]["returned_documents_sum"],
+                    expected.len(),
+                    "{label}"
+                );
+            } else if !expected.is_empty() {
+                assert_eq!(result["mean_recall"], 1.0, "{label}");
+            }
+            let params_at = args
+                .iter()
+                .position(|arg| arg.eq_ignore_ascii_case(b"PARAMS"))
+                .unwrap();
+            let count = std::str::from_utf8(&args[params_at + 1])
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut explain = redis::cmd("FT.EXPLAIN");
+            explain
+                .arg(&args[1])
+                .arg(&args[2])
+                .arg(&args[params_at..params_at + 2 + count]);
+            explain.arg("DIALECT").arg(if scalar { 2 } else { 4 });
+            let plan: String = explain.query(&mut conn).unwrap();
+            assert!(
+                !plan.contains("INTERSECT"),
+                "redundant range scans: {label}\n{plan}"
+            );
+            if !expected.is_empty() {
+                assert_eq!(
+                    plan.matches("NUMERIC").count(),
+                    1,
+                    "expected one bounded numeric iterator: {label}\n{plan}"
+                );
+            }
+        }
+    }
+    flush_db(&mut conn);
+}
+
+/// #343: `--dump-results` on the vector path writes one record per timed query
+/// naming corpus rows, and the recall `compare-results` derives from the dump
+/// equals the `mean_recall` the run published. Self-comparison passes with
+/// overlap 1.0.
+#[test]
+fn test_binary_redis_dump_results_vector() {
+    wait_for_redis();
+    let configs = serde_json::json!([{
+        "name": "redis-dump-vec", "engine": "redis",
+        "search_params": [{"parallel": 2, "search_params": {"ef": 400}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dump-vec-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-dump-vec",
+        "dump-vec-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_vector_dump_matches_run(&proj.root, &dump, "redis", "redis-dump-vec");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #343 + #344: a config that DECLARES `"workload": "filter-only"` (no
+/// `--skip-vector-index`) builds the no-vector layout, keeps its own name,
+/// publishes the filter-only contract, and dumps exact per-query totals and
+/// row ids that `compare-results` agrees with itself on.
+#[test]
+fn test_binary_redis_dump_results_declared_filter_only() {
+    wait_for_redis();
+    let config = serde_json::json!([{
+        "name": "dump-fo-redis", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": [{"parallel": 2, "top": 3, "workload": "filter-only"}]
+    }]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "dump-fo-redis",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--queries",
+            "90",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "dump-fo-redis", total, returned);
+    common::assert_filter_only_dump(&dump, "redis", 90);
+    let (ok, report) = common::run_compare(&dump, &dump, "redis");
+    assert!(ok, "self-comparison must pass");
+    let counts = &report["pairs"][0]["shapes"][0]["count_agreement"];
+    assert_eq!(counts["fraction"], 1.0);
+    assert_eq!(counts["complete_page_set_agreement"], 1.0);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #343 review: `--target-qps` + `--dump-results`. An open-loop request that is
+/// dropped for lateness is never dispatched: it gets no record and is excluded
+/// from `requested_queries`, so the capture check (records == requested) holds
+/// with drops present, and records + drops account for every offered request.
+/// `--max-lateness-ms 0` at a rate one client cannot sustain forces drops.
+#[test]
+fn test_binary_redis_dump_results_open_loop_with_dropped_requests() {
+    wait_for_redis();
+    let configs = serde_json::json!([{
+        "name": "redis-dump-ol", "engine": "redis",
+        "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dump-ol-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-dump-ol",
+        "dump-ol-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--target-qps",
+            "50000",
+            "--search-duration",
+            "1",
+            "--max-lateness-ms",
+            "0",
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+        ]
+    ));
+    let results = common::read_results_obj(&proj.root, "redis-dump-ol");
+    let requested = results["requested_queries"].as_u64().unwrap();
+    let dropped = results["dropped_queries"].as_u64().unwrap();
+    let offered = results["offered_queries"].as_u64().unwrap();
+    assert!(
+        dropped > 0,
+        "the fixture must force open-loop drops: {results}"
+    );
+    let dumps = common::read_dumps(&dump);
+    assert_eq!(dumps.len(), 1);
+    let records = dumps[0].records.len() as u64;
+    assert_eq!(records, requested, "one record per dispatched request");
+    assert_eq!(records + dropped, offered, "records + drops = offered");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #343 review: end-to-end coverage of the `docid` id space. Rows carry a
+/// `docid` that is not their row id; the dump must name each returned
+/// document by the docid of the row Redis returned — an off-by-one in the
+/// row -> docid mapping gives valid docids of rows that do not match.
+#[test]
+fn test_binary_redis_dump_results_docid_id_space() {
+    wait_for_redis();
+    let config = serde_json::json!([{
+        "name": "dump-docid-redis", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": [{"parallel": 2, "top": 3, "workload": "filter-only"}]
+    }]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let docid = common::add_docids(&proj.root);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "dump-docid-redis",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--queries",
+            "18",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_docid_dump(&dump, docid);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #339: the ranked full-text workload end to end — boosts, Porter2, the
+/// skipped termless query, per-query docids + scores, and the pinned analyzer
+/// recorded in the result. See `common::assert_bm25_run` for every claim.
+#[test]
+fn test_binary_redis_fulltext_bm25() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{
+        "name": "redis-bm25", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": common::bm25_search_params()
+    }]);
+    let proj = common::write_bm25_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-bm25",
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_bm25_run(&proj.root, &dump, "redis", "redis-bm25");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #339: the fulltext arm refuses, before the timed window, an index that
+/// was not built with the pinned settings (a vector-only config's index: no
+/// explicit stopword list) and an index missing a searched text field. Both
+/// are reached through `--skip-upload`, the path that reuses what is there.
+#[test]
+fn test_binary_redis_fulltext_refuses_unpinned_or_incomplete_index() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-bm25-guard";
+    let write_config = |root: &std::path::Path, search_params: serde_json::Value| {
+        fs::write(
+            root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "redis",
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let fulltext = |fields: serde_json::Value| {
+        serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+            "fulltext": {"fields": fields}}])
+    };
+    let proj = common::write_bm25_project("[]");
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    let run = |extra: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &envs,
+            extra,
+        )
+    };
+    let refused = |out: std::process::Output, needle: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must refuse: {stderr}");
+        assert!(stderr.contains(needle), "expected {needle:?} in: {stderr}");
+    };
+
+    // Index built by a vector-only config: stopwords not pinned.
+    write_config(&proj.root, serde_json::json!([{"parallel": 1}]));
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    write_config(&proj.root, fulltext(serde_json::json!({"title": 1.0})));
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "stopwords_list",
+    );
+
+    // Pinned index, but the dataset now declares a text field it lacks.
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    common::write_bm25_registry(&proj.root, true);
+    write_config(
+        &proj.root,
+        fulltext(serde_json::json!({"title": 1.0, "body": 1.0})),
+    );
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "'body' is not in the Redis index",
+    );
+    // #339 review: index-level settings read from the live FT.INFO. Rebuild
+    // the same index (same name and prefix, pinned stopwords, docs kept) with
+    // one setting the result metadata says is not set, and reuse it.
+    write_config(&proj.root, fulltext(serde_json::json!({"title": 1.0})));
+    let index = format!("idx:{name}");
+    let stopwords: Vec<&str> = vector_db_benchmark::fulltext::STOPWORDS.to_vec();
+    for (setting, needle) in [
+        (&["LANGUAGE", "german"][..], "LANGUAGE"),
+        (&["NOFREQS"][..], "NOFREQS"),
+        (&["SCORE_FIELD", "s"][..], "score_field"),
+    ] {
+        let _ = redis::cmd("FT.DROPINDEX")
+            .arg(&index)
+            .query::<()>(&mut conn);
+        redis::cmd("FT.CREATE")
+            .arg(&index)
+            .arg(&["ON", "HASH", "PREFIX", "1", &format!("{name}:")][..])
+            .arg(setting)
+            .arg("STOPWORDS")
+            .arg(stopwords.len())
+            .arg(&stopwords)
+            .arg(&["SCHEMA", "title", "TEXT", "SORTABLE"][..])
+            .query::<()>(&mut conn)
+            .unwrap();
+        refused(
+            run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+            needle,
+        );
+    }
+    // #339 review 4: the server-wide minimum stem length is read back and a
+    // non-default value refused (FT.INFO does not report it).
+    let _ = redis::cmd("FT.DROPINDEX")
+        .arg(&index)
+        .query::<()>(&mut conn);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    redis::cmd("CONFIG")
+        .arg(&["SET", "search-min-stem-len", "3"][..])
+        .query::<()>(&mut conn)
+        .unwrap();
+    let out = run(&["--skip-upload", "--keep-data", "--exit-on-error"]);
+    redis::cmd("CONFIG")
+        .arg(&["SET", "search-min-stem-len", "4"][..])
+        .query::<()>(&mut conn)
+        .unwrap();
+    refused(out, "search-min-stem-len is 3");
+    // Rebuilt by the tool: the same index with only its own fields searches fine.
+    let _ = redis::cmd("FT.DROPINDEX")
+        .arg(&index)
+        .query::<()>(&mut conn);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    // #358 review: an english index without a marker (built before markers
+    // existed) is reused, and the result records the marker the index
+    // actually carries — none — not the one this run would have written.
+    let _ = redis::cmd("DEL")
+        .arg(vector_db_benchmark::fulltext::redis_marker_key(&index))
+        .query::<()>(&mut conn);
+    common::clear_result_files(&proj.root);
+    let ok = run(&["--skip-upload", "--exit-on-error"]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let doc = common::read_result_doc(&proj.root, name);
+    let ft = &doc["params"]["fulltext"];
+    assert!(ft["index_marker"].is_null(), "{}", ft["index_marker"]);
+    assert_eq!(
+        ft["index_marker_expected"],
+        vector_db_benchmark::fulltext::IndexProfile::english().marker()
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #339 follow-up: `analysis: parity` end to end on Redis — no stemming,
+/// whitespace normalization at upload (verified on the stored hash), only the
+/// searched fields indexed (`NOSTEM`), and refusal of an index uploaded in the
+/// other mode when reused through `--skip-upload`, in both directions.
+#[test]
+fn test_binary_redis_fulltext_parity() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-bm25-parity";
+    let write_config = |root: &std::path::Path, search_params: serde_json::Value| {
+        fs::write(
+            root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "redis",
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let proj = common::write_bm25_project("[]");
+    write_config(&proj.root, common::bm25_parity_search_params());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        name,
+        common::BM25_DATASET,
+        TEST_HOST,
+        &envs,
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data"
+        ]
+    ));
+    common::assert_bm25_parity_run(&proj.root, &dump, "redis", name);
+    // The uploaded copy of the indexed field was normalized; the unindexed
+    // title is untouched (it holds no newline in the fixture anyway).
+    let headings: String = redis::cmd("HGET")
+        .arg(format!("{name}:4"))
+        .arg("headings")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(headings, "alpha beta");
+    let run = |extra: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &envs,
+            extra,
+        )
+    };
+    let refused = |out: std::process::Output, needle: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must refuse: {stderr}");
+        assert!(stderr.contains(needle), "expected {needle:?} in: {stderr}");
+    };
+    let english = serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"headings": 1.0, "segment": 1.0}}}]);
+    // Parity index reused in english mode: refused (marker says normalized).
+    write_config(&proj.root, english.clone());
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "the index records analysis",
+    );
+    // English index (stemmed, unnormalized upload) reused in parity: refused.
+    common::clear_result_files(&proj.root);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    write_config(&proj.root, common::bm25_parity_search_params());
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "without whitespace normalization",
+    );
+    flush_db(&mut conn);
+    let _ = redis::cmd("DEL")
+        .arg(format!("vdbb:fulltext-profile:idx:{name}"))
+        .query::<()>(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #358 review 3: a vector-only config never touches a key outside its own
+/// prefix — the fulltext marker key in particular. Run it as an ACL user
+/// limited to `<config>:*`: any command on another key fails with NOPERM.
+#[test]
+fn test_binary_redis_vector_only_stays_inside_its_key_prefix() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-acl-vec";
+    redis::cmd("ACL")
+        .arg(
+            &[
+                "SETUSER",
+                "vdbb-acl-vec",
+                "reset",
+                "on",
+                ">acl-pw",
+                &format!("~{name}:*"),
+                "+@all",
+            ][..],
+        )
+        .query::<()>(&mut conn)
+        .unwrap();
+    let configs = serde_json::json!([{
+        "name": name, "engine": "redis",
+        "search_params": [{"parallel": 1, "top": 10}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    redis::cmd("ACL")
+        .arg(&["LOG", "RESET"][..])
+        .query::<()>(&mut conn)
+        .unwrap();
+    let proj = common::write_match_any_project("acl-vec-test", &configs.to_string(), 8);
+    let port = test_port().to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        name,
+        "acl-vec-test",
+        TEST_HOST,
+        &[
+            ("REDIS_PORT", port.as_str()),
+            ("REDIS_USER", "vdbb-acl-vec"),
+            ("REDIS_AUTH", "acl-pw"),
+        ],
+        &["--exit-on-error"],
+    );
+    // Denials the run swallowed (teardown ignores errors) still land in the
+    // ACL log: there must be none for this user.
+    let log: redis::Value = redis::cmd("ACL")
+        .arg(&["LOG", "128"][..])
+        .query(&mut conn)
+        .unwrap();
+    let denied = format!("{log:?}").contains("vdbb-acl-vec");
+    let _ = redis::cmd("ACL")
+        .arg(&["DELUSER", "vdbb-acl-vec"][..])
+        .query::<()>(&mut conn);
+    assert!(
+        !denied,
+        "a command outside the config's key prefix was denied: {log:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "vector-only run under a prefix ACL: {stderr}"
+    );
+    assert!(!stderr.contains("NOPERM"), "{stderr}");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #358 review 5: under an ACL user limited to the config's key prefix (no
+/// access to `vdbb:fulltext-profile:*`), an english fulltext config still runs
+/// and records `index_marker: null`, while a parity config is refused with an
+/// error naming the key pattern it needs.
+#[test]
+fn test_binary_redis_fulltext_marker_under_a_prefix_acl() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-acl-ft";
+    redis::cmd("ACL")
+        .arg(
+            &[
+                "SETUSER",
+                "vdbb-acl-ft",
+                "reset",
+                "on",
+                ">acl-pw",
+                &format!("~{name}:*"),
+                "+@all",
+            ][..],
+        )
+        .query::<()>(&mut conn)
+        .unwrap();
+    let proj = common::write_bm25_project("[]");
+    let write_config = |search_params: serde_json::Value| {
+        fs::write(
+            proj.root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "redis",
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let port = test_port().to_string();
+    let envs = [
+        ("REDIS_PORT", port.as_str()),
+        ("REDIS_USER", "vdbb-acl-ft"),
+        ("REDIS_AUTH", "acl-pw"),
+    ];
+    let run = || {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &envs,
+            &["--exit-on-error"],
+        )
+    };
+    write_config(
+        serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"title": 1.0, "segment": 1.0}}}]),
+    );
+    let english = run();
+    write_config(common::bm25_parity_search_params());
+    let parity = run();
+    let _ = redis::cmd("ACL")
+        .arg(&["DELUSER", "vdbb-acl-ft"][..])
+        .query::<()>(&mut conn);
+    let stderr = String::from_utf8_lossy(&english.stderr);
+    assert!(
+        english.status.success(),
+        "english under a prefix ACL: {stderr}"
+    );
+    assert!(stderr.contains("records index_marker: null"), "{stderr}");
+    let doc = common::read_result_doc(&proj.root, name);
+    assert_eq!(doc["params"]["fulltext"]["analysis"], "english");
+    assert!(
+        doc["params"]["fulltext"]["index_marker"].is_null(),
+        "{}",
+        doc["params"]["fulltext"]["index_marker"]
+    );
+    let stderr = String::from_utf8_lossy(&parity.stderr);
+    assert!(!parity.status.success(), "parity must refuse: {stderr}");
+    assert!(stderr.contains("'vdbb:fulltext-profile:*'"), "{stderr}");
+    // Refused when the marker cannot be written (configure), before any upload.
+    let stdout = String::from_utf8_lossy(&parity.stdout);
+    assert!(!stdout.contains("Experiment stage: Upload"), "{stdout}");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// Every attribute name in an `FT.INFO` reply (RESP2 or RESP3): each value
+/// that follows an `attribute` token.
+fn ft_info_attribute_names(info: &redis::Value) -> Vec<String> {
+    fn text(v: &redis::Value) -> Option<String> {
+        match v {
+            redis::Value::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            redis::Value::SimpleString(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+    fn walk(v: &redis::Value, out: &mut Vec<String>) {
+        let items: Vec<&redis::Value> = match v {
+            redis::Value::Array(a) => a.iter().collect(),
+            redis::Value::Map(m) => m.iter().flat_map(|(k, v)| [k, v]).collect(),
+            _ => return,
+        };
+        for pair in items.windows(2) {
+            if text(pair[0]).as_deref() == Some("attribute") {
+                if let Some(name) = text(pair[1]) {
+                    out.push(name);
+                }
+            }
+        }
+        for item in items {
+            walk(item, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(info, &mut out);
+    // A RESP map is seen both as pairs and as its flattened items.
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// #340 query side on Redis, over an MS MARCO-shaped corpus: the prepared
+/// `filter_queries.jsonl` runs, every answer passes the per-query count gate,
+/// records carry the prepared shape, only the derived TAG/NUMERIC fields the
+/// queries reference are indexed (text and `url` — which holds `;` — stored
+/// but not indexed), reuse revalidates, and a SUM-PRESERVING error in two
+/// expected counts fails the run.
+#[test]
+fn test_binary_redis_msmarco_filter_only_per_query_gate() {
+    let config = serde_json::json!([{"name":"msm-redis","engine":"redis","upload_params":{"parallel":2},"search_params":[{"parallel":4,"top":5}]}]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    let dump = p.root.join("dumps");
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "--skip-vector-index",
+            "--queries",
+            "27",
+            "--repetitions",
+            "1",
+            "--keep-data",
+            "--fail-on-dropped-queries",
+        ];
+        args.extend_from_slice(extra);
+        common::run_binary_extra(
+            &p.root,
+            "msm-redis",
+            common::MSM_DATASET,
+            "localhost",
+            &envs,
+            &args,
+        )
+    };
+    assert!(run(&["--dump-results", dump.to_str().unwrap()]));
+    common::assert_msmarco_filter_run(&p, "redis-no-vector", 27, &dump);
+
+    let mut conn = get_test_connection();
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("idx:redis-no-vector")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(
+        ft_info_attribute_names(&info),
+        ["category", "doc_len", "rand_key", "tier"],
+        "filter-only indexes exactly the fields its queries reference"
+    );
+    // ...and the rest is still stored in the hash.
+    let hit: redis::Value = redis::cmd("FT.SEARCH")
+        .arg("idx:redis-no-vector")
+        .arg("@tier:[0 9]")
+        .arg("LIMIT")
+        .arg(0)
+        .arg(1)
+        .query(&mut conn)
+        .unwrap();
+    let hit = format!("{hit:?}");
+    for stored in ["Passage", "http://fx.example/", "msmarco_v2.1_doc_fx_"] {
+        assert!(hit.contains(stored), "{stored} not stored: {hit}");
+    }
+
+    // Reuse: the realized schema and the local corpus are revalidated.
+    common::clear_result_files(&p.root);
+    assert!(run(&["--skip-upload"]));
+    let r = common::read_results_obj(&p.root, "redis-no-vector");
+    assert_eq!(r["filter_only"]["per_query_counts_checked"], 27);
+
+    // Two compensating errors keep the sum; the per-query gate still fails.
+    common::clear_result_files(&p.root);
+    p.tamper_expected_counts(&[(0, 1), (3, -1)]);
+    let stderr = common::run_binary_expect_failure(
+        &p.root,
+        "msm-redis",
+        common::MSM_DATASET,
+        "localhost",
+        &envs,
+        &[
+            "--skip-vector-index",
+            "--skip-upload",
+            "--keep-data",
+            "--repetitions",
+            "1",
+        ],
+    );
+    assert!(stderr.contains("per-query count gate"), "{stderr}");
+    assert!(stderr.contains("fx-filter-000 (tag_eq)"), "{stderr}");
+    assert!(stderr.contains("fx-filter-003 (numeric_point)"), "{stderr}");
+
+    let _: redis::Value = redis::cmd("FT.DROPINDEX")
+        .arg("idx:redis-no-vector")
+        .arg("DD")
+        .query(&mut conn)
+        .unwrap();
+    fs::remove_dir_all(&p.root).ok();
+}
+
+/// #340 x #344: filter-only with MS MARCO prepared queries on the shared
+/// `full` index. One engine config mixes a vector search config with the
+/// filter-only one, so the index carries VECTOR plus every declared field
+/// (the vector workload may filter on any of them, `url` included), while
+/// filter-only keeps #340's contract: it validates the realized schema, the
+/// metadata domain and its predicates against the narrowed field set (so
+/// `url`'s `;` and edge whitespace upload fine), runs the prepared set and
+/// passes the per-query count gate — which still fails a SUM-PRESERVING
+/// error in two expected counts.
+#[test]
+fn test_binary_redis_msmarco_filter_only_on_the_full_layout() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let config = serde_json::json!([{"name":"msm-redis-full","engine":"redis","upload_params":{"parallel":2},
+        "search_params":[{"parallel":1,"top":1},{"parallel":4,"top":5,"workload":"filter-only"}]}]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let n = p.queries.len();
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    let dump = p.root.join("dumps");
+    let out = common::run_binary_output(
+        &p.root,
+        "msm-redis-full",
+        common::MSM_DATASET,
+        "localhost",
+        &envs,
+        &[
+            "--keep-data",
+            "--fail-on-dropped-queries",
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.matches("Experiment stage: Upload").count(),
+        1,
+        "{stdout}"
+    );
+    common::assert_msmarco_full_run(&p, n, &dump);
+
+    let index = "idx:msm-redis-full";
+    let info: redis::Value = redis::cmd("FT.INFO").arg(index).query(&mut conn).unwrap();
+    let names = ft_info_attribute_names(&info);
+    for field in ["vector", "category", "doc_len", "rand_key", "tier", "url"] {
+        assert!(
+            names.iter().any(|n| n == field),
+            "{field} not indexed: {names:?}"
+        );
+    }
+    let info = format!("{info:?}");
+    for token in ["VECTOR", "CASESENSITIVE", "NUMERIC"] {
+        assert!(info.contains(token), "FT.INFO lacks {token}: {info}");
+    }
+
+    // Two compensating errors keep the sum; the per-query gate still fails
+    // on `full`, naming the queries.
+    common::clear_result_files(&p.root);
+    p.tamper_expected_counts(&[(0, 1), (3, -1)]);
+    let out = common::run_binary_output(
+        &p.root,
+        "msm-redis-full",
+        common::MSM_DATASET,
+        "localhost",
+        &envs,
+        &["--skip-upload", "--keep-data", "--repetitions", "1"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("per-query count gate"), "{stderr}");
+    assert!(stderr.contains("fx-filter-000 (tag_eq)"), "{stderr}");
+    assert!(stderr.contains("fx-filter-003 (numeric_point)"), "{stderr}");
+
+    flush_db(&mut conn);
+    fs::remove_dir_all(&p.root).ok();
+}
+
+/// #340: an old MS MARCO tarball (derived fields declared, absent from the
+/// payloads, no `filter_queries.jsonl`) is refused end to end naming
+/// `--add-derived-fields` — on filter-only index reuse, filter-only upload and
+/// the VECTOR workload (which indexes the schema's fields too) — by the
+/// loader's `check_prepared_dir`. Never an index with empty columns.
+#[test]
+fn test_binary_redis_msmarco_stale_corpus_is_refused_naming_the_cure() {
+    let config = serde_json::json!([
+        {"name":"msm-stale","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":5}]},
+        {"name":"msm-stale-vec","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":1}]}
+    ]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let port = test_port().to_string();
+    let envs = [("REDIS_PORT", port.as_str())];
+    let mut conn = get_test_connection();
+    let cure = "--add-derived-fields";
+    let refuse = |engine: &str, extra: &[&str]| {
+        common::run_binary_expect_failure(
+            &p.root,
+            engine,
+            common::MSM_DATASET,
+            "localhost",
+            &envs,
+            extra,
+        )
+    };
+
+    // A good corpus uploaded, then the local copy goes stale: reuse refuses.
+    assert!(common::run_binary_extra(
+        &p.root,
+        "msm-stale",
+        common::MSM_DATASET,
+        "localhost",
+        &envs,
+        &["--skip-vector-index", "--skip-search", "--keep-data"],
+    ));
+    common::clear_result_files(&p.root);
+    p.strip_derived_payload_fields();
+    let e = refuse(
+        "msm-stale",
+        &["--skip-vector-index", "--skip-upload", "--keep-data"],
+    );
+    assert!(e.contains(cure) && e.contains("\"category\""), "{e}");
+    // Filter-only upload, and the vector workload.
+    let e = refuse("msm-stale", &["--skip-vector-index"]);
+    assert!(e.contains(cure), "{e}");
+    let e = refuse("msm-stale-vec", &["--skip-search"]);
+    assert!(e.contains(cure), "{e}");
+    // An old tarball has no filter_queries.jsonl either: refused rather than
+    // falling back to tests.jsonl, whose conditions are null.
+    fs::remove_file(p.dataset_dir().join("filter_queries.jsonl")).unwrap();
+    let e = refuse("msm-stale", &["--skip-vector-index"]);
+    assert!(
+        e.contains(cure) && e.contains("filter_queries.jsonl"),
+        "{e}"
+    );
+
+    if let Ok(indexes) = redis::cmd("FT._LIST").query::<Vec<String>>(&mut conn) {
+        for idx in indexes
+            .iter()
+            .filter(|i| i.contains("msm-stale") || *i == "idx:redis-no-vector")
+        {
+            let _: redis::RedisResult<()> = redis::cmd("FT.DROPINDEX")
+                .arg(idx)
+                .arg("DD")
+                .query(&mut conn);
+        }
+    }
+    fs::remove_dir_all(&p.root).ok();
+}
+
+/// #340 review: without a prepared query set (H&M, synthetic) filter-only
+/// builds the same index as before #340 — every declared field, `text`
+/// included as TEXT. Only a prepared set narrows the layout.
+#[test]
+fn test_binary_redis_filter_only_without_prepared_set_keeps_the_declared_layout() {
+    let config = serde_json::json!([{"name":"scalar-layout","engine":"redis","upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":3}]}]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let declared = common::add_text_field(&proj.root);
+    assert!(declared.iter().any(|f| f == "note"));
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-layout",
+        "scalar-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &["--skip-vector-index", "--skip-search", "--keep-data"],
+    ));
+    let mut conn = get_test_connection();
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg("idx:redis-no-vector")
+        .query(&mut conn)
+        .unwrap();
+    assert_eq!(ft_info_attribute_names(&info), declared, "{info:?}");
+    assert!(format!("{info:?}").contains("TEXT"), "{info:?}");
+    let _: redis::Value = redis::cmd("FT.DROPINDEX")
+        .arg("idx:redis-no-vector")
+        .arg("DD")
+        .query(&mut conn)
+        .unwrap();
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344: one engine config runs vector, filter-only and fulltext against ONE
+/// index built once in the shared `full` layout — one upload file with ingest
+/// phases, three search files, exact filter-only totals and exact filtered
+/// recall (both need the CASESENSITIVE TAG the full layout adds). See
+/// `common::shared_index::assert_run` for every claim.
+#[test]
+fn test_binary_redis_one_ingest_many_workloads() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let config = "redis-shared";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "redis", "upload_params": {"parallel": 2},
+        "search_params": shared_index::search_params()
+    }]);
+    let proj = shared_index::write_project(&configs.to_string());
+    let port = test_port().to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        config,
+        shared_index::DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &["--fail-on-dropped-queries", "--keep-data"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.matches("Experiment stage: Upload").count(),
+        1,
+        "one ingest for three workloads: {stdout}"
+    );
+    shared_index::assert_run(&proj, config, "redis_ft_info_percent_indexed");
+
+    // The realized index is the union: VECTOR + TEXT + CASESENSITIVE TAG +
+    // NUMERIC, holding the corpus once.
+    let index = format!("idx:{config}");
+    let info: redis::Value = redis::cmd("FT.INFO").arg(&index).query(&mut conn).unwrap();
+    let info = format!("{info:?}");
+    for token in ["VECTOR", "TEXT", "CASESENSITIVE", "NUMERIC"] {
+        assert!(info.contains(token), "FT.INFO lacks {token}: {info}");
+    }
+    assert_eq!(
+        ft_info_num_docs(&mut conn, &index),
+        shared_index::DOCS as i64
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344: the realized index is checked against the planned layout ONCE,
+/// before any search config runs. A `--skip-upload` run of the mixed config —
+/// search configs in their natural order, vector FIRST — over an index a
+/// vector-only config built (VECTOR, but case-insensitive TAGs) is refused
+/// before any result is written: no vector result labelled `full` that really
+/// matched case-insensitively.
+#[test]
+fn test_binary_redis_full_layout_refuses_a_reused_vector_layout_index() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let proj = shared_index::write_project("[]");
+    let port = test_port().to_string();
+    shared_index::assert_reuse_refused(
+        &proj,
+        &serde_json::json!({"name": "redis-shared-reuse", "engine": "redis",
+            "upload_params": {"parallel": 1}}),
+        TEST_HOST,
+        &[("REDIS_PORT", port.as_str())],
+        shared_index::vector_only(),
+        shared_index::search_params(),
+        "index layout check (full): filter-only requires CASESENSITIVE TAG",
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344, the reverse: a vector-only config (`vector` plan) reusing the `full`
+/// index a mixed config built would match tags case-sensitively while its
+/// results say `vector`. Refused before any result is written.
+#[test]
+fn test_binary_redis_vector_layout_refuses_a_reused_full_index() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let proj = shared_index::write_project("[]");
+    let port = test_port().to_string();
+    shared_index::assert_reuse_refused(
+        &proj,
+        &serde_json::json!({"name": "redis-shared-reverse", "engine": "redis",
+            "upload_params": {"parallel": 1}}),
+        TEST_HOST,
+        &[("REDIS_PORT", port.as_str())],
+        shared_index::search_params(),
+        shared_index::vector_only(),
+        "index layout check (vector): the index is not a `vector`-layout index",
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344 review: on the shared `full` index, a corpus token outside
+/// filter-only's metadata domain is refused before the upload — not at the
+/// first filter-only search, after the vector config had already run.
+#[test]
+fn test_binary_redis_full_layout_refuses_bad_metadata_before_upload() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let config = "redis-shared-domain";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": shared_index::search_params()
+    }]);
+    let proj = shared_index::write_project(&configs.to_string());
+    let port = test_port().to_string();
+    shared_index::assert_bad_metadata_refused_before_upload(
+        &proj,
+        config,
+        TEST_HOST,
+        &[("REDIS_PORT", port.as_str())],
+    );
+    let keys: i64 = redis::cmd("DBSIZE").query(&mut conn).unwrap();
+    // configure() may leave its index marker key; the corpus is not there.
+    assert!(
+        keys < shared_index::DOCS as i64,
+        "corpus not uploaded: {keys} keys"
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344 review: the shared-corpus backfill path (REDIS_KEY_PREFIX) checks
+/// filter-only's metadata domain too. A `vector` config — which does not check
+/// that domain — uploads a corpus with a `;` tag under the shared prefix; a
+/// `full` config then finds the corpus complete and skips its own upload. It
+/// must still refuse the bad token before writing any result.
+#[test]
+fn test_binary_redis_shared_corpus_full_layout_refuses_bad_metadata() {
+    use common::shared_index;
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([
+        {"name": "redis-scfull-vector", "engine": "redis", "upload_params": {"parallel": 1},
+         "search_params": shared_index::vector_only()},
+        {"name": "redis-scfull-mixed", "engine": "redis", "upload_params": {"parallel": 1},
+         "search_params": shared_index::search_params()}
+    ]);
+    let proj = shared_index::write_project(&configs.to_string());
+    shared_index::poison_keyword_token(&proj);
+    let port = test_port().to_string();
+    let envs = [
+        ("REDIS_PORT", port.as_str()),
+        ("REDIS_KEY_PREFIX", "shared_scfull:"),
+    ];
+    // The vector config uploads the corpus (no domain check on `vector`).
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-scfull-vector",
+        shared_index::DATASET,
+        TEST_HOST,
+        &envs,
+        &["--skip-search", "--keep-data"],
+    ));
+    common::clear_result_files(&proj.root);
+    let keys: i64 = redis::cmd("EVAL")
+        .arg("return #redis.call('keys', KEYS[1])")
+        .arg(1)
+        .arg("shared_scfull:*")
+        .query(&mut conn)
+        .unwrap();
+    assert!(
+        keys >= shared_index::DOCS as i64,
+        "shared corpus uploaded: {keys}"
+    );
+    // The `full` config reuses it via the backfill path, and refuses.
+    shared_index::assert_refused_on_bad_metadata(&proj, "redis-scfull-mixed", TEST_HOST, &envs);
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #341: the hybrid workload on an MS MARCO-shaped fixture (the prepared 100K
+/// corpus is too large for CI). One timed pass per selectivity bucket; recall
+/// against the brute-forced FILTERED truth is reported per bucket, and the
+/// per-query dump carries the bucket as its shape. With an explicit
+/// `HYBRID_POLICY: ADHOC_BF` every query is brute force, so recall is exact —
+/// and `FT.PROFILE` must confirm Redis ran that mode for all 12 queries of each
+/// bucket. Unset, Redis chooses; every query must still report a hybrid mode.
+#[test]
+fn test_binary_redis_hybrid_per_bucket_recall_and_policy() {
+    wait_for_redis();
+    let configs = serde_json::json!([
+        {"name": "redis-hyb-adhoc", "engine": "redis",
+         "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                            "hybrid_policy": "ADHOC_BF", "search_params": {"ef": 200}}],
+         "upload_params": {"parallel": 2, "batch_size": 500}},
+        {"name": "redis-hyb-auto", "engine": "redis",
+         "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                            "search_params": {"ef": 200}}],
+         "upload_params": {"parallel": 2, "batch_size": 500}}
+    ]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let port = test_port().to_string();
+    for (config, min_recall) in [("redis-hyb-adhoc", 0.999), ("redis-hyb-auto", 0.8)] {
+        let dump = proj.root.join(format!("dumps-{config}"));
+        assert!(common::run_binary_extra(
+            &proj.root,
+            config,
+            "hybrid-test",
+            "localhost",
+            &[("REDIS_PORT", &port)],
+            &[
+                "--dump-results",
+                dump.to_str().unwrap(),
+                "--fail-on-dropped-queries"
+            ]
+        ));
+        let evidence = common::assert_hybrid_run(&proj, config, &dump, min_recall, "vector");
+        for e in &evidence {
+            // 4 per predicate x 3 predicates: here, the whole 12-query bucket.
+            assert_eq!(e["profiled_queries"], 12, "{config}: {e}");
+            assert_eq!(e["profile_sample_per_predicate"], 4, "{config}: {e}");
+            assert_eq!(e["bucket_queries"], 12, "{config}: {e}");
+            assert_eq!(e["shards"], 1, "{config}: {e}");
+            let modes = e["vector_search_modes"].as_object().unwrap();
+            assert_eq!(
+                modes.values().map(|v| v.as_u64().unwrap()).sum::<u64>(),
+                12,
+                "{config}: {e}"
+            );
+            if config == "redis-hyb-adhoc" {
+                assert_eq!(modes.len(), 1, "{e}");
+                assert_eq!(modes["HYBRID_ADHOC_BF"], 12, "{e}");
+            } else {
+                assert!(modes.keys().all(|m| m.starts_with("HYBRID_")), "{e}");
+            }
+        }
+        let results = common::read_results_obj(&proj.root, config);
+        let note = &results["hybrid"]["engine"];
+        assert_eq!(note["verbatim"], true);
+        assert_eq!(
+            note["mode_source"],
+            "FT.PROFILE of a fixed sample (the first 4 queries of each predicate) after each \
+             bucket's timed pass, with the policy the pass sent; one mode per shard"
+        );
+        if config == "redis-hyb-adhoc" {
+            assert_eq!(note["hybrid_policy"], "ADHOC_BF");
+        }
+    }
+    // A config policy that contradicts REDIS_HYBRID_POLICY is a hard error,
+    // not a silent pick of one of them — refused at startup, for that reason.
+    let (ok, stdout, stderr) = common::run_binary_text(
+        &proj.root,
+        "redis-hyb-adhoc",
+        "hybrid-test",
+        "localhost",
+        &[("REDIS_PORT", &port), ("REDIS_HYBRID_POLICY", "BATCHES")],
+    );
+    assert!(!ok);
+    assert!(stderr.contains("REDIS_HYBRID_POLICY"), "{stderr}");
+    assert!(!stdout.contains("Experiment stage:"), "{stdout}");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #341 x #344: hybrid and filter-only in ONE engine config share one index,
+/// built once in the `full` layout (hybrid needs the vector field, filter-only
+/// the CASESENSITIVE tags). Hybrid keeps exact per-bucket recall under
+/// `ADHOC_BF` with FT.PROFILE confirming the mode; filter-only passes its
+/// per-query count gate; both search files and the hybrid dump record `full`.
+#[test]
+fn test_binary_redis_hybrid_and_filter_only_share_one_full_index() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let config = "redis-hyb-fo";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "redis",
+        "search_params": [
+            {"parallel": 2, "top": 10, "workload": "hybrid", "hybrid_policy": "ADHOC_BF",
+             "search_params": {"ef": 200}},
+            {"parallel": 2, "top": 10, "workload": "filter-only"}],
+        "upload_params": {"parallel": 2, "batch_size": 500}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let counts = common::add_hybrid_filter_queries(&proj);
+    let port = test_port().to_string();
+    let dump = proj.root.join("dumps");
+    let out = common::run_binary_output(
+        &proj.root,
+        config,
+        "hybrid-test",
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let evidence = common::assert_hybrid_run(&proj, config, &dump, 0.999, "full");
+    for e in &evidence {
+        assert_eq!(e["vector_search_modes"]["HYBRID_ADHOC_BF"], 12, "{e}");
+    }
+    common::assert_hybrid_mix_filter_only(&proj, config, &stdout, &counts);
+    // The realized index is the union: VECTOR + TEXT (title) + CASESENSITIVE
+    // TAG + NUMERIC.
+    let info: redis::Value = redis::cmd("FT.INFO")
+        .arg(format!("idx:{config}"))
+        .query(&mut conn)
+        .unwrap();
+    let info = format!("{info:?}");
+    for token in ["VECTOR", "TEXT", "CASESENSITIVE", "NUMERIC"] {
+        assert!(info.contains(token), "FT.INFO lacks {token}: {info}");
+    }
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #342: the STREAMING upload (`--upload-reader stream`) on the MS MARCO-shaped
+/// fixture, with a batch size and thread count that do not divide the corpus.
+/// `ADHOC_BF` is an exact filtered search, so recall 0.999 in every bucket
+/// means every row arrived with its vector AND the payload fields the
+/// predicates read (derived numerics, category tag, title text). The upload
+/// result records the reader that ran, and the run states the flag.
+#[test]
+fn test_binary_redis_streaming_upload_is_exact_on_hybrid() {
+    wait_for_redis();
+    let configs = serde_json::json!([
+        {"name": "redis-hyb-stream", "engine": "redis",
+         "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                            "hybrid_policy": "ADHOC_BF", "search_params": {"ef": 200}}],
+         "upload_params": {"parallel": 3, "batch_size": 333}}
+    ]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-stream", &configs.to_string());
+    let port = test_port().to_string();
+    let dump = proj.root.join("dumps-stream");
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-hyb-stream",
+        "hybrid-stream",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--upload-reader",
+            "stream",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_hybrid_run(&proj, "redis-hyb-stream", &dump, 0.999, "vector");
+    let upload = common::read_upload_doc(&proj.root, "redis-hyb-stream");
+    let reader = &upload["results"]["upload_reader"];
+    assert_eq!(reader["reader"], "stream", "{upload}");
+    assert_eq!(reader["flag"], "stream", "{upload}");
+    assert_eq!(reader["rows"], common::HYBRID_N as u64, "{upload}");
+    assert_eq!(upload["results"]["upload_count"], common::HYBRID_N as u64);
+    // #344 on the streamed path: one-clock phases, checked against the
+    // legacy fields the upload file also carries.
+    let r = &upload["results"];
+    let ph = &r["ingest_phases"];
+    assert_eq!(
+        ph["index_wait"], "redis_ft_info_percent_indexed",
+        "{upload}"
+    );
+    assert_eq!(ph["documents"], common::HYBRID_N as u64, "{upload}");
+    let f = |k: &str| r[k].as_f64().unwrap_or_else(|| panic!("results.{k}: {r}"));
+    assert!(f("upload_time") > 0.0 && f("index_wait_time") >= 0.0, "{r}");
+    assert!(
+        (f("upload_time") + f("index_wait_time") - f("total_ingest_time")).abs() < 1e-3,
+        "{r}"
+    );
+    assert!(
+        (f("read_time") + f("total_ingest_time") - f("total_time")).abs() < 1e-3,
+        "{r}"
+    );
+    let doc = common::read_result_doc(&proj.root, "redis-hyb-stream");
+    let invocation = &doc["params"]["engine_params"]["invocation"];
+    assert_eq!(invocation["upload_reader"], "stream", "{invocation}");
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #361 review: the streamed upload's payload pre-flight. A `payloads.jsonl`
+/// one row short is refused before the first HSET, as on the in-memory path,
+/// rather than after the whole corpus was sent: the server holds no keys.
+#[test]
+fn test_binary_redis_streaming_upload_refuses_a_short_payload_file_before_writing() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([
+        {"name": "redis-stream-short", "engine": "redis",
+         "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+         "upload_params": {"parallel": 3, "batch_size": 333}}
+    ]);
+    let proj = common::write_msmarco_hybrid_project("stream-short", &configs.to_string());
+    // Drop the last payload row: the stream would only find it after every
+    // batch had been sent.
+    let payloads = proj.root.join("datasets/stream-short/payloads.jsonl");
+    let text = std::fs::read_to_string(&payloads).unwrap();
+    let keep = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0;
+    std::fs::write(&payloads, format!("{keep}\n")).unwrap();
+    let port = test_port().to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        "redis-stream-short",
+        "stream-short",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &["--upload-reader", "stream"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let all = format!("{stdout}\n{stderr}");
+    assert!(
+        all.contains("payload pre-flight failed") && all.contains("doesn't match vector count"),
+        "{all}"
+    );
+    let keys: i64 = redis::cmd("DBSIZE").query(&mut conn).unwrap();
+    assert_eq!(
+        keys, 0,
+        "documents were written before the payload file was checked"
+    );
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }

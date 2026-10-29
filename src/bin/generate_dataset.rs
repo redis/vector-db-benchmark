@@ -54,6 +54,7 @@ const MULTIVECTOR_NAME: &str = "synthetic-multivector-16";
 #[derive(Parser, Debug)]
 #[command(
     name = "generate-dataset",
+    version = vector_db_benchmark::build_info::LONG_VERSION,
     about = "Generate small deterministic synthetic datasets (sparse / hybrid / filter / selectivity) on disk."
 )]
 struct Args {

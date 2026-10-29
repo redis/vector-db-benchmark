@@ -90,7 +90,15 @@ src/
   msmarco.rs          # MS MARCO corpus prep: sampling, oracle, NPY writers (unit-tested)
   query_filter.rs     # The ONE door from a dataset's `conditions` JSON to a filter (#219)
   metrics.rs          # recall / precision / MRR / NDCG — see the metric-naming note below
+  workload.rs         # per-search-config workload + engine/workload table, index layouts
+                      #   incl. the shared `full` one (#344)
+  ingest.rs           # ingestion phases (upload / index wait / total) on one clock (#344)
+  results_dump.rs     # per-query record contract, --dump-results JSONL (#343)
+  fulltext.rs         # ranked BM25 workload: query terms, pinned analyzers, index checks (#339)
+  compare_results.rs  # compare-results: overlap/Jaccard/rank/count vs a reference
   start_gate.rs       # Worker barrier for parallel search
+  build_info.rs       # commit the binaries were built from: `--version`, `params.build`
+                      #   (resolved by build.rs via build_info/resolve.rs, #366)
   config.rs, redis_client.rs, parsers.rs
   bin/
     vector_db_benchmark/
@@ -104,6 +112,26 @@ tests/                # integration_<engine>.rs, plus harness_invariants +
 datasets/datasets.json        # Dataset registry
 experiments/configurations/   # Engine configs (HNSW params, search params)
 ```
+
+## Cutting a release (prebuilt binaries, #366)
+
+`.github/workflows/release-binaries.yml` attaches `vector-db-benchmark-<tag>-{linux-x86_64,linux-aarch64,macos-aarch64}.tar.gz`
+and `SHA256SUMS` to a published release. Its `plan` job runs `check_release_tag`
+(`scripts/release/lib.sh`) first. That check refuses a tag that does not name
+`Cargo.toml`'s `[package].version` (`X.Y.Z`, `vX.Y.Z` or `X.Y.Z-rc.N`), and any
+tag containing `+`.
+
+So: **bump the version, merge, then tag that commit and publish the release.**
+A release published without the bump gets no archives, but still becomes
+"latest", which breaks the README's install one-liner until it is fixed.
+
+If `publish` or the check after it fails, use **Re-run failed jobs** on that
+run. It reuses the same build artifacts, and `publish.sh` completes the upload,
+replacing any upload that never finished. **Re-run all jobs** rebuilds, so the
+digests differ and the run refuses. Rebuild a tag on purpose only with
+`workflow_dispatch` (`tag` plus `clobber: true`, which replaces the whole set). Everything except the upload also runs on PRs that
+touch the archive's inputs: `make release-selftest` and
+`scripts/release/install-test.sh` run there.
 
 ## Dataset Formats
 
@@ -170,6 +198,35 @@ auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
   global top-1k before anything is written; `--verify` re-runs that check against
   an already-prepared dataset.
 - `--discover-crc32` re-derives the sampling thresholds (26.9 GB metadata scan).
+- `msmarco-cohere-1024-100M-cosine` (#342, threshold 880,865 -> 100,000,027
+  rows, ~600 GB) has no download; it is built on the client host and is larger
+  than client RAM. Preparation must stay streaming (the hybrid pass uses
+  `StreamedCorpus` + `RowMask` bits, not `HybridCorpus`), and its upload uses
+  `--upload-reader stream|auto` (`src/upload_stream.rs`, Redis + OpenSearch).
+  `tests/streaming_memory.rs` measures peak allocation with a counting
+  allocator and fails if either path grows with the corpus.
+- Payloads also carry four SYNTHETIC exact-match fields derived from `docid`
+  alone (`category`, `doc_len`, `tier`, `rand_key`; `src/msmarco/derived.rs`),
+  and `filter_queries.jsonl` holds the filter-only query set over them with an
+  exact `expected_count` per query. Filtered workloads (#340, #341) must reuse
+  `msmarco::derived` (`Predicate`, `count_matches`, `matching_ids`) rather than
+  re-implementing predicate evaluation. `--add-derived-fields` upgrades an
+  already-prepared corpus in place without the full rescan.
+- The filter-only workload reads `filter_queries.jsonl` through
+  `filter_only::query_set` (prepared set, index layout, per-query count gate).
+  It relies on the loader (`Dataset::get_path` -> `derived::check_prepared_dir`)
+  to refuse a stale directory before any workload sees it; do not re-check.
+- `hybrid_queries.jsonl` (#341, `src/msmarco/hybrid.rs`, format in
+  `src/hybrid.rs`) pairs every query vector with a predicate (derived fields
+  and/or a `title` text match) and its brute-forced FILTERED top-1000, computed
+  by the unfiltered oracle's own `TopK` (`add_block_where`) and cross-checked
+  against `tests.jsonl`. Text-match agreement rules live in
+  `src/msmarco/text_match.rs`; never send a text predicate whose term was not
+  chosen by them. `--add-hybrid-queries` adds the file in place; `--verify`
+  regenerates it. `--add-derived-fields` rewrites the payloads and so REMOVES
+  `hybrid_queries.jsonl` (its truth was computed from the old payloads; see
+  `msmarco::hybrid::DERIVED_UPGRADE_PUBLISH`); re-run `--add-hybrid-queries`
+  after it.
 
 ## Key Patterns
 

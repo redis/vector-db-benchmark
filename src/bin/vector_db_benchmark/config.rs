@@ -127,6 +127,17 @@ pub struct SearchParams {
     pub calibration_param: Option<String>,
     /// Calibration: target precision to achieve
     pub calibration_precision: Option<f64>,
+    /// Query family this search config runs (#344). Undeclared means `vector`;
+    /// `--skip-vector-index` forces `filter-only`. Resolved once per engine
+    /// config by `vector_db_benchmark::workload::plan` before anything connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<vector_db_benchmark::workload::Workload>,
+    /// Runtime-only (never read from or written to a config file): set by the
+    /// runner under `--dump-results` so the engine records a
+    /// `results_dump::RawQueryResult` per timed query into
+    /// `SearchResults::query_records`.
+    #[serde(skip)]
+    pub capture_query_results: bool,
     /// Catch-all for engine-specific search params (e.g., OpenSearch "knn.algo_param.ef_search")
     #[serde(flatten)]
     pub extra: Option<HashMap<String, serde_json::Value>>,
@@ -214,6 +225,13 @@ pub struct EngineConfig {
     /// When true, vectors are uploaded but not indexed; search is filter-only.
     #[serde(default)]
     pub skip_vector_index: bool,
+    /// Runtime-only (never read from or written to a config file): set by the
+    /// runner when the config's workload plan needs the shared `full` index
+    /// (`vector_db_benchmark::workload::IndexLayout::Full`, #344) — the vector
+    /// layout with its scalar fields typed for filter-only. Honoured by the
+    /// engines in `workload::supports_full_layout`.
+    #[serde(skip)]
+    pub full_index_layout: bool,
     /// This entry exactly as it appears in the configuration FILE.
     ///
     /// The typed fields above are lossy in three ways that matter to an artifact
@@ -2029,6 +2047,8 @@ mod shipped_config_knob_guard {
         "max_lateness_ms",
         "calibration_param",
         "calibration_precision",
+        // #344: resolved by the runner into the engine dispatch, not an engine knob.
+        "workload",
         // The inner `search_params` object itself is a container, not a knob.
         // `config` is #215's alias for that same container (upstream's spelling).
         "search_params",
@@ -2455,7 +2475,28 @@ mod shipped_config_knob_guard {
                 }
                 if let Some(list) = entry.get("search_params").and_then(|v| v.as_array()) {
                     for sp in list {
-                        collect_knobs(sp, "search_params", &mut knobs);
+                        // #339: the `fulltext` block is a typed,
+                        // deny_unknown_fields struct parsed by the library
+                        // (`fulltext::FulltextSpec`), and the keys under its
+                        // `fields` are data (field names), not knobs — so it is
+                        // validated with the real parser instead of by token
+                        // matching an engine's source.
+                        let mut sp = sp.clone();
+                        if let Some(block) = sp
+                            .as_object_mut()
+                            .and_then(|o| o.remove(vector_db_benchmark::fulltext::SPEC_KEY))
+                        {
+                            if let Err(e) = vector_db_benchmark::fulltext::validate_declared(
+                                engine,
+                                vector_db_benchmark::workload::Workload::Fulltext,
+                                Some(&block),
+                            ) {
+                                violations.push(format!(
+                                    "{file_name} [{name}] has an invalid fulltext block: {e}"
+                                ));
+                            }
+                        }
+                        collect_knobs(&sp, "search_params", &mut knobs);
                     }
                 }
 

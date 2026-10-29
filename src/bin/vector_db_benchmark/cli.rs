@@ -2,14 +2,23 @@
 //!
 //! Mirrors the Python run.py CLI interface.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 /// Rust implementation of vector-db-benchmark.
 /// Supports redis and vectorsets engines.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "vector-db-benchmark")]
-#[command(version, about = "Run vector database benchmarks", long_about = None)]
+#[command(
+    version = vector_db_benchmark::build_info::LONG_VERSION,
+    about = "Run vector database benchmarks",
+    long_about = None
+)]
 pub struct Args {
+    /// Optional subcommand. Without one, the benchmark runs as before.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Engine patterns to run (supports wildcards like "redis*", repeatable)
     #[arg(long, default_value = "*")]
     pub engines: Vec<String>,
@@ -186,7 +195,8 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub ef_runtime: Vec<i64>,
 
-    /// Describe available options: 'datasets' or 'engines'
+    /// Describe available options: 'datasets', 'engines', or 'build' (the
+    /// provenance block result files record, as JSON)
     #[arg(long)]
     pub describe: Option<String>,
 
@@ -207,6 +217,8 @@ pub struct Args {
 
     /// Skip vector indexing: upload vectors but don't index them, run filter-only queries.
     /// Collapses all M/EF variants of the same engine into a single "<engine>-no-vector" experiment.
+    /// Equivalent to declaring `"workload": "filter-only"` on every search config (#344);
+    /// a config that declares another workload is refused under this flag.
     #[arg(long, default_value = "false")]
     pub skip_vector_index: bool,
 
@@ -217,6 +229,64 @@ pub struct Args {
     /// this only for full-fidelity archival of a specific run.
     #[arg(long, default_value = "false")]
     pub dump_raw_latencies: bool,
+
+    /// Write every timed query's result to DIR (#343): one JSONL per (config,
+    /// dataset, workload, parallel, search config), holding `query_id`, the
+    /// returned EXTERNAL ids (`docid` where the dataset has one, else the corpus
+    /// row id — never an engine key), scores, the exact total where the
+    /// workload requests one, and latency. Captured outside each latency sample
+    /// but inside the throughput window when this flag is on (the capture runs
+    /// in the measured worker loop, so it counts toward `rps`); written after
+    /// the search phase. DIR must be empty or absent: a non-empty DIR is
+    /// refused at startup. An engine without per-query capture for the
+    /// workload fails the run instead of writing an empty dump. Feed two runs'
+    /// dumps to `compare-results`.
+    #[arg(long, value_name = "DIR")]
+    pub dump_results: Option<PathBuf>,
+
+    /// How the upload reads the corpus (#342): `auto` (default) streams a
+    /// compound (`vectors.npy` + `payloads.jsonl`) corpus from disk, a batch at
+    /// a time, only when the in-memory reader could not hold it (>= 128 GiB of
+    /// vectors, or 2x the vectors above MemAvailable capped by the cgroup
+    /// limit), and loads everything
+    /// else into memory as before — so the 100K/1M/10M MS MARCO upload numbers
+    /// keep their meaning; `stream` always streams (compound datasets only;
+    /// engines without a streaming upload refuse it); `memory` always loads.
+    /// Streaming bounds client memory by parallel x batch_size instead of the
+    /// corpus size, and uploads the same rows. Only the Redis and OpenSearch
+    /// uploads stream. The reader used is recorded as `results.upload_reader`.
+    #[arg(long, value_name = "MODE", default_value = "auto")]
+    pub upload_reader: vector_db_benchmark::upload_stream::UploadReader,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Compare two engines' `--dump-results` output against a declared
+    /// reference engine (#343). Exits non-zero when any query was answered by
+    /// one engine and not by the other.
+    CompareResults(CompareResultsArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct CompareResultsArgs {
+    /// A dump file or a directory of dumps.
+    pub first: PathBuf,
+    /// A dump file or a directory of dumps.
+    pub second: PathBuf,
+    /// The source-of-truth engine: matched against each dump header's engine
+    /// type or config name. The side whose dumps all name it is the reference.
+    #[arg(long)]
+    pub reference: String,
+    /// Write the JSON report here.
+    #[arg(long, value_name = "FILE")]
+    pub json: Option<PathBuf>,
+    /// Write the Markdown table here (it is always printed to stdout).
+    #[arg(long, value_name = "FILE")]
+    pub markdown: Option<PathBuf>,
+    /// Do not fail when a dump on either side has no counterpart (they are
+    /// still listed). Off by default: a missing dump is a missing comparison.
+    #[arg(long)]
+    pub allow_unpaired: bool,
 }
 
 #[cfg(test)]
@@ -298,6 +368,52 @@ mod tests {
 
     // Raw-array dump (#151-8): opt-in, defaults to false so result files carry
     // only the compact digests, and parses when explicitly requested.
+    #[test]
+    fn upload_reader_parses_and_defaults_to_auto() {
+        use vector_db_benchmark::upload_stream::UploadReader;
+        assert_eq!(parse(&[]).upload_reader, UploadReader::Auto);
+        assert_eq!(
+            parse(&["--upload-reader", "stream"]).upload_reader,
+            UploadReader::Stream
+        );
+        assert_eq!(
+            parse(&["--upload-reader", "memory"]).upload_reader,
+            UploadReader::Memory
+        );
+        assert!(Args::try_parse_from(["vdbb", "--upload-reader", "mmap"]).is_err());
+    }
+
+    #[test]
+    fn dump_results_and_compare_results_parse() {
+        assert_eq!(parse(&[]).dump_results, None);
+        assert!(parse(&[]).command.is_none());
+        assert_eq!(
+            parse(&["--dump-results", "/tmp/d"]).dump_results,
+            Some(PathBuf::from("/tmp/d"))
+        );
+        let args = Args::try_parse_from([
+            "vector-db-benchmark",
+            "compare-results",
+            "a",
+            "b",
+            "--reference",
+            "opensearch",
+            "--json",
+            "r.json",
+        ])
+        .unwrap();
+        let Some(Command::CompareResults(c)) = args.command else {
+            panic!("compare-results did not parse as the subcommand");
+        };
+        assert_eq!(c.first, PathBuf::from("a"));
+        assert_eq!(c.reference, "opensearch");
+        assert_eq!(c.json, Some(PathBuf::from("r.json")));
+        // The reference engine is mandatory: the report must name it.
+        assert!(
+            Args::try_parse_from(["vector-db-benchmark", "compare-results", "a", "b"]).is_err()
+        );
+    }
+
     #[test]
     fn dump_raw_latencies_parses() {
         assert!(

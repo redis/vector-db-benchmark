@@ -91,9 +91,25 @@ pub const NEIGHBOURS: usize = 1000;
 /// Queries in `queries_jsonl/queries.jsonl.gz` (TREC-DL 2021 + 2022 + 2023).
 pub const QUERY_COUNT: usize = 1677;
 
+pub mod derived;
+pub mod hybrid;
+pub mod text_match;
+
 /// Payload fields carried over from the MS MARCO segmented-document records,
 /// with the `schema` type each is registered under in `datasets/datasets.json`.
-/// Kept here so the prepared payloads and the registered schema cannot drift.
+pub const PASSAGE_FIELDS: &[(&str, &str)] = &[
+    ("docid", "keyword"),
+    ("url", "keyword"),
+    ("title", "text"),
+    ("headings", "text"),
+    ("segment", "text"),
+    ("start_char", "int"),
+    ("end_char", "int"),
+];
+
+/// Every payload field the preparer writes: [`PASSAGE_FIELDS`] followed by
+/// [`derived::DERIVED_FIELDS`] (pinned by a test). Kept here so the prepared
+/// payloads and the registered schema cannot drift.
 pub const PAYLOAD_FIELDS: &[(&str, &str)] = &[
     ("docid", "keyword"),
     ("url", "keyword"),
@@ -102,6 +118,10 @@ pub const PAYLOAD_FIELDS: &[(&str, &str)] = &[
     ("segment", "text"),
     ("start_char", "int"),
     ("end_char", "int"),
+    ("category", "keyword"),
+    ("doc_len", "int"),
+    ("tier", "int"),
+    ("rand_key", "int"),
 ];
 
 /// Number of hash buckets the uniform sampler partitions the corpus into.
@@ -283,11 +303,20 @@ pub struct Variant {
 /// briefly and was removed — see [`Sampling`] for why position-based selection
 /// is the wrong default for a corpus whose point is its metadata.
 ///
-/// The thresholds nest (886 < 8805 < 88075), so each variant is a strict subset
-/// of the larger ones and results stay comparable across sizes.
+/// The thresholds nest (886 < 8805 < 88075 < 880865), so each variant is a
+/// strict subset of the larger ones and results stay comparable across sizes.
+///
+/// The 100M variant (#342) is larger than any benchmark client's RAM: ~410 GB
+/// of float32 vectors and ~184 GB of payloads. `prepare-msmarco` builds it
+/// with the same streaming passes as the others (peak RSS is O(per-passage
+/// derived fields + title vocabulary), ~4 GB, not O(corpus)), and the
+/// benchmark streams it into Redis / OpenSearch (`upload_stream`). It has no
+/// published tarball: build it on the client host.
 pub const VARIANTS: &[Variant] = &[
     // Realized counts measured by `--discover-crc32` over all 113,520,750
-    // docids at revision e78737fe: 99,964 / 1,000,044 / 9,999,959.
+    // docids at revision e78737fe: 99,964 / 1,000,044 / 9,999,959, and
+    // 100,000,027 at 880865 (#342; reproduced the first three exactly in the
+    // same scan, 2026-10-28).
     Variant {
         dataset_name: "msmarco-cohere-1024-100K-cosine",
         dir: "msmarco-cohere-1024/crc32-t886",
@@ -306,7 +335,46 @@ pub const VARIANTS: &[Variant] = &[
         limit: 9_999_959,
         threshold: 88_075,
     },
+    Variant {
+        dataset_name: "msmarco-cohere-1024-100M-cosine",
+        dir: "msmarco-cohere-1024/crc32-t880865",
+        limit: 100_000_027,
+        threshold: 880_865,
+    },
 ];
+
+/// Sizes `--discover-crc32` reports a threshold for: one per registered
+/// variant, so a rescan re-derives every constant above.
+pub const DISCOVERY_TARGETS: [u64; 4] = [100_000, 1_000_000, 10_000_000, 100_000_000];
+
+/// Revision suffix of the prepared tarballs in S3. Bumped whenever the files a
+/// tarball holds change shape (v2: payloads gain the derived fields and
+/// `filter_queries.jsonl` is added, #340), so a new artifact never overwrites an
+/// old one under the same name. The old objects stay in place.
+///
+/// This does NOT invalidate a local cache: the benchmark keys the local copy on
+/// the entry's `path` (the variant's `dir`) and skips the download whenever that
+/// directory exists. A stale directory is caught on load instead, by
+/// `derived::check_prepared_dir`.
+pub const TARBALL_REVISION: &str = "v2";
+
+/// `msmarco-cohere-1024-1M-cosine-v2`, the stem of a variant's published tarball.
+pub fn tarball_stem(v: &Variant) -> String {
+    format!("{}-{}", v.dataset_name, TARBALL_REVISION)
+}
+
+/// What to tell someone whose MS MARCO dataset directory is missing and has
+/// no download link (the 100M, #342): the exact build command. `None` for a
+/// name that is not an MS MARCO variant.
+pub fn build_hint(dataset_name: &str) -> Option<String> {
+    variant(dataset_name).map(|v| {
+        format!(
+            "build it on this host with `make prepare-msmarco MSMARCO_DATASET={}` (see the \
+             README's MS MARCO section for disk and time)",
+            v.dataset_name
+        )
+    })
+}
 
 /// Look a variant up by its registered dataset name.
 pub fn variant(dataset_name: &str) -> Option<&'static Variant> {
@@ -684,6 +752,23 @@ impl TopK {
     /// `first_id`. Parallelised across queries, so each rayon task owns one
     /// query's `best` list exclusively and the block is read-shared.
     pub fn add_block(&mut self, block: &[f32], first_id: i64) -> Result<(), String> {
+        self.add_block_where(block, first_id, |_, _| true)
+    }
+
+    /// [`TopK::add_block`] restricted per query: row `id` is a candidate for
+    /// query `qi` only when `keep(qi, id)`. The SAME scoring, insertion and
+    /// tie-break as the unfiltered oracle — `add_block` is this with an
+    /// always-true `keep` — so a filtered ground truth (#341) is the unfiltered
+    /// ranking with non-matching rows removed, never a second implementation.
+    pub fn add_block_where<F>(
+        &mut self,
+        block: &[f32],
+        first_id: i64,
+        keep: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(usize, i64) -> bool + Sync,
+    {
         // A returned error, NOT a debug_assert: every suite and the preparer itself
         // run `--release`, where a debug assertion is compiled out — so the guard
         // would have been absent from exactly the binary that writes published
@@ -713,12 +798,15 @@ impl TopK {
         self.best.par_iter_mut().enumerate().for_each(|(qi, best)| {
             let q = &queries[qi * dim..(qi + 1) * dim];
             for (row, doc) in block.chunks_exact(dim).enumerate() {
+                let id = first_id + row as i64;
+                if !keep(qi, id) {
+                    continue;
+                }
                 // Cosine on unit vectors is the plain dot product.
                 let score = dot(q, doc);
                 if best.len() == k && score <= best[k - 1].0 {
                     continue;
                 }
-                let id = first_id + row as i64;
                 let pos = best
                     .binary_search_by(|probe| {
                         // Descending by score; ascending by id on a tie so
@@ -753,25 +841,48 @@ impl TopK {
 // Records -> on-disk rows
 // ---------------------------------------------------------------------------
 
-/// Project one `passages_jsonl` record onto the payload we store, keeping only
-/// [`PAYLOAD_FIELDS`] and in that order.
+/// Project one `passages_jsonl` record onto the payload we store: the
+/// [`PASSAGE_FIELDS`] it carries, plus the [`derived`] fields computed from its
+/// `docid`.
 ///
 /// A record missing `docid` is an error, not a `null` payload: `docid` is the
 /// key [`verify_head_against_shipped`] matches against `top1k_passage_ids`, and
-/// without it the npy↔jsonl alignment is unverifiable.
+/// without it the npy↔jsonl alignment is unverifiable (and nothing can be
+/// derived).
+///
+/// Also accepts an already-prepared payload, which is how
+/// `prepare-msmarco --add-derived-fields` upgrades a corpus in place: projecting
+/// a payload again yields the same passage fields, and derived fields already
+/// present must equal the derivation. Because the result is a sorted-key
+/// `serde_json` map either way, an upgraded corpus and a fresh build serialize
+/// to the same bytes.
 pub fn payload_from_passage(record: &serde_json::Value) -> Result<serde_json::Value, String> {
     let obj = record
         .as_object()
         .ok_or_else(|| "passage record is not a JSON object".to_string())?;
-    if !obj.contains_key("docid") {
-        return Err("passage record has no 'docid' field".to_string());
-    }
+    let docid = match obj.get("docid") {
+        None => return Err("passage record has no 'docid' field".to_string()),
+        Some(d) => d
+            .as_str()
+            .ok_or_else(|| format!("passage record's 'docid' is not a string: {d}"))?,
+    };
     let mut out = serde_json::Map::with_capacity(PAYLOAD_FIELDS.len());
-    for (field, _) in PAYLOAD_FIELDS {
+    for (field, _) in PASSAGE_FIELDS {
         if let Some(v) = obj.get(*field) {
             out.insert((*field).to_string(), v.clone());
         }
     }
+    let derived = derived::DerivedFields::from_docid(docid);
+    // Carry any derived field the record already holds so `insert_into` can
+    // refuse a value that disagrees with the derivation.
+    for (field, _) in derived::DERIVED_FIELDS {
+        if let Some(v) = obj.get(*field) {
+            out.insert((*field).to_string(), v.clone());
+        }
+    }
+    derived
+        .insert_into(&mut out)
+        .map_err(|e| format!("docid {docid:?}: {e}"))?;
     Ok(serde_json::Value::Object(out))
 }
 
@@ -1058,8 +1169,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_missing_variant_names_its_build_command() {
+        let h = build_hint("msmarco-cohere-1024-100M-cosine").unwrap();
+        assert!(
+            h.contains("make prepare-msmarco MSMARCO_DATASET=msmarco-cohere-1024-100M-cosine"),
+            "{h}"
+        );
+        assert!(build_hint("glove-100-angular").is_none());
+    }
+
+    #[test]
     fn variants_are_registered_under_their_own_names_and_dirs() {
-        assert_eq!(VARIANTS.len(), 3);
+        assert_eq!(VARIANTS.len(), 4);
+        // `--discover-crc32` sizes exactly the registered round numbers.
+        let rounds: Vec<u64> = VARIANTS
+            .iter()
+            .map(|v| {
+                let round = DISCOVERY_TARGETS
+                    .iter()
+                    .copied()
+                    .min_by_key(|t| t.abs_diff(v.limit))
+                    .unwrap();
+                // Within 0.1% of its round size, like every realized count.
+                assert!(round.abs_diff(v.limit) * 1000 < round, "{v:?}");
+                round
+            })
+            .collect();
+        assert_eq!(rounds, DISCOVERY_TARGETS.to_vec());
         // One family only. A position-based prefix family existed and was
         // removed: selection must be by hash, or the metadata distribution is an
         // artefact of how the corpus happens to be ordered.
@@ -1164,7 +1300,7 @@ mod tests {
             // exist.
             if let Some(link) = entry.get("link").and_then(|l| l.as_str()) {
                 assert!(
-                    link.ends_with(&format!("/{}.tgz", v.dataset_name)),
+                    link.ends_with(&format!("/{}.tgz", tarball_stem(v))),
                     "{}: link {link:?} does not name this variant's tarball",
                     v.dataset_name
                 );
@@ -1642,6 +1778,47 @@ mod tests {
 
     /// Every payload field must be declared in the dataset schema with the type
     /// the engines will build a column/index for.
+    #[test]
+    fn payload_fields_are_the_passage_fields_then_the_derived_ones() {
+        let joined: Vec<_> = PASSAGE_FIELDS
+            .iter()
+            .chain(derived::DERIVED_FIELDS)
+            .copied()
+            .collect();
+        assert_eq!(PAYLOAD_FIELDS, &joined[..]);
+    }
+
+    #[test]
+    fn payload_carries_the_derived_fields_and_reprojects_to_the_same_bytes() {
+        let rec = serde_json::json!({
+            "docid": "msmarco_v2.1_doc_00_0#0_0",
+            "url": "http://example.com/",
+            "start_char": 0,
+        });
+        let p = payload_from_passage(&rec).unwrap();
+        // Values from the Python reference in `derived`'s tests.
+        assert_eq!(p["category"], serde_json::json!("cat14"));
+        assert_eq!(p["doc_len"], serde_json::json!(4476));
+        assert_eq!(p["tier"], serde_json::json!(1));
+        assert_eq!(p["rand_key"], serde_json::json!(923_388_215_550u64));
+        // Upgrading an already-prepared payload is a byte-for-byte no-op.
+        let again = payload_from_passage(&p).unwrap();
+        assert_eq!(
+            serde_json::to_string(&again).unwrap(),
+            serde_json::to_string(&p).unwrap()
+        );
+        // ...and an old payload without derived fields upgrades to the fresh bytes.
+        assert_eq!(
+            serde_json::to_string(&payload_from_passage(&rec).unwrap()).unwrap(),
+            serde_json::to_string(&again).unwrap()
+        );
+        // A stored derived value that disagrees is refused, not overwritten.
+        let mut bad = p.clone();
+        bad["tier"] = serde_json::json!(7);
+        assert!(payload_from_passage(&bad).unwrap_err().contains("tier"));
+        assert!(payload_from_passage(&serde_json::json!({"docid": 5})).is_err());
+    }
+
     #[test]
     fn payload_fields_declare_a_schema_type_each() {
         for (name, ty) in PAYLOAD_FIELDS {

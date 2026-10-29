@@ -283,6 +283,32 @@ fn test_opensearch_knn_search() {
     let hits = body["hits"]["hits"].as_array().unwrap();
     assert!(!hits.is_empty(), "Expected search results");
 
+    // Query-level effort must be accepted by the real Lucene engine while
+    // the returned result count stays at K, not the larger candidate budget.
+    let tuned = vector_db_benchmark::opensearch_query::build_knn_body(
+        &[1.0, 0.0, 0.0, 0.0],
+        3,
+        None,
+        Some(128),
+    )
+    .unwrap();
+    let response = client
+        .post(format!("{}/{}/_search", os_base_url(), OS_INDEX))
+        .json(&tuned)
+        .send()
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().unwrap_or_default()
+    );
+    let tuned_body: serde_json::Value = response.json().unwrap();
+    assert_eq!(tuned_body["hits"]["hits"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        tuned_body["hits"]["hits"][0]["fields"]["_id"][0],
+        id_to_uuid_hex(0)
+    );
+
     // First result should be id=0 (exact match)
     let first_id = hits[0]["_id"].as_str().unwrap();
     let expected_id = id_to_uuid_hex(0);
@@ -1323,4 +1349,1175 @@ fn read_params_obj(root: &std::path::Path, engine: &str) -> serde_json::Value {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     v["params"].clone()
+}
+
+#[test]
+fn test_binary_opensearch_filter_only_contract() {
+    wait_for_opensearch();
+    let _fielddata = DisabledIdFielddata::new();
+    let config = serde_json::json!([{"name":"scalar-os","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":4,"top":3}]}]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "scalar-contract";
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-os",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &[
+            "--skip-vector-index",
+            "--queries",
+            "90",
+            "--keep-data",
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "opensearch-no-vector", total, returned);
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        mapping[index]["mappings"]["properties"]["price"]["type"],
+        "double"
+    );
+    let vector = &mapping[index]["mappings"]["properties"]["vector"];
+    assert_eq!(vector["type"], "float");
+    assert_eq!(vector["index"], false);
+    assert_eq!(vector["doc_values"], false);
+    let settings: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_settings", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(settings[index]["settings"]["index"]["knn"], "false");
+    common::assert_filter_only_predicates(
+        &proj.root,
+        "scalar-os",
+        "opensearch-no-vector",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+    );
+    // The reuse path must keep the scalar schema and corpus intact.
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-os",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &[
+            "--skip-vector-index",
+            "--queries",
+            "90",
+            "--skip-upload",
+            "--keep-data",
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "opensearch-no-vector", total, returned);
+    os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send()
+        .unwrap();
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+/// Temporarily forbid loading _id fielddata and restore the previous setting.
+/// This suite is destructive and requires the dedicated disposable compose
+/// cluster; OPENSEARCH_PORT must never point at a shared or production cluster.
+struct DisabledIdFielddata(serde_json::Value);
+impl DisabledIdFielddata {
+    fn new() -> Self {
+        let old: serde_json::Value = os_client()
+            .get(format!("{}/_cluster/settings", os_base_url()))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        let previous = old["transient"]["indices"]["id_field_data"]["enabled"].clone();
+        os_client()
+            .put(format!("{}/_cluster/settings", os_base_url()))
+            .json(&serde_json::json!({"transient":{"indices.id_field_data.enabled":false}}))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        Self(previous)
+    }
+}
+impl Drop for DisabledIdFielddata {
+    fn drop(&mut self) {
+        let _ = os_client()
+            .put(format!("{}/_cluster/settings", os_base_url()))
+            .json(&serde_json::json!({"transient":{"indices.id_field_data.enabled":self.0}}))
+            .send();
+    }
+}
+
+#[test]
+fn test_binary_opensearch_filter_only_dot_high_dimension_and_default_limit() {
+    wait_for_opensearch();
+    let config = serde_json::json!([{"name":"scalar-wide","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":1}]}]);
+    let (proj, total, _) = common::write_filter_only_project(&config.to_string());
+    common::resize_filter_only_vectors(&proj.root, 4096, "dot");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-wide",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "scalar-wide")
+        ],
+        &["--skip-vector-index", "--fail-on-dropped-queries"]
+    ));
+    let doc = common::read_result_doc(&proj.root, "opensearch-no-vector");
+    assert_eq!(doc["results"]["requested_queries"], 9);
+    assert_eq!(doc["results"]["filter_only"]["result_limit"], 10);
+    assert_eq!(
+        doc["results"]["filter_only"]["matched_documents_sum"],
+        total
+    );
+    assert_eq!(
+        doc["results"]["filter_only"]["returned_documents_sum"],
+        common::filter_only_expected_counts()
+            .iter()
+            .map(|n| (*n).min(10))
+            .sum::<u64>()
+    );
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+#[test]
+fn test_binary_opensearch_filter_only_rejects_vector_index_reuse() {
+    wait_for_opensearch();
+    let config = serde_json::json!([{"name":"scalar-reuse","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":3}]}]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "scalar-vector-reuse";
+    let envs = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", index),
+    ];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-reuse",
+        "scalar-test",
+        "http://127.0.0.1",
+        &envs,
+        &["--skip-search", "--keep-data"]
+    ));
+    common::clear_result_files(&proj.root);
+    let out = std::process::Command::new(common::binary_path())
+        .current_dir(&proj.root)
+        .envs(envs)
+        .args([
+            "--engines",
+            "scalar-reuse",
+            "--datasets",
+            "scalar-test",
+            "--host",
+            "http://127.0.0.1",
+            "--skip-vector-index",
+            "--skip-upload",
+            "--queries",
+            "1",
+            "--fail-on-dropped-queries",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("filter-only requires index.knn=false"),
+        "{stderr}"
+    );
+    assert!(std::fs::read_dir(proj.root.join("results"))
+        .unwrap()
+        .all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("-search-")));
+    os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+/// #343: `--dump-results` on the OpenSearch KNN path. Ids come back as the
+/// engine's uuid `_id`s and must be dumped as corpus rows; the dump's recall
+/// must equal the published `mean_recall`.
+#[test]
+fn test_binary_opensearch_dump_results_vector() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-dump-vec", "engine": "opensearch",
+        "search_params": [{"parallel": 2, "num_candidates": 400}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dump-vec-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-dump-vec",
+        "dump-vec-test",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_dump_vec")
+        ],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_vector_dump_matches_run(&proj.root, &dump, "opensearch", "os-dump-vec");
+}
+
+/// #343 + #344: declared `"workload": "filter-only"` on OpenSearch, dumped
+/// and self-compared.
+#[test]
+fn test_binary_opensearch_dump_results_declared_filter_only() {
+    wait_for_opensearch();
+    let _fielddata = DisabledIdFielddata::new();
+    let config = serde_json::json!([{
+        "name": "dump-fo-os", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1}, "upload_params": {"parallel": 1},
+        "search_params": [{"parallel": 2, "top": 3, "workload": "filter-only"}]
+    }]);
+    let (proj, total, returned) = common::write_filter_only_project(&config.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "dump-fo-os",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", "dump-fo")],
+        &[
+            "--queries",
+            "90",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_filter_only_results(&proj.root, "dump-fo-os", total, returned);
+    common::assert_filter_only_dump(&dump, "opensearch", 90);
+    let (ok, report) = common::run_compare(&dump, &dump, "opensearch");
+    assert!(ok, "self-comparison must pass");
+    let counts = &report["pairs"][0]["shapes"][0]["count_agreement"];
+    assert_eq!(counts["fraction"], 1.0);
+    assert_eq!(counts["complete_page_set_agreement"], 1.0);
+}
+
+/// #339: the ranked full-text workload end to end on OpenSearch — boosts,
+/// the porter2 analyzer (a Porter analyzer would also return "generation"
+/// for "generously"), the skipped termless query, per-query docids + scores.
+/// See `common::assert_bm25_run` for every claim.
+#[test]
+fn test_binary_opensearch_fulltext_bm25() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-bm25", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1}, "upload_params": {"parallel": 1},
+        "search_params": common::bm25_search_params()
+    }]);
+    let proj = common::write_bm25_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-bm25",
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_bm25")
+        ],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_bm25_run(&proj.root, &dump, "opensearch", "os-bm25");
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #339: the fulltext arm refuses, before the timed window, an index whose
+/// text fields use the default analyzer (built by a vector-only config) and an
+/// index missing a searched text field — both reached through `--skip-upload`.
+#[test]
+fn test_binary_opensearch_fulltext_refuses_unpinned_or_incomplete_index() {
+    wait_for_opensearch();
+    let name = "os-bm25-guard";
+    let index = "bench_bm25_guard";
+    let write_config = |root: &std::path::Path, search_params: serde_json::Value| {
+        std::fs::write(
+            root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "opensearch",
+                "collection_params": {"number_of_shards": 1},
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let fulltext = |fields: serde_json::Value| {
+        serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+            "fulltext": {"fields": fields}}])
+    };
+    let proj = common::write_bm25_project("[]");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let envs = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", index),
+    ];
+    let run = |extra: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            "http://127.0.0.1",
+            &envs,
+            extra,
+        )
+    };
+    let refused = |out: std::process::Output, needle: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must refuse: {stderr}");
+        assert!(stderr.contains(needle), "expected {needle:?} in: {stderr}");
+    };
+
+    write_config(&proj.root, serde_json::json!([{"parallel": 1}]));
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    write_config(&proj.root, fulltext(serde_json::json!({"title": 1.0})));
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "expected the pinned vdbb_english_porter2",
+    );
+
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    common::write_bm25_registry(&proj.root, true);
+    write_config(
+        &proj.root,
+        fulltext(serde_json::json!({"title": 1.0, "body": 1.0})),
+    );
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "'body' is not in the OpenSearch mapping",
+    );
+    write_config(&proj.root, fulltext(serde_json::json!({"title": 1.0})));
+    let ok = run(&["--skip-upload", "--exit-on-error"]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // #339 review: a 2-shard index (per-shard BM25 statistics) is refused
+    // unless the config opts in; the opt-in records the live shard count.
+    common::write_bm25_registry(&proj.root, false);
+    let two_shards = |search_params: serde_json::Value| {
+        std::fs::write(
+            proj.root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "opensearch",
+                "collection_params": {"number_of_shards": 2},
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    two_shards(fulltext(serde_json::json!({"title": 1.0})));
+    refused(run(&["--keep-data", "--exit-on-error"]), "2 shards");
+    common::clear_result_files(&proj.root);
+    two_shards(
+        serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"title": 1.0}, "allow_multi_shard": true}}]),
+    );
+    let ok = run(&["--skip-upload", "--exit-on-error"]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let doc = common::read_result_doc(&proj.root, name);
+    assert_eq!(doc["params"]["fulltext"]["number_of_shards"], 2);
+    assert_eq!(doc["params"]["fulltext"]["allow_multi_shard"], true);
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #339 follow-up: `analysis: parity` end to end on OpenSearch — the nostem
+/// analyzer, whitespace normalization at upload (verified on `_source`), only
+/// the searched fields indexed, and refusal of an index uploaded in the other
+/// mode when reused through `--skip-upload`, in both directions.
+#[test]
+fn test_binary_opensearch_fulltext_parity() {
+    wait_for_opensearch();
+    let name = "os-bm25-parity";
+    let index = "bench_bm25_parity";
+    let write_config = |root: &std::path::Path, search_params: serde_json::Value| {
+        std::fs::write(
+            root.join("experiments/configurations/test.json"),
+            serde_json::json!([{"name": name, "engine": "opensearch",
+                "collection_params": {"number_of_shards": 1},
+                "upload_params": {"parallel": 1}, "search_params": search_params}])
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let proj = common::write_bm25_project("[]");
+    write_config(&proj.root, common::bm25_parity_search_params());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let envs = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", index),
+    ];
+    assert!(common::run_binary_extra(
+        &proj.root,
+        name,
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &envs,
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data"
+        ]
+    ));
+    common::assert_bm25_parity_run(&proj.root, &dump, "opensearch", name);
+    let hit: serde_json::Value = os_client()
+        .post(format!("{}/{index}/_search", os_base_url()))
+        .json(&serde_json::json!({"query": {"term": {"docid": "d4"}}}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(
+        hit["hits"]["hits"][0]["_source"]["headings"], "alpha beta",
+        "{hit}"
+    );
+    let run = |extra: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            "http://127.0.0.1",
+            &envs,
+            extra,
+        )
+    };
+    let refused = |out: std::process::Output, needle: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "must refuse: {stderr}");
+        assert!(stderr.contains(needle), "expected {needle:?} in: {stderr}");
+    };
+    let english = serde_json::json!([{"parallel": 1, "top": 5, "workload": "fulltext",
+        "fulltext": {"fields": {"headings": 1.0, "segment": 1.0}}}]);
+    write_config(&proj.root, english);
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "the index records analysis",
+    );
+    common::clear_result_files(&proj.root);
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    write_config(&proj.root, common::bm25_parity_search_params());
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "without whitespace normalization",
+    );
+    // A schema text field that is indexed but not searched is refused in
+    // parity. Build the parity index while the schema does not declare
+    // `title` (OpenSearch then maps the payload key dynamically, as indexed
+    // text), then reuse it once the schema declares `title` as text.
+    let registry_path = proj.root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&registry_path).unwrap()).unwrap();
+    registry[0]["schema"]
+        .as_object_mut()
+        .unwrap()
+        .remove("title");
+    std::fs::write(&registry_path, registry.to_string()).unwrap();
+    assert!(run(&["--skip-search", "--keep-data"]).status.success());
+    common::write_bm25_registry(&proj.root, false);
+    refused(
+        run(&["--skip-upload", "--keep-data", "--exit-on-error"]),
+        "indexed text field 'title' that is not searched",
+    );
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #340 query side on OpenSearch, over an MS MARCO-shaped corpus: the prepared
+/// `filter_queries.jsonl` runs, every answer passes the per-query count gate,
+/// records carry the prepared shape, the mapping holds exactly the referenced
+/// derived keyword/long fields with `dynamic: false` (text and `url` stay in
+/// `_source`, unindexed), reuse revalidates, and a SUM-PRESERVING error in two
+/// expected counts fails the run.
+#[test]
+fn test_binary_opensearch_msmarco_filter_only_per_query_gate() {
+    wait_for_opensearch();
+    let _fielddata = DisabledIdFielddata::new();
+    let config = serde_json::json!([{"name":"msm-os","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":2},"search_params":[{"parallel":4,"top":5}]}]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "msm-filter";
+    let envs = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", index),
+    ];
+    let dump = p.root.join("dumps");
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "--skip-vector-index",
+            "--queries",
+            "27",
+            "--repetitions",
+            "1",
+            "--keep-data",
+            "--fail-on-dropped-queries",
+        ];
+        args.extend_from_slice(extra);
+        common::run_binary_extra(
+            &p.root,
+            "msm-os",
+            common::MSM_DATASET,
+            "http://127.0.0.1",
+            &envs,
+            &args,
+        )
+    };
+    assert!(run(&["--dump-results", dump.to_str().unwrap()]));
+    common::assert_msmarco_filter_run(&p, "opensearch-no-vector", 27, &dump);
+
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let m = &mapping[index]["mappings"];
+    assert_eq!(m["dynamic"], "false", "{m}");
+    let mut fields: Vec<&String> = m["properties"].as_object().unwrap().keys().collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        ["category", "doc_len", "rand_key", "tier", "vector"],
+        "filter-only maps exactly the fields its queries reference: {m}"
+    );
+    assert_eq!(m["properties"]["category"]["type"], "keyword");
+    assert_eq!(m["properties"]["rand_key"]["type"], "long");
+    // Unmapped fields are stored in _source, not indexed: a query on one
+    // matches nothing although every document holds it.
+    let hit: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_search?size=1", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let source = &hit["hits"]["hits"][0]["_source"];
+    assert!(source["segment"].as_str().unwrap().starts_with("Passage"));
+    assert!(source["url"].as_str().unwrap().contains("fx.example"));
+    let unindexed: serde_json::Value = os_client()
+        .post(format!("{}/{index}/_count", os_base_url()))
+        .json(&serde_json::json!({"query": {"exists": {"field": "segment"}}}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(unindexed["count"], 0, "{unindexed}");
+
+    // Reuse: the realized mapping and the local corpus are revalidated.
+    common::clear_result_files(&p.root);
+    assert!(run(&["--skip-upload"]));
+    let r = common::read_results_obj(&p.root, "opensearch-no-vector");
+    assert_eq!(r["filter_only"]["per_query_counts_checked"], 27);
+
+    // Two compensating errors keep the sum; the per-query gate still fails.
+    common::clear_result_files(&p.root);
+    p.tamper_expected_counts(&[(0, 1), (3, -1)]);
+    let stderr = common::run_binary_expect_failure(
+        &p.root,
+        "msm-os",
+        common::MSM_DATASET,
+        "http://127.0.0.1",
+        &envs,
+        &[
+            "--skip-vector-index",
+            "--skip-upload",
+            "--keep-data",
+            "--repetitions",
+            "1",
+        ],
+    );
+    assert!(stderr.contains("per-query count gate"), "{stderr}");
+    assert!(stderr.contains("fx-filter-000 (tag_eq)"), "{stderr}");
+    assert!(stderr.contains("fx-filter-003 (numeric_point)"), "{stderr}");
+
+    os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send()
+        .unwrap();
+    std::fs::remove_dir_all(&p.root).ok();
+}
+
+/// #340 x #344: filter-only with MS MARCO prepared queries on the shared
+/// `full` index. One engine config mixes a vector search config with the
+/// filter-only one, so the index is a k-NN index mapping every declared field
+/// (the vector workload may filter on any of them); filter-only keeps #340's
+/// contract on it: the realized mapping, the metadata domain and its
+/// predicates are checked against the narrowed field set (its numeric fields
+/// mapped `long` / `double`, `url` free to hold `;`), the prepared set runs,
+/// and the per-query count gate passes — and still fails a SUM-PRESERVING
+/// error in two expected counts.
+#[test]
+fn test_binary_opensearch_msmarco_filter_only_on_the_full_layout() {
+    wait_for_opensearch();
+    // No `DisabledIdFielddata` here: the vector config's k-NN query
+    // tie-breaks on `_id`. The no-vector MS MARCO test above keeps it.
+    let config = serde_json::json!([{"name":"msm-os-full","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":2},
+        "search_params":[{"parallel":1,"top":1},{"parallel":4,"top":5,"workload":"filter-only"}]}]);
+    let p = common::write_msmarco_filter_project(&config.to_string());
+    let n = p.queries.len();
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "msm-filter-full";
+    let envs = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", index),
+    ];
+    let dump = p.root.join("dumps");
+    let out = common::run_binary_output(
+        &p.root,
+        "msm-os-full",
+        common::MSM_DATASET,
+        "http://127.0.0.1",
+        &envs,
+        &[
+            "--keep-data",
+            "--fail-on-dropped-queries",
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.matches("Experiment stage: Upload").count(),
+        1,
+        "{stdout}"
+    );
+    common::assert_msmarco_full_run(&p, n, &dump);
+
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let props = &mapping[index]["mappings"]["properties"];
+    assert_eq!(props["vector"]["type"], "knn_vector", "{props}");
+    assert_eq!(props["category"]["type"], "keyword", "{props}");
+    assert_eq!(props["rand_key"]["type"], "long", "{props}");
+    assert_eq!(props["url"]["type"], "keyword", "{props}");
+
+    // Two compensating errors keep the sum; the per-query gate still fails
+    // on `full`, naming the queries.
+    common::clear_result_files(&p.root);
+    p.tamper_expected_counts(&[(0, 1), (3, -1)]);
+    let out = common::run_binary_output(
+        &p.root,
+        "msm-os-full",
+        common::MSM_DATASET,
+        "http://127.0.0.1",
+        &envs,
+        &["--skip-upload", "--keep-data", "--repetitions", "1"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("per-query count gate"), "{stderr}");
+    assert!(stderr.contains("fx-filter-000 (tag_eq)"), "{stderr}");
+    assert!(stderr.contains("fx-filter-003 (numeric_point)"), "{stderr}");
+
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&p.root).ok();
+}
+
+/// #340 review: without a prepared query set (H&M, synthetic) filter-only maps
+/// every declared field as before #340 — `text` included — and leaves dynamic
+/// mapping alone. Only a prepared set narrows the layout.
+#[test]
+fn test_binary_opensearch_filter_only_without_prepared_set_keeps_the_declared_layout() {
+    wait_for_opensearch();
+    let config = serde_json::json!([{"name":"scalar-layout-os","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":[{"parallel":1,"top":3}]}]);
+    let (proj, _, _) = common::write_filter_only_project(&config.to_string());
+    let declared = common::add_text_field(&proj.root);
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let index = "scalar-layout";
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "scalar-layout-os",
+        "scalar-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &["--skip-vector-index", "--skip-search", "--keep-data"],
+    ));
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let m = &mapping[index]["mappings"];
+    assert!(m.get("dynamic").is_none(), "{m}");
+    let mut fields: Vec<String> = m["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| *k != "vector")
+        .cloned()
+        .collect();
+    fields.sort();
+    assert_eq!(fields, declared, "{m}");
+    assert_eq!(m["properties"]["note"]["type"], "text", "{m}");
+    // Mapped by the harness, not by dynamic mapping (which would add a
+    // `.keyword` multi-field to every string): the layout is the declared one.
+    for f in &declared {
+        assert!(
+            m["properties"][f].get("fields").is_none(),
+            "{f} dynamic: {m}"
+        );
+    }
+    os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send()
+        .unwrap();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344: one engine config runs vector, filter-only and fulltext against ONE
+/// OpenSearch index built once in the shared `full` layout — a k-NN index
+/// whose `float` fields are mapped `double`, so the filter-only range on
+/// `price` (values 1e-8 apart) counts exactly. See
+/// `common::shared_index::assert_run` for every claim.
+#[test]
+fn test_binary_opensearch_one_ingest_many_workloads() {
+    use common::shared_index;
+    wait_for_opensearch();
+    // No `DisabledIdFielddata` here: the vector arm's KNN query tie-breaks on
+    // `_id`. The filter-only arm's independence from `_id` fielddata is pinned
+    // by the filter-only suites above.
+    let config = "os-shared";
+    let index = "bench_shared_full";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1}, "upload_params": {"parallel": 2},
+        "search_params": shared_index::search_params()
+    }]);
+    let proj = shared_index::write_project(&configs.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let out = common::run_binary_output(
+        &proj.root,
+        config,
+        shared_index::DATASET,
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &["--fail-on-dropped-queries", "--keep-data"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.matches("Experiment stage: Upload").count(),
+        1,
+        "one ingest for three workloads: {stdout}"
+    );
+    shared_index::assert_run(&proj, config, "opensearch_force_merge_refresh");
+
+    // The realized index is the union: knn on, an indexed knn_vector, text,
+    // keyword, long and double — holding the corpus once.
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let props = &mapping[index]["mappings"]["properties"];
+    assert_eq!(props["vector"]["type"], "knn_vector", "{props}");
+    assert_eq!(props["price"]["type"], "double", "{props}");
+    assert_eq!(props["size"]["type"], "long", "{props}");
+    assert_eq!(props["color"]["type"], "keyword", "{props}");
+    assert_eq!(props["title"]["type"], "text", "{props}");
+    let settings: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_settings", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(settings[index]["settings"]["index"]["knn"], "true");
+    let count: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_count", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(count["count"], shared_index::DOCS);
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #344: the realized index is checked against the planned layout ONCE,
+/// before any search config runs. A `--skip-upload` run of the mixed config —
+/// vector FIRST — over an index a vector-only config built (`price` mapped
+/// `float`, which collapses 1e-8-apart values) is refused before any result is
+/// written.
+#[test]
+fn test_binary_opensearch_full_layout_refuses_a_reused_vector_layout_index() {
+    os_reuse_refused(
+        "os-shared-reuse",
+        "bench_shared_reuse",
+        common::shared_index::vector_only(),
+        common::shared_index::search_params(),
+        "index layout check (full): filter-only requires double mapping for price",
+    );
+}
+
+/// #344, the reverse: a vector-only config over the `full` index a mixed
+/// config built (`price` mapped `double`) would be labelled `vector`. Refused
+/// before any result is written.
+#[test]
+fn test_binary_opensearch_vector_layout_refuses_a_reused_full_index() {
+    os_reuse_refused(
+        "os-shared-reverse",
+        "bench_shared_reverse",
+        common::shared_index::search_params(),
+        common::shared_index::vector_only(),
+        "index layout check (vector): the index is not a `vector`-layout index",
+    );
+}
+
+/// #344 review: on the shared `full` index, a corpus token outside
+/// filter-only's metadata domain is refused before the upload.
+#[test]
+fn test_binary_opensearch_full_layout_refuses_bad_metadata_before_upload() {
+    use common::shared_index;
+    wait_for_opensearch();
+    let config = "os-shared-domain";
+    let index = "bench_shared_domain";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "upload_params": {"parallel": 1},
+        "search_params": shared_index::search_params()
+    }]);
+    let proj = shared_index::write_project(&configs.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    shared_index::assert_bad_metadata_refused_before_upload(
+        &proj,
+        config,
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", port.as_str()),
+            ("OPENSEARCH_INDEX", index),
+        ],
+    );
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+fn os_reuse_refused(
+    config: &str,
+    index: &str,
+    build: serde_json::Value,
+    reuse: serde_json::Value,
+    expected: &str,
+) {
+    use common::shared_index;
+    wait_for_opensearch();
+    let proj = shared_index::write_project("[]");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    shared_index::assert_reuse_refused(
+        &proj,
+        &serde_json::json!({"name": config, "engine": "opensearch",
+            "collection_params": {"number_of_shards": 1},
+            "upload_params": {"parallel": 1}}),
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", port.as_str()),
+            ("OPENSEARCH_INDEX", index),
+        ],
+        build,
+        reuse,
+        expected,
+    );
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #341: the hybrid workload on OpenSearch — lucene `knn` with the predicate
+/// as its `filter` and an explicit `k`, one timed pass per selectivity bucket,
+/// recall against the brute-forced FILTERED truth per bucket. The k-NN
+/// plugin's filtered-request counter must have grown by at least one per
+/// query in every bucket (the filter reached the k-NN query), and the report
+/// states that Lucene's exact-search fallback is not observable.
+#[test]
+fn test_binary_opensearch_hybrid_per_bucket_recall() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-hyb", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                           "search_params": {"ef": 200}}],
+        "upload_params": {"parallel": 2, "batch_size": 500}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-hyb",
+        "hybrid-test",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_hybrid")
+        ],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    let evidence = common::assert_hybrid_run(&proj, "os-hyb", &dump, 0.8, "vector");
+    for e in &evidence {
+        // Exact on this dedicated single-node container: 12 queries plus one
+        // prime per worker (parallel 2). Production only requires >= answered.
+        assert_eq!(e["knn_query_with_filter_requests_delta"], 14, "{e}");
+    }
+    let results = common::read_results_obj(&proj.root, "os-hyb");
+    assert!(results["hybrid"]["engine"]["exact_search_fallback"]
+        .as_str()
+        .unwrap()
+        .starts_with("not observable"));
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+/// #341 x #344: hybrid and filter-only in ONE engine config share one index,
+/// built once in the `full` layout. Hybrid's filter still reaches the k-NN
+/// query in every bucket; filter-only passes its per-query count gate (and its
+/// requests carry no vector clause, checked before timing); both search files
+/// and the hybrid dump record `full`.
+#[test]
+fn test_binary_opensearch_hybrid_and_filter_only_share_one_full_index() {
+    wait_for_opensearch();
+    let config = "os-hyb-fo";
+    let index = "bench_hybrid_full";
+    let configs = serde_json::json!([{
+        "name": config, "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [
+            {"parallel": 2, "top": 10, "workload": "hybrid", "search_params": {"ef": 200}},
+            {"parallel": 2, "top": 10, "workload": "filter-only"}],
+        "upload_params": {"parallel": 2, "batch_size": 500}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let counts = common::add_hybrid_filter_queries(&proj);
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let out = common::run_binary_output(
+        &proj.root,
+        config,
+        "hybrid-test",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+            "--keep-data",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let evidence = common::assert_hybrid_run(&proj, config, &dump, 0.8, "full");
+    for e in &evidence {
+        assert!(
+            e["knn_query_with_filter_requests_delta"].as_u64().unwrap() >= 12,
+            "{e}"
+        );
+    }
+    common::assert_hybrid_mix_filter_only(&proj, config, &stdout, &counts);
+    let mapping: serde_json::Value = os_client()
+        .get(format!("{}/{index}/_mapping", os_base_url()))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let props = &mapping[index]["mappings"]["properties"];
+    assert_eq!(props["vector"]["type"], "knn_vector", "{props}");
+    assert_eq!(props["title"]["type"], "text", "{props}");
+    assert_eq!(props["category"]["type"], "keyword", "{props}");
+    assert_eq!(props["tier"]["type"], "long", "{props}");
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+/// #342: the STREAMING upload (`--upload-reader stream`) on OpenSearch, with a
+/// batch size and thread count that do not divide the corpus: the hybrid
+/// buckets reach the same recall floor as the in-memory upload's test above,
+/// every row is counted, and the upload result records the stream reader.
+#[test]
+fn test_binary_opensearch_streaming_upload_hybrid_recall() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-hyb-stream", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                           "search_params": {"ef": 200}}],
+        "upload_params": {"parallel": 3, "batch_size": 333}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-stream", &configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-hyb-stream",
+        "hybrid-stream",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_hybrid_stream")
+        ],
+        &[
+            "--upload-reader",
+            "stream",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_hybrid_run(&proj, "os-hyb-stream", &dump, 0.8, "vector");
+    let upload = common::read_upload_doc(&proj.root, "os-hyb-stream");
+    let reader = &upload["results"]["upload_reader"];
+    assert_eq!(reader["reader"], "stream", "{upload}");
+    assert_eq!(reader["rows"], common::HYBRID_N as u64, "{upload}");
+    assert_eq!(upload["results"]["upload_count"], common::HYBRID_N as u64);
+    // #344 on the streamed path: one-clock phases, checked against the
+    // legacy fields the upload file also carries.
+    let r = &upload["results"];
+    let ph = &r["ingest_phases"];
+    assert_eq!(
+        ph["index_wait"], "opensearch_force_merge_refresh",
+        "{upload}"
+    );
+    assert_eq!(ph["documents"], common::HYBRID_N as u64, "{upload}");
+    let f = |k: &str| r[k].as_f64().unwrap_or_else(|| panic!("results.{k}: {r}"));
+    assert!(f("upload_time") > 0.0 && f("index_wait_time") >= 0.0, "{r}");
+    assert!(
+        (f("upload_time") + f("index_wait_time") - f("total_ingest_time")).abs() < 1e-3,
+        "{r}"
+    );
+    assert!(
+        (f("read_time") + f("total_ingest_time") - f("total_time")).abs() < 1e-3,
+        "{r}"
+    );
+    std::fs::remove_dir_all(proj.root).unwrap();
+}
+
+/// #361 review: the streamed upload's payload pre-flight. A `payloads.jsonl`
+/// one row short is refused before the first bulk request, as on the
+/// in-memory path, rather than after the whole corpus was sent.
+#[test]
+fn test_binary_opensearch_streaming_upload_refuses_a_short_payload_file_before_writing() {
+    wait_for_opensearch();
+    let index = "bench_stream_short";
+    let configs = serde_json::json!([{
+        "name": "os-stream-short", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 3, "batch_size": 333}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("stream-short", &configs.to_string());
+    // Drop the last payload row: the stream would only find it after every
+    // batch had been sent.
+    let payloads = proj.root.join("datasets/stream-short/payloads.jsonl");
+    let text = std::fs::read_to_string(&payloads).unwrap();
+    let keep = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0;
+    std::fs::write(&payloads, format!("{keep}\n")).unwrap();
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let out = common::run_binary_output(
+        &proj.root,
+        "os-stream-short",
+        "stream-short",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &["--upload-reader", "stream"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let all = format!("{stdout}\n{stderr}");
+    assert!(
+        all.contains("payload pre-flight failed") && all.contains("doesn't match vector count"),
+        "{all}"
+    );
+    // No document reached the index (a missing index counts as none).
+    let resp = os_client()
+        .get(format!("{}/{index}/_count", os_base_url()))
+        .send()
+        .unwrap();
+    if resp.status().is_success() {
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(
+            body["count"], 0,
+            "documents were written before the check: {body}"
+        );
+    } else {
+        assert_eq!(resp.status().as_u16(), 404);
+    }
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
 }

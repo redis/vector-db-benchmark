@@ -289,7 +289,7 @@ fn run_dragonfly_filter_test(
     name: &str,
     dataset: &str,
     build: impl Fn(&str, &str, usize) -> common::FilterProject,
-) {
+) -> PathBuf {
     wait_for_dragonfly();
     let dim = 8;
     let configs = serde_json::json!([{
@@ -324,13 +324,16 @@ fn run_dragonfly_filter_test(
         name,
         recall
     );
+    proj.root
 }
 
 /// Bool-equality filter — Dragonfly now indexes `bool` as a TAG and applies the
 /// `@flag:{true}` prefilter (previously KNN-only).
 #[test]
 fn test_binary_dragonfly_bool() {
-    run_dragonfly_filter_test("dragonfly-bool", "bool-test", common::write_bool_project);
+    let root = run_dragonfly_filter_test("dragonfly-bool", "bool-test", common::write_bool_project);
+    let result = common::read_result_doc(&root, "dragonfly-bool");
+    assert!(result["params"]["engine_params"]["effective"]["numeric_range_encoding"].is_null());
 }
 
 /// UUID exact-match (TAG).
@@ -342,7 +345,14 @@ fn test_binary_dragonfly_uuid() {
 /// Datetime range — stored as NUMERIC epoch seconds, filtered with an ISO range.
 #[test]
 fn test_binary_dragonfly_datetime() {
-    run_dragonfly_filter_test("dragonfly-dt", "dt-test", common::write_datetime_project);
+    let root = run_dragonfly_filter_test("dragonfly-dt", "dt-test", common::write_datetime_project);
+    let result = common::read_result_doc(&root, "dragonfly-dt");
+    // This real CLI fixture exercises a bounded [gte, lt) datetime range with
+    // PARAMS against the server and must identify the encoding in its artifact.
+    assert_eq!(
+        result["params"]["engine_params"]["effective"]["numeric_range_encoding"],
+        "bounded_leaf_v1"
+    );
 }
 
 /// Full-text — a `text` field indexed as TEXT, `@body:quick` prefilter.

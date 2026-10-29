@@ -53,3 +53,51 @@ pub fn read_hdf5_vectors(path: &str, normalize: bool) -> Result<(Vec<i64>, Vec<V
 
     Ok((ids, vectors))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trips an ann-benchmarks-shaped file through the HDF5 library this
+    /// build links — including the DEFLATE filter. The prebuilt release archives
+    /// (#366, `--features release-static`) compile HDF5 and zlib from source
+    /// instead of using the system library, and the release workflow runs this
+    /// test against that build: a static HDF5 missing zlib would open plain
+    /// files and fail only on a compressed corpus, in the middle of a run.
+    #[test]
+    fn reads_a_deflate_compressed_train_dataset() {
+        assert!(
+            hdf5::filters::deflate_available(),
+            "the linked HDF5 has no DEFLATE (zlib) filter"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.hdf5");
+        // Row-major 3 x 2.
+        let train = [3.0f32, 4.0, 1.0, 0.0, 0.0, 2.0];
+        {
+            let f = Hdf5File::create(&path).unwrap();
+            let ds = f
+                .new_dataset::<f32>()
+                .deflate(6)
+                .shape((3, 2))
+                .create("train")
+                .unwrap();
+            ds.write_raw(&train).unwrap();
+            assert!(
+                ds.filters()
+                    .iter()
+                    .any(|f| matches!(f, hdf5::filters::Filter::Deflate(_))),
+                "dataset was written without the DEFLATE filter: {:?}",
+                ds.filters()
+            );
+        }
+        let p = path.to_str().unwrap();
+        assert_eq!(hdf5_train_row_count(p).unwrap(), 3);
+        let (ids, vectors) = read_hdf5_vectors(p, true).unwrap();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(
+            vectors,
+            vec![vec![0.6, 0.8], vec![1.0, 0.0], vec![0.0, 1.0]]
+        );
+    }
+}

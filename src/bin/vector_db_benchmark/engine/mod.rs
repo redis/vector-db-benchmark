@@ -32,6 +32,8 @@ mod weaviate_grpc;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use std::time::{Duration, Instant};
+use vector_db_benchmark::results_dump::RawQueryResult;
+use vector_db_benchmark::workload::Workload;
 
 pub use chroma::ChromaEngine;
 pub use dragonfly::DragonflyEngine;
@@ -94,6 +96,11 @@ pub struct UploadStats {
     pub memory_usage: Option<serde_json::Value>,
     /// See [`IndexCoverage`]. `None` = this engine does not verify.
     pub index_coverage: Option<IndexCoverage>,
+    /// Upload / index-wait / total ingest phases on one clock (#344), emitted
+    /// as extra keys in the upload file. `None` = this engine does not report
+    /// phases yet (only Redis and OpenSearch do); the legacy `upload_time` /
+    /// `total_time` keys are written either way.
+    pub ingest_phases: Option<vector_db_benchmark::ingest::IngestPhases>,
 }
 
 /// Update-to-search ratio for mixed workload benchmarks.
@@ -107,6 +114,8 @@ pub struct UpdateSearchRatio {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SearchResults {
+    /// Metadata-only result contract and count checksums; absent on KNN runs.
+    pub filter_only: Option<vector_db_benchmark::filter_only::Stats>,
     pub total_time: f64,
     pub mean_time: f64,
     /// Mean per-query precision, denominator = results the engine actually
@@ -135,6 +144,8 @@ pub struct SearchResults {
     pub max_time: f64,
     pub rps: f64,
     pub p50_time: f64,
+    /// Added for #346; p50/p95/p99 fields are unchanged for back-compat.
+    pub p90_time: f64,
     pub p95_time: f64,
     pub p99_time: f64,
     /// Per-query precision-at-returned samples (see `mean_precision_at_returned`).
@@ -165,9 +176,11 @@ pub struct SearchResults {
     pub dropped_queries: usize,
     pub late_queries: usize,
     pub schedule_delay_p50_time: Option<f64>,
+    pub schedule_delay_p90_time: Option<f64>,
     pub schedule_delay_p95_time: Option<f64>,
     pub schedule_delay_p99_time: Option<f64>,
     pub end_to_end_p50_time: Option<f64>,
+    pub end_to_end_p90_time: Option<f64>,
     pub end_to_end_p95_time: Option<f64>,
     pub end_to_end_p99_time: Option<f64>,
     // Mixed benchmark update metrics (None when search-only)
@@ -181,6 +194,7 @@ pub struct SearchResults {
     pub update_rps: Option<f64>,
     pub update_mean_time: Option<f64>,
     pub update_p50_time: Option<f64>,
+    pub update_p90_time: Option<f64>,
     pub update_p95_time: Option<f64>,
     pub update_p99_time: Option<f64>,
     pub update_latencies: Option<Vec<f64>>,
@@ -205,6 +219,31 @@ pub struct SearchResults {
     /// share one and still be reading materially different things, so the
     /// artifact carries the mechanism rather than only the grade.
     pub update_attribution_detail: Option<String>,
+    /// #339: the fulltext workload's `vector_db_benchmark::fulltext::result_metadata`
+    /// block (analyzers, boosts, query set). Its presence is the fulltext
+    /// fingerprint checked by [`search_workload`].
+    pub fulltext: Option<serde_json::Value>,
+    /// The workload that produced this result. Set only by [`search_workload`],
+    /// the single dispatch point, after the result passed its shape check.
+    pub workload: Option<Workload>,
+    /// The layout of the index this result was measured on (#344), stamped by
+    /// the runner from the workload plan; emitted as `params.index_layout`.
+    pub index_layout: Option<vector_db_benchmark::workload::IndexLayout>,
+    /// One record per timed query (failures included), in no particular order.
+    /// `Some` only when the engine was asked to capture
+    /// (`SearchParams::capture_query_results`); see
+    /// `vector_db_benchmark::results_dump` for the contract.
+    pub query_records: Option<Vec<RawQueryResult>>,
+    /// Hybrid workload only (#341): the per-selectivity-bucket report and the
+    /// width profile of the FILTERED ground truth the run was scored against.
+    pub hybrid: Option<HybridOutcome>,
+}
+
+/// What a hybrid run publishes beyond the common search statistics.
+#[derive(Debug, Clone)]
+pub struct HybridOutcome {
+    pub report: vector_db_benchmark::hybrid::HybridReport,
+    pub ground_truth: Option<crate::ground_truth::GroundTruthStats>,
 }
 
 /// How firmly an engine can tie a counted mixed-workload update to the corpus
@@ -352,6 +391,7 @@ pub fn finalize_update_stats(
         results.update_rps = Some(0.0);
         results.update_mean_time = None;
         results.update_p50_time = None;
+        results.update_p90_time = None;
         results.update_p95_time = None;
         results.update_p99_time = None;
         results.update_latencies = Some(times);
@@ -363,6 +403,7 @@ pub fn finalize_update_stats(
     results.update_rps = Some(times.len() as f64 / total_time);
     results.update_mean_time = Some(times.iter().sum::<f64>() / times.len() as f64);
     results.update_p50_time = Some(percentile_linear(&sorted, 0.50));
+    results.update_p90_time = Some(percentile_linear(&sorted, 0.90));
     results.update_p95_time = Some(percentile_linear(&sorted, 0.95));
     results.update_p99_time = Some(percentile_linear(&sorted, 0.99));
     results.update_latencies = Some(times);
@@ -462,25 +503,28 @@ pub fn attach_open_loop_metrics(
     dropped_queries: usize,
     late_queries: usize,
 ) {
-    let percentiles = |values: &[f64]| -> (f64, f64, f64) {
+    let percentiles = |values: &[f64]| -> (f64, f64, f64, f64) {
         let mut sorted = values.to_vec();
         sorted.sort_by(|a, b| a.total_cmp(b));
         (
             percentile_linear(&sorted, 0.50),
+            percentile_linear(&sorted, 0.90),
             percentile_linear(&sorted, 0.95),
             percentile_linear(&sorted, 0.99),
         )
     };
-    let (sd50, sd95, sd99) = percentiles(schedule_delays);
-    let (e2e50, e2e95, e2e99) = percentiles(end_to_end_latencies);
+    let (sd50, sd90, sd95, sd99) = percentiles(schedule_delays);
+    let (e2e50, e2e90, e2e95, e2e99) = percentiles(end_to_end_latencies);
     results.target_qps = Some(plan.target_qps);
     results.offered_queries = Some(plan.total_requests);
     results.dropped_queries = dropped_queries;
     results.late_queries = late_queries;
     results.schedule_delay_p50_time = Some(sd50);
+    results.schedule_delay_p90_time = Some(sd90);
     results.schedule_delay_p95_time = Some(sd95);
     results.schedule_delay_p99_time = Some(sd99);
     results.end_to_end_p50_time = Some(e2e50);
+    results.end_to_end_p90_time = Some(e2e90);
     results.end_to_end_p95_time = Some(e2e95);
     results.end_to_end_p99_time = Some(e2e99);
 }
@@ -580,6 +624,7 @@ pub fn compute_search_stats(
         max_time,
         rps: times.len() as f64 / total_time,
         p50_time: pct(0.50),
+        p90_time: pct(0.90),
         p95_time: pct(0.95),
         p99_time: pct(0.99),
         precisions_at_returned: precisions.to_vec(),
@@ -679,6 +724,52 @@ pub trait Engine {
         num_queries: i64,
     ) -> Result<SearchResults, String>;
 
+    /// Filter-only workload: exact-match predicates, no vector clause, exact
+    /// total (#328/#340). Must set `SearchResults::filter_only`. Reached only
+    /// through [`search_workload`]; the default is a hard error.
+    fn search_filter_only(
+        &mut self,
+        _dataset: &Dataset,
+        _search_params: &SearchParams,
+        _num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        Err(workload_not_implemented(self.name(), Workload::FilterOnly))
+    }
+
+    /// Ranked full-text (BM25) workload (#339). Default: hard error.
+    fn search_fulltext(
+        &mut self,
+        _dataset: &Dataset,
+        _search_params: &SearchParams,
+        _num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        Err(workload_not_implemented(self.name(), Workload::Fulltext))
+    }
+
+    /// Hybrid prefilter + KNN workload (#341). Default: hard error.
+    fn search_hybrid(
+        &mut self,
+        _dataset: &Dataset,
+        _search_params: &SearchParams,
+        _num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        Err(workload_not_implemented(self.name(), Workload::Hybrid))
+    }
+
+    /// Read back the realized index and refuse one that is not `layout` (#344),
+    /// so every search result's `params.index_layout` names the index it ran
+    /// on. Runs once after configure/upload (or the `--skip-upload` reuse
+    /// check) and BEFORE any search config, so the order of search configs
+    /// does not decide whether a mislabelled result is written. Default: no
+    /// check — only engines that build more than one layout implement it.
+    fn check_index_layout(
+        &mut self,
+        _dataset: &Dataset,
+        _layout: vector_db_benchmark::workload::IndexLayout,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Delete/cleanup the index
     fn delete(&mut self) -> Result<(), String>;
 
@@ -769,6 +860,64 @@ pub trait Engine {
             self.name()
         ))
     }
+}
+
+fn workload_not_implemented(engine: &str, workload: Workload) -> String {
+    format!("workload \"{workload}\" is not implemented by engine '{engine}'")
+}
+
+/// THE dispatch point from a resolved [`Workload`] to an engine call (#344).
+///
+/// Every measured search, warm-up included, goes through here. It refuses a
+/// combination `workload::dispatchable` does not allow (the `implemented`
+/// table, plus the flag-only legacy filter-only engines), then
+/// checks the result carries the workload's fingerprint and — under
+/// `--dump-results` — one per-query record per attempted query. A failure of
+/// any of these is an error, never a fallback to the vector path.
+pub fn search_workload(
+    engine: &mut dyn Engine,
+    engine_type: &str,
+    workload: Workload,
+    dataset: &Dataset,
+    params: &SearchParams,
+    num_queries: i64,
+) -> Result<SearchResults, String> {
+    if !vector_db_benchmark::workload::dispatchable(engine_type, workload) {
+        return Err(workload_not_implemented(engine.name(), workload));
+    }
+    let mut results = match workload {
+        Workload::Vector => engine.search(dataset, params, num_queries),
+        Workload::Hybrid => engine.search_hybrid(dataset, params, num_queries),
+        Workload::Fulltext => engine.search_fulltext(dataset, params, num_queries),
+        Workload::FilterOnly => engine.search_filter_only(dataset, params, num_queries),
+    }?;
+    vector_db_benchmark::workload::verify_engine_result_shape(
+        engine_type,
+        workload,
+        results.filter_only.is_some(),
+        results.mean_precision_at_returned == -1.0,
+    )
+    .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    vector_db_benchmark::workload::verify_fulltext_shape(workload, results.fulltext.is_some())
+        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    vector_db_benchmark::hybrid::verify_fingerprint(workload, results.hybrid.is_some())
+        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    if params.capture_query_results {
+        let records = results.query_records.as_ref().ok_or_else(|| {
+            format!(
+                "--dump-results: engine '{}' does not capture per-query results for workload \
+                 \"{workload}\"",
+                engine.name()
+            )
+        })?;
+        vector_db_benchmark::results_dump::validate_capture(
+            records.len(),
+            results.requested_queries,
+        )
+        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    }
+    results.workload = Some(workload);
+    Ok(results)
 }
 
 /// Build a Redis connection URL.
@@ -1200,5 +1349,577 @@ mod stats_tests {
         let ones = vec![1.0; 10];
         let r2 = compute_search_stats(&times, &ones, &ones, &ones, &ones, 1.0, 10, 1, 10).unwrap();
         assert!((r2.recall_p10 - 1.0).abs() < 1e-9);
+    }
+}
+
+/// The single workload dispatch point (#344) and its guards. A fake engine
+/// stands in for a server: what is under test is the routing and the checks
+/// on what comes back, not any engine's query.
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use vector_db_benchmark::results_dump::RawQueryResult;
+
+    struct Fake {
+        result: SearchResults,
+        has_filter_only_arm: bool,
+    }
+
+    impl Engine for Fake {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn configure(&mut self, _: &Dataset) -> Result<(), String> {
+            Ok(())
+        }
+        fn upload(&mut self, _: &Dataset) -> Result<UploadStats, String> {
+            Ok(UploadStats::default())
+        }
+        fn search(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            Ok(self.result.clone())
+        }
+        fn search_filter_only(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            if self.has_filter_only_arm {
+                Ok(self.result.clone())
+            } else {
+                Err("fake has no filter-only arm".into())
+            }
+        }
+        fn delete(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn search_params(&self) -> &[SearchParams] {
+            &[]
+        }
+    }
+
+    fn dataset() -> Dataset {
+        Dataset::new(serde_json::from_value(serde_json::json!({"name": "d", "path": "d"})).unwrap())
+    }
+
+    fn params(capture: bool) -> SearchParams {
+        let mut p: SearchParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        p.capture_query_results = capture;
+        p
+    }
+
+    fn vector_result(records: Option<usize>) -> SearchResults {
+        SearchResults {
+            requested_queries: 2,
+            query_records: records.map(|n| {
+                (0..n)
+                    .map(|i| RawQueryResult::ok(i, i, vec![], None, 0.0))
+                    .collect()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn filter_result() -> SearchResults {
+        SearchResults {
+            filter_only: Some(vector_db_benchmark::filter_only::Stats::default()),
+            ..vector_result(None)
+        }
+    }
+
+    fn run(
+        fake: &mut Fake,
+        engine_type: &str,
+        w: Workload,
+        capture: bool,
+    ) -> Result<SearchResults, String> {
+        search_workload(fake, engine_type, w, &dataset(), &params(capture), -1)
+    }
+
+    #[test]
+    fn routes_each_workload_to_its_arm_and_labels_the_result() {
+        let mut f = Fake {
+            result: vector_result(None),
+            has_filter_only_arm: false,
+        };
+        let r = run(&mut f, "redis", Workload::Vector, false).unwrap();
+        assert_eq!(r.workload, Some(Workload::Vector));
+        let mut f = Fake {
+            result: filter_result(),
+            has_filter_only_arm: true,
+        };
+        let r = run(&mut f, "redis", Workload::FilterOnly, false).unwrap();
+        assert_eq!(r.workload, Some(Workload::FilterOnly));
+    }
+
+    #[test]
+    fn an_engine_type_without_the_workload_is_refused_before_any_call() {
+        // The fake HAS a filter-only arm; the table still refuses qdrant.
+        let mut f = Fake {
+            result: filter_result(),
+            has_filter_only_arm: true,
+        };
+        let e = run(&mut f, "qdrant", Workload::FilterOnly, false).unwrap_err();
+        assert!(e.contains("not implemented"), "{e}");
+        for w in [Workload::Fulltext, Workload::Hybrid] {
+            assert!(run(&mut f, "redis", w, false).is_err(), "{w}");
+        }
+    }
+
+    #[test]
+    fn default_arms_are_hard_errors_not_vector_fallbacks() {
+        let mut f = Fake {
+            result: vector_result(None),
+            has_filter_only_arm: false,
+        };
+        let (d, p) = (dataset(), params(false));
+        assert!(f.search_fulltext(&d, &p, -1).is_err());
+        assert!(f.search_hybrid(&d, &p, -1).is_err());
+    }
+
+    #[test]
+    fn a_result_from_the_wrong_path_is_refused() {
+        // Filter-only arm that actually ran a vector search.
+        let mut f = Fake {
+            result: vector_result(None),
+            has_filter_only_arm: true,
+        };
+        assert!(run(&mut f, "redis", Workload::FilterOnly, false).is_err());
+        // Vector dispatch that came back with filter-only stats.
+        let mut f = Fake {
+            result: filter_result(),
+            has_filter_only_arm: false,
+        };
+        assert!(run(&mut f, "redis", Workload::Vector, false).is_err());
+    }
+
+    #[test]
+    fn a_requested_capture_must_cover_every_attempted_query() {
+        for (records, ok) in [
+            (None, false),
+            (Some(1), false),
+            (Some(3), false),
+            (Some(2), true),
+        ] {
+            let mut f = Fake {
+                result: vector_result(records),
+                has_filter_only_arm: false,
+            };
+            assert_eq!(
+                run(&mut f, "redis", Workload::Vector, true).is_ok(),
+                ok,
+                "records={records:?}"
+            );
+        }
+        // Not requested: no records is fine.
+        let mut f = Fake {
+            result: vector_result(None),
+            has_filter_only_arm: false,
+        };
+        assert!(run(&mut f, "redis", Workload::Vector, false).is_ok());
+    }
+
+    /// PR #351 CI regression: Valkey/MongoDB's legacy filter-only harness
+    /// returns the `-1.0` precision sentinel and no `filter_only` stats. Under
+    /// `--skip-vector-index` that must dispatch and pass, as on master, while a
+    /// result missing the sentinel is still refused as a misroute.
+    #[test]
+    fn legacy_filter_only_engines_dispatch_on_the_precision_sentinel() {
+        let legacy = |sentinel: bool| SearchResults {
+            mean_precision_at_returned: if sentinel { -1.0 } else { 0.9 },
+            ..vector_result(None)
+        };
+        for engine_type in ["valkey", "mongodb"] {
+            let mut f = Fake {
+                result: legacy(true),
+                has_filter_only_arm: true,
+            };
+            let r = run(&mut f, engine_type, Workload::FilterOnly, false).unwrap();
+            assert_eq!(r.workload, Some(Workload::FilterOnly));
+            let mut f = Fake {
+                result: legacy(false),
+                has_filter_only_arm: true,
+            };
+            assert!(run(&mut f, engine_type, Workload::FilterOnly, false).is_err());
+            // The vector path returning the sentinel ran the filter-only harness.
+            let mut f = Fake {
+                result: legacy(true),
+                has_filter_only_arm: false,
+            };
+            assert!(run(&mut f, engine_type, Workload::Vector, false).is_err());
+        }
+    }
+}
+
+/// #339: the dispatch point checks the fulltext fingerprint both ways.
+#[cfg(test)]
+mod fulltext_dispatch_tests {
+    use super::*;
+
+    struct TextFake {
+        fulltext_meta: bool,
+    }
+
+    impl Engine for TextFake {
+        fn name(&self) -> &str {
+            "text-fake"
+        }
+        fn configure(&mut self, _: &Dataset) -> Result<(), String> {
+            Ok(())
+        }
+        fn upload(&mut self, _: &Dataset) -> Result<UploadStats, String> {
+            Ok(UploadStats::default())
+        }
+        fn search(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            Ok(SearchResults {
+                fulltext: self.fulltext_meta.then(|| serde_json::json!({})),
+                ..Default::default()
+            })
+        }
+        fn search_fulltext(
+            &mut self,
+            d: &Dataset,
+            p: &SearchParams,
+            n: i64,
+        ) -> Result<SearchResults, String> {
+            self.search(d, p, n)
+        }
+        fn delete(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn search_params(&self) -> &[SearchParams] {
+            &[]
+        }
+    }
+
+    fn run(meta: bool, engine_type: &str, w: Workload) -> Result<SearchResults, String> {
+        let d = Dataset::new(
+            serde_json::from_value(serde_json::json!({"name": "d", "path": "d"})).unwrap(),
+        );
+        let p: SearchParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        search_workload(
+            &mut TextFake {
+                fulltext_meta: meta,
+            },
+            engine_type,
+            w,
+            &d,
+            &p,
+            -1,
+        )
+    }
+
+    #[test]
+    fn fulltext_is_routed_and_fingerprinted() {
+        for engine in ["redis", "opensearch"] {
+            let r = run(true, engine, Workload::Fulltext).unwrap();
+            assert_eq!(r.workload, Some(Workload::Fulltext));
+            // A "fulltext" result without the metadata did not run the arm.
+            assert!(run(false, engine, Workload::Fulltext).is_err());
+            // A vector result carrying it ran the wrong arm.
+            assert!(run(true, engine, Workload::Vector).is_err());
+            assert!(run(false, engine, Workload::Vector).is_ok());
+        }
+        // Engines without the arm are refused before the call.
+        let e = run(true, "valkey", Workload::Fulltext).unwrap_err();
+        assert!(e.contains("not implemented"), "{e}");
+    }
+}
+
+/// The hybrid workload's per-bucket driver (#341), shared by every engine arm.
+///
+/// Calls `pass(bucket, positions)` once per non-empty selectivity bucket, in
+/// bucket order; `positions` index the query set, and the pass returns its
+/// timed `SearchResults` (records, if captured, naming queries by their
+/// position in `positions`) plus the engine evidence for the bucket. Each
+/// bucket is therefore its own timed window and its QPS a measured throughput.
+/// The returned result is the union of the passes (latencies, quality samples,
+/// time and requested counts summed) with the per-bucket report attached.
+pub fn run_hybrid_buckets(
+    set: &vector_db_benchmark::hybrid::HybridQuerySet,
+    top: usize,
+    text_match: serde_json::Value,
+    engine_note: serde_json::Value,
+    mut pass: impl FnMut(
+        vector_db_benchmark::hybrid::Bucket,
+        &[usize],
+    ) -> Result<(SearchResults, serde_json::Value), String>,
+) -> Result<SearchResults, String> {
+    use vector_db_benchmark::hybrid as hy;
+    let mut buckets = Vec::new();
+    let (mut times, mut precs, mut recs, mut mrrs, mut ndcgs) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut total_time, mut requested, mut parallel) = (0.0, 0usize, 1usize);
+    let mut records: Option<Vec<RawQueryResult>> = None;
+    for (bucket, positions) in set.by_bucket() {
+        println!(
+            "\tHybrid bucket {bucket}: {} queries over {} predicate(s)",
+            positions.len(),
+            {
+                let mut p: Vec<&str> = positions
+                    .iter()
+                    .map(|&i| set.meta[i].predicate_id.as_str())
+                    .collect();
+                p.sort_unstable();
+                p.dedup();
+                p.len()
+            }
+        );
+        let (r, evidence) = pass(bucket, &positions)?;
+        if r.top != top {
+            return Err(format!(
+                "hybrid bucket {bucket} ran at k={} but the config pins top={top}",
+                r.top
+            ));
+        }
+        let meta: Vec<&hy::HybridQueryMeta> = positions.iter().map(|&i| &set.meta[i]).collect();
+        let report = hy::bucket_report(
+            bucket,
+            &r.latencies,
+            &r.recalls,
+            r.total_time,
+            r.requested_queries,
+            &meta,
+            evidence,
+        )?;
+        println!(
+            "\t  {bucket}: recall@{top}={:.4} rps={:.1} p50={:.2}ms p90={:.2}ms p99={:.2}ms",
+            report.mean_recall,
+            report.rps,
+            report.p50_time * 1e3,
+            report.p90_time * 1e3,
+            report.p99_time * 1e3
+        );
+        buckets.push(report);
+        if let Some(raw) = r.query_records {
+            records
+                .get_or_insert_with(Vec::new)
+                .extend(hy::remap_records(raw, &positions, requested)?);
+        }
+        times.extend(r.latencies);
+        precs.extend(r.precisions_at_returned);
+        recs.extend(r.recalls);
+        mrrs.extend(r.mrrs);
+        ndcgs.extend(r.ndcgs);
+        total_time += r.total_time;
+        requested += r.requested_queries;
+        parallel = r.parallel;
+    }
+    let mut out = compute_search_stats(
+        &times, &precs, &recs, &mrrs, &ndcgs, total_time, top, parallel, requested,
+    )?;
+    out.query_records = records;
+    out.hybrid = Some(HybridOutcome {
+        report: hy::HybridReport {
+            query_file: hy::HYBRID_QUERIES_FILE,
+            top,
+            queries: set.meta.len(),
+            text_match,
+            buckets,
+            engine: engine_note,
+        },
+        ground_truth: crate::ground_truth::GroundTruthProfile::from_rows(set.neighbors.clone())
+            .stats(top),
+    });
+    Ok(out)
+}
+
+#[cfg(test)]
+mod hybrid_driver_tests {
+    use super::*;
+    use vector_db_benchmark::hybrid::{Bucket, HybridQueryMeta, HybridQuerySet};
+
+    fn set() -> HybridQuerySet {
+        let meta = |i: usize, bucket| HybridQueryMeta {
+            query_id: format!("q{i}"),
+            predicate_id: format!("p{}", i % 2),
+            predicate_shape: "numeric_range".into(),
+            bucket,
+            matching_count: 10,
+            selectivity: 0.1,
+        };
+        HybridQuerySet::from_parts(
+            vec![vec![0.0]; 4],
+            vec![vec![1, 2, 3]; 4],
+            vec![serde_json::json!({"and": [{"tier": {"range": {"lt": 3}}}]}); 4],
+            vec![
+                meta(0, Bucket::S1),
+                meta(1, Bucket::S50),
+                meta(2, Bucket::S1),
+                meta(3, Bucket::S50),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn pass_result(n: usize, latency: f64, time: f64, capture: bool) -> SearchResults {
+        let mut r = compute_search_stats(
+            &vec![latency; n],
+            &vec![1.0; n],
+            &vec![0.5; n],
+            &vec![1.0; n],
+            &vec![1.0; n],
+            time,
+            10,
+            2,
+            n,
+        )
+        .unwrap();
+        r.query_records = capture.then(|| {
+            (0..n)
+                .map(|i| RawQueryResult::ok(i, i, vec![], None, latency))
+                .collect()
+        });
+        r
+    }
+
+    #[test]
+    fn each_bucket_is_its_own_pass_and_the_union_is_reported() {
+        let s = set();
+        let mut seen = Vec::new();
+        let r = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |b, p| {
+                seen.push((b, p.to_vec()));
+                let lat = if b == Bucket::S50 { 0.01 } else { 0.02 };
+                Ok((
+                    pass_result(p.len(), lat, 1.0, true),
+                    serde_json::json!({"b": b}),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![(Bucket::S50, vec![1, 3]), (Bucket::S1, vec![0, 2])]
+        );
+        let h = r.hybrid.as_ref().unwrap();
+        assert_eq!(h.report.buckets.len(), 2);
+        assert!((h.report.buckets[0].p50_time - 0.01).abs() < 1e-12);
+        assert!((h.report.buckets[1].p50_time - 0.02).abs() < 1e-12);
+        assert_eq!(h.report.buckets[0].predicates, vec!["p1"]);
+        assert_eq!(r.requested_queries, 4);
+        assert!((r.total_time - 2.0).abs() < 1e-12);
+        assert!((r.rps - 2.0).abs() < 1e-12);
+        // Records name the query-set position and keep a unique dispatch order.
+        let recs = r.query_records.unwrap();
+        let mut ids: Vec<(usize, usize)> = recs.iter().map(|q| (q.seq, q.query_id)).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![(0, 1), (1, 3), (2, 0), (3, 2)]);
+        assert_eq!(h.ground_truth.as_ref().unwrap().top, 10);
+    }
+
+    #[test]
+    fn a_pass_at_another_k_or_with_no_success_is_an_error() {
+        let s = set();
+        let e = run_hybrid_buckets(
+            &s,
+            5,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, p| {
+                Ok((
+                    pass_result(p.len(), 0.01, 1.0, false),
+                    serde_json::json!({}),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("k=10"), "{e}");
+        let e = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, _| Err("engine refused".into()),
+        )
+        .unwrap_err();
+        assert_eq!(e, "engine refused");
+    }
+
+    /// An engine whose hybrid arm returns a canned result.
+    struct HybridFake(SearchResults);
+
+    impl Engine for HybridFake {
+        fn name(&self) -> &str {
+            "hybrid-fake"
+        }
+        fn configure(&mut self, _: &Dataset) -> Result<(), String> {
+            Ok(())
+        }
+        fn upload(&mut self, _: &Dataset) -> Result<UploadStats, String> {
+            Ok(UploadStats::default())
+        }
+        fn search(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            Ok(self.0.clone())
+        }
+        fn search_hybrid(
+            &mut self,
+            _: &Dataset,
+            _: &SearchParams,
+            _: i64,
+        ) -> Result<SearchResults, String> {
+            Ok(self.0.clone())
+        }
+        fn delete(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn search_params(&self) -> &[SearchParams] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn dispatch_requires_the_hybrid_fingerprint() {
+        let d = Dataset::new(
+            serde_json::from_value(serde_json::json!({"name": "d", "path": "d"})).unwrap(),
+        );
+        let p: SearchParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        let s = set();
+        let hybrid = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, p| {
+                Ok((
+                    pass_result(p.len(), 0.01, 1.0, false),
+                    serde_json::json!({}),
+                ))
+            },
+        )
+        .unwrap();
+        // The hybrid arm's real result passes and is labelled.
+        let mut f = HybridFake(hybrid.clone());
+        let r = search_workload(&mut f, "redis", Workload::Hybrid, &d, &p, -1).unwrap();
+        assert_eq!(r.workload, Some(Workload::Hybrid));
+        // A "hybrid" arm that returned a plain vector result is refused...
+        let mut f = HybridFake(pass_result(4, 0.01, 1.0, false));
+        let e = search_workload(&mut f, "redis", Workload::Hybrid, &d, &p, -1).unwrap_err();
+        assert!(e.contains("hybrid report"), "{e}");
+        // ...and so is a vector dispatch that came back with a hybrid report.
+        let mut f = HybridFake(hybrid);
+        assert!(search_workload(&mut f, "redis", Workload::Vector, &d, &p, -1).is_err());
+        // Engines without the arm are refused by the table before any call.
+        let mut f = HybridFake(pass_result(4, 0.01, 1.0, false));
+        assert!(search_workload(&mut f, "valkey", Workload::Hybrid, &d, &p, -1).is_err());
     }
 }

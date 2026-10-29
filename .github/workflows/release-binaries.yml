@@ -1,0 +1,366 @@
+name: Release binaries
+
+# Prebuilt archives for a release (#366): linux-x86_64, linux-aarch64 and
+# macos-aarch64 tarballs plus SHA256SUMS, uploaded as release assets.
+#
+# The SAME jobs run on pull requests that touch anything the archives are built
+# from — everything except the upload. So a PR shows that the archives build,
+# carry the right commit, run on a bare ubuntu:22.04 for both architectures and
+# check out against SHA256SUMS, before a release depends on it.
+#
+# If `publish` (or the check after it) fails, use "Re-run failed jobs" on the
+# run: that reuses this run's build artifacts, so the digests match and
+# publish.sh completes the upload (it also replaces any upload that never
+# finished). "Re-run all jobs" REBUILDS: the new archives' digests differ from
+# what is already on the release, and the run refuses. A tag that already has
+# assets from a different build is only replaced by a workflow_dispatch with
+# `clobber: true`, which replaces the whole set (and deletes any stale archive
+# of that tag), so a release never mixes archives from two builds. The
+# decisions live in scripts/release/publish.sh and are exercised on every PR by
+# `make release-selftest` against a fake `gh`.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and attach archives to
+        required: true
+        type: string
+      clobber:
+        description: Replace this tag's existing archives / SHA256SUMS (otherwise the run refuses)
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'src/**'
+      - 'Makefile'
+      - 'LICENSE'
+      - 'README.md'
+      - 'scripts/release/**'
+      - 'scripts/install-release.sh'
+      - 'datasets/datasets.json'
+      - 'datasets/random-100/**'
+      - 'experiments/configurations/**'
+      - '.github/workflows/release-binaries.yml'
+
+permissions:
+  contents: read
+
+# The toolchain every archive is built with, pinned so a tag can be rebuilt
+# with the same compiler. BUILD-INFO.txt in each archive records `rustc -vV`.
+# Bump deliberately (a PR runs the full archive check with the new one).
+env:
+  RELEASE_RUST_TOOLCHAIN: '1.99.1'
+
+concurrency:
+  group: release-binaries-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    name: Resolve tag and commit
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request)
+              tag="pr-$PR_NUMBER"; sha="$PR_SHA"; publish=false ;;
+            release|workflow_dispatch)
+              tag="${RELEASE_TAG:-$INPUT_TAG}"
+              [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "::error::invalid tag '$tag'"; exit 1; }
+              gh release view "$tag" -R "$GITHUB_REPOSITORY" --json tagName >/dev/null ||
+                { echo "::error::no release for tag '$tag'"; exit 1; }
+              # The tag's COMMIT (an annotated tag resolves through to it).
+              sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha)"
+              publish=true ;;
+            *) echo "::error::unexpected event $EVENT"; exit 1 ;;
+          esac
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve a commit for '$tag'"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "Building $tag from $sha (publish: $publish)" >> "$GITHUB_STEP_SUMMARY"
+
+      # A release whose tag does not name the crate version would fail only in
+      # package.sh, after every build, leaving a public "latest" release with
+      # no archives (which breaks the README one-liner). Check it here, from
+      # the tag's own Cargo.toml, in seconds.
+      - uses: actions/checkout@v4
+        if: steps.plan.outputs.publish == 'true'
+        with:
+          ref: ${{ steps.plan.outputs.sha }}
+      - name: Tag names the crate version (check_release_tag)
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          source scripts/release/lib.sh
+          check_release_tag "$TAG" "$(crate_version)"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built ON Ubuntu 22.04 (glibc 2.35), natively for each architecture:
+          # the binaries need no newer glibc than the oldest host they promise.
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - platform: macos-aarch64
+            target: aarch64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+
+      - name: Confirm the checkout is the planned commit
+        run: test "$(git rev-parse HEAD)" = "$SHA"
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update && sudo apt-get install -y cmake binutils
+          else
+            command -v cmake >/dev/null || brew install cmake
+            command -v gtar >/dev/null || brew install gnu-tar
+          fi
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install "$RELEASE_RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RELEASE_RUST_TOOLCHAIN"
+          rustc -vV
+          # Not `rustc -vV | grep -q`: grep exits at the match, rustc takes
+          # SIGPIPE, and pipefail fails the step (exit 141, seen on macOS).
+          test "$(rustc -vV | sed -n 's/^release: //p')" = "$RELEASE_RUST_TOOLCHAIN"
+
+      # Cached on PRs only. A release builds from scratch, so nothing a PR
+      # compiled can end up in a published archive.
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name == 'pull_request'
+        with:
+          key: release-static-${{ matrix.target }}-${{ env.RELEASE_RUST_TOOLCHAIN }}
+
+      # The static HDF5 (+ zlib) this archive links is not the system library
+      # the rest of CI tests against: read a DEFLATE-compressed HDF5 file
+      # through it, and check the embedded build identity, before packaging.
+      - name: Test the statically linked build
+        # Unset as in package.sh: HDF5_DIR / HDF5_VERSION would make hdf5-sys
+        # link the system library, OPENSSL_NO_VENDOR would make openssl-sys
+        # ignore `vendored`, and this would test the wrong libraries.
+        run: env -u HDF5_DIR -u HDF5_VERSION -u OPENSSL_NO_VENDOR cargo test --release --locked --features release-static --target "$TARGET" --lib -- build_info readers::hdf5_reader
+
+      - name: Package (make release-archive)
+        run: make release-archive TAG="$TAG" RELEASE_TARGET="$TARGET" ${{ needs.plan.outputs.publish == 'true' && 'RELEASE=1' || '' }}
+
+      - name: Run the archive on the build host
+        run: bash scripts/release/verify.sh "dist/vector-db-benchmark-$TAG-${{ matrix.platform }}.tar.gz" --expect-sha "$SHA" --expect-tag "$TAG"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.platform }}
+          path: dist/vector-db-benchmark-${{ needs.plan.outputs.tag }}-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  fresh-host:
+    # #366's acceptance check: the archive runs on a fresh Ubuntu 22.04 with no
+    # toolchain. A bare ubuntu:22.04 container on a native runner of each
+    # architecture: no cargo, no compiler, no libhdf5.
+    name: Run on bare ubuntu:22.04 (${{ matrix.platform }})
+    needs: [plan, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          sparse-checkout: scripts/release
+      - uses: actions/download-artifact@v4
+        with:
+          name: archive-${{ matrix.platform }}
+          path: dist
+      - name: Extract and run in ubuntu:22.04 (no libssl, no CA bundle)
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e TAG -e SHA -e PLATFORM ubuntu:22.04 bash -euo pipefail -c '
+            . /etc/os-release; echo "host: $PRETTY_NAME $(uname -m)"
+            [[ "$VERSION_ID" == 22.04 ]]
+            for t in cargo rustc cc gcc; do
+              if command -v "$t" >/dev/null; then echo "not a bare host: $t is installed"; exit 1; fi
+            done
+            # The stock image ships libssl3. Remove it, so a binary that still
+            # needed the system OpenSSL could not run here by accident.
+            dpkg --remove --force-depends libssl3 >/dev/null
+            ldconfig
+            if ldconfig -p | grep -E "libssl|libcrypto|libhdf5"; then
+              echo "not a bare host: libraries the archive must carry are installed"; exit 1
+            fi
+            [[ ! -e /etc/ssl/certs/ca-certificates.crt ]]
+            bash scripts/release/verify.sh "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" \
+              --expect-sha "$SHA" --expect-tag "$TAG"
+            # Negative control for the TLS probe below: with no CA bundle the
+            # certificate check must fail.
+            mkdir /tmp/x && tar xzf "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" -C /tmp/x
+            bash scripts/release/tls-probe.sh /tmp/x expect-fail'
+      - name: HTTPS through the static OpenSSL (ubuntu:22.04 + ca-certificates)
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e TAG -e PLATFORM ubuntu:22.04 bash -euo pipefail -c '
+            apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends ca-certificates >/dev/null
+            mkdir /tmp/x && tar xzf "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" -C /tmp/x
+            bash scripts/release/tls-probe.sh /tmp/x expect-ok'
+      # Amazon Linux 2023 (glibc 2.34, the default AWS client image): the
+      # oldest glibc the archives promise (MAX_GLIBC in lib.sh), its own CA
+      # bundle path (/etc/pki/tls), and the archive's checks plus HTTPS there.
+      - name: Extract, run and HTTPS in amazonlinux:2023
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e TAG -e SHA -e PLATFORM amazonlinux:2023 bash -euo pipefail -c '
+            . /etc/os-release; echo "host: $PRETTY_NAME $(uname -m) $(ldd --version 2>/dev/null | head -n1 || true)"
+            dnf install -y -q tar gzip findutils >/dev/null
+            bash scripts/release/verify.sh "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" \
+              --expect-sha "$SHA" --expect-tag "$TAG"
+            mkdir /tmp/x && tar xzf "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" -C /tmp/x
+            bash scripts/release/tls-probe.sh /tmp/x expect-ok'
+
+  checksums:
+    name: SHA256SUMS + install script
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - name: Release script self-test (make release-selftest)
+        run: make release-selftest
+      - name: Exactly one archive per platform
+        run: |
+          set -euo pipefail
+          ls -l dist
+          for p in linux-x86_64 linux-aarch64 macos-aarch64; do
+            test -f "dist/vector-db-benchmark-$TAG-$p.tar.gz"
+          done
+          test "$(find dist -name '*.tar.gz' | wc -l)" -eq 3
+      - name: Write and check SHA256SUMS (make release-checksums)
+        run: make release-checksums
+      - name: Users' own check (sha256sum -c)
+        run: cd dist && sha256sum -c SHA256SUMS
+      # scripts/install-release.sh, the README one-liner included (no tag:
+      # it follows /releases/latest), against a local stand-in for GitHub
+      # serving these archives, and every refusal it has.
+      - name: install-release.sh against these archives (scripts/release/install-test.sh)
+        run: bash scripts/release/install-test.sh dist "$TAG" "$SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Upload to the release
+    needs: [plan, build, fresh-host, checksums]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      CLOBBER: ${{ inputs.clobber == true }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Re-check the set being uploaded
+        run: bash scripts/release/checksums.sh check dist
+      # Refuses a different build unless clobber; resumes a partial upload of
+      # this one. Every branch is covered by `make release-selftest`.
+      - name: Upload (scripts/release/publish.sh)
+        env:
+          REPO: ${{ github.repository }}
+        run: bash scripts/release/publish.sh "$TAG" dist
+      - name: Verify what the release now serves
+        run: |
+          set -euo pipefail
+          mkdir published
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D published -p 'vector-db-benchmark-*.tar.gz' -p SHA256SUMS
+          bash scripts/release/checksums.sh check published
+          for f in dist/*; do cmp "$f" "published/$(basename "$f")"; done
+          # The README install path, end to end, from github.com.
+          bash scripts/install-release.sh "$TAG" "$RUNNER_TEMP/vdb"
+          [[ "$("$RUNNER_TEMP/vdb/vector-db-benchmark" --version)" == *"(git $SHA)" ]]
+      - name: Summary
+        run: |
+          {
+            echo "## Release binaries for $TAG"
+            echo
+            echo "Built from \`$SHA\`."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

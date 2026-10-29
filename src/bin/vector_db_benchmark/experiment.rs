@@ -17,6 +17,7 @@ use crate::config::{
 use crate::dataset::Dataset;
 use crate::engine::{create_engine, CorpusCount, Engine, UpdateSearchRatio};
 use crate::summary::{self, SearchEntry};
+use vector_db_benchmark::workload::{IndexLayout, Workload, WorkloadPlan};
 
 /// Results directory
 fn results_dir() -> PathBuf {
@@ -73,7 +74,10 @@ fn run_with_search_watchdog<T>(timeout_secs: f64, label: &str, f: impl FnOnce() 
 }
 
 pub fn run(args: &Args) -> Result<(), String> {
-    println!("vector-db-benchmark v{}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "vector-db-benchmark {}",
+        vector_db_benchmark::build_info::LONG_VERSION
+    );
 
     if args.target_qps != 0.0 {
         if !args.target_qps.is_finite() || args.target_qps <= 0.0 {
@@ -107,6 +111,10 @@ pub fn run(args: &Args) -> Result<(), String> {
             return Err("--warmup-seconds requires --target-qps or --search-duration".to_string());
         }
     }
+
+    // A set but unparsable INDEXING_WAIT_SECS refuses the run here, before
+    // any download, connection or upload (#361 review, #219).
+    crate::effective_config::indexing_wait_override()?;
 
     let dataset_configs = read_dataset_configs()?;
     // A configuration file that fails to load takes EVERY configuration it
@@ -183,6 +191,184 @@ pub fn run(args: &Args) -> Result<(), String> {
         ));
     }
 
+    // Exclude adapters without scalar support before any selection or namespace
+    // collision guard; skipped configs cannot collide with an executed workload.
+    if args.skip_vector_index {
+        engines.retain(|(_, config)| {
+            let engine_type = config.engine.as_deref().unwrap_or("unknown");
+            let supported = vector_db_benchmark::workload::supports_skip_vector_index(engine_type);
+            if !supported {
+                eprintln!(
+                    "WARNING: --skip-vector-index not implemented for engine '{}', skipping",
+                    engine_type
+                );
+            }
+            supported
+        });
+        if engines.is_empty() {
+            return Err("No selected engines support --skip-vector-index".into());
+        }
+    }
+
+    // Resolve every search config's workload (#344) before anything is
+    // downloaded or connected: an unimplemented (engine, workload) pair or a
+    // config mixing index layouts is a hard error here, never a fallback.
+    let mut plans: std::collections::HashMap<String, WorkloadPlan> =
+        std::collections::HashMap::new();
+    for (name, config) in &engines {
+        let declared: Vec<Option<Workload>> = config
+            .search_params
+            .iter()
+            .flatten()
+            .map(|sp| sp.workload)
+            .collect();
+        let plan = vector_db_benchmark::workload::plan(
+            config.engine.as_deref().unwrap_or("unknown"),
+            &declared,
+            args.skip_vector_index,
+        )
+        .map_err(|e| format!("config '{name}': {e}"))?;
+        let calibration_declared: Vec<bool> = config
+            .search_params
+            .iter()
+            .flatten()
+            .map(|sp| sp.calibration_param.is_some())
+            .collect();
+        vector_db_benchmark::workload::check_calibration(
+            &plan,
+            &calibration_declared,
+            args.skip_vector_index,
+        )
+        .map_err(|e| format!("config '{name}': {e}"))?;
+        // `0:S` is pure search; only a ratio with updates runs a mixed phase.
+        let mixed_phases = args
+            .update_search_ratio
+            .iter()
+            .map(|s| parse_update_search_ratio(s).map(|r| r.updates > 0))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|mixed| mixed);
+        vector_db_benchmark::workload::check_update_search_ratio(&plan, mixed_phases)
+            .map_err(|e| format!("config '{name}': {e}"))?;
+        // A conflicting filter-only result limit on the shared index is refused
+        // here, before any download; the search stage applies the same rule.
+        if plan.layout == IndexLayout::Full {
+            vector_db_benchmark::filter_only::mixed_search_param_indices(
+                config
+                    .search_params
+                    .iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(i, sp)| {
+                        Ok((
+                            plan.workload(i)? == Workload::FilterOnly,
+                            sp.parallel,
+                            sp.top,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                Some(vector_db_benchmark::filter_only::DEFAULT_LIMIT as i64),
+            )
+            .map_err(|e| format!("config '{name}': {e}"))?;
+        }
+        if args.dump_results.is_some() {
+            vector_db_benchmark::workload::check_capture(&plan)
+                .map_err(|e| format!("config '{name}': {e}"))?;
+        }
+        // #339: a `fulltext` block only on a fulltext search config, and well-formed.
+        for (i, sp) in config.search_params.iter().flatten().enumerate() {
+            vector_db_benchmark::fulltext::validate_declared(
+                &plan.engine_type,
+                plan.workload(i)?,
+                sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
+            )
+            .map_err(|e| format!("config '{name}', search config #{i}: {e}"))?;
+        }
+        // #339 parity: the index profile all fulltext search configs share
+        // (analysis mode, indexed text fields) must be resolvable, and parity
+        // never shares an engine config with another workload.
+        let profile_inputs = config
+            .search_params
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, sp)| {
+                Ok((
+                    plan.workload(i)?,
+                    sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let profile = vector_db_benchmark::fulltext::index_profile(profile_inputs)
+            .map_err(|e| format!("config '{name}': {e}"))?;
+        // Before any download: a fulltext profile on a Redis shared corpus
+        // (parity, or a prefix overlapping the marker keys); the engine
+        // re-checks it at configure.
+        vector_db_benchmark::fulltext::check_redis_shared_prefix(
+            &plan.engine_type,
+            profile.as_ref(),
+            vector_db_benchmark::fulltext::resolve_shared_prefix(
+                crate::effective_config::env_var("REDIS_KEY_PREFIX")
+                    .ok()
+                    .as_deref(),
+            )
+            .as_deref(),
+        )
+        .map_err(|e| format!("config '{name}': {e}"))?;
+        // Hybrid (#341): `top`, `--queries` and the open-loop knobs are
+        // checked here, before anything is downloaded or connected. The CLI
+        // `--target-qps` / `--search-duration` are merged into each search
+        // config only at search time, so they are folded in here too.
+        let cli_target_qps = (args.target_qps > 0.0).then_some(args.target_qps);
+        let cli_duration = (args.search_duration > 0.0).then_some(args.search_duration);
+        for (i, sp) in config.search_params.iter().flatten().enumerate() {
+            if plan.workload(i)? == Workload::Hybrid {
+                vector_db_benchmark::hybrid::check_params(
+                    sp.top,
+                    sp.target_qps.or(cli_target_qps),
+                    sp.duration_seconds.or(cli_duration),
+                    args.queries,
+                )
+                .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
+            }
+        }
+        // Hybrid (#341): `hybrid_policy` is read only by the Redis hybrid arm;
+        // anywhere else it would be silently ignored.
+        for (i, sp) in config.search_params.iter().flatten().enumerate() {
+            vector_db_benchmark::hybrid::check_policy_knob_allowed(
+                &plan.engine_type,
+                plan.workload(i)?,
+                sp.knob("hybrid_policy").is_some(),
+            )
+            .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
+        }
+        // Hybrid (#341): a Redis HYBRID_POLICY conflict needs nothing from the
+        // server, so it is refused here, before anything is downloaded or
+        // connected — not after an upload.
+        if plan.engine_type == "redis" {
+            let env_policy = crate::effective_config::env_or("REDIS_HYBRID_POLICY", "");
+            for (i, sp) in config.search_params.iter().flatten().enumerate() {
+                if plan.workload(i)? == Workload::Hybrid {
+                    vector_db_benchmark::hybrid::resolve_redis_policy(
+                        sp.knob("hybrid_policy"),
+                        &env_policy,
+                    )
+                    .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
+                }
+            }
+        }
+        if args.target_qps > 0.0 && plan.workloads.iter().any(|w| *w != Workload::Vector) {
+            return Err(format!(
+                "--target-qps currently supports search-only vector benchmarks; config \
+                 '{name}' declares a non-vector workload"
+            ));
+        }
+        plans.insert(name.to_string(), plan);
+    }
+    if let Some(dir) = &args.dump_results {
+        vector_db_benchmark::results_dump::prepare_dump_dir(dir)?;
+    }
+
     if args.target_qps > 0.0 || args.search_duration > 0.0 {
         let unsupported: Vec<_> = engines
             .iter()
@@ -199,19 +385,14 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
     }
 
-    // --skip-vector-index: deduplicate engine configs by engine type.
-    // Multiple M/EF variants (e.g. redis-m-16-ef-64, redis-m-32-ef-128) collapse
-    // into a single "<engine_type>-no-vector" experiment.
+    // Scalar runs require one explicit config per engine; silently keeping the
+    // first would discard result-limit and index-setting differences.
     if args.skip_vector_index {
-        let mut seen_engine_types = std::collections::HashSet::new();
-        engines.retain(|(_, config)| {
-            let engine_type = config.engine.as_deref().unwrap_or("unknown");
-            seen_engine_types.insert(engine_type.to_string())
-        });
-        println!(
-            "--skip-vector-index: deduplicated to {} engine(s)",
-            engines.len()
-        );
+        vector_db_benchmark::filter_only::validate_engine_selection(
+            engines.iter().map(|(name, config)| {
+                (name.as_str(), config.engine.as_deref().unwrap_or("unknown"))
+            }),
+        )?;
     }
 
     // Collision guard (#151-4): among the selected configs, no two configs of the
@@ -220,7 +401,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     // and keyspace with another's (the exact bug this fix closes). Also fires when
     // an `*_EXACT` pin is set with >1 config for that engine (every
     // config then resolves to the same verbatim base). In --skip-vector-index mode
-    // the dedup above already leaves one config per engine, so this is a no-op.
+    // selection validation above guarantees one config per engine.
     {
         use crate::engine::index_naming::{derive_index_name, index_name_exact};
         let mut seen: std::collections::HashMap<(String, String), String> =
@@ -296,8 +477,6 @@ pub fn run(args: &Args) -> Result<(), String> {
     );
     pb.enable_steady_tick(std::time::Duration::from_secs(1));
 
-    let skip_vector_engines = ["redis", "valkey", "mongodb"];
-
     // Soft wall-clock budget: once total elapsed reaches --timeout, stop launching
     // further experiments and finish cleanly. This bounds the overall run without
     // interrupting an in-flight experiment (the Rust runner is blocking, so a hard
@@ -325,25 +504,32 @@ pub fn run(args: &Args) -> Result<(), String> {
             num_engine_configs
         );
     }
-    'experiments: for (engine_idx, (_engine_name, engine_config)) in engines.iter().enumerate() {
+    // `--upload-reader auto` decides once per dataset for the whole
+    // invocation (#361 review): every config's `Dataset` shares these
+    // readings, so one sweep never mixes the in-memory and streaming readers.
+    let memory_snapshots =
+        std::sync::Arc::new(vector_db_benchmark::upload_stream::MemorySnapshots::default());
+    'experiments: for (engine_idx, (engine_name, engine_config)) in engines.iter().enumerate() {
         // With --reset-between-configs, only the LAST config keeps its data under
         // --keep-data; earlier configs tear down after finishing so at most one
         // config's corpus is resident (#184). (A full M×EF sweep runs every config
         // over the same datasets, so the last config is the last to touch each.)
         let is_last_config = engine_idx + 1 == num_engine_configs;
-        // Apply --skip-vector-index: override name and set flag on config
+        let plan = plans
+            .get(engine_name.as_str())
+            .ok_or_else(|| format!("no workload plan for config '{engine_name}'"))?;
+        // The plan's index layout decides whether configure() builds a vector
+        // index. `--skip-vector-index` additionally keeps its legacy rename.
         let mut engine_config = (*engine_config).clone();
+        if plan.layout == IndexLayout::NoVector {
+            engine_config.skip_vector_index = true;
+        }
+        // One shared index for a config mixing filter-only with vector-index
+        // workloads (#344); `plan` only picks it for engines that build it.
+        engine_config.full_index_layout = plan.layout == IndexLayout::Full;
         if args.skip_vector_index {
             let engine_type = engine_config.engine.as_deref().unwrap_or("unknown");
-            if !skip_vector_engines.contains(&engine_type) {
-                eprintln!(
-                    "WARNING: --skip-vector-index not implemented for engine '{}', skipping",
-                    engine_type
-                );
-                continue;
-            }
             engine_config.name = format!("{}-no-vector", engine_type);
-            engine_config.skip_vector_index = true;
         }
 
         for (dataset_name, dataset_config) in &datasets {
@@ -375,7 +561,35 @@ pub fn run(args: &Args) -> Result<(), String> {
                 println!("{}", "=".repeat(60));
             });
 
-            let dataset = Dataset::new((*dataset_config).clone());
+            let dataset = Dataset::new((*dataset_config).clone())
+                .with_upload_reader(args.upload_reader)
+                .with_memory_snapshots(memory_snapshots.clone());
+
+            // Hybrid (#341): the query set must exist and be valid before the
+            // engine is built, so a corpus without `hybrid_queries.jsonl` fails
+            // here rather than after configure + upload.
+            if plan.workloads.contains(&Workload::Hybrid) {
+                let tops: Vec<usize> = engine_config
+                    .search_params
+                    .iter()
+                    .flatten()
+                    .enumerate()
+                    .filter(|(i, _)| plan.workload(*i).ok() == Some(Workload::Hybrid))
+                    .filter_map(|(_, sp)| sp.top.filter(|t| *t > 0).map(|t| t as usize))
+                    .collect();
+                let n = vector_db_benchmark::hybrid::preflight(
+                    &dataset.get_path()?,
+                    dataset.config.schema.as_ref(),
+                    &tops,
+                )
+                .map_err(|e| {
+                    format!(
+                        "[config={} dataset={}] hybrid workload: {e}",
+                        engine_config.name, dataset_name
+                    )
+                })?;
+                pb.suspend(|| println!("Hybrid query set: {n} queries checked"));
+            }
 
             // Start this experiment's provenance recording BEFORE the engine is
             // built — engines resolve most of their environment knobs in `new()`,
@@ -404,6 +618,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                 &mut *engine,
                 &dataset,
                 args,
+                plan,
                 is_last_config,
                 number_of_shards.as_ref(),
                 recording,
@@ -459,6 +674,11 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
         // Caught by the guard below on the very first merge after it landed.
         "allow_partial_corpus": args.allow_partial_corpus,
         "dump_raw_latencies": args.dump_raw_latencies,
+        // Non-boolean: where per-query result dumps went (#343).
+        "dump_results": args.dump_results,
+        // Non-boolean: how the upload read the corpus (#342). The reader that
+        // actually ran is recorded per upload as `results.upload_reader`.
+        "upload_reader": args.upload_reader.as_str(),
         "exit_on_error": args.exit_on_error,
         "fail_on_dropped_queries": args.fail_on_dropped_queries,
         "keep_data": args.keep_data,
@@ -789,6 +1009,7 @@ fn check_corpus_reuse_precondition(
     engine: &mut dyn Engine,
     dataset: &Dataset,
     args: &Args,
+    no_vector_layout: bool,
 ) -> Result<Option<serde_json::Value>, String> {
     // Nothing is measured, so nothing can be misreported.
     if args.skip_search {
@@ -799,7 +1020,7 @@ fn check_corpus_reuse_precondition(
     // search phase returns before `read_queries()`. Same rationale as
     // `--skip-search` above, and checking it here also keeps the fetch below
     // from downloading a corpus for a run that will publish nothing.
-    if args.skip_vector_index
+    if no_vector_layout
         && !dataset
             .config
             .schema
@@ -1132,6 +1353,7 @@ fn run_single_experiment(
     engine: &mut dyn Engine,
     dataset: &Dataset,
     args: &Args,
+    plan: &WorkloadPlan,
     is_last_config: bool,
     number_of_shards: Option<&serde_json::Value>,
     // Consumed, never read: holding it proves `begin_experiment` ran for THIS
@@ -1153,6 +1375,9 @@ fn run_single_experiment(
     // not create the corpus must not tear it down, whatever `--keep-data` says.
     let keep_data =
         args.skip_upload || (args.keep_data && (is_last_config || !args.reset_between_configs));
+    // Every search config of this engine config needs this layout (#344);
+    // `NoVector` is exactly the legacy `--skip-vector-index` path.
+    let no_vector_layout = plan.layout == IndexLayout::NoVector;
 
     // Skip an incompatible (engine, dataset) pair BEFORE `get_path()`, which would
     // otherwise download the archive — hundreds of MB for the msmarco-sparse sets
@@ -1189,6 +1414,42 @@ fn run_single_experiment(
         }
     }
 
+    // #339: checked before anything touches the server (no configure/upload):
+    // every fulltext search config's fields resolve against this dataset's
+    // schema, and a fulltext search config — which pins the text analyzer for
+    // the whole index — does not share one with vector/hybrid configs whose
+    // dataset filters on a text field.
+    vector_db_benchmark::fulltext::check_fields_before_connecting(
+        engine
+            .search_params()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| plan.workload(*i).ok() == Some(Workload::Fulltext))
+            .map(|(i, sp)| (i, sp.knob(vector_db_benchmark::fulltext::SPEC_KEY))),
+        dataset.config.schema.as_ref(),
+        &dataset.config.name,
+    )?;
+    if vector_db_benchmark::fulltext::mixes_with_filtered_workloads(&plan.workloads) {
+        let text_fields =
+            vector_db_benchmark::fulltext::schema_text_fields(dataset.config.schema.as_ref());
+        // Hybrid (#341): its predicates live in hybrid_queries.jsonl, not in
+        // tests.jsonl, and its text-match agreement rules assume each engine's
+        // DEFAULT text analysis — count them too.
+        let hybrid_text_queries = if plan.workloads.contains(&Workload::Hybrid) {
+            vector_db_benchmark::hybrid::count_text_field_rows(&dataset.get_path()?, &text_fields)?
+        } else {
+            0
+        };
+        vector_db_benchmark::fulltext::check_mixed_text_filters(
+            &plan.workloads,
+            vector_db_benchmark::fulltext::count_text_field_queries(
+                &dataset.get_path()?,
+                &text_fields,
+            )? + hybrid_text_queries,
+            &dataset.config.name,
+        )?;
+    }
+
     // Snapshot server metadata BEFORE any upload/search so results are
     // reproducible (server version, loaded modules incl. the search module,
     // full INFO/CONFIG, index state). None for non-Redis-wire engines.
@@ -1214,6 +1475,8 @@ fn run_single_experiment(
             &dataset.config.name,
             &upload_stats,
             number_of_shards,
+            plan,
+            dataset.upload_reader_report().as_ref(),
         )?;
     } else {
         // `--skip-upload` means: the server already holds the corpus I want —
@@ -1237,8 +1500,14 @@ fn run_single_experiment(
         // it: if phase 1 was a NORMAL upload, phase 2 does not destroy anything —
         // it publishes a QPS number from an empty `<engine>-no-vector` index while
         // the real corpus sits untouched under the original config name.
-        corpus_reuse = check_corpus_reuse_precondition(engine, dataset, args)?;
+        corpus_reuse = check_corpus_reuse_precondition(engine, dataset, args, no_vector_layout)?;
     }
+
+    // The index every search config is about to run on must be the layout the
+    // results will be labelled with (#344) — checked once, before any search
+    // config, so a reused index of the wrong layout fails before anything is
+    // written, whatever order the search configs are declared in.
+    engine.check_index_layout(dataset, plan.layout)?;
 
     // Build ordered search phases: pure search first, then mixed ratios ascending
     let search_phases: Vec<Option<UpdateSearchRatio>> = if args.update_search_ratio.is_empty() {
@@ -1295,7 +1564,7 @@ fn run_single_experiment(
     // query vector just to drop it (~22 s warm / ~137 s cold per config on the
     // compound h-and-m dataset, paid once per config in a sweep).
     let ground_truth: Option<crate::ground_truth::GroundTruthProfile> =
-        if args.skip_vector_index || args.skip_search {
+        if no_vector_layout || args.skip_search {
             None
         } else {
             match crate::ground_truth::GroundTruthProfile::load(dataset) {
@@ -1387,7 +1656,7 @@ fn run_single_experiment(
     // just as much to a hard search failure, and matters more now that a
     // short-staffed worker pool is one of them (#214).
     let mut fatal_search_error: Option<String> = None;
-    let skip_vector_index = args.skip_vector_index;
+    let skip_vector_index = no_vector_layout;
 
     if !args.skip_search {
         // --skip-vector-index + no query conditions = nothing to search for
@@ -1426,18 +1695,40 @@ fn run_single_experiment(
         // Clone search params to avoid borrow conflict
         let all_search_params: Vec<_> = engine.search_params().to_vec();
 
-        // --skip-vector-index: dedup search params by parallel level only
-        // (ef values are irrelevant for filter-only queries)
+        // Collapse redundant EF configs, but never silently discard a different
+        // scalar result limit at the same concurrency.
         let effective_search_params: Vec<(usize, SearchParams)> = if skip_vector_index {
-            let mut seen_parallels = std::collections::HashSet::new();
-            all_search_params
-                .into_iter()
-                .enumerate()
-                .filter(|(_, sp)| {
-                    let p = sp.parallel.unwrap_or(1);
-                    seen_parallels.insert(p)
-                })
-                .collect()
+            vector_db_benchmark::filter_only::search_param_indices(
+                all_search_params.iter().map(|sp| (sp.parallel, sp.top)),
+                // --skip-vector-index canonicalizes names to <engine>-no-vector.
+                // Legacy adapters still derive their default from ground truth.
+                matches!(plan.engine_type.as_str(), "redis" | "opensearch")
+                    .then_some(vector_db_benchmark::filter_only::DEFAULT_LIMIT as i64),
+            )?
+            .into_iter()
+            .map(|index| (index, all_search_params[index].clone()))
+            .collect()
+        } else if plan.layout == IndexLayout::Full {
+            // #344: the filter-only configs on the shared index follow the
+            // no-vector rule above; the other workloads run as declared.
+            vector_db_benchmark::filter_only::mixed_search_param_indices(
+                all_search_params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sp)| {
+                        Ok((
+                            plan.workload(i)? == Workload::FilterOnly,
+                            sp.parallel,
+                            sp.top,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                // `full` exists on Redis and OpenSearch only: the fixed default.
+                Some(vector_db_benchmark::filter_only::DEFAULT_LIMIT as i64),
+            )?
+            .into_iter()
+            .map(|index| (index, all_search_params[index].clone()))
+            .collect()
         } else {
             all_search_params.into_iter().enumerate().collect()
         };
@@ -1471,22 +1762,42 @@ fn run_single_experiment(
                     }
                 }
 
-                // Filter by ef_runtime if specified (irrelevant for skip_vector_index)
-                if !skip_vector_index && !args.ef_runtime.is_empty() {
-                    if let Some(ref inner) = search_params.search_params {
-                        if let Some(ef) = inner.ef {
-                            if !args.ef_runtime.contains(&ef) {
-                                continue;
-                            }
-                        }
-                    }
+                let workload = plan.workload(*search_id)?;
+                // Filter by ef_runtime if specified; EF never drops a
+                // filter-only config, on `no-vector` or on `full` (#344).
+                if !vector_db_benchmark::workload::ef_runtime_keeps(
+                    workload,
+                    search_params.search_params.as_ref().and_then(|s| s.ef),
+                    &args.ef_runtime,
+                ) {
+                    continue;
                 }
 
                 let parallel = search_params.parallel.unwrap_or(1);
+                // Mixed phases interleave VECTOR searches with updates; any other
+                // workload there would be measured as something it is not.
+                if phase.is_some() && workload != Workload::Vector {
+                    return Err(format!(
+                        "--update-search-ratio runs the vector workload; search config \
+                         #{search_id} is \"{workload}\""
+                    ));
+                }
+                // Calibration tunes a vector search knob (it calls the vector
+                // path). Refused at startup by `workload::check_calibration`
+                // except for the legacy `--skip-vector-index` filter-only path,
+                // which keeps ignoring it; this is the backstop.
+                if !matches!(workload, Workload::Vector | Workload::FilterOnly)
+                    && search_params.calibration_param.is_some()
+                {
+                    return Err(format!(
+                        "calibration_param is only supported for the vector workload; search \
+                         config #{search_id} is \"{workload}\""
+                    ));
+                }
 
                 // Calibration is skipped for filter-only mode (no vector search to tune)
                 let mut calibration_json: Option<serde_json::Value> = None;
-                let calibrated_params = if skip_vector_index {
+                let calibrated_params = if workload != Workload::Vector {
                     None
                 } else if let (Some(cal_param), Some(cal_precision)) = (
                     &search_params.calibration_param,
@@ -1552,6 +1863,10 @@ fn run_single_experiment(
 
                 let base_params = calibrated_params.as_ref().unwrap_or(search_params);
                 let mut runtime_params = base_params.clone();
+                // Recorded in the result file's params; the engine reads the
+                // dispatch, not this field.
+                runtime_params.workload = Some(workload);
+                runtime_params.capture_query_results = args.dump_results.is_some();
                 if args.search_duration > 0.0 {
                     runtime_params.duration_seconds = Some(args.search_duration);
                 }
@@ -1560,7 +1875,9 @@ fn run_single_experiment(
                     runtime_params.max_lateness_ms = Some(args.max_lateness_ms);
                 }
                 let effective_params = &runtime_params;
-                let effective_ef = if skip_vector_index {
+                // Per search config, not per index: on the shared `full` index
+                // (#344) a filter-only config sits next to vector ones.
+                let effective_ef = if workload == Workload::FilterOnly {
                     "n/a".to_string()
                 } else {
                     effective_params
@@ -1571,7 +1888,7 @@ fn run_single_experiment(
                         .unwrap_or_else(|| "default".to_string())
                 };
 
-                if skip_vector_index {
+                if workload == Workload::FilterOnly {
                     println!(
                         "\tRunning filter-only search {}: parallel={}",
                         search_id, parallel
@@ -1590,8 +1907,17 @@ fn run_single_experiment(
                         "\tOpen-loop warm-up: {:.1} QPS for {:.1}s",
                         args.target_qps, args.warmup_seconds
                     );
+                    // A warm-up's records are discarded; do not pay for them.
+                    warmup_params.capture_query_results = false;
                     run_with_search_watchdog(args.search_timeout, "open-loop warm-up", || {
-                        engine.search(dataset, &warmup_params, args.queries)
+                        crate::engine::search_workload(
+                            engine,
+                            &plan.engine_type,
+                            workload,
+                            dataset,
+                            &warmup_params,
+                            args.queries,
+                        )
                     })
                     .map_err(|e| format!("open-loop warm-up failed: {}", e))?;
                 } else if args.search_duration > 0.0 && args.warmup_seconds > 0.0 {
@@ -1603,8 +1929,16 @@ fn run_single_experiment(
                     warmup_params.duration_seconds = Some(args.warmup_seconds);
                     warmup_params.target_qps = None;
                     println!("\tClosed-loop warm-up: {:.1}s", args.warmup_seconds);
+                    warmup_params.capture_query_results = false;
                     run_with_search_watchdog(args.search_timeout, "closed-loop warm-up", || {
-                        engine.search(dataset, &warmup_params, args.queries)
+                        crate::engine::search_workload(
+                            engine,
+                            &plan.engine_type,
+                            workload,
+                            dataset,
+                            &warmup_params,
+                            args.queries,
+                        )
                     })
                     .map_err(|e| format!("closed-loop warm-up failed: {}", e))?;
                 }
@@ -1660,7 +1994,14 @@ fn run_single_experiment(
                             Some(ratio) => {
                                 engine.search_mixed(dataset, effective_params, args.queries, ratio)
                             }
-                            None => engine.search(dataset, effective_params, args.queries),
+                            None => crate::engine::search_workload(
+                                engine,
+                                &plan.engine_type,
+                                workload,
+                                dataset,
+                                effective_params,
+                                args.queries,
+                            ),
                         });
                     let cpu_after = crate::proc_cpu::sample();
 
@@ -1740,8 +2081,11 @@ fn run_single_experiment(
                 }
 
                 match best {
-                    Some(results) => {
-                        if skip_vector_index {
+                    Some(mut results) => {
+                        // Every workload of this config ran on the one index
+                        // the plan's layout built (#344).
+                        results.index_layout = Some(plan.layout);
+                        if workload == Workload::FilterOnly {
                             println!("\t→ QPS: {:.1} (filter-only, no precision)", results.rps);
                         } else {
                             println!(
@@ -1868,6 +2212,25 @@ fn run_single_experiment(
         )?;
     }
 
+    // Per-query dumps (#343), written after every timed window has closed. A
+    // failure here is RECORDED, not returned: it must not replace a hard search
+    // failure or the dropped-query verdict below, nor skip summary and teardown.
+    // It is reported last (see `with_dump_failure`).
+    let dump_failure: Option<String> = match &args.dump_results {
+        Some(dir) => write_query_dumps(
+            dir,
+            &plan.engine_type,
+            engine.name(),
+            dataset,
+            &mut pending_saves,
+        )
+        .err(),
+        None => None,
+    };
+    if let Some(e) = &dump_failure {
+        eprintln!("\t⚠ {e}");
+    }
+
     // Only now that the completed points are on disk may a hard search failure
     // end the run.
     if let Some(msg) = fatal_search_error {
@@ -1877,7 +2240,7 @@ fn run_single_experiment(
                 pending_saves.len()
             );
         }
-        return Err(msg);
+        return Err(with_dump_failure(msg, dump_failure.as_deref()));
     }
 
     // Now that the evidence is on disk, honour --fail-on-dropped-queries. Every
@@ -1885,13 +2248,16 @@ fn run_single_experiment(
     // engine-agnostic by construction: it reads the `failed_queries` that
     // `compute_search_stats` derives for all of them.
     if args.fail_on_dropped_queries && !dropped_query_failures.is_empty() {
-        return Err(format!(
-            "{} search config(s) lost queries and --fail-on-dropped-queries is set: {}. \
-             Recall/latency for these cover the surviving subset only, which biases recall \
-             upward. Results were still written; re-run with less load, or drop the flag to \
-             accept a partial run.",
-            dropped_query_failures.len(),
-            dropped_query_failures.join("; ")
+        return Err(with_dump_failure(
+            format!(
+                "{} search config(s) lost queries and --fail-on-dropped-queries is set: {}. \
+                 Recall/latency for these cover the surviving subset only, which biases recall \
+                 upward. Results were still written; re-run with less load, or drop the flag to \
+                 accept a partial run.",
+                dropped_query_failures.len(),
+                dropped_query_failures.join("; ")
+            ),
+            dump_failure.as_deref(),
         ));
     }
 
@@ -1970,8 +2336,23 @@ fn run_single_experiment(
         engine.delete()?;
     }
 
+    // A failed dump write is surfaced only after summary and teardown ran.
+    if let Some(e) = dump_failure {
+        return Err(e);
+    }
+
     println!("Experiment stage: Done");
     Ok(())
+}
+
+/// An experiment's primary failure, with a secondary `--dump-results` write
+/// failure appended rather than substituted (#343 review): the search failure
+/// or dropped-query verdict is what the run is about, and must stay first.
+fn with_dump_failure(primary: String, dump_failure: Option<&str>) -> String {
+    match dump_failure {
+        Some(d) => format!("{primary}\n(also: {d})"),
+        None => primary,
+    }
 }
 
 /// Outcome of a calibration sweep, including whether it actually got there.
@@ -2246,6 +2627,130 @@ fn metrics_schema(gt: Option<&crate::ground_truth::GroundTruthStats>) -> serde_j
     schema
 }
 
+/// Row id -> external id for a dataset's per-query dumps (logic and tests in
+/// `results_dump::external_ids_for_dataset`). Cached for the most recent
+/// dataset: a sweep dumps every config against the same corpus, and the
+/// `docid` scan reads the whole `payloads.jsonl`. Outside every timed window.
+fn external_ids(
+    dataset: &Dataset,
+) -> Result<std::sync::Arc<vector_db_benchmark::results_dump::ExternalIds>, String> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<Option<(String, Arc<vector_db_benchmark::results_dump::ExternalIds>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut slot = cache.lock().map_err(|_| "external id cache poisoned")?;
+    if let Some((name, ids)) = slot.as_ref() {
+        if *name == dataset.config.name {
+            return Ok(Arc::clone(ids));
+        }
+    }
+    let ids = Arc::new(vector_db_benchmark::results_dump::external_ids_for_dataset(
+        &dataset.config.name,
+        dataset.config.dataset_type.as_deref(),
+        dataset.config.schema.as_ref(),
+        || dataset.get_path(),
+    )?);
+    *slot = Some((dataset.config.name.clone(), Arc::clone(&ids)));
+    Ok(ids)
+}
+
+/// Write one JSONL per completed search point that captured per-query results
+/// (`--dump-results`, #343). Consumes the captures so they are not kept in
+/// memory afterwards. Refuses to overwrite an existing dump: two runs' records
+/// in one file could not be told apart.
+fn write_query_dumps(
+    dir: &std::path::Path,
+    engine_type: &str,
+    engine_name: &str,
+    dataset: &Dataset,
+    pending: &mut [(
+        usize,
+        SearchParams,
+        crate::engine::SearchResults,
+        Option<serde_json::Value>,
+    )],
+) -> Result<(), String> {
+    use vector_db_benchmark::results_dump as dump;
+    if pending.iter().all(|(_, _, r, _)| r.query_records.is_none()) {
+        return Ok(());
+    }
+    let ids = external_ids(dataset)?;
+    let mut expected: Option<Vec<Vec<i64>>> = None;
+    // Hybrid (#341): truth and the per-query bucket come from the hybrid set.
+    let mut hybrid: Option<(Vec<Vec<i64>>, Vec<String>)> = None;
+    for (search_id, params, results, _) in pending.iter_mut() {
+        let Some(raw) = results.query_records.take() else {
+            continue;
+        };
+        let workload = results
+            .workload
+            .ok_or("--dump-results: a result reached the dump without a dispatched workload")?;
+        if workload == Workload::Hybrid && hybrid.is_none() {
+            let set = dataset.read_hybrid_query_set()?;
+            let buckets = set
+                .meta
+                .iter()
+                .map(|m| m.bucket.as_str().to_string())
+                .collect();
+            hybrid = Some((set.neighbors, buckets));
+        }
+        let records = if workload == Workload::Hybrid {
+            let (gt, buckets) = hybrid.as_ref().ok_or("hybrid query set not loaded")?;
+            dump::resolve_records(&raw, &ids, Some(gt), results.top, &|q| {
+                buckets.get(q).cloned()
+            })?
+        } else {
+            let gt = if workload.has_ground_truth() {
+                if expected.is_none() {
+                    expected = Some(dataset.read_queries()?.1);
+                }
+                expected.as_deref()
+            } else {
+                None
+            };
+            // Filter-only records carry the prepared query's shape (#340), so
+            // `compare-results` reports per shape; KNN has none yet.
+            let filter_set = if workload == Workload::FilterOnly {
+                dataset.filter_query_file()?
+            } else {
+                None
+            };
+            let shape = |q: usize| filter_set.as_ref().and_then(|s| s.shape(q));
+            dump::resolve_records(&raw, &ids, gt, results.top, &shape)?
+        };
+        let header = dump::DumpHeader {
+            schema_version: dump::DUMP_SCHEMA_VERSION,
+            engine: engine_type.to_string(),
+            config: engine_name.to_string(),
+            dataset: dataset.config.name.clone(),
+            workload,
+            parallel: params.parallel.unwrap_or(1).max(1) as usize,
+            top: results.top,
+            search_id: *search_id,
+            id_space: ids.space(),
+            index_layout: results.index_layout.map(|l| l.as_str().to_string()),
+        };
+        let path = dir.join(dump::dump_file_name(&header));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                format!(
+                    "--dump-results: cannot create {} ({e}); use an empty directory per run",
+                    path.display()
+                )
+            })?;
+        dump::write_dump(std::io::BufWriter::new(file), &header, &records)?;
+        println!(
+            "\tPer-query results ({} records) dumped to: {:?}",
+            records.len(),
+            path
+        );
+    }
+    Ok(())
+}
+
 /// Save search results to JSON file (matches Python v0 format)
 #[allow(clippy::too_many_arguments)]
 fn save_search_results(
@@ -2400,8 +2905,100 @@ fn build_search_result_json(
     // profile is evaluated at the `top` this run actually used, so a reader can
     // see whether `mean_recall` is the same quantity upstream calls
     // `mean_precisions` for this dataset — or by how much they cannot be.
+    // p90 (#346), next to the p50/p95/p99 fields above. Inserted here rather
+    // than in the literal because that `json!` is at the macro recursion limit;
+    // serde_json's map is sorted, so the emitted document is the same.
+    result["results"]["p90_time"] = json!(results.p90_time);
+    result["results"]["schedule_delay_p90_time"] = json!(results.schedule_delay_p90_time);
+    result["results"]["end_to_end_p90_time"] = json!(results.end_to_end_p90_time);
+
     let gt_stats = ground_truth.and_then(|gt| gt.stats(results.top));
     result["metrics_schema"] = metrics_schema(gt_stats.as_ref());
+
+    // The workload the dispatch point actually ran (#344), on every result.
+    if let Some(workload) = results.workload {
+        result["params"]["workload"] = serde_json::json!(workload.as_str());
+    }
+    // The index it ran on (#344): "full" means one ingest served this config's
+    // other workloads too, and its scalar fields are typed for filter-only.
+    if let Some(layout) = results.index_layout {
+        result["params"]["index_layout"] = serde_json::json!(layout.as_str());
+    }
+    // #343 review: a --dump-results run's rps includes the per-query capture
+    // work (outside each latency sample, inside the throughput window). Say so
+    // in the artifact, where its QPS will be compared with a non-dump run's.
+    if search_params.capture_query_results {
+        result["params"]["per_query_capture"] = serde_json::json!({
+            "enabled": true,
+            "in_throughput_window": true,
+            "in_latency_samples": false,
+        });
+    }
+    // Hybrid (#341): the per-bucket report, and the metric schema's width
+    // profile describes the FILTERED ground truth the run was scored against.
+    if let Some(h) = &results.hybrid {
+        result["results"]["hybrid"] = serde_json::to_value(&h.report).unwrap();
+        result["metrics_schema"] = metrics_schema(h.ground_truth.as_ref());
+        result["metrics_schema"]["ground_truth_source"] =
+            serde_json::json!(vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE);
+        result["metrics_schema"]["hybrid_headline"] = serde_json::json!(
+            "top-level rps / latency / recall are the UNION of one timed pass per selectivity \
+             bucket (total queries / summed pass time), dominated by the slowest bucket; compare \
+             hybrid runs per bucket (results.hybrid.buckets), not results.rps against vector runs. \
+             With --repetitions N the kept repetition is the one with the best UNION rps, so the \
+             per-bucket figures all come from that repetition, not from a per-bucket best-of-N"
+        );
+    }
+    if let Some(contract) = &results.filter_only {
+        result["params"]["workload"] = serde_json::json!("filter-only");
+        result["results"]["filter_only"] = serde_json::to_value(contract).unwrap();
+        result["metrics_schema"] = serde_json::json!({
+            "version": 2, "workload": "filter-only", "vector_quality": "not applicable",
+            "result_order": "unspecified", "returned_fields": "IDs only", "total_count": "exact",
+            "latency": "OpenSearch includes retry/backoff; Redis uses one attempt without reconnect/retry; connection setup and priming excluded"
+        });
+        for key in [
+            "mean_precision_at_returned",
+            "mean_recall",
+            "recall_p10",
+            "mean_mrr",
+            "mean_ndcg",
+            "precision_at_returned_dist",
+            "recall_dist",
+            "mrr_dist",
+            "ndcg_dist",
+        ] {
+            result["results"].as_object_mut().unwrap().remove(key);
+        }
+    }
+
+    // #339: what a fulltext run measured (analyzers, boosts, skipped queries).
+    // There is no ground truth: quality is scored against a reference engine
+    // by `compare-results`, so the vector-quality keys are not published.
+    if let Some(meta) = &results.fulltext {
+        result["params"]["workload"] = serde_json::json!("fulltext");
+        result["params"]["fulltext"] = meta.clone();
+        result["metrics_schema"] = serde_json::json!({
+            "version": 2, "workload": "fulltext", "vector_quality": "not applicable",
+            "result_order": "ranked by engine score (descending)",
+            "returned_fields": "IDs and engine-native BM25 scores (not comparable across engines)",
+            "quality": "overlap@k / Jaccard@k / rank correlation against a reference engine via compare-results",
+            "latency": "OpenSearch excludes retry/backoff (as on its vector path); Redis uses one attempt; connection setup and priming excluded"
+        });
+        for key in [
+            "mean_precision_at_returned",
+            "mean_recall",
+            "recall_p10",
+            "mean_mrr",
+            "mean_ndcg",
+            "precision_at_returned_dist",
+            "recall_dist",
+            "mrr_dist",
+            "ndcg_dist",
+        ] {
+            result["results"].as_object_mut().unwrap().remove(key);
+        }
+    }
 
     // How the swept parameter was chosen, and — crucially — whether the target
     // was actually reached. A calibration that converged on the maximum value
@@ -2440,19 +3037,26 @@ fn build_search_result_json(
     // `effective` covers only the knobs resolved through the recording helpers.
     result["params"]["engine_params"] = engine_params.clone();
 
+    // Which build produced these numbers (#366): crate version and the commit
+    // the binary was compiled from, so a result traces back to a release
+    // archive. `git_sha` is null when the build could not tell.
+    result["params"]["build"] = vector_db_benchmark::build_info::provenance();
+
     // Opt-in full-fidelity archival: additionally emit the raw per-query arrays
     // exactly as before. Off by default so large runs stay ~1000x smaller.
     if dump_raw_latencies {
         let results_obj = result["results"].as_object_mut().unwrap();
         // `precisions` is another upstream key name carrying upstream's per-query
         // recall@top values, so our array ships under an unambiguous name too.
-        results_obj.insert(
-            "precisions_at_returned".to_string(),
-            json!(results.precisions_at_returned),
-        );
-        results_obj.insert("recalls".to_string(), json!(results.recalls));
-        results_obj.insert("mrrs".to_string(), json!(results.mrrs));
-        results_obj.insert("ndcgs".to_string(), json!(results.ndcgs));
+        if results.filter_only.is_none() && results.fulltext.is_none() {
+            results_obj.insert(
+                "precisions_at_returned".to_string(),
+                json!(results.precisions_at_returned),
+            );
+            results_obj.insert("recalls".to_string(), json!(results.recalls));
+            results_obj.insert("mrrs".to_string(), json!(results.mrrs));
+            results_obj.insert("ndcgs".to_string(), json!(results.ndcgs));
+        }
         results_obj.insert("latencies".to_string(), json!(results.latencies));
     }
 
@@ -2495,6 +3099,9 @@ fn build_search_result_json(
         if let Some(t) = results.update_p50_time {
             results_obj.insert("update_p50_time".to_string(), json!(t));
         }
+        if let Some(t) = results.update_p90_time {
+            results_obj.insert("update_p90_time".to_string(), json!(t));
+        }
         if let Some(t) = results.update_p95_time {
             results_obj.insert("update_p95_time".to_string(), json!(t));
         }
@@ -2536,6 +3143,8 @@ fn save_upload_results(
     dataset_name: &str,
     stats: &crate::engine::UploadStats,
     number_of_shards: Option<&serde_json::Value>,
+    plan: &WorkloadPlan,
+    upload_reader: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let filename = format!(
@@ -2543,14 +3152,21 @@ fn save_upload_results(
         engine_name, dataset_name, stats.upload_count, timestamp
     );
 
+    check_upload_phases(stats)?;
     crate::effective_config::set_phase("upload");
-    let result = build_upload_result_json(
+    let mut result = build_upload_result_json(
         engine_name,
         dataset_name,
         stats,
         number_of_shards,
         &crate::effective_config::snapshot(),
     );
+    stamp_shared_index(&mut result, plan);
+    // Which reader fed the upload (#342), as recorded by the reader itself:
+    // `stream` (bounded client memory) or `memory`, with the flag and why.
+    if let Some(reader) = upload_reader {
+        result["results"]["upload_reader"] = reader.clone();
+    }
 
     let path = results_dir().join(&filename);
     fs::write(&path, serde_json::to_string_pretty(&result).unwrap())
@@ -2558,6 +3174,31 @@ fn save_upload_results(
 
     println!("Results saved to: {:?}", path);
     Ok(())
+}
+
+/// Refuse to publish ingest phases that are not the measurement the legacy
+/// keys report (#344): a phase report whose `upload_time` or `total_time`
+/// disagrees with the engine's would put two different ingests in one file.
+fn check_upload_phases(stats: &crate::engine::UploadStats) -> Result<(), String> {
+    match &stats.ingest_phases {
+        Some(p) => p.check_legacy_fields(stats.upload_time, stats.total_time),
+        None => Ok(()),
+    }
+}
+
+/// Record which index this upload built and which workloads it serves
+/// (#344): `params.index_layout` and `params.index_workloads` (the distinct
+/// workloads of the engine config's search configs, in first-declared order).
+/// The search files of the same experiment carry the same `index_layout`.
+fn stamp_shared_index(result: &mut serde_json::Value, plan: &WorkloadPlan) {
+    let mut workloads: Vec<&str> = Vec::new();
+    for w in &plan.workloads {
+        if !workloads.contains(&w.as_str()) {
+            workloads.push(w.as_str());
+        }
+    }
+    result["params"]["index_layout"] = json!(plan.layout.as_str());
+    result["params"]["index_workloads"] = json!(workloads);
 }
 
 /// Build the upload-result JSON document. Split out for the same reason as
@@ -2603,6 +3244,14 @@ fn build_upload_result_json(
         result["results"]["index_coverage_fraction"] = json!(coverage.fraction());
     }
 
+    // Ingestion as phases (#344): `read_time`, `index_wait_time`,
+    // `total_ingest_time`, docs/s and the timestamped boundaries, NEXT TO the
+    // legacy `upload_time` / `total_time`, which keep their meaning. Absent for
+    // engines that do not report phases — absence reads as "unreported".
+    if let Some(phases) = &stats.ingest_phases {
+        phases.write_into(&mut result["results"]);
+    }
+
     // Same provenance block as the search files (#212), tagged `phase: "upload"`.
     // It is scoped to what had been resolved when this file was written, so a
     // knob the engine only resolves during search is absent here. The phase tag
@@ -2613,6 +3262,9 @@ fn build_upload_result_json(
     // whole-run view.
     result["params"]["engine_params"] = engine_params.clone();
 
+    // Same build block as the search files (#366).
+    result["params"]["build"] = vector_db_benchmark::build_info::provenance();
+
     result
 }
 
@@ -2621,6 +3273,37 @@ mod tests {
     use super::parse_update_search_ratio;
     use super::run_with_search_watchdog;
     use crate::engine::UpdateSearchRatio;
+
+    /// #361 review: every `Dataset` the run builds shares ONE
+    /// `MemorySnapshots`, created once before the config loop, so
+    /// `--upload-reader auto` decides once per dataset for the whole
+    /// invocation (the decision itself is unit-tested in `upload_stream` and
+    /// `dataset`). Reads this file's own non-test source.
+    #[test]
+    fn every_config_shares_the_invocations_memory_snapshots() {
+        let src = include_str!("experiment.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let sites: Vec<usize> = prod
+            .match_indices("Dataset::new(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(sites.len(), 1, "one Dataset construction in the run loop");
+        let stmt = &prod[sites[0]..sites[0] + prod[sites[0]..].find(';').unwrap()];
+        assert!(
+            stmt.contains(".with_memory_snapshots(memory_snapshots.clone())"),
+            "the run's Dataset does not share the invocation's snapshots: {stmt}"
+        );
+        let created: Vec<usize> = prod
+            .match_indices("MemorySnapshots::default()")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(created.len(), 1, "one snapshot set per invocation");
+        let config_loop = prod.find("'experiments: for").unwrap();
+        assert!(
+            created[0] < config_loop,
+            "the snapshots must be created before the config loop, not per config"
+        );
+    }
 
     // Watchdog disabled (timeout <= 0, non-finite): must run `f` inline on the
     // current thread and return its value verbatim — the default, unchanged path.
@@ -3024,11 +3707,18 @@ mod tests {
         /// `#[cfg(test)] const` at item level has no brace, and the guard's
         /// `strip_test_modules` used to brace-count from the next `{` it found —
         /// silently deleting the production code in between.
-        const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[(
-            "verbose",
-            "console output only: changes what is printed, never what is measured \
+        const INVOCATION_EXCLUDED_FLAGS: &[(&str, &str)] = &[
+            (
+                "verbose",
+                "console output only: changes what is printed, never what is measured \
          or which experiments run",
-        )];
+            ),
+            (
+                "allow_unpaired",
+                "a `compare-results` subcommand flag: that subcommand reads dumps and runs \
+                 no benchmark, so there is no run artifact for it to reach",
+            ),
+        ];
 
         /// Every `Args` BOOLEAN that changes what is measured must be recorded.
         ///
@@ -3103,6 +3793,7 @@ mod tests {
                 "warmup_seconds",
                 "configurations_dir",
                 "results_dir",
+                "upload_reader",
             ] {
                 assert!(
                     recorded.contains_key(required),
@@ -3117,6 +3808,10 @@ mod tests {
                 "warmup_seconds",
                 "configurations_dir",
                 "results_dir",
+                // #343: where per-query dumps went (an Option<PathBuf> flag).
+                "dump_results",
+                // #342: `--upload-reader` (an enum flag).
+                "upload_reader",
             ];
             let fabricated: Vec<&String> = recorded
                 .keys()
@@ -3230,6 +3925,49 @@ mod tests {
             begin("cfg", &crate::cli::Args::parse_from(["vdbb"]));
             let d = doc(&crate::effective_config::snapshot());
             assert!(d["params"]["engine_params"]["declared"].is_object());
+        }
+
+        /// #366: both result files say which build produced them, so a number
+        /// can be traced to the release archive (or the commit) it came from.
+        #[test]
+        fn search_and_upload_results_carry_the_build_block() {
+            use super::super::{build_search_result_json, build_upload_result_json};
+            use crate::config::SearchParams;
+            use crate::engine::{SearchResults, UploadStats};
+
+            let expected = vector_db_benchmark::build_info::provenance();
+            assert_eq!(expected["crate_version"], env!("CARGO_PKG_VERSION"));
+
+            let search = build_search_result_json(
+                "redis-test",
+                "glove-25-angular",
+                &serde_json::from_value::<SearchParams>(
+                    serde_json::json!({"parallel": 1, "top": 10}),
+                )
+                .unwrap(),
+                &SearchResults {
+                    top: 10,
+                    ..Default::default()
+                },
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                &serde_json::json!({}),
+            );
+            assert_eq!(search["params"]["build"], expected, "search file");
+
+            let upload = build_upload_result_json(
+                "redis-test",
+                "glove-25-angular",
+                &UploadStats::default(),
+                None,
+                &serde_json::json!({}),
+            );
+            assert_eq!(upload["params"]["build"], expected, "upload file");
         }
 
         /// The upload file carries it too, tagged with its phase — and #212's
@@ -4198,9 +4936,10 @@ mod reuse_handler_tests {
         let ds = measurable_dataset(dir.path(), 400);
         let mut engine = stub("chroma-handler", Ok(None));
 
-        let record = check_corpus_reuse_precondition(&mut engine, &ds, &args())
-            .expect("an engine with no probe must not abort the run")
-            .expect("the verdict must still be recorded in the artifact");
+        let record =
+            check_corpus_reuse_precondition(&mut engine, &ds, &args(), args().skip_vector_index)
+                .expect("an engine with no probe must not abort the run")
+                .expect("the verdict must still be recorded in the artifact");
 
         assert_eq!(record["status"], "unverified");
         assert_eq!(record["actual_rows"], serde_json::Value::Null);
@@ -4220,8 +4959,9 @@ mod reuse_handler_tests {
         let ds = measurable_dataset(dir.path(), 400);
         let mut engine = stub("redis-handler", Ok(Some(CorpusCount::exact(1))));
 
-        let err = check_corpus_reuse_precondition(&mut engine, &ds, &args())
-            .expect_err("a short exact count must abort");
+        let err =
+            check_corpus_reuse_precondition(&mut engine, &ds, &args(), args().skip_vector_index)
+                .expect_err("a short exact count must abort");
         assert!(
             err.contains("the corpus you asked to reuse is incomplete"),
             "{err}"
@@ -4255,11 +4995,410 @@ mod reuse_handler_tests {
             "--skip-upload",
             "--skip-vector-index",
         ]);
-        let out = check_corpus_reuse_precondition(&mut engine, &ds, &args)
+        let out = check_corpus_reuse_precondition(&mut engine, &ds, &args, args.skip_vector_index)
             .expect("a run that searches nothing must not be rejected");
         assert!(
             out.is_none(),
             "no verdict should be recorded for a run that measures nothing: {out:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dump_failure_ordering_tests {
+    use super::with_dump_failure;
+
+    /// A late `--dump-results` write failure is appended to, never substituted
+    /// for, the experiment's primary failure (#343 review).
+    #[test]
+    fn the_primary_failure_stays_first_and_the_dump_failure_is_kept() {
+        let e = with_dump_failure("search failed".into(), Some("dump: disk full"));
+        assert!(e.starts_with("search failed"), "{e}");
+        assert!(e.contains("dump: disk full"), "{e}");
+        assert_eq!(
+            with_dump_failure("search failed".into(), None),
+            "search failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod filter_only_serialization_tests {
+    use super::build_search_result_json;
+    use crate::{config::SearchParams, engine::SearchResults};
+    use serde_json::json;
+
+    #[test]
+    fn scalar_documents_omit_all_vector_quality_with_and_without_raw_arrays() {
+        let params: SearchParams = serde_json::from_value(json!({"parallel":1,"top":3})).unwrap();
+        for scalar in [false, true] {
+            for raw in [false, true] {
+                // Deliberately nonempty quality data makes accidental leakage
+                // visible; callers need not pre-clear values for serialization.
+                let results = SearchResults {
+                    top: 3,
+                    parallel: 1,
+                    requested_queries: 2,
+                    num_queries: 2,
+                    rps: 123.0,
+                    mean_time: 0.0015,
+                    p50_time: 0.0015,
+                    mean_precision_at_returned: 0.75,
+                    mean_recall: 0.5,
+                    mean_mrr: 0.5,
+                    mean_ndcg: 0.5,
+                    recall_p10: 0.5,
+                    precisions_at_returned: vec![0.5, 1.0],
+                    recalls: vec![0.5, 0.5],
+                    mrrs: vec![0.5, 0.5],
+                    ndcgs: vec![0.5, 0.5],
+                    latencies: vec![0.001, 0.002],
+                    filter_only: scalar.then_some(vector_db_benchmark::filter_only::Stats {
+                        result_limit: 3,
+                        matched_documents_sum: 17,
+                        returned_documents_sum: 6,
+                        retried_queries: 0,
+                        per_query_counts_checked: None,
+                        index_layout: None,
+                    }),
+                    // What `engine::search_workload` stamps on every result.
+                    workload: Some(if scalar {
+                        vector_db_benchmark::workload::Workload::FilterOnly
+                    } else {
+                        vector_db_benchmark::workload::Workload::Vector
+                    }),
+                    ..Default::default()
+                };
+                let doc = build_search_result_json(
+                    "test",
+                    "fixture",
+                    &params,
+                    &results,
+                    None,
+                    None,
+                    raw,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &json!({}),
+                );
+                let result = &doc["results"];
+                for key in [
+                    "mean_precision_at_returned",
+                    "mean_recall",
+                    "recall_p10",
+                    "mean_mrr",
+                    "mean_ndcg",
+                    "precision_at_returned_dist",
+                    "recall_dist",
+                    "mrr_dist",
+                    "ndcg_dist",
+                ] {
+                    assert_eq!(
+                        result.get(key).is_some(),
+                        !scalar,
+                        "{key}: scalar={scalar}, raw={raw}"
+                    );
+                }
+                for key in ["precisions_at_returned", "recalls", "mrrs", "ndcgs"] {
+                    assert_eq!(
+                        result.get(key).is_some(),
+                        !scalar && raw,
+                        "{key}: scalar={scalar}, raw={raw}"
+                    );
+                }
+                assert_eq!(result.get("latencies").is_some(), raw);
+                if raw {
+                    assert_eq!(result["latencies"], json!([0.001, 0.002]));
+                }
+                assert!(result["latency_hdr"].is_object());
+                assert_eq!(result["rps"], 123.0);
+                assert_eq!(result["p50_time"], 0.0015);
+                assert_eq!(result["requested_queries"], 2);
+                assert_eq!(result["succeeded_queries"], 2);
+                assert_eq!(result["failed_queries"], 0);
+                assert_eq!(result.get("filter_only").is_some(), scalar);
+                if scalar {
+                    assert_eq!(doc["params"]["workload"], "filter-only");
+                    assert_eq!(doc["metrics_schema"]["total_count"], "exact");
+                    assert_eq!(doc["metrics_schema"]["returned_fields"], "IDs only");
+                    assert_eq!(
+                        result["filter_only"],
+                        json!({"result_limit":3,"matched_documents_sum":17,"returned_documents_sum":6,"retried_queries":0})
+                    );
+                    assert!(doc["metrics_schema"].get("ground_truth").is_none());
+                } else {
+                    // #344: the dispatched workload is recorded on every result.
+                    assert_eq!(doc["params"]["workload"], "vector");
+                    assert_eq!(result["mean_recall"], 0.5);
+                }
+            }
+        }
+    }
+
+    /// #343 review: a run with per-query capture says so in the artifact; a run
+    /// without it carries no such block.
+    #[test]
+    fn per_query_capture_is_recorded_only_when_on() {
+        for capture in [false, true] {
+            let mut params: SearchParams = serde_json::from_value(json!({"parallel":1})).unwrap();
+            params.capture_query_results = capture;
+            let results = SearchResults {
+                top: 10,
+                parallel: 1,
+                requested_queries: 1,
+                num_queries: 1,
+                latencies: vec![0.001],
+                workload: Some(vector_db_benchmark::workload::Workload::Vector),
+                ..Default::default()
+            };
+            let doc = build_search_result_json(
+                "test",
+                "fixture",
+                &params,
+                &results,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                &json!({}),
+            );
+            let block = doc["params"].get("per_query_capture");
+            assert_eq!(block.is_some(), capture, "capture={capture}");
+            if capture {
+                assert_eq!(block.unwrap()["in_throughput_window"], true);
+            }
+        }
+    }
+}
+
+/// #346: p90 is published for every latency series (search, update,
+/// schedule-delay, end-to-end) and is the numpy-linear p90 of that series' own
+/// samples.
+#[cfg(test)]
+mod p90_publication_tests {
+    use super::build_search_result_json;
+    use crate::config::SearchParams;
+    use crate::engine::{
+        attach_open_loop_metrics, compute_search_stats, finalize_update_stats, OpenLoopPlan,
+        UpdateAttribution, UpdateSearchRatio, UpdateTally,
+    };
+    use serde_json::json;
+
+    /// `numpy.percentile(v, 90)` (linear), written out independently of
+    /// `percentile_linear` so a shared bug in that helper cannot pass both.
+    fn numpy_p90(values: &[f64]) -> f64 {
+        let mut v = values.to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let rank = 0.9 * (v.len() - 1) as f64;
+        let lo = rank.floor() as usize;
+        let frac = rank - lo as f64;
+        if frac == 0.0 {
+            v[lo]
+        } else {
+            v[lo] + (v[lo + 1] - v[lo]) * frac
+        }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-12
+    }
+
+    #[test]
+    fn p90_is_published_for_every_latency_series_from_a_known_sample() {
+        // Each series gets a DIFFERENT known sample, so a p90 copied from the
+        // wrong series, or from p50/p95, cannot match. Reversed so the
+        // computation has to sort. Hand-derived numpy-linear p90s:
+        //   search  1..=100 ms : rank 89.1 -> 90.1 ms   (nearest-rank would give 91)
+        //   update  10..=100 ms step 10 : rank 8.1 -> 91 ms
+        //   sched   1..=20 ms  : rank 17.1 -> 18.1 ms
+        //   e2e     2..=100 ms step 2   : rank 44.1 -> 90.2 ms
+        let search: Vec<f64> = (1..=100).rev().map(|i| i as f64 / 1000.0).collect();
+        let update: Vec<f64> = (1..=10).rev().map(|i| i as f64 / 100.0).collect();
+        let sched: Vec<f64> = (1..=20).rev().map(|i| i as f64 / 1000.0).collect();
+        let e2e: Vec<f64> = (1..=50).rev().map(|i| i as f64 * 2.0 / 1000.0).collect();
+        for (v, want) in [
+            (&search, 0.0901),
+            (&update, 0.091),
+            (&sched, 0.0181),
+            (&e2e, 0.0902),
+        ] {
+            assert!(close(numpy_p90(v), want), "reference p90 of {v:?}");
+        }
+
+        let params: SearchParams = serde_json::from_value(json!({
+            "parallel": 1, "top": 10, "target_qps": 100.0, "duration_seconds": 1.0
+        }))
+        .unwrap();
+        let ones = vec![1.0; search.len()];
+        let mut results =
+            compute_search_stats(&search, &ones, &ones, &ones, &ones, 1.0, 10, 1, 100).unwrap();
+        finalize_update_stats(
+            &mut results,
+            UpdateTally {
+                times: update.clone(),
+                unattributed: 0,
+                failed: 0,
+            },
+            1.0,
+            UpdateAttribution::CorpusRow,
+            &UpdateSearchRatio {
+                updates: 1,
+                searches: 1,
+            },
+            "test",
+        );
+        let plan = OpenLoopPlan::from_params(&params).unwrap().unwrap();
+        attach_open_loop_metrics(&mut results, plan, &sched, &e2e, 0, 0);
+
+        let doc = build_search_result_json(
+            "redis-test",
+            "fixture",
+            &params,
+            &results,
+            None,
+            None,
+            true, // --dump-raw-latencies
+            None,
+            None,
+            None,
+            None,
+            &json!({}),
+        );
+        let r = &doc["results"];
+        let got = |k: &str| {
+            r[k].as_f64()
+                .unwrap_or_else(|| panic!("{k} missing or not a number in {r}"))
+        };
+
+        assert!(
+            close(got("p90_time"), 0.0901),
+            "p90_time={}",
+            got("p90_time")
+        );
+        assert!(close(got("update_p90_time"), 0.091));
+        assert!(close(got("schedule_delay_p90_time"), 0.0181));
+        assert!(close(got("end_to_end_p90_time"), 0.0902));
+
+        // The published p90 is the p90 of the raw samples published beside it.
+        let raw = |k: &str| -> Vec<f64> {
+            r[k].as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap())
+                .collect()
+        };
+        assert!(close(got("p90_time"), numpy_p90(&raw("latencies"))));
+        assert!(close(
+            got("update_p90_time"),
+            numpy_p90(&raw("update_latencies"))
+        ));
+
+        // Back-compat: the existing percentiles are still published, unchanged,
+        // and p90 sits between its neighbours in every series.
+        for prefix in ["", "update_", "schedule_delay_", "end_to_end_"] {
+            let p = |q: &str| got(&format!("{prefix}p{q}_time"));
+            assert!(
+                p("50") <= p("90") && p("90") <= p("95") && p("95") <= p("99"),
+                "{prefix}: p50={} p90={} p95={} p99={}",
+                p("50"),
+                p("90"),
+                p("95"),
+                p("99")
+            );
+        }
+        assert!(close(got("p50_time"), 0.0505));
+        assert!(close(got("p95_time"), 0.09505));
+        assert!(close(got("p99_time"), 0.09901));
+    }
+}
+
+#[cfg(test)]
+#[path = "experiment/shared_index_tests.rs"]
+mod shared_index_tests;
+
+#[cfg(test)]
+mod hybrid_serialization_tests {
+    use super::build_search_result_json;
+    use crate::config::SearchParams;
+    use crate::engine::{HybridOutcome, SearchResults};
+    use crate::ground_truth::GroundTruthProfile;
+
+    /// #341: a hybrid result publishes its per-bucket report, and the metric
+    /// schema's ground-truth profile is the FILTERED truth's, not the vector
+    /// truth the runner profiled for the dataset.
+    #[test]
+    fn hybrid_result_carries_its_report_and_filtered_truth_profile() {
+        let params: SearchParams =
+            serde_json::from_value(serde_json::json!({"parallel": 1, "top": 10})).unwrap();
+        let report = vector_db_benchmark::hybrid::HybridReport {
+            query_file: vector_db_benchmark::hybrid::HYBRID_QUERIES_FILE,
+            top: 10,
+            queries: 2,
+            text_match: serde_json::json!({}),
+            buckets: Vec::new(),
+            engine: serde_json::json!({"hybrid_policy": "ADHOC_BF"}),
+        };
+        let narrow = GroundTruthProfile::from_rows(vec![vec![1, 2, 3]; 2]);
+        let results = SearchResults {
+            top: 10,
+            latencies: vec![0.001, 0.002],
+            hybrid: Some(HybridOutcome {
+                report,
+                ground_truth: narrow.stats(10),
+            }),
+            ..Default::default()
+        };
+        let vector_gt = GroundTruthProfile::from_rows(vec![(0..100).collect(); 2]);
+        let build = |r: &SearchResults| {
+            build_search_result_json(
+                "redis-test",
+                "d",
+                &params,
+                r,
+                None,
+                None,
+                false,
+                None,
+                Some(&vector_gt),
+                None,
+                None,
+                &serde_json::json!({}),
+            )
+        };
+        let doc = build(&results);
+        assert_eq!(
+            doc["results"]["hybrid"]["engine"]["hybrid_policy"],
+            "ADHOC_BF"
+        );
+        assert_eq!(
+            doc["metrics_schema"]["ground_truth_source"],
+            "hybrid_queries.jsonl"
+        );
+        assert!(doc["metrics_schema"]["hybrid_headline"]
+            .as_str()
+            .unwrap()
+            .contains("per bucket"));
+        assert!(doc["metrics_schema"]["hybrid_headline"]
+            .as_str()
+            .unwrap()
+            .contains("not from a per-bucket best-of-N"));
+        assert_eq!(
+            doc["metrics_schema"]["ground_truth"]["queries_with_fewer_than_top_neighbours"],
+            2
+        );
+        // Without a hybrid outcome nothing hybrid is emitted.
+        let plain = SearchResults {
+            top: 10,
+            latencies: vec![0.001],
+            ..Default::default()
+        };
+        let doc = build(&plain);
+        assert!(doc["results"].get("hybrid").is_none());
+        assert!(doc["metrics_schema"].get("ground_truth_source").is_none());
     }
 }
