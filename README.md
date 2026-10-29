@@ -433,7 +433,9 @@ happens before the ingest clock starts, so it is not counted in any phase.
 ### Hybrid prefilter + KNN (#341)
 
 `"workload": "hybrid"` runs the dataset's `hybrid_queries.jsonl` (written by
-`prepare-msmarco`; `--add-hybrid-queries` upgrades an existing corpus in place):
+`prepare-msmarco`; `--add-hybrid-queries` upgrades an existing corpus in place,
+and must be re-run after `--add-derived-fields`, which removes the set because its
+truth was computed from the payloads it rewrites):
 each query vector of `tests.jsonl` paired with a predicate over the derived
 exact-match fields and/or a full-text match on `title`, with the exact number
 of matching rows and the brute-forced top-1000 OVER THOSE ROWS ONLY.

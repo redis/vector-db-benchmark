@@ -194,7 +194,10 @@ auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
   against `tests.jsonl`. Text-match agreement rules live in
   `src/msmarco/text_match.rs`; never send a text predicate whose term was not
   chosen by them. `--add-hybrid-queries` adds the file in place; `--verify`
-  regenerates it.
+  regenerates it. `--add-derived-fields` rewrites the payloads and so REMOVES
+  `hybrid_queries.jsonl` (its truth was computed from the old payloads; see
+  `msmarco::hybrid::DERIVED_UPGRADE_PUBLISH`); re-run `--add-hybrid-queries`
+  after it.
 
 ## Key Patterns
 

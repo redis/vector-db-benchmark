@@ -56,10 +56,12 @@
 //! failure aborts before anything is registered as usable.
 
 use std::collections::HashMap;
+
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use vector_db_benchmark::msmarco::hybrid::PublishStep;
 
 use clap::Parser;
 use flate2::read::MultiGzDecoder;
@@ -409,8 +411,10 @@ const OUTPUTS: [&str; 6] = [
 /// What `--add-hybrid-queries` writes.
 const HYBRID_OUTPUTS: [&str; 2] = [HYBRID_QUERIES, "PREPARED.json"];
 
-/// What `--add-derived-fields` rewrites. `vectors.npy` and `tests.jsonl` are
-/// left alone.
+/// What `--add-derived-fields` rewrites (and so stages, and clears stale
+/// `.part`s of). `vectors.npy` and `tests.jsonl` are left alone. It publishes
+/// them through `msmarco::hybrid::DERIVED_UPGRADE_PUBLISH`, which also removes
+/// the now-stale `hybrid_queries.jsonl`, in the same order as below.
 ///
 /// [`publish`] renames in REVERSE order, so `filter_queries.jsonl` (first
 /// here) is renamed LAST. Its presence is then a reliable sign that the
@@ -429,18 +433,35 @@ fn staged(dir: &Path, name: &str) -> PathBuf {
 /// Publish every staged file, replacing whatever was there. Renames within one
 /// directory, so each is atomic; the set as a whole is not, which is why
 /// `vectors.npy` (the one [`is_complete`] measures) goes last.
-fn publish(dir: &Path, names: &[&str]) -> Result<(), String> {
-    // Clear any previous marker FIRST: from here until the last rename the
+fn publish(dir: &Path, names: &[&'static str]) -> Result<(), String> {
+    let steps: Vec<PublishStep> = names.iter().rev().map(|n| PublishStep::Rename(n)).collect();
+    publish_steps(dir, &steps)
+}
+
+/// Run publish steps in order: rename a staged file over its published name,
+/// or remove a published file (absent is fine). The COMPLETE marker is
+/// cleared first and written only once every step has landed.
+fn publish_steps(dir: &Path, steps: &[PublishStep]) -> Result<(), String> {
+    // Clear any previous marker FIRST: from here until the last step the
     // directory is a mix of old and new files and must not read as complete.
     let marker = dir.join(COMPLETE_MARKER);
     let _ = std::fs::remove_file(&marker);
-    for name in names.iter().rev() {
-        let from = staged(dir, name);
-        if !from.exists() {
-            return Err(format!("{} was never written", from.display()));
+    for step in steps {
+        match *step {
+            PublishStep::Rename(name) => {
+                let from = staged(dir, name);
+                if !from.exists() {
+                    return Err(format!("{} was never written", from.display()));
+                }
+                std::fs::rename(&from, dir.join(name))
+                    .map_err(|e| format!("publish {}: {}", from.display(), e))?;
+            }
+            PublishStep::Remove(name) => match std::fs::remove_file(dir.join(name)) {
+                Ok(()) => println!("Removed {name}: it was computed from the replaced files."),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("remove {}: {e}", dir.join(name).display())),
+            },
         }
-        std::fs::rename(&from, dir.join(name))
-            .map_err(|e| format!("publish {}: {}", from.display(), e))?;
     }
     std::fs::write(&marker, "ok\n").map_err(|e| format!("write {}: {}", marker.display(), e))
 }
@@ -1737,8 +1758,13 @@ fn add_derived_fields(args: &Args) -> Result<(), String> {
             "derived_fields_added_at": chrono::Utc::now().to_rfc3339(),
         }),
     )?;
+    // The rewritten payloads invalidate any hybrid query set: the manifest
+    // stops listing it and the publish removes it (see
+    // `msmarco::hybrid::DERIVED_UPGRADE_PUBLISH`); `--add-hybrid-queries`
+    // regenerates it.
+    msmarco::hybrid::drop_from_manifest(&mut manifest)?;
     write_manifest_value(&dir, &manifest)?;
-    publish(&dir, &DERIVED_OUTPUTS)?;
+    publish_steps(&dir, &msmarco::hybrid::DERIVED_UPGRADE_PUBLISH)?;
 
     println!(
         "Added derived fields to {} passages and wrote {} filter queries to {} in {:.1}s.",
@@ -1861,5 +1887,45 @@ mod tests {
             assert!(dir.path().join(name).exists(), "{name}");
         }
         assert!(dir.path().join(COMPLETE_MARKER).exists());
+    }
+
+    /// Review of #357: `--add-derived-fields`' publish renames exactly what it
+    /// stages, and removes `hybrid_queries.jsonl` (truth computed from the
+    /// old payloads), never leaving it beside the new payloads, including
+    /// when the run dies mid-publish.
+    #[test]
+    fn derived_upgrade_publish_removes_the_stale_hybrid_set() {
+        use msmarco::hybrid::DERIVED_UPGRADE_PUBLISH;
+        let mut renamed: Vec<&str> = DERIVED_UPGRADE_PUBLISH
+            .iter()
+            .filter_map(|s| match s {
+                PublishStep::Rename(n) => Some(*n),
+                PublishStep::Remove(_) => None,
+            })
+            .collect();
+        renamed.sort();
+        let mut outputs = DERIVED_OUTPUTS.to_vec();
+        outputs.sort();
+        assert_eq!(renamed, outputs);
+
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join(HYBRID_QUERIES), "old\n").unwrap();
+        std::fs::write(staged(d, "PREPARED.json"), "{}").unwrap();
+        std::fs::write(staged(d, FILTER_QUERIES), "{}\n").unwrap();
+        // Dies at the payload rename: the old set is already gone.
+        assert!(publish_steps(d, &DERIVED_UPGRADE_PUBLISH).is_err());
+        assert!(!d.join(HYBRID_QUERIES).exists());
+        assert!(!d.join(FILTER_QUERIES).exists());
+        assert!(!d.join(COMPLETE_MARKER).exists());
+        // A rerun (set already absent) completes.
+        std::fs::write(staged(d, "PREPARED.json"), "{}").unwrap();
+        std::fs::write(staged(d, "payloads.jsonl"), "{}\n").unwrap();
+        publish_steps(d, &DERIVED_UPGRADE_PUBLISH).unwrap();
+        assert!(!d.join(HYBRID_QUERIES).exists());
+        for name in DERIVED_OUTPUTS {
+            assert!(d.join(name).exists(), "{name}");
+        }
+        assert!(d.join(COMPLETE_MARKER).exists());
     }
 }

@@ -822,9 +822,97 @@ pub fn write_fixture_corpus(
     std::fs::write(dir.join("tests.jsonl"), tests).map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Invalidation by `--add-derived-fields`
+// ---------------------------------------------------------------------------
+
+/// The `PREPARED.json` keys that describe [`crate::hybrid::HYBRID_QUERIES_FILE`].
+pub const MANIFEST_KEYS: [&str; 2] = ["hybrid_queries", "hybrid_queries_added_at"];
+
+/// One step of publishing `prepare-msmarco --add-derived-fields`' staged
+/// outputs: rename a staged file over its published name, or remove a
+/// published file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishStep {
+    Rename(&'static str),
+    Remove(&'static str),
+}
+
+/// How `--add-derived-fields` publishes, in order. Rewriting `payloads.jsonl`
+/// invalidates `hybrid_queries.jsonl`: its predicates, matching counts and
+/// filtered truth were computed from the old payloads, and the startup
+/// check (`hybrid::check_bound_to_corpus`) only binds it to `vectors.npy`
+/// and `tests.jsonl`, so a stale set would still pass. So the set is removed
+/// in the same publish, and the binary's `run()` and the benchmark's
+/// hybrid preflight then refuse until `--add-hybrid-queries` regenerates it.
+///
+/// The order keeps one invariant at every point a run could die: a
+/// published `hybrid_queries.jsonl` was computed from the published
+/// `payloads.jsonl`.
+/// 1. `PREPARED.json` first. The new manifest no longer lists the hybrid
+///    set ([`drop_from_manifest`]). If the run dies here, the old set is
+///    still valid for the old payloads.
+/// 2. Remove `hybrid_queries.jsonl`, BEFORE the payloads change.
+/// 3. `payloads.jsonl`.
+/// 4. `filter_queries.jsonl` LAST: its presence marks the upgrade as done
+///    (`run()` and `derived::check_prepared_dir` key on it).
+pub const DERIVED_UPGRADE_PUBLISH: [PublishStep; 4] = [
+    PublishStep::Rename("PREPARED.json"),
+    PublishStep::Remove(crate::hybrid::HYBRID_QUERIES_FILE),
+    PublishStep::Rename("payloads.jsonl"),
+    PublishStep::Rename(derived::FILTER_QUERIES_FILE),
+];
+
+/// Remove the hybrid query set's entries ([`MANIFEST_KEYS`]) from a
+/// `PREPARED.json` value, for a publish that removes the set itself.
+pub fn drop_from_manifest(manifest: &mut Value) -> Result<(), String> {
+    let obj = manifest
+        .as_object_mut()
+        .ok_or("PREPARED.json must be a JSON object")?;
+    for key in MANIFEST_KEYS {
+        obj.remove(key);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #357: `--add-derived-fields` rewrites the payloads, so it
+    /// must remove the hybrid set computed from the old ones. The removal
+    /// lands after the new manifest (which drops the set) and before the
+    /// payloads, and `filter_queries.jsonl` is still the last step.
+    #[test]
+    fn derived_upgrade_removes_the_hybrid_set_before_the_payloads_change() {
+        use PublishStep::*;
+        let at = |step: PublishStep| {
+            DERIVED_UPGRADE_PUBLISH
+                .iter()
+                .position(|s| *s == step)
+                .unwrap_or_else(|| panic!("{step:?} is not in the derived-upgrade publish"))
+        };
+        let remove = at(Remove(crate::hybrid::HYBRID_QUERIES_FILE));
+        assert!(at(Rename("PREPARED.json")) < remove);
+        assert!(remove < at(Rename("payloads.jsonl")));
+        assert_eq!(
+            DERIVED_UPGRADE_PUBLISH.last(),
+            Some(&Rename(derived::FILTER_QUERIES_FILE))
+        );
+
+        let mut manifest = json!({
+            "corpus": "x",
+            "hybrid_queries": {"queries": 3},
+            "hybrid_queries_added_at": "t",
+            "filter_queries": {"queries": 31},
+        });
+        drop_from_manifest(&mut manifest).unwrap();
+        assert_eq!(
+            manifest,
+            json!({"corpus": "x", "filter_queries": {"queries": 31}})
+        );
+        assert!(drop_from_manifest(&mut json!([])).is_err());
+    }
 
     const N: usize = 20_000;
 
