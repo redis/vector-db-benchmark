@@ -78,7 +78,7 @@ The filter path is **not** the shared RediSearch builder used by Redis/Valkey/Dr
 
 **Re-measured on KiviDB 1.1.2.** Every divergence probe was re-run against `kividb/kividb:v1.1.2-full`, the image CI runs, with Redis Stack 7.4.7 (`redis-stack-server:7.4.0-v8`) and Redis 8.8.0 answering the same queries on the same fixture. The expected counts are computed from the fixture, not taken from any server. KiviDB 1.1.2 returned the expected count on every probe, as both Redis servers did, except for GEO:
 
-| divergence (as numbered in `kividb_filter`) | probes | KiviDB 1.1.2 |
+| divergence (rows 1-9 as numbered in `kividb_filter`; row 10 is the index-side TAG declaration) | probes | KiviDB 1.1.2 |
 |---|---|---|
 | 1. `$param` in a filter | TAG, NUMERIC and TEXT, plain and hybrid (`=>[KNN …]`) | substituted |
 | 2. backslash-escaped TAG value | `@t:{hello\ world}` | correct |
