@@ -44,10 +44,10 @@
 //! version is served the same way (unlike
 //! dragonfly.rs's `DRAGONFLY_PROTOCOL=resp3`); every connection stays RESP2.
 //!
-//! # FT.INFO dialect: no `num_docs` / `percent_indexed`
+//! # FT.INFO dialect: no `num_docs` / `percent_indexed` (KiviDB 1.0.2)
 //!
-//! This is the detail that actually motivated this engine. KiviDB's `FT.INFO`
-//! does not expose RediSearch's `num_docs` / `indexing` / `percent_indexed`
+//! This is the detail that actually motivated this engine. KiviDB 1.0.2's
+//! `FT.INFO` does not expose RediSearch's `num_docs` / `indexing` / `percent_indexed`
 //! fields at all — a benchmark client that polls for those (as the generic
 //! wait-for-indexing loops in this repo, and in the legacy `v0/` Python tool,
 //! do) sees `num_docs` default to 0 forever and stalls until its own timeout,
@@ -57,7 +57,9 @@
 //! tombstone compaction). `wait_for_indexing` below polls those fields
 //! instead. Because KiviDB builds each vector's HNSW entry synchronously
 //! inside the `HSET` that stores it, this in practice returns immediately —
-//! there is no async backfill phase to wait out.
+//! there is no async backfill phase to wait out. KiviDB 1.0.5 also reports
+//! `num_docs` and `percent_indexed`; `indexing_wait::kividb_ready` accepts
+//! either shape, so nothing here depends on the version.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2153,9 +2155,10 @@ fn validate_dataset_support(dataset: &Dataset, server: &KividbServer) -> Result<
                      TAG on `,` (a stored `Smith, John` stops matching itself) and needs \
                      `SEPARATOR ;`, which KiviDB < 1.0.5 rejects; guessing either way risks \
                      publishing a recall for a filter that matched the wrong documents. \
-                     Per-run remedies: point the run at a KiviDB server that reports \
-                     `kividb_version` (every published image does), or drop this dataset from \
-                     `--datasets`."
+                     Per-run remedies: run against a server whose `INFO server` reports \
+                     `kividb_version` as `major.minor.patch[-pre][+build]` (every published \
+                     KiviDB image does, e.g. `kividb_version:1.0.5`), or drop this dataset \
+                     from `--datasets`."
                 ));
             }
             Some(TagSemantics::Atomic)
@@ -2619,11 +2622,14 @@ impl Engine for KividbEngine {
                     .map_err(|e| {
                         format!("KiviDB: FT.INFO {} failed: {e}", self.config.index_name)
                     })?;
+                let separators = ft_info_tag_separators(&info)
+                    .map_err(|e| format!("KiviDB: index `{}`: {e}", self.config.index_name))?;
                 check_index_tag_separators(
                     &self.config.index_name,
-                    ft_info_tag_separators(&info)?.as_ref(),
+                    separators.as_ref(),
                     &tag_fields,
                     server.tag_semantics(),
+                    &server.describe(),
                 )?;
             }
             server.tag_semantics()

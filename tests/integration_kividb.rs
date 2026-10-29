@@ -787,6 +787,110 @@ fn test_binary_kividb_tag_values_with_parens_pipe_and_at() {
     );
 }
 
+/// `--skip-upload` never calls `configure()`, so on a pre-1.0.5 server the
+/// version check repeated in `search()` is the only thing between a
+/// hand-built `labels TAG` index and a recall computed for a `match_any` that
+/// can only match whole joined strings. (The FT.INFO read-back cannot help:
+/// before 1.0.5 there is no SEPARATOR to read.) From 1.0.5 such an index is
+/// legitimate, so the body runs on the legacy suite only.
+#[test]
+fn test_kividb_skip_upload_refuses_labels_on_a_pre_1_0_5_server() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    if assert_server_tag_semantics(&mut conn) == TagSemantics::Separator {
+        println!(">= 1.0.5 server: a labels TAG index is supported, nothing to refuse");
+        return;
+    }
+
+    let name = "kividb-labels-hand";
+    let dataset = "kividb-labels-hand-test";
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": name, "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = common::write_match_any_labels_project(
+        dataset,
+        &configs.to_string(),
+        dim,
+        common::GtMetric::L2,
+    );
+    // The index an older tool (or a hand) could have built: `labels` as a
+    // plain, atomic TAG.
+    let _: () = redis::cmd("FT.CREATE")
+        .arg(format!("idx:{name}"))
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg(format!("{name}:"))
+        .arg("SCHEMA")
+        .arg("vector")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg(10)
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg(dim)
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .arg("M")
+        .arg(16)
+        .arg("EF_CONSTRUCTION")
+        .arg(128)
+        .arg("labels")
+        .arg("TAG")
+        .query(&mut conn)
+        .unwrap();
+    // Populate it with the corpus size the dataset declares, so the
+    // `--skip-upload` corpus-count guard (which runs first) is satisfied and
+    // the refusal under test is the one that fires.
+    let mut pipe = redis::pipe();
+    for id in 0..common::N_DOCS {
+        let vector: Vec<u8> = (0..dim)
+            .flat_map(|d| ((id * dim + d) as f32).to_le_bytes())
+            .collect();
+        pipe.cmd("HSET")
+            .arg(format!("{name}:{id}"))
+            .arg("vector")
+            .arg(vector)
+            .arg("labels")
+            .arg("a;b")
+            .ignore();
+    }
+    let _: () = pipe.query(&mut conn).unwrap();
+
+    let port = test_port().to_string();
+    let run = common::run_binary_capture_extra(
+        &proj.root,
+        name,
+        dataset,
+        TEST_HOST,
+        &[("KIVIDB_PORT", port.as_str())],
+        &["--skip-upload"],
+    );
+    assert!(
+        !run.ok,
+        "--skip-upload over a labels TAG index on a pre-1.0.5 server must be refused"
+    );
+    assert!(
+        run.combined.contains("multi-valued keyword field `labels`"),
+        "refused for the wrong reason:\n{}",
+        run.combined
+    );
+    let searches: Vec<_> = fs::read_dir(proj.root.join("results"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("-search-"))
+        .collect();
+    assert!(searches.is_empty(), "refused run wrote {searches:?}");
+}
+
 /// `--skip-upload` must not measure a reused index whose TAG fields the server
 /// splits on `,`. On KiviDB >= 1.0.5 a bare TAG reports `SEPARATOR ,`; an index
 /// built that way (by a binary predating #375, which declared scalar TAGs bare,

@@ -157,22 +157,28 @@ pub fn ft_info_tag_separators(
 /// stored `Smith, John`, and would publish a recall for filters that matched
 /// the wrong documents. Before 1.0.5 there is nothing to check (no `SEPARATOR`
 /// can be declared, and `FT.INFO` reports no attributes), so `Atomic` passes.
+///
+/// `reported` is [`KividbServer::describe`], so every refusal names the version
+/// the server reported.
 pub fn check_index_tag_separators(
     index: &str,
     separators: Option<&BTreeMap<String, Option<String>>>,
     tag_fields: &[String],
     tags: Option<TagSemantics>,
+    reported: &str,
 ) -> Result<(), String> {
     if tag_fields.is_empty() {
         return Ok(());
     }
-    let rebuild = "Re-run without `--skip-upload` so `configure()` rebuilds the index with \
-                   `TAG SEPARATOR ;`.";
+    let rebuild = format!(
+        "({reported}.) Re-run without `--skip-upload` so `configure()` rebuilds the index \
+         with `TAG SEPARATOR ;`."
+    );
     match tags {
         Some(TagSemantics::Atomic) => Ok(()),
         None => Err(format!(
-            "KiviDB: cannot verify the TAG declarations of index `{index}`: the server's \
-             version, and so its TAG semantics, are unknown"
+            "KiviDB: cannot verify the TAG declarations of index `{index}`: {reported}, so \
+             the server's TAG semantics are unknown"
         )),
         Some(TagSemantics::Separator) => {
             let Some(separators) = separators else {
@@ -185,15 +191,27 @@ pub fn check_index_tag_separators(
                 match separators.get(field) {
                     Some(Some(sep)) if sep == ";" => {}
                     Some(sep) => {
+                        let consequence = match sep.as_deref() {
+                            Some(",") => "On KiviDB >= 1.0.5 that splits a stored value such \
+                                          as `Smith, John` into `Smith` + `John`, so a filter \
+                                          on the whole value under-matches and a filter on a \
+                                          fragment over-matches."
+                                .to_string(),
+                            Some(other) => format!(
+                                "On KiviDB >= 1.0.5 that splits every stored value on \
+                                 {other:?}, so a filter on a whole value containing it \
+                                 under-matches and a filter on a fragment over-matches."
+                            ),
+                            None => "The server reports no SEPARATOR for it, so how it \
+                                     tokenises stored values is unknown."
+                                .to_string(),
+                        };
                         let sep = sep
                             .as_deref()
                             .map_or("none".to_string(), |s| format!("{s:?}"));
                         return Err(format!(
                             "KiviDB: index `{index}` declares TAG field `{field}` with \
-                             SEPARATOR {sep}, not \";\". On KiviDB >= 1.0.5 that splits a \
-                             stored value such as `Smith, John` into `Smith` + `John`, so a \
-                             filter on the whole value under-matches and a filter on a fragment \
-                             over-matches. {rebuild}"
+                             SEPARATOR {sep}, not \";\". {consequence} {rebuild}"
                         ));
                     }
                     None => {
@@ -221,19 +239,21 @@ fn raw_kividb_version(info: &str) -> Option<&str> {
 /// (`1.0`, `v1.0.5`, `1.0.5.1`, `+1.0.5`) is `None`: an unrecognised version is
 /// reported as such, never guessed at.
 fn parse_version(value: &str) -> Option<KividbVersion> {
-    // Build metadata never affects precedence.
-    let value = value.split_once('+').map_or(value, |(v, _)| v);
+    // A SemVer pre-release or build identifier: non-empty, `[0-9A-Za-z.-]`.
+    let valid_ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    };
+    // Build metadata never affects precedence, but must still be well-formed.
+    let value = match value.split_once('+') {
+        Some((v, build)) if valid_ident(build) => v,
+        Some(_) => return None,
+        None => value,
+    };
     let (core, prerelease) = match value.split_once('-') {
-        Some((core, pre)) => {
-            let valid_pre = !pre.is_empty()
-                && pre
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-            if !valid_pre {
-                return None;
-            }
-            (core, true)
-        }
+        Some((core, pre)) if valid_ident(pre) => (core, true),
+        Some(_) => return None,
         None => (value, false),
     };
     // `u32::from_str` would accept a leading `+`, but none survives here: the
@@ -304,6 +324,8 @@ mod tests {
             "1.+0.5",
             "1.0.5-",
             "1.0.5-r c",
+            "1.0.5+",
+            "1.0.5+b d",
         ] {
             assert_eq!(parse_kividb_version(&info(v)), None, "{v:?} must not parse");
             assert_eq!(semantics(v), None, "{v:?} must read as unknown");
@@ -394,8 +416,10 @@ mod tests {
     ) -> Result<(), String> {
         let seps = ft_info_tag_separators(info).unwrap();
         let fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-        check_index_tag_separators("idx:x", seps.as_ref(), &fields, tags)
+        check_index_tag_separators("idx:x", seps.as_ref(), &fields, tags, REPORTED)
     }
+
+    const REPORTED: &str = "`INFO server` reported `kividb_version:1.0.6`";
 
     #[test]
     fn reads_tag_separators_from_ft_info() {
@@ -442,6 +466,57 @@ mod tests {
         assert!(check(&good, &["s"], None).is_err());
         // No TAG field: nothing to check, whatever the server.
         check(&v102, &[], None).unwrap();
+        // Every refusal names what the server reported.
+        let stale_err = check(&stale, &["s", "labels"], Some(Separator)).unwrap_err();
+        for e in [
+            stale_err.clone(),
+            check(&v102, &["s"], Some(Separator)).unwrap_err(),
+            check(&good, &["s"], None).unwrap_err(),
+        ] {
+            assert!(e.contains("kividb_version:1.0.6"), "{e}");
+        }
+        // The `Smith, John` story is told only for a `,` separator.
+        assert!(stale_err.contains("Smith, John"), "{stale_err}");
+        let pipe = check(&ft_info_105(&[("s", "|")]), &["s"], Some(Separator)).unwrap_err();
+        assert!(pipe.contains("\"|\"") && !pipe.contains("Smith"), "{pipe}");
+    }
+
+    /// A TAG attribute that reports no `SEPARATOR` at all (`Some(None)`) is
+    /// refused on a >= 1.0.5 server, and the two malformed `FT.INFO` shapes
+    /// are errors rather than an empty (vacuously passing) map.
+    #[test]
+    fn tag_attribute_without_separator_and_malformed_ft_info_are_refused() {
+        let attr = |pairs: &[&str]| redis::Value::Array(pairs.iter().map(|s| bulk(s)).collect());
+        let info = |attrs: redis::Value| {
+            redis::Value::Array(vec![
+                bulk("index_name"),
+                bulk("idx:x"),
+                bulk("attributes"),
+                attrs,
+            ])
+        };
+        let no_sep = info(redis::Value::Array(vec![attr(&[
+            "identifier",
+            "s",
+            "attribute",
+            "s",
+            "type",
+            "TAG",
+        ])]));
+        assert_eq!(
+            ft_info_tag_separators(&no_sep).unwrap().unwrap().get("s"),
+            Some(&None)
+        );
+        let e = check(&no_sep, &["s"], Some(TagSemantics::Separator)).unwrap_err();
+        assert!(e.contains("SEPARATOR none"), "{e}");
+
+        let not_array = info(bulk("oops"));
+        let e = ft_info_tag_separators(&not_array).unwrap_err();
+        assert!(e.contains("not an array"), "{e}");
+
+        let nameless = info(redis::Value::Array(vec![attr(&["type", "TAG"])]));
+        let e = ft_info_tag_separators(&nameless).unwrap_err();
+        assert!(e.contains("without a name"), "{e}");
     }
 
     #[test]
