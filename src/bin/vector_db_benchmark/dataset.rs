@@ -3,18 +3,21 @@
 //! Provides Dataset struct that wraps config and provides data access.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use crate::config::{datasets_dir, DatasetConfig};
 use crate::download;
 use vector_db_benchmark::filter_only::query_set::FilterQuerySet;
 use vector_db_benchmark::query_filter::QueryConditions;
 use vector_db_benchmark::readers::metadata::MetadataItem;
+use vector_db_benchmark::readers::CompoundStream;
 use vector_db_benchmark::readers::{
     csr_row_count, hdf5_train_row_count, mvec_row_count, npy_row_count, read_compound_data,
     read_compound_queries, read_gt_neighbours, read_hdf5_vectors, read_jsonl_queries,
     read_jsonl_vectors, read_multivector_matrix, read_npy_vectors, read_sparse_matrix, MultiVector,
     SparseVector,
 };
+use vector_db_benchmark::upload_stream::{self, UploadPlan, UploadReader};
 
 /// Dataset wrapper that provides access to vectors and metadata
 pub struct Dataset {
@@ -23,6 +26,28 @@ pub struct Dataset {
     /// dataset per run): every filter-only step reads it, and the files do not
     /// change during a run.
     filter_query_file: std::sync::OnceLock<Result<Option<FilterQuerySet>, String>>,
+    /// `--upload-reader` (#342): how the upload reads the corpus.
+    upload_reader: UploadReader,
+    /// What the upload's reader actually did, recorded by the reader itself
+    /// (never by the engine) and written to the upload result as
+    /// `results.upload_reader`.
+    upload_report: Mutex<Option<serde_json::Value>>,
+    /// Memory this process can use (`upload_stream::mem_available`:
+    /// `MemAvailable` capped by the cgroup limit), read once at construction.
+    /// Overridable for tests.
+    mem_available: upload_stream::AvailableMemory,
+}
+
+/// The corpus as an upload receives it (#342): the three arrays of the
+/// in-memory reader, or a stream that yields them a batch at a time. Both
+/// carry the same rows (`readers::stream_reader`).
+pub enum UploadSource {
+    InMemory {
+        ids: Vec<i64>,
+        vectors: Vec<Vec<f32>>,
+        metadata: Vec<Option<MetadataItem>>,
+    },
+    Stream(CompoundStream),
 }
 
 impl Dataset {
@@ -30,6 +55,91 @@ impl Dataset {
         Self {
             config,
             filter_query_file: std::sync::OnceLock::new(),
+            upload_reader: UploadReader::default(),
+            upload_report: Mutex::new(None),
+            mem_available: upload_stream::mem_available(),
+        }
+    }
+
+    /// Replace the measured `MemAvailable` (tests).
+    #[cfg(test)]
+    pub fn with_mem_available(mut self, bytes: Option<u64>) -> Self {
+        self.mem_available = upload_stream::AvailableMemory {
+            bytes,
+            source: "set by test".into(),
+        };
+        self
+    }
+
+    /// Set the `--upload-reader` mode.
+    pub fn with_upload_reader(mut self, mode: UploadReader) -> Self {
+        self.upload_reader = mode;
+        self
+    }
+
+    /// The reader the last upload used, as recorded by the reader.
+    pub fn upload_reader_report(&self) -> Option<serde_json::Value> {
+        self.upload_report.lock().ok().and_then(|r| r.clone())
+    }
+
+    /// Record that this upload read nothing (#361 review): e.g. a Redis
+    /// shared-corpus config whose corpus is already on the server. Lets a
+    /// reader of `results.upload_reader` tell "nothing was uploaded" from a
+    /// result that predates #342.
+    pub fn record_no_upload(&self, reason: &str) {
+        self.record_upload_reader(serde_json::json!({
+            "reader": "none",
+            "flag": self.upload_reader.as_str(),
+            "reason": reason,
+        }));
+    }
+
+    fn record_upload_reader(&self, report: serde_json::Value) {
+        if let Ok(mut slot) = self.upload_report.lock() {
+            *slot = Some(report);
+        }
+    }
+
+    /// Open the corpus for an engine that can stream (Redis, OpenSearch).
+    ///
+    /// `--upload-reader` and the corpus decide which reader
+    /// (`upload_stream::plan`): `auto` streams a compound corpus only when the
+    /// in-memory reader could not hold it (>= 128 GiB of vectors, or 2x the
+    /// vectors above `MemAvailable`) and loads everything else exactly as
+    /// [`Dataset::read_vectors`] does, so every dataset up to the 10M MS MARCO
+    /// takes the pre-#342 path unchanged on a host that can load it.
+    pub fn open_upload(&self, normalize: bool) -> Result<UploadSource, String> {
+        let path = self.get_path()?;
+        self.validate_vector_count()?;
+        let compound =
+            (self.config.dataset_type.as_deref() == Some("tar")).then_some(path.as_path());
+        match upload_stream::plan(self.upload_reader, compound, self.mem_available.bytes)? {
+            UploadPlan::Stream { layout, reason } => {
+                let stream = CompoundStream::open(&path, normalize)?;
+                self.record_upload_reader(serde_json::json!({
+                    "reader": "stream",
+                    "flag": self.upload_reader.as_str(),
+                    "reason": reason,
+                    "available_memory": self.mem_available.source,
+                    "rows": layout.rows,
+                    "vector_bytes": layout.data_bytes(),
+                }));
+                Ok(UploadSource::Stream(stream))
+            }
+            UploadPlan::InMemory { reason } => {
+                let (ids, vectors, metadata) = self.load_all(normalize)?;
+                self.record_upload_reader(serde_json::json!({
+                    "reader": "memory",
+                    "flag": self.upload_reader.as_str(),
+                    "reason": reason,
+                    "available_memory": self.mem_available.source,
+                }));
+                Ok(UploadSource::InMemory {
+                    ids,
+                    vectors,
+                    metadata,
+                })
+            }
         }
     }
 
@@ -69,8 +179,10 @@ impl Dataset {
                     link, path_str
                 ))
             } else {
+                let hint = vector_db_benchmark::msmarco::build_hint(&self.config.name)
+                    .map_or(String::new(), |h| format!("; {h}"));
                 Err(format!(
-                    "Dataset path not found and no download link: {} (tried {:?})",
+                    "Dataset path not found and no download link: {} (tried {:?}){hint}",
                     path_str, datasets_path
                 ))
             }
@@ -448,9 +560,62 @@ impl Dataset {
         ))
     }
 
-    /// Read all vectors and metadata from the dataset
+    /// Read all vectors and metadata from the dataset into memory.
+    ///
+    /// The path of every engine without a streaming upload. Refused under
+    /// `--upload-reader stream`, which asks for the corpus NOT to be
+    /// materialised: loading it anyway would be the flag parsed and ignored.
     #[allow(clippy::type_complexity)]
     pub fn read_vectors(
+        &self,
+        normalize: bool,
+    ) -> Result<(Vec<i64>, Vec<Vec<f32>>, Vec<Option<MetadataItem>>), String> {
+        if self.upload_reader == UploadReader::Stream {
+            return Err(format!(
+                "--upload-reader stream: this path reads the whole '{}' corpus into memory \
+                 (only the redis and opensearch uploads stream, and a mixed workload re-reads \
+                 the corpus); use --upload-reader auto or memory",
+                self.config.name
+            ));
+        }
+        // Pre-flight (#361): under `auto`, an engine without a streaming
+        // upload refuses a compound corpus this host cannot load, instead of
+        // allocating it and being OOM-killed. This is a floor, not a
+        // guarantee: it checks the reader's own peak against memory available
+        // NOW, so an engine on the same host that grows during the upload is
+        // not accounted for — leave it room yourself. `--upload-reader memory`
+        // overrides.
+        if self.upload_reader == UploadReader::Auto
+            && self.config.dataset_type.as_deref() == Some("tar")
+        {
+            let path = self.get_path()?;
+            if let Some(layout) =
+                vector_db_benchmark::readers::streamable_layout(&path.join("vectors.npy"))
+            {
+                upload_stream::in_memory_fits(layout.data_bytes(), self.mem_available.bytes)
+                    .map_err(|e| {
+                        format!(
+                            "'{}': {e}; this path reads the whole corpus (only the redis and \
+                             opensearch uploads stream). Use a streaming engine, a larger host, \
+                             or --upload-reader memory to try anyway",
+                            self.config.name
+                        )
+                    })?;
+            }
+        }
+        let loaded = self.load_all(normalize)?;
+        if self.upload_reader_report().is_none() {
+            self.record_upload_reader(serde_json::json!({
+                "reader": "memory",
+                "flag": self.upload_reader.as_str(),
+                "reason": "this engine's upload has no streaming path",
+            }));
+        }
+        Ok(loaded)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn load_all(
         &self,
         normalize: bool,
     ) -> Result<(Vec<i64>, Vec<Vec<f32>>, Vec<Option<MetadataItem>>), String> {
@@ -1010,6 +1175,114 @@ mod tests {
         // The same directory under a schema without the derived fields loads.
         dataset.config.schema = Some(serde_json::json!({"docid":"keyword"}));
         assert_eq!(dataset.get_path().unwrap(), dir.path());
+    }
+
+    /// #342: `--upload-reader` picks the reader, the reader records what it
+    /// did, and `stream` is never silently turned into a full load.
+    #[test]
+    fn upload_reader_mode_picks_the_reader_and_records_it() {
+        use vector_db_benchmark::upload_stream::UploadReader;
+        let dir = tempfile::tempdir().unwrap();
+        let vectors: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32, 1.0, 2.0]).collect();
+        write_npy_vectors(dir.path().join("vectors.npy").to_str().unwrap(), &vectors).unwrap();
+        let lines: String = (0..5).map(|i| format!("{{\"n\":{i}}}\n")).collect();
+        std::fs::write(dir.path().join("payloads.jsonl"), lines).unwrap();
+
+        // auto: a small compound corpus takes the in-memory (pre-#342) path.
+        let ds = dataset_at(dir.path(), "tar", Some(5));
+        assert!(ds.upload_reader_report().is_none());
+        match ds.open_upload(false).unwrap() {
+            UploadSource::InMemory {
+                ids,
+                vectors: got,
+                metadata,
+            } => {
+                assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+                assert_eq!(got, vectors);
+                assert_eq!(metadata.len(), 5);
+            }
+            UploadSource::Stream(_) => panic!("auto streamed a 60-byte corpus"),
+        }
+        let r = ds.upload_reader_report().unwrap();
+        assert_eq!(
+            (r["reader"].as_str(), r["flag"].as_str()),
+            (Some("memory"), Some("auto"))
+        );
+
+        // stream: the same rows, from the stream, and recorded as such.
+        let ds = dataset_at(dir.path(), "tar", Some(5)).with_upload_reader(UploadReader::Stream);
+        match ds.open_upload(false).unwrap() {
+            UploadSource::Stream(mut s) => {
+                let b = s.next_raw(64).unwrap().unwrap().decode().unwrap();
+                assert_eq!(b.vectors, vectors);
+                assert!(s.next_raw(64).unwrap().is_none());
+            }
+            UploadSource::InMemory { .. } => panic!("--upload-reader stream loaded the corpus"),
+        }
+        let r = ds.upload_reader_report().unwrap();
+        assert_eq!(r["reader"], "stream");
+        assert_eq!(r["rows"], 5);
+        assert_eq!(r["vector_bytes"], 60);
+        // An engine without a streaming upload refuses rather than loading.
+        assert!(ds
+            .read_vectors(false)
+            .unwrap_err()
+            .contains("--upload-reader stream"));
+
+        // memory: loads even what could be streamed.
+        let ds = dataset_at(dir.path(), "tar", Some(5)).with_upload_reader(UploadReader::Memory);
+        assert!(matches!(
+            ds.open_upload(false).unwrap(),
+            UploadSource::InMemory { .. }
+        ));
+        assert_eq!(ds.upload_reader_report().unwrap()["flag"], "memory");
+
+        // The non-streaming engines' path records the in-memory reader too.
+        let ds = dataset_at(dir.path(), "tar", Some(5));
+        assert_eq!(ds.read_vectors(false).unwrap().1, vectors);
+        assert_eq!(ds.upload_reader_report().unwrap()["reader"], "memory");
+
+        // An upload that read nothing says so.
+        let ds = dataset_at(dir.path(), "tar", Some(5));
+        ds.record_no_upload("shared corpus already populated");
+        let r = ds.upload_reader_report().unwrap();
+        assert_eq!(r["reader"], "none");
+        assert_eq!(r["reason"], "shared corpus already populated");
+
+        // auto on a host that cannot load the corpus: a streaming engine
+        // streams, and the non-streaming path refuses before allocating.
+        let ds = dataset_at(dir.path(), "tar", Some(5)).with_mem_available(Some(119));
+        assert!(matches!(
+            ds.open_upload(false).unwrap(),
+            UploadSource::Stream(_)
+        ));
+        assert!(ds.upload_reader_report().unwrap()["reason"]
+            .as_str()
+            .unwrap()
+            .contains("MemAvailable"));
+        assert_eq!(
+            ds.upload_reader_report().unwrap()["available_memory"],
+            "set by test"
+        );
+        let e = ds.read_vectors(false).unwrap_err();
+        assert!(
+            e.contains("MemAvailable") && e.contains("--upload-reader memory"),
+            "{e}"
+        );
+        // Exactly enough (2 x 60 bytes) loads; `memory` overrides the refusal.
+        let ds = dataset_at(dir.path(), "tar", Some(5)).with_mem_available(Some(120));
+        assert_eq!(ds.read_vectors(false).unwrap().1, vectors);
+        let ds = dataset_at(dir.path(), "tar", Some(5))
+            .with_upload_reader(UploadReader::Memory)
+            .with_mem_available(Some(1));
+        assert_eq!(ds.read_vectors(false).unwrap().1, vectors);
+
+        // stream on a dataset the streaming reader cannot read is refused.
+        let jsonl = tempfile::tempdir().unwrap();
+        std::fs::write(jsonl.path().join("vectors.jsonl"), "[1.0,0.0,0.0]\n").unwrap();
+        let ds =
+            dataset_at(jsonl.path(), "jsonl", Some(1)).with_upload_reader(UploadReader::Stream);
+        assert!(ds.open_upload(false).is_err());
     }
 
     #[test]

@@ -2028,6 +2028,22 @@ pub fn read_result_doc(root: &Path, engine: &str) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
+/// The whole upload-result document for `engine` (#342: `results.upload_reader`).
+pub fn read_upload_doc(root: &Path, engine: &str) -> serde_json::Value {
+    let pattern = format!("{}-*-upload-*.json", engine);
+    let path = fs::read_dir(root.join("results"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            glob::Pattern::new(&pattern)
+                .unwrap()
+                .matches(&p.file_name().unwrap().to_string_lossy())
+        })
+        .unwrap_or_else(|| panic!("no upload result for {}", engine));
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
 pub fn read_results_obj(root: &Path, engine: &str) -> serde_json::Value {
     let pattern = format!("{}-*-search-*.json", engine);
     let dir = root.join("results");

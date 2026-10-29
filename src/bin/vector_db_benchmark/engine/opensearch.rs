@@ -24,13 +24,15 @@ use vector_db_benchmark::start_gate::WorkerPool;
 use vector_db_benchmark::workload::{IndexLayout, Workload};
 
 use crate::config::{EngineConfig, SearchParams};
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, UploadSource};
 use crate::engine::{CorpusCount, Engine, SearchResults, UploadStats};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::MetadataItem;
 
 /// Ranked full-text workload (#339).
 mod fulltext;
+/// Streaming upload from disk (#342).
+mod stream_upload;
 
 #[derive(Clone)]
 struct OpenSearchConfig {
@@ -2447,7 +2449,17 @@ impl Engine for OpenSearchEngine {
         let dataset_path = dataset.get_path()?;
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
-        let (ids, vectors, mut metadata) = dataset.read_vectors(normalize)?;
+        // #342: a corpus too large to hold in client memory is streamed from
+        // disk instead (`--upload-reader`); everything below is the in-memory
+        // path, unchanged.
+        let (ids, vectors, mut metadata) = match dataset.open_upload(normalize)? {
+            UploadSource::InMemory {
+                ids,
+                vectors,
+                metadata,
+            } => (ids, vectors, metadata),
+            UploadSource::Stream(stream) => return self.upload_streamed(dataset, stream),
+        };
         // #339 parity: normalize newlines in the indexed text fields before
         // anything is sent (recorded in the index `_meta` by configure()).
         self.normalize_fulltext_upload(&mut metadata)?;

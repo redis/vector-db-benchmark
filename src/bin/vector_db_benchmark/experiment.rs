@@ -549,7 +549,8 @@ pub fn run(args: &Args) -> Result<(), String> {
                 println!("{}", "=".repeat(60));
             });
 
-            let dataset = Dataset::new((*dataset_config).clone());
+            let dataset =
+                Dataset::new((*dataset_config).clone()).with_upload_reader(args.upload_reader);
 
             // Hybrid (#341): the query set must exist and be valid before the
             // engine is built, so a corpus without `hybrid_queries.jsonl` fails
@@ -662,6 +663,9 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
         "dump_raw_latencies": args.dump_raw_latencies,
         // Non-boolean: where per-query result dumps went (#343).
         "dump_results": args.dump_results,
+        // Non-boolean: how the upload read the corpus (#342). The reader that
+        // actually ran is recorded per upload as `results.upload_reader`.
+        "upload_reader": args.upload_reader.as_str(),
         "exit_on_error": args.exit_on_error,
         "fail_on_dropped_queries": args.fail_on_dropped_queries,
         "keep_data": args.keep_data,
@@ -1459,6 +1463,7 @@ fn run_single_experiment(
             &upload_stats,
             number_of_shards,
             plan,
+            dataset.upload_reader_report().as_ref(),
         )?;
     } else {
         // `--skip-upload` means: the server already holds the corpus I want —
@@ -3121,6 +3126,7 @@ fn save_upload_results(
     stats: &crate::engine::UploadStats,
     number_of_shards: Option<&serde_json::Value>,
     plan: &WorkloadPlan,
+    upload_reader: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let timestamp = Local::now().format("%Y-%m-%d-%H-%M-%S");
     let filename = format!(
@@ -3138,6 +3144,11 @@ fn save_upload_results(
         &crate::effective_config::snapshot(),
     );
     stamp_shared_index(&mut result, plan);
+    // Which reader fed the upload (#342), as recorded by the reader itself:
+    // `stream` (bounded client memory) or `memory`, with the flag and why.
+    if let Some(reader) = upload_reader {
+        result["results"]["upload_reader"] = reader.clone();
+    }
 
     let path = results_dir().join(&filename);
     fs::write(&path, serde_json::to_string_pretty(&result).unwrap())
@@ -3730,6 +3741,7 @@ mod tests {
                 "warmup_seconds",
                 "configurations_dir",
                 "results_dir",
+                "upload_reader",
             ] {
                 assert!(
                     recorded.contains_key(required),
@@ -3746,6 +3758,8 @@ mod tests {
                 "results_dir",
                 // #343: where per-query dumps went (an Option<PathBuf> flag).
                 "dump_results",
+                // #342: `--upload-reader` (an enum flag).
+                "upload_reader",
             ];
             let fabricated: Vec<&String> = recorded
                 .keys()

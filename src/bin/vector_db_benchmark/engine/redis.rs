@@ -16,13 +16,14 @@ use super::redis_utils;
 use redis::Connection;
 
 use crate::config::{EngineConfig, SearchParams};
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, UploadSource};
 use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{
     attach_open_loop_metrics, closed_loop_duration, zero_search_results, CorpusCount, Engine,
     OpenLoopPlan, SearchResults, UpdateSearchRatio, UploadStats,
 };
 use crate::metrics::compute_metrics;
+use vector_db_benchmark::indexing_wait::WaitPhase;
 use vector_db_benchmark::parsers::{datetime_to_epoch_secs, parse_ft_search_response};
 use vector_db_benchmark::query_filter::QueryFilter;
 use vector_db_benchmark::readers::metadata::{MetadataItem, MetadataValue};
@@ -32,6 +33,8 @@ use vector_db_benchmark::workload::{IndexLayout, Workload};
 
 /// Ranked full-text workload (#339).
 mod fulltext;
+/// Streaming upload from disk (#342).
+mod stream_upload;
 
 /// Redis engine configuration
 #[derive(Clone)]
@@ -613,45 +616,15 @@ impl RedisEngine {
                         }
                         let (batch_start, batch_end) = batches[idx];
 
-                        // Upload the batch, reconnecting + retrying on a TRANSIENT
-                        // connection error (broken pipe / reset / EOF / timeout —
-                        // common under heavy index-build load behind a managed-Redis
-                        // proxy). Without this a single dropped socket aborted the
-                        // whole sweep (#160). Genuine command errors (WRONGTYPE,
-                        // syntax, …) are NOT transient and fail fast.
-                        let mut attempt = 0usize;
-                        let batch_result = loop {
-                            match upload_batch_internal(
-                                &mut conn,
-                                &config,
-                                &ids[batch_start..batch_end],
-                                &vectors[batch_start..batch_end],
-                                &metadata[batch_start..batch_end],
-                            ) {
-                                Ok(()) => break Ok(()),
-                                Err(e) => {
-                                    if !is_transient_conn_error(&e) || attempt >= MAX_UPLOAD_RETRIES
-                                    {
-                                        break Err(format!(
-                                            "batch {idx} failed after {attempt} \
-                                             reconnect attempt(s): {e}"
-                                        ));
-                                    }
-                                    attempt += 1;
-                                    // Bounded exponential backoff: 100·2^(n-1) ms,
-                                    // capped at 2s.
-                                    let backoff_ms = (100u64 << (attempt - 1)).min(2000);
-                                    std::thread::sleep(std::time::Duration::from_millis(
-                                        backoff_ms,
-                                    ));
-                                    // Re-open the connection; if that also fails
-                                    // transiently we retry again next iteration.
-                                    if let Ok(c) = client.get_connection() {
-                                        conn = c;
-                                    }
-                                }
-                            }
-                        };
+                        let batch_result = upload_batch_with_retry(
+                            &client,
+                            &mut conn,
+                            &config,
+                            &format!("batch {idx}"),
+                            &ids[batch_start..batch_end],
+                            &vectors[batch_start..batch_end],
+                            &metadata[batch_start..batch_end],
+                        );
                         if let Err(e) = batch_result {
                             *error.lock().unwrap() = Some(e);
                             break;
@@ -681,9 +654,14 @@ impl RedisEngine {
     }
 
     /// Wait until FT.INFO reports num_docs >= expected.
-    fn wait_for_indexing(&self, expected: usize) -> Result<(), String> {
+    /// `phase`: [`WaitPhase::FullBuild`] when the whole index is built inside
+    /// this wait (the shared-corpus skip path), else
+    /// [`WaitPhase::UploadTail`]. It picks the budget's per-document slope.
+    fn wait_for_indexing(&self, expected: usize, phase: WaitPhase) -> Result<(), String> {
         let mut conn = self.get_connection()?;
-        let max_wait = 120; // seconds
+        // Scales with the corpus; INDEXING_WAIT_SECS overrides. Expiry is an
+        // error (#361), never a pass on a partly built index.
+        let max_wait = crate::effective_config::indexing_wait_budget_secs(phase, 120, expected);
         let start = Instant::now();
 
         loop {
@@ -724,116 +702,30 @@ impl RedisEngine {
                 }
             };
 
-            // Parse num_docs, indexing, and percent_indexed from FT.INFO response.
-            // The response can be a flat array (RESP2) or a Map (RESP3).
-            let mut num_docs: usize = 0;
-            let mut indexing: bool = false;
-            let mut percent_indexed: f64 = 1.0;
-
-            fn extract_usize(val: &redis::Value) -> usize {
-                match val {
-                    redis::Value::BulkString(s) => String::from_utf8_lossy(s).parse().unwrap_or(0),
-                    redis::Value::Int(n) => *n as usize,
-                    redis::Value::Double(f) => *f as usize,
-                    redis::Value::SimpleString(s) => s.parse().unwrap_or(0),
-                    _ => 0,
-                }
-            }
-
-            fn extract_bool_nonzero(val: &redis::Value) -> bool {
-                match val {
-                    redis::Value::BulkString(s) => s != b"0",
-                    redis::Value::Int(n) => *n != 0,
-                    redis::Value::Double(f) => *f != 0.0,
-                    redis::Value::SimpleString(s) => s != "0",
-                    redis::Value::Boolean(b) => *b,
-                    _ => false,
-                }
-            }
-
-            fn extract_f64(val: &redis::Value) -> f64 {
-                match val {
-                    redis::Value::BulkString(s) => {
-                        String::from_utf8_lossy(s).parse().unwrap_or(1.0)
-                    }
-                    redis::Value::Int(n) => *n as f64,
-                    redis::Value::Double(f) => *f,
-                    redis::Value::SimpleString(s) => s.parse().unwrap_or(1.0),
-                    _ => 1.0,
-                }
-            }
-
-            match &info {
-                redis::Value::Array(arr) => {
-                    // RESP2: alternating key-value pairs (keys can be BulkString or SimpleString)
-                    for i in (0..arr.len()).step_by(2) {
-                        let key_str = match &arr[i] {
-                            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
-                            redis::Value::SimpleString(s) => s.clone(),
-                            _ => continue,
-                        };
-                        if key_str == "num_docs" {
-                            if let Some(val) = arr.get(i + 1) {
-                                num_docs = extract_usize(val);
-                            }
-                        }
-                        if key_str == "indexing" {
-                            if let Some(val) = arr.get(i + 1) {
-                                indexing = extract_bool_nonzero(val);
-                            }
-                        }
-                        if key_str == "percent_indexed" {
-                            if let Some(val) = arr.get(i + 1) {
-                                percent_indexed = extract_f64(val);
-                            }
-                        }
-                    }
-                }
-                redis::Value::Map(map) => {
-                    // RESP3: key-value map
-                    for (k, v) in map {
-                        let key_str = match k {
-                            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
-                            redis::Value::SimpleString(s) => s.clone(),
-                            _ => continue,
-                        };
-                        if key_str == "num_docs" {
-                            num_docs = extract_usize(v);
-                        }
-                        if key_str == "indexing" {
-                            indexing = extract_bool_nonzero(v);
-                        }
-                        if key_str == "percent_indexed" {
-                            percent_indexed = extract_f64(v);
-                        }
-                    }
-                }
-                _ => {
-                    eprintln!("Unexpected FT.INFO response type: {:?}", info);
-                }
-            }
-
-            if num_docs >= expected && !indexing && percent_indexed >= 1.0 {
+            // Shared parser (#361): an absent num_docs fails fast instead of
+            // being read as 0 and waiting out the whole budget.
+            let progress = vector_db_benchmark::indexing_wait::parse_ft_info(&info)
+                .map_err(|e| format!("redis: {e}"))?;
+            let state = progress.describe(expected as u64);
+            if redis_index_ready(&progress, expected)? {
                 println!(
-                    "Indexing complete: {} docs in {:.1}s",
-                    num_docs,
+                    "Indexing complete ({state}) in {:.1}s",
                     start.elapsed().as_secs_f64()
                 );
                 return Ok(());
             }
 
-            if start.elapsed().as_secs() > max_wait {
-                println!(
-                    "Warning: indexing timeout after {}s (num_docs={}/{}, percent_indexed={:.2})",
-                    max_wait, num_docs, expected, percent_indexed
-                );
-                return Ok(());
-            }
+            vector_db_benchmark::indexing_wait::verdict(
+                "redis",
+                start.elapsed(),
+                std::time::Duration::from_secs(max_wait),
+                &state,
+            )?;
 
             if start.elapsed().as_secs() > 0 && start.elapsed().as_secs().is_multiple_of(10) {
                 println!(
-                    "  indexing... num_docs={}/{}, percent_indexed={:.2}, indexing={}",
-                    num_docs, expected, percent_indexed, indexing
+                    "  indexing... {state} ({:.0}s)",
+                    start.elapsed().as_secs_f64()
                 );
             }
 
@@ -1275,6 +1167,45 @@ fn is_transient_conn_error(msg: &str) -> bool {
         "uninitialized cluster state",
     ];
     SIGNATURES.iter().any(|sig| m.contains(sig))
+}
+
+/// Upload one batch, reconnecting + retrying on a TRANSIENT connection error
+/// (broken pipe / reset / EOF / timeout — common under heavy index-build load
+/// behind a managed-Redis proxy). Without this a single dropped socket aborted
+/// the whole sweep (#160). Genuine command errors (WRONGTYPE, syntax, …) are
+/// NOT transient and fail fast. Shared by the in-memory and the streaming
+/// (#342) uploads, so both have the same retry policy.
+fn upload_batch_with_retry(
+    client: &redis::Client,
+    conn: &mut Connection,
+    config: &RedisEngineConfig,
+    label: &str,
+    ids: &[i64],
+    vectors: &[Vec<f32>],
+    metadata: &[Option<MetadataItem>],
+) -> Result<(), String> {
+    let mut attempt = 0usize;
+    loop {
+        match upload_batch_internal(conn, config, ids, vectors, metadata) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !is_transient_conn_error(&e) || attempt >= MAX_UPLOAD_RETRIES {
+                    return Err(format!(
+                        "{label} failed after {attempt} reconnect attempt(s): {e}"
+                    ));
+                }
+                attempt += 1;
+                // Bounded exponential backoff: 100·2^(n-1) ms, capped at 2s.
+                let backoff_ms = (100u64 << (attempt - 1)).min(2000);
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                // Re-open the connection; if that also fails transiently we
+                // retry again next iteration.
+                if let Ok(c) = client.get_connection() {
+                    *conn = c;
+                }
+            }
+        }
+    }
 }
 
 fn upload_batch_internal(
@@ -2501,7 +2432,8 @@ impl Engine for RedisEngine {
                     // then the backfill. `upload_time` is exactly 0.0, so
                     // `upload_docs_per_sec` is null rather than docs / ~1µs.
                     let clock = vector_db_benchmark::ingest::IngestClock::without_upload();
-                    self.wait_for_indexing(existing)?;
+                    dataset.record_no_upload("shared corpus already populated (#188)");
+                    self.wait_for_indexing(existing, WaitPhase::FullBuild)?;
                     let phases = clock.index_ready(
                         existing,
                         0.0,
@@ -2530,7 +2462,17 @@ impl Engine for RedisEngine {
         let dataset_path = dataset.get_path()?;
         println!("Reading dataset from {}...", dataset_path.display());
         let read_start = Instant::now();
-        let (ids, vectors, mut metadata) = dataset.read_vectors(normalize)?;
+        // #342: a corpus too large to hold in client memory is streamed from
+        // disk instead (`--upload-reader`); everything below is the in-memory
+        // path, unchanged.
+        let (ids, vectors, mut metadata) = match dataset.open_upload(normalize)? {
+            UploadSource::InMemory {
+                ids,
+                vectors,
+                metadata,
+            } => (ids, vectors, metadata),
+            UploadSource::Stream(stream) => return self.upload_streamed(dataset, stream),
+        };
         // #339 parity: normalize newlines in the indexed text fields before
         // anything is sent (recorded in the index marker by configure()).
         self.normalize_fulltext_upload(&mut metadata)?;
@@ -2584,7 +2526,7 @@ impl Engine for RedisEngine {
         // post_upload()). Excluding it made every engine but mongodb look
         // artificially fast to index.
         let expected = vectors.len();
-        self.wait_for_indexing(expected)?;
+        self.wait_for_indexing(expected, WaitPhase::UploadTail)?;
         let phases = clock.index_ready(
             expected,
             read_time,
@@ -4726,5 +4668,50 @@ mod hybrid_filter_tests {
             let f = parse_conditions(&c).expect("builder renders a filter");
             check_hybrid_filter(&p, &f).unwrap_or_else(|e| panic!("{c}: {e}"));
         }
+    }
+}
+
+/// redis's readiness rule over the shared FT.INFO parse (#361).
+fn redis_index_ready(
+    p: &vector_db_benchmark::indexing_wait::FtInfoProgress,
+    expected: usize,
+) -> Result<bool, String> {
+    vector_db_benchmark::indexing_wait::ft_info_ready("redis", p, expected as u64, false)
+}
+
+#[cfg(test)]
+mod redis_index_ready_tests {
+    use super::*;
+    use vector_db_benchmark::indexing_wait::parse_ft_info;
+
+    fn bulk(s: &str) -> redis::Value {
+        redis::Value::BulkString(s.as_bytes().to_vec())
+    }
+
+    /// #361 review: a redis FT.INFO without `num_docs` fails fast (absent is
+    /// not 0), an unparsable one names the field, and a complete reply is ready.
+    #[test]
+    fn redis_wait_treats_absent_num_docs_as_an_error_not_zero() {
+        let missing = redis::Value::Array(vec![bulk("indexing"), bulk("0")]);
+        let e = redis_index_ready(&parse_ft_info(&missing).unwrap(), 5).unwrap_err();
+        assert!(e.starts_with("redis: FT.INFO reports no num_docs"), "{e}");
+        let garbage = redis::Value::Array(vec![bulk("num_docs"), bulk("n/a")]);
+        assert!(parse_ft_info(&garbage).is_err());
+        let done = redis::Value::Array(vec![
+            bulk("num_docs"),
+            bulk("5"),
+            bulk("indexing"),
+            bulk("0"),
+            bulk("percent_indexed"),
+            bulk("1"),
+        ]);
+        assert_eq!(
+            redis_index_ready(&parse_ft_info(&done).unwrap(), 5),
+            Ok(true)
+        );
+        assert_eq!(
+            redis_index_ready(&parse_ft_info(&done).unwrap(), 6),
+            Ok(false)
+        );
     }
 }

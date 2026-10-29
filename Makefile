@@ -363,6 +363,8 @@ agent-check-test:
 	cargo test --test integration_cli --release
 	cargo test --test overhead_invariants --release
 	cargo test --test harness_invariants --release
+	@echo "=== streaming peak-memory suite (#342, counting allocator, no container) ==="
+	cargo test --test streaming_memory --release
 
 .PHONY: check-strict
 check-strict: fmt-check lint-strict

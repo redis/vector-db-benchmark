@@ -2403,3 +2403,65 @@ fn test_binary_opensearch_hybrid_and_filter_only_share_one_full_index() {
         .send();
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #342: the STREAMING upload (`--upload-reader stream`) on OpenSearch, with a
+/// batch size and thread count that do not divide the corpus: the hybrid
+/// buckets reach the same recall floor as the in-memory upload's test above,
+/// every row is counted, and the upload result records the stream reader.
+#[test]
+fn test_binary_opensearch_streaming_upload_hybrid_recall() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-hyb-stream", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                           "search_params": {"ef": 200}}],
+        "upload_params": {"parallel": 3, "batch_size": 333}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-stream", &configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-hyb-stream",
+        "hybrid-stream",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_hybrid_stream")
+        ],
+        &[
+            "--upload-reader",
+            "stream",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_hybrid_run(&proj, "os-hyb-stream", &dump, 0.8, "vector");
+    let upload = common::read_upload_doc(&proj.root, "os-hyb-stream");
+    let reader = &upload["results"]["upload_reader"];
+    assert_eq!(reader["reader"], "stream", "{upload}");
+    assert_eq!(reader["rows"], common::HYBRID_N as u64, "{upload}");
+    assert_eq!(upload["results"]["upload_count"], common::HYBRID_N as u64);
+    // #344 on the streamed path: one-clock phases, checked against the
+    // legacy fields the upload file also carries.
+    let r = &upload["results"];
+    let ph = &r["ingest_phases"];
+    assert_eq!(
+        ph["index_wait"], "opensearch_force_merge_refresh",
+        "{upload}"
+    );
+    assert_eq!(ph["documents"], common::HYBRID_N as u64, "{upload}");
+    let f = |k: &str| r[k].as_f64().unwrap_or_else(|| panic!("results.{k}: {r}"));
+    assert!(f("upload_time") > 0.0 && f("index_wait_time") >= 0.0, "{r}");
+    assert!(
+        (f("upload_time") + f("index_wait_time") - f("total_ingest_time")).abs() < 1e-3,
+        "{r}"
+    );
+    assert!(
+        (f("read_time") + f("total_ingest_time") - f("total_time")).abs() < 1e-3,
+        "{r}"
+    );
+    std::fs::remove_dir_all(proj.root).unwrap();
+}

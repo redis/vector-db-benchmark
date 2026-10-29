@@ -18,6 +18,7 @@ pub mod config;
 pub mod filter_only;
 pub mod fulltext;
 pub mod hybrid;
+pub mod indexing_wait;
 pub mod ingest;
 pub mod metrics;
 pub mod msmarco;
@@ -31,6 +32,7 @@ pub mod redis_numeric_range;
 pub mod results_dump;
 pub mod start_gate;
 pub mod synthetic;
+pub mod upload_stream;
 pub mod workload;
 
 // Re-export commonly used types

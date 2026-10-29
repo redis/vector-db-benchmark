@@ -1043,6 +1043,24 @@ pub fn record_effective(key: &str, value: impl Into<Value>) {
     recorder().record_effective(key, value.into());
 }
 
+/// The indexing wait budget, in seconds, for `expected` documents in `phase`
+/// over an engine floor (`vector_db_benchmark::indexing_wait::budget`), with
+/// `INDEXING_WAIT_SECS` as the override. Records the budget the wait ACTUALLY
+/// uses as the effective value (#361 review), not the `0` that stands for
+/// "unset", and which phase's slope applied as `indexing_wait_phase`.
+pub fn indexing_wait_budget_secs(
+    phase: vector_db_benchmark::indexing_wait::WaitPhase,
+    floor_secs: u64,
+    expected: usize,
+) -> u64 {
+    use vector_db_benchmark::indexing_wait::{budget, INDEXING_WAIT_ENV};
+    let override_secs: u64 = env_parsed(INDEXING_WAIT_ENV, 0u64);
+    let secs = budget(phase, floor_secs, expected, Some(override_secs)).as_secs();
+    record_effective(INDEXING_WAIT_ENV, secs);
+    record_effective("indexing_wait_phase", phase.as_str());
+    secs
+}
+
 /// Record that a declared value was not the one used.
 pub fn note_override(
     key: &str,
@@ -2147,6 +2165,34 @@ mod tests {
         assert_eq!(s["effective"]["VDBB_TEST_BUDGET_MS"], 250);
         assert_eq!(s["env"]["VDBB_TEST_BUDGET_MS"], "250");
         assert!(s["overridden"].as_array().unwrap().is_empty());
+    }
+
+    /// #361 review: the snapshot records the indexing-wait budget the run used,
+    /// computed or overridden, never the `0` that means "unset".
+    #[test]
+    fn the_indexing_wait_budget_recorded_is_the_one_used() {
+        let _l = test_lock();
+        let _g = EnvGuard::set("INDEXING_WAIT_SECS", None);
+        reset();
+        use vector_db_benchmark::indexing_wait::WaitPhase::{FullBuild, UploadTail};
+        assert_eq!(
+            indexing_wait_budget_secs(UploadTail, 120, 100_000_027),
+            10_120
+        );
+        let s = snapshot();
+        assert_eq!(s["effective"]["INDEXING_WAIT_SECS"], 10_120);
+        assert_eq!(s["effective"]["indexing_wait_phase"], "upload_tail");
+        assert_eq!(s["env"]["INDEXING_WAIT_SECS"], Value::Null);
+        reset();
+        assert_eq!(indexing_wait_budget_secs(FullBuild, 120, 1_000_044), 1_120);
+        let s = snapshot();
+        assert_eq!(s["effective"]["INDEXING_WAIT_SECS"], 1_120);
+        assert_eq!(s["effective"]["indexing_wait_phase"], "full_build");
+        drop(_g);
+        let _g = EnvGuard::set("INDEXING_WAIT_SECS", Some("45"));
+        reset();
+        assert_eq!(indexing_wait_budget_secs(FullBuild, 600, 10_000_000), 45);
+        assert_eq!(snapshot()["effective"]["INDEXING_WAIT_SECS"], 45);
     }
 
     #[test]

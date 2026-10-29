@@ -176,6 +176,13 @@ auto-download from S3; `prepare-msmarco` rebuilds them from Hugging Face.
   global top-1k before anything is written; `--verify` re-runs that check against
   an already-prepared dataset.
 - `--discover-crc32` re-derives the sampling thresholds (26.9 GB metadata scan).
+- `msmarco-cohere-1024-100M-cosine` (#342, threshold 880,865 -> 100,000,027
+  rows, ~600 GB) has no download; it is built on the client host and is larger
+  than client RAM. Preparation must stay streaming (the hybrid pass uses
+  `StreamedCorpus` + `RowMask` bits, not `HybridCorpus`), and its upload uses
+  `--upload-reader stream|auto` (`src/upload_stream.rs`, Redis + OpenSearch).
+  `tests/streaming_memory.rs` measures peak allocation with a counting
+  allocator and fails if either path grows with the corpus.
 - Payloads also carry four SYNTHETIC exact-match fields derived from `docid`
   alone (`category`, `doc_len`, `tier`, `rand_key`; `src/msmarco/derived.rs`),
   and `filter_queries.jsonl` holds the filter-only query set over them with an

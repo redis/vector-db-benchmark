@@ -396,18 +396,27 @@ impl KividbEngine {
         Ok(())
     }
 
-    /// Wait until KiviDB's FT.INFO reports the HNSW graph as fully built.
+    /// Wait until KiviDB's FT.INFO reports the index as fully built, by the
+    /// algorithm's own signal (`indexing_wait::kividb_ready`).
     ///
-    /// KiviDB has no `num_docs` / `indexing` / `percent_indexed` in FT.INFO —
-    /// see the module doc comment. This polls `hnsw_live_count` (documents
-    /// actually in the graph) and `hnsw_compaction_in_progress` instead. In
+    /// Older KiviDB has no `num_docs` / `indexing` / `percent_indexed` in
+    /// FT.INFO — see the module doc comment. For HNSW this polls
+    /// `hnsw_live_count` (documents actually in the graph) and
+    /// `hnsw_compaction_in_progress`; a FLAT index has no graph and never
+    /// reports `hnsw_live_count`, so it is judged by `num_docs` when present. In
     /// practice this returns on the first poll: KiviDB builds each vector's
     /// HNSW entry synchronously inside the `HSET` that stores it, so by the
     /// time upload's HSETs have all returned, `hnsw_live_count` is already at
     /// `expected` and no compaction is running.
     fn wait_for_indexing(&self, expected: usize) -> Result<(), String> {
         let mut conn = self.get_connection()?;
-        let max_wait = 600; // seconds – generous, even though KiviDB shouldn't need it
+        // Scales with the corpus; INDEXING_WAIT_SECS overrides. Expiry is an
+        // error (#361), never a pass on a partly built index.
+        let max_wait = crate::effective_config::indexing_wait_budget_secs(
+            vector_db_benchmark::indexing_wait::WaitPhase::UploadTail,
+            600,
+            expected,
+        );
         let start = Instant::now();
 
         loop {
@@ -416,88 +425,41 @@ impl KividbEngine {
                 .query(&mut conn)
                 .map_err(|e| format!("FT.INFO error: {}", e))?;
 
-            let mut live_count: usize = 0;
-            let mut compaction_in_progress: bool = false;
+            // Strict parse (#361): an unparsable count is an immediate error,
+            // not a 0 that waits out the whole budget.
+            let progress = vector_db_benchmark::indexing_wait::parse_kividb_ft_info(&info)
+                .map_err(|e| format!("kividb: {e}"))?;
 
-            fn extract_usize(val: &redis::Value) -> usize {
-                match val {
-                    redis::Value::BulkString(s) => String::from_utf8_lossy(s).parse().unwrap_or(0),
-                    redis::Value::Int(n) => *n as usize,
-                    redis::Value::Double(f) => *f as usize,
-                    redis::Value::SimpleString(s) => s.parse().unwrap_or(0),
-                    _ => 0,
-                }
-            }
-
-            fn extract_bool_nonzero(val: &redis::Value) -> bool {
-                match val {
-                    redis::Value::BulkString(s) => s != b"0",
-                    redis::Value::Int(n) => *n != 0,
-                    redis::Value::Double(f) => *f != 0.0,
-                    redis::Value::SimpleString(s) => s != "0",
-                    redis::Value::Boolean(b) => *b,
-                    _ => false,
-                }
-            }
-
-            let mut handle_pair = |key: &str, val: &redis::Value| match key {
-                "hnsw_live_count" => live_count = extract_usize(val),
-                "hnsw_compaction_in_progress" => {
-                    compaction_in_progress = compaction_in_progress || extract_bool_nonzero(val)
-                }
-                _ => {}
-            };
-
-            match &info {
-                redis::Value::Array(arr) => {
-                    for i in (0..arr.len()).step_by(2) {
-                        let key_str = match &arr[i] {
-                            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
-                            redis::Value::SimpleString(s) => s.clone(),
-                            _ => continue,
-                        };
-                        if let Some(val) = arr.get(i + 1) {
-                            handle_pair(&key_str, val);
-                        }
-                    }
-                }
-                redis::Value::Map(map) => {
-                    for (k, v) in map {
-                        let key_str = match k {
-                            redis::Value::BulkString(s) => String::from_utf8_lossy(s).to_string(),
-                            redis::Value::SimpleString(s) => s.clone(),
-                            _ => continue,
-                        };
-                        handle_pair(&key_str, v);
-                    }
-                }
-                _ => {
-                    eprintln!("Unexpected FT.INFO response type: {:?}", info);
-                }
-            }
-
-            if live_count >= expected && !compaction_in_progress {
+            let state = format!(
+                "algorithm={}, num_docs={:?}, hnsw_live_count={:?}/{}, compaction_in_progress={}",
+                self.config.algorithm,
+                progress.num_docs,
+                progress.hnsw_live_count,
+                expected,
+                progress.compaction_in_progress
+            );
+            if vector_db_benchmark::indexing_wait::kividb_ready(
+                &self.config.algorithm,
+                &progress,
+                expected as u64,
+            )? {
                 println!(
-                    "Indexing complete: {} docs in {:.1}s",
-                    live_count,
+                    "Indexing complete ({state}) in {:.1}s",
                     start.elapsed().as_secs_f64()
                 );
                 return Ok(());
             }
 
-            if start.elapsed().as_secs() > max_wait {
-                println!(
-                    "Warning: indexing timeout after {}s (hnsw_live_count={}/{}, compaction_in_progress={})",
-                    max_wait, live_count, expected, compaction_in_progress
-                );
-                return Ok(());
-            }
+            vector_db_benchmark::indexing_wait::verdict(
+                "kividb",
+                start.elapsed(),
+                std::time::Duration::from_secs(max_wait),
+                &state,
+            )?;
 
             if start.elapsed().as_secs().is_multiple_of(10) && start.elapsed().as_secs() > 0 {
                 println!(
-                    "Waiting for indexing: {} docs, compaction_in_progress={} ({:.0}s)",
-                    live_count,
-                    compaction_in_progress,
+                    "Waiting for indexing: {state} ({:.0}s)",
                     start.elapsed().as_secs_f64()
                 );
             }

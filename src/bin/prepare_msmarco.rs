@@ -638,8 +638,7 @@ fn discover_crc32(args: &Args) -> Result<(), String> {
         );
     }
 
-    let targets = [100_000u64, 1_000_000, 10_000_000];
-    let report = hist.to_json(&targets);
+    let report = hist.to_json(&msmarco::DISCOVERY_TARGETS);
     println!(
         "\n{}",
         serde_json::to_string_pretty(&report).unwrap_or_default()

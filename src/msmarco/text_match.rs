@@ -368,15 +368,16 @@ impl TermCounter {
 /// the lexicographically smallest term), among terms with ZERO ambiguous
 /// documents under the full [`classify`] rule. `excluded` terms are skipped.
 ///
-/// `texts(term)` must count, over the whole corpus, documents classified
+/// `scan(term)` must count, over the whole corpus, documents classified
 /// `Yes` and `Ambiguous` for `term`; it is a callback so the caller can scan
-/// however its corpus is stored. Candidates are confirmed nearest-first, so
+/// however its corpus is stored (in memory, or streamed from disk, where it
+/// can fail with an I/O error). Candidates are confirmed nearest-first, so
 /// the scan count is small in practice.
 pub fn choose_term(
     counter: &TermCounter,
     target: u64,
     excluded: &[&str],
-    mut scan: impl FnMut(&str) -> (u64, u64),
+    mut scan: impl FnMut(&str) -> Result<(u64, u64), String>,
 ) -> Result<(String, u64), String> {
     let mut cands = counter.candidates();
     cands.retain(|(_, t)| !excluded.contains(t));
@@ -386,7 +387,7 @@ pub fn choose_term(
             .then(a.1.cmp(b.1))
     });
     for (raw_yes, term) in cands {
-        let (yes, amb) = scan(term);
+        let (yes, amb) = scan(term)?;
         if yes != raw_yes {
             return Err(format!(
                 "text term {term:?}: the full classifier counts {yes} matching documents but \
@@ -507,13 +508,13 @@ mod tests {
             c.add_doc(t);
         }
         let scan = |term: &str| {
-            texts
+            Ok(texts
                 .iter()
                 .fold((0, 0), |(y, a), t| match classify(t, term) {
                     Yes => (y + 1, a),
                     Ambiguous => (y, a + 1),
                     No => (y, a),
-                })
+                }))
         };
         // "nature" has a raw-ambiguous document, so it is never a candidate.
         assert!(c.candidates().iter().all(|(_, t)| *t != "nature"));
@@ -527,9 +528,21 @@ mod tests {
         // "cafe" is only raw-visible in no document; "society" is Yes twice.
         assert_eq!(choose_term(&c, 2, &["quora"], scan).unwrap().0, "society");
         // A scan that disagrees with the counter is an error, not a choice.
-        assert!(choose_term(&c, 3, &[], |_| (99, 0)).is_err());
+        assert!(choose_term(&c, 3, &[], |_| Ok((99, 0))).is_err());
+        // A scan that fails (a streamed corpus hitting an I/O error) is
+        // propagated as itself.
+        assert_eq!(
+            choose_term(&c, 3, &[], |_| Err("disk gone".into())).unwrap_err(),
+            "disk gone"
+        );
         // A candidate the full rule finds ambiguous is skipped.
-        let picky = |term: &str| if term == "fandom" { (3, 1) } else { scan(term) };
+        let picky = |term: &str| {
+            if term == "fandom" {
+                Ok((3, 1))
+            } else {
+                scan(term)
+            }
+        };
         assert_eq!(choose_term(&c, 3, &[], picky).unwrap().0, "quora");
     }
 }
