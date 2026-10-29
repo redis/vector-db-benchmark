@@ -302,7 +302,7 @@ Gatekeeper until you run `xattr -d com.apple.quarantine <file>` on it.
 The release workflow builds the archives from the tag's commit and checks,
 before building anything, that **the tag names the crate version**.
 
-1. Bump `[package].version` in `Cargo.toml` (it is still `0.1.0`), and merge that.
+1. Bump `[package].version` in `Cargo.toml`, and merge that.
 2. Tag the merged commit `X.Y.Z`, `vX.Y.Z` or a pre-release `X.Y.Z-rc.N`, matching
    that version. Don't use `+`: GitHub may rename assets named after it.
 3. Publish a GitHub release for the tag. `Release binaries` attaches the three

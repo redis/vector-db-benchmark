@@ -1,6 +1,6 @@
 [package]
 name = "vector_db_benchmark"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Embeds the git commit the binaries were built from (`--version`, and
 # `params.build` in every result file). Logic: src/build_info/resolve.rs.
