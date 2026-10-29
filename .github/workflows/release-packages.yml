@@ -262,6 +262,11 @@ jobs:
       - name: Container prerequisites
         run: |
           export DEBIAN_FRONTEND=noninteractive
+          # Debian 11 left LTS on 2026-08-31 and its pool is gone from
+          # deb.debian.org: read it from archive.debian.org instead.
+          if grep -qx 'VERSION_CODENAME=bullseye' /etc/os-release; then
+            sed -i 's|deb.debian.org|archive.debian.org|' /etc/apt/sources.list
+          fi
           apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl
       - uses: actions/checkout@v4
         with:
@@ -345,6 +350,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Debian 11 left LTS on 2026-08-31 and its pool is gone from
+          # deb.debian.org: read it from archive.debian.org instead.
+          if grep -qx 'VERSION_CODENAME=bullseye' /etc/os-release; then
+            sed -i 's|deb.debian.org|archive.debian.org|' /etc/apt/sources.list
+          fi
           apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
           mkdir -p src/scripts/release
           curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" \
