@@ -361,7 +361,11 @@ jobs:
     steps:
       - name: Container prerequisites
         run: |
-          if command -v dnf >/dev/null; then dnf install -y findutils tar gzip curl ca-certificates; else yum install -y findutils tar gzip curl ca-certificates; fi
+          # el9 and Amazon Linux 2023 ship curl-minimal, which conflicts with
+          # the curl package: only add curl where no curl binary is present.
+          pkgs="findutils tar gzip ca-certificates"
+          command -v curl >/dev/null || pkgs="$pkgs curl"
+          if command -v dnf >/dev/null; then dnf install -y $pkgs; else yum install -y $pkgs; fi
       - uses: actions/download-artifact@v4
         with:
           name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
