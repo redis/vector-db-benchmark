@@ -14,6 +14,9 @@
 #    `vector-db-benchmark-<tag>-*.tar.gz` that this set does not contain:
 #    refuse, unless CLOBBER=true. A release must not mix archives from two
 #    builds, and SHA256SUMS must describe what is actually served.
+#  * An asset of this tag whose upload never finished (GitHub `state` other
+#    than `uploaded`, e.g. a runner died mid-upload): it is not served and
+#    has no digest, so it is deleted and uploaded again, without CLOBBER.
 #  * CLOBBER=true: delete SHA256SUMS FIRST (so no stale checksum file is live
 #    while archives change), delete stale archives, replace the archives, then
 #    upload the new SHA256SUMS.
@@ -40,14 +43,18 @@ ours=()
 while IFS= read -r f; do ours+=("$f"); done < <(cd "$dir" && find . -maxdepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort)
 is_ours() { in_list "$1" "${ours[@]}"; }
 
-# name<TAB>digest for every asset currently on the release. Fails the script
-# (set -e) if gh fails.
-listing="$("$GH" api "repos/$REPO/releases/tags/$tag" --jq '.assets[] | [.name, (.digest // "")] | @tsv')"
+# name<TAB>state<TAB>digest for every asset currently on the release (digest
+# last: it may be empty, and tab is IFS whitespace, so an empty field in the
+# middle would collapse). Fails the script (set -e) if gh fails.
+listing="$("$GH" api "repos/$REPO/releases/tags/$tag" --jq '.assets[] | [.name, (.state // "uploaded"), (.digest // "")] | @tsv')"
 
-present=() conflicting=() stale=()
-while IFS=$'\t' read -r name digest; do
+is_release_file() { is_ours "$1" || [[ "$1" == "vector-db-benchmark-$tag-"*.tar.gz ]]; }
+present=() conflicting=() stale=() incomplete=()
+while IFS=$'\t' read -r name state digest; do
   [[ -n "$name" ]] || continue
-  if is_ours "$name"; then
+  if [[ "${state:-uploaded}" != uploaded ]] && is_release_file "$name"; then
+    incomplete+=("$name")
+  elif is_ours "$name"; then
     if [[ "$digest" == "sha256:$(sha256_file "$dir/$name")" ]]; then
       present+=("$name")
     else
@@ -71,6 +78,13 @@ upload() { # upload <extra gh flags...> -- <names...>
 archives=()
 for f in "${ours[@]}"; do [[ "$f" == SHA256SUMS ]] || archives+=("$f"); done
 
+# Unfinished uploads are not served by the release: remove them, and what is
+# ours is uploaded again below like any missing file.
+for n in ${incomplete[@]+"${incomplete[@]}"}; do
+  echo "removing an unfinished upload: $n"
+  "$GH" release delete-asset "$tag" "$n" -R "$REPO" --yes
+done
+
 if [[ ${#conflicting[@]} -eq 0 && ${#stale[@]} -eq 0 ]]; then
   missing=()
   for f in "${archives[@]}"; do
@@ -87,10 +101,15 @@ if [[ ${#conflicting[@]} -eq 0 && ${#stale[@]} -eq 0 ]]; then
 fi
 
 if [[ "$CLOBBER" != true ]]; then
-  echo "publish.sh: release $tag already has assets from a different build:" >&2
-  [[ ${#conflicting[@]} -eq 0 ]] || echo "  different digest: ${conflicting[*]}" >&2
+  echo "publish.sh: release $tag already serves assets this build did not produce:" >&2
+  for n in ${conflicting[@]+"${conflicting[@]}"}; do
+    d="$(awk -F'\t' -v n="$n" '$1 == n {print $3}' <<<"$listing")"
+    if [[ -n "$d" ]]; then echo "  different digest: $n ($d)" >&2
+    else echo "  no digest reported, cannot show it is this build's: $n" >&2; fi
+  done
   [[ ${#stale[@]} -eq 0 ]] || echo "  not in this set:  ${stale[*]}" >&2
-  echo "Refusing to mix builds. Re-run via workflow_dispatch with clobber: true to replace the whole set." >&2
+  echo "Refusing to mix builds. If a previous attempt of THIS run uploaded them, use 'Re-run failed jobs'" >&2
+  echo "(same artifacts, same digests); to rebuild the tag on purpose, dispatch with clobber: true." >&2
   exit 1
 fi
 

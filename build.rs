@@ -70,28 +70,33 @@ fn main() {
     //
     // `logs/HEAD` (HEAD's reflog) is appended on every move of HEAD. Where
     // reflogs are off (`core.logAllRefUpdates=false`) and the branch ref is
-    // packed, a commit creates the loose ref file: the ref's directory is
-    // watched for that.
+    // packed, a commit instead CREATES the loose ref file, and for a branch
+    // like `feat/x` after `git pack-refs --all --prune` even its directory
+    // (`refs/heads/feat`) is gone. So the nearest EXISTING ancestor of the
+    // ref's directory is watched (cargo scans a directory recursively): the
+    // file appearing under it re-runs this script instead of keeping the old
+    // SHA.
     if probe.toplevel.as_deref() == Some(manifest_canon.as_path()) {
-        let mut paths = vec![
-            "HEAD".to_string(),
-            "logs/HEAD".to_string(),
-            "packed-refs".to_string(),
-        ];
+        let git_path = |p: &str| {
+            git(&manifest_dir, &["rev-parse", "--git-path", p]).map(|s| manifest_dir.join(s.trim()))
+        };
+        let mut watch: Vec<PathBuf> = ["HEAD", "logs/HEAD", "packed-refs"]
+            .iter()
+            .filter_map(|p| git_path(p))
+            .filter(|p| p.exists())
+            .collect();
         if let Some(r) = git(&manifest_dir, &["symbolic-ref", "-q", "HEAD"]) {
-            let r = r.trim().to_string();
-            if let Some((dir, _)) = r.rsplit_once('/') {
-                paths.push(dir.to_string());
-            }
-            paths.push(r);
-        }
-        for p in paths {
-            if let Some(path) = git(&manifest_dir, &["rev-parse", "--git-path", &p]) {
-                let path = manifest_dir.join(path.trim());
-                if path.exists() {
-                    println!("cargo:rerun-if-changed={}", path.display());
+            if let Some(ref_file) = git_path(r.trim()) {
+                if ref_file.exists() {
+                    watch.push(ref_file.clone());
+                }
+                if let Some(dir) = ref_file.parent() {
+                    watch.extend(resolve::nearest_existing_ancestor(dir, |p| p.exists()));
                 }
             }
+        }
+        for path in watch {
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
 

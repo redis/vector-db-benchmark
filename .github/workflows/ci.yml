@@ -16,6 +16,8 @@ on:
       # Read by tests/harness_invariants.rs (INV-A4).
       - '.github/workflows/release-binaries.yml'
       - '.github/workflows/docker-build-pr.yml'
+      - '.github/workflows/docker-publish-master.yml'
+      - '.github/workflows/docker-publish-release.yml'
       - 'scripts/release/**'
   pull_request:
     paths:
@@ -31,6 +33,8 @@ on:
       # Read by tests/harness_invariants.rs (INV-A4).
       - '.github/workflows/release-binaries.yml'
       - '.github/workflows/docker-build-pr.yml'
+      - '.github/workflows/docker-publish-master.yml'
+      - '.github/workflows/docker-publish-release.yml'
       - 'scripts/release/**'
 
 jobs:

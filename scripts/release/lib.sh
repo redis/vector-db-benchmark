@@ -138,7 +138,9 @@ check_portable_linkage() {
              return 1 ;;
         esac
       done < <(readelf -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
-      newest="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)"
+      # `|| true`: grep finds nothing in a binary with no GLIBC_ symbols, which
+      # under pipefail would abort here silently instead of reporting "none".
+      newest="$(objdump -T "$bin" | { grep -o 'GLIBC_[0-9][0-9.]*' || true; } | sed 's/GLIBC_//' | sort -uV | tail -n1)"
       if [[ -n "$newest" && "$(printf '%s\n%s\n' "$newest" "$MAX_GLIBC" | sort -V | tail -n1)" != "$MAX_GLIBC" ]]; then
         echo "$bin: needs GLIBC_$newest, newer than the promised $MAX_GLIBC (Amazon Linux 2023)" >&2
         return 1

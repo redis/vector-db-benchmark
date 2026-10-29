@@ -220,8 +220,9 @@ case "$1 $2" in
     for f in "$FAKE_REL"/*; do
       [[ -e "$f" ]] || continue
       n="$(basename "$f")"
-      if [[ -n "${FAKE_NO_DIGEST:-}" && "$n" == "$FAKE_NO_DIGEST" ]]; then printf '%s\t\n' "$n"
-      else printf '%s\tsha256:%s\n' "$n" "$(sha "$f")"; fi
+      if [[ -n "${FAKE_INCOMPLETE:-}" && "$n" == "$FAKE_INCOMPLETE" ]]; then printf '%s\tstarter\t\n' "$n"
+      elif [[ -n "${FAKE_NO_DIGEST:-}" && "$n" == "$FAKE_NO_DIGEST" ]]; then printf '%s\tuploaded\t\n' "$n"
+      else printf '%s\tuploaded\tsha256:%s\n' "$n" "$(sha "$f")"; fi
     done ;;
   "release upload")
     shift 3; clobber=0; files=()
@@ -292,6 +293,17 @@ rm "$t/rel/release-notes.txt"
 
 : >"$t/log"
 expect "unknown digest counts as different" 1 env FAKE_NO_DIGEST=SHA256SUMS GH="$fake/gh" REPO=o/r FAKE_REL="$t/rel" FAKE_LOG="$t/log" bash "$here/publish.sh" T "$t/dist"
+if grep -q 'no digest reported' "$t/out"; then ok "unknown digest: says so, not 'different digest'"; else bad "unknown-digest wording: $(cat "$t/out")"; fi
+
+# A runner that died mid-upload leaves a half-written asset (state "starter",
+# no digest). It is not served, so a plain re-run replaces it without clobber.
+printf 'half' >"$t/rel/vector-db-benchmark-T-linux-aarch64.tar.gz"; rm -f "$t/rel/SHA256SUMS"; : >"$t/log"
+expect "unfinished upload replaced without CLOBBER" 0 env FAKE_INCOMPLETE=vector-db-benchmark-T-linux-aarch64.tar.gz GH="$fake/gh" REPO=o/r FAKE_REL="$t/rel" FAKE_LOG="$t/log" bash "$here/publish.sh" T "$t/dist"
+if same_as_dist; then ok "unfinished upload: release completed with this build"; else bad "unfinished upload: content differs"; fi
+if ! grep -q -- '--clobber' "$t/log"; then ok "unfinished upload: no --clobber"; else bad "unfinished upload used --clobber"; fi
+printf 'half' >"$t/rel/vector-db-benchmark-T-macos-aarch64.tar.gz"; : >"$t/log"
+expect "unfinished upload of an archive not in this set is removed too" 0 env FAKE_INCOMPLETE=vector-db-benchmark-T-macos-aarch64.tar.gz GH="$fake/gh" REPO=o/r FAKE_REL="$t/rel" FAKE_LOG="$t/log" bash "$here/publish.sh" T "$t/dist"
+if same_as_dist; then ok "  ... and the release serves exactly this set"; else bad "unfinished stale archive survived"; fi
 
 reset_rel
 expect "API failure aborts" 1 env FAKE_FAIL_API=1 GH="$fake/gh" REPO=o/r FAKE_REL="$t/rel" FAKE_LOG="$t/log" bash "$here/publish.sh" T "$t/dist"

@@ -8,12 +8,16 @@ name: Release binaries
 # carry the right commit, run on a bare ubuntu:22.04 for both architectures and
 # check out against SHA256SUMS, before a release depends on it.
 #
-# Re-running for a tag that already has assets from a DIFFERENT build refuses
-# unless dispatched with `clobber: true`, which then replaces the whole set
-# (and deletes any stale archive of that tag), so a release never mixes
-# archives from two builds. Re-running after a partial upload of the same build
-# just completes it. The decisions live in scripts/release/publish.sh and are
-# exercised on every PR by `make release-selftest` against a fake `gh`.
+# If `publish` (or the check after it) fails, use "Re-run failed jobs" on the
+# run: that reuses this run's build artifacts, so the digests match and
+# publish.sh completes the upload (it also replaces any upload that never
+# finished). "Re-run all jobs" REBUILDS: the new archives' digests differ from
+# what is already on the release, and the run refuses. A tag that already has
+# assets from a different build is only replaced by a workflow_dispatch with
+# `clobber: true`, which replaces the whole set (and deletes any stale archive
+# of that tag), so a release never mixes archives from two builds. The
+# decisions live in scripts/release/publish.sh and are exercised on every PR by
+# `make release-selftest` against a fake `gh`.
 
 on:
   release:

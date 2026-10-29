@@ -18,8 +18,11 @@
 #    `--help` exits 0;
 #  * `vector-db-benchmark --describe build` (the `params.build` block of every
 #    result file) names that commit, a clean tree, `release-static`, and, on
-#    THIS host, the same OpenSSL and HDF5 as BUILD-INFO.txt recorded at build
-#    time: a binary that picked up the host's libraries would differ;
+#    THIS host, the same OpenSSL and HDF5 versions as BUILD-INFO.txt recorded
+#    at build time, so the recorded provenance is what actually runs. (Equal
+#    versions do not prove static linking: Ubuntu 22.04's libhdf5 is also
+#    1.10.7. The `ldd` check above, run where those libraries are absent, and
+#    package.sh's NEEDED check are what catch a system link);
 #  * every binary actually runs a real workload from the archive's own files:
 #    `--describe datasets` reads the bundled datasets.json, generate-dataset
 #    writes an .npy corpus that bench_npy reads back, bench_jsonl reads the

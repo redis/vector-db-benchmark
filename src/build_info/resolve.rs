@@ -63,8 +63,10 @@ pub struct GitProbe {
 pub struct BuildSource {
     /// Full lowercase 40-hex commit, or `None` when unknown.
     pub sha: Option<String>,
-    /// `Some(true)` when tracked files differed from `sha`; `None` when that
-    /// could not be determined (always the case for [`Origin::Env`]).
+    /// `Some(true)` when the compiled inputs (`build.rs`, `src`, `Cargo.toml`,
+    /// `Cargo.lock`) differed from `sha`, by a tracked change or an untracked
+    /// file under them; `None` when that could not be determined (always the
+    /// case for [`Origin::Env`]).
     pub dirty: Option<bool>,
     pub origin: Origin,
 }
@@ -131,6 +133,18 @@ pub fn version_line(crate_version: &str, src: &BuildSource) -> String {
         (Some(sha), _) => format!("{crate_version} (git {sha})"),
         (None, _) => format!("{crate_version} (git commit unknown)"),
     }
+}
+
+/// `dir` itself if it exists, else its nearest ancestor that does. `build.rs`
+/// watches it for the branch's loose ref file: after `git pack-refs --prune`,
+/// the ref of a branch `feat/x` has no file AND no `refs/heads/feat`
+/// directory, and the commit that creates both must still re-run the build
+/// script, or the binary would keep naming the previous commit.
+pub fn nearest_existing_ancestor(
+    dir: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    dir.ancestors().find(|p| exists(p)).map(Path::to_path_buf)
 }
 
 /// The crate's enabled cargo features, from the `CARGO_FEATURE_<NAME>`
@@ -342,6 +356,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tree_state(&src), "unknown");
+    }
+
+    #[test]
+    fn the_watched_ref_directory_is_the_nearest_one_that_exists() {
+        let have =
+            |set: &'static [&'static str]| move |p: &Path| set.iter().any(|s| Path::new(s) == p);
+        // Packed and pruned: refs/heads/feat is gone, refs/heads remains.
+        assert_eq!(
+            nearest_existing_ancestor(
+                Path::new("/g/refs/heads/feat"),
+                have(&["/g", "/g/refs", "/g/refs/heads"])
+            ),
+            Some(PathBuf::from("/g/refs/heads"))
+        );
+        // Deeper nesting climbs as far as needed.
+        assert_eq!(
+            nearest_existing_ancestor(Path::new("/g/refs/heads/a/b/c"), have(&["/g", "/g/refs"])),
+            Some(PathBuf::from("/g/refs"))
+        );
+        // A directory that exists is watched itself.
+        assert_eq!(
+            nearest_existing_ancestor(
+                Path::new("/g/refs/heads/feat"),
+                have(&["/g", "/g/refs", "/g/refs/heads", "/g/refs/heads/feat"])
+            ),
+            Some(PathBuf::from("/g/refs/heads/feat"))
+        );
+        assert_eq!(
+            nearest_existing_ancestor(Path::new("/x/y"), have(&[])),
+            None
+        );
     }
 
     #[test]

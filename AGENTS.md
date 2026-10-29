@@ -125,8 +125,11 @@ So: **bump the version, merge, then tag that commit and publish the release.**
 A release published without the bump gets no archives, but still becomes
 "latest", which breaks the README's install one-liner until it is fixed.
 
-Rebuild a tag with `workflow_dispatch` (`tag`; `clobber: true` replaces a
-different build's assets). Everything except the upload also runs on PRs that
+If `publish` or the check after it fails, use **Re-run failed jobs** on that
+run. It reuses the same build artifacts, and `publish.sh` completes the upload,
+replacing any upload that never finished. **Re-run all jobs** rebuilds, so the
+digests differ and the run refuses. Rebuild a tag on purpose only with
+`workflow_dispatch` (`tag` plus `clobber: true`, which replaces the whole set). Everything except the upload also runs on PRs that
 touch the archive's inputs: `make release-selftest` and
 `scripts/release/install-test.sh` run there.
 

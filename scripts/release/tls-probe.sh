@@ -23,7 +23,9 @@
 # default). GitHub answers 404 and nothing is created; the probe needs a
 # request that has to pass certificate validation to get any HTTP answer.
 #
-# Runs inside a bare ubuntu:22.04 container in the release workflow.
+# Runs in the release workflow's fresh-host containers: expect-fail in a bare
+# ubuntu:22.04 with no CA bundle, expect-ok in ubuntu:22.04 + ca-certificates
+# and in amazonlinux:2023 (whose CA bundle lives under /etc/pki/tls).
 set -euo pipefail
 
 dir="${1:-}" mode="${2:-}" url="${3:-https://api.github.com}"

@@ -60,6 +60,13 @@ sha="$(git rev-parse HEAD)"
 require_gnu_tar
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target}"
+# The C code (HDF5 via cmake, OpenSSL, zlib) is compiled for this macOS
+# minimum too, not the build host's: the minos check below cannot see objects
+# built for a newer macOS (the linker only warns). The workflow sets it; a
+# local Mac build gets the same default.
+if [[ "$target" == *-apple-darwin ]]; then
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$MAX_MACOS_MINOS}"
+fi
 # hdf5-sys builds its bundled HDF5 only when HDF5_DIR is UNSET; with it set
 # (the Makefile exports it for normal builds) `release-static` silently links
 # the system libhdf5 instead. check_portable_linkage below would catch that,
@@ -101,11 +108,11 @@ trap 'rm -rf "$stage"' EXIT
 for b in "${bins[@]}"; do
   install -m 0755 "$bin_dir/$b" "$stage/$b"
 done
-mkdir -p "$stage/datasets" "$stage/experiments"
-cp datasets/datasets.json "$stage/datasets/"
-cp -R datasets/random-100 "$stage/datasets/"
-cp -R experiments/configurations "$stage/experiments/"
-cp LICENSE README.md "$stage/"
+# The data files come from the commit (`git archive HEAD`), not the working
+# tree, so a local build cannot ship an untracked or ignored file that sits in
+# datasets/random-100 or experiments/configurations.
+git archive --format=tar HEAD -- datasets/datasets.json datasets/random-100 \
+  experiments/configurations LICENSE README.md | "$TAR" -x -C "$stage"
 {
   echo "archive: $name.tar.gz"
   echo "tag: $tag"

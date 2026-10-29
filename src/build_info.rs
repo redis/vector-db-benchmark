@@ -268,9 +268,12 @@ mod tests {
         if let Some(v) = openssl_runtime_version() {
             assert!(v.starts_with("OpenSSL "), "{v}");
         }
-        // A release-static build must run the vendored OpenSSL (3.x) and the
-        // bundled HDF5, never the system copies that an HDF5_DIR or
-        // OPENSSL_NO_VENDOR left in the caller's environment would link.
+        // A release-static build reports the bundled HDF5's version and an
+        // OpenSSL 3.x. This is a sanity check of what is recorded, NOT what
+        // catches a system link: Ubuntu 22.04's own libhdf5 is also 1.10.7,
+        // and its OpenSSL is 3.0. That is caught by check_portable_linkage
+        // (no NEEDED libhdf5/libssl/libcrypto) in package.sh and by verify.sh's
+        // `ldd` check on a host where those libraries are absent.
         if cfg!(feature = "release-static") {
             assert_eq!(h, BUNDLED_HDF5, "release-static must run the bundled HDF5");
             if let Some(v) = openssl_runtime_version() {
@@ -279,6 +282,7 @@ mod tests {
         }
     }
 
-    /// The HDF5 version `hdf5-src` (pulled in by `release-static`) bundles.
+    /// The HDF5 version `hdf5-src` (pulled in by `release-static`) bundles;
+    /// the same as Ubuntu 22.04's system library, so it identifies nothing.
     const BUNDLED_HDF5: &str = "1.10.7";
 }

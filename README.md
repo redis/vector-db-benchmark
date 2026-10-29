@@ -265,8 +265,15 @@ before building anything, that **the tag names the crate version**.
 
 If the workflow refuses the tag, delete the release, fix the version or the tag,
 and publish again. A published release without archives becomes "latest", and
-the installer one-liner refuses it. To rebuild an existing tag, dispatch the
-workflow with `tag` (add `clobber: true` to replace a different build's assets).
+the installer one-liner refuses it.
+
+If the upload fails, or the check after it fails, open the workflow run and
+use **Re-run failed jobs**. That reuses the run's build artifacts, and
+`publish.sh` finishes the upload; it also replaces any upload that never
+finished. Don't use **Re-run all jobs**: it rebuilds, the new archives'
+digests differ from the ones already on the release, and the run refuses to
+mix builds. Rebuilding a tag on purpose is a `workflow_dispatch` with `tag`
+and `clobber: true`, which replaces the whole set.
 
 ### Docker (recommended)
 

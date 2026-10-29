@@ -1725,6 +1725,8 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
         "- 'build.rs'",
         "- '.github/workflows/release-binaries.yml'",
         "- '.github/workflows/docker-build-pr.yml'",
+        "- '.github/workflows/docker-publish-master.yml'",
+        "- '.github/workflows/docker-publish-release.yml'",
         "- 'scripts/release/**'",
     ] {
         assert_eq!(
@@ -1745,6 +1747,16 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
             && docker_pr.contains("--version"),
         "docker-build-pr.yml must build with VDB_BUILD_GIT_SHA and check --version names it"
     );
+
+    // The published images name their commit too (the Docker build context
+    // has no `.git`, so without the build-arg they would report "unknown").
+    for wf_name in ["docker-publish-master.yml", "docker-publish-release.yml"] {
+        let wf = repo_file(&format!(".github/workflows/{wf_name}"));
+        assert!(
+            wf.contains("VDB_BUILD_GIT_SHA=${{ github.sha }}"),
+            "{wf_name} must build with VDB_BUILD_GIT_SHA=${{{{ github.sha }}}}"
+        );
+    }
 
     // The dirty-tree scope is one list in two languages: what build.rs reports
     // as "dirty tree" and what package.sh refuses to package must agree.

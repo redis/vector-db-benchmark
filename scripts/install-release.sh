@@ -13,7 +13,8 @@
 # is extracted: plain files and directories inside DEST only.
 #
 # VDB_RELEASE_BASE_URL overrides https://github.com/redis/vector-db-benchmark/releases
-# (CI points it at a file:// directory of freshly built archives).
+# (CI's scripts/release/install-test.sh points it at a local HTTP stand-in
+# for GitHub serving freshly built archives).
 set -euo pipefail
 
 tag="${1:-}"
@@ -37,6 +38,18 @@ case "$(uname -m)" in
   *) die "no prebuilt binaries for $(uname -m); build from source (see README)" ;;
 esac
 [[ "$os-$arch" != macos-x86_64 ]] || die "no prebuilt binaries for Intel macOS; build from source (see README)"
+
+# The Linux archives need glibc 2.34 or newer (MAX_GLIBC in
+# scripts/release/lib.sh). Say so before downloading, rather than letting the
+# binary fail later with "GLIBC_2.34 not found". Skipped where getconf cannot
+# tell (musl, or no getconf): the archive is then simply tried.
+MIN_GLIBC=2.34
+if [[ "$os" == linux ]] && glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null)" && [[ "$glibc" == glibc\ * ]]; then
+  have="${glibc#glibc }"
+  if [[ "$(printf '%s\n%s\n' "$have" "$MIN_GLIBC" | sort -V | head -n1)" != "$MIN_GLIBC" ]]; then
+    die "this host has glibc $have; the prebuilt Linux binaries need $MIN_GLIBC or newer (Amazon Linux 2023, RHEL 9, Ubuntu 22.04, Debian 12). Use the Docker image or build from source (see README)"
+  fi
+fi
 
 if [[ -z "$tag" ]]; then
   # /releases/latest redirects to /releases/tag/<tag>; no API token or rate limit.

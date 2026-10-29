@@ -15,7 +15,9 @@
 #   * SHA256SUMS does not list this platform          -> "does not list"
 #   * the archive does not match SHA256SUMS           -> "checksum mismatch"
 #   * an archive member outside the destination       -> refused before extracting
+#   * a link member                                    -> refused before extracting
 #   * a non-empty destination                         -> refused
+#   * glibc older than 2.34 (Linux)                   -> refused before downloading
 #
 # Runs in the release workflow's PR check on a Linux runner.
 set -euo pipefail
@@ -39,7 +41,10 @@ name="vector-db-benchmark-$tag-$plat.tar.gz"
 w="$(mktemp -d)"
 srv="$w/srv"
 pid=""
-cleanup() { [[ -n "$pid" ]] && kill "$pid" 2>/dev/null; rm -rf "$w"; }
+cleanup() {
+  if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
+  rm -rf "$w"
+}
 trap cleanup EXIT
 
 # One directory per scenario, laid out like github.com/<repo>/releases:
@@ -66,7 +71,18 @@ with tarfile.open(sys.argv[1], "w:gz") as t:
     info = tarfile.TarInfo("../escaped"); info.size = len(data)
     t.addfile(info, io.BytesIO(data))
 PY
-(cd "$srv/evil/download/$tag" && { if command -v sha256sum >/dev/null; then sha256sum "$name"; else shasum -a 256 "$name"; fi; } >SHA256SUMS)
+sums_for() { (cd "$1" && { if command -v sha256sum >/dev/null; then sha256sum "$name"; else shasum -a 256 "$name"; fi; } >SHA256SUMS); }
+sums_for "$srv/evil/download/$tag"
+# A link member named like the binary: extracting it would make
+# ./vector-db-benchmark point anywhere on the host.
+release link "tag/$tag"
+python3 -I - "$srv/link/download/$tag/$name" <<'PY'
+import sys, tarfile
+with tarfile.open(sys.argv[1], "w:gz") as t:
+    info = tarfile.TarInfo("vector-db-benchmark"); info.type = tarfile.SYMTYPE; info.linkname = "/bin/sh"
+    t.addfile(info)
+PY
+sums_for "$srv/link/download/$tag"
 
 # The stand-in server: /<scenario>/latest redirects as GitHub does, every
 # other path is served from $srv (a missing asset is a 404). Listens on a
@@ -130,6 +146,16 @@ refused "SHA256SUMS does not list the archive" nolist "does not list $name"
 refused "archive does not match SHA256SUMS" corrupt "checksum mismatch" "$tag"
 refused "archive member outside the destination" evil "outside the destination" "$tag"
 if [[ ! -e "$w/escaped" ]]; then ok "evil archive: nothing written outside"; else bad "evil archive escaped"; fi
+refused "archive with a link member" link "link or special member" "$tag"
+
+# An old glibc is refused before anything is downloaded (a fake getconf
+# reports glibc 2.31, Ubuntu 20.04's). Linux only: the check is.
+if [[ "$(uname -s)" == Linux ]]; then
+  mkdir -p "$w/oldlibc"; printf '#!/bin/sh\necho "glibc 2.31"\n' >"$w/oldlibc/getconf"; chmod +x "$w/oldlibc/getconf"
+  rc=0; PATH="$w/oldlibc:$PATH" VDB_RELEASE_BASE_URL="$url/ok" bash "$installer" "$tag" "$w/oldglibc" >"$w/out" 2>&1 || rc=$?
+  if [[ "$rc" != 0 ]] && grep -qF "has glibc 2.31" "$w/out" && ! grep -qF Downloading "$w/out"; then ok "glibc 2.31 refused before downloading"
+  else bad "glibc 2.31 (exit $rc)"; fi
+fi
 
 mkdir -p "$w/full"; : >"$w/full/keep"
 if install "non-empty destination" ok "$w/full" "$tag"; then bad "non-empty destination: installed over it"
