@@ -11,6 +11,7 @@
 //! - `results_dump` - per-query result records and the `--dump-results` format
 //! - `compare_results` - scores one engine's dumps against a declared reference
 //! - `config` - Redis configuration from environment
+//! - `kividb_caps` - version-gated KiviDB server capabilities
 //! - `redis_client` - Redis connection management
 
 pub mod build_info;
@@ -21,6 +22,7 @@ pub mod fulltext;
 pub mod hybrid;
 pub mod indexing_wait;
 pub mod ingest;
+pub mod kividb_caps;
 pub mod metrics;
 pub mod msmarco;
 pub mod opensearch_maintenance;

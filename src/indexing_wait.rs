@@ -203,7 +203,7 @@ impl FtInfoProgress {
     }
 }
 
-fn value_text(v: &redis::Value) -> Option<String> {
+pub(crate) fn value_text(v: &redis::Value) -> Option<String> {
     match v {
         redis::Value::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
         redis::Value::SimpleString(s) => Some(s.clone()),
@@ -239,7 +239,7 @@ pub fn parse_ft_info(info: &redis::Value) -> Result<FtInfoProgress, String> {
 }
 
 /// Top-level (field, value) pairs of an `FT.INFO` reply, RESP2 or RESP3.
-fn ft_info_pairs(info: &redis::Value) -> Result<Vec<(String, &redis::Value)>, String> {
+pub(crate) fn ft_info_pairs(info: &redis::Value) -> Result<Vec<(String, &redis::Value)>, String> {
     match info {
         redis::Value::Array(a) => Ok(a
             .chunks(2)
@@ -354,8 +354,9 @@ pub fn kividb_ready(algorithm: &str, p: &KividbProgress, expected: u64) -> Resul
         Ok(match p.num_docs.or(p.hnsw_live_count) {
             Some(n) => n >= expected,
             // Verified against KiviDB source (kividbio/kividb src/commands/search.rs,
-            // v1.1.0 and main: `hnsw_*` only for HNSW fields) and CI on the pinned
-            // quay.io/kividbio/kividb:v1.0.2-full image (#361, d682fb6).
+            // v1.1.0 and main: `hnsw_*` only for HNSW fields) and in CI (#361,
+            // d682fb6). KiviDB 1.1.2 reports `num_docs` (measured), so this arm is
+            // only reached by a server that reports neither.
             None => true,
         })
     } else {

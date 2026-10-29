@@ -186,17 +186,16 @@ services:
       retries: 10
 
   kividb:
-    image: quay.io/kividbio/kividb:v1.0.2-full
-    # KiviDB listens on 6380 internally (not 6379). The image ships no
-    # redis-cli/valkey-cli, but it does include bash, so the healthcheck opens
-    # a raw TCP connection to the server port to confirm readiness.
+    # The current stable KiviDB release, `full` variant (Lua + TLS). Published
+    # to Docker Hub (`kividb/kividb`) and GHCR (`ghcr.io/kividbio/kividb`).
+    image: kividb/kividb:v1.1.2-full
+    # KiviDB listens on 6380 internally (not 6379). The image is distroless:
+    # no shell and no redis-cli, so there is nothing to run a healthcheck with.
+    # As with Chroma below, `up --wait` therefore waits only for the container
+    # to be running, and the suite's wait_for_kividb() polls PING (30s
+    # deadline) for actual readiness.
     ports:
       - "6386:6380"
-    healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6380"]
-      interval: 1s
-      timeout: 3s
-      retries: 15
 
   chroma:
     image: chromadb/chroma:1.0.0

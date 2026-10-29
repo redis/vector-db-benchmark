@@ -568,7 +568,7 @@ help:
 	@echo "  make integration-test-mongodb         - MongoDB Atlas Local 8.0.4"
 	@echo "  make integration-test-valkey          - Valkey Bundle (latest)"
 	@echo "  make integration-test-dragonfly       - Dragonfly"
-	@echo "  make integration-test-kividb          - KiviDB"
+	@echo "  make integration-test-kividb          - KiviDB 1.1.2"
 	@echo "  make integration-test-chroma          - Chroma"
 	@echo "  make integration-test-vertex          - Vertex AI (cloud-only, needs GCP creds)"
 	@echo ""

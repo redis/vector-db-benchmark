@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use redis::Connection;
+use vector_db_benchmark::kividb_caps::KividbServer;
 
 mod common;
 
@@ -566,17 +567,32 @@ fn test_binary_kividb_geo_is_rejected_not_silently_dropped() {
     );
 }
 
-/// Multi-valued `labels`: a KiviDB TAG value is atomic (never split on any
-/// separator), so a `match_any` over a labels array can only ever match the
-/// whole joined string — i.e. nothing. The run must abort rather than build an
-/// index that silently answers every such query with zero documents — and abort
-/// in `configure()`, before the payload file is parsed at all (3.6 GB for the
-/// shipped `arxiv-titles-384-angular-filters`).
+/// Assert the server under test is one the tool declares TAG fields on
+/// (KiviDB >= 1.1.2, see `kividb_caps`), so a server that silently stops
+/// reporting a usable `kividb_version` fails the suite by name instead of
+/// failing every TAG test for a reason that is harder to read.
+fn assert_server_supports_tags(conn: &mut Connection) {
+    let info: String = redis::cmd("INFO").arg("server").query(conn).unwrap();
+    let server = KividbServer::from_info(&info);
+    assert!(
+        server.tags_supported(),
+        "{} — this suite needs a KiviDB the tool supports TAG fields on",
+        server.describe()
+    );
+}
+
+/// Multi-valued `labels`: the field is declared `TAG SEPARATOR ;` (as redis.rs
+/// does) and a `match_any` over the array has contains-any semantics. The
+/// fixture's ground truth is filtered on that semantics, so an engine that
+/// indexes the joined string as one atomic TAG scores ~0 recall. (On a server
+/// the tool does not support TAG fields on, the run is refused in
+/// `configure()`: unit-tested in `kividb.rs`.)
 #[test]
-fn test_binary_kividb_multivalued_labels_is_rejected_not_silently_mis_encoded() {
+fn test_binary_kividb_multivalued_labels_match_any() {
     wait_for_kividb();
     let mut conn = get_test_connection();
     flush_db(&mut conn);
+    assert_server_supports_tags(&mut conn);
 
     let dim = 8;
     let configs = serde_json::json!([{
@@ -592,21 +608,153 @@ fn test_binary_kividb_multivalued_labels_is_rejected_not_silently_mis_encoded() 
         common::GtMetric::L2,
     );
     assert!(
-        !common::run_binary(
+        proj.matching_docs >= proj.top,
+        "fixture must have >= top matching docs (got {})",
+        proj.matching_docs
+    );
+    let ok = common::run_binary(
+        &proj.root,
+        "kividb-labels",
+        "kividb-labels-test",
+        TEST_HOST,
+        &[("KIVIDB_PORT", test_port().to_string().as_str())],
+    );
+    assert!(ok, "kividb multi-valued labels run failed");
+    let recall = common::read_recall(&proj.root, "kividb-labels");
+    println!("kividb match_any labels recall={:.3}", recall);
+    assert!(
+        recall >= 0.9,
+        "kividb multi-valued labels match_any recall {:.3} < 0.9",
+        recall
+    );
+}
+
+/// A SCALAR keyword value containing a comma must match itself, and only
+/// itself. KiviDB splits a bare TAG on `,` (the RediSearch default; measured on
+/// 1.1.2: `@s:{Smith}` matches a stored `Smith, John`), so every TAG must be
+/// declared `SEPARATOR ;`. A bare declaration collapses recall here.
+#[test]
+fn test_binary_kividb_keyword_value_with_comma() {
+    {
+        wait_for_kividb();
+        assert_server_supports_tags(&mut get_test_connection());
+    }
+    run_kividb_filter_test(
+        "kividb-comma",
+        "kividb-comma-test",
+        common::write_comma_keyword_project,
+    );
+}
+
+/// `--skip-upload` must not measure a reused index whose TAG fields the server
+/// splits on `,`. On KiviDB a bare TAG reports `SEPARATOR ,`; an index
+/// built that way (by a binary predating #375, which declared scalar TAGs bare,
+/// or by hand) under-matches every comma-bearing value. Phase 1 uploads the
+/// comma fixture and keeps it; the index is then rebuilt over the same keys,
+/// first bare (must be refused, naming the field) and then `SEPARATOR ;` (must
+/// run at full recall: the positive control that the check is not a blanket
+/// refusal and that the rebuilt index really covers the kept corpus).
+#[test]
+fn test_kividb_skip_upload_refuses_a_stale_bare_tag_index() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    assert_server_supports_tags(&mut conn);
+
+    let name = "kividb-stale";
+    let configs = serde_json::json!([{
+        "name": name, "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let dim = 8;
+    let proj = common::write_comma_keyword_project("kividb-stale-test", &configs.to_string(), dim);
+    let port = test_port().to_string();
+    let envs = [("KIVIDB_PORT", port.as_str())];
+    assert!(
+        common::run_binary_extra(
             &proj.root,
-            "kividb-labels",
-            "kividb-labels-test",
+            name,
+            "kividb-stale-test",
             TEST_HOST,
-            &[("KIVIDB_PORT", test_port().to_string().as_str())],
+            &envs,
+            &["--keep-data"]
         ),
-        "kividb must REJECT a multi-valued labels field, not index it as an atomic TAG"
+        "phase 1 (upload, keep data) failed"
     );
-    assert_no_results_written(&proj.root);
-    assert_eq!(
-        redis::cmd("DBSIZE").query::<i64>(&mut conn).unwrap_or(-1),
-        0,
-        "a multi-valued labels dataset must be rejected BEFORE the corpus is uploaded"
+
+    let index = format!("idx:{name}");
+    let rebuild = |conn: &mut Connection, tag: &[&str]| {
+        let _: () = redis::cmd("FT.DROPINDEX").arg(&index).query(conn).unwrap();
+        let mut cmd = redis::cmd("FT.CREATE");
+        cmd.arg(&index)
+            .arg("ON")
+            .arg("HASH")
+            .arg("PREFIX")
+            .arg("1")
+            .arg(format!("{name}:"))
+            .arg("SCHEMA")
+            .arg("vector")
+            .arg("VECTOR")
+            .arg("HNSW")
+            .arg(10)
+            .arg("TYPE")
+            .arg("FLOAT32")
+            .arg("DIM")
+            .arg(dim)
+            .arg("DISTANCE_METRIC")
+            .arg("L2")
+            .arg("M")
+            .arg(16)
+            .arg("EF_CONSTRUCTION")
+            .arg(128)
+            .arg("author");
+        for a in tag {
+            cmd.arg(*a);
+        }
+        let _: () = cmd.query(conn).unwrap();
+    };
+
+    rebuild(&mut conn, &["TAG"]);
+    delete_search_result_files(&proj.root);
+    let run = common::run_binary_capture_extra(
+        &proj.root,
+        name,
+        "kividb-stale-test",
+        TEST_HOST,
+        &envs,
+        &["--skip-upload", "--keep-data"],
     );
+    assert!(!run.ok, "a bare-TAG index must be refused");
+    assert!(
+        run.combined
+            .contains("declares TAG field `author` with SEPARATOR \",\""),
+        "refused for the wrong reason:\n{}",
+        run.combined
+    );
+    let searches: Vec<_> = fs::read_dir(proj.root.join("results"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("-search-"))
+        .collect();
+    assert!(searches.is_empty(), "refused run wrote {searches:?}");
+
+    rebuild(&mut conn, &["TAG", "SEPARATOR", ";"]);
+    assert!(
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            "kividb-stale-test",
+            TEST_HOST,
+            &envs,
+            &["--skip-upload"]
+        ),
+        "a SEPARATOR ; index over the kept corpus must be accepted"
+    );
+    let recall = common::read_recall(&proj.root, name);
+    assert!(recall >= 0.9, "rebuilt-index recall {recall:.3} < 0.9");
 }
 
 /// A `"algorithm":"flat"` config must run end-to-end: EF_RUNTIME is HNSW-only,
