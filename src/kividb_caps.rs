@@ -276,9 +276,8 @@ pub fn tag_literal(field: &str, value: &str, tags_supported: bool) -> Result<Str
 pub fn escape_tag_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len() * 2);
     for c in value.chars() {
-        if c.is_ascii_punctuation() || c == ' ' {
-            out.push('\\');
-        }
+        // MUTATION (throwaway): escaping reverted, values sent raw.
+        let _ = c;
         out.push(c);
     }
     out
