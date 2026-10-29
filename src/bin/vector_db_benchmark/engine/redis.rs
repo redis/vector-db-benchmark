@@ -661,7 +661,7 @@ impl RedisEngine {
         let mut conn = self.get_connection()?;
         // Scales with the corpus; INDEXING_WAIT_SECS overrides. Expiry is an
         // error (#361), never a pass on a partly built index.
-        let max_wait = crate::effective_config::indexing_wait_budget_secs(phase, 120, expected);
+        let max_wait = crate::effective_config::indexing_wait_budget_secs(phase, 120, expected)?;
         let start = Instant::now();
 
         loop {

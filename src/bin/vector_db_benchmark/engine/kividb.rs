@@ -416,7 +416,7 @@ impl KividbEngine {
             vector_db_benchmark::indexing_wait::WaitPhase::UploadTail,
             600,
             expected,
-        );
+        )?;
         let start = Instant::now();
 
         loop {

@@ -535,6 +535,31 @@ impl Dataset {
     /// Validate scalar metadata on reuse without loading vector values. Only
     /// compound datasets carry metadata in the supported dense readers; other
     /// formats yield no metadata on upload and therefore need no payload scan.
+    /// The streamed upload's pre-flight (#361 review): one pass over
+    /// `payloads.jsonl` that parses every row and counts them against the
+    /// vectors (`upload_stream::preflight_payloads`), and, with
+    /// `filter_only_domain`, also checks filter-only's metadata domain on the
+    /// same rows (what [`Self::validate_scalar_metadata`] checks), so the file
+    /// is read once. Runs before the first batch is sent.
+    pub fn preflight_streamed_payloads(&self, filter_only_domain: bool) -> Result<(), String> {
+        let path = self.get_path()?;
+        let schema = if filter_only_domain {
+            self.filter_only_index_schema()?
+        } else {
+            None
+        };
+        upload_stream::preflight_payloads(&path, |item| {
+            if filter_only_domain {
+                vector_db_benchmark::filter_only::domain::validate_metadata(
+                    std::slice::from_ref(&item),
+                    schema.as_ref(),
+                )
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     pub fn validate_scalar_metadata(&self) -> Result<(), String> {
         if self.config.dataset_type.as_deref() != Some("tar") {
             return Ok(());

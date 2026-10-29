@@ -5904,3 +5904,48 @@ fn test_binary_redis_streaming_upload_is_exact_on_hybrid() {
     assert_eq!(invocation["upload_reader"], "stream", "{invocation}");
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// #361 review: the streamed upload's payload pre-flight. A `payloads.jsonl`
+/// one row short is refused before the first HSET, as on the in-memory path,
+/// rather than after the whole corpus was sent: the server holds no keys.
+#[test]
+fn test_binary_redis_streaming_upload_refuses_a_short_payload_file_before_writing() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([
+        {"name": "redis-stream-short", "engine": "redis",
+         "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+         "upload_params": {"parallel": 3, "batch_size": 333}}
+    ]);
+    let proj = common::write_msmarco_hybrid_project("stream-short", &configs.to_string());
+    // Drop the last payload row: the stream would only find it after every
+    // batch had been sent.
+    let payloads = proj.root.join("datasets/stream-short/payloads.jsonl");
+    let text = std::fs::read_to_string(&payloads).unwrap();
+    let keep = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0;
+    std::fs::write(&payloads, format!("{keep}\n")).unwrap();
+    let port = test_port().to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        "redis-stream-short",
+        "stream-short",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &["--upload-reader", "stream"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let all = format!("{stdout}\n{stderr}");
+    assert!(
+        all.contains("payload pre-flight failed") && all.contains("doesn't match vector count"),
+        "{all}"
+    );
+    let keys: i64 = redis::cmd("DBSIZE").query(&mut conn).unwrap();
+    assert_eq!(
+        keys, 0,
+        "documents were written before the payload file was checked"
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

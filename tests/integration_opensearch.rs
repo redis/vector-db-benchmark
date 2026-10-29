@@ -2465,3 +2465,59 @@ fn test_binary_opensearch_streaming_upload_hybrid_recall() {
     );
     std::fs::remove_dir_all(proj.root).unwrap();
 }
+
+/// #361 review: the streamed upload's payload pre-flight. A `payloads.jsonl`
+/// one row short is refused before the first bulk request, as on the
+/// in-memory path, rather than after the whole corpus was sent.
+#[test]
+fn test_binary_opensearch_streaming_upload_refuses_a_short_payload_file_before_writing() {
+    wait_for_opensearch();
+    let index = "bench_stream_short";
+    let configs = serde_json::json!([{
+        "name": "os-stream-short", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 1, "top": 10, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 3, "batch_size": 333}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("stream-short", &configs.to_string());
+    // Drop the last payload row: the stream would only find it after every
+    // batch had been sent.
+    let payloads = proj.root.join("datasets/stream-short/payloads.jsonl");
+    let text = std::fs::read_to_string(&payloads).unwrap();
+    let keep = text.trim_end_matches('\n').rsplit_once('\n').unwrap().0;
+    std::fs::write(&payloads, format!("{keep}\n")).unwrap();
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let out = common::run_binary_output(
+        &proj.root,
+        "os-stream-short",
+        "stream-short",
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &["--upload-reader", "stream"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let all = format!("{stdout}\n{stderr}");
+    assert!(
+        all.contains("payload pre-flight failed") && all.contains("doesn't match vector count"),
+        "{all}"
+    );
+    // No document reached the index (a missing index counts as none).
+    let resp = os_client()
+        .get(format!("{}/{index}/_count", os_base_url()))
+        .send()
+        .unwrap();
+    if resp.status().is_success() {
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(
+            body["count"], 0,
+            "documents were written before the check: {body}"
+        );
+    } else {
+        assert_eq!(resp.status().as_u16(), 404);
+    }
+    let _ = os_client()
+        .delete(format!("{}/{index}", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}

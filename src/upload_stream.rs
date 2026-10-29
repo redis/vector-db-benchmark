@@ -432,6 +432,28 @@ pub fn mean_payload_bytes(dir: &Path, rows: u64) -> u64 {
         .unwrap_or(0)
 }
 
+/// Pre-flight of a streamed upload's `payloads.jsonl` (#361 review): every
+/// row is parsed and the rows are counted against `vectors.npy` BEFORE the
+/// first batch is sent. The in-memory reader finds a truncated, overlong or
+/// malformed payload file while reading, before any write; the stream would
+/// otherwise find it at that row, possibly hours into the upload, leaving a
+/// partial corpus on the server that cannot be resumed. `visit` sees each
+/// parsed row (the filter-only metadata-domain check rides on this pass, so
+/// the file is read once); memory is one row. The vectors file's length is
+/// already checked against its header when the stream is opened. An absent
+/// `payloads.jsonl` is the in-memory reader's "no metadata", not an error.
+pub fn preflight_payloads(
+    dir: &Path,
+    visit: impl FnMut(Option<crate::readers::MetadataItem>) -> Result<(), String>,
+) -> Result<(), String> {
+    crate::readers::visit_compound_metadata(dir, visit).map_err(|e| {
+        format!(
+            "{}: payload pre-flight failed; nothing was uploaded: {e}",
+            dir.display()
+        )
+    })
+}
+
 /// Run a streamed ingest on ONE [`IngestClock`] (#344 semantics, #342 path):
 /// the clock starts immediately before `upload` (which streams and sends
 /// every batch), `upload_done` when it returns, then `wait` (the engine's
@@ -577,6 +599,58 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// #361 review: the streamed upload's payload pre-flight refuses a
+    /// truncated, overlong or malformed `payloads.jsonl` (a bad row anywhere,
+    /// the last one included) and visits every row of a good one.
+    #[test]
+    fn payload_preflight_refuses_what_the_stream_would_find_mid_upload() {
+        use super::preflight_payloads;
+        let dir = corpus(5, 2, true);
+        let payloads = dir.path().join("payloads.jsonl");
+        let good = std::fs::read_to_string(&payloads).unwrap();
+        let mut seen = 0;
+        preflight_payloads(dir.path(), |item| {
+            assert!(item.is_some());
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 5);
+
+        let lines: Vec<&str> = good.lines().collect();
+        let cases = [
+            (
+                "truncated",
+                lines[..4].join("\n") + "\n",
+                "doesn't match vector count",
+            ),
+            (
+                "overlong",
+                good.clone() + "{\"row\":5}\n",
+                "doesn't match vector count",
+            ),
+            (
+                "malformed last row",
+                lines[..4].join("\n") + "\n{\"row\":\n",
+                "Failed to parse payload row 5",
+            ),
+        ];
+        for (name, text, want) in cases {
+            std::fs::write(&payloads, text).unwrap();
+            let e = preflight_payloads(dir.path(), |_| Ok(())).unwrap_err();
+            assert!(
+                e.contains(want) && e.contains("nothing was uploaded"),
+                "{name}: {e}"
+            );
+        }
+        // The visitor's refusal (the filter-only domain check) is returned.
+        std::fs::write(&payloads, &good).unwrap();
+        let e = preflight_payloads(dir.path(), |_| Err("bad tag".into())).unwrap_err();
+        assert!(e.contains("bad tag"), "{e}");
+        // No payload file: no metadata, as the in-memory reader.
+        std::fs::remove_file(&payloads).unwrap();
+        preflight_payloads(dir.path(), |_| panic!("no rows to visit")).unwrap();
+    }
     /// #361 review: `auto` decides once per dataset per invocation. The
     /// reading taken at a dataset's first use is reused by every later config
     /// even when memory has since changed enough to flip the decision; each

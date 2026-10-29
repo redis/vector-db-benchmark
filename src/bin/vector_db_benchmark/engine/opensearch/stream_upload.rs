@@ -26,12 +26,17 @@ impl OpenSearchEngine {
         let rows = stream.rows();
         let dim = stream.dim();
         let read_start = Instant::now();
-        // Filter-only's metadata domain is checked BEFORE anything is written
-        // whenever the index serves filter-only (`no-vector` or the shared
-        // `full` layout, #344), as the in-memory path does; here by a
-        // payload-only streaming pass, which is this path's `read_time`.
-        if self.config.layout.serves(Workload::FilterOnly) && !self.scalar_metadata_validated {
-            dataset.validate_scalar_metadata()?;
+        // Pre-flight, BEFORE anything is written (#361 review): one
+        // payload-only pass parses every `payloads.jsonl` row and counts them
+        // against the vectors, so a truncated or malformed file fails here,
+        // as on the in-memory path, not hours into the upload with a partial
+        // corpus on the server. When the index serves filter-only (`no-vector`
+        // or the shared `full` layout, #344) the same pass checks its metadata
+        // domain. This pass is this path's `read_time`.
+        let check_domain =
+            self.config.layout.serves(Workload::FilterOnly) && !self.scalar_metadata_validated;
+        dataset.preflight_streamed_payloads(check_domain)?;
+        if check_domain {
             self.scalar_metadata_validated = true;
         }
         // #339 parity: the in-memory path's whitespace normalization, per batch.

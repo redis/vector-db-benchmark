@@ -411,7 +411,7 @@ which a pre-#344 `vector` ingest never did (`no-vector` always did). Compare
 
 | key | meaning |
 |---|---|
-| `results.read_time` | client-side dataset read, before the first batch; on a `full` or `no-vector` index it includes the filter-only metadata-domain scan of the corpus. Under the streaming reader (`results.upload_reader.reader` = `stream`, #342) only that scan: the corpus is read and decoded inside `upload_time` |
+| `results.read_time` | client-side dataset read, before the first batch; on a `full` or `no-vector` index it includes the filter-only metadata-domain scan of the corpus. Under the streaming reader (`results.upload_reader.reader` = `stream`, #342) it is the payload pre-flight (every `payloads.jsonl` row parsed and counted, carrying that scan when it applies): the corpus is read and decoded inside `upload_time` |
 | `results.index_wait_time` | last batch acknowledged → index searchable |
 | `results.total_ingest_time` | `upload_time + index_wait_time`: first batch → index-ready |
 | `results.upload_docs_per_sec` / `ingest_docs_per_sec` | `upload_count` over each |
@@ -1586,6 +1586,12 @@ Neither side of the run loads it:
   100K, 1M and 10M MS MARCO variants on a host that can load them, so their
   published `upload_time` keeps meaning upload only (on the streaming path,
   disk read and decode run inside the upload window instead of `read_time`).
+  Before the first batch, a streamed upload makes one pass over
+  `payloads.jsonl` that parses every row and counts the rows against
+  `vectors.npy`, so a truncated or malformed file fails up front, with
+  nothing written, as it does on the in-memory path. This pass, which also
+  carries the filter-only metadata-domain check when the index serves
+  filter-only, is the streaming path's `read_time`.
   `memory` forces the old path. An engine without a streaming upload refuses,
   under `auto`, a compound corpus the host cannot load, instead of being
   OOM-killed; `--upload-reader memory` overrides. The check covers the
@@ -1608,7 +1614,10 @@ Neither side of the run loads it:
   index build, 2,277 docs/s; a backfill was not timed).
   `INDEXING_WAIT_SECS=<seconds>` replaces either budget, and the run records
   the budget it used and which slope applied (`INDEXING_WAIT_SECS`,
-  `indexing_wait_phase` in the effective config). An
+  `indexing_wait_phase` in the effective config). It must be a whole number
+  of seconds above zero: a value that is set but does not parse (`100000s`,
+  `-1`, `0`) refuses the run at startup, before any download or connection,
+  instead of falling back to the computed budget. An
   expired budget is an error: the run does not go on to search a partly built
   index. Recovery at 100M: the failed run leaves the uploaded data in place
   (an upload error returns before cleanup), but `--skip-upload` does NOT

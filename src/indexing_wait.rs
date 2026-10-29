@@ -60,6 +60,25 @@ pub const FULL_BUILD_DOCS_PER_EXTRA_SECOND: u64 = 1_000;
 /// The wait budget for `expected` documents in `phase`: `floor_secs` plus the
 /// phase's per-document slope, unless `override_secs` (from
 /// [`INDEXING_WAIT_ENV`]) is set to a positive value.
+/// Parse `INDEXING_WAIT_SECS` (#361 review). Unset is `None` (the computed
+/// budget). A value that is set must be a whole number of seconds greater
+/// than zero, else it is an error, checked once at startup before anything
+/// connects: under #219's rule a declared value the run would not honour
+/// (`100000s`, `-1`, `1e5`, empty) is refused rather than silently replaced
+/// by the computed budget. `0` is refused too: it would read as "no wait"
+/// and is not one; unset the variable for the computed budget.
+pub fn parse_override(raw: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    match raw.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Some(secs)),
+        _ => Err(format!(
+            "{INDEXING_WAIT_ENV}={raw:?} is not a whole number of seconds greater than zero; \
+             set e.g. {INDEXING_WAIT_ENV}=36000, or unset it for the computed budget \
+             (floor + 1 s per 10,000 docs after an upload)"
+        )),
+    }
+}
+
 pub fn budget(
     phase: WaitPhase,
     floor_secs: u64,
@@ -288,6 +307,20 @@ pub fn kividb_ready(algorithm: &str, p: &KividbProgress, expected: u64) -> Resul
 
 #[cfg(test)]
 mod tests {
+    /// #361 review: a set but unparsable `INDEXING_WAIT_SECS` is an error
+    /// (#219), never the computed budget in disguise.
+    #[test]
+    fn indexing_wait_override_is_parsed_strictly() {
+        use super::parse_override;
+        assert_eq!(parse_override(None), Ok(None));
+        assert_eq!(parse_override(Some("36000")), Ok(Some(36_000)));
+        assert_eq!(parse_override(Some(" 90 ")), Ok(Some(90)));
+        for bad in ["100000s", "-1", "0", "", "1e5", "1.5", "ten"] {
+            let e = parse_override(Some(bad)).unwrap_err();
+            assert!(e.contains("INDEXING_WAIT_SECS"), "{bad}: {e}");
+        }
+    }
+
     use super::*;
 
     fn bulk(s: &str) -> redis::Value {

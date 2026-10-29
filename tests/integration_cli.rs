@@ -20,6 +20,63 @@ fn run(args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// #361 review (#219 rule): an `INDEXING_WAIT_SECS` that is set but does not
+/// parse refuses the run at startup, before any download or connection,
+/// instead of running with the computed budget it silently replaced.
+#[test]
+fn an_unparsable_indexing_wait_is_refused_before_download_or_connection() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let datasets = root.path().join("datasets");
+    std::fs::create_dir(&datasets).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    std::fs::write(
+        datasets.join("datasets.json"),
+        json!([{
+            "name":"wait-fixture", "type":"tar", "path":"missing-corpus",
+            "vector_size":1,"distance":"l2",
+            "link":format!("http://127.0.0.1:{port}/must-not-download.tar.gz")
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let engines_file = root.path().join("engines.json");
+    std::fs::write(
+        &engines_file,
+        json!([{"name":"wait-cfg","engine":"redis","search_params":[{}]}]).to_string(),
+    )
+    .unwrap();
+    for bad in ["100000s", "-1"] {
+        let output = Command::new(common::binary_path())
+            .current_dir(root.path())
+            .args([
+                "--engines",
+                "wait-cfg",
+                "--datasets",
+                "wait-fixture",
+                "--host",
+                "127.0.0.1",
+                "--engines-file",
+            ])
+            .arg(&engines_file)
+            .env("REDIS_PORT", &port)
+            .env("INDEXING_WAIT_SECS", bad)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{bad}: {stdout}");
+        assert!(
+            stderr.contains("INDEXING_WAIT_SECS") && stderr.contains(bad),
+            "{bad}: {stderr}"
+        );
+        assert!(!stdout.contains("Experiment stage:"), "{bad}: {stdout}");
+        assert!(!datasets.join("missing-corpus").exists());
+    }
+}
+
 #[test]
 fn help_exits_zero_and_lists_key_flags() {
     let (ok, stdout, _stderr) = run(&["--help"]);

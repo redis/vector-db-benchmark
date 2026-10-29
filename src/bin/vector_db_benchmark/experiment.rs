@@ -109,6 +109,10 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
     }
 
+    // A set but unparsable INDEXING_WAIT_SECS refuses the run here, before
+    // any download, connection or upload (#361 review, #219).
+    crate::effective_config::indexing_wait_override()?;
+
     let dataset_configs = read_dataset_configs()?;
     // A configuration file that fails to load takes EVERY configuration it
     // defines with it, and under a wildcard `--engines` that silently shrinks the
