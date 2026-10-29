@@ -164,7 +164,7 @@ jobs:
   fresh-host:
     # #366's acceptance check: the archive runs on a fresh Ubuntu 22.04 with no
     # toolchain. A bare ubuntu:22.04 container on a native runner of each
-    # architecture: no cargo, no compiler, no libhdf5, no ca-certificates.
+    # architecture: no cargo, no compiler, no libhdf5.
     name: Run on bare ubuntu:22.04 (${{ matrix.platform }})
     needs: [plan, build]
     strategy:
@@ -189,17 +189,21 @@ jobs:
           name: archive-${{ matrix.platform }}
           path: dist
       - name: Extract and run in ubuntu:22.04
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          docker run --rm -v "$PWD:/w:ro" -w /w -e TAG -e SHA ubuntu:22.04 bash -euo pipefail -c '
+          docker run --rm -v "$PWD:/w:ro" -w /w -e TAG -e SHA -e PLATFORM ubuntu:22.04 bash -euo pipefail -c '
             . /etc/os-release; echo "host: $PRETTY_NAME $(uname -m)"
             [[ "$VERSION_ID" == 22.04 ]]
             for t in cargo rustc cc gcc; do
               if command -v "$t" >/dev/null; then echo "not a bare host: $t is installed"; exit 1; fi
             done
-            if ldconfig -p | grep -E "libhdf5|libssl\.so|libcrypto\.so"; then
-              echo "not a bare host: the libraries the archive must bundle are installed"; exit 1
+            # ubuntu:22.04 itself ships libssl3; the archive does not use it
+            # (the build job rejects any binary that links it).
+            if ldconfig -p | grep libhdf5; then
+              echo "not a bare host: libhdf5 is installed"; exit 1
             fi
-            bash scripts/release/verify.sh "dist/vector-db-benchmark-$TAG-'"${{ matrix.platform }}"'.tar.gz" \
+            bash scripts/release/verify.sh "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" \
               --expect-sha "$SHA" --expect-tag "$TAG"'
 
   checksums:
