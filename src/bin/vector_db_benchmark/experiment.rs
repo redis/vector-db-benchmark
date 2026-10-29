@@ -74,7 +74,10 @@ fn run_with_search_watchdog<T>(timeout_secs: f64, label: &str, f: impl FnOnce() 
 }
 
 pub fn run(args: &Args) -> Result<(), String> {
-    println!("vector-db-benchmark v{}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "vector-db-benchmark {}",
+        vector_db_benchmark::build_info::LONG_VERSION
+    );
 
     if args.target_qps != 0.0 {
         if !args.target_qps.is_finite() || args.target_qps <= 0.0 {
@@ -3019,6 +3022,11 @@ fn build_search_result_json(
     // `effective` covers only the knobs resolved through the recording helpers.
     result["params"]["engine_params"] = engine_params.clone();
 
+    // Which build produced these numbers (#366): crate version and the commit
+    // the binary was compiled from, so a result traces back to a release
+    // archive. `git_sha` is null when the build could not tell.
+    result["params"]["build"] = vector_db_benchmark::build_info::provenance();
+
     // Opt-in full-fidelity archival: additionally emit the raw per-query arrays
     // exactly as before. Off by default so large runs stay ~1000x smaller.
     if dump_raw_latencies {
@@ -3232,6 +3240,9 @@ fn build_upload_result_json(
     // false at run level. Compare the search file, or the summary, for the
     // whole-run view.
     result["params"]["engine_params"] = engine_params.clone();
+
+    // Same build block as the search files (#366).
+    result["params"]["build"] = vector_db_benchmark::build_info::provenance();
 
     result
 }
@@ -3859,6 +3870,49 @@ mod tests {
             begin("cfg", &crate::cli::Args::parse_from(["vdbb"]));
             let d = doc(&crate::effective_config::snapshot());
             assert!(d["params"]["engine_params"]["declared"].is_object());
+        }
+
+        /// #366: both result files say which build produced them, so a number
+        /// can be traced to the release archive (or the commit) it came from.
+        #[test]
+        fn search_and_upload_results_carry_the_build_block() {
+            use super::super::{build_search_result_json, build_upload_result_json};
+            use crate::config::SearchParams;
+            use crate::engine::{SearchResults, UploadStats};
+
+            let expected = vector_db_benchmark::build_info::provenance();
+            assert_eq!(expected["crate_version"], env!("CARGO_PKG_VERSION"));
+
+            let search = build_search_result_json(
+                "redis-test",
+                "glove-25-angular",
+                &serde_json::from_value::<SearchParams>(
+                    serde_json::json!({"parallel": 1, "top": 10}),
+                )
+                .unwrap(),
+                &SearchResults {
+                    top: 10,
+                    ..Default::default()
+                },
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                &serde_json::json!({}),
+            );
+            assert_eq!(search["params"]["build"], expected, "search file");
+
+            let upload = build_upload_result_json(
+                "redis-test",
+                "glove-25-angular",
+                &UploadStats::default(),
+                None,
+                &serde_json::json!({}),
+            );
+            assert_eq!(upload["params"]["build"], expected, "upload file");
         }
 
         /// The upload file carries it too, tagged with its phase — and #212's

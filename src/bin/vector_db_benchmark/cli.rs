@@ -9,7 +9,11 @@ use std::path::PathBuf;
 /// Supports redis and vectorsets engines.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "vector-db-benchmark")]
-#[command(version, about = "Run vector database benchmarks", long_about = None)]
+#[command(
+    version = vector_db_benchmark::build_info::LONG_VERSION,
+    about = "Run vector database benchmarks",
+    long_about = None
+)]
 pub struct Args {
     /// Optional subcommand. Without one, the benchmark runs as before.
     #[command(subcommand)]

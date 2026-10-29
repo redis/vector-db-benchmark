@@ -8,6 +8,7 @@ on:
       - '.dockerignore'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'build.rs'
       - 'src/**'
       - 'datasets/datasets.json'
       - 'experiments/configurations/**'

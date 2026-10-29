@@ -97,6 +97,8 @@ src/
   fulltext.rs         # ranked BM25 workload: query terms, pinned analyzers, index checks (#339)
   compare_results.rs  # compare-results: overlap/Jaccard/rank/count vs a reference
   start_gate.rs       # Worker barrier for parallel search
+  build_info.rs       # commit the binaries were built from: `--version`, `params.build`
+                      #   (resolved by build.rs via build_info/resolve.rs, #366)
   config.rs, redis_client.rs, parsers.rs
   bin/
     vector_db_benchmark/

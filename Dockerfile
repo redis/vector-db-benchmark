@@ -21,6 +21,9 @@ WORKDIR /build
 # Copy only Cargo manifests and lock file first, then build dependencies
 # with dummy source files. This layer is cached unless Cargo.toml/lock change.
 COPY Cargo.toml Cargo.lock ./
+# build.rs embeds the git commit (#366) and compiles src/build_info/resolve.rs;
+# both must exist for the dependency layer to build.
+COPY build.rs ./
 
 # Create dummy source structure matching all targets
 RUN mkdir -p src/bin/vector_db_benchmark/engine src/readers src/redisearch src/vectorsets \
@@ -30,6 +33,7 @@ RUN mkdir -p src/bin/vector_db_benchmark/engine src/readers src/redisearch src/v
     && echo "fn main() {}" > src/bin/vector_db_benchmark/main.rs \
     && touch src/lib.rs \
     && touch src/bin/vector_db_benchmark/engine/mod.rs
+COPY src/build_info/resolve.rs ./src/build_info/resolve.rs
 
 # Build dependencies only (this layer is cached)
 # HDF5_DIR is set dynamically to support both amd64 and arm64
@@ -37,6 +41,11 @@ RUN HDF5_DIR=/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/hdf5/serial \
     cargo build --release --bin vector-db-benchmark 2>/dev/null || true
 # Remove dummy source and binary fingerprints, keep compiled dependencies
 RUN rm -rf src target/release/vector-db-benchmark target/release/.fingerprint/vector_db_benchmark-*
+
+# The build context has no .git, so the binary reports "git commit unknown"
+# unless the commit is passed in: --build-arg VDB_BUILD_GIT_SHA=$(git rev-parse HEAD)
+ARG VDB_BUILD_GIT_SHA=""
+ENV VDB_BUILD_GIT_SHA=${VDB_BUILD_GIT_SHA}
 
 # --- Source build layer ---
 # Copy real source code

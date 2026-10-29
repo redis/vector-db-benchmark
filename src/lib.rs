@@ -13,6 +13,7 @@
 //! - `config` - Redis configuration from environment
 //! - `redis_client` - Redis connection management
 
+pub mod build_info;
 pub mod compare_results;
 pub mod config;
 pub mod filter_only;

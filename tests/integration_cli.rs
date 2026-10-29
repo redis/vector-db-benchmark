@@ -20,6 +20,26 @@ fn run(args: &[&str]) -> (bool, String, String) {
     )
 }
 
+/// #366: `--version` names the crate version AND the commit the binary was
+/// built from — the line the release workflow compares against the tag's
+/// commit. The built binary must agree with the library constant it embeds.
+#[test]
+fn version_prints_the_crate_version_and_build_commit() {
+    let (ok, stdout, _stderr) = run(&["--version"]);
+    assert!(ok, "--version should exit 0");
+    assert_eq!(
+        stdout.trim_end(),
+        format!(
+            "vector-db-benchmark {}",
+            vector_db_benchmark::build_info::LONG_VERSION
+        )
+    );
+    assert!(
+        stdout.contains(&format!("{} (git ", env!("CARGO_PKG_VERSION"))),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn help_exits_zero_and_lists_key_flags() {
     let (ok, stdout, _stderr) = run(&["--help"]);

@@ -204,6 +204,33 @@ Experiment stage: Done
 
 ## Quick Start
 
+### Prebuilt binaries (no toolchain, no Docker)
+
+Every release after 0.1.0 carries `vector-db-benchmark-<tag>-linux-x86_64.tar.gz`,
+`…-linux-aarch64.tar.gz`, `…-macos-aarch64.tar.gz` and a `SHA256SUMS` file. The
+Linux archives run on glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+) with nothing
+else installed: HDF5, zlib and OpenSSL are linked in. Each archive is flat. It
+holds all the binaries next to `datasets/datasets.json` and
+`experiments/configurations/`, which the CLI reads from the working directory.
+
+```bash
+# Latest release for this host's OS/arch, checksum-verified, into ./vector-db-benchmark-<tag>
+curl -fsSL https://raw.githubusercontent.com/redis/vector-db-benchmark/master/scripts/install-release.sh | bash
+# A given tag and destination:   … | bash -s -- 0.2.0 /opt/vdb      (or: make install-release TAG=0.2.0 DEST=/opt/vdb)
+
+# Or by hand: pick the archive for this arch and extract it here
+TAG=0.2.0; ARCH=$(uname -m | sed 's/arm64/aarch64/')
+curl -fsSL "https://github.com/redis/vector-db-benchmark/releases/download/$TAG/vector-db-benchmark-$TAG-linux-$ARCH.tar.gz" | tar xz
+./vector-db-benchmark --version   # vector-db-benchmark 0.2.0 (git <commit the archive was built from>)
+./vector-db-benchmark --help
+```
+
+`--version` prints the commit each binary was built from, and every result file
+records it under `params.build` (`crate_version`, `git_sha`, `git_tree`,
+`git_sha_source`). That way a number traces back to the archive that produced it.
+A source build without `.git` (such as the Docker image) reports the commit as
+unknown unless you build with `VDB_BUILD_GIT_SHA=<full sha>`.
+
 ### Docker (recommended)
 
 ```bash

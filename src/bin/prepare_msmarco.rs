@@ -110,6 +110,7 @@ const DISCOVER_CONCURRENCY: usize = 16;
 #[derive(Parser, Debug)]
 #[command(
     name = "prepare-msmarco",
+    version = vector_db_benchmark::build_info::LONG_VERSION,
     about = "Download and prepare an MS MARCO v2.1 + Cohere embed-v3 dataset (vectors + metadata)."
 )]
 struct Args {

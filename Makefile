@@ -3,6 +3,7 @@
 # Targets:
 #   make setup               - Install system deps and Rust toolchain
 #   make install             - Build and install binary to PREFIX (/usr/local)
+#   make install-release     - Download + verify a prebuilt release for this host
 #   make vector-db-benchmark - Build the main CLI binary
 #   make test                - Run Rust unit tests (no docker needed)
 #   make integration-test    - Run integration tests (requires redis:8.6.0 docker)
@@ -95,6 +96,34 @@ install: build
 	install -d $(PREFIX)/bin
 	install -m 755 target/release/vector-db-benchmark $(PREFIX)/bin/vector-db-benchmark
 	@echo "Installed: $(PREFIX)/bin/vector-db-benchmark"
+
+# ============================================================
+# PREBUILT RELEASE ARCHIVES (#366) — .github/workflows/release-binaries.yml
+# runs these on every release and on PRs that touch the build.
+# ============================================================
+
+# Download the prebuilt archive for this host from a GitHub release, verify its
+# checksum and extract it. TAG defaults to the latest release, DEST to
+# ./vector-db-benchmark-<tag>.
+.PHONY: install-release
+install-release:
+	bash scripts/install-release.sh "$(TAG)" "$(DEST)"
+
+# Build + package one target: dist/vector-db-benchmark-<TAG>-<platform>.tar.gz.
+# Statically links HDF5/zlib/OpenSSL (--features release-static), needs cmake
+# and a clean tree. RELEASE=1 also requires TAG to name the crate version.
+RELEASE_TARGET ?= $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+RELEASE_OUT ?= dist
+.PHONY: release-archive
+release-archive:
+	@test -n "$(TAG)" || { echo "usage: make release-archive TAG=<tag> [RELEASE_TARGET=<triple>] [RELEASE=1]"; exit 2; }
+	bash scripts/release/package.sh --target "$(RELEASE_TARGET)" --tag "$(TAG)" --out "$(RELEASE_OUT)" $(if $(RELEASE),--release)
+
+# Write, then re-check, SHA256SUMS over every archive in RELEASE_OUT.
+.PHONY: release-checksums
+release-checksums:
+	bash scripts/release/checksums.sh write "$(RELEASE_OUT)"
+	bash scripts/release/checksums.sh check "$(RELEASE_OUT)"
 
 # ============================================================
 # TEST - Run Rust unit tests with dataset coverage
@@ -468,6 +497,9 @@ help:
 	@echo "                           Use this, not 'make check' — 'check' runs NO tests."
 	@echo "  make build             - Build Rust code in release mode"
 	@echo "  make install           - Build and install binary to PREFIX (default: /usr/local)"
+	@echo "  make install-release   - Download a prebuilt release for this host [TAG=] [DEST=]"
+	@echo "  make release-archive   - Package a prebuilt release archive TAG=<tag> [RELEASE_TARGET=]"
+	@echo "  make release-checksums - Write + check SHA256SUMS over RELEASE_OUT (default: dist)"
 	@echo "  make test              - Run Rust unit tests (no docker needed)"
 	@echo "  make check             - Linting + formatting ONLY (no tests; see agent-check)"
 	@echo "  make check-strict      - Run linting with warnings as errors"
