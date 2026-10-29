@@ -458,8 +458,9 @@ impl RedisEngine {
                 //
                 // Compression/REDUCE come from the config block or REDIS_SVS_*
                 // (resolved in new()). REDUCE (LeanVec dim-reduction) is only valid
-                // with a LeanVec COMPRESSION. On OSS / non-Intel builds COMPRESSION
-                // silently falls back to basic 8-bit scalar quantization.
+                // with a LeanVec COMPRESSION. On OSS / non-Intel builds the server
+                // falls back to scalar 8-bit quantization (GlobalSQ8); the read-back
+                // after FT.CREATE (`verify_svs_compression`) turns that into an error.
                 let graph_max_degree = self
                     .config
                     .svs_graph_max_degree
@@ -599,6 +600,18 @@ impl RedisEngine {
                 .query(conn)
                 .map_err(|e| format!("Failed to verify HNSW SQ8 index: {e}"))?;
             self.config.hnsw_sq8.verify_ft_info(&info)?;
+        }
+        // SVS compression read-back: without LVQ support the server builds
+        // GlobalSQ8 for any requested COMPRESSION, which must not be published
+        // under the requested name.
+        if !self.config.skip_vector_index && is_svs(&self.config.algorithm) {
+            if let Some(requested) = &self.config.svs_compression {
+                let info: redis::Value = redis::cmd("FT.INFO")
+                    .arg(&self.config.index_name)
+                    .query(conn)
+                    .map_err(|e| format!("Failed to verify SVS compression: {e}"))?;
+                vector_db_benchmark::redis_hnsw_sq8::verify_svs_compression(requested, &info)?;
+            }
         }
 
         Ok(())

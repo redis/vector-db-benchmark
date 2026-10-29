@@ -265,17 +265,7 @@ impl Sq8Options {
         if self.compression.is_none() {
             return Ok(());
         }
-        let attributes = field(info, "attributes").ok_or("FT.INFO has no attributes")?;
-        let entries = match attributes {
-            RedisValue::Array(entries) => entries,
-            _ => return Err("FT.INFO attributes has an unexpected shape".into()),
-        };
-        let vector = entries
-            .iter()
-            .find(|entry| {
-                field(entry, "identifier").and_then(as_string).as_deref() == Some("vector")
-            })
-            .ok_or("FT.INFO has no vector attribute")?;
+        let vector = vector_attribute(info)?;
         let actual_compression = field(vector, "compression").and_then(as_string);
         if actual_compression.as_deref() != self.compression.as_deref() {
             return Err(format!(
@@ -297,6 +287,79 @@ impl Sq8Options {
         }
         Ok(())
     }
+}
+
+/// SVS-VAMANA `COMPRESSION` values RediSearch accepts and the spelling
+/// `FT.INFO` reports back for each on a host with LVQ/LeanVec support.
+/// Source: RediSearch `src/spec.c` (`parseVectorField_svs_quantBits` matches
+/// the request case-insensitively with `STR_EQCASE`), `src/vector_index.h`
+/// (the `VECSIM_LVQ_*` / `VECSIM_LEANVEC_*` strings) and `src/vector_index.c`
+/// `VecSimSvsCompression_ToString`, which `src/info/info_command.c` emits as
+/// the vector attribute's `compression`.
+const SVS_COMPRESSION_FT_INFO: &[&str] = &[
+    "LVQ8",
+    "LVQ4",
+    "LVQ4x4",
+    "LVQ4x8",
+    "LeanVec4x8",
+    "LeanVec8x8",
+];
+
+/// What `FT.INFO` reports for an SVS index built without LVQ/LeanVec
+/// support (`VECSIM_LVQ_SCALAR`). `VecSimSvsCompression_ToString` returns it
+/// for ANY requested compression when `isLVQSupported()` is false, i.e. on a
+/// non-Intel CPU or a build without the Intel SVS optimisations.
+pub const SVS_SCALAR_FALLBACK: &str = "GlobalSQ8";
+
+/// The `FT.INFO` spelling expected for a requested SVS compression: the
+/// canonical name from [`SVS_COMPRESSION_FT_INFO`], or the request itself
+/// for a name this table does not know (a newer server's mode).
+pub fn svs_expected_ft_info_compression(requested: &str) -> &str {
+    SVS_COMPRESSION_FT_INFO
+        .iter()
+        .copied()
+        .find(|c| c.eq_ignore_ascii_case(requested))
+        .unwrap_or(requested)
+}
+
+/// Create-time read-back for SVS-VAMANA `COMPRESSION`: the `vector`
+/// attribute's compression in `FT.INFO` must be the one requested. On a
+/// platform without LVQ support RediSearch builds `GlobalSQ8` for every
+/// request, so a config named after LVQ8 or LeanVec would otherwise publish
+/// scalar-quantised results under that name.
+pub fn verify_svs_compression(requested: &str, info: &RedisValue) -> Result<(), String> {
+    let vector = vector_attribute(info)?;
+    let actual = field(vector, "compression")
+        .and_then(as_string)
+        .ok_or("FT.INFO vector attribute has no compression")?;
+    let expected = svs_expected_ft_info_compression(requested);
+    if actual.eq_ignore_ascii_case(expected) {
+        return Ok(());
+    }
+    if actual == SVS_SCALAR_FALLBACK {
+        return Err(format!(
+            "SVS COMPRESSION: requested {requested}, server built {SVS_SCALAR_FALLBACK} (this \
+             platform has no LVQ/LeanVec support, so RediSearch fell back to scalar 8-bit \
+             quantization); refusing to report its results under the {requested} label"
+        ));
+    }
+    Err(format!(
+        "SVS COMPRESSION: requested {requested} (FT.INFO spelling {expected}), server built \
+         {actual}"
+    ))
+}
+
+/// The `vector` attribute of an `FT.INFO` reply, RESP2 or RESP3.
+fn vector_attribute(info: &RedisValue) -> Result<&RedisValue, String> {
+    let attributes = field(info, "attributes").ok_or("FT.INFO has no attributes")?;
+    let entries = match attributes {
+        RedisValue::Array(entries) | RedisValue::Set(entries) => entries,
+        _ => return Err("FT.INFO attributes has an unexpected shape".into()),
+    };
+    entries
+        .iter()
+        .find(|entry| field(entry, "identifier").and_then(as_string).as_deref() == Some("vector"))
+        .ok_or_else(|| "FT.INFO has no vector attribute".into())
 }
 
 /// A declared value must have the right JSON type, including rejection of null.
@@ -651,6 +714,82 @@ mod tests {
         assert!(default
             .verify_ft_info(&info(&["compression", "SQ8", "training_threshold", "0"]))
             .is_err());
+    }
+
+    /// RESP2 (flat array) and RESP3 (map) `FT.INFO` replies with one
+    /// `vector` attribute carrying `compression`.
+    fn svs_info(compression: Option<&str>) -> [RedisValue; 2] {
+        let s = |s: &str| RedisValue::BulkString(s.as_bytes().to_vec());
+        let mut pairs = vec![
+            (s("identifier"), s("vector")),
+            (s("algorithm"), s("SVS-VAMANA")),
+        ];
+        if let Some(c) = compression {
+            pairs.push((s("compression"), s(c)));
+        }
+        let resp2_attr = RedisValue::Array(
+            pairs
+                .iter()
+                .flat_map(|(k, v)| [k.clone(), v.clone()])
+                .collect(),
+        );
+        let resp2 = RedisValue::Array(vec![
+            s("index_name"),
+            s("idx"),
+            s("attributes"),
+            RedisValue::Array(vec![resp2_attr]),
+        ]);
+        let resp3 = RedisValue::Map(vec![
+            (s("index_name"), s("idx")),
+            (
+                s("attributes"),
+                RedisValue::Array(vec![RedisValue::Map(pairs)]),
+            ),
+        ]);
+        [resp2, resp3]
+    }
+
+    #[test]
+    fn svs_read_back_accepts_the_server_spelling_of_each_compression() {
+        // Shipped configs spell LVQ4X8 / LVQ4X4; FT.INFO reports LVQ4x8 /
+        // LVQ4x4. A correct Intel build must pass in both reply shapes.
+        for (requested, reported) in [
+            ("LVQ8", "LVQ8"),
+            ("LVQ4", "LVQ4"),
+            ("LVQ4X4", "LVQ4x4"),
+            ("LVQ4X8", "LVQ4x8"),
+            ("LeanVec4x8", "LeanVec4x8"),
+            ("leanvec8x8", "LeanVec8x8"),
+        ] {
+            assert_eq!(svs_expected_ft_info_compression(requested), reported);
+            for info in svs_info(Some(reported)) {
+                verify_svs_compression(requested, &info)
+                    .unwrap_or_else(|e| panic!("{requested} -> {reported}: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn svs_read_back_refuses_the_scalar_fallback_and_other_mismatches() {
+        for info in svs_info(Some("GlobalSQ8")) {
+            let e = verify_svs_compression("LVQ8", &info).unwrap_err();
+            assert!(
+                e.contains("requested LVQ8, server built GlobalSQ8")
+                    && e.contains("no LVQ/LeanVec support"),
+                "{e}"
+            );
+        }
+        for info in svs_info(Some("LVQ4x8")) {
+            let e = verify_svs_compression("LVQ8", &info).unwrap_err();
+            assert!(e.contains("server built LVQ4x8"), "{e}");
+        }
+        for info in svs_info(Some("NO_COMPRESSION")) {
+            assert!(verify_svs_compression("LeanVec4x8", &info).is_err());
+        }
+        for info in svs_info(None) {
+            let e = verify_svs_compression("LVQ8", &info).unwrap_err();
+            assert!(e.contains("no compression"), "{e}");
+        }
     }
 
     #[test]

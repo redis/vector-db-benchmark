@@ -1654,6 +1654,137 @@ fn test_binary_redis_svs_vamana() {
     fs::remove_dir_all(&project_root).ok();
 }
 
+/// SVS `COMPRESSION` create-time read-back (#325). Without LVQ support
+/// RediSearch builds `GlobalSQ8` for any requested compression, and FT.INFO
+/// says so; a config named for LVQ8 must then fail instead of publishing
+/// scalar-quantised results under the LVQ8 name. Platform-agnostic: a probe
+/// index shows what THIS server builds for LVQ8, and the run must fail with
+/// the read-back error exactly when that is `GlobalSQ8`, and succeed when the
+/// server really builds LVQ8.
+#[test]
+fn test_binary_redis_svs_compression_read_back() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+
+    let _: () = redis::cmd("FT.CREATE")
+        .arg("svs-lvq8-probe")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("svs-lvq8-probe:")
+        .arg("SCHEMA")
+        .arg("vector")
+        .arg("VECTOR")
+        .arg("SVS-VAMANA")
+        .arg("8")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DIM")
+        .arg("16")
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .arg("COMPRESSION")
+        .arg("LVQ8")
+        .query(&mut conn)
+        .expect("probe FT.CREATE with SVS COMPRESSION LVQ8");
+    let probe: redis::Value = redis::cmd("FT.INFO")
+        .arg("svs-lvq8-probe")
+        .query(&mut conn)
+        .expect("probe FT.INFO");
+    let built_scalar = vector_db_benchmark::redis_hnsw_sq8::verify_svs_compression("LVQ8", &probe)
+        .err()
+        .map(|e| e.contains("server built GlobalSQ8"));
+    flush_db(&mut conn);
+
+    let dim = 16;
+    let count = 100;
+    let top = 5;
+    let (_, vectors) = generate_test_vectors(count, dim);
+    let queries: Vec<Vec<f32>> = vectors[..10].to_vec();
+    let neighbors: Vec<Vec<i64>> = queries
+        .iter()
+        .map(|q| brute_force_neighbors(q, &vectors, top))
+        .collect();
+    let engine_config = serde_json::json!([{
+        "name": "test-redis-svs-lvq8",
+        "engine": "redis",
+        "algorithm": "svs-vamana",
+        "collection_params": {
+            "svs-vamana_config": {
+                "GRAPH_MAX_DEGREE": 32,
+                "CONSTRUCTION_WINDOW_SIZE": 200,
+                "compression": "LVQ8"
+            }
+        },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 200 }, "top": top }],
+        "upload_params": { "data_type": "FLOAT32", "parallel": 1, "batch_size": 64 }
+    }]);
+    let project_root = create_test_project(
+        "test-svs-lvq8",
+        &serde_json::to_string_pretty(&engine_config).unwrap(),
+        &vectors,
+        &queries,
+        &neighbors,
+        "l2",
+        dim,
+    );
+    let output = Command::new(binary_path())
+        .args([
+            "--engines",
+            "test-redis-svs-lvq8",
+            "--datasets",
+            "test-svs-lvq8",
+            "--host",
+            "localhost",
+        ])
+        .env("REDIS_PORT", test_port().to_string())
+        .env_remove("REDIS_SVS_COMPRESSION")
+        .current_dir(&project_root)
+        .output()
+        .expect("Failed to run vector-db-benchmark");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let results = project_root.join("results");
+    let search_results = fs::read_dir(&results)
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.starts_with("test-redis-svs-lvq8-") && n.contains("-search-")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    match built_scalar {
+        // This server falls back to GlobalSQ8: the run must refuse it.
+        Some(true) => {
+            assert!(
+                !output.status.success(),
+                "an LVQ8 config on a GlobalSQ8-only server must fail.\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert!(
+                stderr.contains("requested LVQ8, server built GlobalSQ8")
+                    || stdout.contains("requested LVQ8, server built GlobalSQ8"),
+                "expected the SVS read-back error.\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert_eq!(search_results, 0, "no search result may be published");
+        }
+        // This server builds real LVQ8: the read-back must accept it.
+        None => {
+            assert!(
+                output.status.success(),
+                "an LVQ8 config on an LVQ-capable server must pass.\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            assert!(search_results > 0, "expected a search result");
+        }
+        Some(false) => panic!("probe index reported an unexpected compression: {probe:?}"),
+    }
+    flush_db(&mut conn);
+    fs::remove_dir_all(&project_root).ok();
+}
+
 #[test]
 fn test_binary_redis_open_loop_fixed_qps() {
     wait_for_redis();

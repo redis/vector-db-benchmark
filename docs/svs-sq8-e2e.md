@@ -27,11 +27,20 @@ CONSTRUCTION_WINDOW_SIZE=200. These are starting construction settings:
 equal numeric knobs do not imply equal graph structure or equal recall.
 Report each algorithm's measured speed/quality tradeoff.
 
-On the pinned Arm Neoverse-V2 development host build, requested SVS LVQ8 reports
-`GlobalSQ8` in FT.INFO and scalar quantization in VECSIM_INFO. Label results
-with that effective compression, CPU and build. They do not measure Intel LVQ
-performance. Read back the SVS graph degree, construction window, compression
-and actual training threshold; the HNSW threshold field does not configure SVS.
+On a server without LVQ/LeanVec support (any non-Intel CPU, such as the pinned
+Arm Neoverse-V2 development host, or a build without the Intel SVS
+optimisations), RediSearch builds `GlobalSQ8` scalar quantization for every
+requested SVS `COMPRESSION` and reports `GlobalSQ8` in FT.INFO. The harness reads
+the compression back from FT.INFO right after `FT.CREATE`. A mismatch is a fatal
+error naming the requested and the built compression, so on such a host the
+`redis-compare-*-svs-lvq8` configurations fail loudly instead of publishing
+scalar-quantised results under the LVQ8 name. They measure Intel LVQ only on an
+LVQ-capable host. The read-back accepts the server's own spelling (for example a
+requested `LVQ4X8` is reported as `LVQ4x8`). Under `--skip-upload` there is no
+read-back yet; that is tracked in
+[#374](https://github.com/redis/vector-db-benchmark/issues/374). Also read back
+the SVS graph degree, construction window and actual training threshold; the
+HNSW threshold field does not configure SVS.
 
 ## Dataset and workers
 
