@@ -8,9 +8,12 @@ name: Release binaries
 # carry the right commit, run on a bare ubuntu:22.04 for both architectures and
 # check out against SHA256SUMS, before a release depends on it.
 #
-# Re-running for a tag that already has assets refuses unless dispatched with
-# `clobber: true`, which then replaces the WHOLE set (and deletes any stale
-# archive of that tag), so a release never mixes archives from two builds.
+# Re-running for a tag that already has assets from a DIFFERENT build refuses
+# unless dispatched with `clobber: true`, which then replaces the whole set
+# (and deletes any stale archive of that tag), so a release never mixes
+# archives from two builds. Re-running after a partial upload of the same build
+# just completes it. The decisions live in scripts/release/publish.sh and are
+# exercised on every PR by `make release-selftest` against a fake `gh`.
 
 on:
   release:
@@ -33,6 +36,8 @@ on:
       - 'build.rs'
       - 'src/**'
       - 'Makefile'
+      - 'LICENSE'
+      - 'README.md'
       - 'scripts/release/**'
       - 'scripts/install-release.sh'
       - 'datasets/datasets.json'
@@ -42,6 +47,12 @@ on:
 
 permissions:
   contents: read
+
+# The toolchain every archive is built with, pinned so a tag can be rebuilt
+# with the same compiler. BUILD-INFO.txt in each archive records `rustc -vV`.
+# Bump deliberately (a PR runs the full archive check with the new one).
+env:
+  RELEASE_RUST_TOOLCHAIN: '1.99.1'
 
 concurrency:
   group: release-binaries-${{ github.event.release.tag_name || inputs.tag || github.ref }}
@@ -131,16 +142,17 @@ jobs:
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
-          rustup toolchain install stable --profile minimal --target "$TARGET"
-          rustup default stable
+          rustup toolchain install "$RELEASE_RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RELEASE_RUST_TOOLCHAIN"
           rustc -vV
+          rustc -vV | grep -qx "release: $RELEASE_RUST_TOOLCHAIN"
 
       # Cached on PRs only. A release builds from scratch, so nothing a PR
       # compiled can end up in a published archive.
       - uses: Swatinem/rust-cache@v2
         if: github.event_name == 'pull_request'
         with:
-          key: release-static-${{ matrix.target }}
+          key: release-static-${{ matrix.target }}-${{ env.RELEASE_RUST_TOOLCHAIN }}
 
       # The static HDF5 (+ zlib) this archive links is not the system library
       # the rest of CI tests against: read a DEFLATE-compressed HDF5 file
@@ -188,7 +200,7 @@ jobs:
         with:
           name: archive-${{ matrix.platform }}
           path: dist
-      - name: Extract and run in ubuntu:22.04
+      - name: Extract and run in ubuntu:22.04 (no libssl, no CA bundle)
         env:
           PLATFORM: ${{ matrix.platform }}
         run: |
@@ -198,13 +210,28 @@ jobs:
             for t in cargo rustc cc gcc; do
               if command -v "$t" >/dev/null; then echo "not a bare host: $t is installed"; exit 1; fi
             done
-            # ubuntu:22.04 itself ships libssl3; the archive does not use it
-            # (the build job rejects any binary that links it).
-            if ldconfig -p | grep libhdf5; then
-              echo "not a bare host: libhdf5 is installed"; exit 1
+            # The stock image ships libssl3. Remove it, so a binary that still
+            # needed the system OpenSSL could not run here by accident.
+            dpkg --remove --force-depends libssl3 >/dev/null
+            ldconfig
+            if ldconfig -p | grep -E "libssl|libcrypto|libhdf5"; then
+              echo "not a bare host: libraries the archive must carry are installed"; exit 1
             fi
+            [[ ! -e /etc/ssl/certs/ca-certificates.crt ]]
             bash scripts/release/verify.sh "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" \
-              --expect-sha "$SHA" --expect-tag "$TAG"'
+              --expect-sha "$SHA" --expect-tag "$TAG"
+            # Negative control for the TLS probe below: with no CA bundle the
+            # certificate check must fail.
+            mkdir /tmp/x && tar xzf "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" -C /tmp/x
+            bash scripts/release/tls-probe.sh /tmp/x expect-fail'
+      - name: HTTPS through the static OpenSSL (ubuntu:22.04 + ca-certificates)
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e TAG -e PLATFORM ubuntu:22.04 bash -euo pipefail -c '
+            apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends ca-certificates >/dev/null
+            mkdir /tmp/x && tar xzf "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" -C /tmp/x
+            bash scripts/release/tls-probe.sh /tmp/x expect-ok'
 
   checksums:
     name: SHA256SUMS + install script
@@ -222,6 +249,8 @@ jobs:
           pattern: archive-*
           path: dist
           merge-multiple: true
+      - name: Release script self-test (make release-selftest)
+        run: make release-selftest
       - name: Exactly one archive per platform
         run: |
           set -euo pipefail
@@ -277,36 +306,12 @@ jobs:
           path: dist
       - name: Re-check the set being uploaded
         run: bash scripts/release/checksums.sh check dist
-      - name: Upload (refuses to overwrite unless clobber)
-        run: |
-          set -euo pipefail
-          mapfile -t ours < <(cd dist && ls)
-          mapfile -t existing < <(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
-          # Ours, plus any stale archive of this tag a previous run left behind.
-          conflicting=()
-          for a in "${existing[@]}"; do
-            if [[ "$a" == SHA256SUMS || ( "$a" == "vector-db-benchmark-$TAG-"* && "$a" == *.tar.gz ) ]]; then
-              conflicting+=("$a")
-            fi
-          done
-          if [[ ${#conflicting[@]} -gt 0 ]]; then
-            if [[ "$CLOBBER" != true ]]; then
-              echo "::error::release $TAG already has: ${conflicting[*]}. Refusing to mix builds; re-run via workflow_dispatch with clobber: true to replace the whole set."
-              exit 1
-            fi
-            for a in "${conflicting[@]}"; do
-              if ! printf '%s\n' "${ours[@]}" | grep -qxF "$a"; then
-                echo "deleting stale asset $a"
-                gh release delete-asset "$TAG" "$a" -R "$GITHUB_REPOSITORY" --yes
-              fi
-            done
-          fi
-          # Archives first, SHA256SUMS last: a reader never sees checksums for
-          # archives that are not there yet.
-          archives=()
-          for f in "${ours[@]}"; do [[ "$f" == SHA256SUMS ]] || archives+=("dist/$f"); done
-          gh release upload "$TAG" "${archives[@]}" -R "$GITHUB_REPOSITORY" --clobber
-          gh release upload "$TAG" dist/SHA256SUMS -R "$GITHUB_REPOSITORY" --clobber
+      # Refuses a different build unless clobber; resumes a partial upload of
+      # this one. Every branch is covered by `make release-selftest`.
+      - name: Upload (scripts/release/publish.sh)
+        env:
+          REPO: ${{ github.repository }}
+        run: bash scripts/release/publish.sh "$TAG" dist
       - name: Verify what the release now serves
         run: |
           set -euo pipefail

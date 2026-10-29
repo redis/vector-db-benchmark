@@ -119,6 +119,13 @@ release-archive:
 	@test -n "$(TAG)" || { echo "usage: make release-archive TAG=<tag> [RELEASE_TARGET=<triple>] [RELEASE=1]"; exit 2; }
 	bash scripts/release/package.sh --target "$(RELEASE_TARGET)" --tag "$(TAG)" --out "$(RELEASE_OUT)" $(if $(RELEASE),--release)
 
+# Self-test of the release shell logic (tag/version policy, SHA256SUMS checks,
+# unsafe-archive refusal, and publish.sh's refuse / resume / clobber decisions
+# against a fake gh). No network, no cargo; runs in the PR check.
+.PHONY: release-selftest
+release-selftest:
+	bash scripts/release/selftest.sh
+
 # Write, then re-check, SHA256SUMS over every archive in RELEASE_OUT.
 .PHONY: release-checksums
 release-checksums:
@@ -502,6 +509,7 @@ help:
 	@echo "  make install-release   - Download a prebuilt release for this host [TAG=] [DEST=]"
 	@echo "  make release-archive   - Package a prebuilt release archive TAG=<tag> [RELEASE_TARGET=]"
 	@echo "  make release-checksums - Write + check SHA256SUMS over RELEASE_OUT (default: dist)"
+	@echo "  make release-selftest  - Self-test the release scripts (publish logic vs a fake gh)"
 	@echo "  make test              - Run Rust unit tests (no docker needed)"
 	@echo "  make check             - Linting + formatting ONLY (no tests; see agent-check)"
 	@echo "  make check-strict      - Run linting with warnings as errors"

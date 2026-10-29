@@ -51,14 +51,24 @@ archive="$(cd "$(dirname "$archive")" && pwd)/$base"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 cd "$work"
+
+# Inspect every member BEFORE extracting anything: an absolute path or a `..`
+# component could write outside this directory, and a link member could point
+# a later member (or a binary we are about to run) anywhere. The archive is
+# plain files and directories only.
+members="$(tar tzf "$archive")" || fail "cannot list $base"
+while IFS= read -r p; do
+  case "/$p/" in
+    //*|*/../*) fail "archive member escapes the extraction directory: $p" ;;
+  esac
+done <<<"$members"
+# `tar tv` prints the type as the first character of the mode column.
+if tar tvzf "$archive" | cut -c1 | grep -q '[^-d]'; then
+  fail "archive contains a link or special member: $(tar tvzf "$archive" | grep -v '^[-d]' | head -n3)"
+fi
+
 # The way the README tells people to install it.
 gzip -dc "$archive" | tar x
-
-for p in $(tar tzf "$archive"); do
-  case "$p" in
-    /*|../*|*/../*) fail "archive member escapes the extraction directory: $p" ;;
-  esac
-done
 
 info="BUILD-INFO.txt"
 [[ -f "$info" ]] || fail "no $info at the archive root"
@@ -78,6 +88,18 @@ done
 actual="$(find . -maxdepth 1 -type f -perm -u+x | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')"
 expected="$(printf '%s\n' "${listed[@]}" | LC_ALL=C sort | tr '\n' ' ')"
 [[ "$actual" == "$expected" ]] || fail "executables at the archive root [$actual] != BUILD-INFO binaries [$expected]"
+
+# What the dynamic loader actually resolves on THIS host: nothing missing, and
+# none of the libraries the archive is supposed to carry inside it.
+if [[ "$(uname -s)" == Linux ]] && command -v ldd >/dev/null 2>&1; then
+  for b in "${listed[@]}"; do
+    deps="$(ldd "./$b" 2>&1)" || fail "ldd ./$b failed: $deps"
+    if grep -E 'not found|libssl|libcrypto|libhdf5|libz\.so' <<<"$deps"; then
+      fail "$b resolves a library the archive should not need (above)"
+    fi
+  done
+  echo "ok: ldd resolves only system libraries for ${#listed[@]} binaries"
+fi
 
 for f in datasets/datasets.json datasets/random-100/vectors.jsonl experiments/configurations LICENSE README.md; do
   [[ -e "$f" ]] || fail "archive is missing $f"

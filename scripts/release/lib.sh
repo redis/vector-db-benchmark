@@ -56,6 +56,8 @@ for p in json.load(sys.stdin)["packages"]:
 
 # Oldest glibc the Linux archives promise to run on: Ubuntu 22.04's.
 MAX_GLIBC=2.35
+# Oldest macOS the macOS archive promises (MACOSX_DEPLOYMENT_TARGET in the workflow).
+MAX_MACOS_MINOS=11.0
 
 # `check_portable_linkage <binary> <target>` — fail unless the binary needs
 # nothing a fresh host lacks. Linux: only glibc's own libraries and libgcc_s
@@ -87,7 +89,15 @@ check_portable_linkage() {
           *) echo "$bin: links $lib, which is not part of macOS" >&2; return 1 ;;
         esac
       done < <(otool -L "$bin" | tail -n +2 | awk '{print $1}')
-      echo "linkage ok: $(basename "$bin")"
+      # The oldest macOS the binary loads on (LC_BUILD_VERSION minos) must not
+      # exceed the one promised; C code built by cmake/cc defaults to the SDK's.
+      newest="$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f && $1 == "minos" {print $2; exit}')"
+      [[ -n "$newest" ]] || { echo "$bin: no LC_BUILD_VERSION minos" >&2; return 1; }
+      if [[ "$(printf '%s\n%s\n' "$newest" "$MAX_MACOS_MINOS" | sort -V | tail -n1)" != "$MAX_MACOS_MINOS" ]]; then
+        echo "$bin: minos $newest is newer than the promised macOS $MAX_MACOS_MINOS" >&2
+        return 1
+      fi
+      echo "linkage ok: $(basename "$bin") (minos $newest)"
       ;;
     *) echo "check_portable_linkage: unsupported target $target" >&2; return 1 ;;
   esac

@@ -1651,15 +1651,25 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
     for needed in [
         "make release-archive",
         "make release-checksums",
+        "make release-selftest",
         "scripts/release/verify.sh",
+        "scripts/release/publish.sh",
+        "scripts/release/tls-probe.sh",
         "scripts/install-release.sh",
         "ubuntu:22.04",
+        "RELEASE_RUST_TOOLCHAIN",
     ] {
         assert!(
             wf.contains(needed),
             "release-binaries.yml no longer uses `{needed}`"
         );
     }
+    // The upload decisions (refuse / resume / clobber) live in publish.sh, where
+    // the self-test reaches them; an inline `gh release upload` would not be.
+    assert!(
+        !wf.contains("gh release upload") && !wf.contains("--clobber"),
+        "release-binaries.yml uploads assets inline; go through scripts/release/publish.sh"
+    );
     for line in wf.lines() {
         let line = line.trim();
         assert!(
@@ -1690,6 +1700,8 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
         "'build.rs'",
         "'src/**'",
         "'Makefile'",
+        "'LICENSE'",
+        "'README.md'",
         "'scripts/release/**'",
         "'scripts/install-release.sh'",
         "'datasets/datasets.json'",

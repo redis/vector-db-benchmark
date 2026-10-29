@@ -50,10 +50,14 @@ fn main() {
         .map(|s| !s.trim().is_empty()),
     };
 
-    // Re-run when HEAD moves (checkout, commit) or the index changes.
+    // Re-run when HEAD moves (checkout, commit, reset) or the index changes.
+    // `logs/HEAD` (HEAD's reflog) is appended on every move of HEAD, including
+    // a commit to a branch whose ref was packed and so had no loose file to
+    // watch until that commit wrote one.
     if probe.toplevel.as_deref() == Some(manifest_canon.as_path()) {
         let mut paths = vec![
             "HEAD".to_string(),
+            "logs/HEAD".to_string(),
             "index".to_string(),
             "packed-refs".to_string(),
         ];

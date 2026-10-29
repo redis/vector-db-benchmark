@@ -58,9 +58,10 @@ base64 = "0.22"
 # compile HDF5, zlib and OpenSSL from source and link them statically, so the
 # archive runs on a host with no libhdf5 / libssl installed. Default builds
 # (Docker image, `cargo build`, CI) do not enable it and keep linking the
-# system libraries exactly as before. Versions are the ones the lock already
-# resolves for the transitive copies, so enabling the feature adds the `-src`
-# crates and nothing else.
+# system libraries exactly as before. `hdf5-sys` and `openssl` are the versions
+# the lock already resolves for the transitive copies; the feature adds four
+# build-only crates to the lock (`hdf5-src`, `openssl-src`, `libz-sys`, `cmake`)
+# and changes no existing version.
 hdf5-sys = { version = "0.8.1", optional = true, features = ["static", "zlib"] }
 libz-sys = { version = "1", optional = true, default-features = false, features = ["static"] }
 
