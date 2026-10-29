@@ -445,12 +445,9 @@ impl RedisEngine {
             // (is_svs), but RediSearch requires the exact `SVS-VAMANA` keyword —
             // so normalize any SVS spelling to it rather than passing a token
             // like `SVS` that FT.CREATE would reject.
-            let algo_token = if is_svs(&self.config.algorithm) {
-                "SVS-VAMANA".to_string()
-            } else {
-                self.config.algorithm.to_uppercase()
-            };
-            cmd.arg("vector").arg("VECTOR").arg(algo_token);
+            cmd.arg("vector")
+                .arg("VECTOR")
+                .arg(self.vector_algorithm_token());
             if is_svs(&self.config.algorithm) {
                 // SVS-VAMANA (Redis 8.2+) uses GRAPH_MAX_DEGREE / CONSTRUCTION_WINDOW_SIZE,
                 // NOT HNSW's M / EF_CONSTRUCTION (those are rejected at FT.CREATE:
@@ -607,10 +604,7 @@ impl RedisEngine {
                 .arg(&self.config.index_name)
                 .query(conn)
                 .map_err(|e| format!("Failed to verify vector compression: {e}"))?;
-            self.verify_vector_compression(
-                &info,
-                vector_db_benchmark::redis_hnsw_sq8::ReadBack::Created,
-            )?;
+            self.verify_created_index(&info)?;
         }
 
         Ok(())
@@ -1163,17 +1157,41 @@ impl RedisEngine {
         self.config.layout
     }
 
-    /// The vector field's compression in `info` (FT.INFO of this config's
-    /// index) must be what this run resolved, in both directions: HNSW SQ8 or
-    /// none, SVS compression or `NO_COMPRESSION`. Called after FT.CREATE and,
-    /// via `check_index_layout`, before every search, reused index or not.
-    fn verify_vector_compression(
+    /// The `FT.CREATE` algorithm keyword for this config, which FT.INFO
+    /// reports back verbatim as the field's `algorithm`. SVS is matched by
+    /// substring (`is_svs`), but RediSearch requires the exact `SVS-VAMANA`
+    /// keyword, so any SVS spelling is normalized to it rather than passing a
+    /// token like `SVS` that FT.CREATE would reject.
+    fn vector_algorithm_token(&self) -> String {
+        if is_svs(&self.config.algorithm) {
+            vector_db_benchmark::redis_hnsw_sq8::SVS_ALGORITHM.to_string()
+        } else {
+            self.config.algorithm.to_uppercase()
+        }
+    }
+
+    /// Read-back right after this run's FT.CREATE: strict (the `vector`
+    /// field it just declared must be there).
+    fn verify_created_index(&self, info: &redis::Value) -> Result<(), String> {
+        self.verify_vector_field(info, vector_db_benchmark::redis_hnsw_sq8::ReadBack::Created)
+    }
+
+    /// Read-back before every search, of an index this or another invocation
+    /// built: a fulltext-only index (no `vector` field) passes.
+    fn verify_reused_index(&self, info: &redis::Value) -> Result<(), String> {
+        self.verify_vector_field(info, vector_db_benchmark::redis_hnsw_sq8::ReadBack::Reused)
+    }
+
+    /// The vector field in `info` (FT.INFO of this config's index) must have
+    /// this config's algorithm and the compression this run resolved, in both
+    /// directions: HNSW SQ8 or none, SVS compression or `NO_COMPRESSION`.
+    fn verify_vector_field(
         &self,
         info: &redis::Value,
         when: vector_db_benchmark::redis_hnsw_sq8::ReadBack,
     ) -> Result<(), String> {
         vector_db_benchmark::redis_hnsw_sq8::verify_vector_field_compression(
-            is_svs(&self.config.algorithm),
+            &self.vector_algorithm_token(),
             &self.config.hnsw_sq8,
             self.config.svs_compression.as_deref(),
             info,
@@ -3474,11 +3492,8 @@ impl Engine for RedisEngine {
                 .map_err(|e| format!("index layout check ({layout}): {e}"))?;
         }
         if check_compression {
-            self.verify_vector_compression(
-                &info,
-                vector_db_benchmark::redis_hnsw_sq8::ReadBack::Reused,
-            )
-            .map_err(|e| format!("index compression check: {e}"))?;
+            self.verify_reused_index(&info)
+                .map_err(|e| format!("index compression check: {e}"))?;
         }
         Ok(())
     }
@@ -4164,14 +4179,49 @@ mod tests {
         assert_eq!(&bytes[0..4], &1.0f32.to_le_bytes());
     }
 
+    /// Restores one environment variable when dropped.
+    struct EnvGuard(&'static str, Option<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    fn set_env(name: &'static str, value: Option<&str>) -> EnvGuard {
+        let prev = std::env::var(name).ok();
+        match value {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
+        EnvGuard(name, prev)
+    }
+
+    /// `RedisEngine::new` reads `REDIS_HNSW_*` / `REDIS_SVS_*` and writes the
+    /// process-wide recorder. Hold the recorder's test lock and clear those
+    /// variables (restored on drop, before the lock is released), so the tests
+    /// pass in a shell where a developer exported them for a run, as the run
+    /// guides say to.
+    fn isolated_engine_env() -> impl Sized {
+        let lock = crate::effective_config::test_lock();
+        let env = [
+            "REDIS_HNSW_COMPRESSION",
+            "REDIS_HNSW_TRAINING_THRESHOLD",
+            "REDIS_SVS_COMPRESSION",
+            "REDIS_SVS_REDUCE",
+        ]
+        .map(|name| set_env(name, None));
+        (env, lock)
+    }
+
     // Legacy SVS configs (dbpedia-calibration.json shape) nest algorithm,
     // data_type, and the svs-vamana_config block under collection_params. new()
     // must resolve all of them so the config actually selects + configures SVS.
     #[test]
     fn resolves_nested_svs_collection_params() {
-        // RedisEngine::new reads REDIS_HNSW_* and writes the process-wide
-        // recorder; records_resolved_hnsw_sq8_in_effective_config sets both.
-        let _lock = crate::effective_config::test_lock();
+        let _env = isolated_engine_env();
         use super::{is_svs, RedisEngine};
         let cfg_json = serde_json::json!({
             "name": "dbpedia-cal-svs-LeanVec4x8-div4-float16",
@@ -4205,9 +4255,7 @@ mod tests {
     // (no svs block) leaves the SVS fields None + derives nothing.
     #[test]
     fn hnsw_config_leaves_svs_fields_unset() {
-        // RedisEngine::new reads REDIS_HNSW_* and writes the process-wide
-        // recorder; records_resolved_hnsw_sq8_in_effective_config sets both.
-        let _lock = crate::effective_config::test_lock();
+        let _env = isolated_engine_env();
         use super::RedisEngine;
         let cfg_json = serde_json::json!({
             "name": "redis-hnsw",
@@ -4230,7 +4278,7 @@ mod tests {
     #[test]
     fn malformed_svs_compression_or_reduce_is_refused() {
         use super::RedisEngine;
-        let _lock = crate::effective_config::test_lock();
+        let _env = isolated_engine_env();
         for svs in [
             serde_json::json!({ "compression": null }),
             serde_json::json!({ "compression": 8 }),
@@ -4257,24 +4305,8 @@ mod tests {
     #[test]
     fn records_resolved_hnsw_sq8_in_effective_config() {
         use super::RedisEngine;
-        let _lock = crate::effective_config::test_lock();
-        struct Env(&'static str, Option<String>);
-        impl Drop for Env {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(v) => std::env::set_var(self.0, v),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
-        let set = |name: &'static str, value: Option<&str>| {
-            let prev = std::env::var(name).ok();
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-            Env(name, prev)
-        };
+        let _env = isolated_engine_env();
+        let set = set_env;
         let record = |hnsw: serde_json::Value| {
             let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
                 "name": "redis-hnsw-plain",

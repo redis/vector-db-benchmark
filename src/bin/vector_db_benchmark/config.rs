@@ -1462,6 +1462,52 @@ mod tests {
         }
     }
 
+    /// The calibration SQ8 cases were hand-copied from the HNSW baselines;
+    /// the comparison is only fair while each one equals its baseline except
+    /// for the name and the compression keys. An edit to one side of a pair
+    /// fails here.
+    #[test]
+    fn calibration_sq8_cases_equal_their_hnsw_baselines() {
+        for prefix in ["dbpedia", "cohere"] {
+            let path = project_root().join(format!(
+                "experiments/configurations/{prefix}-calibration.json"
+            ));
+            let configs: Vec<serde_json::Value> =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let by_name = |name: &str| -> serde_json::Value {
+                configs
+                    .iter()
+                    .find(|c| c["name"] == name)
+                    .unwrap_or_else(|| panic!("{name} missing from {}", path.display()))
+                    .clone()
+            };
+            let mut pairs = 0;
+            for variant in ["zero", "trained"] {
+                for dt in ["float16", "float32"] {
+                    let mut sq8 = by_name(&format!("{prefix}-cal-hnsw-sq8-{variant}-{dt}"));
+                    let mut baseline = by_name(&format!("{prefix}-cal-hnsw-{dt}"));
+                    let hnsw = sq8["collection_params"]["hnsw_config"]
+                        .as_object_mut()
+                        .unwrap();
+                    assert_eq!(hnsw.remove("COMPRESSION"), Some(serde_json::json!("SQ8")));
+                    let threshold = hnsw.remove("TRAINING_THRESHOLD");
+                    assert!(threshold.is_some(), "{prefix} {variant} {dt}");
+                    assert!(
+                        baseline["collection_params"]["hnsw_config"]
+                            .get("COMPRESSION")
+                            .is_none(),
+                        "{prefix} {dt} baseline must be uncompressed"
+                    );
+                    sq8.as_object_mut().unwrap().remove("name");
+                    baseline.as_object_mut().unwrap().remove("name");
+                    assert_eq!(sq8, baseline, "{prefix} sq8-{variant}-{dt} vs baseline");
+                    pairs += 1;
+                }
+            }
+            assert_eq!(pairs, 4);
+        }
+    }
+
     #[test]
     fn matches_pattern_glob_positions() {
         // prefix* / *suffix / mid*dle

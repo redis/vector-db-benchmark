@@ -74,8 +74,9 @@ differ, the search invocation fails before writing a result, in either
 direction: SQ8 resolved for an uncompressed index, or no compression resolved
 for an SQ8 index (or a different threshold). The same check covers
 `REDIS_INDEX_NAME_EXACT=1`, which points a configuration at an index another
-configuration built. Graph parameters (`M`, `EF_CONSTRUCTION`) are not read
-back on the search path
+configuration built. The reused index's vector field must also have this
+configuration's algorithm (`HNSW`, `FLAT` or `SVS-VAMANA`). Graph parameters
+(`M`, `EF_CONSTRUCTION`) are not read back by the harness
 ([#374](https://github.com/redis/vector-db-benchmark/issues/374)).
 
 The variables apply to every HNSW configuration that lacks `COMPRESSION`,

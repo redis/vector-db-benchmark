@@ -312,9 +312,11 @@ impl Sq8Options {
         if self.compression.is_some() {
             return self.verify_ft_info(info);
         }
+        // RediSearch emits `compression` for HNSW only when quantized and
+        // never for FLAT; `NO_COMPRESSION` is an SVS-only value, so any key
+        // here means the field is not a plain HNSW/FLAT one.
         match field(vector, "compression").and_then(as_string) {
             None => Ok(()),
-            Some(c) if c == SVS_NO_COMPRESSION => Ok(()),
             Some(c) => Err(format!(
                 "this run resolves no HNSW COMPRESSION (neither the config nor \
                  REDIS_HNSW_COMPRESSION sets it), but the index's vector field reports \
@@ -341,12 +343,20 @@ pub enum ReadBack {
     Reused,
 }
 
-/// The one compression read-back the Redis engine calls, after `FT.CREATE`
-/// ([`ReadBack::Created`]) and before every search ([`ReadBack::Reused`]):
-/// HNSW via [`Sq8Options::verify_index_compression`], SVS via
-/// [`verify_svs_index_compression`], both direction-aware.
+/// `FT.INFO`'s `algorithm` for an SVS field (`VecSimAlgorithm_ToString`).
+pub const SVS_ALGORITHM: &str = "SVS-VAMANA";
+
+/// The one vector read-back the Redis engine calls, after `FT.CREATE`
+/// ([`ReadBack::Created`]) and before every search ([`ReadBack::Reused`]).
+/// `algorithm` is the token this config passes to `FT.CREATE` (`FLAT`,
+/// `HNSW` or `SVS-VAMANA`); RediSearch `info_command.c` reports the field's
+/// `algorithm` with the same spelling, and it must match, so a reused index
+/// of another algorithm under this config's name is refused. Compression is
+/// then checked in both directions: HNSW/FLAT via
+/// [`Sq8Options::verify_index_compression`], SVS via
+/// [`verify_svs_index_compression`].
 pub fn verify_vector_field_compression(
-    is_svs: bool,
+    algorithm: &str,
     hnsw: &Sq8Options,
     svs_compression: Option<&str>,
     info: &RedisValue,
@@ -357,7 +367,20 @@ pub fn verify_vector_field_compression(
             format!("{e} right after FT.CREATE declared one; the compression cannot be confirmed")
         })?;
     }
-    if is_svs {
+    if let Some(vector) = vector_attribute_if_any(info)? {
+        match field(vector, "algorithm").and_then(as_string) {
+            Some(built) if built.eq_ignore_ascii_case(algorithm) => {}
+            Some(built) => {
+                return Err(format!(
+                    "this config builds {algorithm}, but the index's vector field is {built}; \
+                     it was built by another config (REDIS_INDEX_NAME_EXACT=1 or --skip-upload \
+                     reuse), and its results would carry this config's label"
+                ))
+            }
+            None => return Err("FT.INFO vector attribute has no algorithm".into()),
+        }
+    }
+    if algorithm.eq_ignore_ascii_case(SVS_ALGORITHM) {
         verify_svs_index_compression(svs_compression, info)
     } else {
         hnsw.verify_index_compression(info)
@@ -991,6 +1014,62 @@ mod tests {
         }
     }
 
+    /// A plain HNSW (or FLAT) config reusing, under its name, an index of
+    /// another algorithm (an uncompressed SVS index reports
+    /// `NO_COMPRESSION`) must be refused, not publish SVS numbers under an
+    /// HNSW label. Both reply shapes.
+    #[test]
+    fn reused_index_of_another_algorithm_is_refused() {
+        let plain = Sq8Options::default();
+        for info in svs_info(Some(SVS_NO_COMPRESSION)) {
+            // The compression check alone: NO_COMPRESSION is SVS-only.
+            let e = plain.verify_index_compression(&info).unwrap_err();
+            assert!(e.contains("NO_COMPRESSION"), "{e}");
+            for (algorithm, when) in [
+                ("HNSW", ReadBack::Reused),
+                ("FLAT", ReadBack::Reused),
+                ("HNSW", ReadBack::Created),
+            ] {
+                let e = verify_vector_field_compression(algorithm, &plain, None, &info, when)
+                    .unwrap_err();
+                assert!(e.contains(&format!("builds {algorithm}")), "{e}");
+                assert!(e.contains("SVS-VAMANA"), "{e}");
+            }
+            assert!(verify_vector_field_compression(
+                "SVS-VAMANA",
+                &plain,
+                None,
+                &info,
+                ReadBack::Reused
+            )
+            .is_ok());
+        }
+        for shape in [hnsw_info_resp2, hnsw_info_resp3] {
+            let info = shape(None, 0);
+            assert!(
+                verify_vector_field_compression("HNSW", &plain, None, &info, ReadBack::Reused)
+                    .is_ok()
+            );
+            assert!(
+                verify_vector_field_compression("hnsw", &plain, None, &info, ReadBack::Reused)
+                    .is_ok()
+            );
+            for algorithm in ["FLAT", "SVS-VAMANA"] {
+                assert!(
+                    verify_vector_field_compression(
+                        algorithm,
+                        &plain,
+                        None,
+                        &info,
+                        ReadBack::Reused
+                    )
+                    .is_err(),
+                    "{algorithm} on an HNSW index"
+                );
+            }
+        }
+    }
+
     /// The search-path check, in both directions and both reply shapes:
     /// requested SQ8 on a plain index, and no compression on an SQ8 index.
     #[test]
@@ -1051,18 +1130,24 @@ mod tests {
         assert!(verify_svs_index_compression(None, &no_attributes).is_err());
         // What configure() and check_index_layout() call: strict right after
         // FT.CREATE, lenient on reuse, for HNSW and SVS, compressed or not.
-        for (is_svs, hnsw, svs) in [
-            (false, &sq8, None),
-            (false, &plain, None),
-            (true, &plain, Some("LVQ8")),
-            (true, &plain, None),
+        for (algorithm, hnsw, svs) in [
+            ("HNSW", &sq8, None),
+            ("HNSW", &plain, None),
+            ("FLAT", &plain, None),
+            ("SVS-VAMANA", &plain, Some("LVQ8")),
+            ("SVS-VAMANA", &plain, None),
         ] {
-            let e =
-                verify_vector_field_compression(is_svs, hnsw, svs, &text_only, ReadBack::Created)
-                    .unwrap_err();
+            let e = verify_vector_field_compression(
+                algorithm,
+                hnsw,
+                svs,
+                &text_only,
+                ReadBack::Created,
+            )
+            .unwrap_err();
             assert!(e.contains("no vector attribute"), "{e}");
             assert!(verify_vector_field_compression(
-                is_svs,
+                algorithm,
                 hnsw,
                 svs,
                 &text_only,
@@ -1074,11 +1159,11 @@ mod tests {
         for when in [ReadBack::Created, ReadBack::Reused] {
             for shape in [hnsw_info_resp2, hnsw_info_resp3] {
                 assert!(
-                    verify_vector_field_compression(false, &sq8, None, &shape(None, 0), when)
+                    verify_vector_field_compression("HNSW", &sq8, None, &shape(None, 0), when)
                         .is_err()
                 );
                 assert!(verify_vector_field_compression(
-                    false,
+                    "HNSW",
                     &plain,
                     None,
                     &shape(Some("SQ8"), 10_240),
@@ -1086,7 +1171,7 @@ mod tests {
                 )
                 .is_err());
                 assert!(verify_vector_field_compression(
-                    false,
+                    "HNSW",
                     &plain,
                     None,
                     &shape(None, 0),
@@ -1095,10 +1180,14 @@ mod tests {
                 .is_ok());
             }
             for info in svs_info(Some("GlobalSQ8")) {
-                assert!(
-                    verify_vector_field_compression(true, &plain, Some("LVQ8"), &info, when)
-                        .is_err()
-                );
+                assert!(verify_vector_field_compression(
+                    "SVS-VAMANA",
+                    &plain,
+                    Some("LVQ8"),
+                    &info,
+                    when
+                )
+                .is_err());
             }
         }
     }

@@ -1834,6 +1834,47 @@ fn test_binary_redis_skip_upload_compression_mismatch_fails() {
     );
     assert_eq!(count_search_results(&root, "redis-cmp-svs"), 0, "{log}");
 
+    // 3. Another algorithm under this config's name: an uncompressed SVS
+    // index (FT.INFO `compression NO_COMPRESSION`) over the HNSW config's
+    // documents, searched by the plain HNSW config, must be refused rather
+    // than publish SVS numbers under the HNSW label.
+    let _: () = redis::cmd("FT.DROPINDEX")
+        .arg("idx:redis-cmp-hnsw")
+        .query(&mut conn)
+        .expect("drop the HNSW index, keeping its documents");
+    let _: () = redis::cmd("FT.CREATE")
+        .arg("idx:redis-cmp-hnsw")
+        .arg(
+            &[
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "redis-cmp-hnsw:",
+                "SCHEMA",
+                "vector",
+            ][..],
+        )
+        .arg(&["VECTOR", "SVS-VAMANA", "6", "TYPE", "FLOAT32", "DIM"][..])
+        .arg(dim)
+        .arg(&["DISTANCE_METRIC", "L2"][..])
+        .query(&mut conn)
+        .expect("out-of-band uncompressed SVS FT.CREATE");
+    let before = count_search_results(&root, "redis-cmp-hnsw");
+    let (ok, log) = run("redis-cmp-hnsw", &["--skip-upload"], &[]);
+    assert!(!ok, "an HNSW search of an SVS index must fail.\n{log}");
+    assert!(
+        log.contains("index compression check")
+            && log.contains("builds HNSW")
+            && log.contains("SVS-VAMANA"),
+        "expected the algorithm mismatch error.\n{log}"
+    );
+    assert_eq!(
+        count_search_results(&root, "redis-cmp-hnsw"),
+        before,
+        "{log}"
+    );
+
     flush_db(&mut conn);
     fs::remove_dir_all(&root).ok();
 }
@@ -2394,6 +2435,36 @@ fn test_binary_redis_hnsw_sq8_reaches_server() {
         stderr.contains("notice: Redis config 'redis-sq8-env' resolves HNSW COMPRESSION SQ8"),
         "the env-sourced SQ8 notice is missing: {stderr}"
     );
+    // The search half of the guide's two-invocation workflow, run without the
+    // env that built redis-sq8-env's SQ8 index: refused before searching, on
+    // a server that really reports HNSW `compression`.
+    let before = count_search_results(&root, "redis-sq8-env");
+    let output = Command::new(binary_path())
+        .args([
+            "--engines",
+            "redis-sq8-env",
+            "--datasets",
+            "test-sq8",
+            "--host",
+            "localhost",
+            "--keep-data",
+            "--skip-if-exists",
+            "false",
+            "--skip-upload",
+        ])
+        .env("REDIS_PORT", test_port().to_string())
+        .env_remove("REDIS_HNSW_COMPRESSION")
+        .env_remove("REDIS_HNSW_TRAINING_THRESHOLD")
+        .current_dir(&root)
+        .output()
+        .expect("run the SQ8 search without env");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "must refuse: {stderr}");
+    assert!(
+        stderr.contains("resolves no HNSW COMPRESSION"),
+        "expected the search-path compression error: {stderr}"
+    );
+    assert_eq!(count_search_results(&root, "redis-sq8-env"), before);
     fs::remove_dir_all(root).ok();
 }
 
