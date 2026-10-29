@@ -36,7 +36,10 @@ if [[ -z "$tag" ]]; then
   latest="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$base/latest")" ||
     die "could not resolve the latest release from $base/latest"
   tag="${latest##*/}"
-  [[ -n "$tag" && "$tag" != latest ]] || die "could not resolve the latest release from $base/latest"
+  # With no published release, /releases/latest lands on the /releases page.
+  [[ "$tag" != releases && "$latest" == */tag/* ]] ||
+    die "$base has no published release to install; pass a tag, or build from source (see README)"
+  latest_resolved=1
 fi
 [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die "invalid tag '$tag'"
 
@@ -46,7 +49,12 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 echo "Downloading $name ($tag) ..."
-curl -fsSL -o "$tmp/$name" "$base/download/$tag/$name" || die "download failed: $base/download/$tag/$name"
+if ! curl -fsSL -o "$tmp/$name" "$base/download/$tag/$name"; then
+  if [[ -n "${latest_resolved:-}" ]]; then
+    die "the latest release, $tag, has no prebuilt archive $name (releases before prebuilt binaries ship none); pass a tag that has one, or build from source (see README)"
+  fi
+  die "no prebuilt archive $name at $base/download/$tag/ (no such release, or it predates prebuilt binaries); build from source (see README)"
+fi
 curl -fsSL -o "$tmp/SHA256SUMS" "$base/download/$tag/SHA256SUMS" || die "download failed: SHA256SUMS"
 
 want="$(awk -v n="$name" '$2 == n {print $1}' "$tmp/SHA256SUMS")"

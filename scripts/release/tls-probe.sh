@@ -13,7 +13,15 @@
 #                 failure is the server's HTTP answer ("create collection failed").
 #  * expect-fail: on a host with no CA bundle, the request must NOT get that far
 #                 ("create collection request failed") — the negative control
-#                 that shows the probe can tell the two apart.
+#                 that shows the probe can tell the two apart. The binary's
+#                 error does not carry the cause, so the probe first proves, in
+#                 the same container, that the name resolves and port 443
+#                 accepts a TCP connection: what is left to fail is TLS.
+#
+# Side effect, intentional: the Chroma client sends an unauthenticated DELETE
+# and then a POST for a collection path to the URL (api.github.com by
+# default). GitHub answers 404 and nothing is created; the probe needs a
+# request that has to pass certificate validation to get any HTTP answer.
 #
 # Runs inside a bare ubuntu:22.04 container in the release workflow.
 set -euo pipefail
@@ -30,6 +38,18 @@ mkdir -p "$work/datasets"
 # config that is not shipped: nothing here depends on the archive's configs.
 printf '%s' '[{"name":"tls-probe","vector_size":4,"distance":"cosine","type":"h5","path":"tls-probe/p.hdf5","link":"https://127.0.0.1:9/never","description":"tls probe"}]' >"$work/datasets/datasets.json"
 printf '%s' '[{"name":"tls-probe","engine":"chroma","connection_params":{},"collection_params":{},"search_params":[{"parallel":1,"search_params":{}}],"upload_params":{"parallel":1}}]' >"$work/engines.json"
+
+if [[ "$mode" == expect-fail ]]; then
+  # DNS + TCP to the same host and port, without TLS (bash's /dev/tcp: the
+  # bare image has no curl), so a failure below is not "no network".
+  hostport="${url#https://}"; hostport="${hostport%%/*}"
+  host="${hostport%%:*}"; port=443; [[ "$hostport" == *:* ]] && port="${hostport##*:}"
+  if ! timeout 20 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null; then
+    echo "tls-probe: FAIL: cannot reach $host:$port over TCP here, so a failed request would prove nothing about TLS" >&2
+    exit 1
+  fi
+  echo "probe: $host:$port reachable over TCP"
+fi
 
 set +e
 out="$(cd "$work" && timeout 120 "$bin" --engines-file engines.json --engines tls-probe \

@@ -13,8 +13,18 @@ mod resolve;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// What the binaries are compiled from. The dirty flag covers exactly these
+/// (an edited README or test is not a different binary), and they are what
+/// cargo watches below, so the flag can never be stale against them.
+const COMPILED_INPUTS: [&str; 4] = ["build.rs", "src", "Cargo.toml", "Cargo.lock"];
+
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
+        // `git status` otherwise refreshes `.git/index` under an optional
+        // lock. Rewriting the index from a build script makes the build its
+        // own input: observed recompiling the crate on EVERY `cargo build`
+        // in a bind-mounted checkout, where the stat cache never matches.
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -31,23 +41,21 @@ fn main() {
     let manifest_canon = manifest_dir.canonicalize().unwrap_or(manifest_dir.clone());
 
     println!("cargo:rerun-if-env-changed=VDB_BUILD_GIT_SHA");
-    println!("cargo:rerun-if-changed=build.rs");
-    // The dirty-tree flag has to follow edits to the sources themselves, not
-    // only commits: a directory here is scanned recursively by cargo.
-    for p in ["src", "Cargo.toml", "Cargo.lock"] {
+    // A directory here is scanned recursively by cargo.
+    for p in COMPILED_INPUTS {
         println!("cargo:rerun-if-changed={p}");
     }
 
+    // Untracked files count under the compiled inputs: a new module that is
+    // compiled in but not committed makes the binary differ from the commit.
+    let mut status = vec!["status", "--porcelain", "--untracked-files=all", "--"];
+    status.extend(COMPILED_INPUTS);
     let probe = resolve::GitProbe {
         toplevel: git(&manifest_dir, &["rev-parse", "--show-toplevel"])
             .map(|s| PathBuf::from(s.trim()))
             .map(|p| p.canonicalize().unwrap_or(p)),
         head: git(&manifest_dir, &["rev-parse", "HEAD"]),
-        dirty: git(
-            &manifest_dir,
-            &["status", "--porcelain", "--untracked-files=no"],
-        )
-        .map(|s| !s.trim().is_empty()),
+        dirty: git(&manifest_dir, &status).map(|s| !s.trim().is_empty()),
     };
 
     // Re-run when HEAD moves (checkout, commit, reset) or the index changes.
@@ -78,6 +86,12 @@ fn main() {
     let src = resolve::resolve(env_override.as_deref(), &manifest_canon, &probe)
         .unwrap_or_else(|e| panic!("{e}"));
 
+    // Cargo always sets TARGET for build scripts; it is the triple being
+    // compiled for (not the host), which is what a result file should name.
+    println!(
+        "cargo:rustc-env=VDB_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap()
+    );
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
     println!(
         "cargo:rustc-env=VDB_GIT_SHA={}",

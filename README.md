@@ -227,9 +227,15 @@ curl -fsSL "https://github.com/redis/vector-db-benchmark/releases/download/$TAG/
 
 `--version` prints the commit each binary was built from, and every result file
 records it under `params.build` (`crate_version`, `git_sha`, `git_tree`,
-`git_sha_source`). That way a number traces back to the archive that produced it.
+`git_sha_source`, plus `target` and `features`, which tell a release archive,
+`["release-static"]` with vendored OpenSSL and bundled HDF5, from a source build
+of the same commit). That way a number traces back to the archive that produced it.
 A source build without `.git` (such as the Docker image) reports the commit as
 unknown unless you build with `VDB_BUILD_GIT_SHA=<full sha>`.
+
+The macOS archive is not signed. The `curl | tar` path above sets no quarantine
+flag, so it runs as is; an archive downloaded through a browser is blocked by
+Gatekeeper until you run `xattr -d com.apple.quarantine <file>` on it.
 
 ### Docker (recommended)
 

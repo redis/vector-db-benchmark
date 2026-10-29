@@ -23,14 +23,34 @@ pub const GIT_SHA_SOURCE: &str = env!("VDB_GIT_SHA_SOURCE");
 /// `0.1.0 (git 0123…cdef)`. Built by [`resolve::version_line`].
 pub const LONG_VERSION: &str = env!("VDB_LONG_VERSION");
 
+/// Target triple the binaries were compiled for, e.g.
+/// `x86_64-unknown-linux-gnu`.
+pub const BUILD_TARGET: &str = env!("VDB_BUILD_TARGET");
+
+/// The non-default cargo features compiled in. `release-static` (what the
+/// release archives are built with) swaps the client stack: vendored OpenSSL
+/// and bundled HDF5 instead of the system libraries, and TLS cost sits in the
+/// timed path of the managed engines. Add a feature here when one is added to
+/// `Cargo.toml`.
+pub fn features() -> Vec<&'static str> {
+    let mut f = Vec::new();
+    if cfg!(feature = "release-static") {
+        f.push("release-static");
+    }
+    f
+}
+
 /// The `params.build` block of every result file: which build produced the
-/// numbers, so a result can be traced to a release archive.
+/// numbers, so a result can be traced to a release archive, and told apart
+/// from a source build of the same commit (`features`, `target`).
 pub fn provenance() -> serde_json::Value {
     serde_json::json!({
         "crate_version": CRATE_VERSION,
         "git_sha": if GIT_SHA == "unknown" { serde_json::Value::Null } else { GIT_SHA.into() },
         "git_tree": GIT_TREE,
         "git_sha_source": GIT_SHA_SOURCE,
+        "target": BUILD_TARGET,
+        "features": features(),
     })
 }
 
@@ -75,11 +95,45 @@ mod tests {
         } else {
             assert_eq!(p["git_sha"], GIT_SHA);
         }
+        // The release archives are built with `release-static` (and their
+        // unit tests run with it in release-binaries.yml); `make agent-check`
+        // builds without it. Both directions are checked between the two.
+        let expect: Vec<&str> = if cfg!(feature = "release-static") {
+            vec!["release-static"]
+        } else {
+            vec![]
+        };
+        assert_eq!(p["features"], serde_json::json!(expect));
+        assert_eq!(p["target"], BUILD_TARGET);
         let mut keys: Vec<_> = p.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(
             keys,
-            ["crate_version", "git_sha", "git_sha_source", "git_tree"]
+            [
+                "crate_version",
+                "features",
+                "git_sha",
+                "git_sha_source",
+                "git_tree",
+                "target"
+            ]
         );
+    }
+
+    /// The triple is the one this test binary runs as: its arch and OS agree
+    /// with the compiled `std::env::consts`, checked independently of how
+    /// `build.rs` obtained it.
+    #[test]
+    fn build_target_names_the_platform_the_code_was_compiled_for() {
+        let arch = std::env::consts::ARCH;
+        assert!(
+            BUILD_TARGET.starts_with(&format!("{arch}-")),
+            "{BUILD_TARGET} vs arch {arch}"
+        );
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            o => o,
+        };
+        assert!(BUILD_TARGET.contains(os), "{BUILD_TARGET} vs os {os}");
     }
 }
