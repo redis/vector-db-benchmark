@@ -44,6 +44,7 @@ if [[ "$mode" == expect-fail ]]; then
   # bare image has no curl), so a failure below is not "no network".
   hostport="${url#https://}"; hostport="${hostport%%/*}"
   host="${hostport%%:*}"; port=443; [[ "$hostport" == *:* ]] && port="${hostport##*:}"
+  # shellcheck disable=SC2016  # $1/$2 expand in the child bash, by design
   if ! timeout 20 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null; then
     echo "tls-probe: FAIL: cannot reach $host:$port over TCP here, so a failed request would prove nothing about TLS" >&2
     exit 1

@@ -13,6 +13,10 @@ on:
       - 'datasets/datasets.json'
       - 'experiments/configurations/**'
       - '.github/workflows/ci.yml'
+      # Read by tests/harness_invariants.rs (INV-A4).
+      - '.github/workflows/release-binaries.yml'
+      - '.github/workflows/docker-build-pr.yml'
+      - 'scripts/release/**'
   pull_request:
     paths:
       - 'Makefile'
@@ -24,6 +28,10 @@ on:
       - 'datasets/datasets.json'
       - 'experiments/configurations/**'
       - '.github/workflows/ci.yml'
+      # Read by tests/harness_invariants.rs (INV-A4).
+      - '.github/workflows/release-binaries.yml'
+      - '.github/workflows/docker-build-pr.yml'
+      - 'scripts/release/**'
 
 jobs:
   check:

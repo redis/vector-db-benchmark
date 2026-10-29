@@ -7,8 +7,10 @@
 #
 # Picks linux-x86_64, linux-aarch64 or macos-aarch64 from `uname`, downloads that
 # archive and SHA256SUMS from the GitHub release, refuses on a checksum mismatch,
-# and extracts into DEST (default ./vector-db-benchmark-<tag>). Without a tag it
-# installs the latest release. Needs curl, tar, gzip and sha256sum/shasum.
+# and extracts into DEST (default ./vector-db-benchmark-<tag>), which must not
+# exist or be empty. Without a tag it installs the latest release. Needs curl,
+# tar, gzip and sha256sum/shasum. Archive members are checked before anything
+# is extracted: plain files and directories inside DEST only.
 #
 # VDB_RELEASE_BASE_URL overrides https://github.com/redis/vector-db-benchmark/releases
 # (CI points it at a file:// directory of freshly built archives).
@@ -18,6 +20,11 @@ tag="${1:-}"
 base="${VDB_RELEASE_BASE_URL:-https://github.com/redis/vector-db-benchmark/releases}"
 
 die() { echo "install-release: $*" >&2; exit 1; }
+
+if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else die "needs sha256sum or shasum to check the download, and found neither"
+fi
 
 case "$(uname -s)" in
   Linux) os=linux ;;
@@ -45,6 +52,10 @@ fi
 
 name="vector-db-benchmark-$tag-$os-$arch.tar.gz"
 dest="${2:-${DEST:-./vector-db-benchmark-$tag}}"
+if [[ -e "$dest" ]]; then
+  [[ -d "$dest" ]] || die "$dest exists and is not a directory"
+  [[ -z "$(ls -A "$dest")" ]] || die "$dest exists and is not empty; remove it or pass another destination"
+fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -59,12 +70,18 @@ curl -fsSL -o "$tmp/SHA256SUMS" "$base/download/$tag/SHA256SUMS" || die "downloa
 
 want="$(awk -v n="$name" '$2 == n {print $1}' "$tmp/SHA256SUMS")"
 [[ -n "$want" ]] || die "SHA256SUMS of $tag does not list $name"
-if command -v sha256sum >/dev/null 2>&1; then
-  got="$(sha256sum "$tmp/$name" | cut -d' ' -f1)"
-else
-  got="$(shasum -a 256 "$tmp/$name" | cut -d' ' -f1)"
-fi
+got="$(sha256 "$tmp/$name")"
 [[ "$got" == "$want" ]] || die "checksum mismatch for $name: got $got, SHA256SUMS says $want"
+
+# Before extracting: no absolute path or `..` (a write outside DEST), and no
+# link or special member (which a later member could be written through).
+members="$(tar -tzf "$tmp/$name")" || die "cannot list $name"
+while IFS= read -r p; do
+  case "/$p/" in //*|*/../*) die "$name has a member outside the destination: $p" ;; esac
+done <<<"$members"
+listing="$(tar -tvzf "$tmp/$name")" || die "cannot list $name"
+odd="$(grep -v '^[-d]' <<<"$listing" || true)"
+[[ -z "$odd" ]] || die "$name has a link or special member: $(head -n1 <<<"$odd")"
 
 mkdir -p "$dest"
 tar -xzf "$tmp/$name" -C "$dest"

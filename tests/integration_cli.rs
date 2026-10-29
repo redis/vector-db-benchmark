@@ -40,6 +40,18 @@ fn version_prints_the_crate_version_and_build_commit() {
     );
 }
 
+/// `--describe build` prints exactly the `params.build` block result files
+/// carry (release packaging copies it into BUILD-INFO.txt).
+#[test]
+fn describe_build_prints_the_provenance_block() {
+    let (ok, stdout, stderr) = run(&["--describe", "build"]);
+    assert!(ok, "--describe build should exit 0: {stderr}");
+    let printed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON on stdout");
+    // The test binary and the CLI binary are built by the same cargo run, so
+    // every field agrees.
+    assert_eq!(printed, vector_db_benchmark::build_info::provenance());
+}
+
 /// #361 review (#219 rule): an `INDEXING_WAIT_SECS` that is set but does not
 /// parse refuses the run at startup, before any download or connection,
 /// instead of running with the computed budget it silently replaced.

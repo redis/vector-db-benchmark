@@ -208,8 +208,9 @@ Experiment stage: Done
 
 Every release after 0.1.0 carries `vector-db-benchmark-<tag>-linux-x86_64.tar.gz`,
 `…-linux-aarch64.tar.gz`, `…-macos-aarch64.tar.gz` and a `SHA256SUMS` file. The
-Linux archives run on glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+) with nothing
-else installed: HDF5, zlib and OpenSSL are linked in. Each archive is flat. It
+Linux archives run on glibc 2.34 or newer (Amazon Linux 2023, RHEL 9, Ubuntu 22.04+,
+Debian 12+) with nothing else installed: HDF5, zlib and OpenSSL are linked in.
+CI runs each one on bare `ubuntu:22.04` and `amazonlinux:2023` containers. Each archive is flat. It
 holds all the binaries next to `datasets/datasets.json` and
 `experiments/configurations/`, which the CLI reads from the working directory.
 
@@ -218,24 +219,54 @@ holds all the binaries next to `datasets/datasets.json` and
 curl -fsSL https://raw.githubusercontent.com/redis/vector-db-benchmark/master/scripts/install-release.sh | bash
 # A given tag and destination:   … | bash -s -- 0.2.0 /opt/vdb      (or: make install-release TAG=0.2.0 DEST=/opt/vdb)
 
-# Or by hand: pick the archive for this arch and extract it here
-TAG=0.2.0; ARCH=$(uname -m | sed 's/arm64/aarch64/')
+# Or by hand, on Linux (on a Mac use …-macos-aarch64.tar.gz): extract here
+TAG=0.2.0; ARCH=$(uname -m)
 curl -fsSL "https://github.com/redis/vector-db-benchmark/releases/download/$TAG/vector-db-benchmark-$TAG-linux-$ARCH.tar.gz" | tar xz
 ./vector-db-benchmark --version   # vector-db-benchmark 0.2.0 (git <commit the archive was built from>)
 ./vector-db-benchmark --help
 ```
 
-`--version` prints the commit each binary was built from, and every result file
-records it under `params.build` (`crate_version`, `git_sha`, `git_tree`,
-`git_sha_source`, plus `target` and `features`, which tell a release archive,
-`["release-static"]` with vendored OpenSSL and bundled HDF5, from a source build
-of the same commit). That way a number traces back to the archive that produced it.
+`--version` prints the commit each binary was built from. Every result file
+records the whole build under `params.build`, and `--describe build` prints the
+same block:
+
+| Field | What it says |
+|---|---|
+| `crate_version`, `git_sha`, `git_tree`, `git_sha_source` | the source: version, commit (`null` if unknown), `clean`/`dirty`, and whether git or `VDB_BUILD_GIT_SHA` named it |
+| `target`, `profile`, `features`, `rustc` | how it was compiled; a release archive says `["release-static"]` |
+| `openssl`, `hdf5` | the library versions actually loaded when the run started |
+
+The last two matter because TLS sits in the timed path of the managed and cloud
+engines. A release archive runs its own OpenSSL (3.x, vendored) and HDF5 (1.10.7,
+bundled), while the Docker image and a `cargo build` use the system's (OpenSSL 3.0
+and HDF5 1.10.8 on Debian 12). So two results from the same commit can differ in
+client overhead, and `params.build` shows which. The vendored OpenSSL also ignores
+the host's crypto-policies (`/etc/crypto-policies`, a FIPS provider); it still
+uses the host's CA certificates.
+
 A source build without `.git` (such as the Docker image) reports the commit as
 unknown unless you build with `VDB_BUILD_GIT_SHA=<full sha>`.
 
 The macOS archive is not signed. The `curl | tar` path above sets no quarantine
 flag, so it runs as is; an archive downloaded through a browser is blocked by
 Gatekeeper until you run `xattr -d com.apple.quarantine <file>` on it.
+
+#### Cutting a release
+
+The release workflow builds the archives from the tag's commit and checks,
+before building anything, that **the tag names the crate version**.
+
+1. Bump `[package].version` in `Cargo.toml` (it is still `0.1.0`), and merge that.
+2. Tag the merged commit `X.Y.Z`, `vX.Y.Z` or a pre-release `X.Y.Z-rc.N`, matching
+   that version. Don't use `+`: GitHub may rename assets named after it.
+3. Publish a GitHub release for the tag. `Release binaries` attaches the three
+   archives and `SHA256SUMS`, then re-downloads them and runs the installer
+   against them.
+
+If the workflow refuses the tag, delete the release, fix the version or the tag,
+and publish again. A published release without archives becomes "latest", and
+the installer one-liner refuses it. To rebuild an existing tag, dispatch the
+workflow with `tag` (add `clobber: true` to replace a different build's assets).
 
 ### Docker (recommended)
 

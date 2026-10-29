@@ -52,7 +52,9 @@ pub struct GitProbe {
     pub toplevel: Option<std::path::PathBuf>,
     /// `git rev-parse HEAD`.
     pub head: Option<String>,
-    /// Whether `git status --porcelain --untracked-files=no` printed anything.
+    /// Whether `git status --porcelain --untracked-files=all -- <compiled
+    /// inputs>` printed anything: a tracked change or an untracked file under
+    /// `build.rs`, `src`, `Cargo.toml` or `Cargo.lock` (see `build.rs`).
     pub dirty: Option<bool>,
 }
 
@@ -129,6 +131,30 @@ pub fn version_line(crate_version: &str, src: &BuildSource) -> String {
         (Some(sha), _) => format!("{crate_version} (git {sha})"),
         (None, _) => format!("{crate_version} (git commit unknown)"),
     }
+}
+
+/// The crate's enabled cargo features, from the `CARGO_FEATURE_<NAME>`
+/// variables cargo gives a build script: lowercased, `_` back to `-`, sorted,
+/// without `default` (which names no behaviour of its own).
+///
+/// Cargo upper-cases names and maps `-` to `_`, so `release-static` arrives as
+/// `CARGO_FEATURE_RELEASE_STATIC`. A feature with a real `_` in its name would
+/// come back as `-`; this crate has none.
+pub fn features_from_env<I>(vars: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut f: Vec<String> = vars
+        .into_iter()
+        .filter_map(|(k, _)| {
+            k.strip_prefix("CARGO_FEATURE_")
+                .map(|n| n.to_ascii_lowercase().replace('_', "-"))
+        })
+        .filter(|n| !n.is_empty() && n != "default")
+        .collect();
+    f.sort();
+    f.dedup();
+    f
 }
 
 /// Tree state as one word, for result files: `clean`, `dirty` or `unknown`.
@@ -289,6 +315,54 @@ mod tests {
             format!("1.2.3 (git {SHA})")
         );
         assert_eq!(tree_state(&asserted), "unknown");
+    }
+
+    /// The dirty probe must reach the result: a tree git reports as modified
+    /// is `dirty` in result files and says so in `--version`.
+    #[test]
+    fn a_dirty_probe_is_reported_as_a_dirty_tree() {
+        let src = resolve(
+            None,
+            Path::new("/src/vdb"),
+            &probe("/src/vdb", Some(SHA), Some(true)),
+        )
+        .unwrap();
+        assert_eq!(src.dirty, Some(true));
+        assert_eq!(tree_state(&src), "dirty");
+        assert!(
+            version_line("0.1.0", &src).ends_with(", dirty tree)"),
+            "{}",
+            version_line("0.1.0", &src)
+        );
+        // And a probe that could not tell is unknown, not clean.
+        let src = resolve(
+            None,
+            Path::new("/src/vdb"),
+            &probe("/src/vdb", Some(SHA), None),
+        )
+        .unwrap();
+        assert_eq!(tree_state(&src), "unknown");
+    }
+
+    #[test]
+    fn features_come_from_cargos_variables() {
+        let vars = |ks: &[&str]| {
+            ks.iter()
+                .map(|k| (k.to_string(), "1".to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            features_from_env(vars(&[
+                "CARGO_FEATURE_RELEASE_STATIC",
+                "CARGO_FEATURE_DEFAULT",
+                "CARGO_PKG_VERSION",
+                "PATH",
+                "CARGO_FEATURE_A",
+            ])),
+            ["a", "release-static"]
+        );
+        assert!(features_from_env(vars(&["CARGO_FEATURE_DEFAULT", "HOME"])).is_empty());
+        assert!(features_from_env(Vec::new()).is_empty());
     }
 
     #[test]

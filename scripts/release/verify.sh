@@ -16,6 +16,10 @@
 #  * each clap binary's `--version` is exactly `<name> <crate version> (git <sha>)`
 #    for the expected commit — not "dirty tree", not "commit unknown" — and its
 #    `--help` exits 0;
+#  * `vector-db-benchmark --describe build` (the `params.build` block of every
+#    result file) names that commit, a clean tree, `release-static`, and, on
+#    THIS host, the same OpenSSL and HDF5 as BUILD-INFO.txt recorded at build
+#    time: a binary that picked up the host's libraries would differ;
 #  * every binary actually runs a real workload from the archive's own files:
 #    `--describe datasets` reads the bundled datasets.json, generate-dataset
 #    writes an .npy corpus that bench_npy reads back, bench_jsonl reads the
@@ -95,7 +99,9 @@ expected="$(printf '%s\n' "${listed[@]}" | LC_ALL=C sort | tr '\n' ' ')"
 # none of the libraries the archive is supposed to carry inside it.
 if [[ "$(uname -s)" == Linux ]] && command -v ldd >/dev/null 2>&1; then
   for b in "${listed[@]}"; do
-    deps="$(ldd "./$b" 2>&1)" || fail "ldd ./$b failed: $deps"
+    # A fully static executable has nothing to resolve; ldd says so and
+    # exits non-zero.
+    deps="$(ldd "./$b" 2>&1)" || [[ "$deps" == *"not a dynamic executable"* ]] || fail "ldd ./$b failed: $deps"
     if grep -E 'not found|libssl|libcrypto|libhdf5|libz\.so' <<<"$deps"; then
       fail "$b resolves a library the archive should not need (above)"
     fi
@@ -114,6 +120,19 @@ for b in "${CLAP_BINS[@]}"; do
   "./$b" --help >/dev/null || fail "$b --help exited non-zero"
   echo "ok: $got"
 done
+
+./vector-db-benchmark --describe build > build.json || fail "--describe build exited non-zero"
+has() { grep -qF -- "$1" build.json; }
+has "\"git_sha\": \"$expect_sha\"" || fail "--describe build does not name $expect_sha: $(cat build.json)"
+has '"git_tree": "clean"' || fail "--describe build does not report a clean tree: $(cat build.json)"
+has '"release-static"' || fail "--describe build does not list the release-static feature: $(cat build.json)"
+for lib in openssl hdf5; do
+  recorded="$(field "$lib")"
+  [[ -n "$recorded" ]] || fail "$info records no $lib version"
+  if [[ "$recorded" == null ]]; then want="\"$lib\": null"; else want="\"$lib\": \"$recorded\""; fi
+  has "$want" || fail "$lib loaded here differs from the build's ($recorded): $(grep -F "\"$lib\"" build.json)"
+done
+echo "ok: --describe build: $expect_sha, release-static, openssl $(field openssl), hdf5 $(field hdf5)"
 
 ./vector-db-benchmark --describe datasets > describe.out || fail "--describe datasets exited non-zero"
 grep -q 'random-100' describe.out || fail "--describe datasets did not list the bundled random-100 dataset"

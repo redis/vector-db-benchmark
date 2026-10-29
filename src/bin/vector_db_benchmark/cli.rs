@@ -195,7 +195,8 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub ef_runtime: Vec<i64>,
 
-    /// Describe available options: 'datasets' or 'engines'
+    /// Describe available options: 'datasets', 'engines', or 'build' (the
+    /// provenance block result files record, as JSON)
     #[arg(long)]
     pub describe: Option<String>,
 

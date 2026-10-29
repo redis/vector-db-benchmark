@@ -1,8 +1,10 @@
-//! Embeds the git commit the binaries are built from (#366).
+//! Embeds the git commit the binaries are built from, and how they were
+//! built (target, features, profile, rustc), for `--version` and every
+//! result file's `params.build` (#366).
 //!
-//! I/O only: runs `git`, hands the answers to `src/build_info/resolve.rs`
-//! (unit-tested as `build_info::resolve`) and emits its decision as `VDB_*`
-//! compile-time variables. With no git, or no `.git` of the crate's own (the
+//! I/O only: runs `git` and `rustc -V`, hands the answers to
+//! `src/build_info/resolve.rs` (unit-tested as `build_info::resolve`) and
+//! emits its decision as `VDB_*` compile-time variables. With no git, or no `.git` of the crate's own (the
 //! Docker build context), the build still succeeds and reports the commit as
 //! unknown; `VDB_BUILD_GIT_SHA` can assert it instead.
 
@@ -16,14 +18,16 @@ use std::process::Command;
 /// What the binaries are compiled from. The dirty flag covers exactly these
 /// (an edited README or test is not a different binary), and they are what
 /// cargo watches below, so the flag can never be stale against them.
+/// `scripts/release/lib.sh` has the same list (COMPILED_INPUTS); INV-A4 in
+/// tests/harness_invariants.rs keeps the two equal.
 const COMPILED_INPUTS: [&str; 4] = ["build.rs", "src", "Cargo.toml", "Cargo.lock"];
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         // `git status` otherwise refreshes `.git/index` under an optional
-        // lock. Rewriting the index from a build script makes the build its
-        // own input: observed recompiling the crate on EVERY `cargo build`
-        // in a bind-mounted checkout, where the stat cache never matches.
+        // lock. A build script must not write to the repository: at 33caa04,
+        // which also watched the index, that recompiled the crate on EVERY
+        // `cargo build` in a bind-mounted checkout.
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(dir)
@@ -41,6 +45,7 @@ fn main() {
     let manifest_canon = manifest_dir.canonicalize().unwrap_or(manifest_dir.clone());
 
     println!("cargo:rerun-if-env-changed=VDB_BUILD_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=RUSTC");
     // A directory here is scanned recursively by cargo.
     for p in COMPILED_INPUTS {
         println!("cargo:rerun-if-changed={p}");
@@ -58,19 +63,27 @@ fn main() {
         dirty: git(&manifest_dir, &status).map(|s| !s.trim().is_empty()),
     };
 
-    // Re-run when HEAD moves (checkout, commit, reset) or the index changes.
-    // `logs/HEAD` (HEAD's reflog) is appended on every move of HEAD, including
-    // a commit to a branch whose ref was packed and so had no loose file to
-    // watch until that commit wrote one.
+    // Re-run when HEAD moves (checkout, commit, reset). The dirty flag needs
+    // nothing more: it covers only COMPILED_INPUTS, which are watched above.
+    // NOT `.git/index`: any `git status` (an IDE polling, a prompt) rewrites
+    // it, which would recompile the lib and every binary with no change.
+    //
+    // `logs/HEAD` (HEAD's reflog) is appended on every move of HEAD. Where
+    // reflogs are off (`core.logAllRefUpdates=false`) and the branch ref is
+    // packed, a commit creates the loose ref file: the ref's directory is
+    // watched for that.
     if probe.toplevel.as_deref() == Some(manifest_canon.as_path()) {
         let mut paths = vec![
             "HEAD".to_string(),
             "logs/HEAD".to_string(),
-            "index".to_string(),
             "packed-refs".to_string(),
         ];
         if let Some(r) = git(&manifest_dir, &["symbolic-ref", "-q", "HEAD"]) {
-            paths.push(r.trim().to_string());
+            let r = r.trim().to_string();
+            if let Some((dir, _)) = r.rsplit_once('/') {
+                paths.push(dir.to_string());
+            }
+            paths.push(r);
         }
         for p in paths {
             if let Some(path) = git(&manifest_dir, &["rev-parse", "--git-path", &p]) {
@@ -92,6 +105,29 @@ fn main() {
         "cargo:rustc-env=VDB_BUILD_TARGET={}",
         std::env::var("TARGET").unwrap()
     );
+    // The features cargo enabled for this crate, from its CARGO_FEATURE_*
+    // variables: derived, so a feature added to Cargo.toml is recorded
+    // without anyone remembering to list it.
+    println!(
+        "cargo:rustc-env=VDB_FEATURES={}",
+        resolve::features_from_env(std::env::vars()).join(",")
+    );
+    // `release` or `debug` (the base profile cargo builds with).
+    println!(
+        "cargo:rustc-env=VDB_BUILD_PROFILE={}",
+        std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into())
+    );
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let rustc_version = Command::new(rustc)
+        .arg("-V")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=VDB_RUSTC_VERSION={rustc_version}");
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
     println!(
         "cargo:rustc-env=VDB_GIT_SHA={}",

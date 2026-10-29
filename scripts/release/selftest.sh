@@ -8,12 +8,14 @@
 # behaves like the real one where it matters (upload refuses an existing name
 # without --clobber; the listing carries `sha256:` digests).
 #
-# Needs bash, coreutils, tar, gzip. No network, no cargo.
+# Needs bash, coreutils, GNU tar (gtar on macOS: `brew install gnu-tar`),
+# gzip and git. No network, no cargo (a fake one stands in).
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release/lib.sh
 source "$here/lib.sh"
+require_gnu_tar || exit 1
 
 t="$(mktemp -d)"
 trap 'rm -rf "$t"' EXIT
@@ -43,6 +45,16 @@ expect "check_tag rejects ../x" 1 check_tag ../x
 expect "check_tag rejects empty" 1 check_tag ""
 expect "platform_for_target rejects riscv" 1 platform_for_target riscv64gc-unknown-linux-gnu
 
+echo "check_release_tag (the plan job's gate, before any build)"
+expect "release 0.2.0 for 0.2.0" 0 check_release_tag 0.2.0 0.2.0
+expect "release v0.2.0 for 0.2.0" 0 check_release_tag v0.2.0 0.2.0
+expect "release 0.2.0-rc.1 for 0.2.0" 0 check_release_tag 0.2.0-rc.1 0.2.0
+expect "release 0.2.0 for crate 0.1.0 refused" 1 check_release_tag 0.2.0 0.1.0
+if grep -q 'does not name the crate version' "$t/out"; then ok "version refusal says why"; else bad "version refusal message: $(cat "$t/out")"; fi
+expect "release 0.2.0+build.1 refused (asset rename)" 1 check_release_tag 0.2.0+build.1 0.2.0
+if grep -q "contains '+'" "$t/out"; then ok "'+' refusal says why"; else bad "'+' refusal message: $(cat "$t/out")"; fi
+expect "release tag a/b refused" 1 check_release_tag a/b 0.2.0
+
 echo "checksums.sh"
 d="$t/cs"
 mkdir -p "$d"
@@ -65,7 +77,7 @@ echo "verify.sh refuses unsafe archives before extracting"
 mk_evil() { # mk_evil <archive> <member name>  — a tar whose member is named literally
   local src="$t/evilsrc"
   rm -rf "$src"; mkdir -p "$src"; printf 'x' >"$src/f"
-  tar -C "$src" --transform "s|^f\$|$2|" -czf "$1" f
+  "$TAR" -C "$src" --transform "s|^f\$|$2|" -czf "$1" f
 }
 ev="$t/ev"; mkdir -p "$ev/tmp"
 mk_evil "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" "../escaped"
@@ -77,7 +89,7 @@ if [[ ! -e "$ev/tmp/escaped" ]]; then ok "nothing written outside the extraction
 mk_evil "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" "a/../../escaped2"
 expect "member a/../../escaped2" 1 bash "$here/verify.sh" "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" --expect-sha 0123456789abcdef0123456789abcdef01234567
 lsrc="$t/lsrc"; mkdir -p "$lsrc"; ln -s /etc/passwd "$lsrc/vector-db-benchmark"
-tar -C "$lsrc" -czf "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" vector-db-benchmark
+"$TAR" -C "$lsrc" -czf "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" vector-db-benchmark
 expect "symlink member" 1 bash "$here/verify.sh" "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" --expect-sha 0123456789abcdef0123456789abcdef01234567
 if grep -q 'link' "$t/out"; then ok "refused for the link, not something else"; else bad "symlink refusal reason: $(cat "$t/out")"; fi
 
@@ -87,9 +99,107 @@ if grep -q 'link' "$t/out"; then ok "refused for the link, not something else"; 
 bsrc="$t/bsrc"; mkdir -p "$bsrc"
 ln -s /etc/passwd "$bsrc/aaa-link"
 for i in $(seq 1 3000); do : >"$bsrc/f$i"; done
-(cd "$bsrc" && tar -czf "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" aaa-link f*)
+(cd "$bsrc" && "$TAR" -czf "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" aaa-link f*)
 expect "link first in a long listing" 1 bash "$here/verify.sh" "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" --expect-sha 0123456789abcdef0123456789abcdef01234567
 if grep -q 'link' "$t/out"; then ok "long listing: refused for the link"; else bad "long-listing link refusal reason: $(tail -n2 "$t/out")"; fi
+
+echo "verify.sh against stand-in archives"
+# A well-formed archive whose "binaries" are scripts answering exactly what
+# verify.sh asks, so every refusal below is checked against a positive control
+# that passes, and fails only for the one thing each case breaks.
+fake_sha=0123456789abcdef0123456789abcdef01234567
+other_sha=fedcba9876543210fedcba9876543210fedcba98
+mk_fake() { # mk_fake <out dir> <tag> <BUILD-INFO sha> <--version sha> <describe sha> <features>
+  local out="$1" tag="$2" info_sha="$3" ver_sha="$4" desc_sha="$5" feats="$6" st="$t/fake-stage" b
+  rm -rf "$st"; mkdir -p "$st/datasets/random-100" "$st/experiments/configurations" "$out"
+  for b in "${REQUIRED_BINS[@]}"; do
+    cat >"$st/$b" <<FAKEBIN
+#!/usr/bin/env bash
+case "\${1:-}" in
+  --version) echo "$b 0.1.0 (git $ver_sha)" ;;
+  --help) echo usage ;;
+  --describe)
+    if [[ "\$2" == build ]]; then
+      printf '{\n  "git_sha": "%s",\n  "git_tree": "clean",\n  "features": [\n    "%s"\n  ],\n  "openssl": "OpenSSL 3.6.3",\n  "hdf5": "1.10.7"\n}\n' "$desc_sha" "$feats"
+    else echo random-100; fi ;;
+  --out-dir) mkdir -p "\$2/synthetic-hybrid-16" && : >"\$2/synthetic-hybrid-16/vectors.npy" ;;
+  *) echo "Throughput: 1 vec/s" ;;
+esac
+FAKEBIN
+    chmod +x "$st/$b"
+  done
+  echo '[{"name":"random-100"}]' >"$st/datasets/datasets.json"
+  echo '{}' >"$st/datasets/random-100/vectors.jsonl"
+  : >"$st/LICENSE"; : >"$st/README.md"
+  printf 'archive: x\ntag: %s\ncrate_version: 0.1.0\ngit_sha: %s\nfeatures: release-static\nopenssl: OpenSSL 3.6.3\nhdf5: 1.10.7\nbinaries: %s\n' \
+    "$tag" "$info_sha" "${REQUIRED_BINS[*]}" >"$st/BUILD-INFO.txt"
+  "$TAR" -C "$st" -czf "$out/vector-db-benchmark-$tag-linux-x86_64.tar.gz" .
+}
+vf="$t/vf"
+verify() { bash "$here/verify.sh" "$vf/vector-db-benchmark-$1-linux-x86_64.tar.gz" --expect-sha "$fake_sha" --expect-tag "${2:-$1}"; }
+mk_fake "$vf" T "$fake_sha" "$fake_sha" "$fake_sha" release-static
+expect "positive control: a well-formed archive passes" 0 verify T
+expect "wrong --expect-tag refused" 1 verify T U
+if grep -q "archive is for tag 'T', expected 'U'" "$t/out"; then ok "  ... for the tag"; else bad "tag refusal reason: $(tail -n1 "$t/out")"; fi
+mk_fake "$vf" T "$other_sha" "$fake_sha" "$fake_sha" release-static
+expect "BUILD-INFO naming another commit refused" 1 verify T
+if grep -q 'BUILD-INFO.txt git_sha' "$t/out"; then ok "  ... for BUILD-INFO's sha"; else bad "sha refusal reason: $(tail -n1 "$t/out")"; fi
+mk_fake "$vf" T "$fake_sha" "$other_sha" "$fake_sha" release-static
+expect "--version naming another commit refused" 1 verify T
+if grep -q -- '--version printed' "$t/out"; then ok "  ... for --version"; else bad "--version refusal reason: $(tail -n1 "$t/out")"; fi
+mk_fake "$vf" T "$fake_sha" "$fake_sha" "$fake_sha" none
+expect "--describe build without release-static refused" 1 verify T
+if grep -q 'release-static feature' "$t/out"; then ok "  ... for the features"; else bad "features refusal reason: $(tail -n1 "$t/out")"; fi
+
+echo "package.sh gates, before cargo runs"
+# A fake cargo that records being reached: every case below must refuse first,
+# and the positive control must get as far as cargo.
+fakecargo="$t/fakecargo"; mkdir -p "$fakecargo"
+printf '#!/usr/bin/env bash\necho "FAKE CARGO REACHED $*"\nexit 1\n' >"$fakecargo/cargo"; chmod +x "$fakecargo/cargo"
+pkg() { (cd "$1" && PATH="$fakecargo:$PATH" bash scripts/release/package.sh --target x86_64-unknown-linux-gnu --out "$t/pkg-out" "${@:2}"); }
+# The fake cargo also exits 1, so a refusal only counts if it names the dirty
+# tree and cargo was never reached.
+refused_dirty() {
+  if grep -q 'uncommitted changes' "$t/out" && ! grep -q 'FAKE CARGO' "$t/out"; then ok "  ... as uncommitted changes, before cargo"
+  else bad "dirty gate: $(cat "$t/out")"; fi
+}
+# A throwaway repository holding the release scripts, a Cargo.toml and a source
+# file, so the dirty-tree cases cannot touch this checkout.
+pr="$t/pkgrepo"; mkdir -p "$pr/scripts/release" "$pr/src"
+cp "$here"/*.sh "$pr/scripts/release/"
+printf '[package]\nname = "x"\nversion = "0.1.0"\n' >"$pr/Cargo.toml"
+echo 'fn main() {}' >"$pr/src/main.rs"; echo readme >"$pr/README.md"
+git -C "$pr" init -q
+git -C "$pr" add -A
+git -C "$pr" -c user.email=selftest@example.invalid -c user.name=selftest commit -qm init
+expect "--release with a tag that is not the crate version refused" 1 pkg "$pr" --tag 9.9.9 --release
+if grep -q 'does not name the crate version' "$t/out" && ! grep -q 'FAKE CARGO' "$t/out"; then ok "  ... before cargo"; else bad "tag gate: $(cat "$t/out")"; fi
+expect "--release with a '+' tag refused" 1 pkg "$pr" --tag 0.1.0+b --release
+if ! grep -q 'FAKE CARGO' "$t/out"; then ok "  ... before cargo"; else bad "'+' tag reached cargo"; fi
+echo '// edit' >>"$pr/src/main.rs"
+expect "modified compiled source refused" 1 pkg "$pr" --tag T
+refused_dirty
+git -C "$pr" checkout -q -- src/main.rs
+echo 'pub fn x() {}' >"$pr/src/new.rs"
+expect "untracked file under src/ refused (it would be compiled in)" 1 pkg "$pr" --tag T
+refused_dirty
+rm "$pr/src/new.rs"
+echo edit >>"$pr/README.md"
+expect "modified shipped README refused" 1 pkg "$pr" --tag T
+refused_dirty
+git -C "$pr" checkout -q -- README.md
+echo notes >"$pr/notes.txt"
+expect "positive control: a clean tree reaches cargo (untracked notes.txt is not an input)" 1 pkg "$pr" --tag 0.1.0 --release
+if grep -q 'FAKE CARGO REACHED build --release --locked --features release-static' "$t/out"; then ok "  ... and builds release-static, --locked"; else bad "clean tree did not reach cargo: $(cat "$t/out")"; fi
+
+echo "check_portable_linkage"
+if [[ "$(uname -s)" == Linux ]] && command -v readelf >/dev/null && command -v curl >/dev/null; then
+  # curl links libcurl, libssl …: exactly what a release binary must not need.
+  expect "refuses a host binary linking system libraries ($(command -v curl))" 1 check_portable_linkage "$(command -v curl)" x86_64-unknown-linux-gnu
+  if grep -q 'which a fresh host may not have' "$t/out"; then ok "  ... naming the library"; else bad "linkage refusal: $(cat "$t/out")"; fi
+else
+  echo "  skip (needs Linux, binutils and curl)"
+fi
 
 echo "in_list"
 expect "in_list finds an exact member" 0 in_list b a b c

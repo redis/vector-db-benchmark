@@ -15,8 +15,9 @@
 # LICENSE, the README and BUILD-INFO.txt.
 #
 # --release: this is a real release. The tag must then name the crate version
-# (`0.2.0` or `v0.2.0`; a pre-release may add a suffix, `0.2.0-rc.1`), so a
-# binary never reports a different version than the archive it came in.
+# (`0.2.0` or `v0.2.0`; a pre-release may add a suffix, `0.2.0-rc.1`) and
+# carry no `+` (check_release_tag in lib.sh), so a binary never reports a
+# different version than the archive it came in.
 set -euo pipefail
 
 target="" tag="" out="" release=0
@@ -43,27 +44,29 @@ check_tag "$tag"
 
 version="$(crate_version)"
 if [[ "$release" == 1 ]]; then
-  tag_matches_version "$tag" "$version" || {
-    echo "package.sh: release tag '$tag' does not name the crate version '$version' (Cargo.toml)." >&2
-    echo "  Bump [package].version and re-tag, so the binaries report the version they are released as." >&2
-    exit 1; }
+  check_release_tag "$tag" "$version" || { echo "package.sh: refusing to package a release." >&2; exit 1; }
 fi
 
 # The archive must be built from a committed tree: its binaries report the
 # commit, and a dirty tree makes that a lie (`--version` would say so too).
-if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+# Scope and flags: uncommitted_changes in lib.sh.
+changes="$(uncommitted_changes)"
+if [[ -n "$changes" ]]; then
   echo "package.sh: refusing to package a tree with uncommitted changes:" >&2
-  git status --porcelain --untracked-files=no >&2
+  echo "$changes" >&2
   exit 1
 fi
 sha="$(git rev-parse HEAD)"
+require_gnu_tar
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target}"
 # hdf5-sys builds its bundled HDF5 only when HDF5_DIR is UNSET; with it set
 # (the Makefile exports it for normal builds) `release-static` silently links
 # the system libhdf5 instead. check_portable_linkage below would catch that,
 # but the build should not depend on the caller's environment.
-unset HDF5_DIR HDF5_VERSION
+# OPENSSL_NO_VENDOR likewise makes openssl-sys ignore `vendored` and link the
+# system libssl.
+unset HDF5_DIR HDF5_VERSION OPENSSL_NO_VENDOR
 # `--locked`: the archive is built from the tag's Cargo.lock, never a re-resolve.
 cargo build --release --locked --features release-static --target "$target" --bins
 
@@ -79,6 +82,18 @@ done
 for b in "${bins[@]}"; do
   check_portable_linkage "$bin_dir/$b" "$target"
 done
+
+# What the archive's binary itself reports as its build (the `params.build`
+# block of every result it writes): the archive is built natively, so it runs
+# here. It must be the release-static build of this commit.
+describe="$("$bin_dir/vector-db-benchmark" --describe build)"
+build_field() { python3 -c 'import json, sys
+v = json.loads(sys.argv[1])[sys.argv[2]]
+print(",".join(v) if isinstance(v, list) else ("null" if v is None else v))' "$describe" "$1"; }
+[[ "$(build_field features)" == release-static ]] || {
+  echo "package.sh: the built binary reports features '$(build_field features)', not release-static" >&2; exit 1; }
+[[ "$(build_field git_sha)" == "$sha" && "$(build_field git_tree)" == clean ]] || {
+  echo "package.sh: the built binary reports $(build_field git_sha) ($(build_field git_tree)), not clean $sha" >&2; exit 1; }
 
 name="vector-db-benchmark-$tag-$platform"
 stage="$(mktemp -d)"
@@ -97,9 +112,15 @@ cp LICENSE README.md "$stage/"
   echo "crate_version: $version"
   echo "git_sha: $sha"
   echo "target: $target"
-  echo "features: release-static"
+  echo "features: $(build_field features)"
+  echo "profile: $(build_field profile)"
+  echo "rustc: $(build_field rustc)"
+  echo "openssl: $(build_field openssl)"
+  echo "hdf5: $(build_field hdf5)"
   echo "binaries: ${bins[*]}"
   echo "built_at_commit_time: $(git log -1 --format=%cI HEAD)"
+  echo "--- vector-db-benchmark --describe build"
+  echo "$describe"
   echo "--- rustc -vV"
   rustc -vV
   echo "--- cargo -V"
@@ -111,9 +132,7 @@ archive="$(cd "$out" && pwd)/$name.tar.gz"
 # Stable member order, owner and timestamps (the commit time), so repacking the
 # same binaries gives the same archive.
 epoch="$(git log -1 --format=%ct HEAD)"
-tarbin=tar
-command -v gtar >/dev/null 2>&1 && tarbin=gtar
 (cd "$stage" && find . -mindepth 1 -print0 | LC_ALL=C sort -z |
-  "$tarbin" --null --no-recursion -T - --owner=0 --group=0 --numeric-owner \
+  "$TAR" --null --no-recursion -T - --owner=0 --group=0 --numeric-owner \
     --mtime="@$epoch" -cf - | gzip -n -9 > "$archive")
 echo "$archive"

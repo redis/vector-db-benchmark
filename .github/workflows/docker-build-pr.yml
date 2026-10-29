@@ -42,8 +42,22 @@ jobs:
           push: false
           load: true
           tags: ${{ env.IMAGE_NAME }}:pr-${{ github.event.number }}
+          # github.sha is the commit actions/checkout built the context from
+          # (for a pull_request, the merge commit), so the image names it.
+          build-args: VDB_BUILD_GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Test --version names the built commit
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:pr-${{ github.event.number }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          v="$(docker run --rm "$IMAGE" --version)"
+          echo "$v"
+          [[ "$v" == *"(git $SHA)" ]] || { echo "::error::--version does not end with (git $SHA)"; exit 1; }
+          docker run --rm "$IMAGE" --describe build
 
       - name: Test --help
         run: |
@@ -79,6 +93,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
           tags: ${{ env.IMAGE_NAME }}:pr-${{ github.event.number }}-multiplatform
+          build-args: VDB_BUILD_GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

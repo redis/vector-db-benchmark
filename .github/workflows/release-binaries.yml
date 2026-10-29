@@ -96,6 +96,23 @@ jobs:
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "Building $tag from $sha (publish: $publish)" >> "$GITHUB_STEP_SUMMARY"
 
+      # A release whose tag does not name the crate version would fail only in
+      # package.sh, after every build, leaving a public "latest" release with
+      # no archives (which breaks the README one-liner). Check it here, from
+      # the tag's own Cargo.toml, in seconds.
+      - uses: actions/checkout@v4
+        if: steps.plan.outputs.publish == 'true'
+        with:
+          ref: ${{ steps.plan.outputs.sha }}
+      - name: Tag names the crate version (check_release_tag)
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          source scripts/release/lib.sh
+          check_release_tag "$TAG" "$(crate_version)"
+
   build:
     name: Build ${{ matrix.platform }}
     needs: plan
@@ -160,9 +177,10 @@ jobs:
       # the rest of CI tests against: read a DEFLATE-compressed HDF5 file
       # through it, and check the embedded build identity, before packaging.
       - name: Test the statically linked build
-        # HDF5_DIR unset, as in package.sh: with it set, hdf5-sys would link
-        # the system library and this would test the wrong HDF5.
-        run: env -u HDF5_DIR cargo test --release --locked --features release-static --target "$TARGET" --lib -- build_info readers::hdf5_reader
+        # Unset as in package.sh: HDF5_DIR / HDF5_VERSION would make hdf5-sys
+        # link the system library, OPENSSL_NO_VENDOR would make openssl-sys
+        # ignore `vendored`, and this would test the wrong libraries.
+        run: env -u HDF5_DIR -u HDF5_VERSION -u OPENSSL_NO_VENDOR cargo test --release --locked --features release-static --target "$TARGET" --lib -- build_info readers::hdf5_reader
 
       - name: Package (make release-archive)
         run: make release-archive TAG="$TAG" RELEASE_TARGET="$TARGET" ${{ needs.plan.outputs.publish == 'true' && 'RELEASE=1' || '' }}
@@ -236,6 +254,20 @@ jobs:
             apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends ca-certificates >/dev/null
             mkdir /tmp/x && tar xzf "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" -C /tmp/x
             bash scripts/release/tls-probe.sh /tmp/x expect-ok'
+      # Amazon Linux 2023 (glibc 2.34, the default AWS client image): the
+      # oldest glibc the archives promise (MAX_GLIBC in lib.sh), its own CA
+      # bundle path (/etc/pki/tls), and the archive's checks plus HTTPS there.
+      - name: Extract, run and HTTPS in amazonlinux:2023
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w -e TAG -e SHA -e PLATFORM amazonlinux:2023 bash -euo pipefail -c '
+            . /etc/os-release; echo "host: $PRETTY_NAME $(uname -m) $(ldd --version 2>/dev/null | head -n1 || true)"
+            dnf install -y -q tar gzip findutils >/dev/null
+            bash scripts/release/verify.sh "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" \
+              --expect-sha "$SHA" --expect-tag "$TAG"
+            mkdir /tmp/x && tar xzf "dist/vector-db-benchmark-$TAG-$PLATFORM.tar.gz" -C /tmp/x
+            bash scripts/release/tls-probe.sh /tmp/x expect-ok'
 
   checksums:
     name: SHA256SUMS + install script
@@ -267,20 +299,11 @@ jobs:
         run: make release-checksums
       - name: Users' own check (sha256sum -c)
         run: cd dist && sha256sum -c SHA256SUMS
-      - name: install-release.sh against these archives
-        run: |
-          set -euo pipefail
-          # Lay the archives out the way a GitHub release serves them.
-          mkdir -p "rel/download/$TAG"
-          cp dist/* "rel/download/$TAG/"
-          VDB_RELEASE_BASE_URL="file://$PWD/rel" bash scripts/install-release.sh "$TAG" "$RUNNER_TEMP/vdb"
-          test "$("$RUNNER_TEMP/vdb/vector-db-benchmark" --version)" = "vector-db-benchmark $(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1) (git $SHA)"
-          # A corrupted archive must be refused, not installed.
-          printf 'x' >> "rel/download/$TAG/vector-db-benchmark-$TAG-linux-x86_64.tar.gz"
-          if VDB_RELEASE_BASE_URL="file://$PWD/rel" bash scripts/install-release.sh "$TAG" "$RUNNER_TEMP/vdb2"; then
-            echo "install-release.sh accepted an archive that does not match SHA256SUMS"; exit 1
-          fi
-          test ! -e "$RUNNER_TEMP/vdb2/vector-db-benchmark"
+      # scripts/install-release.sh, the README one-liner included (no tag:
+      # it follows /releases/latest), against a local stand-in for GitHub
+      # serving these archives, and every refusal it has.
+      - name: install-release.sh against these archives (scripts/release/install-test.sh)
+        run: bash scripts/release/install-test.sh dist "$TAG" "$SHA"
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets

@@ -1656,7 +1656,10 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
         "scripts/release/publish.sh",
         "scripts/release/tls-probe.sh",
         "scripts/install-release.sh",
+        "scripts/release/install-test.sh",
+        "check_release_tag",
         "ubuntu:22.04",
+        "amazonlinux:2023",
         "RELEASE_RUST_TOOLCHAIN",
     ] {
         assert!(
@@ -1715,11 +1718,46 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
         );
     }
 
-    // build.rs is compiled into every test binary, so ci.yml must rerun on it.
+    // ci.yml runs this test, so it must rerun on everything the test reads:
+    // build.rs (compiled into every test binary) and the files below.
     let ci = repo_file(".github/workflows/ci.yml");
-    assert_eq!(
-        ci.matches("- 'build.rs'").count(),
-        2,
-        "ci.yml's push and pull_request paths must both list build.rs"
+    for input in [
+        "- 'build.rs'",
+        "- '.github/workflows/release-binaries.yml'",
+        "- '.github/workflows/docker-build-pr.yml'",
+        "- 'scripts/release/**'",
+    ] {
+        assert_eq!(
+            ci.matches(input).count(),
+            2,
+            "ci.yml's push and pull_request paths must both list {input}"
+        );
+    }
+
+    // The Docker PR build compiles build.rs and must name the commit it built.
+    let docker_pr = repo_file(".github/workflows/docker-build-pr.yml");
+    assert!(
+        docker_pr.contains("- 'build.rs'"),
+        "docker-build-pr.yml's paths must list build.rs"
+    );
+    assert!(
+        docker_pr.contains("VDB_BUILD_GIT_SHA=${{ github.sha }}")
+            && docker_pr.contains("--version"),
+        "docker-build-pr.yml must build with VDB_BUILD_GIT_SHA and check --version names it"
+    );
+
+    // The dirty-tree scope is one list in two languages: what build.rs reports
+    // as "dirty tree" and what package.sh refuses to package must agree.
+    let build_rs = repo_file("build.rs");
+    assert!(
+        build_rs.contains(
+            r#"const COMPILED_INPUTS: [&str; 4] = ["build.rs", "src", "Cargo.toml", "Cargo.lock"];"#
+        ),
+        "build.rs COMPILED_INPUTS changed: update scripts/release/lib.sh to match, then this test"
+    );
+    assert!(
+        repo_file("scripts/release/lib.sh")
+            .contains("COMPILED_INPUTS=(build.rs src Cargo.toml Cargo.lock)"),
+        "scripts/release/lib.sh COMPILED_INPUTS must equal build.rs's"
     );
 }

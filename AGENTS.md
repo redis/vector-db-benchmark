@@ -113,6 +113,23 @@ datasets/datasets.json        # Dataset registry
 experiments/configurations/   # Engine configs (HNSW params, search params)
 ```
 
+## Cutting a release (prebuilt binaries, #366)
+
+`.github/workflows/release-binaries.yml` attaches `vector-db-benchmark-<tag>-{linux-x86_64,linux-aarch64,macos-aarch64}.tar.gz`
+and `SHA256SUMS` to a published release. Its `plan` job runs `check_release_tag`
+(`scripts/release/lib.sh`) first. That check refuses a tag that does not name
+`Cargo.toml`'s `[package].version` (`X.Y.Z`, `vX.Y.Z` or `X.Y.Z-rc.N`), and any
+tag containing `+`.
+
+So: **bump the version, merge, then tag that commit and publish the release.**
+A release published without the bump gets no archives, but still becomes
+"latest", which breaks the README's install one-liner until it is fixed.
+
+Rebuild a tag with `workflow_dispatch` (`tag`; `clobber: true` replaces a
+different build's assets). Everything except the upload also runs on PRs that
+touch the archive's inputs: `make release-selftest` and
+`scripts/release/install-test.sh` run there.
+
 ## Dataset Formats
 
 - **HDF5** (`.hdf5`): Single file with `train`, `test`, `neighbors` datasets
