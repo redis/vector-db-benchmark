@@ -698,6 +698,198 @@ pub fn write_comma_keyword_project(
     )
 }
 
+/// Keyword values carrying the backslash / brace / comma / quote characters
+/// that KiviDB 1.1.2 only matches exactly once escaped, each next to the decoy
+/// a raw value would hit instead. Shaped on the shipped arxiv `submitter`
+/// values (`J\"org Hennig`, `Rasmus Bj{\o}rk`). Sent raw (measured on 1.1.2),
+/// `J\"org Hennig` matches the decoy `J"org Hennig`, `a\b` matches `ab`, and
+/// `Bj{\o}rk` is a syntax error (a dropped query).
+///
+/// Every query targets one of those values (one is a `match_any` over two of
+/// them), so any wrong encoding fails at least one of the `N_QUERIES` (10)
+/// queries outright; the queries cycle through the targets.
+pub const TAG_ESCAPE_VALUES: [&str; 9] = [
+    r#"J\"org Hennig"#,
+    r#"J"org Hennig"#,
+    r"Rasmus Bj{\o}rk",
+    "Rasmus Bjork",
+    "Smith, John",
+    "Smith",
+    r"a\b",
+    "ab",
+    r"C:\dir",
+];
+
+pub fn write_tag_escape_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_tag_values_project(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        &TAG_ESCAPE_VALUES,
+        &[&[0], &[2], &[4], &[6], &[8], &[0], &[2], &[4], &[6, 8]],
+    )
+}
+
+/// Keyword values with `(`, `)`, `|` and `@`, next to the decoys a mis-parse
+/// would hit. KiviDB 1.1.2 expresses all four exactly once escaped (raw, `x|y`
+/// matches `x` and `y`). `Francisco (Paco) Guinea` is a shipped arxiv
+/// `submitter` value.
+pub const TAG_PAREN_PIPE_VALUES: [&str; 7] = [
+    "Francisco (Paco) Guinea",
+    "Francisco",
+    "x|y",
+    "x",
+    "y",
+    "c@d",
+    "c",
+];
+
+pub fn write_tag_paren_pipe_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_tag_values_project(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        &TAG_PAREN_PIPE_VALUES,
+        &[&[0], &[2], &[5], &[0], &[2], &[5], &[0], &[2, 5]],
+    )
+}
+
+/// Values for the exact-count fixture: one of each character the TAG encoding
+/// has to handle (`\`, `{`, `}`, `"`, `,`, `(`, `)`, `|`), next to the decoy a
+/// raw or mis-parsed value would hit. Value `i` is stored on exactly
+/// [`tag_count_docs`]`(i)` documents, a DISTINCT count per value, so a clause
+/// that matches a decoy instead can never return the right count by accident.
+pub const TAG_COUNT_VALUES: [&str; 14] = [
+    r#"J\"org Hennig"#,
+    r#"J"org Hennig"#,
+    r"Rasmus Bj{\o}rk",
+    "Rasmus Bjork",
+    r"a\b",
+    "ab",
+    "close}brace",
+    "Smith, John",
+    "Smith",
+    "Francisco (Paco) Guinea",
+    "Francisco",
+    "f(x)",
+    "x|y",
+    "x",
+];
+
+/// Stored on every document no [`TAG_COUNT_VALUES`] bucket covers.
+pub const TAG_COUNT_FILLER: &str = "filler";
+
+/// How many documents carry `TAG_COUNT_VALUES[i]`: 12, 14, …, 38 (350 of the
+/// 400; the rest carry [`TAG_COUNT_FILLER`]). All >= `TOP`, so every value can
+/// also be a recall query.
+pub fn tag_count_docs(i: usize) -> usize {
+    12 + 2 * i
+}
+
+/// The [`TAG_COUNT_VALUES`] index document `id` carries, or `None` for filler.
+pub fn tag_count_value_index(id: usize) -> Option<usize> {
+    let mut start = 0;
+    for i in 0..TAG_COUNT_VALUES.len() {
+        let end = start + tag_count_docs(i);
+        if id < end {
+            return Some(i);
+        }
+        start = end;
+    }
+    None
+}
+
+/// The exact-count fixture: field `author` (keyword) per
+/// [`tag_count_value_index`]; the ten recall queries cover `\`, `{ }`, `,`,
+/// `( )` and `|` values, two of them as a `match_any`.
+pub fn write_tag_count_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    const WANTED: [&[usize]; 10] = [
+        &[0],
+        &[2],
+        &[4],
+        &[6],
+        &[7],
+        &[9],
+        &[11],
+        &[12],
+        &[0, 9],
+        &[2, 6],
+    ];
+    let author = |id: usize| {
+        tag_count_value_index(id)
+            .map(|i| TAG_COUNT_VALUES[i])
+            .unwrap_or(TAG_COUNT_FILLER)
+    };
+    write_filter_project_multi(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        GtMetric::L2,
+        N_QUERIES,
+        serde_json::json!({ "author": "keyword" }),
+        move |id| serde_json::json!({ "author": author(id) }),
+        move |q| {
+            let w = WANTED[q % WANTED.len()];
+            let m = if w.len() == 1 {
+                serde_json::json!({ "value": TAG_COUNT_VALUES[w[0]] })
+            } else {
+                serde_json::json!({
+                    "any": w.iter().map(|&i| TAG_COUNT_VALUES[i]).collect::<Vec<_>>()
+                })
+            };
+            serde_json::json!({ "and": [ { "author": { "match": m } } ] })
+        },
+        move |q, id| {
+            tag_count_value_index(id).is_some_and(|i| WANTED[q % WANTED.len()].contains(&i))
+        },
+    )
+}
+
+/// Field `author` (keyword) cycles through `values`; query `q` filters on
+/// `wanted[q % wanted.len()]` — an exact `match` for one index, a `match_any`
+/// for several — with exact-string ground truth.
+fn write_tag_values_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    values: &'static [&'static str],
+    wanted: &'static [&'static [usize]],
+) -> FilterProject {
+    let author = move |id: usize| values[id % values.len()];
+    let wanted_for = move |q: usize| wanted[q % wanted.len()];
+    write_filter_project_multi(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        GtMetric::L2,
+        N_QUERIES,
+        serde_json::json!({ "author": "keyword" }),
+        move |id| serde_json::json!({ "author": author(id) }),
+        move |q| {
+            let w = wanted_for(q);
+            let m = if w.len() == 1 {
+                serde_json::json!({ "value": values[w[0]] })
+            } else {
+                serde_json::json!({ "any": w.iter().map(|&i| values[i]).collect::<Vec<_>>() })
+            };
+            serde_json::json!({ "and": [ { "author": { "match": m } } ] })
+        },
+        move |q, id| wanted_for(q).contains(&(id % values.len())),
+    )
+}
+
 /// bool filter: field `flag` (schema type `bool`), value `id % 2 == 0`. The
 /// query filters `flag == true`, so half the corpus matches.
 pub fn write_bool_project(
