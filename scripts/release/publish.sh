@@ -38,7 +38,7 @@ bash "$here/checksums.sh" check "$dir" >/dev/null
 
 ours=()
 while IFS= read -r f; do ours+=("$f"); done < <(cd "$dir" && find . -maxdepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort)
-is_ours() { printf '%s\n' "${ours[@]}" | grep -qxF "$1"; }
+is_ours() { in_list "$1" "${ours[@]}"; }
 
 # name<TAB>digest for every asset currently on the release. Fails the script
 # (set -e) if gh fails.
@@ -74,12 +74,12 @@ for f in "${ours[@]}"; do [[ "$f" == SHA256SUMS ]] || archives+=("$f"); done
 if [[ ${#conflicting[@]} -eq 0 && ${#stale[@]} -eq 0 ]]; then
   missing=()
   for f in "${archives[@]}"; do
-    printf '%s\n' ${present[@]+"${present[@]}"} | grep -qxF "$f" || missing+=("$f")
+    in_list "$f" ${present[@]+"${present[@]}"} || missing+=("$f")
   done
   [[ ${#present[@]} -eq 0 ]] || echo "already on the release with identical digests: ${present[*]}"
   # No --clobber: gh itself refuses to overwrite an existing name.
   upload -- ${missing[@]+"${missing[@]}"}
-  if ! printf '%s\n' ${present[@]+"${present[@]}"} | grep -qxF SHA256SUMS; then
+  if ! in_list SHA256SUMS ${present[@]+"${present[@]}"}; then
     upload -- SHA256SUMS
   fi
   echo "publish.sh: $tag serves exactly this set"
@@ -95,7 +95,7 @@ if [[ "$CLOBBER" != true ]]; then
 fi
 
 echo "CLOBBER: replacing the whole set on $tag"
-if printf '%s\n' ${present[@]+"${present[@]}"} ${conflicting[@]+"${conflicting[@]}"} | grep -qxF SHA256SUMS; then
+if in_list SHA256SUMS ${present[@]+"${present[@]}"} ${conflicting[@]+"${conflicting[@]}"}; then
   "$GH" release delete-asset "$tag" SHA256SUMS -R "$REPO" --yes
 fi
 for s in ${stale[@]+"${stale[@]}"}; do

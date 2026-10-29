@@ -63,9 +63,11 @@ while IFS= read -r p; do
   esac
 done <<<"$members"
 # `tar tv` prints the type as the first character of the mode column.
-if tar tvzf "$archive" | cut -c1 | grep -q '[^-d]'; then
-  fail "archive contains a link or special member: $(tar tvzf "$archive" | grep -v '^[-d]' | head -n3)"
-fi
+# Captured first, then matched: `tar tv | grep -q` under pipefail would turn a
+# match early in a long listing into SIGPIPE, which an `if` reads as "no link".
+listing="$(tar tvzf "$archive")" || fail "cannot list $base"
+odd="$(grep -v '^[-d]' <<<"$listing" || true)"
+[[ -z "$odd" ]] || fail "archive contains a link or special member: $(head -n3 <<<"$odd")"
 
 # The way the README tells people to install it.
 gzip -dc "$archive" | tar x
@@ -81,7 +83,7 @@ version="$(field crate_version)"
 read -r -a listed <<<"$(field binaries)"
 [[ ${#listed[@]} -gt 0 ]] || fail "$info lists no binaries"
 for b in "${REQUIRED_BINS[@]}"; do
-  printf '%s\n' "${listed[@]}" | grep -qx "$b" || fail "required binary '$b' not in the archive"
+  in_list "$b" "${listed[@]}" || fail "required binary '$b' not in the archive"
 done
 # Exactly the listed binaries are executables at the root — nothing missing,
 # nothing extra that BUILD-INFO does not account for.
@@ -126,7 +128,7 @@ echo "ok: generate-dataset + bench_npy"
 grep -q 'Throughput' bench_jsonl.out || fail "bench_jsonl printed no result"
 echo "ok: bench_jsonl"
 
-if printf '%s\n' "${listed[@]}" | grep -qx bench_hdf5; then
+if in_list bench_hdf5 "${listed[@]}"; then
   # No HDF5 file ships in the archive, so this checks the statically linked
   # library loads and initialises, and that the error is HDF5's own.
   # (The full read path, DEFLATE included, is a unit test the release build

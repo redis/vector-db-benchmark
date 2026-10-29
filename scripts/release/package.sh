@@ -72,7 +72,7 @@ bins=()
 while IFS= read -r b; do bins+=("$b"); done < <(package_bins)
 [[ ${#bins[@]} -gt 0 ]] || { echo "package.sh: cargo metadata listed no binaries" >&2; exit 1; }
 for b in "${REQUIRED_BINS[@]}"; do
-  printf '%s\n' "${bins[@]}" | grep -qx "$b" || {
+  in_list "$b" "${bins[@]}" || {
     echo "package.sh: required binary '$b' is not a target of this crate" >&2; exit 1; }
 done
 

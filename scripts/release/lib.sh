@@ -12,6 +12,17 @@ REQUIRED_BINS=(vector-db-benchmark prepare-msmarco generate-dataset bench_npy be
 # The binaries that parse flags with clap, and so answer --help / --version.
 CLAP_BINS=(vector-db-benchmark prepare-msmarco generate-dataset)
 
+# `in_list <needle> <items...>`: exact membership without a pipe. Never write
+# `producer | grep -q` under `set -o pipefail`: grep exits at the first match,
+# the producer takes SIGPIPE, and the pipeline reports failure (141), which an
+# `if` then reads as "not found".
+in_list() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
+  return 1
+}
+
 # Rust target triple -> the <platform> part of the archive name.
 platform_for_target() {
   case "$1" in

@@ -81,6 +81,21 @@ tar -C "$lsrc" -czf "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" vector-db-be
 expect "symlink member" 1 bash "$here/verify.sh" "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" --expect-sha 0123456789abcdef0123456789abcdef01234567
 if grep -q 'link' "$t/out"; then ok "refused for the link, not something else"; else bad "symlink refusal reason: $(cat "$t/out")"; fi
 
+# A link FIRST in a listing far larger than a pipe buffer: a `tar tv | grep -q`
+# check would stop reading at the match, tar would take SIGPIPE, and under
+# pipefail the `if` would read the failure as "no link" and extract anyway.
+bsrc="$t/bsrc"; mkdir -p "$bsrc"
+ln -s /etc/passwd "$bsrc/aaa-link"
+for i in $(seq 1 3000); do : >"$bsrc/f$i"; done
+(cd "$bsrc" && tar -czf "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" aaa-link f*)
+expect "link first in a long listing" 1 bash "$here/verify.sh" "$ev/vector-db-benchmark-T-linux-x86_64.tar.gz" --expect-sha 0123456789abcdef0123456789abcdef01234567
+if grep -q 'link' "$t/out"; then ok "long listing: refused for the link"; else bad "long-listing link refusal reason: $(tail -n2 "$t/out")"; fi
+
+echo "in_list"
+expect "in_list finds an exact member" 0 in_list b a b c
+expect "in_list is exact, not a prefix" 1 in_list b ab bc
+expect "in_list on an empty list" 1 in_list a
+
 echo "publish.sh against a fake gh"
 fake="$t/fakebin"; mkdir -p "$fake"
 cat >"$fake/gh" <<'FAKE'
