@@ -1667,6 +1667,12 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         pinned_toolchain(&archives, "release-binaries.yml"),
         "release-packages.yml and release-binaries.yml pin different Rust toolchains"
     );
+    // Steps in Debian/Ubuntu containers otherwise run under dash, where the
+    // build step's `set -o pipefail`, `[[ ]]` and arrays are syntax errors.
+    assert!(
+        packages.contains("\ndefaults:\n  run:\n    shell: bash\n"),
+        "release-packages.yml must default every run step to bash"
+    );
     for needed in [
         "scripts/release/build-deb.sh",
         "scripts/release/build-rpm.sh",

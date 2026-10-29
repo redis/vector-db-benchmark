@@ -111,6 +111,12 @@ env:
   STAGING_BUCKET: vdb-package-staging
   SHARED_STAGING_BUCKET: redis-test-package-repository
 
+# Container steps otherwise run under `sh`, which is dash on Debian/Ubuntu
+# images: every step here may use bash (pipefail, [[ ]], arrays).
+defaults:
+  run:
+    shell: bash
+
 jobs:
   plan:
     name: Resolve tag, commit and matrix
