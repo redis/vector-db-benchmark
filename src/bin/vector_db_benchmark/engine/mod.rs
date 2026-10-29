@@ -1945,13 +1945,18 @@ mod sq8_engine_guard_tests {
     /// under the SQ8 name (#325 review).
     #[test]
     fn create_engine_refuses_sq8_keys_outside_redis() {
-        for engine in ["valkey", "dragonfly", "kividb"] {
+        let upper = serde_json::json!({ "M": 16, "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 0 });
+        let lower = serde_json::json!({ "m": 16, "compression": "SQ8" });
+        for (engine, hnsw) in [
+            ("valkey", &upper),
+            ("dragonfly", &upper),
+            ("kividb", &upper),
+            ("valkey", &lower),
+        ] {
             let cfg: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
                 "name": format!("{engine}-hnsw-sq8"),
                 "engine": engine,
-                "collection_params": {
-                    "hnsw_config": { "M": 16, "COMPRESSION": "SQ8", "TRAINING_THRESHOLD": 0 }
-                }
+                "collection_params": { "hnsw_config": hnsw }
             }))
             .unwrap();
             match create_engine(&cfg, "localhost") {

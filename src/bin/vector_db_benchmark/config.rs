@@ -36,8 +36,13 @@ pub struct HnswConfig {
     pub ef_construction: Option<i64>,
     /// Redis HNSW scalar compression. Serde rejects malformed and explicit null
     /// values; the library validates SQ8 support against algorithm and type.
+    /// The lowercase aliases match `M`/`m` and the lowercase `compression` of
+    /// `svs-vamana_config`: without them `{"compression": "SQ8"}` fell into
+    /// `extra` and the Redis engine built an uncompressed index under the
+    /// config's SQ8 name.
     #[serde(
         rename = "COMPRESSION",
+        alias = "compression",
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "vector_db_benchmark::redis_hnsw_sq8::present_string"
@@ -45,6 +50,7 @@ pub struct HnswConfig {
     pub compression: Option<String>,
     #[serde(
         rename = "TRAINING_THRESHOLD",
+        alias = "training_threshold",
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "vector_db_benchmark::redis_hnsw_sq8::present_u64"
@@ -913,7 +919,23 @@ mod tests {
         assert!(absent.get("TRAINING_THRESHOLD").is_none());
         serde_json::from_value::<HnswConfig>(absent).unwrap();
 
+        // Lowercase spellings are the same typed fields, never `extra` (where
+        // the Redis engine would ignore them and build uncompressed HNSW).
+        let lower: HnswConfig = serde_json::from_value(json!({
+            "m": 16, "compression": "SQ8", "training_threshold": 0
+        }))
+        .unwrap();
+        assert_eq!(lower.compression.as_deref(), Some("SQ8"));
+        assert_eq!(lower.training_threshold, Some(0));
+        assert!(
+            lower.unsupported_keys().is_empty(),
+            "{:?}",
+            lower.unsupported_keys()
+        );
+
         for bad in [
+            json!({"compression": null}),
+            json!({"training_threshold": "0"}),
             json!({"COMPRESSION": null}),
             json!({"COMPRESSION": 8}),
             json!({"TRAINING_THRESHOLD": null}),

@@ -170,6 +170,7 @@ const DECLARED_KEY_ALLOWLIST: &[&str] = &[
     "EF_CONSTRUCTION",
     "COMPRESSION",
     "TRAINING_THRESHOLD",
+    "training_threshold",
     "efConstruction",
     "maxConnections",
     "on_disk",
