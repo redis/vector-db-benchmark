@@ -1639,6 +1639,293 @@ fn every_repo_path_named_in_the_agent_docs_exists() {
     }
 }
 
+/// INV-A5: the deb/rpm package workflow builds with the SAME Rust toolchain
+/// release-binaries.yml pins, only through the scripts its PR check runs, from
+/// packaging sources built `--locked --features release-static`, runs the
+/// publish scripts' self-test and dry run on every PR, and its PR trigger
+/// covers every package-specific input: the packaging sources and scripts,
+/// the binary set (`src/bin/**`) and the data the packages ship. The rest of
+/// `src/` is compiled `--features release-static` by release-binaries.yml's PR
+/// run (INV-A4), and the binaries the packages install must be exactly cargo's
+/// bin targets (checked below), so a renamed or added binary fails here even
+/// when no package build runs. Production publishing is gated (variable,
+/// final tag, pinned signing key). A package built with a different
+/// toolchain than the archives of the same release, or by an inline `cargo
+/// build` no PR exercised, is exactly what the release pipeline must not ship.
+#[test]
+fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_scripts() {
+    fn pinned_toolchain(wf: &str, name: &str) -> String {
+        let line = wf
+            .lines()
+            .find(|l| l.trim_start().starts_with("RELEASE_RUST_TOOLCHAIN:"))
+            .unwrap_or_else(|| panic!("{name} must pin RELEASE_RUST_TOOLCHAIN"));
+        line.split_once(':')
+            .unwrap()
+            .1
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string()
+    }
+    let archives = repo_file(".github/workflows/release-binaries.yml");
+    let packages = repo_file(".github/workflows/release-packages.yml");
+    assert_eq!(
+        pinned_toolchain(&packages, "release-packages.yml"),
+        pinned_toolchain(&archives, "release-binaries.yml"),
+        "release-packages.yml and release-binaries.yml pin different Rust toolchains"
+    );
+    // Steps in Debian/Ubuntu containers otherwise run under dash, where the
+    // build step's `set -o pipefail`, `[[ ]]` and arrays are syntax errors.
+    assert!(
+        packages.contains("\ndefaults:\n  run:\n    shell: bash\n"),
+        "release-packages.yml must default every run step to bash"
+    );
+    for needed in [
+        "scripts/release/build-deb.sh",
+        "scripts/release/build-rpm.sh",
+        "scripts/release/test-package.sh",
+        "scripts/release/publish-apt.sh",
+        "scripts/release/publish-yum.sh",
+        "make release-selftest-packages",
+        "--dry-run",
+        "VDB_BUILD_GIT_SHA",
+        // The publish job pins the bucket to the environment, and the shared,
+        // production-signed Redis staging bucket is taken only under a prefix.
+        "STAGING_BUCKET",
+        "SHARED_STAGING_BUCKET",
+        // The verify step reads the bucket over HTTPS through lib.sh's
+        // path-style URL (see the scan below), and checks OUR stanza.
+        "s3_origin_url",
+        "deb_index_entry",
+        // Production: switched on by a variable, final tags only, signing
+        // key pinned to the environment's fingerprint.
+        "vars.PACKAGES_PRODUCTION",
+        "check_production_tag \"$tag\"",
+        "vars.APT_SIGNING_FPR",
+    ] {
+        assert!(
+            packages.contains(needed),
+            "release-packages.yml no longer uses `{needed}`"
+        );
+    }
+    // Any non-comment line, not only `run:` one-liners: every build step is a
+    // `run: |` block, so a check on the `run:` line alone would be vacuous.
+    for line in packages.lines() {
+        let code = line.trim();
+        if code.starts_with('#') {
+            continue;
+        }
+        for tool in ["cargo build", "dpkg-buildpackage", "rpmbuild"] {
+            assert!(
+                !code.contains(tool),
+                "release-packages.yml runs `{tool}` inline:\n    {code}\n\
+                 Go through scripts/release/build-deb.sh / build-rpm.sh, so a PR builds what a release ships."
+            );
+        }
+    }
+    // No virtual-hosted S3 URL (`<bucket>.s3.<region>.amazonaws.com`, or the
+    // legacy `<bucket>.s3-<region>`): S3's certificate is a one-label wildcard,
+    // so it fails TLS for a dotted bucket, and production is
+    // `packages.redis.io`. The verify step would go red AFTER publishing. Build
+    // the URL with lib.sh's path-style `s3_origin_url` instead.
+    let mut sources = vec![(
+        ".github/workflows/release-packages.yml".to_string(),
+        packages.clone(),
+    )];
+    for script in [
+        "lib.sh",
+        "publish-apt.sh",
+        "publish-yum.sh",
+        "test-package.sh",
+        "build-deb.sh",
+        "build-rpm.sh",
+        "selftest-packages.sh",
+    ] {
+        let name = format!("scripts/release/{script}");
+        sources.push((name.clone(), repo_file(&name)));
+    }
+    for (name, src) in &sources {
+        for line in src.lines() {
+            let code = line.trim();
+            if code.starts_with('#') || !code.contains("amazonaws.com") {
+                continue;
+            }
+            assert!(
+                !code.contains(".s3.") && !code.contains(".s3-"),
+                "{name} builds a virtual-hosted S3 URL:\n    {code}\n\
+                 Use `s3_origin_url` (scripts/release/lib.sh): path-style, so a dotted bucket passes TLS."
+            );
+        }
+    }
+    // The production and signing guards are lib.sh functions the selftest
+    // covers; here, each call site must be there VERBATIM on a code line (not
+    // a comment, not weakened by a trailing `|| true`).
+    let code_lines = |src: &str| -> Vec<String> {
+        src.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.starts_with('#'))
+            .collect()
+    };
+    let wf_code = code_lines(&packages);
+    for call in [
+        "PACKAGES_PRODUCTION: ${{ vars.PACKAGES_PRODUCTION }}",
+        "publish_to=\"$(production_gate \"$EVENT\" \"$PACKAGES_PRODUCTION\")\" || { echo \"::error::release_type=public needs vars.PACKAGES_PRODUCTION=true\"; exit 1; }",
+        "check_production_tag \"$tag\" || { echo \"::error::refusing to publish '$tag' to production\"; exit 1; }",
+        "EXPECTED_FPR: ${{ vars.APT_SIGNING_FPR }}",
+        "check_signing_fpr \"$EXPECTED_FPR\" \"$fpr\" \"$PUBLISH_TO\" || { echo \"::error::signing key does not match the environment's APT_SIGNING_FPR (see above)\"; exit 1; }",
+        "base=\"$(s3_origin_url \"$BUCKET\" \"$REGION\" \"$REPO_PREFIX\")\"",
+        "gpg_status_signed_by \"$signing_fpr\" <<<\"$status\" ||",
+    ] {
+        assert!(
+            wf_code.iter().any(|l| l == call),
+            "release-packages.yml no longer has this guard line verbatim:\n    {call}"
+        );
+    }
+    assert!(
+        code_lines(&repo_file("scripts/release/publish-apt.sh"))
+            .iter()
+            .any(|l| l == "if ! gpg_status_signed_by \"$fpr\" <<<\"$status\"; then"),
+        "publish-apt.sh no longer checks the existing InRelease's signer"
+    );
+    // The verify step builds no URL from the bucket name itself (a two-line
+    // `host=...; base="https://$BUCKET.$host"` would get past the scan above).
+    assert!(
+        !packages.contains("https://$BUCKET") && !packages.contains("https://${BUCKET"),
+        "release-packages.yml builds a URL from the bucket name; use s3_origin_url"
+    );
+    // The binaries the packages install are exactly cargo's bin targets (the
+    // [[bin]] entries plus the ones auto-discovered under src/bin/), and
+    // lib.sh's REQUIRED_BINS: a binary renamed in src/bin must fail here, not
+    // on release day in every `install` line of debian/rules and the spec.
+    let words = |line: &str| -> std::collections::BTreeSet<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    };
+    let cargo_toml = repo_file("Cargo.toml");
+    let mut cargo_bins = std::collections::BTreeSet::new();
+    let mut bin_paths = std::collections::BTreeSet::new();
+    for block in cargo_toml.split("[[bin]]").skip(1) {
+        let block = block.split("\n[").next().unwrap();
+        let field = |key: &str| {
+            block
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(key)?.trim().strip_prefix('='))
+                .map(|v| v.trim().trim_matches('"').to_string())
+        };
+        cargo_bins.insert(field("name").expect("[[bin]] without name"));
+        bin_paths.insert(field("path").expect("[[bin]] without path"));
+    }
+    let src_bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+    for entry in std::fs::read_dir(&src_bin).expect("read src/bin") {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let (rel, stem) = if path.is_dir() {
+            (format!("src/bin/{name}/main.rs"), name.clone())
+        } else if let Some(stem) = name.strip_suffix(".rs") {
+            (format!("src/bin/{name}"), stem.to_string())
+        } else {
+            continue;
+        };
+        if !bin_paths.contains(&rel) && (path.is_file() || path.join("main.rs").is_file()) {
+            cargo_bins.insert(stem); // autobins
+        }
+    }
+    let rules = repo_file("debian/rules");
+    let make_var = |var: &str| {
+        rules
+            .lines()
+            .find_map(|l| l.strip_prefix(var)?.trim_start().strip_prefix(":="))
+            .unwrap_or_else(|| panic!("debian/rules has no `{var} :=` line"))
+            .to_string()
+    };
+    let deb_bins: std::collections::BTreeSet<String> = words(&make_var("BINS"))
+        .union(&words(&make_var("LIBEX")))
+        .cloned()
+        .collect();
+    let spec = repo_file("rpm/vector-db-benchmark.spec");
+    let rpm_bins: std::collections::BTreeSet<String> = spec
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("for b in ")?.split_once("; do"))
+        .flat_map(|(list, _)| words(list))
+        .collect();
+    // test-package.sh's own loops: what it checks is installed and runs.
+    let installed: std::collections::BTreeSet<String> =
+        repo_file("scripts/release/test-package.sh")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("for b in ")?.split_once("; do"))
+            .flat_map(|(list, _)| words(list))
+            .collect();
+    let lib = repo_file("scripts/release/lib.sh");
+    let required: std::collections::BTreeSet<String> = words(
+        lib.lines()
+            .find_map(|l| l.strip_prefix("REQUIRED_BINS=(")?.strip_suffix(')'))
+            .expect("lib.sh has no one-line REQUIRED_BINS=(...)"),
+    );
+    for (what, set) in [
+        ("debian/rules BINS + LIBEX", &deb_bins),
+        ("the spec's %install loops", &rpm_bins),
+        ("lib.sh REQUIRED_BINS", &required),
+        ("test-package.sh's install checks", &installed),
+    ] {
+        assert_eq!(
+            set, &cargo_bins,
+            "{what} differs from cargo's bin targets (Cargo.toml [[bin]] + src/bin autobins)"
+        );
+    }
+    // Both package sources build the tag's lockfile with the static feature,
+    // so a package depends on glibc alone (what test-package.sh installs on).
+    for (file, build_line) in [
+        ("debian/rules", "cargo build"),
+        ("rpm/vector-db-benchmark.spec", "cargo build"),
+    ] {
+        let src = repo_file(file);
+        let build = src
+            .lines()
+            .find(|l| l.trim_start().starts_with(build_line))
+            .unwrap_or_else(|| panic!("{file} has no `{build_line}` line"));
+        for flag in [
+            "--release",
+            "--locked",
+            "--features release-static",
+            "--bins",
+        ] {
+            assert!(build.contains(flag), "{file}: `{build}` lacks {flag}");
+        }
+    }
+    let pr = packages
+        .split_once("  pull_request:")
+        .expect("release-packages.yml must run on pull_request")
+        .1
+        .split_once("\npermissions:")
+        .expect("the pull_request block must precede `permissions:`")
+        .0;
+    for input in [
+        "'Cargo.toml'",
+        "'Cargo.lock'",
+        "'build.rs'",
+        "'LICENSE'",
+        "'debian/**'",
+        "'rpm/**'",
+        "'scripts/release/build-deb.sh'",
+        "'scripts/release/build-rpm.sh'",
+        "'scripts/release/test-package.sh'",
+        "'scripts/release/publish-apt.sh'",
+        "'scripts/release/publish-yum.sh'",
+        "'scripts/release/selftest-packages.sh'",
+        "'scripts/release/lib.sh'",
+        "'.github/workflows/release-packages.yml'",
+        // What the packages ship besides the compiled code.
+        "'src/bin/**'",
+        "'README.md'",
+        "'datasets/datasets.json'",
+        "'datasets/random-100/**'",
+        "'experiments/configurations/**'",
+    ] {
+        assert!(
+            pr.contains(input),
+            "release-packages.yml's pull_request paths no longer include {input}"
+        );
+    }
+}
+
 /// INV-A4 (#366): the release-archive workflow builds through the Makefile and
 /// the scripts its PR check runs, and its PR trigger covers every input of the
 /// archive. The PR run is the only time the archive path executes before a
@@ -1724,6 +2011,11 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
     for input in [
         "- 'build.rs'",
         "- '.github/workflows/release-binaries.yml'",
+        // INV-A5's inputs: its production gates, signing pin and binary-set
+        // check live in these, so a PR touching only them must still run it.
+        "- '.github/workflows/release-packages.yml'",
+        "- 'debian/**'",
+        "- 'rpm/**'",
         "- '.github/workflows/docker-build-pr.yml'",
         "- '.github/workflows/docker-publish-master.yml'",
         "- '.github/workflows/docker-publish-release.yml'",

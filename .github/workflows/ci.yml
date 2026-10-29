@@ -13,12 +13,15 @@ on:
       - 'datasets/datasets.json'
       - 'experiments/configurations/**'
       - '.github/workflows/ci.yml'
-      # Read by tests/harness_invariants.rs (INV-A4).
+      # Read by tests/harness_invariants.rs (INV-A4, INV-A5).
       - '.github/workflows/release-binaries.yml'
+      - '.github/workflows/release-packages.yml'
       - '.github/workflows/docker-build-pr.yml'
       - '.github/workflows/docker-publish-master.yml'
       - '.github/workflows/docker-publish-release.yml'
       - 'scripts/release/**'
+      - 'debian/**'
+      - 'rpm/**'
   pull_request:
     paths:
       - 'Makefile'
@@ -30,12 +33,15 @@ on:
       - 'datasets/datasets.json'
       - 'experiments/configurations/**'
       - '.github/workflows/ci.yml'
-      # Read by tests/harness_invariants.rs (INV-A4).
+      # Read by tests/harness_invariants.rs (INV-A4, INV-A5).
       - '.github/workflows/release-binaries.yml'
+      - '.github/workflows/release-packages.yml'
       - '.github/workflows/docker-build-pr.yml'
       - '.github/workflows/docker-publish-master.yml'
       - '.github/workflows/docker-publish-release.yml'
       - 'scripts/release/**'
+      - 'debian/**'
+      - 'rpm/**'
 
 jobs:
   check:

@@ -34,6 +34,28 @@ pub struct HnswConfig {
         alias = "ef_construction"
     )]
     pub ef_construction: Option<i64>,
+    /// Redis HNSW scalar compression. Serde rejects malformed and explicit null
+    /// values; the library validates SQ8 support against algorithm and type.
+    /// The lowercase aliases match `M`/`m` and the lowercase `compression` of
+    /// `svs-vamana_config`: without them `{"compression": "SQ8"}` fell into
+    /// `extra` and the Redis engine built an uncompressed index under the
+    /// config's SQ8 name.
+    #[serde(
+        rename = "COMPRESSION",
+        alias = "compression",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "vector_db_benchmark::redis_hnsw_sq8::present_string"
+    )]
+    pub compression: Option<String>,
+    #[serde(
+        rename = "TRAINING_THRESHOLD",
+        alias = "training_threshold",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "vector_db_benchmark::redis_hnsw_sq8::present_u64"
+    )]
+    pub training_threshold: Option<u64>,
     /// Qdrant: keep the HNSW graph on disk (mmap) instead of in RAM.
     pub on_disk: Option<bool>,
     /// Qdrant: per-payload-value graph links. `m: 0` + `payload_m: k` builds
@@ -880,6 +902,51 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn redis_sq8_fields_are_typed_and_reject_malformed_values() {
+        let cfg: HnswConfig = serde_json::from_value(json!({
+            "M": 16, "COMPRESSION": "sq8", "TRAINING_THRESHOLD": 0
+        }))
+        .unwrap();
+        assert_eq!(cfg.compression.as_deref(), Some("sq8"));
+        assert_eq!(cfg.training_threshold, Some(0));
+        assert!(cfg.unsupported_keys().is_empty());
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(serialized["COMPRESSION"], "sq8");
+        assert_eq!(serialized["TRAINING_THRESHOLD"], 0);
+        let absent = serde_json::to_value(HnswConfig::default()).unwrap();
+        assert!(absent.get("COMPRESSION").is_none());
+        assert!(absent.get("TRAINING_THRESHOLD").is_none());
+        serde_json::from_value::<HnswConfig>(absent).unwrap();
+
+        // Lowercase spellings are the same typed fields, never `extra` (where
+        // the Redis engine would ignore them and build uncompressed HNSW).
+        let lower: HnswConfig = serde_json::from_value(json!({
+            "m": 16, "compression": "SQ8", "training_threshold": 0
+        }))
+        .unwrap();
+        assert_eq!(lower.compression.as_deref(), Some("SQ8"));
+        assert_eq!(lower.training_threshold, Some(0));
+        assert!(
+            lower.unsupported_keys().is_empty(),
+            "{:?}",
+            lower.unsupported_keys()
+        );
+
+        for bad in [
+            json!({"compression": null}),
+            json!({"training_threshold": "0"}),
+            json!({"COMPRESSION": null}),
+            json!({"COMPRESSION": 8}),
+            json!({"TRAINING_THRESHOLD": null}),
+            json!({"TRAINING_THRESHOLD": -1}),
+            json!({"TRAINING_THRESHOLD": "0"}),
+            json!({"TRAINING_THRESHOLD": 1.5}),
+        ] {
+            assert!(serde_json::from_value::<HnswConfig>(bad).is_err());
+        }
+    }
+
     /// Corpus size advertised by a dataset's own corpus filename, when the leaf
     /// path segment carries an unambiguous magnitude token — `random_keywords_1m`
     /// => 1_000_000, `..._100k` => 100_000, `...-1G-...` => 1_000_000_000. The
@@ -1354,6 +1421,91 @@ mod tests {
             seen > 10,
             "expected the real config directory, found {seen} files"
         );
+    }
+
+    /// `<prefix>-cal-hnsw-*` also selects the HNSW SQ8 calibration cases
+    /// (#325), which need an SQ8-capable server; `<prefix>-cal-hnsw-float*` is
+    /// the documented way to select only the uncompressed baselines. Pinned
+    /// with the harness's own matcher against the shipped files, so a rename
+    /// that breaks the documented glob fails here.
+    #[test]
+    fn calibration_globs_separate_hnsw_baselines_from_sq8() {
+        for prefix in ["dbpedia", "cohere"] {
+            let path = project_root().join(format!(
+                "experiments/configurations/{prefix}-calibration.json"
+            ));
+            let configs: Vec<serde_json::Value> =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let names: Vec<&str> = configs.iter().filter_map(|c| c["name"].as_str()).collect();
+            let select = |pattern: &str| -> Vec<&str> {
+                names
+                    .iter()
+                    .copied()
+                    .filter(|n| matches_pattern(n, pattern))
+                    .collect()
+            };
+            let baselines = select(&format!("{prefix}-cal-hnsw-float*"));
+            assert_eq!(
+                baselines,
+                [
+                    format!("{prefix}-cal-hnsw-float16"),
+                    format!("{prefix}-cal-hnsw-float32")
+                ]
+            );
+            let hnsw = select(&format!("{prefix}-cal-hnsw-*"));
+            assert_eq!(hnsw.len(), 6, "{hnsw:?}");
+            let sq8 = select(&format!("{prefix}-cal-hnsw-sq8-*"));
+            assert_eq!(sq8.len(), 4, "{sq8:?}");
+            assert!(hnsw
+                .iter()
+                .all(|n| baselines.contains(n) || sq8.contains(n)));
+        }
+    }
+
+    /// The calibration SQ8 cases were hand-copied from the HNSW baselines;
+    /// the comparison is only fair while each one equals its baseline except
+    /// for the name and the compression keys. An edit to one side of a pair
+    /// fails here.
+    #[test]
+    fn calibration_sq8_cases_equal_their_hnsw_baselines() {
+        for prefix in ["dbpedia", "cohere"] {
+            let path = project_root().join(format!(
+                "experiments/configurations/{prefix}-calibration.json"
+            ));
+            let configs: Vec<serde_json::Value> =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let by_name = |name: &str| -> serde_json::Value {
+                configs
+                    .iter()
+                    .find(|c| c["name"] == name)
+                    .unwrap_or_else(|| panic!("{name} missing from {}", path.display()))
+                    .clone()
+            };
+            let mut pairs = 0;
+            for variant in ["zero", "trained"] {
+                for dt in ["float16", "float32"] {
+                    let mut sq8 = by_name(&format!("{prefix}-cal-hnsw-sq8-{variant}-{dt}"));
+                    let mut baseline = by_name(&format!("{prefix}-cal-hnsw-{dt}"));
+                    let hnsw = sq8["collection_params"]["hnsw_config"]
+                        .as_object_mut()
+                        .unwrap();
+                    assert_eq!(hnsw.remove("COMPRESSION"), Some(serde_json::json!("SQ8")));
+                    let threshold = hnsw.remove("TRAINING_THRESHOLD");
+                    assert!(threshold.is_some(), "{prefix} {variant} {dt}");
+                    assert!(
+                        baseline["collection_params"]["hnsw_config"]
+                            .get("COMPRESSION")
+                            .is_none(),
+                        "{prefix} {dt} baseline must be uncompressed"
+                    );
+                    sq8.as_object_mut().unwrap().remove("name");
+                    baseline.as_object_mut().unwrap().remove("name");
+                    assert_eq!(sq8, baseline, "{prefix} sq8-{variant}-{dt} vs baseline");
+                    pairs += 1;
+                }
+            }
+            assert_eq!(pairs, 4);
+        }
     }
 
     #[test]
@@ -2036,6 +2188,8 @@ mod shipped_config_knob_guard {
             &[
                 "m",
                 "ef_construction",
+                "compression",
+                "training_threshold",
                 "on_disk",
                 "payload_m",
                 "inline_storage",
@@ -2079,6 +2233,8 @@ mod shipped_config_knob_guard {
         match leaf {
             "M" => "m",
             "EF_CONSTRUCTION" | "ef_construct" => "ef_construction",
+            "COMPRESSION" => "compression",
+            "TRAINING_THRESHOLD" => "training_threshold",
             // #215 made `EF` an alias of the typed `ef` field.
             "EF" => "ef",
             other => other,
@@ -2631,6 +2787,8 @@ mod shipped_config_knob_guard {
             "M",
             "EF_CONSTRUCTION",
             "ef_construct",
+            "COMPRESSION",
+            "TRAINING_THRESHOLD",
             "on_disk",
             "payload_m",
             "inline_storage",

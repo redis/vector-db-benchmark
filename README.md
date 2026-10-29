@@ -323,6 +323,72 @@ digests differ from the ones already on the release, and the run refuses to
 mix builds. Rebuilding a tag on purpose is a `workflow_dispatch` with `tag`
 and `clobber: true`, which replaces the whole set.
 
+### Linux packages (APT / YUM)
+
+> **Coming soon.** Publishing to packages.redis.io is not switched on yet: the
+> production side (bucket credentials and the Redis signing key) is still to be
+> set up, so `apt-get install` / `dnf install` below do not find
+> `vector-db-benchmark` today. Use the release archives above until a release
+> announces its packages. The packaging itself is built and install-tested on
+> every change to it (`.github/workflows/release-packages.yml`).
+
+Native packages will be built for every release, from the same commit as the
+archives above, one per distribution, and published to the Redis package
+repositories. They install `vector-db-benchmark`,
+`prepare-msmarco` and `generate-dataset` into `/usr/bin`, the reader
+micro-benchmarks under `/usr/lib/vector-db-benchmark` (`/usr/libexec` on RPM
+systems), and the dataset catalogue plus engine configurations under
+`/usr/share/vector-db-benchmark`. HDF5, zlib and OpenSSL are linked in; the
+package depends on glibc (and libgcc) only.
+
+**Debian 11/12/13 and Ubuntu 20.04/22.04/24.04/26.04** (amd64, arm64), from the
+[packages.redis.io](https://packages.redis.io) APT repository:
+
+```bash
+sudo apt install lsb-release curl gpg
+curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+sudo apt-get update
+sudo apt-get install vector-db-benchmark
+```
+
+**RHEL 8/9/10 compatible** (Rocky, Alma; x86_64, aarch64):
+
+```bash
+sudo curl -fsSL https://packages.redis.io/gpg -o /etc/pki/rpm-gpg/redis-archive-keyring.gpg
+sudo tee /etc/yum.repos.d/redis.repo <<'EOF'
+[redis]
+name=Redis
+baseurl=https://packages.redis.io/rpm/el$releasever/$basearch
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/redis-archive-keyring.gpg
+EOF
+sudo dnf install -y vector-db-benchmark
+```
+
+**Amazon Linux 2023** uses its own, fixed path (its `$releasever` is a point
+release such as `2023.8.20250818`, not an `el<n>` value): replace the `baseurl`
+above with `https://packages.redis.io/rpm/amzn2023/$basearch`.
+
+The CLI looks for `datasets/datasets.json` in the working directory (and up to
+five parents) and writes `results/` next to it, so work from a copy of the
+packaged tree:
+
+```bash
+cp -r /usr/share/vector-db-benchmark ~/vdb && cd ~/vdb
+vector-db-benchmark --version            # vector-db-benchmark <version> (git <commit the package was built from>)
+vector-db-benchmark --describe datasets
+vector-db-benchmark --host localhost --engines 'redis-single*' --datasets glove-25-angular
+```
+
+To build a package yourself, on (a container of) the target distribution:
+`make release-deb DIST=$(lsb_release -cs) INSTALL_DEPS=1` or
+`make release-rpm INSTALL_DEPS=1`. `make release-test-package PKG=dist/<file>`
+then installs and runs it the way the release workflow does; run that on a
+*bare* container of the same distribution (it refuses a host with a Rust
+toolchain, and it adds and removes the package and a local repository).
+
 ### Docker (recommended)
 
 ```bash
