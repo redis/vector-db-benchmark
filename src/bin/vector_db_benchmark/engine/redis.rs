@@ -663,13 +663,22 @@ impl RedisEngine {
         // error (#361), never a pass on a partly built index.
         let max_wait = crate::effective_config::indexing_wait_budget_secs(phase, 120, expected)?;
         let start = Instant::now();
+        // Consecutive transient errors are retried for the 120 s reconnect
+        // window, not the corpus-scaled budget (#361 review): a server that
+        // died mid-wait fails in minutes, not hours.
+        let mut retry = vector_db_benchmark::indexing_wait::TransientRetry::new(
+            std::time::Duration::from_secs(max_wait),
+        );
 
         loop {
             let info: redis::Value = match redis::cmd("FT.INFO")
                 .arg(&self.config.index_name)
                 .query(&mut conn)
             {
-                Ok(v) => v,
+                Ok(v) => {
+                    retry.on_success();
+                    v
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     // A momentary blip right after a successful upload (a dropped
@@ -678,11 +687,15 @@ impl RedisEngine {
                     // the whole sweep (#198). While there is still budget, drop
                     // the (possibly dead) connection, reconnect, and retry —
                     // mirroring the #160 upload-retry philosophy on the verify
-                    // path. Only a terminal error, or exhausting the budget,
-                    // propagates.
-                    if is_transient_conn_error(&msg) && start.elapsed().as_secs() < max_wait {
+                    // path. Only a terminal error, an outage longer than the
+                    // reconnect window, or exhausting the budget propagates.
+                    if is_transient_conn_error(&msg) {
+                        let outage = retry.on_transient(start, Instant::now(), &msg)?;
                         eprintln!(
-                            "wait_for_indexing: transient FT.INFO error ({msg}); reconnecting and retrying (elapsed {}s/{}s)",
+                            "wait_for_indexing: transient FT.INFO error ({msg}); reconnecting and \
+                             retrying (outage {}s/{}s, elapsed {}s/{}s)",
+                            outage.as_secs(),
+                            vector_db_benchmark::indexing_wait::RECONNECT_WINDOW.as_secs(),
                             start.elapsed().as_secs(),
                             max_wait
                         );
@@ -692,7 +705,8 @@ impl RedisEngine {
                         match self.get_connection() {
                             Ok(c) => conn = c,
                             Err(ce) => eprintln!(
-                                "wait_for_indexing: reconnect failed ({ce}); will retry within budget"
+                                "wait_for_indexing: reconnect failed ({ce}); will retry within the \
+                                 reconnect window"
                             ),
                         }
                         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -3437,6 +3451,30 @@ mod tests {
     use crate::config::DatasetConfig;
     use crate::dataset::Dataset;
     use vector_db_benchmark::readers::write_npy_vectors;
+
+    /// #361 review: the FT.INFO wait retries transient errors through
+    /// `TransientRetry` (unit-tested in `indexing_wait`): an answered poll
+    /// resets the outage, and the retry gives up through its verdict, not the
+    /// budget alone. Reads this file's own `wait_for_indexing`.
+    #[test]
+    fn indexing_wait_caps_transient_outages_and_resets_on_an_answer() {
+        let src = include_str!("redis.rs");
+        let start = src.find("fn wait_for_indexing(").unwrap();
+        let body = &src[start..start + src[start..].find("\n    }\n").unwrap()];
+        let squeezed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            squeezed.contains("Ok(v) => { retry.on_success(); v }"),
+            "an answered FT.INFO poll must reset the outage: {body}"
+        );
+        assert!(
+            squeezed.contains("retry.on_transient(start, Instant::now(), &msg)?"),
+            "transient errors must go through the reconnect window: {body}"
+        );
+        assert!(
+            !squeezed.contains("start.elapsed().as_secs() < max_wait"),
+            "the transient retry must not be bounded by the budget alone: {body}"
+        );
+    }
 
     /// A compound ("tar") dataset rooted at an absolute temp dir holding a real
     /// `vectors.npy` of `rows` rows, declaring `declared` in datasets.json.

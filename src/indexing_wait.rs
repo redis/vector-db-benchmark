@@ -79,6 +79,66 @@ pub fn parse_override(raw: Option<&str>) -> Result<Option<u64>, String> {
     }
 }
 
+/// How long an indexing wait keeps reconnecting through CONSECUTIVE
+/// transient errors (connection refused, a dropped socket, a transient
+/// `ERRCLUSTER` while the coordinator re-initialises, #198): the pre-#361
+/// whole-wait budget, kept as its own cap now that the indexing budget scales
+/// with the corpus (#361 review). Without it a server OOM-killed during a
+/// 100M wait would be retried for the whole budget, ~2.8 h after an upload
+/// and ~28 h for a full build.
+pub const RECONNECT_WINDOW: Duration = Duration::from_secs(120);
+
+/// The retry decision for transient errors during an indexing wait: an
+/// outage (consecutive failures) may last at most [`RECONNECT_WINDOW`], and
+/// never past the indexing budget; any successful poll ends the outage.
+#[derive(Debug, Clone)]
+pub struct TransientRetry {
+    budget: Duration,
+    outage_since: Option<std::time::Instant>,
+}
+
+impl TransientRetry {
+    pub fn new(budget: Duration) -> Self {
+        TransientRetry {
+            budget,
+            outage_since: None,
+        }
+    }
+
+    /// A poll answered: the next failure starts a new outage.
+    pub fn on_success(&mut self) {
+        self.outage_since = None;
+    }
+
+    /// A transient error at `now`, `start` being the start of the wait.
+    /// `Ok(outage so far)`: reconnect and retry. `Err`: give up.
+    pub fn on_transient(
+        &mut self,
+        start: std::time::Instant,
+        now: std::time::Instant,
+        error: &str,
+    ) -> Result<Duration, String> {
+        let since = *self.outage_since.get_or_insert(now);
+        let outage = now.saturating_duration_since(since);
+        if outage > RECONNECT_WINDOW {
+            return Err(format!(
+                "FT.INFO error: {error} (the server has not answered for {:.0}s, past the \
+                 {}s reconnect window; giving up rather than retrying for the whole indexing \
+                 budget)",
+                outage.as_secs_f64(),
+                RECONNECT_WINDOW.as_secs()
+            ));
+        }
+        if now.saturating_duration_since(start) >= self.budget {
+            return Err(format!(
+                "FT.INFO error: {error} (indexing wait budget of {}s spent)",
+                self.budget.as_secs()
+            ));
+        }
+        Ok(outage)
+    }
+}
+
 pub fn budget(
     phase: WaitPhase,
     floor_secs: u64,
@@ -307,6 +367,42 @@ pub fn kividb_ready(algorithm: &str, p: &KividbProgress, expected: u64) -> Resul
 
 #[cfg(test)]
 mod tests {
+    /// #361 review: a transient-error outage during an indexing wait is
+    /// capped at the 120 s reconnect window, NOT the corpus-scaled budget, and
+    /// the window restarts after any answered poll (the #198 coordinator
+    /// restart: short outages, however many, within a long wait pass).
+    #[test]
+    fn transient_errors_are_retried_for_the_reconnect_window_not_the_budget() {
+        use super::{TransientRetry, RECONNECT_WINDOW};
+        use std::time::{Duration, Instant};
+        let s = |n: u64| Duration::from_secs(n);
+        let t0 = Instant::now();
+        assert_eq!(RECONNECT_WINDOW, s(120));
+        // A 100M upload-tail budget: 10,120 s.
+        let mut r = TransientRetry::new(s(10_120));
+        assert_eq!(r.on_transient(t0, t0 + s(1_000), "refused"), Ok(s(0)));
+        assert_eq!(r.on_transient(t0, t0 + s(1_120), "refused"), Ok(s(120)));
+        let e = r.on_transient(t0, t0 + s(1_121), "refused").unwrap_err();
+        assert!(
+            e.contains("refused") && e.contains("reconnect window"),
+            "{e}"
+        );
+
+        // Outages separated by answered polls each get their own window.
+        let mut r = TransientRetry::new(s(10_120));
+        for k in 0..5u64 {
+            let at = t0 + s(1_000 * (k + 1));
+            assert!(r.on_transient(t0, at, "ERRCLUSTER").is_ok());
+            assert!(r.on_transient(t0, at + s(100), "ERRCLUSTER").is_ok());
+            r.on_success();
+        }
+        // ...but the budget still bounds every retry.
+        let mut r = TransientRetry::new(s(60));
+        assert!(r.on_transient(t0, t0 + s(59), "refused").is_ok());
+        let e = r.on_transient(t0, t0 + s(60), "refused").unwrap_err();
+        assert!(e.contains("budget"), "{e}");
+    }
+
     /// #361 review: a set but unparsable `INDEXING_WAIT_SECS` is an error
     /// (#219), never the computed budget in disguise.
     #[test]

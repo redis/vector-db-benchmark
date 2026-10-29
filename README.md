@@ -1617,7 +1617,11 @@ Neither side of the run loads it:
   `indexing_wait_phase` in the effective config). It must be a whole number
   of seconds above zero: a value that is set but does not parse (`100000s`,
   `-1`, `0`) refuses the run at startup, before any download or connection,
-  instead of falling back to the computed budget. An
+  instead of falling back to the computed budget. On Redis, transient
+  connection errors during the wait (a dropped socket, a coordinator
+  restart) are retried for at most 120 s in a row, whatever the budget, so
+  a server that died mid-wait fails in minutes rather than hours; any
+  answered poll restarts that window. An
   expired budget is an error: the run does not go on to search a partly built
   index. Recovery at 100M: the failed run leaves the uploaded data in place
   (an upload error returns before cleanup), but `--skip-upload` does NOT
