@@ -97,7 +97,7 @@ Row 10 is the one that decides how this tool declares TAG fields. A bare TAG ind
 
 Row 10 matters for shipped data. Streaming every shipped dataset with a TAG-typed field (h-and-m, arxiv, the three random-keyword sets, `random-768-100-tenants`, MS MARCO 100K and 1M; `synthetic-filter-32` is generated locally, and `random-768-25-tenants` and MS MARCO 10M/100M have no download link) shows that h-and-m has a comma in **99 query filter values** (`section_name`, `garment_group_name`, e.g. `Womens Nightwear, Socks & Tigh`) and ~17,000 corpus values; with bare TAGs those filters would silently under-match. Under `SEPARATOR ;`, a `;` inside a value is split instead, as on Redis/Valkey/Dragonfly. No shipped query filter value contains one. In the corpus only 12 arxiv `submitter` values (HTML entities such as `&#322;`) and 10 MS MARCO `url`s do. Neither direction is hit: none of arxiv's 2,928 distinct `submitter` query values equals a stored `;`-value or any of its 20 fragments, compared case-insensitively and trimmed as a TAG matches, and MS MARCO has no filtered vector queries (#377). `search()` also reads the index's TAG declarations back from `FT.INFO` and refuses a reused (`--skip-upload`) index whose TAG fields the server would split on `,`, such as one built bare by an older binary.
 
-**Row 2 decides how the filter emitter writes a TAG value.** The emitter's literal, minimally parenthesised *structure* is unchanged and correct on 1.1.2. The TAG *value* is not sent raw: 1.1.2 honours RediSearch backslash escapes, so a raw value is read differently. Measured on 1.1.2, a raw `a\b` matched the stored `ab`, a raw `J\"org Hennig` matched `J"org Hennig`, a raw `x|y` matched `x` and `y`, and a raw `}` or a leading `"` is a syntax error. Every TAG value is therefore escaped by the RediSearch rule, a backslash before every ASCII punctuation character and space (`kividb_filter::escape_tag_value`). On 1.1.2 that was measured exact for all 32 ASCII punctuation characters plus space, at the start, middle and end of a value, bare, inside a group and AND'd; non-ASCII characters are exact unescaped. This matters for shipped data. Of the TAG-bearing datasets listed above, arxiv `submitter` is the only exposed field:
+**Row 2 decides how the filter emitter writes a TAG value.** The emitter's literal, minimally parenthesised *structure* is unchanged and correct on 1.1.2. The TAG *value* is not sent raw: 1.1.2 honours RediSearch backslash escapes, so a raw value is read differently. Measured on 1.1.2, a raw `a\b` matched the stored `ab`, a raw `J\"org Hennig` matched `J"org Hennig`, a raw `x|y` matched `x` and `y`, and a raw `}` or a leading `"` is a syntax error. Every TAG value is therefore escaped by the RediSearch rule, a backslash before every ASCII punctuation character and space (`kividb_caps::escape_tag_value`). On 1.1.2 that was measured exact for all 32 ASCII punctuation characters plus space, at the start, middle and end of a value, bare, inside a group and AND'd; non-ASCII characters are exact unescaped. This matters for shipped data. Of the TAG-bearing datasets listed above, arxiv `submitter` is the only exposed field:
 
 - **77 of its 10,000 queries** use a value containing `\` (69 distinct values, e.g. `J\"org Hennig`), 14 of them also with `{`/`}` (e.g. `Rasmus Bj{\o}rk`), and 4 use parentheses (`Francisco (Paco) Guinea`, `Chun Ning (Jeanie) Lau`).
 - No other shipped query value contains `\ { } ( ) | @ ;`.
@@ -106,16 +106,17 @@ Sent raw (measured on 1.0.5, which handles escapes the same way as 1.1.2), the b
 
 Some values have no exact encoding, and each is a **hard error** when the filter is built, never a silent miss (all measured on 1.1.2):
 
-- leading or trailing whitespace, which the query parser trims;
+- leading or trailing whitespace, which the query parser trims (`@t:{\ sp}` matched the stored `sp`, ` sp` and `sp `);
 - `;`, the declared separator, so the stored value was split and nothing matches it whole;
 - a trailing `*`, read as a prefix wildcard even when escaped (`@t:{zz\*}` matched 73 documents);
 - a leading `$`, read as a query parameter even when escaped (`No such parameter`).
 
-No shipped query value hits any of these. CI runs the KiviDB suite against `kividb/kividb:v1.1.2-full` (`make integration-test-kividb`). It includes three live TAG fixtures:
+No shipped query value hits any of these. CI runs the KiviDB suite against `kividb/kividb:v1.1.2-full` (`make integration-test-kividb`). It includes four live TAG fixtures:
 
 - a comma in a keyword value, which fails if a TAG is declared bare;
 - backslash, brace and quote values, each next to the decoy a raw value would match instead;
 - `(`, `)`, `|` and `@` values, each next to its decoys;
+- an exact-count fixture: values containing `\`, `{`, `}`, `"`, `,`, `(`, `)` and `|`, each stored on a different number of documents, queried on the engine's own index with the literal the engine sends. Every value must return exactly its own documents, bare and inside a group.
 
 **TAG matching is case-insensitive** (measured on 1.1.2: `@t:{mixed}` matches a stored `MiXeD`), as it is in `redis.rs`'s `vector` layout, while the shipped ground truth matches exactly. So a filter value that differs from another stored value only in case over-matches, on KiviDB and on Redis. Measured by a reviewer on 1.0.5, which folds case the same way, that affects 31 of h-and-m's 10,000 queries (e.g. `department_name` `Jersey fancy`: 3,148 documents vs 1,397 exact) and 30 of arxiv's. The cross-engine question is tracked in #377. Stored whitespace is trimmed too, so `@t:{sp}` also matches a stored ` sp `.
 

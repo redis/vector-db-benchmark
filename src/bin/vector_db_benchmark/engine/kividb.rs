@@ -530,14 +530,14 @@ impl KividbEngine {
 /// backslash escapes, so a raw `\` is read as an escape (`@t:{a\b}` matches the
 /// stored `ab`, not `a\b`), a raw `}` or leading `"` is a syntax error, and a
 /// raw `|` is the TAG-OR separator. Every TAG value is therefore escaped
-/// ([`escape_tag_value`]: a backslash before every ASCII punctuation character
+/// (`kividb_caps::escape_tag_value`: a backslash before every ASCII punctuation character
 /// and space), which was measured exact on 1.1.2 for all 32 of them plus space,
 /// bare, inside a group and AND'd. [`parse_conditions`] takes whether the
 /// server is one TAG fields are supported on (KiviDB >= 1.1.2, see
 /// `kividb_caps`) and refuses every TAG value anywhere else, since the escaped
 /// form is only known to be right there.
 ///
-/// What a value cannot express is a hard error ([`tag_value_problem`]), never a
+/// What a value cannot express is a hard error (`kividb_caps::tag_value_problem`), never a
 /// silent miss. On the index side a bare TAG splits on `,` (as on RediSearch),
 /// so `create_index` declares every TAG `SEPARATOR ;` (`tag_declaration`), and
 /// `@f:{Smith\,\ John}` matches exactly.
@@ -566,13 +566,13 @@ impl KividbEngine {
 ///    spaces, `-`, `$`, `{`, `}`, `:`, `;`, `.`, `/`, quotes and backslashes all
 ///    round-tripped verbatim. From 1.0.5, and on 1.1.2, this is reversed:
 ///    escapes are honoured and the raw forms of `\`, `|`, `}` and a leading `"`
-///    are wrong, so every TAG value is escaped ([`escape_tag_value`]).
+///    are wrong, so every TAG value is escaped (`kividb_caps::escape_tag_value`).
 /// 3. **Four characters were inexpressible in a TAG value on the early
 ///    release**: `|` (always the TAG-OR separator), `@` (degraded the query to
 ///    match-all) and `(`/`)` (parsed as grouping inside a group), with no
 ///    escape to fall back on. Escaped, all four are exact on 1.1.2, bare,
 ///    grouped and AND'd. What is still inexpressible is listed in
-///    [`tag_value_problem`].
+///    `kividb_caps::tag_value_problem`.
 /// 4. **`|` spacing is inverted between the two positions it appears in.**
 ///    INSIDE braces it must NOT be spaced: `@f:{a | b}` matches EVERY document
 ///    (a parser divergence) while `@f:{a|b}` is correct. BETWEEN clauses it
@@ -625,7 +625,7 @@ impl KividbEngine {
 /// selectivity, so the filtered numbers this engine reports are meaningful.
 pub(crate) mod kividb_filter {
     use serde_json::{Map, Value};
-    use vector_db_benchmark::kividb_caps::TAG_MIN_VERSION_STR;
+    use vector_db_benchmark::kividb_caps::tag_literal;
     use vector_db_benchmark::parsers::datetime_to_epoch_secs;
 
     /// Sentinel TAG/TEXT value used to express "matches nothing".
@@ -1106,124 +1106,6 @@ pub(crate) mod kividb_filter {
         Ok(Node::Leaf(format!("@{field}:{{{literal}}}")))
     }
 
-    /// What goes between a TAG clause's braces for `value`: the value escaped
-    /// with [`escape_tag_value`], or an error if it cannot be matched exactly.
-    ///
-    /// `tags_supported` is `KividbServer::tags_supported` (KiviDB >= 1.1.2).
-    /// The escaped form is only known to be right there; the release before
-    /// 1.0.5 matched escaped values against nothing. So on any other server a
-    /// TAG value is an error. The engine already refuses a dataset whose schema
-    /// declares a TAG field on such a server; this also covers a string
-    /// condition on a field the schema does not declare as a TAG.
-    pub fn tag_literal(field: &str, value: &str, tags_supported: bool) -> Result<String, String> {
-        if !tags_supported {
-            return Err(format!(
-                "KiviDB filter: cannot encode TAG value {value:?} for field `{field}`: the \
-                 server's `kividb_version` is unknown or older than {TAG_MIN_VERSION_STR}, the \
-                 oldest KiviDB on which this tool's (escaped) TAG encoding is tested."
-            ));
-        }
-        if let Some(problem) = tag_value_problem(value) {
-            return Err(format!(
-                "KiviDB filter: TAG value {value:?} for field `{field}` cannot be expressed \
-                 exactly on KiviDB: {problem}. Refusing to emit a filter that would report a \
-                 wrong recall."
-            ));
-        }
-        Ok(escape_tag_value(value))
-    }
-
-    /// RediSearch-style TAG escaping, as KiviDB 1.1.2 accepts it: a backslash
-    /// before every ASCII punctuation character and before space.
-    ///
-    /// Measured on `kividb_version:1.1.2` (a `TAG SEPARATOR ;` index): storing
-    /// `zz<c>zz`, `zz<c>` and `<c>zz` for each of the 32 ASCII punctuation
-    /// characters plus space and querying the escaped value bare, inside a
-    /// parenthesised OR AND'd with a second clause, and AND'd after another
-    /// clause returned exactly the expected documents in all three positions,
-    /// except the shapes [`tag_value_problem`] refuses. Raw, 22 of 146 probe
-    /// values were wrong: a raw `\` is read as an escape (`a\b` matched `ab`,
-    /// `J\"org Hennig` matched `J"org Hennig`), a raw `|` is the TAG-OR
-    /// separator (`x|y` matched `x` and `y`), and a raw `}` or leading `"` is a
-    /// syntax error. KiviDB 1.0.5 measured the same way, which is how the
-    /// shipped arxiv `submitter` values were found: escaped they return their
-    /// exact corpus counts (`J\"org Hennig` → 31, 0 raw; `Ulf-G. Mei{\ss}ner` →
-    /// 108, a syntax error raw).
-    ///
-    /// Non-ASCII characters are passed through: non-ASCII punctuation and
-    /// fullwidth look-alikes (`’ – （ ） ｜ ＠ ＊ ＄`) and accented letters
-    /// matched exactly unescaped on 1.1.2. Escaping everything rather than a
-    /// minimal set is deliberate: it is the RediSearch rule, so every character
-    /// this emitter could meet in a value has one encoding with a measurement
-    /// behind it.
-    pub fn escape_tag_value(value: &str) -> String {
-        let mut out = String::with_capacity(value.len() * 2);
-        for c in value.chars() {
-            if c.is_ascii_punctuation() || c == ' ' {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-        out
-    }
-
-    /// Why `value` cannot be expressed exactly as a KiviDB TAG query value, or
-    /// `None` if it can. Measured on 1.1.2 (and on 1.0.5 before it), with the
-    /// value escaped by [`escape_tag_value`]:
-    ///
-    /// * **Leading or trailing whitespace.** The query side trims it, and so
-    ///   does the index: `@t:{\ sp}` matched the stored `sp`, ` sp` and `sp `.
-    ///   Rust's `char::is_whitespace` is used, which covers the tab, U+3000
-    ///   and U+2028 that were measured to be trimmed as well (on 1.0.5).
-    /// * **`;`**, the SEPARATOR every TAG field is declared with, so the stored
-    ///   value was split into tokens and no query matches it whole
-    ///   (`@t:{zz\;zz}` → 0).
-    /// * **A trailing `*`**, read as a prefix wildcard even when escaped:
-    ///   `@t:{zz\*}` matched 73 documents (`zz`, `zzzz`, `zza`, `zz!zz`, …) and
-    ///   a lone `\*` is a syntax error. A `*` elsewhere (`zz\*zz`, `\*zz`) is
-    ///   exact.
-    /// * **A leading `$`**, read as a query parameter even when escaped:
-    ///   `@t:{\$zz}` fails with `No such parameter`. That error is per query,
-    ///   and `search()` drops a failed query with only a log line, so it is
-    ///   refused here instead. A `$` elsewhere (`zz\$`, `zz\$zz`) is exact.
-    ///
-    /// No shipped query value hits any of these. Only the QUERY side is
-    /// checked: a stored value with one of these shapes does not perturb any
-    /// other query (on 1.1.2 the stored `zz*`, `$zz` and `zz*zz` leave
-    /// `@t:{zz}` at exactly its own documents). Two corpus-side effects that do
-    /// reach other queries are in the README, because they are shared with
-    /// redis.rs's `vector` layout: TAG matching is case-insensitive, and stored
-    /// whitespace is trimmed (so `@t:{sp}` also matches a stored ` sp `).
-    pub fn tag_value_problem(value: &str) -> Option<String> {
-        if value.starts_with(char::is_whitespace) || value.ends_with(char::is_whitespace) {
-            Some(
-                "it has leading or trailing whitespace, which KiviDB trims from a TAG query \
-                 value (`@t:{\\ sp}` is looked up as `sp`)"
-                    .to_string(),
-            )
-        } else if value.contains(';') {
-            Some(
-                "it contains `;`, the SEPARATOR every TAG field is declared with, so the \
-                 stored value was split into tokens and no query can match it whole"
-                    .to_string(),
-            )
-        } else if value.ends_with('*') {
-            Some(
-                "it ends in `*`, which KiviDB reads as a prefix wildcard even when escaped \
-                 (`@t:{zz\\*}` also matches `zz`, `zzab`, ...)"
-                    .to_string(),
-            )
-        } else if value.starts_with('$') {
-            Some(
-                "it starts with `$`, which KiviDB reads as a query parameter even when \
-                 escaped (`@t:{\\$zz}` fails with `No such parameter`)"
-                    .to_string(),
-            )
-        } else {
-            None
-        }
-    }
-
     /// TAG clause that matches nothing. See [`NEVER_MATCH`].
     fn never_match_tag(field: &str) -> Node {
         Node::Leaf(format!("@{field}:{{{NEVER_MATCH}}}"))
@@ -1283,102 +1165,6 @@ pub(crate) mod kividb_filter {
         }
 
         #[test]
-        fn the_inexpressible_set_is_semicolon_trailing_star_leading_dollar() {
-            for (v, needle) in [
-                ("a;b", "`;`"),
-                (";", "`;`"),
-                ("zz*", "prefix wildcard"),
-                ("a*b*", "prefix wildcard"),
-                ("*", "prefix wildcard"),
-                ("$p", "query parameter"),
-                ("$", "query parameter"),
-            ] {
-                let p = tag_value_problem(v).expect(v);
-                assert!(p.contains(needle), "{v}: {p}");
-                let e = err(exact("c", v));
-                assert!(e.contains(needle), "{v}: {e}");
-            }
-            // Measured exact once escaped on 1.1.2: `*` / `$` anywhere else,
-            // and the four characters the early release could not express.
-            for v in [
-                "a*b",
-                "*zz",
-                "a$b",
-                "zz$",
-                "a|b",
-                "a@b",
-                "Bag (Small)",
-                "x{y}z",
-                "a\\b",
-            ] {
-                assert_eq!(tag_value_problem(v), None, "{v}");
-            }
-            for c in "-_.:/\\+*?~^$#%&[]{}<>=!,'\"`|@() ".chars() {
-                assert_eq!(
-                    tag_value_problem(&format!("zz{c}zz")),
-                    None,
-                    "{c:?} must be expressible (escaped) on KiviDB 1.1.2"
-                );
-            }
-        }
-
-        #[test]
-        fn leading_or_trailing_whitespace_is_inexpressible() {
-            for v in [
-                " sp",
-                "sp ",
-                " sp ",
-                "\tlead",
-                "trail\t",
-                "zz\u{3000}",
-                "\u{2028}zz",
-            ] {
-                let p = tag_value_problem(v).unwrap_or_else(|| panic!("{v:?}"));
-                assert!(p.contains("whitespace"), "{v:?}: {p}");
-            }
-            for v in ["two  spaces", "tab\there", "sp"] {
-                assert_eq!(tag_value_problem(v), None, "{v:?}");
-            }
-            let e = err(exact("c", " sp"));
-            assert!(e.contains("whitespace"), "{e}");
-            let e = err(json!({"and": [{"c": {"match": {"any": ["ok", "sp "]}}}]}));
-            assert!(e.contains("whitespace"), "{e}");
-        }
-
-        #[test]
-        fn every_ascii_punctuation_character_and_space_is_escaped() {
-            // The measured set: all 32 ASCII punctuation characters plus space.
-            let specials: String = (0u8..128)
-                .map(char::from)
-                .filter(|c| c.is_ascii_punctuation() || *c == ' ')
-                .collect();
-            assert_eq!(specials.len(), 33);
-            for c in specials.chars() {
-                assert_eq!(
-                    escape_tag_value(&format!("a{c}b")),
-                    format!("a\\{c}b"),
-                    "{c:?}"
-                );
-            }
-            // Alphanumerics, other ASCII whitespace inside a value, and every
-            // non-ASCII character (measured exact unescaped) pass through.
-            for v in [
-                "abcXYZ019",
-                "tab\there",
-                "Jörg Müller",
-                "王小明",
-                "（）｜＠＊＄",
-                "nbsp\u{a0}x",
-            ] {
-                let want: String = v
-                    .chars()
-                    .flat_map(|c| (c == ' ').then_some('\\').into_iter().chain([c]))
-                    .collect();
-                assert_eq!(escape_tag_value(v), want, "{v}");
-            }
-        }
-
-        #[test]
         fn shipped_arxiv_values_render_escaped() {
             // Exactly what was measured to return the corpus counts
             // (`J\"org Hennig` → 31, `Ulf-G. Mei{\ss}ner` → 108; raw, 0 and a
@@ -1394,6 +1180,21 @@ pub(crate) mod kividb_filter {
                 ),
             ] {
                 assert_eq!(q(exact("s", v)), want, "{v}");
+            }
+        }
+
+        /// `tag_literal`'s refusals (pinned in `kividb_caps`) reach the caller
+        /// from both TAG paths, exact match and every `match_any` arm.
+        #[test]
+        fn tag_value_problems_abort_both_exact_and_match_any() {
+            for v in [
+                exact("c", " sp"),
+                exact("c", "zz*"),
+                json!({"and": [{"c": {"match": {"any": ["ok", "sp "]}}}]}),
+                json!({"and": [{"c": {"match": {"any": ["ok", "$p"]}}}]}),
+            ] {
+                let e = err(v.clone());
+                assert!(e.contains("cannot be expressed exactly"), "{v}: {e}");
             }
         }
 
@@ -1845,7 +1646,7 @@ fn upload_batch_internal(
                             s.clone()
                         };
                         // Stored verbatim, with NO corpus-side counterpart to
-                        // `kividb_filter::tag_value_problem`. That asymmetry is
+                        // `kividb_caps::tag_value_problem`. That asymmetry is
                         // deliberate and measured — see its doc: the failures
                         // it refuses live in the QUERY parser, and a stored
                         // occurrence is inert.
