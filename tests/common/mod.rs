@@ -698,6 +698,105 @@ pub fn write_comma_keyword_project(
     )
 }
 
+/// Keyword values carrying the backslash / brace / comma / quote characters
+/// whose TAG encoding differs by KiviDB version, each next to the decoy a
+/// wrong encoding would hit instead. Shaped on the shipped arxiv `submitter`
+/// values (`J\"org Hennig`, `Rasmus Bj{\o}rk`):
+///
+/// * sent raw to KiviDB >= 1.0.5 (which honours escapes), `J\"org Hennig`
+///   matches the decoy `J"org Hennig`, `a\b` matches `ab`, `C:\dir` matches
+///   nothing and `Bj{\o}rk` is a syntax error (a dropped query);
+/// * sent escaped to KiviDB 1.0.2 (which does not), every one matches nothing.
+///
+/// Every query targets one of those values (one is a `match_any` over two of
+/// them), so any wrong encoding fails at least one of the ten queries outright.
+pub const TAG_ESCAPE_VALUES: [&str; 9] = [
+    r#"J\"org Hennig"#,
+    r#"J"org Hennig"#,
+    r"Rasmus Bj{\o}rk",
+    "Rasmus Bjork",
+    "Smith, John",
+    "Smith",
+    r"a\b",
+    "ab",
+    r"C:\dir",
+];
+
+pub fn write_tag_escape_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_tag_values_project(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        &TAG_ESCAPE_VALUES,
+        &[&[0], &[2], &[4], &[6], &[8], &[0], &[2], &[4], &[6, 8]],
+    )
+}
+
+/// Keyword values with `(`, `)`, `|` and `@`, next to the decoys a mis-parse
+/// would hit. KiviDB >= 1.0.5 expresses all four exactly once escaped;
+/// KiviDB 1.0.2 cannot express any of them, so the run must be refused there.
+/// `Francisco (Paco) Guinea` is a shipped arxiv `submitter` value.
+pub const TAG_PAREN_PIPE_VALUES: [&str; 7] = [
+    "Francisco (Paco) Guinea",
+    "Francisco",
+    "x|y",
+    "x",
+    "y",
+    "c@d",
+    "c",
+];
+
+pub fn write_tag_paren_pipe_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+) -> FilterProject {
+    write_tag_values_project(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        &TAG_PAREN_PIPE_VALUES,
+        &[&[0], &[2], &[5], &[0], &[2], &[5], &[0], &[2, 5]],
+    )
+}
+
+/// Field `author` (keyword) cycles through `values`; query `q` filters on
+/// `wanted[q % wanted.len()]` — an exact `match` for one index, a `match_any`
+/// for several — with exact-string ground truth.
+fn write_tag_values_project(
+    dataset_name: &str,
+    engine_configs_json: &str,
+    dim: usize,
+    values: &'static [&'static str],
+    wanted: &'static [&'static [usize]],
+) -> FilterProject {
+    let author = move |id: usize| values[id % values.len()];
+    let wanted_for = move |q: usize| wanted[q % wanted.len()];
+    write_filter_project_multi(
+        dataset_name,
+        engine_configs_json,
+        dim,
+        GtMetric::L2,
+        N_QUERIES,
+        serde_json::json!({ "author": "keyword" }),
+        move |id| serde_json::json!({ "author": author(id) }),
+        move |q| {
+            let w = wanted_for(q);
+            let m = if w.len() == 1 {
+                serde_json::json!({ "value": values[w[0]] })
+            } else {
+                serde_json::json!({ "any": w.iter().map(|&i| values[i]).collect::<Vec<_>>() })
+            };
+            serde_json::json!({ "and": [ { "author": { "match": m } } ] })
+        },
+        move |q, id| wanted_for(q).contains(&(id % values.len())),
+    )
+}
+
 /// bool filter: field `flag` (schema type `bool`), value `id % 2 == 0`. The
 /// query filters `flag == true`, so half the corpus matches.
 pub fn write_bool_project(

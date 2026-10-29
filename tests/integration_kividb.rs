@@ -687,6 +687,106 @@ fn test_binary_kividb_keyword_value_with_comma() {
     );
 }
 
+/// Run a TAG-value fixture with `--fail-on-dropped-queries` (a value the
+/// server rejects as a syntax error would otherwise be dropped with a log line
+/// and leave the recall of the surviving queries looking fine), then require
+/// either a near-exact recall or a refusal that wrote nothing.
+///
+/// Each fixture's ten queries all target a value whose encoding is
+/// version-specific, next to the decoy a wrong encoding would match instead,
+/// so a single mis-encoded value costs a whole query (recall <= 0.9).
+fn run_kividb_tag_value_test(
+    name: &str,
+    dataset: &str,
+    build: impl Fn(&str, &str, usize) -> common::FilterProject,
+    expect_refused: bool,
+    refusal_needle: &str,
+) {
+    let dim = 8;
+    let configs = serde_json::json!([{
+        "name": name, "engine": "kividb", "algorithm": "hnsw",
+        "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 128 } },
+        "search_params": [{ "parallel": 1, "search_params": { "ef": 256 } }],
+        "upload_params": { "parallel": 1, "batch_size": 64 }
+    }]);
+    let proj = build(dataset, &configs.to_string(), dim);
+    assert!(proj.matching_docs >= proj.top);
+    let port = test_port().to_string();
+    let run = common::run_binary_capture_extra(
+        &proj.root,
+        name,
+        dataset,
+        TEST_HOST,
+        &[("KIVIDB_PORT", port.as_str())],
+        &["--fail-on-dropped-queries"],
+    );
+    if expect_refused {
+        assert!(
+            !run.ok,
+            "kividb {name}: expected a refusal, the run succeeded"
+        );
+        assert!(
+            run.combined.contains(refusal_needle),
+            "kividb {name}: refusal must name {refusal_needle:?}; output:\n{}",
+            run.combined
+        );
+        // Query conditions are resolved in `search()`, after the upload (the
+        // same place every engine's filter refusals fire), so only a SEARCH
+        // result must be absent.
+        let searches: Vec<_> = fs::read_dir(proj.root.join("results"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-search-"))
+            .collect();
+        assert!(searches.is_empty(), "refused run wrote {searches:?}");
+        return;
+    }
+    assert!(run.ok, "kividb {name} run failed:\n{}", run.combined);
+    let recall = common::read_recall(&proj.root, name);
+    println!("kividb {name} recall={recall:.3}");
+    assert!(
+        recall >= 0.95,
+        "kividb {name} recall {recall:.3} < 0.95: a TAG value was encoded wrongly for this \
+         server version (see kividb_filter::tag_literal)"
+    );
+}
+
+/// Backslash, braces, a double quote and a comma in TAG filter values
+/// (shipped arxiv shape). Exact on both server generations, with a different
+/// encoding on each: raw before 1.0.5, backslash-escaped from 1.0.5.
+#[test]
+fn test_binary_kividb_tag_values_with_backslash_and_braces() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    assert_server_tag_semantics(&mut conn);
+    run_kividb_tag_value_test(
+        "kividb-tag-escape",
+        "kividb-tag-escape-test",
+        common::write_tag_escape_project,
+        false,
+        "",
+    );
+}
+
+/// `(`, `)`, `|` and `@` in TAG filter values. Exact once escaped on >= 1.0.5;
+/// inexpressible before 1.0.5, where the run must be refused.
+#[test]
+fn test_binary_kividb_tag_values_with_parens_pipe_and_at() {
+    wait_for_kividb();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let atomic = assert_server_tag_semantics(&mut conn) == TagSemantics::Atomic;
+    run_kividb_tag_value_test(
+        "kividb-tag-paren",
+        "kividb-tag-paren-test",
+        common::write_tag_paren_pipe_project,
+        atomic,
+        "cannot be expressed exactly on this KiviDB server",
+    );
+}
+
 /// `--skip-upload` must not measure a reused index whose TAG fields the server
 /// splits on `,`. On KiviDB >= 1.0.5 a bare TAG reports `SEPARATOR ,`; an index
 /// built that way (by a binary predating #375, which declared scalar TAGs bare,

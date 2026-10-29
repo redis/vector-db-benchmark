@@ -426,7 +426,14 @@ fn engines() -> Vec<(&'static str, EngineResolver)> {
         // "produced nothing" before resolving, and so does this.
         ("kividb", |c, _| {
             through("KiviDB", c, |v| {
-                let rendered = super::kividb::kividb_filter::parse_conditions(v)?;
+                // The CI-pinned server generation (>= 1.0.5). What this matrix
+                // checks — a filter produced, with every leaf kept — does not
+                // depend on how a TAG value is encoded; the per-version
+                // encoding is pinned in kividb_filter's own tests.
+                let rendered = super::kividb::kividb_filter::parse_conditions(
+                    v,
+                    Some(vector_db_benchmark::kividb_caps::TagSemantics::Separator),
+                )?;
                 Ok((rendered != super::kividb::kividb_filter::MATCH_ALL).then_some(rendered))
             })
         }),
