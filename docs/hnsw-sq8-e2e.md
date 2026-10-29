@@ -66,12 +66,17 @@ results are still labeled with that configuration's name. When only
 (`HNSW_QUANT_DEFAULT_TRAINING_THRESHOLD`, `10 * DEFAULT_BLOCK_SIZE`), and the
 `FT.INFO` read-back confirms it at index creation.
 
-The `verify_ft_info` read-back runs only when the index is created. This guide's
-workflow is two invocations (`--skip-search` upload, then `--skip-upload`
-search). Export identical values for both invocations; otherwise the search
-results record `hnsw_compression` for an index that was built differently, and
-nothing on the search path detects it (tracked in
-[#374](https://github.com/redis/vector-db-benchmark/issues/374)).
+The compression is read back from `FT.INFO` twice: right after `FT.CREATE`, and
+again before any search, including `--skip-upload` searches of an index another
+invocation built. This guide's workflow is two invocations (`--skip-search`
+upload, then `--skip-upload` search). Export identical values for both. If they
+differ, the search invocation fails before writing a result, in either
+direction: SQ8 resolved for an uncompressed index, or no compression resolved
+for an SQ8 index (or a different threshold). The same check covers
+`REDIS_INDEX_NAME_EXACT=1`, which points a configuration at an index another
+configuration built. Graph parameters (`M`, `EF_CONSTRUCTION`) are not read
+back on the search path
+([#374](https://github.com/redis/vector-db-benchmark/issues/374)).
 
 The variables apply to every HNSW configuration that lacks `COMPRESSION`,
 including the `-plain` baselines in `redis-hnsw-sq8-k10.json` and

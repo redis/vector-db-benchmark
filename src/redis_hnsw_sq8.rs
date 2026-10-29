@@ -89,8 +89,9 @@ impl Sq8Resolution {
             ));
         }
         Some(format!(
-            "notice: Redis config '{config_name}' builds its HNSW index with {}, not from \
-             the config; its results are labeled '{config_name}'",
+            "notice: Redis config '{config_name}' resolves HNSW {}, not from the config; \
+             the index is checked against this before searching, and its results are \
+             labeled '{config_name}'",
             parts.join(" and ")
         ))
     }
@@ -269,7 +270,9 @@ impl Sq8Options {
         let actual_compression = field(vector, "compression").and_then(as_string);
         if actual_compression.as_deref() != self.compression.as_deref() {
             return Err(format!(
-                "FT.INFO vector compression {:?} differs from requested {:?}",
+                "FT.INFO vector compression {:?} differs from requested {:?} (the index was \
+                 not built with this run's HNSW COMPRESSION; check REDIS_HNSW_* and the config \
+                 against the invocation that built it)",
                 actual_compression, self.compression
             ));
         }
@@ -286,6 +289,103 @@ impl Sq8Options {
             ));
         }
         Ok(())
+    }
+
+    /// Direction-aware read-back for an index this run is about to SEARCH,
+    /// whether it built it or reuses it (`--skip-upload`,
+    /// `REDIS_INDEX_NAME_EXACT=1`). With compression resolved it is
+    /// [`Self::verify_ft_info`]. Without, the vector field must report none:
+    /// RediSearch `src/info/info_command.c` emits `compression` /
+    /// `training_threshold` for an HNSW field only when
+    /// `quantType != VecSimQuant_NONE`, so a plain HNSW (or FLAT) field has no
+    /// `compression` key. Otherwise an SQ8 index would be published as
+    /// uncompressed, e.g. built with `REDIS_HNSW_COMPRESSION` and searched
+    /// without it.
+    ///
+    /// An index with no `vector` field serves no vector workload (a fulltext
+    /// index, say), so there is no compression to mislabel and it passes; an
+    /// `FT.INFO` without `attributes` still fails.
+    pub fn verify_index_compression(&self, info: &RedisValue) -> Result<(), String> {
+        let Some(vector) = vector_attribute_if_any(info)? else {
+            return Ok(());
+        };
+        if self.compression.is_some() {
+            return self.verify_ft_info(info);
+        }
+        match field(vector, "compression").and_then(as_string) {
+            None => Ok(()),
+            Some(c) if c == SVS_NO_COMPRESSION => Ok(()),
+            Some(c) => Err(format!(
+                "this run resolves no HNSW COMPRESSION (neither the config nor \
+                 REDIS_HNSW_COMPRESSION sets it), but the index's vector field reports \
+                 compression {c} (training_threshold {}); it was built by another invocation or \
+                 config, and its results would be labeled uncompressed",
+                field(vector, "training_threshold")
+                    .and_then(as_string)
+                    .unwrap_or_else(|| "?".into())
+            )),
+        }
+    }
+}
+
+/// What `FT.INFO` reports as an SVS field's `compression` when it has none
+/// (RediSearch `VECSIM_NO_COMPRESSION`, from `VecSimSvsCompression_ToString`).
+pub const SVS_NO_COMPRESSION: &str = "NO_COMPRESSION";
+
+/// [`Sq8Options::verify_index_compression`] for SVS-VAMANA: with a resolved
+/// compression it is [`verify_svs_compression`]; without, the field must
+/// report `NO_COMPRESSION` (an SVS field always carries `compression`, so a
+/// missing one cannot be confirmed and fails).
+pub fn verify_svs_index_compression(
+    requested: Option<&str>,
+    info: &RedisValue,
+) -> Result<(), String> {
+    let Some(vector) = vector_attribute_if_any(info)? else {
+        return Ok(());
+    };
+    if let Some(requested) = requested {
+        return verify_svs_compression(requested, info);
+    }
+    match field(vector, "compression").and_then(as_string) {
+        Some(c) if c == SVS_NO_COMPRESSION => Ok(()),
+        Some(c) => Err(format!(
+            "this run resolves no SVS COMPRESSION (neither the config nor \
+             REDIS_SVS_COMPRESSION sets it), but the index's vector field reports compression \
+             {c}; it was built by another invocation or config, and its results would be \
+             labeled uncompressed"
+        )),
+        None => Err("FT.INFO SVS vector attribute has no compression".into()),
+    }
+}
+
+/// A key of `collection_params.svs-vamana_config` that must be a string when
+/// present. A `null` or a number used to fall through to the env or to no
+/// value, building an uncompressed index under, say, an LVQ8 name.
+pub fn svs_block_string(
+    block: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match block.and_then(|b| b.get(key)) {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!(
+            "collection_params.svs-vamana_config.{key} must be a string, got {other}"
+        )),
+    }
+}
+
+/// A key of `collection_params.svs-vamana_config` that must be a positive
+/// integer when present (`REDUCE`): a malformed value used to be dropped
+/// silently, building a `-div4` config without dimensionality reduction.
+pub fn svs_block_positive_int(
+    block: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Result<Option<i64>, String> {
+    match block.and_then(|b| b.get(key)) {
+        None => Ok(None),
+        Some(v) => v.as_i64().filter(|&n| n > 0).map(Some).ok_or_else(|| {
+            format!("collection_params.svs-vamana_config.{key} must be a positive integer, got {v}")
+        }),
     }
 }
 
@@ -308,7 +408,10 @@ const SVS_COMPRESSION_FT_INFO: &[&str] = &[
 /// What `FT.INFO` reports for an SVS index built without LVQ/LeanVec
 /// support (`VECSIM_LVQ_SCALAR`). `VecSimSvsCompression_ToString` returns it
 /// for ANY requested compression when `isLVQSupported()` is false, i.e. on a
-/// non-Intel CPU or a build without the Intel SVS optimisations.
+/// non-Intel CPU or a build without the Intel SVS optimisations. The official
+/// `redis` Docker images are such builds: they run a plain `make all` without
+/// `BUILD_INTEL_SVS_OPT` (RediSearch `build.sh` defaults it to 0; the LVQ /
+/// LeanVec binaries are RSALv2-only), so they report `GlobalSQ8` on every CPU.
 pub const SVS_SCALAR_FALLBACK: &str = "GlobalSQ8";
 
 /// The `FT.INFO` spelling expected for a requested SVS compression: the
@@ -349,6 +452,18 @@ pub fn verify_svs_compression(requested: &str, info: &RedisValue) -> Result<(), 
     ))
 }
 
+/// The `vector` attribute of an `FT.INFO` reply, if the index has one. An
+/// `FT.INFO` without `attributes` is an error, not "no vector field".
+fn vector_attribute_if_any(info: &RedisValue) -> Result<Option<&RedisValue>, String> {
+    match vector_attribute(info) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e == NO_VECTOR_ATTRIBUTE => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+const NO_VECTOR_ATTRIBUTE: &str = "FT.INFO has no vector attribute";
+
 /// The `vector` attribute of an `FT.INFO` reply, RESP2 or RESP3.
 fn vector_attribute(info: &RedisValue) -> Result<&RedisValue, String> {
     let attributes = field(info, "attributes").ok_or("FT.INFO has no attributes")?;
@@ -359,7 +474,7 @@ fn vector_attribute(info: &RedisValue) -> Result<&RedisValue, String> {
     entries
         .iter()
         .find(|entry| field(entry, "identifier").and_then(as_string).as_deref() == Some("vector"))
-        .ok_or_else(|| "FT.INFO has no vector attribute".into())
+        .ok_or_else(|| NO_VECTOR_ATTRIBUTE.into())
 }
 
 /// A declared value must have the right JSON type, including rejection of null.
@@ -789,6 +904,155 @@ mod tests {
         for info in svs_info(None) {
             let e = verify_svs_compression("LVQ8", &info).unwrap_err();
             assert!(e.contains("no compression"), "{e}");
+        }
+    }
+
+    /// RESP3 `FT.INFO` (map) for one HNSW `vector` field, with
+    /// `training_threshold` as an integer, as the server sends it
+    /// (`REPLY_KVINT`). `None` compression omits both keys, like a plain HNSW
+    /// field.
+    fn hnsw_info_resp3(compression: Option<&str>, threshold: i64) -> RedisValue {
+        let s = |s: &str| RedisValue::BulkString(s.as_bytes().to_vec());
+        let mut attr = vec![
+            (s("identifier"), s("vector")),
+            (s("algorithm"), s("HNSW")),
+            (s("M"), RedisValue::Int(16)),
+        ];
+        if let Some(c) = compression {
+            attr.push((s("compression"), s(c)));
+            attr.push((s("training_threshold"), RedisValue::Int(threshold)));
+        }
+        RedisValue::Map(vec![(
+            s("attributes"),
+            RedisValue::Array(vec![RedisValue::Map(attr)]),
+        )])
+    }
+
+    fn hnsw_info_resp2(compression: Option<&str>, threshold: i64) -> RedisValue {
+        let s = |s: &str| RedisValue::BulkString(s.as_bytes().to_vec());
+        let mut attr = vec![s("identifier"), s("vector"), s("algorithm"), s("HNSW")];
+        if let Some(c) = compression {
+            attr.extend([s("compression"), s(c), s("training_threshold")]);
+            attr.push(RedisValue::Int(threshold));
+        }
+        RedisValue::Array(vec![
+            s("attributes"),
+            RedisValue::Array(vec![RedisValue::Array(attr)]),
+        ])
+    }
+
+    #[test]
+    fn hnsw_read_back_handles_resp3_and_integer_threshold() {
+        let sq8 =
+            Sq8Options::from_hnsw_fields(Some("SQ8"), Some(0), "hnsw", "FLOAT32", false).unwrap();
+        let default =
+            Sq8Options::from_hnsw_fields(Some("SQ8"), None, "hnsw", "FLOAT32", false).unwrap();
+        for shape in [hnsw_info_resp2, hnsw_info_resp3] {
+            assert!(sq8.verify_ft_info(&shape(Some("SQ8"), 0)).is_ok());
+            assert!(sq8.verify_ft_info(&shape(Some("SQ8"), 10_240)).is_err());
+            assert!(default.verify_ft_info(&shape(Some("SQ8"), 10_240)).is_ok());
+            assert!(sq8.verify_ft_info(&shape(None, 0)).is_err());
+        }
+    }
+
+    /// The search-path check, in both directions and both reply shapes:
+    /// requested SQ8 on a plain index, and no compression on an SQ8 index.
+    #[test]
+    fn index_compression_check_is_direction_aware() {
+        let plain = Sq8Options::default();
+        let sq8 =
+            Sq8Options::from_hnsw_fields(Some("SQ8"), None, "hnsw", "FLOAT32", false).unwrap();
+        for shape in [hnsw_info_resp2, hnsw_info_resp3] {
+            assert!(plain.verify_index_compression(&shape(None, 0)).is_ok());
+            assert!(sq8
+                .verify_index_compression(&shape(Some("SQ8"), 10_240))
+                .is_ok());
+            let e = sq8.verify_index_compression(&shape(None, 0)).unwrap_err();
+            assert!(e.contains("differs from requested"), "{e}");
+            let e = plain
+                .verify_index_compression(&shape(Some("SQ8"), 10_240))
+                .unwrap_err();
+            assert!(
+                e.contains("resolves no HNSW COMPRESSION") && e.contains("SQ8"),
+                "{e}"
+            );
+        }
+        for info in svs_info(Some("NO_COMPRESSION")) {
+            assert!(verify_svs_index_compression(None, &info).is_ok());
+            assert!(verify_svs_index_compression(Some("LVQ8"), &info).is_err());
+        }
+        for info in svs_info(Some("GlobalSQ8")) {
+            let e = verify_svs_index_compression(None, &info).unwrap_err();
+            assert!(
+                e.contains("resolves no SVS COMPRESSION") && e.contains("GlobalSQ8"),
+                "{e}"
+            );
+        }
+        for info in svs_info(Some("LVQ8")) {
+            assert!(verify_svs_index_compression(Some("LVQ8"), &info).is_ok());
+            assert!(verify_svs_index_compression(None, &info).is_err());
+        }
+        for info in svs_info(None) {
+            assert!(verify_svs_index_compression(None, &info).is_err());
+        }
+        // No vector field (a fulltext-only index): nothing to mislabel. No
+        // attributes at all: cannot be confirmed, so it fails.
+        let s = |s: &str| RedisValue::BulkString(s.as_bytes().to_vec());
+        let text_only = RedisValue::Array(vec![
+            s("attributes"),
+            RedisValue::Array(vec![RedisValue::Array(vec![
+                s("identifier"),
+                s("title"),
+                s("type"),
+                s("TEXT"),
+            ])]),
+        ]);
+        assert!(sq8.verify_index_compression(&text_only).is_ok());
+        assert!(plain.verify_index_compression(&text_only).is_ok());
+        assert!(verify_svs_index_compression(Some("LVQ8"), &text_only).is_ok());
+        let no_attributes = RedisValue::Array(vec![s("index_name"), s("idx")]);
+        assert!(plain.verify_index_compression(&no_attributes).is_err());
+        assert!(verify_svs_index_compression(None, &no_attributes).is_err());
+        assert!(
+            sq8.verify_ft_info(&text_only).is_err(),
+            "create-time stays strict"
+        );
+    }
+
+    #[test]
+    fn svs_block_values_must_have_the_right_type() {
+        let block = |v: serde_json::Value| v.as_object().cloned().unwrap();
+        let ok = block(serde_json::json!({ "compression": "LVQ8", "REDUCE": 384 }));
+        assert_eq!(
+            svs_block_string(Some(&ok), "compression")
+                .unwrap()
+                .as_deref(),
+            Some("LVQ8")
+        );
+        assert_eq!(
+            svs_block_positive_int(Some(&ok), "REDUCE").unwrap(),
+            Some(384)
+        );
+        assert_eq!(svs_block_string(None, "compression").unwrap(), None);
+        assert_eq!(svs_block_positive_int(Some(&ok), "absent").unwrap(), None);
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(8),
+            serde_json::json!(["LVQ8"]),
+        ] {
+            let b = block(serde_json::json!({ "compression": bad }));
+            let e = svs_block_string(Some(&b), "compression").unwrap_err();
+            assert!(e.contains("svs-vamana_config.compression"), "{e}");
+        }
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!("384"),
+            serde_json::json!(0),
+            serde_json::json!(-4),
+            serde_json::json!(1.5),
+        ] {
+            let b = block(serde_json::json!({ "REDUCE": bad }));
+            assert!(svs_block_positive_int(Some(&b), "REDUCE").is_err(), "{b:?}");
         }
     }
 

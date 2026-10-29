@@ -27,20 +27,25 @@ CONSTRUCTION_WINDOW_SIZE=200. These are starting construction settings:
 equal numeric knobs do not imply equal graph structure or equal recall.
 Report each algorithm's measured speed/quality tradeoff.
 
-On a server without LVQ/LeanVec support (any non-Intel CPU, such as the pinned
-Arm Neoverse-V2 development host, or a build without the Intel SVS
-optimisations), RediSearch builds `GlobalSQ8` scalar quantization for every
-requested SVS `COMPRESSION` and reports `GlobalSQ8` in FT.INFO. The harness reads
-the compression back from FT.INFO right after `FT.CREATE`. A mismatch is a fatal
-error naming the requested and the built compression, so on such a host the
-`redis-compare-*-svs-lvq8` configurations fail loudly instead of publishing
-scalar-quantised results under the LVQ8 name. They measure Intel LVQ only on an
-LVQ-capable host. The read-back accepts the server's own spelling (for example a
-requested `LVQ4X8` is reported as `LVQ4x8`). Under `--skip-upload` there is no
-read-back yet; that is tracked in
-[#374](https://github.com/redis/vector-db-benchmark/issues/374). Also read back
-the SVS graph degree, construction window and actual training threshold; the
-HNSW threshold field does not configure SVS.
+LVQ and LeanVec are Intel's proprietary SVS optimisations and are not in Redis
+Open Source. A server has them only when it is built with them (an RSALv2 Redis
+build made with `BUILD_INTEL_SVS_OPT=yes`, or a Redis distribution that ships
+them) and runs on an Intel CPU. Everywhere else, RediSearch builds `GlobalSQ8`
+scalar quantization for every requested SVS `COMPRESSION` and reports
+`GlobalSQ8` in FT.INFO. That includes stock `redis` Docker images such as
+`redis:8.8.0`, even on Intel x86, and the pinned Arm Neoverse-V2 development
+host. The harness reads the compression back from FT.INFO right after
+`FT.CREATE` and again before any search, including `--skip-upload` reuse. A
+mismatch is a fatal error naming the requested and the built compression. So on
+such a server the `redis-compare-*-svs-lvq8` configurations, and the
+`*-cal-svs-LVQ*` / `*-cal-svs-LeanVec*` calibration cases, fail loudly instead
+of publishing scalar-quantised results under an LVQ or LeanVec name. Run them
+on a server built with the Intel SVS optimisations. The read-back accepts the
+server's own spelling (for example a requested `LVQ4X8` is reported as
+`LVQ4x8`), and a configuration without compression must find `NO_COMPRESSION`.
+The graph degree, construction window, `REDUCE` and training threshold are not
+read back by the harness, so check them in FT.INFO yourself; the HNSW threshold
+field does not configure SVS.
 
 ## Dataset and workers
 

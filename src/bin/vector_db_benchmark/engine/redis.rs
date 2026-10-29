@@ -290,23 +290,27 @@ impl RedisEngine {
                     .and_then(|v| v.as_object());
                 let svs_i64 =
                     |key: &str| svs_block.and_then(|b| b.get(key)).and_then(|v| v.as_i64());
-                let compression = svs_block
-                    .and_then(|b| b.get("compression"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        crate::effective_config::env_var("REDIS_SVS_COMPRESSION")
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                    })
-                    .filter(|s| !s.is_empty());
-                let reduce = svs_i64("REDUCE")
-                    .or_else(|| {
-                        crate::effective_config::env_var("REDIS_SVS_REDUCE")
-                            .ok()
-                            .and_then(|s| s.trim().parse::<i64>().ok())
-                    })
-                    .filter(|&n| n > 0);
+                // A present-but-malformed value is an error, not a fall-through
+                // to the env or to none (that built uncompressed under an LVQ name).
+                let compression = vector_db_benchmark::redis_hnsw_sq8::svs_block_string(
+                    svs_block,
+                    "compression",
+                )?
+                .or_else(|| {
+                    crate::effective_config::env_var("REDIS_SVS_COMPRESSION")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                })
+                .filter(|s| !s.is_empty());
+                let reduce = vector_db_benchmark::redis_hnsw_sq8::svs_block_positive_int(
+                    svs_block, "REDUCE",
+                )?
+                .or_else(|| {
+                    crate::effective_config::env_var("REDIS_SVS_REDUCE")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                })
+                .filter(|&n| n > 0);
                 // `REDIS_SVS_*` reach these only after config precedence, a
                 // trim and an emptiness/positivity filter, so the raw text in
                 // `env` is not what the index was built with.
@@ -594,24 +598,16 @@ impl RedisEngine {
             .map_err(|e| format!("Failed to create index: {}", e))?;
         self.write_fulltext_marker(conn, ft_profile.as_ref())?;
 
-        if self.config.hnsw_sq8.compression.is_some() {
+        // Fail fast, before uploading anything: the vector field must carry the
+        // compression this run resolved (without LVQ support the server builds
+        // GlobalSQ8 for any requested SVS COMPRESSION). `check_index_layout`
+        // repeats the check before searching, on the reuse paths too.
+        if !self.config.skip_vector_index {
             let info: redis::Value = redis::cmd("FT.INFO")
                 .arg(&self.config.index_name)
                 .query(conn)
-                .map_err(|e| format!("Failed to verify HNSW SQ8 index: {e}"))?;
-            self.config.hnsw_sq8.verify_ft_info(&info)?;
-        }
-        // SVS compression read-back: without LVQ support the server builds
-        // GlobalSQ8 for any requested COMPRESSION, which must not be published
-        // under the requested name.
-        if !self.config.skip_vector_index && is_svs(&self.config.algorithm) {
-            if let Some(requested) = &self.config.svs_compression {
-                let info: redis::Value = redis::cmd("FT.INFO")
-                    .arg(&self.config.index_name)
-                    .query(conn)
-                    .map_err(|e| format!("Failed to verify SVS compression: {e}"))?;
-                vector_db_benchmark::redis_hnsw_sq8::verify_svs_compression(requested, &info)?;
-            }
+                .map_err(|e| format!("Failed to verify vector compression: {e}"))?;
+            self.verify_vector_compression(&info)?;
         }
 
         Ok(())
@@ -1162,6 +1158,21 @@ impl RedisEngine {
     /// The layout `configure()` builds for this config (#344).
     fn index_layout(&self) -> vector_db_benchmark::workload::IndexLayout {
         self.config.layout
+    }
+
+    /// The vector field's compression in `info` (FT.INFO of this config's
+    /// index) must be what this run resolved, in both directions: HNSW SQ8 or
+    /// none, SVS compression or `NO_COMPRESSION`. Called after FT.CREATE and,
+    /// via `check_index_layout`, before every search, reused index or not.
+    fn verify_vector_compression(&self, info: &redis::Value) -> Result<(), String> {
+        if is_svs(&self.config.algorithm) {
+            vector_db_benchmark::redis_hnsw_sq8::verify_svs_index_compression(
+                self.config.svs_compression.as_deref(),
+                info,
+            )
+        } else {
+            self.config.hnsw_sq8.verify_index_compression(info)
+        }
     }
 
     fn create_progress_bar(&self, total: usize) -> ProgressBar {
@@ -3421,10 +3432,11 @@ impl Engine for RedisEngine {
         use vector_db_benchmark::filter_only as fo;
         use vector_db_benchmark::workload::IndexLayout;
         let schema = dataset.config.schema.as_ref();
-        let validate = match layout {
-            IndexLayout::Full => fo::validate_redis_full_schema,
+        type Validate = fn(&serde_json::Value, Option<&serde_json::Value>) -> Result<(), String>;
+        let validate: Option<Validate> = match layout {
+            IndexLayout::Full => Some(fo::validate_redis_full_schema),
             // Only tag fields can tell the layouts apart; a schema without
-            // them has nothing to check, so skip the round trip.
+            // them has nothing to check.
             IndexLayout::Vector
                 if schema.and_then(|s| s.as_object()).is_some_and(|fields| {
                     fields
@@ -3432,18 +3444,34 @@ impl Engine for RedisEngine {
                         .any(|k| matches!(k.as_str(), Some("keyword" | "uuid" | "bool")))
                 }) =>
             {
-                fo::validate_redis_vector_layout
+                Some(fo::validate_redis_vector_layout)
             }
             // No-vector: filter-only reads it back before every run.
-            _ => return Ok(()),
+            _ => None,
         };
+        // Every index with a vector field also gets the compression read-back
+        // here, the one check that runs before searching on every path:
+        // `--skip-upload` and `REDIS_INDEX_NAME_EXACT=1` reuse an index this
+        // invocation did not build (#374), so its compression must match what
+        // this run resolved, in both directions.
+        let check_compression = layout != IndexLayout::NoVector && !self.config.skip_vector_index;
+        if validate.is_none() && !check_compression {
+            return Ok(());
+        }
         let mut conn = self.get_connection()?;
         let info: redis::Value = redis::cmd("FT.INFO")
             .arg(&self.config.index_name)
             .query(&mut conn)
             .map_err(|e| format!("index layout check ({layout}): FT.INFO failed: {e}"))?;
-        validate(&redis_value_to_json(&info), schema)
-            .map_err(|e| format!("index layout check ({layout}): {e}"))
+        if let Some(validate) = validate {
+            validate(&redis_value_to_json(&info), schema)
+                .map_err(|e| format!("index layout check ({layout}): {e}"))?;
+        }
+        if check_compression {
+            self.verify_vector_compression(&info)
+                .map_err(|e| format!("index compression check: {e}"))?;
+        }
+        Ok(())
     }
 
     fn delete(&mut self) -> Result<(), String> {
@@ -4185,6 +4213,32 @@ mod tests {
         assert_eq!(c.svs_graph_max_degree, None);
         assert_eq!(c.svs_compression, None);
         assert_eq!(c.svs_reduce, None);
+    }
+
+    /// A present-but-malformed `svs-vamana_config` compression or REDUCE is an
+    /// error, not a silent fall-through that builds uncompressed (or without
+    /// reduction) under the config's LVQ / `-div4` name.
+    #[test]
+    fn malformed_svs_compression_or_reduce_is_refused() {
+        use super::RedisEngine;
+        let _lock = crate::effective_config::test_lock();
+        for svs in [
+            serde_json::json!({ "compression": null }),
+            serde_json::json!({ "compression": 8 }),
+            serde_json::json!({ "compression": "LeanVec4x8", "REDUCE": "384" }),
+        ] {
+            let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+                "name": "redis-svs-bad",
+                "engine": "redis",
+                "algorithm": "svs-vamana",
+                "collection_params": { "svs-vamana_config": svs }
+            }))
+            .unwrap();
+            match RedisEngine::new(&ec, "localhost") {
+                Ok(_) => panic!("accepted malformed svs-vamana_config {svs}"),
+                Err(e) => assert!(e.contains("svs-vamana_config"), "{e}"),
+            }
+        }
     }
 
     /// The engine records what it BUILT: on a plain config with
