@@ -133,6 +133,14 @@ release-checksums:
 	bash scripts/release/checksums.sh write "$(RELEASE_OUT)"
 	bash scripts/release/checksums.sh check "$(RELEASE_OUT)"
 
+# Self-test of the package publish scripts (publish-apt.sh / publish-yum.sh)
+# against fake aws / deb-s3 with tiny fixtures: codename grouping, dist tag ->
+# directory, refuse / skip / overwrite, signing mandatory, RPMs before repodata.
+# Needs rpm, rpmbuild, createrepo_c, dpkg-deb, gpg. No network.
+.PHONY: release-selftest-packages
+release-selftest-packages:
+	bash scripts/release/selftest-packages.sh
+
 # Native .deb / .rpm packages (.github/workflows/release-packages.yml builds
 # these inside a container of every codename / distro they are published for).
 # Run ON the target distribution; DIST is the Debian/Ubuntu codename. Add
@@ -532,6 +540,7 @@ help:
 	@echo "  make release-archive   - Package a prebuilt release archive TAG=<tag> [RELEASE_TARGET=]"
 	@echo "  make release-checksums - Write + check SHA256SUMS over RELEASE_OUT (default: dist)"
 	@echo "  make release-selftest  - Self-test the release scripts (publish logic vs a fake gh)"
+	@echo "  make release-selftest-packages - Self-test publish-apt.sh / publish-yum.sh against fakes"
 	@echo "  make release-deb       - Build the .deb for this host's codename DIST=<codename> [INSTALL_DEPS=1]"
 	@echo "  make release-rpm       - Build the RPM on this el8/el9/el10/AL2023 host [INSTALL_DEPS=1]"
 	@echo "  make release-test-package - Install + run a built package on this host PKG=<file>"

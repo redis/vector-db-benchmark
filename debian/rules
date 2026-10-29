@@ -13,9 +13,16 @@ export PATH := $(CARGO_HOME)/bin:$(PATH)
 # hdf5-sys links the system libhdf5 when HDF5_DIR is set (the Makefile exports it
 # for normal builds); the package must get the bundled static one.
 unexport HDF5_DIR HDF5_VERSION
-# A build tree without a usable .git (a container running as another uid, a
-# source tarball) would otherwise report the commit as unknown.
-VDB_BUILD_GIT_SHA ?= $(shell git -c safe.directory='*' rev-parse HEAD 2>/dev/null)
+# The commit the binaries report. build-deb.sh exports it after checking the
+# tree is clean; a bare `dpkg-buildpackage` gets it from git here, and a dirty
+# tree is refused rather than stamped with a commit it does not match.
+ifeq ($(VDB_BUILD_GIT_SHA),)
+GIT := git -c safe.directory='*'
+ifneq ($(shell $(GIT) status --porcelain --untracked-files=no 2>/dev/null),)
+$(error uncommitted changes in the tree; commit them or build through scripts/release/build-deb.sh)
+endif
+VDB_BUILD_GIT_SHA := $(shell $(GIT) rev-parse HEAD 2>/dev/null)
+endif
 export VDB_BUILD_GIT_SHA
 
 PKG    := vector-db-benchmark
@@ -50,6 +57,9 @@ override_dh_auto_install:
 override_dh_auto_clean:
 	rm -rf $(DESTD) debian/files debian/*.substvars debian/*.debhelper debian/.debhelper
 
-# Release binaries carry no debug info worth a -dbgsym package.
+# Release binaries carry no debug info worth a -dbgsym package, and old dwz
+# (focal, bullseye) chokes on Rust DWARF that dh_strip discards anyway.
+override_dh_dwz:
+
 override_dh_strip:
 	dh_strip --no-automatic-dbgsym

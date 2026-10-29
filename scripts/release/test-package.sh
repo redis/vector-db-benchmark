@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 # Install a built vector-db-benchmark .deb or .rpm the way a user would, and run it.
 #
-#   scripts/release/test-package.sh <package> --expect-sha <40-hex> [--expect-version <crate version>] [--repo-id <el9|amzn2023|codename>]
+#   scripts/release/test-package.sh <package> --expect-sha <40-hex> [--expect-version <crate version>] [--repo-id <el8|el9|el10|amzn2023>]
 #
 # Needs only the distro's package tools: the release workflow runs it inside a
-# bare container of every codename / distro the package is published for,
-# on both architectures. Checks, in order:
-#  * the package installs from the file with its own dependencies resolved
-#    (nothing pre-installed by hand, so a missing Depends/Requires shows);
+# BARE container of every codename / distro the package is published for, on
+# both architectures (it refuses a host with a Rust toolchain, since the point
+# is that the package works without one). It adds and removes the package and
+# a local repository definition, so run it on a throwaway container, not a
+# workstation. Checks, in order:
+#  * the package installs from the file with its own dependencies resolved by
+#    the package manager (nothing pre-installed by hand, so a missing
+#    Depends/Requires shows);
 #  * each CLI's `--version` is exactly `<name> <version> (git <sha>)` and its
 #    `--help` exits 0;
 #  * the installed data files work: `--describe datasets` reads the packaged
-#    datasets.json from a copy of /usr/share/vector-db-benchmark, and
-#    bench_jsonl reads the packaged random-100 corpus;
-#  * the package also installs from a LOCAL repository built the way
-#    packages.redis.io serves it (deb: Packages index; rpm: createrepo_c with
-#    the README's baseurl pattern), which catches index/metadata and
-#    Requires/Depends bugs a direct file install does not.
+#    datasets.json from a copy of /usr/share/vector-db-benchmark, bench_jsonl
+#    reads the packaged random-100 corpus, bench_hdf5 reaches the linked HDF5;
+#  * the package also installs from a LOCAL repository laid out as
+#    packages.redis.io serves it — deb: dists/<codename>/main/binary-<arch>/
+#    Packages + Release (apt-ftparchive); rpm: createrepo_c under the README's
+#    rpm/el$releasever/$basearch or rpm/amzn2023/$basearch baseurl — and the
+#    installed package is confirmed to have come from that repository. This
+#    catches index/metadata and Depends/Requires bugs a direct file install
+#    does not.
 set -euo pipefail
 
 pkg="" expect_sha="" expect_version="" repo_id=""
@@ -26,7 +33,8 @@ while [[ $# -gt 0 ]]; do
     --expect-version) expect_version="$2"; shift 2 ;;
     --repo-id) repo_id="$2"; shift 2 ;;
     -*) echo "test-package.sh: unknown flag: $1" >&2; exit 2 ;;
-    *) pkg="$1"; shift ;;
+    *) [[ -z "$pkg" ]] || { echo "test-package.sh: one package at a time ('$pkg' and '$1' given)" >&2; exit 2; }
+       pkg="$1"; shift ;;
   esac
 done
 [[ -n "$pkg" && -n "$expect_sha" ]] || {
@@ -45,6 +53,12 @@ case "$pkg" in
   *.rpm) kind=rpm ;;
   *) fail "not a .deb or .rpm: $pkg" ;;
 esac
+
+repo_root=/tmp/vdb-local-repo
+cleanup() {
+  rm -rf "$repo_root" /etc/apt/sources.list.d/vdb-local-test.list /etc/yum.repos.d/vdb-local-test.repo
+}
+trap cleanup EXIT
 
 pm_install_file() {
   if [[ "$kind" == deb ]]; then
@@ -69,6 +83,8 @@ if [[ "$kind" == deb ]]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   echo "--- package metadata"; dpkg-deb -f "$pkg" Package Version Architecture Depends
+  pkg_arch="$(dpkg-deb -f "$pkg" Architecture)"
+  [[ "$pkg_arch" == "$(dpkg --print-architecture)" ]] || fail "package is $pkg_arch, host is $(dpkg --print-architecture)"
 else
   echo "--- package metadata"; rpm -qp --queryformat 'Name: %{NAME}\nVersion: %{VERSION}-%{RELEASE}\nArch: %{ARCH}\n' "$pkg"
   echo "Requires:"; rpm -qpR "$pkg" | sed 's/^/  /'
@@ -83,6 +99,7 @@ pm_install_file "$pkg"
 
 run_checks() {
   local version="$1"
+  hash -r   # bash caches the paths it ran before the remove/reinstall
   for b in vector-db-benchmark prepare-msmarco generate-dataset; do
     command -v "$b" >/dev/null || fail "$b not on PATH after install"
     got="$("$b" --version)" || fail "$b --version exited non-zero"
@@ -131,27 +148,42 @@ run_checks "$crate_version"
 
 echo "--- reinstall from a local repository laid out like packages.redis.io"
 pm_remove
-hash -r   # bash caches the paths it ran; the files are what must be gone
+hash -r
 for f in /usr/bin/vector-db-benchmark /usr/bin/prepare-msmarco /usr/bin/generate-dataset /usr/share/vector-db-benchmark/datasets/datasets.json; do
   [[ -e "$f" ]] && fail "$f still present after remove"
 done
-repo_root=/tmp/localrepo
 rm -rf "$repo_root"
 if [[ "$kind" == deb ]]; then
-  apt-get install -y --no-install-recommends dpkg-dev >/dev/null
-  mkdir -p "$repo_root"
-  cp "$pkg" "$repo_root/"
-  ( cd "$repo_root" && dpkg-scanpackages --multiversion . > Packages && gzip -k -f Packages )
-  echo "deb [trusted=yes] file:$repo_root ./" > /etc/apt/sources.list.d/vdb-local-test.list
+  apt-get install -y --no-install-recommends apt-utils >/dev/null
+  codename="${VERSION_CODENAME:?no VERSION_CODENAME in /etc/os-release}"
+  [[ "$installed_version" == *"~$codename" ]] || fail "package version '$installed_version' is not for this host's codename '$codename'"
+  arch="$(dpkg --print-architecture)"
+  # The deb-s3 layout: pool/ plus dists/<codename>/main/binary-<arch>/Packages
+  # and a dists/<codename>/Release, served with the codename as the suite.
+  mkdir -p "$repo_root/pool/$codename" "$repo_root/dists/$codename/main/binary-$arch"
+  cp "$pkg" "$repo_root/pool/$codename/"
+  ( cd "$repo_root" &&
+    apt-ftparchive packages pool > "dists/$codename/main/binary-$arch/Packages" &&
+    gzip -k -f "dists/$codename/main/binary-$arch/Packages" &&
+    apt-ftparchive -o "APT::FTPArchive::Release::Origin=packages.redis.io" \
+                   -o "APT::FTPArchive::Release::Suite=$codename" \
+                   -o "APT::FTPArchive::Release::Codename=$codename" \
+                   -o "APT::FTPArchive::Release::Components=main" \
+                   -o "APT::FTPArchive::Release::Architectures=$arch" \
+                   release "dists/$codename" > "dists/$codename/Release" )
+  echo "deb [trusted=yes] file:$repo_root $codename main" > /etc/apt/sources.list.d/vdb-local-test.list
   apt-get update
-  apt-cache policy vector-db-benchmark
+  policy="$(apt-cache policy vector-db-benchmark)"
+  echo "$policy"
+  grep -qF "file:$repo_root" <<<"$policy" || fail "apt does not see vector-db-benchmark in the local repository"
   apt-get install -y vector-db-benchmark
   dpkg-query -W -f 'installed from repo: ${Package} ${Version}\n' vector-db-benchmark
 else
   if command -v dnf >/dev/null; then dnf install -y createrepo_c; else yum install -y createrepo_c || yum install -y createrepo; fi
   arch="$(uname -m)"
-  # Same baseurl pattern as the README: rpm/el$releasever/$basearch, or
-  # rpm/amzn2023/$basearch on Amazon Linux (whose $releasever is 2023).
+  # Same baseurl pattern as the README: rpm/el$releasever/$basearch, or the
+  # fixed rpm/amzn2023/$basearch on Amazon Linux, whose $releasever is a point
+  # release (2023.x.y) rather than an el<n> value.
   if [[ -z "$repo_id" ]]; then
     if [[ "${ID:-}" == amzn ]]; then repo_id=amzn2023; else repo_id="el${VERSION_ID%%.*}"; fi
   fi
@@ -170,9 +202,14 @@ baseurl=$baseurl
 enabled=1
 gpgcheck=0
 REPO
-  if command -v dnf >/dev/null; then dnf install -y vector-db-benchmark; else yum install -y vector-db-benchmark; fi
+  if command -v dnf >/dev/null; then
+    dnf install -y vector-db-benchmark
+    from="$(dnf repoquery --installed --qf '%{from_repo}' vector-db-benchmark 2>/dev/null | tail -n1)"
+    [[ -z "$from" || "$from" == vdb-local-test || "$from" == "@System" ]] || fail "installed from '$from', not the local repository"
+  else
+    yum install -y vector-db-benchmark
+  fi
   rpm -q vector-db-benchmark | sed 's/^/installed from repo: /'
 fi
-hash -r
 run_checks "$crate_version"
 echo "test-package.sh: $(basename "$pkg") OK on ${PRETTY_NAME:-?} $(uname -m)"

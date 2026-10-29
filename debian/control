@@ -1,5 +1,5 @@
 Source: vector-db-benchmark
-Section: admin
+Section: utils
 Priority: optional
 Maintainer: Redis Ltd. <oss@redislabs.com>
 # cargo and rustc are NOT listed: the distros' own are too old for this crate
@@ -8,8 +8,9 @@ Maintainer: Redis Ltd. <oss@redislabs.com>
 # PATH. cmake and perl build the statically linked HDF5 / zlib / OpenSSL
 # (--features release-static), so the package needs none of those libraries
 # at run time, on any codename.
+# lintian's embedded-library (zlib/openssl/hdf5) is intentional: see above.
 Build-Depends: debhelper-compat (= 12), cmake, perl, pkg-config, ca-certificates, git
-Standards-Version: 4.4.1
+Standards-Version: 4.6.2
 Homepage: https://github.com/redis/vector-db-benchmark
 Vcs-Browser: https://github.com/redis/vector-db-benchmark
 Vcs-Git: https://github.com/redis/vector-db-benchmark.git

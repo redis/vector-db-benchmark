@@ -9,16 +9,33 @@
 # the one packages.redis.io serves: <prefix>/dists/<codename>/... and
 # <prefix>/pool/<codename>/..., objects public-read, `Origin: packages.redis.io`.
 #
-# Signing: if the GPG keyring holds a secret key (the workflow imports
-# APT_SIGNING_KEY), Release is signed with it (InRelease + Release.gpg).
-# Without one the repo is published UNSIGNED and this script says so loudly;
-# that is acceptable for a staging rehearsal only.
+# SIGNING IS MANDATORY. The dists/<codename>/ of both buckets is shared with
+# the other Redis products and already signed (InRelease + Release.gpg): an
+# unsigned deb-s3 run deletes Release.gpg and leaves the old InRelease behind,
+# so every user of that codename gets "Hash Sum mismatch" from apt update.
+# The keyring must hold exactly one secret key (the workflow imports
+# APT_SIGNING_KEY); its fingerprint is passed as `--sign=<fpr>`. Never a bare
+# `--sign`: it is a string option, and the next argument (the first .deb) would
+# be taken as the key id and silently not uploaded.
 #
-# --overwrite  allow re-publishing a version that is already in the index
-#              (deb-s3's default `--fail-if-exists` is what keeps a re-run from
-#              silently replacing a shipped package). Staging rehearsals only.
-# AWS credentials come from the environment (AWS_ACCESS_KEY_ID/... or an
-# assumed role), as deb-s3 reads them through the AWS SDK.
+# deb-s3 refuses (`--fail-if-exists`) a package whose name+version is already
+# in the codename's index under a different file, and a pool object whose
+# content differs from what is there; an identical re-upload is a no-op, so a
+# re-run after a partial publish completes it. --overwrite drops that refusal
+# (staging rehearsals only; on production the CDN would keep serving the old
+# bytes under the new hash for a while).
+#
+# `--lock` takes deb-s3's per-codename lock (deb/dists/<codename>/main/binary-/lockfile),
+# the same one redis-debian's publish takes, so two products do not rewrite one
+# Release concurrently. A job killed mid-publish leaves it behind; the next run
+# waits ten minutes and fails with "Repository is locked": remove the lockfile
+# object by hand after checking nothing else is publishing.
+#
+# AWS credentials come from the environment (static keys or an assumed role;
+# deb-s3 reads them through the AWS SDK, session tokens included). The
+# identity needs s3:PutObjectAcl as well as Put/Get/Delete (public-read objects).
+# --dry-run prints the deb-s3 commands instead of running them and needs
+# neither deb-s3, credentials nor a key.
 set -euo pipefail
 
 bucket="" region="" indir="" prefix=deb origin=packages.redis.io overwrite=0 dry_run=0
@@ -36,19 +53,24 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$bucket" && -n "$region" && -d "$indir" ]] || {
   echo "usage: publish-apt.sh --bucket <bucket> --region <region> --in <dir> [--prefix deb] [--origin <origin>] [--overwrite] [--dry-run]" >&2; exit 2; }
-command -v deb-s3 >/dev/null || { echo "publish-apt.sh: deb-s3 not on PATH" >&2; exit 1; }
 command -v dpkg-deb >/dev/null || { echo "publish-apt.sh: dpkg-deb not on PATH" >&2; exit 1; }
+[[ "$dry_run" == 1 ]] || command -v deb-s3 >/dev/null || { echo "publish-apt.sh: deb-s3 not on PATH" >&2; exit 1; }
 
-sign=()
-# Captured first, not `gpg | grep -q`: under pipefail grep's early exit would
-# read as "no key" (see lib.sh on producer | grep -q).
+# Captured first, not `gpg | grep`: under pipefail grep's early exit would read
+# as "no key" (see lib.sh on producer | grep -q).
 secret_keys="$(gpg --list-secret-keys --with-colons 2>/dev/null || true)"
-if grep -q '^sec:' <<<"$secret_keys"; then
-  sign=(--sign)
-  echo "publish-apt.sh: signing with $(awk -F: '/^fpr:/{print $10; exit}' <<<"$secret_keys")"
-else
-  echo "::warning::publish-apt.sh: no GPG secret key in the keyring, publishing an UNSIGNED repository (staging rehearsal only)"
+n_keys="$(grep -c '^sec:' <<<"$secret_keys" || true)"
+fpr="$(awk -F: '/^fpr:/{print $10; exit}' <<<"$secret_keys")"
+if [[ "$n_keys" -ne 1 || -z "$fpr" ]]; then
+  if [[ "$dry_run" == 1 ]]; then
+    fpr="DRYRUN0000000000000000000000000000000000"
+    echo "publish-apt.sh: dry run with no signing key; would sign with the keyring's one secret key"
+  else
+    echo "publish-apt.sh: the GPG keyring must hold exactly ONE secret key (found $n_keys); refusing to publish unsigned into a shared, signed repository" >&2
+    exit 1
+  fi
 fi
+echo "publish-apt.sh: signing with $fpr"
 
 # codename -> list of .deb files
 declare -A by_dist=()
@@ -69,10 +91,13 @@ for dist in $(printf '%s\n' "${!by_dist[@]}" | LC_ALL=C sort); do
   while IFS= read -r f; do [[ -n "$f" ]] && debs+=("$f"); done <<<"${by_dist[$dist]}"
   echo "--- $dist: ${#debs[@]} package(s)"
   for f in "${debs[@]}"; do dpkg-deb -f "$f" Package Version Architecture | paste -sd' '; done
+  # Every option in `--opt=value` form, and the packages last: a value-taking
+  # option written as two tokens could swallow the first package path.
   cmd=(deb-s3 upload
-    --bucket "$bucket" --s3-region "$region" --prefix "$prefix"
-    --codename "$dist" --component main --origin "$origin"
-    --visibility public --preserve-versions --lock "${exists[@]}" "${sign[@]}"
+    "--bucket=$bucket" "--s3-region=$region" "--prefix=$prefix"
+    "--codename=$dist" "--suite=$dist" --component=main "--origin=$origin"
+    --visibility=public --preserve-versions --lock "${exists[@]}"
+    "--sign=$fpr" "--gpg-options=--batch --no-tty"
     "${debs[@]}")
   if [[ "$dry_run" == 1 ]]; then
     printf 'dry-run:'; printf ' %q' "${cmd[@]}"; echo

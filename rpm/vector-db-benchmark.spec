@@ -13,8 +13,9 @@
 # No -debuginfo / -debugsource: release profile, Rust binaries, nothing useful
 # to extract, and it keeps the shared rpm/ repo small.
 %global debug_package %{nil}
-# Rust binaries are not PIE-relinkable by brp; the static HDF5 is already PIC.
-%undefine _hardened_build
+# No distro CFLAGS/LDFLAGS are applied: cargo drives the build, rustc emits PIE
+# on its own, and the vendored C libraries (HDF5, zlib, OpenSSL) are built by
+# their crates' build scripts.
 # Don't let brp-strip-static-archive / python byte-compile wander around.
 %global __brp_python_bytecompile %{nil}
 
@@ -33,7 +34,6 @@ BuildRequires:  gcc-c++
 BuildRequires:  make
 BuildRequires:  perl
 BuildRequires:  pkgconfig
-BuildRequires:  git
 # OpenSSL's Configure (vendored by --features release-static) needs these
 # perl modules, which el9+/AL2023 split out of the perl package.
 %if 0%{?rhel} >= 9 || 0%{?amzn} >= 2023

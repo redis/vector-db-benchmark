@@ -277,14 +277,14 @@ and `clobber: true`, which replaces the whole set.
 
 ### Linux packages (APT / YUM)
 
-Native packages are built for every release from the same commit as the archives
-above, one per distribution, and published to the Redis package repositories
-(`.github/workflows/release-packages.yml`). They install `vector-db-benchmark`,
+Native packages are built for every release from 0.2.0 on, from the same commit
+as the archives above, one per distribution, and published to the Redis package
+repositories (`.github/workflows/release-packages.yml`). They install `vector-db-benchmark`,
 `prepare-msmarco` and `generate-dataset` into `/usr/bin`, the reader
 micro-benchmarks under `/usr/lib/vector-db-benchmark` (`/usr/libexec` on RPM
 systems), and the dataset catalogue plus engine configurations under
 `/usr/share/vector-db-benchmark`. HDF5, zlib and OpenSSL are linked in; the
-package depends on glibc only.
+package depends on glibc (and libgcc) only.
 
 **Debian 11/12/13 and Ubuntu 20.04/22.04/24.04/26.04** (amd64, arm64), from the
 [packages.redis.io](https://packages.redis.io) APT repository:
@@ -312,8 +312,9 @@ EOF
 sudo dnf install -y vector-db-benchmark
 ```
 
-**Amazon Linux 2023** uses its own path, because its `$releasever` is `2023`:
-replace the `baseurl` above with `https://packages.redis.io/rpm/amzn2023/$basearch`.
+**Amazon Linux 2023** uses its own, fixed path (its `$releasever` is a point
+release such as `2023.8.20250818`, not an `el<n>` value): replace the `baseurl`
+above with `https://packages.redis.io/rpm/amzn2023/$basearch`.
 
 The CLI looks for `datasets/datasets.json` in the working directory (and up to
 five parents) and writes `results/` next to it, so work from a copy of the
@@ -321,15 +322,17 @@ packaged tree:
 
 ```bash
 cp -r /usr/share/vector-db-benchmark ~/vdb && cd ~/vdb
-vector-db-benchmark --version            # vector-db-benchmark 0.2.0 (git <commit the package was built from>)
+vector-db-benchmark --version            # vector-db-benchmark <version> (git <commit the package was built from>)
 vector-db-benchmark --describe datasets
 vector-db-benchmark --host localhost --engines 'redis-single*' --datasets glove-25-angular
 ```
 
-To build the packages yourself, on the target distribution:
+To build a package yourself, on (a container of) the target distribution:
 `make release-deb DIST=$(lsb_release -cs) INSTALL_DEPS=1` or
-`make release-rpm INSTALL_DEPS=1`, then
-`make release-test-package PKG=dist/<file>` installs and runs the result.
+`make release-rpm INSTALL_DEPS=1`. `make release-test-package PKG=dist/<file>`
+then installs and runs it the way the release workflow does; run that on a
+*bare* container of the same distribution (it refuses a host with a Rust
+toolchain, and it adds and removes the package and a local repository).
 
 ### Docker (recommended)
 

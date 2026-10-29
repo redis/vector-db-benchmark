@@ -23,5 +23,12 @@ target/
 
 v0/results/
 
-# Written per build by scripts/release/build-deb.sh (version~codename)
+# Written per build by scripts/release/build-deb.sh (version~codename), and
+# what dpkg-buildpackage leaves behind.
 debian/changelog
+debian/files
+debian/debhelper-build-stamp
+debian/.debhelper/
+debian/*.substvars
+debian/*.debhelper.log
+debian/vector-db-benchmark/
