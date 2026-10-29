@@ -14,9 +14,13 @@
 #  * downloads each such directory in full before regenerating its metadata,
 #    so createrepo_c --update indexes everything already there (and keeps any
 #    extra metadata other products placed: --keep-all-metadata),
-#  * never deletes an RPM; only the directory's repodata/ is replaced, RPMs
-#    are uploaded before it, and the previous hashed metadata files are kept
-#    one generation (--retain-old-md 1) for clients mid-refresh.
+#  * never deletes anything: RPMs are uploaded first, then the new hashed
+#    metadata files, then repomd.xml LAST, so no index ever names a file that
+#    is not there yet. Old metadata generations are left in repodata/ and
+#    accumulate (createrepo_c --update --keep-all-metadata keeps them; a
+#    `sync --delete` could only ever remove files ANOTHER product uploaded
+#    after our sync, which its cached repomd.xml may still name). Pruning old
+#    generations, if ever needed, is by age, never by a delete-sync.
 # There is no cross-product lock on rpm/ (deb-s3's --lock covers only deb/),
 # so the sync -> createrepo_c -> upload sequence is a read-modify-write that
 # another product's publish can race. Two guards, per directory:
@@ -26,6 +30,12 @@
 #  * after the upload, every *.rpm the directory holds must be listed in the
 #    primary.xml.gz it now serves. One that is not fails the run, naming it:
 #    re-run the publish, which re-syncs the directory and rebuilds the index.
+# RESIDUAL RISK, one direction only: a product whose tooling has no such
+# re-list can still upload its repodata/ AFTER our check, built from a sync
+# taken before our RPM landed, and drop our RPM from the index while this run
+# stays green. Only a lock shared by every product would close that; the
+# workflow's verify step (run after both publishes) catches it if it happens
+# within the job.
 # Objects are uploaded public-read (the CDN serves per-object ACLs).
 #
 # Re-runs are idempotent: an RPM already in the repo with the same NEVRA,
@@ -78,10 +88,9 @@ fpr="$(awk -F: '/^fpr:/{print $10; exit}' <<<"$secret_keys")"
 if [[ "$n_keys" -eq 1 && -n "$fpr" && "$dry_run" != 1 ]]; then
   echo "publish-yum.sh: signing RPMs with $fpr"
   # rpm's %__gpg defaults to a gpg2 binary name some distros (Ubuntu) do not
-  # ship; point it at the gpg on PATH, and name the key by fingerprint.
-  grep -q '^%__gpg ' ~/.rpmmacros 2>/dev/null || echo "%__gpg $(command -v gpg)" >> ~/.rpmmacros
-  grep -q '^%_gpg_name' ~/.rpmmacros 2>/dev/null || echo "%_gpg_name $fpr" >> ~/.rpmmacros
-  for f in "${rpms[@]}"; do rpm --addsign "$f"; done
+  # ship: point it at the gpg on PATH, and name the key by fingerprint, on the
+  # command line (a stale ~/.rpmmacros %_gpg_name cannot pick another key).
+  for f in "${rpms[@]}"; do rpm --define "__gpg $(command -v gpg)" --define "_gpg_name $fpr" --addsign "$f"; done
   # Verify against a private rpm database: no root, no host keyring.
   mkdir -p "$work/rpmdb"
   rpm --dbpath "$work/rpmdb" --initdb
@@ -187,7 +196,10 @@ for d in $(printf '%s\n' "${!dirs[@]}" | LC_ALL=C sort); do
       createrepo_c --update --keep-all-metadata --retain-old-md 1 "$local_dir" >/dev/null
     fi
   fi
-  run aws s3 sync "$local_dir/repodata/" "$remote/repodata/" --delete --acl public-read --only-show-errors
+  # New hashed files first, repomd.xml (which names them) last. No --delete
+  # (see the header).
+  run aws s3 sync "$local_dir/repodata/" "$remote/repodata/" --exclude repomd.xml --acl public-read --only-show-errors
+  run aws s3 cp "$local_dir/repodata/repomd.xml" "$remote/repodata/repomd.xml" --acl public-read --only-show-errors
   if [[ "$dry_run" != 1 ]]; then
     # Every RPM in the directory, ours or another product's, must be in the
     # index it now serves: a publish that raced ours between the re-list and

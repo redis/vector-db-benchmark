@@ -140,6 +140,51 @@ digests differ and the run refuses. Rebuild a tag on purpose only with
 touch the archive's inputs: `make release-selftest` and
 `scripts/release/install-test.sh` run there.
 
+### Packages (`release-packages.yml`)
+
+The same `release: published` event also builds a .deb per codename and an
+.rpm per el8/el9/el10/amzn2023, both architectures, installs each on a bare
+container, and publishes them to packages.redis.io (the `build` environment).
+
+- **Production is off until `vars.PACKAGES_PRODUCTION` is `true`.** Until
+  then a final release builds and tests the packages, publishes nothing, and
+  says so in a `::notice::` (the run stays green; no `build` environment is
+  created); `release_type=public` is refused. Before setting the variable:
+  create the `build` environment, add required reviewers, limit deployment
+  branches/tags to `master`, `[0-9]*.[0-9]*.[0-9]*` and `v[0-9]*.[0-9]*.[0-9]*`
+  (and add a tag ruleset restricting who may push those tags: a dispatch runs
+  the dispatched ref's copy of the workflow's guards), then add the five
+  secrets (as memtier-benchmark's `build`) and the environment variable
+  `APT_SIGNING_FPR=54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C`
+  (packages.redis.io/gpg). A key with another fingerprint is refused, and so
+  is a codename whose existing InRelease another key signed.
+- **Crate version stays `X.Y.Z`, also for an rc.** The build scripts refuse a
+  `-` in it. Packages carry that version without a suffix, so production only
+  ever takes a final tag (`X.Y.Z` / `vX.Y.Z`, `check_production_tag`), and a
+  pre-release is built and tested but never published. Mark rc releases as
+  pre-releases anyway.
+- **A pre-release later promoted to final** gets no packages from the
+  `published` event (it already fired). Dispatch `release_type=public
+  tag=<tag>` from `master`.
+- **Re-running a failed publish:** use **Re-run failed jobs**. It reuses the
+  signed build artifacts, so what is already published is skipped as the same
+  build and the rest completes (this is also the fix when publish-yum.sh's
+  index check reports another product's RPM missing). **Re-run all jobs**
+  rebuilds: the new packages differ (build time, digest), deb-s3 and
+  publish-yum.sh refuse them as a different build, and production has no
+  `--overwrite`. Once the artifacts have expired (14 days), dispatch with
+  `deb_dists` / `rpm_distros` limited to the targets that were not published.
+- **Stale deb-s3 lock:** a job killed mid-publish leaves
+  `deb/dists/<codename>/main/binary-/lockfile`; the next run waits ten
+  minutes and fails with "Repository is locked". Delete that object by hand
+  after checking nothing else is publishing.
+- **Before tagging,** a green full-matrix staging rehearsal of the commit is
+  the check that every codename/distro still builds (PRs build jammy and el9
+  only): `gh workflow run release-packages.yml --ref <branch>
+  -f release_type=internal -f overwrite=true`.
+- **After the first production publish,** remove the "Coming soon" note from
+  the README's "Linux packages" section.
+
 ## Dataset Formats
 
 - **HDF5** (`.hdf5`): Single file with `train`, `test`, `neighbors` datasets

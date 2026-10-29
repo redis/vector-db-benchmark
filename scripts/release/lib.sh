@@ -5,9 +5,11 @@
 # cargo, python or binutils: defining the functions that need them is fine,
 # calling them there is not (only package.sh does, on the build host).
 
-# The binaries #366 names. Every archive must carry them; package.sh packages
-# every [[bin]] cargo knows about, so this is the floor, not the list.
-REQUIRED_BINS=(vector-db-benchmark prepare-msmarco generate-dataset bench_npy bench_jsonl)
+# The binaries #366 names, plus bench_hdf5 (auto-discovered from src/bin, and
+# installed by the .deb/.rpm). Every archive must carry them; package.sh
+# packages every [[bin]] cargo knows about, so this is the floor, not the list.
+# INV-A5 keeps it equal to cargo's bin targets and to the packages' lists.
+REQUIRED_BINS=(vector-db-benchmark prepare-msmarco generate-dataset bench_npy bench_jsonl bench_hdf5)
 
 # The binaries that parse flags with clap, and so answer --help / --version.
 CLAP_BINS=(vector-db-benchmark prepare-msmarco generate-dataset)
@@ -97,6 +99,20 @@ check_release_tag() {
   if ! tag_matches_version "$tag" "$version"; then
     echo "release tag '$tag' does not name the crate version '$version' (Cargo.toml [package].version)." >&2
     echo "  Bump the version in Cargo.toml, merge, and tag that commit X.Y.Z, vX.Y.Z or X.Y.Z-rc.N." >&2
+    return 1
+  fi
+}
+
+# `check_production_tag <tag>`: may packages built for this tag go to the
+# PRODUCTION package repositories? Only a final release, `X.Y.Z` or `vX.Y.Z`.
+# The packages carry the crate version, which has no pre-release suffix (the
+# build scripts refuse one), so a `0.2.0-rc.1` build would be published as
+# `0.2.0~<codename>` / `0.2.0-1.<dist>`, labelled as the final release, and
+# the real 0.2.0 would then be refused as a different build. The release's
+# pre-release flag is the first gate; this one does not depend on it.
+check_production_tag() {
+  if [[ ! "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "'$1' is not a final release tag (X.Y.Z or vX.Y.Z); only final releases are published to production" >&2
     return 1
   fi
 }
@@ -251,6 +267,25 @@ s3_origin_url() {
   [[ "$region" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] || { echo "s3_origin_url: invalid region '$region'" >&2; return 1; }
   prefix="${prefix#/}"; prefix="${prefix%/}"
   echo "https://s3.$region.amazonaws.com/$bucket${prefix:+/$prefix}"
+}
+
+# `deb_index_entry <Packages file> <package> <version> <arch>`: "<SHA256>
+# <Filename>" of the ONE stanza for exactly that package, version and
+# architecture, nothing when there is none. The Packages index of a codename
+# is shared with every Redis product, so a bare `Version:` match could be
+# another package's stanza.
+deb_index_entry() {
+  awk -v RS= -v p="$2" -v v="$3" -v a="$4" '
+    { pk = ""; ve = ""; ar = ""; sh = ""; fn = ""
+      n = split($0, line, "\n")
+      for (i = 1; i <= n; i++) {
+        if (line[i] ~ /^Package: /) pk = substr(line[i], 10)
+        else if (line[i] ~ /^Version: /) ve = substr(line[i], 10)
+        else if (line[i] ~ /^Architecture: /) ar = substr(line[i], 15)
+        else if (line[i] ~ /^SHA256: /) sh = substr(line[i], 9)
+        else if (line[i] ~ /^Filename: /) fn = substr(line[i], 11)
+      }
+      if (pk == p && ve == v && ar == a) print sh, fn }' "$1"
 }
 
 # `rpm_release_to_distro <Release tag>`: the rpm/<distro>/ directory an RPM

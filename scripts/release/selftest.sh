@@ -123,7 +123,7 @@ case "\${1:-}" in
       printf '{\n  "git_sha": "%s",\n  "git_tree": "clean",\n  "features": [\n    "%s"\n  ],\n  "openssl": "OpenSSL 3.6.3",\n  "hdf5": "1.10.7"\n}\n' "$desc_sha" "$feats"
     else echo random-100; fi ;;
   --out-dir) mkdir -p "\$2/synthetic-hybrid-16" && : >"\$2/synthetic-hybrid-16/vectors.npy" ;;
-  *) echo "Throughput: 1 vec/s" ;;
+  *) if [[ "$b" == bench_hdf5 ]]; then echo "Failed to open HDF5 file"; else echo "Throughput: 1 vec/s"; fi ;;
 esac
 FAKEBIN
     chmod +x "$st/$b"

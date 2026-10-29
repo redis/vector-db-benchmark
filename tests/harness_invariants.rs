@@ -1643,7 +1643,13 @@ fn every_repo_path_named_in_the_agent_docs_exists() {
 /// release-binaries.yml pins, only through the scripts its PR check runs, from
 /// packaging sources built `--locked --features release-static`, runs the
 /// publish scripts' self-test and dry run on every PR, and its PR trigger
-/// covers every packaging input. A package built with a different
+/// covers every package-specific input: the packaging sources and scripts,
+/// the binary set (`src/bin/**`) and the data the packages ship. The rest of
+/// `src/` is compiled `--features release-static` by release-binaries.yml's PR
+/// run (INV-A4), and the binaries the packages install must be exactly cargo's
+/// bin targets (checked below), so a renamed or added binary fails here even
+/// when no package build runs. Production publishing is gated (variable,
+/// final tag, pinned signing key). A package built with a different
 /// toolchain than the archives of the same release, or by an inline `cargo
 /// build` no PR exercised, is exactly what the release pipeline must not ship.
 #[test]
@@ -1687,8 +1693,14 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "STAGING_BUCKET",
         "SHARED_STAGING_BUCKET",
         // The verify step reads the bucket over HTTPS through lib.sh's
-        // path-style URL (see the scan below).
+        // path-style URL (see the scan below), and checks OUR stanza.
         "s3_origin_url",
+        "deb_index_entry",
+        // Production: switched on by a variable, final tags only, signing
+        // key pinned to the environment's fingerprint.
+        "vars.PACKAGES_PRODUCTION",
+        "check_production_tag \"$tag\"",
+        "vars.APT_SIGNING_FPR",
     ] {
         assert!(
             packages.contains(needed),
@@ -1744,6 +1756,82 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
             );
         }
     }
+    // The verify step builds no URL from the bucket name itself (a two-line
+    // `host=...; base="https://$BUCKET.$host"` would get past the scan above).
+    assert!(
+        !packages.contains("https://$BUCKET") && !packages.contains("https://${BUCKET"),
+        "release-packages.yml builds a URL from the bucket name; use s3_origin_url"
+    );
+    // The binaries the packages install are exactly cargo's bin targets (the
+    // [[bin]] entries plus the ones auto-discovered under src/bin/), and
+    // lib.sh's REQUIRED_BINS: a binary renamed in src/bin must fail here, not
+    // on release day in every `install` line of debian/rules and the spec.
+    let words = |line: &str| -> std::collections::BTreeSet<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    };
+    let cargo_toml = repo_file("Cargo.toml");
+    let mut cargo_bins = std::collections::BTreeSet::new();
+    let mut bin_paths = std::collections::BTreeSet::new();
+    for block in cargo_toml.split("[[bin]]").skip(1) {
+        let block = block.split("\n[").next().unwrap();
+        let field = |key: &str| {
+            block
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(key)?.trim().strip_prefix('='))
+                .map(|v| v.trim().trim_matches('"').to_string())
+        };
+        cargo_bins.insert(field("name").expect("[[bin]] without name"));
+        bin_paths.insert(field("path").expect("[[bin]] without path"));
+    }
+    let src_bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+    for entry in std::fs::read_dir(&src_bin).expect("read src/bin") {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let (rel, stem) = if path.is_dir() {
+            (format!("src/bin/{name}/main.rs"), name.clone())
+        } else if let Some(stem) = name.strip_suffix(".rs") {
+            (format!("src/bin/{name}"), stem.to_string())
+        } else {
+            continue;
+        };
+        if !bin_paths.contains(&rel) && (path.is_file() || path.join("main.rs").is_file()) {
+            cargo_bins.insert(stem); // autobins
+        }
+    }
+    let rules = repo_file("debian/rules");
+    let make_var = |var: &str| {
+        rules
+            .lines()
+            .find_map(|l| l.strip_prefix(var)?.trim_start().strip_prefix(":="))
+            .unwrap_or_else(|| panic!("debian/rules has no `{var} :=` line"))
+            .to_string()
+    };
+    let deb_bins: std::collections::BTreeSet<String> = words(&make_var("BINS"))
+        .union(&words(&make_var("LIBEX")))
+        .cloned()
+        .collect();
+    let spec = repo_file("rpm/vector-db-benchmark.spec");
+    let rpm_bins: std::collections::BTreeSet<String> = spec
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("for b in ")?.split_once("; do"))
+        .flat_map(|(list, _)| words(list))
+        .collect();
+    let lib = repo_file("scripts/release/lib.sh");
+    let required: std::collections::BTreeSet<String> = words(
+        lib.lines()
+            .find_map(|l| l.strip_prefix("REQUIRED_BINS=(")?.strip_suffix(')'))
+            .expect("lib.sh has no one-line REQUIRED_BINS=(...)"),
+    );
+    for (what, set) in [
+        ("debian/rules BINS + LIBEX", &deb_bins),
+        ("the spec's %install loops", &rpm_bins),
+        ("lib.sh REQUIRED_BINS", &required),
+    ] {
+        assert_eq!(
+            set, &cargo_bins,
+            "{what} differs from cargo's bin targets (Cargo.toml [[bin]] + src/bin autobins)"
+        );
+    }
     // Both package sources build the tag's lockfile with the static feature,
     // so a package depends on glibc alone (what test-package.sh installs on).
     for (file, build_line) in [
@@ -1786,6 +1874,12 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "'scripts/release/selftest-packages.sh'",
         "'scripts/release/lib.sh'",
         "'.github/workflows/release-packages.yml'",
+        // What the packages ship besides the compiled code.
+        "'src/bin/**'",
+        "'README.md'",
+        "'datasets/datasets.json'",
+        "'datasets/random-100/**'",
+        "'experiments/configurations/**'",
     ] {
         assert!(
             pr.contains(input),

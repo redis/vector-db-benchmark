@@ -29,7 +29,8 @@ name: Release packages (deb/rpm)
 #            prefix: its deb/ and rpm/ are signed with the PRODUCTION key,
 #            so publishing there would re-sign indexes other products rely on.
 #   build    production, packages.redis.io, no prefix — a published
-#            non-prerelease release, or workflow_dispatch release_type=public
+#            non-prerelease release, or workflow_dispatch release_type=public;
+#            only once vars.PACKAGES_PRODUCTION is 'true', final tags only
 # Each environment carries the same secret names as memtier-benchmark's `build`
 # environment: APT_S3_BUCKET, APT_S3_REGION, APT_SIGNING_KEY and either
 # APT_S3_IAM_ARN (OIDC role to assume) or APT_S3_ACCESS_KEY_ID +
@@ -39,16 +40,38 @@ name: Release packages (deb/rpm)
 # rehearsal to production. Pull requests build, test and dry-run the publish
 # scripts; they never publish.
 #
-# `build` MUST be protected before it gets production secrets: required
-# reviewers, and deployment branches limited to `master` plus release tags
-# (`[0-9]*.[0-9]*.[0-9]*`, `v[0-9]*.[0-9]*.[0-9]*`, the forms check_release_tag
-# accepts). workflow_dispatch runs the workflow file of the DISPATCHED ref, so
-# a branch that edits the bucket / prefix guards below out of its copy would
-# otherwise reach `build`'s secrets with them gone. Until `build` exists the
-# publish job cannot reach production: GitHub creates a missing environment
-# on first use, unprotected but also without the APT_* secrets (none are set
-# at repository level), and the configuration check below then fails before
-# anything is published.
+# PRODUCTION IS OFF until the repository variable PACKAGES_PRODUCTION is
+# 'true'. Until then a published final release builds and tests every
+# package and publishes nothing (a ::notice:: says so; no `build` environment
+# is created), and release_type=public is refused. Switch it on only after:
+#   1. creating the `build` environment and protecting it: required reviewers,
+#      and deployment branches/tags limited to `master` plus the release tags
+#      (`[0-9]*.[0-9]*.[0-9]*`, `v[0-9]*.[0-9]*.[0-9]*`). workflow_dispatch runs
+#      the workflow file of the DISPATCHED ref, so a branch that edits the
+#      guards below out of its copy would otherwise reach `build`'s secrets.
+#      The tag rule alone does not stop that either: anyone who can push a
+#      matching tag can tag a modified workflow. Required reviewers are the
+#      real gate; also add a tag ruleset restricting who may create
+#      release-pattern tags;
+#   2. adding the five secrets, and the environment VARIABLE APT_SIGNING_FPR =
+#      54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C (the key packages.redis.io/gpg
+#      serves). The publish job refuses a key with another fingerprint, and
+#      publish-apt.sh refuses a codename whose InRelease is not already signed
+#      by the key in use: deb-s3 re-signs every product's index of a codename.
+# Production takes final tags only (X.Y.Z / vX.Y.Z, lib.sh
+# check_production_tag): packages carry the crate version without any
+# pre-release suffix, so an rc published there would be labelled as the final
+# release and block it.
+#
+# One publish runs per environment (the `concurrency` group on the publish
+# job). GitHub keeps one running and ONE pending: a third queued publish
+# cancels the pending one, which then shows as cancelled, not published.
+#
+# YUM has no cross-product lock: publish-yum.sh re-lists each directory before
+# uploading repodata/ and checks afterwards that every RPM there is indexed.
+# The residual risk is one-directional: another product's tool, with no such
+# check, can still upload a repodata/ built before our RPM landed, after our
+# check, and drop our RPM from the index while this run stays green.
 #
 # Size of a production YUM publish: publish-yum.sh downloads every object in
 # each rpm/<distro>/<arch>/ it touches (createrepo_c --update needs them on
@@ -108,6 +131,13 @@ on:
       - 'scripts/release/selftest-packages.sh'
       - 'scripts/release/lib.sh'
       - '.github/workflows/release-packages.yml'
+      # What the packages ship besides compiled code, and the binary set (the
+      # rest of src/ is built --features release-static by release-binaries.yml).
+      - 'src/bin/**'
+      - 'README.md'
+      - 'datasets/datasets.json'
+      - 'datasets/random-100/**'
+      - 'experiments/configurations/**'
 
 permissions:
   contents: read
@@ -149,18 +179,25 @@ jobs:
       rpm_matrix: ${{ steps.matrix.outputs.rpm_matrix }}
       deb_dists: ${{ steps.matrix.outputs.deb_dists }}
     steps:
+      # lib.sh only (check_production_tag), at the workflow's own commit.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/release
       - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-          PRERELEASE: ${{ github.event.release.prerelease }}
+          EVENT_PRERELEASE: ${{ github.event.release.prerelease }}
+          PACKAGES_PRODUCTION: ${{ vars.PACKAGES_PRODUCTION }}
           INPUT_TAG: ${{ inputs.tag }}
           RELEASE_TYPE: ${{ inputs.release_type }}
           IN_PREFIX: ${{ inputs.repo_prefix }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          # shellcheck source=scripts/release/lib.sh
+          source scripts/release/lib.sh
           repo_prefix=""
           case "$EVENT" in
             pull_request)
@@ -181,7 +218,7 @@ jobs:
               fi
               if [[ "$EVENT" == release ]]; then
                 # A pre-release is built and tested but never published.
-                if [[ "$PRERELEASE" == true || "$prerelease" == true ]]; then publish_to=none; else publish_to=build; fi
+                if [[ "$EVENT_PRERELEASE" == true || "$prerelease" == true ]]; then publish_to=none; else publish_to=build; fi
               else
                 case "$RELEASE_TYPE" in
                   public)
@@ -205,6 +242,25 @@ jobs:
               fi ;;
             *) echo "::error::unexpected event $EVENT"; exit 1 ;;
           esac
+          if [[ "$publish_to" == build ]]; then
+            # Production is switched on by a repository variable, set only once
+            # `build` exists and is protected (see the header): until then a
+            # release builds and tests, and publishes nothing.
+            if [[ "$PACKAGES_PRODUCTION" != true ]]; then
+              if [[ "$EVENT" == release ]]; then
+                echo "::notice::vars.PACKAGES_PRODUCTION is not 'true': packages built and tested, not published to production"
+                publish_to=none
+              else
+                echo "::error::release_type=public needs vars.PACKAGES_PRODUCTION=true (production publishing is not switched on)"; exit 1
+              fi
+            fi
+          fi
+          if [[ "$publish_to" == build ]]; then
+            # Packages carry the crate version with no pre-release suffix, so an
+            # rc tag would publish as the final version and block it for good:
+            # whatever GitHub's pre-release flag says, only X.Y.Z / vX.Y.Z go out.
+            check_production_tag "$tag" || { echo "::error::refusing to publish '$tag' to production"; exit 1; }
+          fi
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve a commit"; exit 1; }
           {
             echo "tag=$tag"; echo "sha=$sha"; echo "release=$release"; echo "publish_to=$publish_to"; echo "repo_prefix=$repo_prefix"
@@ -456,6 +512,8 @@ jobs:
     env:
       # Ruby 2.7 on ubuntu-22.04 is what memtier-benchmark publishes with today.
       DEB_S3_VERSION: "0.11.3"
+      # sha256 of deb-s3-0.11.3.gem from the deb-s3 GitHub release, recorded 2026-10-29.
+      DEB_S3_GEM_SHA256: b052d7f028ec4b0fe06aaf77f4eb8f6dcd22ce65fbe56698ca56667fda423b16
       TAG: ${{ needs.plan.outputs.tag }}
       PUBLISH_TO: ${{ needs.plan.outputs.publish_to }}
       REPO_PREFIX: ${{ needs.plan.outputs.repo_prefix }}
@@ -490,9 +548,14 @@ jobs:
           # Unsigned publishing is refused by the scripts; say so up front.
           [[ -n "$SIGNING" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_SIGNING_KEY (staging takes a throwaway key, see the workflow header)"; exit 1; }
           echo "use_oidc=$([[ -n "$ROLE" ]] && echo true || echo false)" >> "$GITHUB_ENV"
+      # The publish scripts come from the workflow's OWN commit (github.sha),
+      # the same one as the guards in this file and the selftest job, while
+      # the packages were built from the planned commit (the tag). So a fix to
+      # the publish tooling can finish publishing an existing tag (dispatch
+      # release_type=public tag=<tag> from master), and the scripts that run
+      # are always the ones the selftest just tested.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.plan.outputs.sha }}
           sparse-checkout: scripts/release
       - uses: actions/download-artifact@v4
         with:
@@ -513,6 +576,22 @@ jobs:
           want_rpm=$(jq '.include | length' <<<"$RPM_MATRIX")
           test "$(find debs -name '*.deb' | wc -l)" -eq "$want_deb" || { echo "::error::expected $want_deb .deb files"; exit 1; }
           test "$(find rpms -name '*.rpm' | wc -l)" -eq "$want_rpm" || { echo "::error::expected $want_rpm .rpm files"; exit 1; }
+      # Third-party tooling is installed BEFORE any credential or key is in the
+      # job: nothing it runs at install time can see them.
+      - name: Install createrepo_c, rpm, dpkg-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends createrepo-c rpm dpkg-dev
+          aws --version
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a  # v1.329.0
+        with:
+          ruby-version: "2.7"
+      - name: Install deb-s3 ${{ env.DEB_S3_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://github.com/deb-s3/deb-s3/releases/download/$DEB_S3_VERSION/deb-s3-$DEB_S3_VERSION.gem"
+          echo "$DEB_S3_GEM_SHA256  deb-s3-$DEB_S3_VERSION.gem" | sha256sum -c -
+          gem install "deb-s3-$DEB_S3_VERSION.gem"
       - name: AWS credentials (OIDC role)
         if: env.use_oidc == 'true'
         uses: aws-actions/configure-aws-credentials@v4
@@ -529,24 +608,26 @@ jobs:
       - name: Import the signing key
         env:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          # The fingerprint the environment's repositories are signed with
+          # (environment variable, not a secret). Required for `build`, where
+          # it is production's 54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
+          # (https://packages.redis.io/gpg); optional for staging.
+          EXPECTED_FPR: ${{ vars.APT_SIGNING_FPR }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.gnupg && chmod 0700 ~/.gnupg
           echo "$APT_SIGNING_KEY" | gpg --batch --import
           n="$(gpg --list-secret-keys --with-colons | grep -c '^sec:' || true)"
           [[ "$n" -eq 1 ]] || { echo "::error::APT_SIGNING_KEY must hold exactly one secret key (found $n)"; exit 1; }
-          echo "signing_fpr=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')" >> "$GITHUB_ENV"
-      - name: Install createrepo_c, rpm, dpkg-dev
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends createrepo-c rpm dpkg-dev
-          aws --version
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "2.7"
-      - name: Install deb-s3 ${{ env.DEB_S3_VERSION }}
-        run: |
-          curl -fsSLO "https://github.com/deb-s3/deb-s3/releases/download/$DEB_S3_VERSION/deb-s3-$DEB_S3_VERSION.gem"
-          gem install "deb-s3-$DEB_S3_VERSION.gem"
+          fpr="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          if [[ -z "$EXPECTED_FPR" && "$PUBLISH_TO" == build ]]; then
+            echo "::error::environment 'build' has no APT_SIGNING_FPR variable; set it to the production key's fingerprint"; exit 1
+          fi
+          expected="${EXPECTED_FPR//[[:space:]]/}"
+          if [[ -n "$expected" && "${expected^^}" != "$fpr" ]]; then
+            echo "::error::APT_SIGNING_KEY is $fpr, but environment '$PUBLISH_TO' pins APT_SIGNING_FPR=$expected; refusing to re-sign the shared repositories with another key"; exit 1
+          fi
+          echo "signing_fpr=$fpr" >> "$GITHUB_ENV"
       - name: Publish APT (scripts/release/publish-apt.sh)
         env:
           OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}
@@ -589,8 +670,14 @@ jobs:
             dist="$(dpkg-deb -f "$f" Version)"; dist="${dist##*~}"
             arch="$(dpkg-deb -f "$f" Architecture)"; version="$(dpkg-deb -f "$f" Version)"
             curl -fsSL "$base/deb/dists/$dist/main/binary-$arch/Packages" -o "packages-$dist-$arch"
-            grep -qxF "Version: $version" "packages-$dist-$arch" ||
-              { echo "::error::$base/deb/dists/$dist/main/binary-$arch/Packages does not list vector-db-benchmark $version"; exit 1; }
+            # OUR stanza (package + version + arch), carrying THIS .deb's
+            # digest, and the pool file it names is served.
+            entry="$(deb_index_entry "packages-$dist-$arch" vector-db-benchmark "$version" "$arch")"
+            [[ -n "$entry" && "$entry" != *$'\n'* ]] ||
+              { echo "::error::$base/deb/dists/$dist/main/binary-$arch/Packages has $(grep -c . <<<"$entry") vector-db-benchmark $version $arch stanzas, expected 1"; exit 1; }
+            [[ "${entry%% *}" == "$(sha256sum "$f" | cut -c1-64)" ]] ||
+              { echo "::error::the vector-db-benchmark $version $arch stanza's SHA256 is not this run's .deb ($(basename "$f"))"; exit 1; }
+            curl -fsSI "$base/deb/${entry#* }" >/dev/null || { echo "::error::$base/deb/${entry#* } (named by the index) is not served"; exit 1; }
             # The index we just published is signed by our key, and the
             # signed Release names this Packages file's digest.
             curl -fsSL "$base/deb/dists/$dist/InRelease" -o "inrelease-$dist"

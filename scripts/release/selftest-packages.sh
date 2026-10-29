@@ -6,8 +6,9 @@
 # make is exercised here first, on every PR, against FAKES:
 #   aws     `s3 sync` / `s3 cp` against a directory standing in for the bucket
 #   deb-s3  records its arguments, keeps a per-codename manifest, honours
-#           --fail-if-exists, and REFUSES a bare `--sign` (a string option in
-#           deb-s3: bare, it would swallow the first .deb as the key id)
+#           --fail-if-exists, REFUSES a bare `--sign` (a string option in
+#           deb-s3: bare, it would swallow the first .deb as the key id), and
+#           clearsigns the codename's InRelease with the --sign key
 # with tiny .deb / .rpm fixtures and a throwaway GPG key. Covered: grouping by
 # ~codename and refusing a .deb without one; dist tag -> rpm/<distro>/<arch>;
 # refusing unmapped tags; signing mandatory, --dry-run without a key or tools;
@@ -64,7 +65,9 @@ if [[ "$2" == ls ]]; then
   # Direct children, as `aws s3 ls s3://b/dir/` prints them; exit 1, no
   # output, for a prefix with nothing under it.
   d="$(map "$3")"; out=""
-  if [[ -d "$d" ]]; then
+  if [[ -f "$d" ]]; then
+    out="$(printf '2026-10-29 07:00:00 %10d %s' "$(wc -c < "$d")" "$(basename "$d")")"
+  elif [[ -d "$d" ]]; then
     out="$(cd "$d" && for e in *; do
       [[ -e "$e" ]] || continue
       if [[ -d "$e" ]]; then printf '                           PRE %s/\n' "$e"
@@ -91,6 +94,8 @@ case "$cmd" in
     fi
     if [[ "$delete" == 1 ]]; then
       (cd "$dst" && find . -type f -print0) | while IFS= read -r -d '' f; do
+        # shellcheck disable=SC2053
+        [[ -n "$exclude" && "${f#./}" == $exclude ]] && continue
         [[ -f "$src/$f" ]] || rm -f "$dst/$f"; done
     fi ;;
   cp) mkdir -p "$(dirname "$dst")"; cp "$src" "$dst" ;;
@@ -131,6 +136,8 @@ for d in "${debs[@]}"; do
   echo "$entry" >> "$dir/manifest"
 done
 echo "signed-with=$sign" > "$dir/Release"
+# Like deb-s3: re-sign the codename's InRelease with the --sign key.
+gpg --batch --yes --no-tty --local-user "$sign" --clearsign -o "$dir/InRelease" "$dir/Release"
 FAKE
 chmod +x "$t/bin/aws" "$t/bin/deb-s3"
 export PATH="$t/bin:$PATH"
@@ -201,6 +208,24 @@ GNUPGHOME="$t/twokeys" gpg --batch --quiet --passphrase '' --quick-gen-key 'k2 <
 expect "no secret key: refused (never publish unsigned)" 1 env GNUPGHOME="$t/nokeys" bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs" --overwrite
 expect "no secret key: dry run still allowed" 0 env GNUPGHOME="$t/nokeys" bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs" --dry-run
 expect "two secret keys: refused (ambiguous signer)" 1 env GNUPGHOME="$t/twokeys" bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs" --overwrite
+check "an existing InRelease signed by our key was checked" grep -q '^aws s3 cp s3://bkt/deb/dists/jammy/InRelease ' "$FAKE_LOG"
+# The codename's InRelease is shared and signed with the repository's key:
+# publishing with ANOTHER key would re-sign every product's index with it.
+mkdir -m 0700 "$t/otherkey"
+GNUPGHOME="$t/otherkey" gpg --batch --quiet --passphrase '' --quick-gen-key 'other <other@example.invalid>' rsa2048 sign never 2>/dev/null
+GNUPGHOME="$t/otherkey" gpg --export --armor | gpg --batch --quiet --import 2>/dev/null  # its PUBLIC half is trusted-readable: the signature is valid, just not ours
+mkdir -p "$FAKE_S3/foreign/deb/dists/jammy"
+echo "Origin: packages.redis.io" > "$FAKE_S3/foreign/deb/dists/jammy/Release"
+GNUPGHOME="$t/otherkey" gpg --batch --yes --clearsign -o "$FAKE_S3/foreign/deb/dists/jammy/InRelease" "$FAKE_S3/foreign/deb/dists/jammy/Release" 2>/dev/null
+: > "$FAKE_LOG"
+expect "a codename signed by another key is refused" 1 bash "$here/publish-apt.sh" --bucket foreign --region us-east-2 --in "$t/debs"
+check "... before deb-s3 wrote anything" bash -c "! grep -q '^deb-s3 ' '$FAKE_LOG'"
+check "... naming both keys" bash -c "grep -q 'not by $fpr' '$t/last.out' && grep -q 'signed by [0-9A-F]\{16,\}' '$t/last.out'"
+mkdir -m 0700 "$t/lockedkey"
+GNUPGHOME="$t/lockedkey" gpg --batch --quiet --pinentry-mode loopback --passphrase 'not-in-ci' --quick-gen-key 'locked <locked@example.invalid>' rsa2048 sign never 2>/dev/null
+: > "$FAKE_LOG"
+expect "a key that cannot sign non-interactively is refused" 1 env GNUPGHOME="$t/lockedkey" bash "$here/publish-apt.sh" --bucket fresh --region us-east-2 --in "$t/debs"
+check "... before deb-s3 wrote anything" bash -c "! grep -q '^deb-s3 ' '$FAKE_LOG'"
 
 echo "publish-yum.sh"
 mkrpm 9.9.9 1.el9 x86_64 "$t/rpms/a"; mkrpm 9.9.9 1.amzn2023 x86_64 "$t/rpms/b"; mkrpm 9.9.9 1.el9_4 aarch64 "$t/rpms/c"
@@ -234,6 +259,7 @@ expect "--dry-run needs neither aws nor a key" 0 env PATH="/usr/bin:/bin" GNUPGH
 check "dry run printed the aws commands" grep -q '^dry-run: aws s3 cp' "$t/last.out"
 expect "no secret key: refused" 1 env GNUPGHOME="$t/nokeys" bash "$here/publish-yum.sh" --bucket bkt --in "$t/rpms" --overwrite
 check "the post-upload index check ran" grep -q '^aws s3 ls s3://bkt/rpm/el9/x86_64/' "$FAKE_LOG"
+check "repomd.xml is uploaded after the rest of repodata/" bash -c "s=\$(grep -n 'aws s3 sync .*el9/x86_64/repodata/ s3://' '$FAKE_LOG' | tail -n1 | cut -d: -f1); c=\$(grep -n 'aws s3 cp .*el9/x86_64/repodata/repomd.xml s3://' '$FAKE_LOG' | tail -n1 | cut -d: -f1); [[ -n \$s && -n \$c && \$s -lt \$c ]] && ! grep -q 'repodata/ s3://.*--exclude repomd.xml.*--delete\|repodata/ s3://.*--delete' '$FAKE_LOG'"
 
 # Another product publishing into the same directory while we do. No lock
 # covers rpm/, so publish-yum.sh re-lists before uploading repodata/ and checks
@@ -269,6 +295,15 @@ check "... naming the RPM the index lost" grep -q '^  redis-race-1.2.el9.x86_64.
 check "... and saying to re-run the publish" grep -q 'Re-run this publish' "$t/last.out"
 expect "the re-run it asks for succeeds" 0 bash "$here/publish-yum.sh" --bucket race --in "$t/rpms-race"
 check "... and indexes every RPM in the directory" indexed race el9/x86_64 redis-race-1.1.el9.x86_64.rpm redis-race-1.2.el9.x86_64.rpm vector-db-benchmark-9.9.9-1.el9.x86_64.rpm
+# (c) another product's NEW hashed metadata lands during our repodata/ upload:
+# its repomd.xml (perhaps already cached by the CDN) names it, so our upload
+# must never delete it.
+echo "their primary" > "$t/their-primary.xml.gz"
+expect "a publish racing another product's metadata upload" 0 \
+  env FAKE_RACE_MATCH='^s3 sync .*/el9/x86_64/repodata/ s3://' FAKE_RACE_SRC="$t/their-primary.xml.gz" \
+      FAKE_RACE_DST="s3://race/rpm/el9/x86_64/repodata/0123abcd-primary.xml.gz" \
+      bash "$here/publish-yum.sh" --bucket race --in "$t/rpms-race"
+check "... leaves the other product's hashed metadata in place" test -f "$FAKE_S3/race/rpm/el9/x86_64/repodata/0123abcd-primary.xml.gz"
 
 echo "lib.sh s3_origin_url"
 # Path-style only: production's bucket (packages.redis.io) has dots, and the
@@ -284,6 +319,43 @@ for pair in packages.redis.io:us-east-2 vdb-package-staging:us-east-1 a.b.c:eu-w
 done
 expect "an empty region is refused" 1 s3_origin_url packages.redis.io ""
 expect "a bucket with a slash is refused" 1 s3_origin_url "packages.redis.io/deb" us-east-2
+
+echo "lib.sh check_production_tag"
+# Packages carry the crate version without a pre-release suffix: an rc tag
+# would publish as the final version. Only X.Y.Z / vX.Y.Z reach production.
+for tag in 0.2.0 v0.2.0 10.20.30; do
+  expect "$tag may publish to production" 0 check_production_tag "$tag"
+done
+for tag in 0.2.0-rc.1 v0.2.0-rc.1 0.2.0+build.1 0.2 v0.2.0.1 0.2.0rc1 "" " 0.2.0"; do
+  expect "'$tag' may not" 1 check_production_tag "$tag"
+done
+
+echo "lib.sh deb_index_entry"
+# A shared Packages index: another product with the SAME version string, our
+# package on the other architecture, and ours.
+cat > "$t/Packages" <<'IDX'
+Package: redis-tools
+Version: 0.1.0~jammy
+Architecture: amd64
+Filename: pool/r/redis-tools_0.1.0~jammy_amd64.deb
+SHA256: 1111111111111111111111111111111111111111111111111111111111111111
+
+Package: vector-db-benchmark
+Version: 0.1.0~jammy
+Architecture: arm64
+Filename: pool/v/vector-db-benchmark_0.1.0~jammy_arm64.deb
+SHA256: 2222222222222222222222222222222222222222222222222222222222222222
+
+Package: vector-db-benchmark
+Version: 0.1.0~jammy
+Architecture: amd64
+Filename: pool/v/vector-db-benchmark_0.1.0~jammy_amd64.deb
+SHA256: 3333333333333333333333333333333333333333333333333333333333333333
+IDX
+check "our stanza, not another package's with the same version" test "$(deb_index_entry "$t/Packages" vector-db-benchmark 0.1.0~jammy amd64)" = "3333333333333333333333333333333333333333333333333333333333333333 pool/v/vector-db-benchmark_0.1.0~jammy_amd64.deb"
+check "... and per architecture" test "$(deb_index_entry "$t/Packages" vector-db-benchmark 0.1.0~jammy arm64)" = "2222222222222222222222222222222222222222222222222222222222222222 pool/v/vector-db-benchmark_0.1.0~jammy_arm64.deb"
+check "nothing when only another package has the version" test -z "$(deb_index_entry "$t/Packages" vector-db-benchmark 0.1.0~jammy riscv64)"
+check "nothing for a version we did not publish" test -z "$(deb_index_entry "$t/Packages" vector-db-benchmark 0.2.0~jammy amd64)"
 
 echo "lib.sh rpm_release_to_distro"
 for pair in 1.el8:el8 1.el9:el9 1.el9_4:el9 1.el10:el10 2.el10_1:el10 1.amzn2023:amzn2023; do
