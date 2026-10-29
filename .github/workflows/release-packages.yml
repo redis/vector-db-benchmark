@@ -18,14 +18,16 @@ name: Release packages (deb/rpm)
 # assets are #366's archives + SHA256SUMS).
 #
 # Where it publishes is the GitHub ENVIRONMENT, and nothing else differs:
-#   staging  the staging bucket (redis-test-package-repository, us-east-2),
-#            under an ISOLATED prefix (default vdb-staging/: deb/ and rpm/
-#            below it, exactly the production layout) with a throwaway
-#            signing key, whose public half is published next to the repos
-#            as <prefix>/gpg — workflow_dispatch, release_type=internal.
-#            The shared deb/ and rpm/ of that bucket are signed with the
-#            PRODUCTION key, so a rehearsal there would need that key and
-#            would re-sign indexes other products rely on; it is refused.
+#   staging  our own rehearsal bucket (vdb-package-staging, us-east-2, AWS
+#            account 726902207197), the production layout at its root (deb/,
+#            rpm/, and the throwaway signing key's public half as gpg) —
+#            workflow_dispatch with release_type=internal (the default),
+#            with or without a release tag (without one, the dispatched ref
+#            is built). An optional repo_prefix puts everything under a
+#            sub-path. The Redis-wide staging bucket
+#            (redis-test-package-repository) is accepted only under a
+#            prefix: its deb/ and rpm/ are signed with the PRODUCTION key,
+#            so publishing there would re-sign indexes other products rely on.
 #   build    production, packages.redis.io, no prefix — a published
 #            non-prerelease release, or workflow_dispatch release_type=public
 # Each environment carries the same secret names as memtier-benchmark's `build`
@@ -48,8 +50,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build packages for
-        required: true
+        description: Existing release tag to build packages for (required for release_type=public; a rehearsal may leave it empty and build the dispatched ref)
+        required: false
         type: string
       release_type:
         description: Where to publish (internal = staging bucket, public = packages.redis.io, none = build and test only)
@@ -61,7 +63,7 @@ on:
         type: boolean
         default: false
       repo_prefix:
-        description: Staging only - bucket prefix the deb/ and rpm/ repositories live under (default vdb-staging); the shared root is refused
+        description: Staging only - optional bucket prefix to publish under (deb/, rpm/ and gpg below it)
         required: false
         type: string
       deb_dists:
@@ -106,8 +108,8 @@ env:
   # enough to prove the packaging, not 22 cold static builds per push.
   DEFAULT_PR_DEB_DISTS: '["jammy"]'
   DEFAULT_PR_RPM_DISTROS: '["el9"]'
-  STAGING_BUCKET: redis-test-package-repository
-  DEFAULT_STAGING_PREFIX: vdb-staging
+  STAGING_BUCKET: vdb-package-staging
+  SHARED_STAGING_BUCKET: redis-test-package-repository
 
 jobs:
   plan:
@@ -141,12 +143,18 @@ jobs:
               tag=""; sha="$PR_SHA"; release=false; publish_to=none ;;
             release|workflow_dispatch)
               tag="${RELEASE_TAG:-$INPUT_TAG}"
-              [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "::error::invalid tag '$tag'"; exit 1; }
-              view="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isPrerelease,isDraft)" ||
-                { echo "::error::no release for tag '$tag'"; exit 1; }
-              sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha)"
-              release=true
-              prerelease="$(jq -r '.isPrerelease or .isDraft' <<<"$view")"
+              if [[ -z "$tag" ]]; then
+                # A rehearsal of the dispatched ref: no release, crate version only.
+                [[ "$RELEASE_TYPE" != public ]] || { echo "::error::release_type=public needs the release tag to publish"; exit 1; }
+                sha="$GITHUB_SHA"; release=false; prerelease=true
+              else
+                [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "::error::invalid tag '$tag'"; exit 1; }
+                view="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isPrerelease,isDraft)" ||
+                  { echo "::error::no release for tag '$tag'"; exit 1; }
+                sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha)"
+                release=true
+                prerelease="$(jq -r '.isPrerelease or .isDraft' <<<"$view")"
+              fi
               if [[ "$EVENT" == release ]]; then
                 # A pre-release is built and tested but never published.
                 if [[ "$PRERELEASE" == true || "$prerelease" == true ]]; then publish_to=none; else publish_to=build; fi
@@ -160,14 +168,13 @@ jobs:
                     publish_to=build ;;
                   internal)
                     publish_to=staging
-                    repo_prefix="${IN_PREFIX:-$DEFAULT_STAGING_PREFIX}"
-                    repo_prefix="${repo_prefix#/}"; repo_prefix="${repo_prefix%/}"
-                    # Never the bucket root: its deb/ and rpm/ are the shared,
-                    # production-signed repositories of every Redis product.
-                    [[ "$repo_prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
-                      { echo "::error::repo_prefix '$IN_PREFIX' is empty or not a plain path; staging rehearsals go under a prefix such as $DEFAULT_STAGING_PREFIX"; exit 1; }
-                    [[ "$repo_prefix" != deb && "$repo_prefix" != rpm && "$repo_prefix" != deb/* && "$repo_prefix" != rpm/* ]] ||
-                      { echo "::error::repo_prefix '$repo_prefix' points into the shared repositories"; exit 1; } ;;
+                    repo_prefix="${IN_PREFIX#/}"; repo_prefix="${repo_prefix%/}"
+                    if [[ -n "$repo_prefix" ]]; then
+                      [[ "$repo_prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
+                        { echo "::error::repo_prefix '$IN_PREFIX' is not a plain path"; exit 1; }
+                      [[ "$repo_prefix" != deb && "$repo_prefix" != rpm && "$repo_prefix" != deb/* && "$repo_prefix" != rpm/* ]] ||
+                        { echo "::error::repo_prefix '$repo_prefix' points into the repositories themselves"; exit 1; }
+                    fi ;;
                   *) publish_to=none ;;
                 esac
                 [[ "$publish_to" != build || -z "$IN_PREFIX" ]] || { echo "::error::repo_prefix is for staging rehearsals; production publishes at the bucket root"; exit 1; }
@@ -430,10 +437,15 @@ jobs:
           # sure 'staging' really points at the staging bucket and 'build' never does.
           case "$PUBLISH_TO" in
             staging)
-              [[ "$BUCKET" == "$STAGING_BUCKET" ]] || { echo "::error::environment 'staging' has APT_S3_BUCKET set to something other than $STAGING_BUCKET; refusing to rehearse against it"; exit 1; }
-              [[ -n "$REPO_PREFIX" ]] || { echo "::error::a staging rehearsal must publish under a prefix, never the bucket root"; exit 1; } ;;
+              case "$BUCKET" in
+                "$STAGING_BUCKET") ;;
+                "$SHARED_STAGING_BUCKET")
+                  # Its deb/ and rpm/ are the shared, production-signed repositories.
+                  [[ -n "$REPO_PREFIX" ]] || { echo "::error::$SHARED_STAGING_BUCKET is shared with every Redis product; a rehearsal there needs repo_prefix"; exit 1; } ;;
+                *) echo "::error::environment 'staging' has APT_S3_BUCKET set to '$BUCKET', not a staging bucket; refusing to rehearse against it"; exit 1 ;;
+              esac ;;
             build)
-              [[ "$BUCKET" != "$STAGING_BUCKET" ]] || { echo "::error::environment 'build' points at the staging bucket"; exit 1; }
+              [[ "$BUCKET" != "$STAGING_BUCKET" && "$BUCKET" != "$SHARED_STAGING_BUCKET" ]] || { echo "::error::environment 'build' points at a staging bucket"; exit 1; }
               [[ -z "$REPO_PREFIX" ]] || { echo "::error::production publishes at the bucket root, got prefix '$REPO_PREFIX'"; exit 1; } ;;
             *) echo "::error::unexpected publish target '$PUBLISH_TO'"; exit 1 ;;
           esac
@@ -514,15 +526,15 @@ jobs:
           [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
           bash scripts/release/publish-yum.sh "${args[@]}"
       - name: Publish the public key next to the rehearsal repositories (staging only)
-        # Production's /gpg is the packaging team's; an isolated staging prefix
-        # gets its own, so the README's install steps work against it verbatim
-        # with the base URL swapped.
+        # Production's /gpg is the packaging team's; the staging bucket gets
+        # its own, so the README's install steps work against it verbatim with
+        # the base URL swapped.
         if: needs.plan.outputs.publish_to == 'staging'
         run: |
           set -euo pipefail
           gpg --export --armor "$signing_fpr" > gpg.asc
-          aws s3 cp gpg.asc "s3://$BUCKET/$REPO_PREFIX/gpg" --acl public-read --content-type text/plain --only-show-errors
-          echo "ok: s3://$BUCKET/$REPO_PREFIX/gpg ($signing_fpr)"
+          aws s3 cp gpg.asc "s3://$BUCKET/${REPO_PREFIX:+$REPO_PREFIX/}gpg" --acl public-read --content-type text/plain --only-show-errors
+          echo "ok: s3://$BUCKET/${REPO_PREFIX:+$REPO_PREFIX/}gpg ($signing_fpr)"
       - name: Verify what the repository now serves
         # Against the S3 origin, not the CDN: CloudFront may still cache the
         # previous index for hours, and the objects are public-read either way.
