@@ -160,25 +160,34 @@ container, and publishes them to packages.redis.io (the `build` environment).
   is a codename whose existing InRelease another key signed.
 - **Crate version stays `X.Y.Z`, also for an rc.** The build scripts refuse a
   `-` in it. Packages carry that version without a suffix, so production only
-  ever takes a final tag (`X.Y.Z` / `vX.Y.Z`, `check_production_tag`), and a
-  pre-release is built and tested but never published. Mark rc releases as
-  pre-releases anyway.
+  ever takes a final tag (`X.Y.Z` / `vX.Y.Z`, `check_production_tag`). An rc
+  release MUST be marked as a pre-release: then it is built and tested and
+  never published. Once production is on, an rc NOT marked as one fails the
+  package run at the plan job, before anything is built or tested.
 - **A pre-release later promoted to final** gets no packages from the
   `published` event (it already fired). Dispatch `release_type=public
   tag=<tag>` from `master`.
 - **Re-running a failed publish:** use **Re-run failed jobs**. It reuses the
   run's build artifacts (unsigned; the publish job signs them each time, and
   the identity check ignores signatures), so what is already published is
-  skipped as the same build and the rest completes (this is also the fix when publish-yum.sh's
-  index check reports another product's RPM missing). **Re-run all jobs**
-  rebuilds: the new packages differ (build time, digest), deb-s3 and
+  skipped as the same build and the rest completes (this is also the fix when
+  publish-yum.sh's index check reports another product's RPM missing). It
+  re-runs the run's OWN scripts, so it cannot pick up a fix to them.
+  **Re-run all jobs**, or any new dispatch, rebuilds: the rebuilt packages
+  are not byte-identical (changelog date, build time), deb-s3 and
   publish-yum.sh refuse them as a different build, and production has no
-  `--overwrite`. Once the artifacts have expired (14 days), dispatch with
-  `deb_dists` / `rpm_distros` limited to the targets that were not published.
+  `--overwrite`. So a new dispatch (`deb_dists` / `rpm_distros` limited to
+  what is missing) can only publish targets that nothing of this version
+  reached yet; both lists must name at least one target, and APT publishes
+  before YUM. A release whose APT side, or one arch of an RPM distro, is
+  already published cannot be finished by the workflow once the run can no
+  longer be re-run (or when the fix is in the scripts): that needs a manual
+  publish of the remaining artifacts with the packaging team.
 - **Stale deb-s3 lock:** a job killed mid-publish leaves
   `deb/dists/<codename>/main/binary-/lockfile`; the next run waits ten
-  minutes and fails with "Repository is locked". Delete that object by hand
-  after checking nothing else is publishing.
+  minutes logging "Repository is locked by another user", then fails with
+  `uncaught throw "Unable to obtain a lock after 60, giving up."`. Delete that
+  object by hand after checking nothing else is publishing.
 - **Before tagging,** a green full-matrix staging rehearsal of the commit is
   the check that every codename/distro still builds (PRs build jammy and el9
   only): `gh workflow run release-packages.yml --ref <branch>

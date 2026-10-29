@@ -1756,6 +1756,36 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
             );
         }
     }
+    // The production and signing guards are lib.sh functions the selftest
+    // covers; here, each call site must be there VERBATIM on a code line (not
+    // a comment, not weakened by a trailing `|| true`).
+    let code_lines = |src: &str| -> Vec<String> {
+        src.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.starts_with('#'))
+            .collect()
+    };
+    let wf_code = code_lines(&packages);
+    for call in [
+        "PACKAGES_PRODUCTION: ${{ vars.PACKAGES_PRODUCTION }}",
+        "publish_to=\"$(production_gate \"$EVENT\" \"$PACKAGES_PRODUCTION\")\" || { echo \"::error::release_type=public needs vars.PACKAGES_PRODUCTION=true\"; exit 1; }",
+        "check_production_tag \"$tag\" || { echo \"::error::refusing to publish '$tag' to production\"; exit 1; }",
+        "EXPECTED_FPR: ${{ vars.APT_SIGNING_FPR }}",
+        "check_signing_fpr \"$EXPECTED_FPR\" \"$fpr\" \"$PUBLISH_TO\" || { echo \"::error::signing key does not match the environment's APT_SIGNING_FPR (see above)\"; exit 1; }",
+        "base=\"$(s3_origin_url \"$BUCKET\" \"$REGION\" \"$REPO_PREFIX\")\"",
+        "gpg_status_signed_by \"$signing_fpr\" <<<\"$status\" ||",
+    ] {
+        assert!(
+            wf_code.iter().any(|l| l == call),
+            "release-packages.yml no longer has this guard line verbatim:\n    {call}"
+        );
+    }
+    assert!(
+        code_lines(&repo_file("scripts/release/publish-apt.sh"))
+            .iter()
+            .any(|l| l == "if ! gpg_status_signed_by \"$fpr\" <<<\"$status\"; then"),
+        "publish-apt.sh no longer checks the existing InRelease's signer"
+    );
     // The verify step builds no URL from the bucket name itself (a two-line
     // `host=...; base="https://$BUCKET.$host"` would get past the scan above).
     assert!(
@@ -1816,6 +1846,13 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         .filter_map(|l| l.trim().strip_prefix("for b in ")?.split_once("; do"))
         .flat_map(|(list, _)| words(list))
         .collect();
+    // test-package.sh's own loops: what it checks is installed and runs.
+    let installed: std::collections::BTreeSet<String> =
+        repo_file("scripts/release/test-package.sh")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("for b in ")?.split_once("; do"))
+            .flat_map(|(list, _)| words(list))
+            .collect();
     let lib = repo_file("scripts/release/lib.sh");
     let required: std::collections::BTreeSet<String> = words(
         lib.lines()
@@ -1826,6 +1863,7 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         ("debian/rules BINS + LIBEX", &deb_bins),
         ("the spec's %install loops", &rpm_bins),
         ("lib.sh REQUIRED_BINS", &required),
+        ("test-package.sh's install checks", &installed),
     ] {
         assert_eq!(
             set, &cargo_bins,
@@ -1973,6 +2011,11 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
     for input in [
         "- 'build.rs'",
         "- '.github/workflows/release-binaries.yml'",
+        // INV-A5's inputs: its production gates, signing pin and binary-set
+        // check live in these, so a PR touching only them must still run it.
+        "- '.github/workflows/release-packages.yml'",
+        "- 'debian/**'",
+        "- 'rpm/**'",
         "- '.github/workflows/docker-build-pr.yml'",
         "- '.github/workflows/docker-publish-master.yml'",
         "- '.github/workflows/docker-publish-release.yml'",

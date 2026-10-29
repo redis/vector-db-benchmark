@@ -51,6 +51,8 @@ mkdir -p "$t/bin" "$FAKE_S3"
 cat > "$t/bin/aws" <<'FAKE'
 #!/usr/bin/env bash
 # fake aws: s3 sync|cp|ls with s3://bucket/key mapped to $FAKE_S3/bucket/key.
+# FAKE_LS_FAIL (a regex on the s3:// argument) makes that `ls` fail as an
+# AccessDenied would (stderr, exit 254).
 # A concurrent publish by another product is simulated with FAKE_RACE_MATCH (a
 # regex on the arguments) + FAKE_RACE_SRC (a file) + FAKE_RACE_DST (s3://...):
 # the first call matching moves the file into the bucket BEFORE it runs.
@@ -61,6 +63,9 @@ if [[ -n "${FAKE_RACE_MATCH:-}" && "$*" =~ $FAKE_RACE_MATCH && -f "${FAKE_RACE_S
   mkdir -p "$(dirname "$(map "$FAKE_RACE_DST")")"; mv "$FAKE_RACE_SRC" "$(map "$FAKE_RACE_DST")"
 fi
 [[ "$1" == s3 ]] || { echo "fake aws: only s3" >&2; exit 1; }
+if [[ "$2" == ls && -n "${FAKE_LS_FAIL:-}" && "$3" =~ $FAKE_LS_FAIL ]]; then
+  echo "An error occurred (AccessDenied) when calling the ListObjectsV2 operation: Access Denied" >&2; exit 254
+fi
 if [[ "$2" == ls ]]; then
   # Direct children, as `aws s3 ls s3://b/dir/` prints them; exit 1, no
   # output, for a prefix with nothing under it.
@@ -226,6 +231,22 @@ GNUPGHOME="$t/lockedkey" gpg --batch --quiet --pinentry-mode loopback --passphra
 : > "$FAKE_LOG"
 expect "a key that cannot sign non-interactively is refused" 1 env GNUPGHOME="$t/lockedkey" bash "$here/publish-apt.sh" --bucket fresh --region us-east-2 --in "$t/debs"
 check "... before deb-s3 wrote anything" bash -c "! grep -q '^deb-s3 ' '$FAKE_LOG'"
+: > "$FAKE_LOG"
+expect "an InRelease listing error is refused, not taken for a new codename" 1 env FAKE_LS_FAIL='dists/jammy/InRelease$' bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs"
+check "... before deb-s3 wrote anything" bash -c "! grep -q '^deb-s3 ' '$FAKE_LOG' && grep -q 'AccessDenied' '$t/last.out'"
+mkdir -p "$FAKE_S3/gpgonly/deb/dists/jammy"; echo sig > "$FAKE_S3/gpgonly/deb/dists/jammy/Release.gpg"
+: > "$FAKE_LOG"
+expect "a codename with Release.gpg but no InRelease is refused" 1 bash "$here/publish-apt.sh" --bucket gpgonly --region us-east-2 --in "$t/debs"
+check "... before deb-s3 wrote anything" bash -c "! grep -q '^deb-s3 ' '$FAKE_LOG'"
+# A key whose primary only certifies and whose SIGNING SUBKEY makes the
+# signatures: VALIDSIG names the subkey first and the primary last.
+mkdir -m 0700 "$t/subkey"
+GNUPGHOME="$t/subkey" gpg --batch --quiet --passphrase '' --quick-gen-key 'sub <sub@example.invalid>' rsa2048 cert never 2>/dev/null
+sub_fpr="$(GNUPGHOME="$t/subkey" gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+GNUPGHOME="$t/subkey" gpg --batch --quiet --passphrase '' --quick-add-key "$sub_fpr" rsa2048 sign never 2>/dev/null
+expect "a signing-subkey key publishes a new codename" 0 env GNUPGHOME="$t/subkey" bash "$here/publish-apt.sh" --bucket subkey --region us-east-2 --in "$t/debs"
+expect "... and its own InRelease passes the signer check on the next run" 0 env GNUPGHOME="$t/subkey" bash "$here/publish-apt.sh" --bucket subkey --region us-east-2 --in "$t/debs" --overwrite
+check "... which really was a subkey signature" bash -c "GNUPGHOME='$t/subkey' gpg --batch --status-fd 1 --verify '$FAKE_S3/subkey/deb/dists/jammy/InRelease' 2>/dev/null | awk '\$2==\"VALIDSIG\" {exit !(\$3 != \"$sub_fpr\" && \$NF == \"$sub_fpr\")}'"
 
 echo "publish-yum.sh"
 mkrpm 9.9.9 1.el9 x86_64 "$t/rpms/a"; mkrpm 9.9.9 1.amzn2023 x86_64 "$t/rpms/b"; mkrpm 9.9.9 1.el9_4 aarch64 "$t/rpms/c"
@@ -311,8 +332,13 @@ mkdir -p "$FAKE_S3/signedmd/rpm/el9/x86_64/repodata"
 echo '<repomd/>' > "$FAKE_S3/signedmd/rpm/el9/x86_64/repodata/repomd.xml"
 echo 'sig' > "$FAKE_S3/signedmd/rpm/el9/x86_64/repodata/repomd.xml.asc"
 : > "$FAKE_LOG"
-expect "a directory with signed metadata (repomd.xml.asc) is refused" 1 bash "$here/publish-yum.sh" --bucket signedmd --in "$t/rpms-race"
+# Only el9/x86_64 is signed; it sorts LAST of the three target directories, so
+# the refusal must come from the preflight, before amzn2023/ and el9/aarch64.
+expect "a directory with signed metadata (repomd.xml.asc) is refused" 1 bash "$here/publish-yum.sh" --bucket signedmd --in "$t/rpms"
 check "... naming the signature" grep -q 'repomd.xml.asc exists' "$t/last.out"
+check "... before anything was uploaded to ANY directory" bash -c "! grep -qE '^aws s3 (cp|sync) [^ ]+ s3://' '$FAKE_LOG' && ! test -e '$FAKE_S3/signedmd/rpm/amzn2023'"
+: > "$FAKE_LOG"
+expect "a repodata/ listing error is refused" 1 env FAKE_LS_FAIL='/repodata/$' bash "$here/publish-yum.sh" --bucket bkt --in "$t/rpms"
 check "... before anything was uploaded" bash -c "! grep -qE '^aws s3 (cp|sync) [^ ]+ s3://' '$FAKE_LOG'"
 
 echo "lib.sh s3_origin_url"
@@ -336,9 +362,35 @@ echo "lib.sh check_production_tag"
 for tag in 0.2.0 v0.2.0 10.20.30; do
   expect "$tag may publish to production" 0 check_production_tag "$tag"
 done
-for tag in 0.2.0-rc.1 v0.2.0-rc.1 0.2.0+build.1 0.2 v0.2.0.1 0.2.0rc1 "" " 0.2.0"; do
+for tag in 0.2.0-rc.1 v0.2.0-rc.1 0.2.0+build.1 0.2 v0.2.0.1 0.2.0rc1 "" " 0.2.0" 00.2.0 0.02.0; do
   expect "'$tag' may not" 1 check_production_tag "$tag"
 done
+
+echo "lib.sh production_gate"
+check "variable on: build" test "$(production_gate release true)" = build
+check "variable on, public dispatch: build" test "$(production_gate workflow_dispatch true)" = build
+check "variable off, release: none" test "$(production_gate release '')" = none
+check "variable 'yes' is not 'true': none" test "$(production_gate release yes)" = none
+expect "variable off, public dispatch: refused" 1 production_gate workflow_dispatch ''
+
+echo "lib.sh check_signing_fpr"
+F=54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
+expect "build with the pinned key" 0 check_signing_fpr "$F" "$F" build
+expect "pin with spaces and lower case" 0 check_signing_fpr "5431 8fa4 052d 1e61 a6b6  f7bb 5f43 49d6 bf53 aa0c" "$F" build
+expect "build without a pin: refused" 1 check_signing_fpr "" "$F" build
+expect "build with another key: refused" 1 check_signing_fpr "$F" FD183D88E9814786987424DAE26208135FFAAD25 build
+expect "staging without a pin" 0 check_signing_fpr "" FD183D88E9814786987424DAE26208135FFAAD25 staging
+expect "staging with another key: refused" 1 check_signing_fpr "$F" FD183D88E9814786987424DAE26208135FFAAD25 staging
+expect "a short key id is not a pin" 1 check_signing_fpr BF53AA0C "$F" build
+
+echo "lib.sh gpg_status_signed_by"
+st_primary="[GNUPG:] VALIDSIG $F 2026-10-29 1 0 4 0 1 10 01 $F"
+st_sub="[GNUPG:] VALIDSIG 48263292AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 2026-10-29 1 0 4 0 1 10 01 $F"
+expect "signed by the primary key" 0 gpg_status_signed_by "$F" <<<"$st_primary"
+expect "signed by its subkey (primary in the last field)" 0 gpg_status_signed_by "$F" <<<"$st_sub"
+expect "GOODSIG alone is not enough" 1 gpg_status_signed_by "$F" <<<"[GNUPG:] GOODSIG 5F4349D6BF53AA0C redis"
+expect "another key" 1 gpg_status_signed_by FD183D88E9814786987424DAE26208135FFAAD25 <<<"$st_sub"
+expect "a fingerprint prefix does not match" 1 gpg_status_signed_by "${F:0:39}" <<<"$st_primary"
 
 echo "lib.sh deb_index_entry"
 # A shared Packages index: another product with the SAME version string, our

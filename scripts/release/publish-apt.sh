@@ -39,8 +39,9 @@
 # `--lock` takes deb-s3's per-codename lock (deb/dists/<codename>/main/binary-/lockfile),
 # the same one redis-debian's publish takes, so two products do not rewrite one
 # Release concurrently. A job killed mid-publish leaves it behind; the next run
-# waits ten minutes and fails with "Repository is locked": remove the lockfile
-# object by hand after checking nothing else is publishing.
+# waits ten minutes, logging "Repository is locked by another user", then fails
+# with `uncaught throw "Unable to obtain a lock after 60, giving up."`: remove
+# the lockfile object by hand after checking nothing else is publishing.
 #
 # AWS credentials come from the environment (static keys or an assumed role;
 # deb-s3 reads them through the AWS SDK, session tokens included). The
@@ -65,6 +66,9 @@ done
 [[ -n "$bucket" && -n "$region" && -d "$indir" ]] || {
   echo "usage: publish-apt.sh --bucket <bucket> --region <region> --in <dir> [--prefix deb] [--origin <origin>] [--overwrite] [--dry-run]" >&2; exit 2; }
 command -v dpkg-deb >/dev/null || { echo "publish-apt.sh: dpkg-deb not on PATH" >&2; exit 1; }
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/release/lib.sh
+source "$here/lib.sh"
 [[ "$dry_run" == 1 ]] || command -v deb-s3 >/dev/null || { echo "publish-apt.sh: deb-s3 not on PATH" >&2; exit 1; }
 [[ "$dry_run" == 1 ]] || command -v aws >/dev/null || { echo "publish-apt.sh: aws not on PATH" >&2; exit 1; }
 
@@ -100,17 +104,30 @@ if [[ "$dry_run" != 1 ]]; then
   trap 'rm -rf "$work"' EXIT
   gpg --batch --no-tty --local-user "$fpr" --clearsign <<<"publish-apt.sh signing test" >/dev/null 2>"$work/sign.err" || {
     echo "publish-apt.sh: the key $fpr cannot sign non-interactively (passphrase? expired?):" >&2; cat "$work/sign.err" >&2; exit 1; }
+  # `exists <s3://...>`: 0 if the object is there, 1 if not; any other
+  # listing failure (AccessDenied, network) stops the publish, never "new".
+  exists() {
+    local rc=0 listing
+    listing="$(aws s3 ls "$1" 2>"$work/ls.err")" || rc=$?
+    [[ "$rc" -eq 1 && -z "$listing" && ! -s "$work/ls.err" ]] && return 1
+    [[ "$rc" -eq 0 ]] && return 0
+    echo "publish-apt.sh: aws s3 ls $1 failed (exit $rc):" >&2; cat "$work/ls.err" >&2; exit 1
+  }
   for dist in $(printf '%s\n' "${!by_dist[@]}" | LC_ALL=C sort); do
     obj="s3://$bucket/$prefix/dists/$dist/InRelease"
-    rc=0; listing="$(aws s3 ls "$obj" 2>"$work/ls.err")" || rc=$?
-    if [[ "$rc" -eq 1 && -z "$listing" && ! -s "$work/ls.err" ]]; then
+    if ! exists "$obj"; then
+      # deb-s3 writes InRelease and Release.gpg together: a Release.gpg alone
+      # is a signed codename we cannot check here, so it is not "new".
+      if exists "s3://$bucket/$prefix/dists/$dist/Release.gpg"; then
+        echo "publish-apt.sh: $prefix/dists/$dist has a Release.gpg but no InRelease; refusing to re-sign a codename whose signer cannot be checked" >&2
+        exit 1
+      fi
       echo "$dist: no InRelease yet, a new codename in this repository"
       continue
     fi
-    [[ "$rc" -eq 0 ]] || { echo "publish-apt.sh: aws s3 ls $obj failed (exit $rc):" >&2; cat "$work/ls.err" >&2; exit 1; }
     aws s3 cp "$obj" "$work/InRelease-$dist" --only-show-errors
     status="$(gpg --batch --no-tty --status-fd 1 --verify "$work/InRelease-$dist" 2>/dev/null || true)"
-    if ! grep -q "^\[GNUPG:\] VALIDSIG $fpr " <<<"$status"; then
+    if ! gpg_status_signed_by "$fpr" <<<"$status"; then
       signer="$(sed -n 's/^\[GNUPG:\] \(VALIDSIG\|ERRSIG\|NO_PUBKEY\|BADSIG\) \([0-9A-F]*\).*/\2/p' <<<"$status" | head -n1)"
       echo "publish-apt.sh: $obj is signed by ${signer:-an unreadable signature}, not by $fpr." >&2
       echo "  Publishing would re-sign every product's $dist index with a key its users do not trust; refusing." >&2

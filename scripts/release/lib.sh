@@ -111,8 +111,40 @@ check_release_tag() {
 # the real 0.2.0 would then be refused as a different build. The release's
 # pre-release flag is the first gate; this one does not depend on it.
 check_production_tag() {
-  if [[ ! "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  if [[ ! "$1" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
     echo "'$1' is not a final release tag (X.Y.Z or vX.Y.Z); only final releases are published to production" >&2
+    return 1
+  fi
+}
+
+# `production_gate <event> <vars.PACKAGES_PRODUCTION>`: where a run the plan
+# job resolved to `build` really goes. Production is switched on only by the
+# repository variable being exactly `true`: until then a `release` event goes
+# to `none` (built and tested, published nowhere; prints `none`), and an
+# explicit release_type=public dispatch is refused (returns 1).
+production_gate() {
+  local event="$1" production="$2"
+  if [[ "$production" == true ]]; then echo build; return 0; fi
+  if [[ "$event" == release ]]; then echo none; return 0; fi
+  echo "release_type=public needs vars.PACKAGES_PRODUCTION=true (production publishing is not switched on)" >&2
+  return 1
+}
+
+# `check_signing_fpr <pinned> <actual> <environment>`: the signing key the job
+# imported must be the one the environment's repositories are signed with
+# (APT_SIGNING_FPR; whitespace and case ignored). The pin is required for
+# `build`, optional elsewhere. deb-s3 re-signs every product's index of a
+# codename, so a wrong key there breaks `apt update` for all of them.
+check_signing_fpr() {
+  local pinned="${1//[[:space:]]/}" actual="$2" env="$3"
+  pinned="${pinned^^}"
+  if [[ -z "$pinned" ]]; then
+    [[ "$env" != build ]] && return 0
+    echo "environment 'build' has no APT_SIGNING_FPR variable; set it to the production key's fingerprint" >&2
+    return 1
+  fi
+  if [[ "$pinned" != "$actual" ]]; then
+    echo "APT_SIGNING_KEY is $actual, but environment '$env' pins APT_SIGNING_FPR=$pinned; refusing to re-sign the shared repositories with another key" >&2
     return 1
   fi
 }
@@ -286,6 +318,16 @@ deb_index_entry() {
         else if (line[i] ~ /^Filename: /) fn = substr(line[i], 11)
       }
       if (pk == p && ve == v && ar == a) print sh, fn }' "$1"
+}
+
+# `gpg_status_signed_by <primary fpr>` < `gpg --status-fd 1 --verify` output:
+# true when a VALIDSIG line names that key, either as the signing key (the
+# first field) or as its primary key (the last field, when a signing SUBKEY
+# made the signature). Nothing else counts: GOODSIG alone is not enough, and
+# EXPKEYSIG/REVKEYSIG still come with VALIDSIG (the caller's test signature
+# refuses an expired key of ours).
+gpg_status_signed_by() {
+  awk -v f="$1" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == f || $NF == f) {ok = 1} END {exit !ok}'
 }
 
 # `rpm_release_to_distro <Release tag>`: the rpm/<distro>/ directory an RPM

@@ -246,14 +246,8 @@ jobs:
             # Production is switched on by a repository variable, set only once
             # `build` exists and is protected (see the header): until then a
             # release builds and tests, and publishes nothing.
-            if [[ "$PACKAGES_PRODUCTION" != true ]]; then
-              if [[ "$EVENT" == release ]]; then
-                echo "::notice::vars.PACKAGES_PRODUCTION is not 'true': packages built and tested, not published to production"
-                publish_to=none
-              else
-                echo "::error::release_type=public needs vars.PACKAGES_PRODUCTION=true (production publishing is not switched on)"; exit 1
-              fi
-            fi
+            publish_to="$(production_gate "$EVENT" "$PACKAGES_PRODUCTION")" || { echo "::error::release_type=public needs vars.PACKAGES_PRODUCTION=true"; exit 1; }
+            [[ "$publish_to" == build ]] || echo "::notice::vars.PACKAGES_PRODUCTION is not 'true': packages built and tested, not published to production"
           fi
           if [[ "$publish_to" == build ]]; then
             # Packages carry the crate version with no pre-release suffix, so an
@@ -479,9 +473,9 @@ jobs:
     if: needs.plan.outputs.publish_to == 'none'
     runs-on: ubuntu-latest
     steps:
+      # The publish scripts at the workflow's own commit, as `publish` runs them.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.plan.outputs.sha }}
           sparse-checkout: scripts/release
       - uses: actions/download-artifact@v4
         with:
@@ -550,10 +544,12 @@ jobs:
           echo "use_oidc=$([[ -n "$ROLE" ]] && echo true || echo false)" >> "$GITHUB_ENV"
       # The publish scripts come from the workflow's OWN commit (github.sha),
       # the same one as the guards in this file and the selftest job, while
-      # the packages were built from the planned commit (the tag). So a fix to
-      # the publish tooling can finish publishing an existing tag (dispatch
-      # release_type=public tag=<tag> from master), and the scripts that run
-      # are always the ones the selftest just tested.
+      # the packages were built from the planned commit (the tag), so the
+      # scripts that run are always the ones the selftest just tested. A
+      # dispatch from master REBUILDS the packages, and a rebuild is not
+      # byte-identical (changelog date, build time): it can publish only targets
+      # nothing of this version reached yet. It cannot finish a release whose
+      # APT side, or one RPM arch, is already published (see AGENTS.md).
       - uses: actions/checkout@v4
         with:
           sparse-checkout: scripts/release
@@ -620,13 +616,9 @@ jobs:
           n="$(gpg --list-secret-keys --with-colons | grep -c '^sec:' || true)"
           [[ "$n" -eq 1 ]] || { echo "::error::APT_SIGNING_KEY must hold exactly one secret key (found $n)"; exit 1; }
           fpr="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
-          if [[ -z "$EXPECTED_FPR" && "$PUBLISH_TO" == build ]]; then
-            echo "::error::environment 'build' has no APT_SIGNING_FPR variable; set it to the production key's fingerprint"; exit 1
-          fi
-          expected="${EXPECTED_FPR//[[:space:]]/}"
-          if [[ -n "$expected" && "${expected^^}" != "$fpr" ]]; then
-            echo "::error::APT_SIGNING_KEY is $fpr, but environment '$PUBLISH_TO' pins APT_SIGNING_FPR=$expected; refusing to re-sign the shared repositories with another key"; exit 1
-          fi
+          # shellcheck source=scripts/release/lib.sh
+          source scripts/release/lib.sh
+          check_signing_fpr "$EXPECTED_FPR" "$fpr" "$PUBLISH_TO" || { echo "::error::signing key does not match the environment's APT_SIGNING_FPR (see above)"; exit 1; }
           echo "signing_fpr=$fpr" >> "$GITHUB_ENV"
       - name: Publish APT (scripts/release/publish-apt.sh)
         env:
@@ -682,7 +674,7 @@ jobs:
             # signed Release names this Packages file's digest.
             curl -fsSL "$base/deb/dists/$dist/InRelease" -o "inrelease-$dist"
             status="$(gpg --batch --status-fd 1 --verify "inrelease-$dist" 2>/dev/null || true)"
-            grep -q "^\[GNUPG:\] VALIDSIG $signing_fpr " <<<"$status" ||
+            gpg_status_signed_by "$signing_fpr" <<<"$status" ||
               { echo "::error::$base/deb/dists/$dist/InRelease is not signed by $signing_fpr"; exit 1; }
             grep -qF " $(sha256sum "packages-$dist-$arch" | cut -c1-64) " "inrelease-$dist" ||
               { echo "::error::$base/deb/dists/$dist/InRelease does not carry the digest of the served binary-$arch/Packages"; exit 1; }

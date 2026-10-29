@@ -17,12 +17,15 @@
 #  * never deletes anything: RPMs are uploaded first, then the new hashed
 #    metadata files, then repomd.xml LAST, so no index ever names a file that
 #    is not there yet. Old metadata generations are left in repodata/ and
-#    accumulate in S3 (createrepo_c's `--retain-old-md 1` prunes only the
-#    LOCAL copy, and nothing deletes remotely: a `sync --delete` could only
-#    ever remove files ANOTHER product uploaded after our sync, which its
-#    cached repomd.xml may still name). Pruning old generations, if ever
-#    needed, is by age, never by a delete-sync.
-#  * refuses a directory whose metadata is SIGNED (repodata/repomd.xml.asc):
+#    accumulate, in S3 and in each publish's download (with --update
+#    --keep-all-metadata, createrepo_c keeps every older generation despite
+#    `--retain-old-md 1`; and nothing deletes remotely: a `sync --delete`
+#    could only ever remove files ANOTHER product uploaded after our sync,
+#    which its cached repomd.xml may still name). Pruning old generations, if
+#    ever needed, is by age, never by a delete-sync.
+#  * refuses, before uploading anything to ANY directory, when a target
+#    directory's metadata is SIGNED (repodata/repomd.xml.asc or any
+#    repomd.xml.* beside it):
 #    regenerating repomd.xml would leave that detached signature stale and
 #    break `repo_gpgcheck=1` for every product there. None is signed today
 #    (2026-10-29); if one becomes so, this must learn to re-sign repomd.xml
@@ -154,6 +157,24 @@ served_index() {
 # of one NEVRA made within the same second.
 nevra_of() { rpm -qp --queryformat '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{BUILDTIME} %{SIGMD5}' "$1" 2>/dev/null || echo unreadable; }
 
+signed_md_refusal() { # signed_md_refusal <dir> <signature file name>
+  echo "publish-yum.sh: $prefix/$1/repodata/$2 exists: this directory's metadata is signed, and regenerating" >&2
+  echo "  repomd.xml would leave that signature stale (repo_gpgcheck=1 users of every product there would fail)." >&2
+  echo "  Refusing. publish-yum.sh must learn to re-sign repomd.xml before it can publish there." >&2
+}
+if [[ "$dry_run" != 1 ]]; then
+  # Every target directory first, so a refusal leaves the YUM side untouched
+  # (the workflow's APT step runs before this script).
+  for d in $(printf '%s\n' "${!dirs[@]}" | LC_ALL=C sort); do
+    rc=0; listing="$(aws s3 ls "s3://$bucket/$prefix/$d/repodata/" 2>"$work/ls.err")" || rc=$?
+    if [[ "$rc" -ne 0 ]] && ! [[ "$rc" -eq 1 && -z "$listing" && ! -s "$work/ls.err" ]]; then
+      echo "publish-yum.sh: aws s3 ls s3://$bucket/$prefix/$d/repodata/ failed (exit $rc):" >&2; cat "$work/ls.err" >&2; exit 1
+    fi
+    sig="$(awk '$1 != "PRE" && $NF ~ /^repomd\.xml\./ {print $NF; exit}' <<<"$listing")"
+    if [[ -n "$sig" ]]; then signed_md_refusal "$d" "$sig"; echo "  No RPM or metadata was uploaded by this run." >&2; exit 1; fi
+  done
+fi
+
 for d in $(printf '%s\n' "${!dirs[@]}" | LC_ALL=C sort); do
   remote="s3://$bucket/$prefix/$d"
   local_dir="$work/.repo/$d"
@@ -163,11 +184,12 @@ for d in $(printf '%s\n' "${!dirs[@]}" | LC_ALL=C sort); do
   # error is a real error: without the existing files, --update would publish
   # metadata that forgets the other products' RPMs in this directory.
   run aws s3 sync "$remote/" "$local_dir/" --only-show-errors
+  # Again on what the sync brought down (it may have appeared since the
+  # preflight); directories before this one may already be published.
   for sig in "$local_dir"/repodata/repomd.xml.*; do
     [[ -e "$sig" ]] || continue
-    echo "publish-yum.sh: $remote/repodata/$(basename "$sig") exists: this directory's metadata is signed, and regenerating" >&2
-    echo "  repomd.xml would leave that signature stale (repo_gpgcheck=1 users of every product here would fail). Refusing;" >&2
-    echo "  nothing was written. publish-yum.sh must re-sign repomd.xml before it can publish here." >&2
+    signed_md_refusal "$d" "$(basename "$sig")"
+    echo "  Nothing was written to $prefix/$d; directories before it in this run may already be published." >&2
     exit 1
   done
   upload=()
