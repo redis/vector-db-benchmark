@@ -32,6 +32,15 @@ For FLOAT16, report accuracy against the dataset's original ground truth as
 end-to-end quality including input conversion, and compare SQ8 with the FLOAT16
 baseline separately from FLOAT32.
 
+## Selecting the calibration cases by glob
+
+`--engines '<prefix>-cal-hnsw-*'` (with `<prefix>` `dbpedia` or `cohere`) also
+matches the four `<prefix>-cal-hnsw-sq8-*` configurations, which need an
+SQ8-capable server. On a server without HNSW SQ8 they fail at `FT.CREATE` or at
+the `FT.INFO` read-back rather than report a number. To run only the
+uncompressed HNSW baselines, use `--engines '<prefix>-cal-hnsw-float*'`, which
+selects exactly `<prefix>-cal-hnsw-float16` and `<prefix>-cal-hnsw-float32`.
+
 ## Environment overrides
 
 Set `REDIS_HNSW_COMPRESSION` to `SQ8` and `REDIS_HNSW_TRAINING_THRESHOLD` to an

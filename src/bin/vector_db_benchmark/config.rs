@@ -1423,6 +1423,45 @@ mod tests {
         );
     }
 
+    /// `<prefix>-cal-hnsw-*` also selects the HNSW SQ8 calibration cases
+    /// (#325), which need an SQ8-capable server; `<prefix>-cal-hnsw-float*` is
+    /// the documented way to select only the uncompressed baselines. Pinned
+    /// with the harness's own matcher against the shipped files, so a rename
+    /// that breaks the documented glob fails here.
+    #[test]
+    fn calibration_globs_separate_hnsw_baselines_from_sq8() {
+        for prefix in ["dbpedia", "cohere"] {
+            let path = project_root().join(format!(
+                "experiments/configurations/{prefix}-calibration.json"
+            ));
+            let configs: Vec<serde_json::Value> =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let names: Vec<&str> = configs.iter().filter_map(|c| c["name"].as_str()).collect();
+            let select = |pattern: &str| -> Vec<&str> {
+                names
+                    .iter()
+                    .copied()
+                    .filter(|n| matches_pattern(n, pattern))
+                    .collect()
+            };
+            let baselines = select(&format!("{prefix}-cal-hnsw-float*"));
+            assert_eq!(
+                baselines,
+                [
+                    format!("{prefix}-cal-hnsw-float16"),
+                    format!("{prefix}-cal-hnsw-float32")
+                ]
+            );
+            let hnsw = select(&format!("{prefix}-cal-hnsw-*"));
+            assert_eq!(hnsw.len(), 6, "{hnsw:?}");
+            let sq8 = select(&format!("{prefix}-cal-hnsw-sq8-*"));
+            assert_eq!(sq8.len(), 4, "{sq8:?}");
+            assert!(hnsw
+                .iter()
+                .all(|n| baselines.contains(n) || sq8.contains(n)));
+        }
+    }
+
     #[test]
     fn matches_pattern_glob_positions() {
         // prefix* / *suffix / mid*dle

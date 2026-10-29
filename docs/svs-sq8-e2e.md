@@ -133,7 +133,11 @@ for training thresholds 0 and 10240) with the same data type, upload settings an
 search point (k=100, 100 clients, calibration to precision 0.95). The SVS matrix
 and the SQ8 matrix are therefore run with the same command, selecting either
 `--engines '<prefix>-cal-svs-*'` or `--engines '<prefix>-cal-hnsw-sq8-*'`, where
-`<prefix>` is `dbpedia` or `cohere`.
+`<prefix>` is `dbpedia` or `cohere`. Note that
+`--engines '<prefix>-cal-hnsw-*'` also matches the four `-cal-hnsw-sq8-*`
+configurations, which need an SQ8-capable server; use
+`--engines '<prefix>-cal-hnsw-float*'` to run only the two uncompressed HNSW
+baselines.
 
 The dbpedia file is meant for `dbpedia-openai-975K-1536-angular-100neighbors`,
 whose 100 neighbors per query are enough for k=100. The cohere file is meant for
