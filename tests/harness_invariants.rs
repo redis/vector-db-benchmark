@@ -1676,6 +1676,10 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "make release-selftest-packages",
         "--dry-run",
         "VDB_BUILD_GIT_SHA",
+        // Staging rehearsals live under an isolated prefix; the shared,
+        // production-signed deb/ and rpm/ of the staging bucket are refused.
+        "DEFAULT_STAGING_PREFIX",
+        "STAGING_BUCKET",
     ] {
         assert!(
             packages.contains(needed),

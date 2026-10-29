@@ -18,10 +18,16 @@ name: Release packages (deb/rpm)
 # assets are #366's archives + SHA256SUMS).
 #
 # Where it publishes is the GitHub ENVIRONMENT, and nothing else differs:
-#   staging  the staging bucket (redis-test-package-repository, us-east-2)
-#            — workflow_dispatch with release_type=internal (the default)
-#   build    production, packages.redis.io — a published non-prerelease
-#            release, or workflow_dispatch with release_type=public
+#   staging  the staging bucket (redis-test-package-repository, us-east-2),
+#            under an ISOLATED prefix (default vdb-staging/: deb/ and rpm/
+#            below it, exactly the production layout) with a throwaway
+#            signing key, whose public half is published next to the repos
+#            as <prefix>/gpg — workflow_dispatch, release_type=internal.
+#            The shared deb/ and rpm/ of that bucket are signed with the
+#            PRODUCTION key, so a rehearsal there would need that key and
+#            would re-sign indexes other products rely on; it is refused.
+#   build    production, packages.redis.io, no prefix — a published
+#            non-prerelease release, or workflow_dispatch release_type=public
 # Each environment carries the same secret names as memtier-benchmark's `build`
 # environment: APT_S3_BUCKET, APT_S3_REGION, APT_SIGNING_KEY and either
 # APT_S3_IAM_ARN (OIDC role to assume) or APT_S3_ACCESS_KEY_ID +
@@ -54,6 +60,10 @@ on:
         description: Allow replacing a version already in the repository (staging only)
         type: boolean
         default: false
+      repo_prefix:
+        description: Staging only - bucket prefix the deb/ and rpm/ repositories live under (default vdb-staging); the shared root is refused
+        required: false
+        type: string
       deb_dists:
         description: Override codenames, comma-separated (e.g. jammy,noble); empty = all
         required: false
@@ -97,6 +107,7 @@ env:
   DEFAULT_PR_DEB_DISTS: '["jammy"]'
   DEFAULT_PR_RPM_DISTROS: '["el9"]'
   STAGING_BUCKET: redis-test-package-repository
+  DEFAULT_STAGING_PREFIX: vdb-staging
 
 jobs:
   plan:
@@ -107,6 +118,7 @@ jobs:
       sha: ${{ steps.plan.outputs.sha }}
       release: ${{ steps.plan.outputs.release }}
       publish_to: ${{ steps.plan.outputs.publish_to }}
+      repo_prefix: ${{ steps.plan.outputs.repo_prefix }}
       deb_matrix: ${{ steps.matrix.outputs.deb_matrix }}
       rpm_matrix: ${{ steps.matrix.outputs.rpm_matrix }}
       deb_dists: ${{ steps.matrix.outputs.deb_dists }}
@@ -119,9 +131,11 @@ jobs:
           PRERELEASE: ${{ github.event.release.prerelease }}
           INPUT_TAG: ${{ inputs.tag }}
           RELEASE_TYPE: ${{ inputs.release_type }}
+          IN_PREFIX: ${{ inputs.repo_prefix }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          repo_prefix=""
           case "$EVENT" in
             pull_request)
               tag=""; sha="$PR_SHA"; release=false; publish_to=none ;;
@@ -144,17 +158,27 @@ jobs:
                     # as the final release and block the final one for good.
                     [[ "$prerelease" != true ]] || { echo "::error::'$tag' is a pre-release or draft; release_type=public is for final releases (use internal to rehearse)"; exit 1; }
                     publish_to=build ;;
-                  internal) publish_to=staging ;;
+                  internal)
+                    publish_to=staging
+                    repo_prefix="${IN_PREFIX:-$DEFAULT_STAGING_PREFIX}"
+                    repo_prefix="${repo_prefix#/}"; repo_prefix="${repo_prefix%/}"
+                    # Never the bucket root: its deb/ and rpm/ are the shared,
+                    # production-signed repositories of every Redis product.
+                    [[ "$repo_prefix" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
+                      { echo "::error::repo_prefix '$IN_PREFIX' is empty or not a plain path; staging rehearsals go under a prefix such as $DEFAULT_STAGING_PREFIX"; exit 1; }
+                    [[ "$repo_prefix" != deb && "$repo_prefix" != rpm && "$repo_prefix" != deb/* && "$repo_prefix" != rpm/* ]] ||
+                      { echo "::error::repo_prefix '$repo_prefix' points into the shared repositories"; exit 1; } ;;
                   *) publish_to=none ;;
                 esac
+                [[ "$publish_to" != build || -z "$IN_PREFIX" ]] || { echo "::error::repo_prefix is for staging rehearsals; production publishes at the bucket root"; exit 1; }
               fi ;;
             *) echo "::error::unexpected event $EVENT"; exit 1 ;;
           esac
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::could not resolve a commit"; exit 1; }
           {
-            echo "tag=$tag"; echo "sha=$sha"; echo "release=$release"; echo "publish_to=$publish_to"
+            echo "tag=$tag"; echo "sha=$sha"; echo "release=$release"; echo "publish_to=$publish_to"; echo "repo_prefix=$repo_prefix"
           } >> "$GITHUB_OUTPUT"
-          echo "Building ${tag:-PR} from $sha; publish to: $publish_to" >> "$GITHUB_STEP_SUMMARY"
+          echo "Building ${tag:-PR} from $sha; publish to: $publish_to${repo_prefix:+ under $repo_prefix/}" >> "$GITHUB_STEP_SUMMARY"
       - id: matrix
         env:
           EVENT: ${{ github.event_name }}
@@ -389,6 +413,7 @@ jobs:
       DEB_S3_VERSION: "0.11.3"
       TAG: ${{ needs.plan.outputs.tag }}
       PUBLISH_TO: ${{ needs.plan.outputs.publish_to }}
+      REPO_PREFIX: ${{ needs.plan.outputs.repo_prefix }}
       BUCKET: ${{ secrets.APT_S3_BUCKET }}
       REGION: ${{ secrets.APT_S3_REGION }}
     steps:
@@ -404,12 +429,16 @@ jobs:
           # Repository-level secrets are inherited by every environment: make
           # sure 'staging' really points at the staging bucket and 'build' never does.
           case "$PUBLISH_TO" in
-            staging) [[ "$BUCKET" == "$STAGING_BUCKET" ]] || { echo "::error::environment 'staging' has APT_S3_BUCKET set to something other than $STAGING_BUCKET; refusing to rehearse against it"; exit 1; } ;;
+            staging)
+              [[ "$BUCKET" == "$STAGING_BUCKET" ]] || { echo "::error::environment 'staging' has APT_S3_BUCKET set to something other than $STAGING_BUCKET; refusing to rehearse against it"; exit 1; }
+              [[ -n "$REPO_PREFIX" ]] || { echo "::error::a staging rehearsal must publish under a prefix, never the bucket root"; exit 1; } ;;
             build)
               [[ "$BUCKET" != "$STAGING_BUCKET" ]] || { echo "::error::environment 'build' points at the staging bucket"; exit 1; }
-              [[ -n "$SIGNING" ]] || { echo "::error::refusing to publish to production unsigned (no APT_SIGNING_KEY)"; exit 1; } ;;
+              [[ -z "$REPO_PREFIX" ]] || { echo "::error::production publishes at the bucket root, got prefix '$REPO_PREFIX'"; exit 1; } ;;
             *) echo "::error::unexpected publish target '$PUBLISH_TO'"; exit 1 ;;
           esac
+          # Unsigned publishing is refused by the scripts; say so up front.
+          [[ -n "$SIGNING" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_SIGNING_KEY (staging takes a throwaway key, see the workflow header)"; exit 1; }
           echo "use_oidc=$([[ -n "$ROLE" ]] && echo true || echo false)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
@@ -447,13 +476,15 @@ jobs:
           aws-access-key-id: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.APT_S3_REGION }}
-      - name: Import the signing key (if the environment has one)
+      - name: Import the signing key
         env:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
         run: |
-          if [[ -z "$APT_SIGNING_KEY" ]]; then echo "::warning::no APT_SIGNING_KEY in '$PUBLISH_TO': packages and indexes will be unsigned"; exit 0; fi
           mkdir -m 0700 -p ~/.gnupg
           echo "$APT_SIGNING_KEY" | gpg --batch --import
+          n="$(gpg --list-secret-keys --with-colons | grep -c '^sec:' || true)"
+          [[ "$n" -eq 1 ]] || { echo "::error::APT_SIGNING_KEY must hold exactly one secret key (found $n)"; exit 1; }
+          echo "signing_fpr=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')" >> "$GITHUB_ENV"
       - name: Install createrepo_c, rpm, dpkg-dev
         run: |
           sudo apt-get update
@@ -471,7 +502,7 @@ jobs:
           OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}
         run: |
           set -euo pipefail
-          args=(--bucket "$BUCKET" --region "$REGION" --in debs --prefix deb --origin packages.redis.io)
+          args=(--bucket "$BUCKET" --region "$REGION" --in debs --prefix "${REPO_PREFIX:+$REPO_PREFIX/}deb" --origin packages.redis.io)
           [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
           bash scripts/release/publish-apt.sh "${args[@]}"
       - name: Publish YUM (scripts/release/publish-yum.sh)
@@ -479,9 +510,19 @@ jobs:
           OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}
         run: |
           set -euo pipefail
-          args=(--bucket "$BUCKET" --in rpms --prefix rpm)
+          args=(--bucket "$BUCKET" --in rpms --prefix "${REPO_PREFIX:+$REPO_PREFIX/}rpm")
           [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
           bash scripts/release/publish-yum.sh "${args[@]}"
+      - name: Publish the public key next to the rehearsal repositories (staging only)
+        # Production's /gpg is the packaging team's; an isolated staging prefix
+        # gets its own, so the README's install steps work against it verbatim
+        # with the base URL swapped.
+        if: needs.plan.outputs.publish_to == 'staging'
+        run: |
+          set -euo pipefail
+          gpg --export --armor "$signing_fpr" > gpg.asc
+          aws s3 cp gpg.asc "s3://$BUCKET/$REPO_PREFIX/gpg" --acl public-read --content-type text/plain --only-show-errors
+          echo "ok: s3://$BUCKET/$REPO_PREFIX/gpg ($signing_fpr)"
       - name: Verify what the repository now serves
         # Against the S3 origin, not the CDN: CloudFront may still cache the
         # previous index for hours, and the objects are public-read either way.
@@ -491,14 +532,22 @@ jobs:
           set -euo pipefail
           # shellcheck source=scripts/release/lib.sh
           source scripts/release/lib.sh
-          base="https://$BUCKET.s3.$REGION.amazonaws.com"
+          base="https://$BUCKET.s3.$REGION.amazonaws.com${REPO_PREFIX:+/$REPO_PREFIX}"
           while IFS= read -r -d '' f; do
             dist="$(dpkg-deb -f "$f" Version)"; dist="${dist##*~}"
             arch="$(dpkg-deb -f "$f" Architecture)"; version="$(dpkg-deb -f "$f" Version)"
-            index="$(curl -fsSL "$base/deb/dists/$dist/main/binary-$arch/Packages")"
-            grep -qxF "Version: $version" <<<"$index" ||
+            curl -fsSL "$base/deb/dists/$dist/main/binary-$arch/Packages" -o "packages-$dist-$arch"
+            grep -qxF "Version: $version" "packages-$dist-$arch" ||
               { echo "::error::$base/deb/dists/$dist/main/binary-$arch/Packages does not list vector-db-benchmark $version"; exit 1; }
-            echo "ok: $dist/$arch lists $version"
+            # The index we just published is signed by our key, and the
+            # signed Release names this Packages file's digest.
+            curl -fsSL "$base/deb/dists/$dist/InRelease" -o "inrelease-$dist"
+            status="$(gpg --batch --status-fd 1 --verify "inrelease-$dist" 2>/dev/null || true)"
+            grep -q "^\[GNUPG:\] VALIDSIG $signing_fpr " <<<"$status" ||
+              { echo "::error::$base/deb/dists/$dist/InRelease is not signed by $signing_fpr"; exit 1; }
+            grep -qF " $(sha256sum "packages-$dist-$arch" | cut -c1-64) " "inrelease-$dist" ||
+              { echo "::error::$base/deb/dists/$dist/InRelease does not carry the digest of the served binary-$arch/Packages"; exit 1; }
+            echo "ok: $dist/$arch lists $version, InRelease signed by $signing_fpr"
           done < <(find debs -name '*.deb' -print0)
           # The index must LIST the package (not just exist): another product's
           # publish racing ours could have regenerated repodata without it.
