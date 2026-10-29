@@ -59,6 +59,11 @@ fi
 sha="$(git rev-parse HEAD)"
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo/target}"
+# hdf5-sys builds its bundled HDF5 only when HDF5_DIR is UNSET; with it set
+# (the Makefile exports it for normal builds) `release-static` silently links
+# the system libhdf5 instead. check_portable_linkage below would catch that,
+# but the build should not depend on the caller's environment.
+unset HDF5_DIR HDF5_VERSION
 # `--locked`: the archive is built from the tag's Cargo.lock, never a re-resolve.
 cargo build --release --locked --features release-static --target "$target" --bins
 

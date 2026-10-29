@@ -158,7 +158,9 @@ jobs:
       # the rest of CI tests against: read a DEFLATE-compressed HDF5 file
       # through it, and check the embedded build identity, before packaging.
       - name: Test the statically linked build
-        run: cargo test --release --locked --features release-static --target "$TARGET" --lib -- build_info readers::hdf5_reader
+        # HDF5_DIR unset, as in package.sh: with it set, hdf5-sys would link
+        # the system library and this would test the wrong HDF5.
+        run: env -u HDF5_DIR cargo test --release --locked --features release-static --target "$TARGET" --lib -- build_info readers::hdf5_reader
 
       - name: Package (make release-archive)
         run: make release-archive TAG="$TAG" RELEASE_TARGET="$TARGET" ${{ needs.plan.outputs.publish == 'true' && 'RELEASE=1' || '' }}
