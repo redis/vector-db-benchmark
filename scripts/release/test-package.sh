@@ -20,10 +20,12 @@
 #  * the package also installs from a LOCAL repository laid out as
 #    packages.redis.io serves it — deb: dists/<codename>/main/binary-<arch>/
 #    Packages + Release (apt-ftparchive); rpm: createrepo_c under the README's
-#    rpm/el$releasever/$basearch or rpm/amzn2023/$basearch baseurl — and the
-#    installed package is confirmed to have come from that repository. This
-#    catches index/metadata and Depends/Requires bugs a direct file install
-#    does not.
+#    rpm/el$releasever/$basearch or rpm/amzn2023/$basearch baseurl. Where it
+#    came from is checked, not assumed: apt, before installing, must show the
+#    package not installed and the local repository as its ONLY source; dnf,
+#    after installing, must record the local repository's id as the package's
+#    origin (`dnf list installed`: `@vdb-local-test`). This catches
+#    index/metadata and Depends/Requires bugs a direct file install does not.
 set -euo pipefail
 
 pkg="" expect_sha="" expect_version="" repo_id=""
@@ -176,6 +178,14 @@ if [[ "$kind" == deb ]]; then
   policy="$(apt-cache policy vector-db-benchmark)"
   echo "$policy"
   grep -qF "file:$repo_root" <<<"$policy" || fail "apt does not see vector-db-benchmark in the local repository"
+  # Not installed, and every source in the version table is the local
+  # repository: what apt-get installs next can only come from there.
+  grep -qx '  Installed: (none)' <<<"$policy" || fail "vector-db-benchmark is still installed before the repository install"
+  sources="$(awk '/^  Version table:/ {t=1; next} t && $1 ~ /^-?[0-9]+$/ && NF >= 2 {print $2}' <<<"$policy")"
+  [[ -n "$sources" ]] || fail "apt-cache policy lists no source for vector-db-benchmark"
+  while IFS= read -r src; do
+    [[ "$src" == "file:$repo_root"* ]] || fail "apt could install vector-db-benchmark from '$src', not only the local repository"
+  done <<<"$sources"
   apt-get install -y vector-db-benchmark
   dpkg-query -W -f 'installed from repo: ${Package} ${Version}\n' vector-db-benchmark
 else
@@ -204,11 +214,16 @@ gpgcheck=0
 REPO
   if command -v dnf >/dev/null; then
     dnf install -y vector-db-benchmark
-    from="$(dnf repoquery --installed --qf '%{from_repo}' vector-db-benchmark 2>/dev/null | tail -n1)"
-    [[ -z "$from" || "$from" == vdb-local-test || "$from" == "@System" ]] || fail "installed from '$from', not the local repository"
   else
     yum install -y vector-db-benchmark
   fi
+  # The repository dnf/yum recorded: the third column of `list installed`
+  # (`@<repo id>`, the same from dnf 4.7 on el8 to 4.20 on el10 and AL2023).
+  # Tokenised, so a long line wrapped onto two does not move it.
+  listing="$(if command -v dnf >/dev/null; then dnf list installed vector-db-benchmark; else yum list installed vector-db-benchmark; fi)" ||
+    fail "the package manager does not list vector-db-benchmark as installed"
+  from="$(tr -s ' \t\n' '\n' <<<"$listing" | awk 'f && ++c == 2 && !done {print; done = 1} index($0, "vector-db-benchmark.") == 1 {f = 1; c = 0}')"
+  [[ "$from" == "@vdb-local-test" ]] || fail "installed from '${from:-<nothing recorded>}', not the local repository vdb-local-test"$'\n'"$listing"
   rpm -q vector-db-benchmark | sed 's/^/installed from repo: /'
 fi
 run_checks "$crate_version"

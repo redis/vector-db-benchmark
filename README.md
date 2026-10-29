@@ -277,9 +277,16 @@ and `clobber: true`, which replaces the whole set.
 
 ### Linux packages (APT / YUM)
 
-Native packages are built for every release from 0.2.0 on, from the same commit
-as the archives above, one per distribution, and published to the Redis package
-repositories (`.github/workflows/release-packages.yml`). They install `vector-db-benchmark`,
+> **Coming soon.** Publishing to packages.redis.io is not switched on yet: the
+> production side (bucket credentials and the Redis signing key) is still to be
+> set up, so `apt-get install` / `dnf install` below do not find
+> `vector-db-benchmark` today. Use the release archives above until a release
+> announces its packages. The packaging itself is built and install-tested on
+> every change to it (`.github/workflows/release-packages.yml`).
+
+Native packages will be built for every release, from the same commit as the
+archives above, one per distribution, and published to the Redis package
+repositories. They install `vector-db-benchmark`,
 `prepare-msmarco` and `generate-dataset` into `/usr/bin`, the reader
 micro-benchmarks under `/usr/lib/vector-db-benchmark` (`/usr/libexec` on RPM
 systems), and the dataset catalogue plus engine configurations under

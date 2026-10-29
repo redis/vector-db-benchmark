@@ -39,6 +39,24 @@ name: Release packages (deb/rpm)
 # rehearsal to production. Pull requests build, test and dry-run the publish
 # scripts; they never publish.
 #
+# `build` MUST be protected before it gets production secrets: required
+# reviewers, and deployment branches limited to `master` plus release tags
+# (`[0-9]*.[0-9]*.[0-9]*`, `v[0-9]*.[0-9]*.[0-9]*`, the forms check_release_tag
+# accepts). workflow_dispatch runs the workflow file of the DISPATCHED ref, so
+# a branch that edits the bucket / prefix guards below out of its copy would
+# otherwise reach `build`'s secrets with them gone. Until `build` exists the
+# publish job cannot reach production: GitHub creates a missing environment
+# on first use, unprotected but also without the APT_* secrets (none are set
+# at repository level), and the configuration check below then fails before
+# anything is published.
+#
+# Size of a production YUM publish: publish-yum.sh downloads every object in
+# each rpm/<distro>/<arch>/ it touches (createrepo_c --update needs them on
+# disk); a release touches 8. On 2026-10-29 each of those directories indexed
+# 27 RPMs, about 20 MB (from its public primary.xml.gz; objects that no index
+# lists are not visible without bucket listing rights), so roughly 160 MB of
+# downloads per release plus our own uploads.
+#
 # The matrix comes from repository variables when set (as in memtier):
 #   vars.DEB_DISTS / vars.RPM_DISTROS        JSON lists, release + dispatch
 #   vars.PR_DEB_DISTS / vars.PR_RPM_DISTROS  JSON lists for pull requests
@@ -379,9 +397,9 @@ jobs:
         run: |
           # el9 and Amazon Linux 2023 ship curl-minimal, which conflicts with
           # the curl package: only add curl where no curl binary is present.
-          pkgs="findutils tar gzip ca-certificates"
-          command -v curl >/dev/null || pkgs="$pkgs curl"
-          if command -v dnf >/dev/null; then dnf install -y $pkgs; else yum install -y $pkgs; fi
+          pkgs=(findutils tar gzip ca-certificates)
+          command -v curl >/dev/null || pkgs+=(curl)
+          if command -v dnf >/dev/null; then dnf install -y "${pkgs[@]}"; else yum install -y "${pkgs[@]}"; fi
       - uses: actions/download-artifact@v4
         with:
           name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
@@ -512,7 +530,7 @@ jobs:
         env:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
         run: |
-          mkdir -m 0700 -p ~/.gnupg
+          mkdir -p ~/.gnupg && chmod 0700 ~/.gnupg
           echo "$APT_SIGNING_KEY" | gpg --batch --import
           n="$(gpg --list-secret-keys --with-colons | grep -c '^sec:' || true)"
           [[ "$n" -eq 1 ]] || { echo "::error::APT_SIGNING_KEY must hold exactly one secret key (found $n)"; exit 1; }
@@ -564,7 +582,9 @@ jobs:
           set -euo pipefail
           # shellcheck source=scripts/release/lib.sh
           source scripts/release/lib.sh
-          base="https://$BUCKET.s3.$REGION.amazonaws.com${REPO_PREFIX:+/$REPO_PREFIX}"
+          # Path-style (lib.sh): production's bucket name has dots, which the
+          # virtual-hosted form's one-label wildcard certificate does not cover.
+          base="$(s3_origin_url "$BUCKET" "$REGION" "$REPO_PREFIX")"
           while IFS= read -r -d '' f; do
             dist="$(dpkg-deb -f "$f" Version)"; dist="${dist##*~}"
             arch="$(dpkg-deb -f "$f" Architecture)"; version="$(dpkg-deb -f "$f" Version)"

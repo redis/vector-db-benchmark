@@ -13,7 +13,9 @@
 # refusing unmapped tags; signing mandatory, --dry-run without a key or tools;
 # re-run idempotency (same build skipped, different build refused, --overwrite);
 # RPMs uploaded before repodata; another product's RPM in the same directory
-# kept and indexed.
+# kept and indexed; another product's RPM uploaded DURING our publish (caught
+# by the re-list, or failing the post-upload index check with a re-run hint);
+# lib.sh's path-style S3 URL for a dotted bucket.
 #
 # Needs: bash, gpg, dpkg-deb, rpm, rpmbuild, createrepo_c, gzip. No network.
 set -euo pipefail
@@ -47,19 +49,44 @@ export FAKE_S3="$t/s3" FAKE_LOG="$t/fake.log"
 mkdir -p "$t/bin" "$FAKE_S3"
 cat > "$t/bin/aws" <<'FAKE'
 #!/usr/bin/env bash
-# fake aws: s3 sync|cp with s3://bucket/key mapped to $FAKE_S3/bucket/key
+# fake aws: s3 sync|cp|ls with s3://bucket/key mapped to $FAKE_S3/bucket/key.
+# A concurrent publish by another product is simulated with FAKE_RACE_MATCH (a
+# regex on the arguments) + FAKE_RACE_SRC (a file) + FAKE_RACE_DST (s3://...):
+# the first call matching moves the file into the bucket BEFORE it runs.
 set -euo pipefail
 echo "aws $*" >> "$FAKE_LOG"
-[[ "$1" == s3 ]] || { echo "fake aws: only s3" >&2; exit 1; }
-cmd="$2"; src="$3"; dst="$4"; shift 4
-delete=0; for a in "$@"; do [[ "$a" == --delete ]] && delete=1; done
 map() { local p="$1"; [[ "$p" == s3://* ]] && p="$FAKE_S3/${p#s3://}"; echo "$p"; }
+if [[ -n "${FAKE_RACE_MATCH:-}" && "$*" =~ $FAKE_RACE_MATCH && -f "${FAKE_RACE_SRC:-}" ]]; then
+  mkdir -p "$(dirname "$(map "$FAKE_RACE_DST")")"; mv "$FAKE_RACE_SRC" "$(map "$FAKE_RACE_DST")"
+fi
+[[ "$1" == s3 ]] || { echo "fake aws: only s3" >&2; exit 1; }
+if [[ "$2" == ls ]]; then
+  # Direct children, as `aws s3 ls s3://b/dir/` prints them; exit 1, no
+  # output, for a prefix with nothing under it.
+  d="$(map "$3")"; out=""
+  if [[ -d "$d" ]]; then
+    out="$(cd "$d" && for e in *; do
+      [[ -e "$e" ]] || continue
+      if [[ -d "$e" ]]; then printf '                           PRE %s/\n' "$e"
+      else printf '2026-10-29 07:00:00 %10d %s\n' "$(wc -c < "$e")" "$e"; fi; done)"
+  fi
+  [[ -n "$out" ]] || exit 1
+  echo "$out"; exit 0
+fi
+cmd="$2"; src="$3"; dst="$4"; shift 4
+delete=0 exclude=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in --delete) delete=1 ;; --exclude) exclude="$2"; shift ;; esac
+  shift
+done
 src="$(map "$src")"; dst="$(map "$dst")"
 case "$cmd" in
   sync)
     mkdir -p "$dst"
     if [[ -d "$src" ]]; then
       (cd "$src" && find . -type f -print0) | while IFS= read -r -d '' f; do
+        # shellcheck disable=SC2053  # the exclude is a glob, as in aws
+        [[ -n "$exclude" && "${f#./}" == $exclude ]] && continue
         mkdir -p "$dst/$(dirname "$f")"; cp "$src/$f" "$dst/$f"; done
     fi
     if [[ "$delete" == 1 ]]; then
@@ -142,9 +169,13 @@ echo "$payload" > %{buildroot}/usr/share/doc/vector-db-benchmark/fixture
 %files
 /usr/share/doc/vector-db-benchmark/fixture
 SPEC
-  rpmbuild -bb --quiet --target "$a" --define "_topdir $top" --define "_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm" "$top/SPECS/f.spec" >/dev/null 2>&1
+  rpmbuild -bb --quiet --target "$a" --define "_topdir $top" --define "use_source_date_epoch_as_buildtime 1" --define "_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm" "$top/SPECS/f.spec" >/dev/null 2>&1
   mkdir -p "$out"; find "$top/RPMS" -name '*.rpm' -exec cp {} "$out/" \;
 }
+
+# Every fixture RPM gets the SAME build time: two different builds of one
+# NEVRA within one second are what NEVRA + BUILDTIME alone cannot tell apart.
+export SOURCE_DATE_EPOCH=1700000000
 
 echo "publish-apt.sh"
 mkdeb 9.9.9~jammy amd64 "$t/debs/a"; mkdeb 9.9.9~jammy arm64 "$t/debs/b"; mkdeb 9.9.9~noble amd64 "$t/debs/c"
@@ -190,8 +221,9 @@ check "... and indexed next to ours" bash -c "gzip -dc '$primary' | grep -q 'red
 check "published RPMs are signed with the selftest key" bash -c "rpm --dbpath '$t/vdb' --initdb && gpg --export --armor '$fpr' > '$t/pub.asc' && rpm --dbpath '$t/vdb' --import '$t/pub.asc' && rpm --dbpath '$t/vdb' -K '$FAKE_S3/bkt/rpm/el9/x86_64/vector-db-benchmark-9.9.9-1.el9.x86_64.rpm' | grep -q 'OK'"
 : > "$FAKE_LOG"
 expect "re-run with the same build succeeds" 0 bash "$here/publish-yum.sh" --bucket bkt --in "$t/rpms"
-check "... and uploads no RPM again" bash -c "! grep -q 'aws s3 cp' '$FAKE_LOG'"
+check "... and uploads no RPM again" bash -c "! grep -qE '^aws s3 cp [^ ]+ s3://[^ ]+[.]rpm ' '$FAKE_LOG'"
 rm -rf "$t/rpms2"; mkrpm 9.9.9 1.el9 x86_64 "$t/rpms2" different-payload
+check "... which has the published build's NEVRA and build time" test "$(rpm -qp --qf '%{BUILDTIME}' "$t/rpms2/vector-db-benchmark-9.9.9-1.el9.x86_64.rpm")" = "$(rpm -qp --qf '%{BUILDTIME}' "$FAKE_S3/bkt/rpm/el9/x86_64/vector-db-benchmark-9.9.9-1.el9.x86_64.rpm")"
 expect "a DIFFERENT build under a published name is refused" 1 bash "$here/publish-yum.sh" --bucket bkt --in "$t/rpms2"
 expect "... unless --overwrite" 0 bash "$here/publish-yum.sh" --bucket bkt --in "$t/rpms2" --overwrite
 check "overwrite uploaded it" grep -q 'aws s3 cp .*el9/x86_64/vector-db-benchmark-9.9.9-1.el9.x86_64.rpm' "$FAKE_LOG"
@@ -201,6 +233,57 @@ expect "an unmapped dist tag (.fc40) is refused" 1 bash "$here/publish-yum.sh" -
 expect "--dry-run needs neither aws nor a key" 0 env PATH="/usr/bin:/bin" GNUPGHOME="$t/nokeys" bash "$here/publish-yum.sh" --bucket bkt --in "$t/rpms" --dry-run
 check "dry run printed the aws commands" grep -q '^dry-run: aws s3 cp' "$t/last.out"
 expect "no secret key: refused" 1 env GNUPGHOME="$t/nokeys" bash "$here/publish-yum.sh" --bucket bkt --in "$t/rpms" --overwrite
+check "the post-upload index check ran" grep -q '^aws s3 ls s3://bkt/rpm/el9/x86_64/' "$FAKE_LOG"
+
+# Another product publishing into the same directory while we do. No lock
+# covers rpm/, so publish-yum.sh re-lists before uploading repodata/ and checks
+# afterwards that every RPM in the directory is in the index it serves.
+indexed() { # indexed <bucket> <dir> <file name...>: all listed in the served primary.xml.gz
+  local b="$1" d="$2" p xml f; shift 2
+  p="$(sed -n 's/.*href="\(repodata\/[^"]*primary\.xml\.gz\)".*/\1/p' "$FAKE_S3/$b/rpm/$d/repodata/repomd.xml" | head -n1)"
+  xml="$(gzip -dc "$FAKE_S3/$b/rpm/$d/$p")" || return 1
+  for f in "$@"; do [[ "$xml" == *"location href=\"$f\""* ]] || return 1; done
+}
+race_rpm() { # race_rpm <version> -> path of another product's RPM, ready to drop in
+  rm -rf "$t/race"; mkrpm "$1" 1.el9 x86_64 "$t/race" "race-$1"
+  local f; f="$(find "$t/race" -name '*.rpm')"; mv "$f" "$t/race/redis-race-$1.el9.x86_64.rpm"
+  echo "$t/race/redis-race-$1.el9.x86_64.rpm"
+}
+mkrpm 9.9.9 1.el9 x86_64 "$t/rpms-race"
+# (a) it lands while our RPM uploads, after our sync: the re-list catches it.
+src="$(race_rpm 1.1)"
+expect "an RPM uploaded after our sync, before the re-list, is published" 0 \
+  env FAKE_RACE_MATCH='^s3 cp .*/rpm/el9/x86_64/vector-db-benchmark' FAKE_RACE_SRC="$src" \
+      FAKE_RACE_DST="s3://race/rpm/el9/x86_64/redis-race-1.1.el9.x86_64.rpm" \
+      bash "$here/publish-yum.sh" --bucket race --in "$t/rpms-race"
+check "... the re-list said so" grep -q 'since the sync, re-indexing: redis-race-1.1.el9.x86_64.rpm' "$t/last.out"
+check "... and the index lists it next to ours" indexed race el9/x86_64 redis-race-1.1.el9.x86_64.rpm vector-db-benchmark-9.9.9-1.el9.x86_64.rpm
+# (b) it lands during our repodata/ upload, after the re-list: the publish
+# fails, naming it and telling the operator to re-run.
+src="$(race_rpm 1.2)"
+expect "an RPM uploaded during our repodata upload fails the publish" 1 \
+  env FAKE_RACE_MATCH='^s3 sync .*/el9/x86_64/repodata/ s3://' FAKE_RACE_SRC="$src" \
+      FAKE_RACE_DST="s3://race/rpm/el9/x86_64/redis-race-1.2.el9.x86_64.rpm" \
+      bash "$here/publish-yum.sh" --bucket race --in "$t/rpms-race"
+check "... naming the RPM the index lost" grep -q '^  redis-race-1.2.el9.x86_64.rpm$' "$t/last.out"
+check "... and saying to re-run the publish" grep -q 'Re-run this publish' "$t/last.out"
+expect "the re-run it asks for succeeds" 0 bash "$here/publish-yum.sh" --bucket race --in "$t/rpms-race"
+check "... and indexes every RPM in the directory" indexed race el9/x86_64 redis-race-1.1.el9.x86_64.rpm redis-race-1.2.el9.x86_64.rpm vector-db-benchmark-9.9.9-1.el9.x86_64.rpm
+
+echo "lib.sh s3_origin_url"
+# Path-style only: production's bucket (packages.redis.io) has dots, and the
+# virtual-hosted host <bucket>.s3.<region>.amazonaws.com is not covered by
+# S3's one-label wildcard certificate *.s3.<region>.amazonaws.com.
+check "dotted bucket -> path-style URL" test "$(s3_origin_url packages.redis.io us-east-2)" = "https://s3.us-east-2.amazonaws.com/packages.redis.io"
+check "... with a prefix" test "$(s3_origin_url packages.redis.io us-east-2 rehearsal/x/)" = "https://s3.us-east-2.amazonaws.com/packages.redis.io/rehearsal/x"
+check "us-east-1 uses its regional host too" test "$(s3_origin_url vdb-package-staging us-east-1)" = "https://s3.us-east-1.amazonaws.com/vdb-package-staging"
+for pair in packages.redis.io:us-east-2 vdb-package-staging:us-east-1 a.b.c:eu-west-1; do
+  u="$(s3_origin_url "${pair%%:*}" "${pair##*:}")"; host="${u#https://}"; host="${host%%/*}"
+  check "${pair%%:*}: host $host is the regional endpoint, no bucket label in it" \
+    test "$host" = "s3.${pair##*:}.amazonaws.com"
+done
+expect "an empty region is refused" 1 s3_origin_url packages.redis.io ""
+expect "a bucket with a slash is refused" 1 s3_origin_url "packages.redis.io/deb" us-east-2
 
 echo "lib.sh rpm_release_to_distro"
 for pair in 1.el8:el8 1.el9:el9 1.el9_4:el9 1.el10:el10 2.el10_1:el10 1.amzn2023:amzn2023; do

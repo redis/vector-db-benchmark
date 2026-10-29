@@ -237,6 +237,22 @@ require_clean_head() {
   echo "$sha"
 }
 
+# `s3_origin_url <bucket> <region> [prefix]`: the HTTPS base URL a bucket's
+# public objects are read from, PATH-style: https://s3.<region>.amazonaws.com/
+# <bucket>[/<prefix>]. Never the virtual-hosted <bucket>.s3.<region>... form:
+# S3's certificate is *.s3.<region>.amazonaws.com, a wildcard of ONE label, so
+# a dotted bucket (production is `packages.redis.io`) fails TLS verification
+# there. The regional host exists for every region, us-east-1 included
+# (s3.us-east-1.amazonaws.com). INV-A5 refuses the virtual-hosted form in the
+# workflow and these scripts.
+s3_origin_url() {
+  local bucket="$1" region="$2" prefix="${3:-}"
+  [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || { echo "s3_origin_url: invalid bucket name '$bucket'" >&2; return 1; }
+  [[ "$region" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] || { echo "s3_origin_url: invalid region '$region'" >&2; return 1; }
+  prefix="${prefix#/}"; prefix="${prefix%/}"
+  echo "https://s3.$region.amazonaws.com/$bucket${prefix:+/$prefix}"
+}
+
 # `rpm_release_to_distro <Release tag>`: the rpm/<distro>/ directory an RPM
 # belongs in, from its dist tag: `1.el9` and `1.el9_4` -> el9, `1.el10` ->
 # el10, `1.amzn2023` -> amzn2023. Anything else (`.fc40`, `.el8.rocky`,

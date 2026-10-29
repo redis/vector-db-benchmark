@@ -1686,6 +1686,9 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         // production-signed Redis staging bucket is taken only under a prefix.
         "STAGING_BUCKET",
         "SHARED_STAGING_BUCKET",
+        // The verify step reads the bucket over HTTPS through lib.sh's
+        // path-style URL (see the scan below).
+        "s3_origin_url",
     ] {
         assert!(
             packages.contains(needed),
@@ -1704,6 +1707,40 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
                 !code.contains(tool),
                 "release-packages.yml runs `{tool}` inline:\n    {code}\n\
                  Go through scripts/release/build-deb.sh / build-rpm.sh, so a PR builds what a release ships."
+            );
+        }
+    }
+    // No virtual-hosted S3 URL (`<bucket>.s3.<region>.amazonaws.com`, or the
+    // legacy `<bucket>.s3-<region>`): S3's certificate is a one-label wildcard,
+    // so it fails TLS for a dotted bucket, and production is
+    // `packages.redis.io`. The verify step would go red AFTER publishing. Build
+    // the URL with lib.sh's path-style `s3_origin_url` instead.
+    let mut sources = vec![(
+        ".github/workflows/release-packages.yml".to_string(),
+        packages.clone(),
+    )];
+    for script in [
+        "lib.sh",
+        "publish-apt.sh",
+        "publish-yum.sh",
+        "test-package.sh",
+        "build-deb.sh",
+        "build-rpm.sh",
+        "selftest-packages.sh",
+    ] {
+        let name = format!("scripts/release/{script}");
+        sources.push((name.clone(), repo_file(&name)));
+    }
+    for (name, src) in &sources {
+        for line in src.lines() {
+            let code = line.trim();
+            if code.starts_with('#') || !code.contains("amazonaws.com") {
+                continue;
+            }
+            assert!(
+                !code.contains(".s3.") && !code.contains(".s3-"),
+                "{name} builds a virtual-hosted S3 URL:\n    {code}\n\
+                 Use `s3_origin_url` (scripts/release/lib.sh): path-style, so a dotted bucket passes TLS."
             );
         }
     }

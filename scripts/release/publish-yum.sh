@@ -17,10 +17,19 @@
 #  * never deletes an RPM; only the directory's repodata/ is replaced, RPMs
 #    are uploaded before it, and the previous hashed metadata files are kept
 #    one generation (--retain-old-md 1) for clients mid-refresh.
+# There is no cross-product lock on rpm/ (deb-s3's --lock covers only deb/),
+# so the sync -> createrepo_c -> upload sequence is a read-modify-write that
+# another product's publish can race. Two guards, per directory:
+#  * just before uploading repodata/, the directory is listed again; RPMs that
+#    appeared since the sync are downloaded and the index rebuilt once, which
+#    shrinks the window to the repodata upload itself;
+#  * after the upload, every *.rpm the directory holds must be listed in the
+#    primary.xml.gz it now serves. One that is not fails the run, naming it:
+#    re-run the publish, which re-syncs the directory and rebuilds the index.
 # Objects are uploaded public-read (the CDN serves per-object ACLs).
 #
-# Re-runs are idempotent: an RPM already in the repo with the same NEVRA and
-# build time is skipped (a partial publish — one directory uploaded, the next
+# Re-runs are idempotent: an RPM already in the repo with the same NEVRA,
+# build time and header+payload digest is skipped (a partial publish — one directory uploaded, the next
 # failed on a transient S3 error — completes on re-run); a DIFFERENT build
 # under the same file name is refused. --overwrite replaces it anyway
 # (staging rehearsals only).
@@ -100,7 +109,35 @@ for f in "${rpms[@]}"; do
   dirs["$distro/$arch"]=1
 done
 
-nevra_of() { rpm -qp --queryformat '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{BUILDTIME}' "$1" 2>/dev/null || echo unreadable; }
+# `remote_rpms <s3://.../dir>`: the *.rpm object names directly under it, one
+# per line, sorted. `aws s3 ls` exits 1 with no output for an empty prefix;
+# any other failure is an error.
+remote_rpms() {
+  local out rc=0
+  out="$(aws s3 ls "$1/" 2>"$work/ls.err")" || rc=$?
+  if [[ "$rc" -ne 0 ]] && ! [[ "$rc" -eq 1 && -z "$out" && ! -s "$work/ls.err" ]]; then
+    echo "publish-yum.sh: aws s3 ls $1/ failed (exit $rc):" >&2; cat "$work/ls.err" >&2; return 1
+  fi
+  awk '$1 != "PRE" && $NF ~ /\.rpm$/ {print $NF}' <<<"$out" | LC_ALL=C sort
+}
+
+# `served_index <s3://.../dir> <scratch dir>`: the file names the primary.xml.gz
+# named by the directory's repodata/repomd.xml lists, one per line, sorted.
+served_index() {
+  local remote="$1" scratch="$2" primary
+  rm -rf "$scratch"; mkdir -p "$scratch"
+  aws s3 cp "$remote/repodata/repomd.xml" "$scratch/repomd.xml" --only-show-errors
+  primary="$(sed -n 's/.*href="\(repodata\/[^"]*primary\.xml\.gz\)".*/\1/p' "$scratch/repomd.xml" | head -n1)"
+  [[ -n "$primary" ]] || { echo "publish-yum.sh: $remote/repodata/repomd.xml names no primary.xml.gz" >&2; return 1; }
+  aws s3 cp "$remote/$primary" "$scratch/primary.xml.gz" --only-show-errors
+  gzip -dc "$scratch/primary.xml.gz" | sed -n 's/.*<location href="\([^"]*\)".*/\1/p' | sed 's|.*/||' | LC_ALL=C sort -u
+}
+
+# A build's identity: NEVRA, build time (whole seconds) and SIGMD5, the digest
+# of header + payload, which signing leaves alone (the published copy is
+# signed, ours is signed again on a re-run), but which tells apart two builds
+# of one NEVRA made within the same second.
+nevra_of() { rpm -qp --queryformat '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH} %{BUILDTIME} %{SIGMD5}' "$1" 2>/dev/null || echo unreadable; }
 
 for d in $(printf '%s\n' "${!dirs[@]}" | LC_ALL=C sort); do
   remote="s3://$bucket/$prefix/$d"
@@ -133,7 +170,40 @@ for d in $(printf '%s\n' "${!dirs[@]}" | LC_ALL=C sort); do
   for b in ${upload[@]+"${upload[@]}"}; do
     run aws s3 cp "$local_dir/$b" "$remote/$b" --acl public-read --only-show-errors
   done
+  if [[ "$dry_run" != 1 ]]; then
+    # Narrow the race: RPMs another product uploaded since the sync above get
+    # indexed too, instead of being dropped by our repodata/ upload.
+    now="$(remote_rpms "$remote")" || exit 1
+    late=()
+    while IFS= read -r b; do
+      if [[ -n "$b" && ! -f "$local_dir/$b" ]]; then late+=("$b"); fi
+    done <<<"$now"
+    if [[ ${#late[@]} -gt 0 ]]; then
+      echo "appeared in $prefix/$d since the sync, re-indexing: ${late[*]}"
+      aws s3 sync "$remote/" "$local_dir/" --exclude 'repodata/*' --only-show-errors
+      for b in "${late[@]}"; do
+        [[ -f "$local_dir/$b" ]] || { echo "publish-yum.sh: $remote/$b listed but not downloaded" >&2; exit 1; }
+      done
+      createrepo_c --update --keep-all-metadata --retain-old-md 1 "$local_dir" >/dev/null
+    fi
+  fi
   run aws s3 sync "$local_dir/repodata/" "$remote/repodata/" --delete --acl public-read --only-show-errors
+  if [[ "$dry_run" != 1 ]]; then
+    # Every RPM in the directory, ours or another product's, must be in the
+    # index it now serves: a publish that raced ours between the re-list and
+    # the upload would otherwise lose its package from the index silently.
+    in_dir="$(remote_rpms "$remote")" || exit 1
+    listed="$(served_index "$remote" "$work/check")" || exit 1
+    missing="$(LC_ALL=C comm -23 <(printf '%s\n' "$in_dir") <(printf '%s\n' "$listed") | sed '/^$/d')"
+    if [[ -n "$missing" ]]; then
+      echo "publish-yum.sh: $remote/repodata/ does not index these RPMs in the directory:" >&2
+      while IFS= read -r m; do echo "  $m" >&2; done <<<"$missing"
+      echo "  Another publish most likely wrote to $prefix/$d at the same time. Re-run this publish (Re-run failed jobs):" >&2
+      echo "  it re-syncs the directory and rebuilds the index, which then lists them. Ours already uploaded are skipped." >&2
+      exit 1
+    fi
+    echo "index check: $(grep -c . <<<"$in_dir") RPMs in $prefix/$d, all listed in the served primary.xml.gz"
+  fi
   echo "published: $(ls "$work/$d") -> $remote/ (uploaded: ${upload[*]:-none, all already there})"
 done
 echo "publish-yum.sh: done (s3://$bucket/$prefix, dirs: $(printf '%s ' "${!dirs[@]}"))"
