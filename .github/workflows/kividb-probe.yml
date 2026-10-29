@@ -1,0 +1,19 @@
+name: KiviDB 1.1.2 TAG probe (throwaway, #375)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/kividb-probe.yml'
+      - '.github/kividb_probe.py'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Start KiviDB 1.1.2
+      run: docker run -d --name kv -p 6386:6380 kividb/kividb:v1.1.2-full
+    - name: Probe
+      run: |
+        pip install --quiet 'redis==5.2.1'
+        python3 .github/kividb_probe.py
