@@ -944,11 +944,8 @@ pub(crate) mod kividb_filter {
                      (expected all-integer or all-string)"
                 ));
             };
-            // Empty strings are invalid TAG syntax and can never match an exact
-            // keyword, so they contribute nothing to the union (same as redis.rs).
-            if s.is_empty() {
-                continue;
-            }
+            // An empty string is refused by `tag_literal` (whether KiviDB
+            // indexes an empty TAG is unmeasured), not skipped.
             let literal = tag_literal(field, s, tags_supported)?;
             clauses.push(Node::Leaf(format!("@{field}:{{{literal}}}")));
         }
@@ -1099,9 +1096,6 @@ pub(crate) mod kividb_filter {
 
     /// A TAG clause for a literal string value.
     fn tag_clause(field: &str, value: &str, tags_supported: bool) -> Result<Node, String> {
-        if value.is_empty() {
-            return Ok(never_match_tag(field));
-        }
         let literal = tag_literal(field, value, tags_supported)?;
         Ok(Node::Leaf(format!("@{field}:{{{literal}}}")))
     }
@@ -1273,6 +1267,21 @@ pub(crate) mod kividb_filter {
                 q(json!({"and": [{"n": {"match": {"any": [1, 2]}}}]})),
                 "@n:[1 1] | @n:[2 2]"
             );
+        }
+
+        /// An empty TAG value, exact or one `match_any` arm, is a hard error,
+        /// not a never-match: whether KiviDB indexes a stored empty TAG is
+        /// unmeasured, so a never-match could silently under-match.
+        #[test]
+        fn empty_tag_value_is_a_hard_error() {
+            for v in [
+                exact("c", ""),
+                json!({"and": [{"c": {"match": {"any": ["ok", ""]}}}]}),
+                json!({"and": [{"c": {"match": {"any": [""]}}}]}),
+            ] {
+                let e = err(v.clone());
+                assert!(e.contains("empty"), "{v}: {e}");
+            }
         }
 
         #[test]
@@ -1593,7 +1602,6 @@ pub(crate) mod kividb_filter {
             // code path may emit one — including the never-match degenerates.
             for cond in [
                 json!({"and": [{"c": {"match": {"any": []}}}]}),
-                json!({"and": [{"c": {"match": {"value": ""}}}]}),
                 json!({"and": [{"body": {"match": {"text": "  "}}}]}),
             ] {
                 let out = q(cond);
@@ -1647,9 +1655,10 @@ fn upload_batch_internal(
                         };
                         // Stored verbatim, with NO corpus-side counterpart to
                         // `kividb_caps::tag_value_problem`. That asymmetry is
-                        // deliberate and measured — see its doc: the failures
-                        // it refuses live in the QUERY parser, and a stored
-                        // occurrence is inert.
+                        // deliberate — see its doc: a stored trailing `*` or
+                        // leading `$` was measured inert. A stored `;` is NOT:
+                        // `SEPARATOR ;` splits it, as on Redis (README row 10,
+                        // #377). Stored edge whitespace is trimmed (README).
                         hset_cmd.arg(k.as_str()).arg(stored);
                     }
                     MetadataValue::Int(n) => {
@@ -1698,8 +1707,9 @@ fn upload_batch_internal(
 ///   bare: a bare TAG splits on RediSearch's default `,`, so a stored
 ///   `Smith, John` would index as `Smith` + `John` and `@f:{Smith}` would
 ///   match it (measured on 1.1.2, see `kividb_caps`).
-/// * Otherwise (an older server, or one whose version is unknown): no
-///   declaration is known to be right, so `Err`.
+/// * Otherwise (an older server, or one whose version is unknown): `Err`.
+///   Older releases are not CI-tested (1.0.5–1.0.6 were measured equivalent,
+///   1.0.2–1.0.4 reject `SEPARATOR`), so nothing is declared on them.
 fn tag_declaration(
     field_name: &str,
     field_type: &str,

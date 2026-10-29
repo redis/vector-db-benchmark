@@ -16,11 +16,10 @@ pub type VersionCore = (u32, u32, u32);
 /// A parsed `kividb_version`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KividbVersion {
+    /// The `major.minor.patch` core. A SemVer pre-release suffix (`1.1.2-rc1`)
+    /// is validated by the parser but not kept: it does not order versions
+    /// here (see [`TAG_MIN_VERSION`]).
     pub core: VersionCore,
-    /// Whether the reported value carried a SemVer pre-release suffix
-    /// (`1.1.2-rc1`). Recorded, but NOT used to order versions: see
-    /// [`TAG_MIN_VERSION`].
-    pub prerelease: bool,
 }
 
 /// The oldest KiviDB release this tool declares TAG fields on: 1.1.2, the
@@ -32,7 +31,7 @@ pub struct KividbVersion {
 /// `SEPARATOR`) splits on RediSearch's default `,`. The engine therefore
 /// declares every TAG `SEPARATOR ;`, exactly as redis.rs does. The query side
 /// honours RediSearch backslash escapes, so the filter emitter escapes every
-/// TAG value (`kividb_filter::escape_tag_value` in the engine).
+/// TAG value ([`escape_tag_value`] below).
 ///
 /// An older server, or one whose version cannot be read, is not supported for
 /// TAG fields: every dataset that declares one is refused (vector-only and
@@ -147,8 +146,10 @@ pub fn ft_info_tag_separators(
 /// hand) reports `SEPARATOR ,`, splits every stored `Smith, John`, and would
 /// publish a recall for filters that matched the wrong documents.
 /// `tags_supported` is [`KividbServer::tags_supported`]: on a server where it
-/// is false no TAG declaration is known to be right, so a TAG-bearing index
-/// cannot be verified at all.
+/// is false the tool declares no TAG (older releases are not CI-tested;
+/// 1.0.5–1.0.6 were measured equivalent), so a TAG-bearing index is refused.
+/// The engine's own call order never reaches that arm (`validate_dataset_support`
+/// refuses first); it is kept for any other caller.
 ///
 /// `reported` is [`KividbServer::describe`], so every refusal names the version
 /// the server reported.
@@ -292,6 +293,13 @@ pub fn escape_tag_value(value: &str) -> String {
 ///   does the index: `@t:{\ sp}` matched the stored `sp`, ` sp` and `sp `.
 ///   Rust's `char::is_whitespace` is used, which covers the tab, U+3000
 ///   and U+2028 that were measured to be trimmed as well (on 1.0.5).
+/// * **Empty.** Whether an empty stored TAG is indexed is unmeasured, so an
+///   empty query value is refused rather than sent as a never-match.
+/// * **Interior whitespace other than a space, or a control character** (tab,
+///   newline, CR, VT, FF, U+00A0, U+3000, …). [`escape_tag_value`] does not
+///   escape them and their handling inside a value was never measured on
+///   1.1.2 (the 1.1.2 probe covered space only), so they are refused rather
+///   than guessed at.
 /// * **`;`**, the SEPARATOR every TAG field is declared with, so the stored
 ///   value was split into tokens and no query matches it whole
 ///   (`@t:{zz\;zz}` → 0).
@@ -305,19 +313,36 @@ pub fn escape_tag_value(value: &str) -> String {
 ///   refused here instead. A `$` elsewhere (`zz\$`, `zz\$zz`) is exact.
 ///
 /// No shipped query value hits any of these. Only the QUERY side is
-/// checked: a stored value with one of these shapes does not perturb any
-/// other query (on 1.1.2 the stored `zz*`, `$zz` and `zz*zz` leave
-/// `@t:{zz}` at exactly its own documents). Two corpus-side effects that do
+/// checked: a stored trailing `*` or leading `$` does not perturb any other
+/// query (on 1.1.2 the stored `zz*`, `$zz` and `zz*zz` leave `@t:{zz}` at
+/// exactly its own documents). A stored `;` is NOT inert: `SEPARATOR ;`
+/// splits it, so `@t:{a}` also matches a stored `a;b`, as on Redis (README
+/// row 10, #377). Two corpus-side effects that do
 /// reach other queries are in the README, because they are shared with
 /// redis.rs's `vector` layout: TAG matching is case-insensitive, and stored
 /// whitespace is trimmed (so `@t:{sp}` also matches a stored ` sp `).
 pub fn tag_value_problem(value: &str) -> Option<String> {
-    if value.starts_with(char::is_whitespace) || value.ends_with(char::is_whitespace) {
+    if value.is_empty() {
+        Some(
+            "it is empty; whether KiviDB indexes an empty TAG value is unmeasured, so a \
+             never-match could silently under-match"
+                .to_string(),
+        )
+    } else if value.starts_with(char::is_whitespace) || value.ends_with(char::is_whitespace) {
         Some(
             "it has leading or trailing whitespace, which KiviDB trims from a TAG query \
              value (`@t:{\\ sp}` is looked up as `sp`)"
                 .to_string(),
         )
+    } else if let Some(c) = value
+        .chars()
+        .find(|&c| (c.is_whitespace() && c != ' ') || c.is_control())
+    {
+        Some(format!(
+            "it contains {c:?}, whitespace other than a space or a control character, \
+             which is not escaped and whose handling inside a TAG value was never measured \
+             on KiviDB 1.1.2 (the query lexer may split or trim on it)"
+        ))
     } else if value.contains(';') {
         Some(
             "it contains `;`, the SEPARATOR every TAG field is declared with, so the \
@@ -364,10 +389,10 @@ fn parse_version(value: &str) -> Option<KividbVersion> {
         Some(_) => return None,
         None => value,
     };
-    let (core, prerelease) = match value.split_once('-') {
-        Some((core, pre)) if valid_ident(pre) => (core, true),
+    let core = match value.split_once('-') {
+        Some((core, pre)) if valid_ident(pre) => core,
         Some(_) => return None,
-        None => (value, false),
+        None => value,
     };
     // `u32::from_str` would accept a leading `+`, but none survives here: the
     // build-metadata split above already cut the value at the first `+`.
@@ -381,13 +406,7 @@ fn parse_version(value: &str) -> Option<KividbVersion> {
     }
     Some(KividbVersion {
         core: (major, minor, patch),
-        prerelease,
     })
-}
-
-/// Extract and parse `kividb_version` from an `INFO` (or `INFO server`) reply.
-pub fn parse_kividb_version(info: &str) -> Option<KividbVersion> {
-    KividbServer::from_info(info).version
 }
 
 #[cfg(test)]
@@ -402,6 +421,10 @@ mod tests {
         format!("# Server\r\nkividb_version:{v}\r\n")
     }
 
+    fn parse_kividb_version(info: &str) -> Option<KividbVersion> {
+        KividbServer::from_info(info).version
+    }
+
     fn supported(v: &str) -> bool {
         KividbServer::from_info(&info(v)).tags_supported()
     }
@@ -410,10 +433,7 @@ mod tests {
     fn parses_the_field_out_of_a_real_info_reply() {
         assert_eq!(
             parse_kividb_version(INFO_112),
-            Some(KividbVersion {
-                core: (1, 1, 2),
-                prerelease: false
-            })
+            Some(KividbVersion { core: (1, 1, 2) })
         );
         assert!(KividbServer::from_info(INFO_112).tags_supported());
     }
@@ -451,10 +471,10 @@ mod tests {
     fn parses_prerelease_and_build_metadata() {
         let v = parse_kividb_version(&info("1.2.0-rc2")).unwrap();
         assert_eq!(v.core, (1, 2, 0));
-        assert!(v.prerelease);
         let v = parse_kividb_version(&info("1.1.2+build.7")).unwrap();
         assert_eq!(v.core, (1, 1, 2));
-        assert!(!v.prerelease);
+        let v = parse_kividb_version(&info("1.1.2-rc.1+b.7")).unwrap();
+        assert_eq!(v.core, (1, 1, 2));
     }
 
     /// Both sides of the gate at `TAG_MIN_VERSION`, plus the numeric-ordering
@@ -710,11 +730,42 @@ mod tests {
             let p = tag_value_problem(v).unwrap_or_else(|| panic!("{v:?}"));
             assert!(p.contains("whitespace"), "{v:?}: {p}");
         }
-        for v in ["two  spaces", "tab\there", "sp"] {
+        for v in ["two  spaces", "a b", "sp"] {
             assert_eq!(tag_value_problem(v), None, "{v:?}");
         }
         let e = tag_literal("c", " sp", true).unwrap_err();
         assert!(e.contains("whitespace"), "{e}");
+    }
+
+    /// Interior whitespace other than a space, and control characters, are
+    /// refused: never measured on 1.1.2 and not escaped.
+    #[test]
+    fn interior_non_space_whitespace_and_control_characters_are_refused() {
+        for v in [
+            "tab\there",
+            "nl\nx",
+            "cr\rx",
+            "vt\u{0B}x",
+            "ff\u{0C}x",
+            "nbsp\u{a0}x",
+            "ideo\u{3000}x",
+            "ls\u{2028}x",
+            "ctl\u{1}x",
+            "del\u{7f}x",
+        ] {
+            let p = tag_value_problem(v).unwrap_or_else(|| panic!("{v:?} must be refused"));
+            assert!(p.contains("never measured"), "{v:?}: {p}");
+        }
+        for v in ["a b", "Smith, John", "Jörg Müller", "（w）"] {
+            assert_eq!(tag_value_problem(v), None, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn empty_value_is_refused() {
+        let p = tag_value_problem("").expect("empty");
+        assert!(p.contains("empty"), "{p}");
+        assert!(tag_literal("c", "", true).unwrap_err().contains("empty"));
     }
 
     #[test]
@@ -732,8 +783,10 @@ mod tests {
                 "{c:?}"
             );
         }
-        // Alphanumerics, other ASCII whitespace inside a value, and every
-        // non-ASCII character (measured exact unescaped) pass through.
+        // Alphanumerics and non-ASCII characters pass through (non-ASCII
+        // punctuation was measured exact unescaped on 1.1.2). Interior
+        // whitespace other than a space also passes through HERE, unmeasured:
+        // `tag_value_problem` refuses it before it is ever escaped.
         for v in [
             "abcXYZ019",
             "tab\there",
