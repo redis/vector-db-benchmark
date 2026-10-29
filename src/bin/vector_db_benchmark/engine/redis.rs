@@ -607,7 +607,10 @@ impl RedisEngine {
                 .arg(&self.config.index_name)
                 .query(conn)
                 .map_err(|e| format!("Failed to verify vector compression: {e}"))?;
-            self.verify_vector_compression(&info)?;
+            self.verify_vector_compression(
+                &info,
+                vector_db_benchmark::redis_hnsw_sq8::ReadBack::Created,
+            )?;
         }
 
         Ok(())
@@ -1164,15 +1167,18 @@ impl RedisEngine {
     /// index) must be what this run resolved, in both directions: HNSW SQ8 or
     /// none, SVS compression or `NO_COMPRESSION`. Called after FT.CREATE and,
     /// via `check_index_layout`, before every search, reused index or not.
-    fn verify_vector_compression(&self, info: &redis::Value) -> Result<(), String> {
-        if is_svs(&self.config.algorithm) {
-            vector_db_benchmark::redis_hnsw_sq8::verify_svs_index_compression(
-                self.config.svs_compression.as_deref(),
-                info,
-            )
-        } else {
-            self.config.hnsw_sq8.verify_index_compression(info)
-        }
+    fn verify_vector_compression(
+        &self,
+        info: &redis::Value,
+        when: vector_db_benchmark::redis_hnsw_sq8::ReadBack,
+    ) -> Result<(), String> {
+        vector_db_benchmark::redis_hnsw_sq8::verify_vector_field_compression(
+            is_svs(&self.config.algorithm),
+            &self.config.hnsw_sq8,
+            self.config.svs_compression.as_deref(),
+            info,
+            when,
+        )
     }
 
     fn create_progress_bar(&self, total: usize) -> ProgressBar {
@@ -3468,8 +3474,11 @@ impl Engine for RedisEngine {
                 .map_err(|e| format!("index layout check ({layout}): {e}"))?;
         }
         if check_compression {
-            self.verify_vector_compression(&info)
-                .map_err(|e| format!("index compression check: {e}"))?;
+            self.verify_vector_compression(
+                &info,
+                vector_db_benchmark::redis_hnsw_sq8::ReadBack::Reused,
+            )
+            .map_err(|e| format!("index compression check: {e}"))?;
         }
         Ok(())
     }

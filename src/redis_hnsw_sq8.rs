@@ -328,6 +328,42 @@ impl Sq8Options {
     }
 }
 
+/// When a vector-compression read-back runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBack {
+    /// Right after this run's `FT.CREATE`, which declared a `vector` field:
+    /// an `FT.INFO` without it cannot confirm anything and is an error.
+    Created,
+    /// Before searching an index that may have been built elsewhere
+    /// (`--skip-upload`, `REDIS_INDEX_NAME_EXACT=1`). An index without a
+    /// `vector` field (a fulltext-only one) passes, because there is no vector
+    /// compression to mislabel, and a vector search on it fails at `FT.SEARCH`.
+    Reused,
+}
+
+/// The one compression read-back the Redis engine calls, after `FT.CREATE`
+/// ([`ReadBack::Created`]) and before every search ([`ReadBack::Reused`]):
+/// HNSW via [`Sq8Options::verify_index_compression`], SVS via
+/// [`verify_svs_index_compression`], both direction-aware.
+pub fn verify_vector_field_compression(
+    is_svs: bool,
+    hnsw: &Sq8Options,
+    svs_compression: Option<&str>,
+    info: &RedisValue,
+    when: ReadBack,
+) -> Result<(), String> {
+    if when == ReadBack::Created {
+        vector_attribute(info).map_err(|e| {
+            format!("{e} right after FT.CREATE declared one; the compression cannot be confirmed")
+        })?;
+    }
+    if is_svs {
+        verify_svs_index_compression(svs_compression, info)
+    } else {
+        hnsw.verify_index_compression(info)
+    }
+}
+
 /// What `FT.INFO` reports as an SVS field's `compression` when it has none
 /// (RediSearch `VECSIM_NO_COMPRESSION`, from `VecSimSvsCompression_ToString`).
 pub const SVS_NO_COMPRESSION: &str = "NO_COMPRESSION";
@@ -1013,10 +1049,58 @@ mod tests {
         let no_attributes = RedisValue::Array(vec![s("index_name"), s("idx")]);
         assert!(plain.verify_index_compression(&no_attributes).is_err());
         assert!(verify_svs_index_compression(None, &no_attributes).is_err());
-        assert!(
-            sq8.verify_ft_info(&text_only).is_err(),
-            "create-time stays strict"
-        );
+        // What configure() and check_index_layout() call: strict right after
+        // FT.CREATE, lenient on reuse, for HNSW and SVS, compressed or not.
+        for (is_svs, hnsw, svs) in [
+            (false, &sq8, None),
+            (false, &plain, None),
+            (true, &plain, Some("LVQ8")),
+            (true, &plain, None),
+        ] {
+            let e =
+                verify_vector_field_compression(is_svs, hnsw, svs, &text_only, ReadBack::Created)
+                    .unwrap_err();
+            assert!(e.contains("no vector attribute"), "{e}");
+            assert!(verify_vector_field_compression(
+                is_svs,
+                hnsw,
+                svs,
+                &text_only,
+                ReadBack::Reused
+            )
+            .is_ok());
+        }
+        // With a vector field both modes are the direction-aware check.
+        for when in [ReadBack::Created, ReadBack::Reused] {
+            for shape in [hnsw_info_resp2, hnsw_info_resp3] {
+                assert!(
+                    verify_vector_field_compression(false, &sq8, None, &shape(None, 0), when)
+                        .is_err()
+                );
+                assert!(verify_vector_field_compression(
+                    false,
+                    &plain,
+                    None,
+                    &shape(Some("SQ8"), 10_240),
+                    when
+                )
+                .is_err());
+                assert!(verify_vector_field_compression(
+                    false,
+                    &plain,
+                    None,
+                    &shape(None, 0),
+                    when
+                )
+                .is_ok());
+            }
+            for info in svs_info(Some("GlobalSQ8")) {
+                assert!(
+                    verify_vector_field_compression(true, &plain, Some("LVQ8"), &info, when)
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]
