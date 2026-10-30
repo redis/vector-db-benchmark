@@ -29,15 +29,24 @@
 #     (ObjectOwnership BucketOwnerPreferred: the publish scripts upload with
 #     --acl public-read; bucket ACL private; the public-access block allows
 #     object ACLs but no public policy); and a bucket policy of Deny statements:
-#       * object writes and deletes by anyone but the publisher role and the
-#         admin role (the account is shared: instance roles and CI users hold
-#         s3:* on *);
-#       * bucket policy/ACL/ownership/public-access-block/versioning/lifecycle
-#         changes and bucket deletion by anyone but the admin role;
+#       * any object write (s3:Put*, s3:Delete*, s3:Replicate*, restore,
+#         retention bypass) by anyone but the publisher role and the admin
+#         role (the account is shared: instance roles and CI users hold s3:*
+#         on *);
+#       * any bucket setting (s3:PutBucket*, s3:DeleteBucket*,
+#         s3:Put*Configuration: policy, ACL, ownership, public-access block,
+#         versioning, lifecycle, replication, encryption, object lock, CORS,
+#         website, tagging, request payment, ...) by anyone but the admin role;
 #       * any ACL outside deb/, rpm/ and gpg; public-read-write/authenticated
 #         canned ACLs anywhere; public bucket ACLs; any x-amz-grant-* header.
 #     Lock-out safety: --apply refuses unless the caller IS the admin role
 #     (--admin-arn), and the account root can always delete a bucket policy.
+#     RESIDUAL RISK: the lock names principals, so it holds only against
+#     principals that cannot write IAM. One that can (e.g. the CI user
+#     ci-benchmarks-clients, IAMFullAccess via its PowerAccess group) can edit
+#     the publisher role's trust policy, assume it, and write as the
+#     publisher. Closing that needs IAM changes outside this script (a
+#     permissions boundary or an SCP denying iam:* on role/vdb-packages-*).
 #  3. the GitHub OIDC provider (if the account lacks it) and the role, trusting
 #     ONLY the subject GitHub issues for `build` (the repository's immutable
 #     `repo:<owner>@<id>/<name>@<id>` form, read from its OIDC customization;
@@ -298,7 +307,7 @@ cat > "$work/bucket-policy.json" <<JSON
       "Sid": "DenyObjectWritesExceptPublisherAndAdmin",
       "Effect": "Deny",
       "Principal": "*",
-      "Action": ["s3:PutObject", "s3:PutObjectAcl", "s3:PutObjectVersionAcl", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Action": ["s3:Put*", "s3:Delete*", "s3:Replicate*", "s3:RestoreObject", "s3:BypassGovernanceRetention"],
       "Resource": "$arn/*",
       "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["$role_arn", "$admin_arn"]}}
     },
@@ -306,8 +315,7 @@ cat > "$work/bucket-policy.json" <<JSON
       "Sid": "DenyBucketChangesExceptAdmin",
       "Effect": "Deny",
       "Principal": "*",
-      "Action": ["s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutBucketAcl", "s3:PutBucketOwnershipControls",
-                 "s3:PutBucketPublicAccessBlock", "s3:PutBucketVersioning", "s3:PutLifecycleConfiguration", "s3:DeleteBucket"],
+      "Action": ["s3:PutBucket*", "s3:DeleteBucket*", "s3:Put*Configuration"],
       "Resource": "$arn",
       "Condition": {"ArnNotLike": {"aws:PrincipalArn": "$admin_arn"}}
     },
@@ -471,7 +479,19 @@ cat <<EOF
 #    never into the checkout:
 scripts/release/setup-signing-key.sh
 EOF
-if [[ "$master_ready" == 1 ]]; then
+# Only from a run that leaves nothing pending: an --apply that just converged
+# everything, or a dry run that found nothing to change.
+converged=0
+if [[ "$changes" -eq 0 || "$apply" == 1 ]]; then converged=1; fi
+if [[ "$master_ready" == 1 && "$converged" == 0 ]]; then
+  cat <<EOF
+
+# 2-3. NOT YET: this run found $changes pending change(s). Run this script
+#      with --apply first; it prints the production steps once the live state
+#      matches (right after that --apply, or on a dry run that finds nothing
+#      to change).
+EOF
+elif [[ "$master_ready" == 1 ]]; then
   cat <<EOF
 
 # 2. Switch production on (a REPOSITORY variable: the plan job reads it before
@@ -492,7 +512,8 @@ else
 #      could not read it). Merge #386 first. Setting PACKAGES_PRODUCTION=true or
 #      dispatching release_type=public before that runs master's OLD workflow,
 #      which publishes with packages.redis.io's Origin and no <base>/gpg.
-#      Re-run this script after the merge to print those two commands.
+#      After the merge, re-run this script with --apply; it then prints
+#      those two commands.
 EOF
 fi
 if [[ "$apply" != 1 ]]; then echo; echo "(dry run: nothing above was changed; re-run with --apply)"; fi

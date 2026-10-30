@@ -181,22 +181,28 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
      the workflow, and the older one accepts `vdb-packages` but publishes with
      packages.redis.io as Origin and no `<base>/gpg` (and the next publish
      after the merge would then change the Origin under every early user).
-     `setup-production-repo.sh` checks master and prints steps 3-4 only once
-     master has `check_publish_target`.
+     `setup-production-repo.sh` prints steps 3-4 only once master has
+     `check_publish_target` AND the run leaves nothing pending (right after an
+     `--apply`, or a dry run that finds nothing to change); otherwise it says
+     to run `--apply` first.
   1. **AWS + GitHub:** `AWS_PROFILE=bench scripts/release/setup-production-repo.sh`
      prints what differs from the live state (dry run); `--apply` converges it.
      Done once on 2026-10-30 from the PR at 2969ca4 (bucket, role, `build`
      environment with fcostaoliveira as required reviewer and the
-     master/tag deployment policies, tag ruleset 26191613); re-run `--apply`
-     after the merge for the hardened bucket policy, the lifecycle rule and the
-     immutable-subject-only trust. It protects `build` BEFORE touching the
+     master/tag deployment policies, tag ruleset 26191613). After the merge, re-run
+     it with `--apply` for the hardened bucket policy, the lifecycle rule and
+     the immutable-subject-only trust. It protects `build` BEFORE touching the
      role (GitHub creates an unprotected environment for any job naming one),
      never re-posts existing branch policies or the ruleset, and refuses
      `--apply` unless the caller is the SSO AdministratorAccess role, the one
      principal (with the publisher role, for objects) the bucket policy lets
      write: account 726902207197 is shared, and instance roles and CI users
      there hold `s3:*` on `*`. The account root can always delete the bucket
-     policy if it ever has to.
+     policy if it ever has to. Residual risk: the policy names principals, so
+     a principal that can write IAM (the CI user `ci-benchmarks-clients` has
+     IAMFullAccess via its `PowerAccess` group) can re-point the publisher
+     role's trust at itself and write as the publisher. Closing that needs a
+     permissions boundary or SCP on `role/vdb-packages-*`, outside this script.
   2. **Signing key + secrets:** `scripts/release/setup-signing-key.sh`
      (needs gpg): RSA 4096, no passphrase (the job signs non-interactively),
      5-year expiry; the secret key, public key and revocation certificate go

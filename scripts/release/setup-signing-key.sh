@@ -17,7 +17,8 @@
 #  * Sets the `build` secrets APT_S3_BUCKET, APT_S3_REGION, APT_S3_IAM_ARN,
 #    APT_SIGNING_KEY and the variable APT_SIGNING_FPR.
 #  * Does NOT set PACKAGES_PRODUCTION: that is switched on only once the code
-#    of PR #386 is on master (setup-production-repo.sh prints that step then).
+#    of PR #386 is on master and setup-production-repo.sh --apply has
+#    converged (it prints that step then).
 # Refuses to run if `build` already pins APT_SIGNING_FPR: that would rotate the
 # key, which is a manual procedure (AGENTS.md "Packages", "Key expiry and rotation").
 set -euo pipefail
@@ -83,6 +84,6 @@ Next:
      then: rm -rf "$OUT"
   2. Once #386 is merged to master (not before: master's older workflow would
      publish with the wrong Origin and no <base>/gpg), re-run
-     scripts/release/setup-production-repo.sh, which then prints the
+     scripts/release/setup-production-repo.sh --apply, which then prints the
      PACKAGES_PRODUCTION=true and release_type=public tag=0.2.0 commands.
 EOF
