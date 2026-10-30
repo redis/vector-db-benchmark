@@ -101,14 +101,17 @@ archive holds and how to verify a build.
 
 ### Using Docker
 
+Release images are published to the GitHub Container Registry:
+
 ```bash
-docker run --rm redis/vector-db-benchmark:0.2.0 --help
+docker run --rm ghcr.io/redis/vector-db-benchmark:0.2.0 --help
 ```
 
-> The `0.2.0` image is published by a follow-up fix to the release workflow and
-> was not on Docker Hub yet on 2026-10-30. Until it appears, use
-> `redis/vector-db-benchmark:latest`, which currently predates 0.2.0. More
-> examples: [Docker](#docker).
+> The GHCR images (`ghcr.io/redis/vector-db-benchmark:<tag>` and `:latest`)
+> come from a follow-up fix to the release workflow (#385), and are available
+> once it has run for 0.2.0; on 2026-10-30 GHCR did not serve them yet. Docker
+> Hub's `redis/vector-db-benchmark` may lag behind: there, `latest` currently
+> predates 0.2.0. More examples: [Docker](#docker).
 
 ### Installing from source
 
@@ -143,7 +146,7 @@ docker stop redis && docker rm redis
 ```
 
 The same run in Docker needs no install at all:
-`docker run --rm --network=host redis/vector-db-benchmark:latest --host localhost --engines redis-docker-test --datasets random-100`.
+`docker run --rm --network=host ghcr.io/redis/vector-db-benchmark:0.2.0 --host localhost --engines redis-docker-test --datasets random-100`.
 
 ## Supported Engines
 
@@ -484,6 +487,10 @@ then installs and runs it the way the release workflow does; run that on a
 toolchain, and it adds and removes the package and a local repository).
 
 ### Docker
+
+The examples use Docker Hub's `redis/vector-db-benchmark:latest`; the release
+images on GHCR (`ghcr.io/redis/vector-db-benchmark:<tag>`, see
+[Using Docker](#using-docker)) take the same arguments.
 
 ```bash
 # Show help
