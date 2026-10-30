@@ -1,56 +1,63 @@
 #!/usr/bin/env bash
 # Publish built .debs to an S3-backed APT repository with deb-s3, one codename at a time.
 #
-#   scripts/release/publish-apt.sh --bucket <bucket> --region <region> --in <dir> [--prefix deb] [--origin packages.redis.io] [--overwrite] [--dry-run]
+#   scripts/release/publish-apt.sh --bucket <bucket> --region <region> --in <dir> [--prefix deb] [--origin vector-db-benchmark] [--overwrite] [--dry-run]
 #
 # <dir> is searched recursively for *.deb; each package's codename is read from
 # its own Version (`<crate version>~<codename>`), so the directory layout the
-# workflow artifacts happen to have does not matter. The repository layout is
-# the one packages.redis.io serves: <prefix>/dists/<codename>/... and
-# <prefix>/pool/<codename>/..., objects public-read, `Origin: packages.redis.io`.
+# workflow artifacts happen to have does not matter. The repository layout:
+# <prefix>/dists/<codename>/... and <prefix>/pool/<codename>/..., objects
+# public-read, `Origin: <origin>` (default lib.sh's APT_ORIGIN; deb-s3 0.11.3
+# writes no Label). Production is our own bucket (lib.sh PRODUCTION_BUCKET);
+# the workflow decides which bucket an environment may use (check_publish_target).
 #
-# SIGNING IS MANDATORY. The dists/<codename>/ of both buckets is shared with
-# the other Redis products and already signed (InRelease + Release.gpg): an
-# unsigned deb-s3 run deletes Release.gpg and leaves the old InRelease behind,
-# so every user of that codename gets "Hash Sum mismatch" from apt update.
+# SIGNING IS MANDATORY. A codename's dists/<codename>/ is already signed
+# (InRelease + Release.gpg) once anything was published to it: an unsigned
+# deb-s3 run deletes Release.gpg and leaves the old InRelease behind, so every
+# user of that codename gets "Hash Sum mismatch" from apt update.
 # The keyring must hold exactly one secret key (the workflow imports
 # APT_SIGNING_KEY); its fingerprint is passed as `--sign=<fpr>`. Never a bare
 # `--sign`: it is a string option, and the next argument (the first .deb) would
 # be taken as the key id and silently not uploaded.
 #
 # THE KEY MUST BE THE ONE THE REPOSITORY IS ALREADY SIGNED WITH. deb-s3
-# re-signs the whole codename (every product's index), so a wrong key (the
-# staging throwaway key, a rotated one) would leave every redis / memtier APT
-# user with NO_PUBKEY on `apt update`. Before anything is written, each target
-# codename's existing dists/<codename>/InRelease is read (aws s3, the object
-# deb-s3 replaces) and must verify as signed by our key; a codename with no
-# InRelease yet (a fresh staging tree or prefix) is new and accepted. The key
-# must also be able to sign at all (no passphrase, not expired): deb-s3
-# uploads the new Release BEFORE signing it, so a signing failure mid-run
-# would leave Release and InRelease disagreeing ("Hash Sum mismatch").
+# re-signs the whole codename (every package in its index), so a wrong key
+# (the staging throwaway key, a rotated one) would leave every user who
+# imported <base>/gpg with NO_PUBKEY on `apt update`. Before anything is
+# written, each target codename's existing dists/<codename>/InRelease is read
+# (aws s3, the object deb-s3 replaces) and must verify as signed by our key; a
+# codename with no InRelease yet (the first publish to production, a fresh
+# staging tree or prefix) is new and accepted, and every later run must then
+# match the key that first publish used. The key must also be able to sign at
+# all (no passphrase, not expired): deb-s3 uploads the new Release BEFORE
+# signing it, so a signing failure mid-run would leave Release and InRelease
+# disagreeing ("Hash Sum mismatch").
 #
 # deb-s3 refuses (`--fail-if-exists`) a package whose name+version is already
 # in the codename's index under a different file, and a pool object whose
 # content differs from what is there; an identical re-upload is a no-op, so a
 # re-run after a partial publish completes it. --overwrite drops that refusal
-# (staging rehearsals only; on production the CDN would keep serving the old
-# bytes under the new hash for a while).
+# (staging rehearsals only: on production, users and caches would keep the
+# old bytes under a version whose index now names new ones).
 #
 # `--lock` takes deb-s3's per-codename lock (deb/dists/<codename>/main/binary-/lockfile),
-# the same one redis-debian's publish takes, so two products do not rewrite one
-# Release concurrently. A job killed mid-publish leaves it behind; the next run
-# waits ten minutes, logging "Repository is locked by another user", then fails
-# with `uncaught throw "Unable to obtain a lock after 60, giving up."`: remove
-# the lockfile object by hand after checking nothing else is publishing.
+# so two publishes (or a publish and the shared staging bucket's other
+# products) do not rewrite one Release concurrently. A job killed mid-publish
+# leaves it behind; the next run waits ten minutes, logging "Repository is
+# locked by another user", then fails with `uncaught throw "Unable to obtain a
+# lock after 60, giving up."`: remove the lockfile object by hand after
+# checking nothing else is publishing.
 #
 # AWS credentials come from the environment (static keys or an assumed role;
 # deb-s3 reads them through the AWS SDK, session tokens included). The
-# identity needs s3:PutObjectAcl as well as Put/Get/Delete (public-read objects).
+# identity needs s3:PutObject + s3:PutObjectAcl (public-read objects),
+# s3:GetObject, s3:ListBucket, and s3:DeleteObject on the lockfile only
+# (setup-production-repo.sh grants exactly that on production).
 # --dry-run prints the deb-s3 commands instead of running them and needs
 # neither deb-s3, credentials nor a key.
 set -euo pipefail
 
-bucket="" region="" indir="" prefix=deb origin=packages.redis.io overwrite=0 dry_run=0
+bucket="" region="" indir="" prefix=deb origin="" overwrite=0 dry_run=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bucket) bucket="$2"; shift 2 ;;
@@ -69,6 +76,8 @@ command -v dpkg-deb >/dev/null || { echo "publish-apt.sh: dpkg-deb not on PATH" 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/release/lib.sh
 source "$here/lib.sh"
+origin="${origin:-$APT_ORIGIN}"
+[[ "$origin" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "publish-apt.sh: --origin '$origin' must be one token (letters, digits, . _ + -)" >&2; exit 2; }
 [[ "$dry_run" == 1 ]] || command -v deb-s3 >/dev/null || { echo "publish-apt.sh: deb-s3 not on PATH" >&2; exit 1; }
 [[ "$dry_run" == 1 ]] || command -v aws >/dev/null || { echo "publish-apt.sh: aws not on PATH" >&2; exit 1; }
 
@@ -82,7 +91,7 @@ if [[ "$n_keys" -ne 1 || -z "$fpr" ]]; then
     fpr="DRYRUN0000000000000000000000000000000000"
     echo "publish-apt.sh: dry run with no signing key; would sign with the keyring's one secret key"
   else
-    echo "publish-apt.sh: the GPG keyring must hold exactly ONE secret key (found $n_keys); refusing to publish unsigned into a shared, signed repository" >&2
+    echo "publish-apt.sh: the GPG keyring must hold exactly ONE secret key (found $n_keys); refusing to publish an unsigned APT repository" >&2
     exit 1
   fi
 fi
@@ -122,7 +131,7 @@ if [[ "$dry_run" != 1 ]]; then
         echo "publish-apt.sh: $prefix/dists/$dist has a Release.gpg but no InRelease; refusing to re-sign a codename whose signer cannot be checked" >&2
         exit 1
       fi
-      echo "$dist: no InRelease yet, a new codename in this repository"
+      echo "$dist: no InRelease yet, a new codename in this repository (later runs must sign with $fpr)"
       continue
     fi
     aws s3 cp "$obj" "$work/InRelease-$dist" --only-show-errors
@@ -130,7 +139,7 @@ if [[ "$dry_run" != 1 ]]; then
     if ! gpg_status_signed_by "$fpr" <<<"$status"; then
       signer="$(sed -n 's/^\[GNUPG:\] \(VALIDSIG\|ERRSIG\|NO_PUBKEY\|BADSIG\) \([0-9A-F]*\).*/\2/p' <<<"$status" | head -n1)"
       echo "publish-apt.sh: $obj is signed by ${signer:-an unreadable signature}, not by $fpr." >&2
-      echo "  Publishing would re-sign every product's $dist index with a key its users do not trust; refusing." >&2
+      echo "  Publishing would re-sign the whole $dist index with a key its users do not trust; refusing." >&2
       echo "  Check the environment's APT_SIGNING_KEY (and APT_SIGNING_FPR)." >&2
       exit 1
     fi

@@ -17,8 +17,8 @@
 #  * the installed data files work: `--describe datasets` reads the packaged
 #    datasets.json from a copy of /usr/share/vector-db-benchmark, bench_jsonl
 #    reads the packaged random-100 corpus, bench_hdf5 reaches the linked HDF5;
-#  * the package also installs from a LOCAL repository laid out as
-#    packages.redis.io serves it — deb: dists/<codename>/main/binary-<arch>/
+#  * the package also installs from a LOCAL repository laid out as the
+#    production repository (lib.sh PRODUCTION_BUCKET) serves it — deb: dists/<codename>/main/binary-<arch>/
 #    Packages + Release (apt-ftparchive); rpm: createrepo_c under the README's
 #    rpm/el$releasever/$basearch or rpm/amzn2023/$basearch baseurl. Where it
 #    came from is checked, not assumed: apt, before installing, must show the
@@ -148,7 +148,7 @@ fi
   fail "installed version '$crate_version' != expected '$expect_version'"
 run_checks "$crate_version"
 
-echo "--- reinstall from a local repository laid out like packages.redis.io"
+echo "--- reinstall from a local repository laid out like the production repository"
 pm_remove
 hash -r
 for f in /usr/bin/vector-db-benchmark /usr/bin/prepare-msmarco /usr/bin/generate-dataset /usr/share/vector-db-benchmark/datasets/datasets.json; do
@@ -161,13 +161,16 @@ if [[ "$kind" == deb ]]; then
   [[ "$installed_version" == *"~$codename" ]] || fail "package version '$installed_version' is not for this host's codename '$codename'"
   arch="$(dpkg --print-architecture)"
   # The deb-s3 layout: pool/ plus dists/<codename>/main/binary-<arch>/Packages
-  # and a dists/<codename>/Release, served with the codename as the suite.
+  # and a dists/<codename>/Release, served with the codename as the suite and
+  # the Origin publish-apt.sh writes (lib.sh APT_ORIGIN; this script runs
+  # alone in a bare container, so the value is repeated here, and
+  # selftest-packages.sh checks the two agree).
   mkdir -p "$repo_root/pool/$codename" "$repo_root/dists/$codename/main/binary-$arch"
   cp "$pkg" "$repo_root/pool/$codename/"
   ( cd "$repo_root" &&
     apt-ftparchive packages pool > "dists/$codename/main/binary-$arch/Packages" &&
     gzip -k -f "dists/$codename/main/binary-$arch/Packages" &&
-    apt-ftparchive -o "APT::FTPArchive::Release::Origin=packages.redis.io" \
+    apt-ftparchive -o "APT::FTPArchive::Release::Origin=vector-db-benchmark" \
                    -o "APT::FTPArchive::Release::Suite=$codename" \
                    -o "APT::FTPArchive::Release::Codename=$codename" \
                    -o "APT::FTPArchive::Release::Components=main" \
@@ -178,6 +181,8 @@ if [[ "$kind" == deb ]]; then
   policy="$(apt-cache policy vector-db-benchmark)"
   echo "$policy"
   grep -qF "file:$repo_root" <<<"$policy" || fail "apt does not see vector-db-benchmark in the local repository"
+  # The Origin users can pin on (`o=`), as apt reads it from the Release file.
+  grep -qE "[ ,]o=vector-db-benchmark(,|$)" <<<"$(apt-cache policy)" || fail "apt does not report the repository's Origin as vector-db-benchmark"
   # Not installed, and every source in the version table is the local
   # repository: what apt-get installs next can only come from there.
   grep -qx '  Installed: (none)' <<<"$policy" || fail "vector-db-benchmark is still installed before the repository install"

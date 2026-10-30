@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Publish built RPMs into an S3-backed YUM repository laid out like packages.redis.io.
+# Publish built RPMs into an S3-backed YUM repository (production: our own
+# lib.sh PRODUCTION_BUCKET; the same layout memtier-benchmark uses).
 #
 #   scripts/release/publish-yum.sh --bucket <bucket> --in <dir> [--prefix rpm] [--overwrite] [--dry-run]
 #
@@ -7,9 +8,10 @@
 # <prefix>/<distro>/<arch>/ where <distro> comes from its own dist tag
 # (Release `1.el9` -> el9, `1.amzn2023` -> amzn2023; lib.sh rpm_release_to_distro)
 # and <arch> from its header, i.e. the README's baseurl pattern
-# rpm/el$releasever/$basearch and rpm/amzn2023/$basearch. The bucket's rpm/
-# prefix is SHARED with other Redis products (prod: redis, redis-stack; staging:
-# redis-rpm's rockylinux*/ dirs), so this script:
+# rpm/el$releasever/$basearch and rpm/amzn2023/$basearch. Production's rpm/
+# holds only vector-db-benchmark, but the script is written for a SHARED rpm/
+# (the Redis-wide staging bucket's holds redis-rpm's rockylinux*/ dirs; and
+# two of our own publishes must not lose each other's RPMs), so it:
 #  * touches only the <distro>/<arch>/ directories it has an RPM for,
 #  * downloads each such directory in full before regenerating its metadata,
 #    so createrepo_c --update indexes everything already there (and keeps any
@@ -27,10 +29,11 @@
 #    directory's metadata is SIGNED (repodata/repomd.xml.asc or any
 #    repomd.xml.* beside it):
 #    regenerating repomd.xml would leave that detached signature stale and
-#    break `repo_gpgcheck=1` for every product there. None is signed today
-#    (2026-10-29); if one becomes so, this must learn to re-sign repomd.xml
-#    first.
-# There is no cross-product lock on rpm/ (deb-s3's --lock covers only deb/),
+#    break `repo_gpgcheck=1` for every user there. We do not sign repomd.xml
+#    (the README's .repo has gpgcheck=1, repo_gpgcheck=0: the RPMs are
+#    signed); if a directory's metadata becomes signed, this must learn to
+#    re-sign repomd.xml first.
+# There is no lock on rpm/ (deb-s3's --lock covers only deb/),
 # so the sync -> createrepo_c -> upload sequence is a read-modify-write that
 # another product's publish can race. Two guards, per directory:
 #  * just before uploading repodata/, the directory is listed again; RPMs that

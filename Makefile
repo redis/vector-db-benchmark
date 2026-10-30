@@ -156,7 +156,7 @@ release-rpm:
 	bash scripts/release/build-rpm.sh --out "$(RELEASE_OUT)" $(if $(INSTALL_DEPS),--install-deps) $(if $(TAG),--release --tag "$(TAG)")
 
 # Install a built package on this (bare) host and run it, from the file and
-# from a local repository laid out like packages.redis.io.
+# from a local repository laid out like the production repository.
 .PHONY: release-test-package
 release-test-package:
 	@test -n "$(PKG)" || { echo "usage: make release-test-package PKG=<file.deb|file.rpm> [SHA=<40-hex>]"; exit 2; }

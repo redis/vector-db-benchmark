@@ -117,7 +117,8 @@ debian/, rpm/                 # Native package sources (.deb per codename, .rpm 
 scripts/release/              # package.sh/verify.sh/checksums.sh/publish.sh/selftest.sh
                               #   (#366 archives), build-deb.sh/build-rpm.sh/test-package.sh
                               #   (packages), publish-apt.sh/publish-yum.sh (deb-s3 /
-                              #   createrepo_c into the S3 package repository)
+                              #   createrepo_c into the S3 package repository),
+                              #   setup-production-repo.sh (one-time AWS setup of it)
 ```
 
 ## Cutting a release (prebuilt binaries, #366)
@@ -144,20 +145,50 @@ touch the archive's inputs: `make release-selftest` and
 
 The same `release: published` event also builds a .deb per codename and an
 .rpm per el8/el9/el10/amzn2023, both architectures, installs each on a bare
-container, and publishes them to packages.redis.io (the `build` environment).
+container, and publishes them to OUR OWN repository: S3 bucket `vdb-packages`
+(us-east-2, AWS account 726902207197, the account of the `vdb-package-staging`
+rehearsal bucket), served at `https://s3.us-east-2.amazonaws.com/vdb-packages`
+with `deb/`, `rpm/` and our signing key's public half at `gpg`. That is the
+`build` environment. It is NOT packages.redis.io: `check_publish_target`
+(`scripts/release/lib.sh`) refuses that repository's buckets, and any bucket
+other than `vdb-packages`, for `build`. The bucket names, region and the APT
+`Origin` (`vector-db-benchmark`; deb-s3 writes no Label) live in lib.sh.
 
-- **Production is off until `vars.PACKAGES_PRODUCTION` is `true`.** Until
-  then a final release builds and tests the packages, publishes nothing, and
-  says so in a `::notice::` (the run stays green; no `build` environment is
-  created); `release_type=public` is refused. Before setting the variable:
-  create the `build` environment, add required reviewers, limit deployment
-  branches/tags to `master`, `[0-9]*.[0-9]*.[0-9]*` and `v[0-9]*.[0-9]*.[0-9]*`
-  (and add a tag ruleset restricting who may push those tags: a dispatch runs
-  the dispatched ref's copy of the workflow's guards), then add the five
-  secrets (as memtier-benchmark's `build`) and the environment variable
-  `APT_SIGNING_FPR=54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C`
-  (packages.redis.io/gpg). A key with another fingerprint is refused, and so
-  is a codename whose existing InRelease another key signed.
+- **Production is off until the repository variable `PACKAGES_PRODUCTION` is
+  `true`.** Until then a final release builds and tests the packages,
+  publishes nothing, and says so in a `::notice::` (the run stays green);
+  `release_type=public` is refused. The one-time setup, in this order (none
+  of it is done yet; each step needs a maintainer):
+  1. **AWS:** `AWS_PROFILE=bench scripts/release/setup-production-repo.sh`
+     prints every change (dry run); re-run with `--apply` to create the
+     bucket (versioned, tagged `team`/`owner`, public reads through object
+     ACLs as staging, public writes denied) and the OIDC role
+     `vdb-packages-publisher` (assumable only by this repository's `build`
+     environment; list the bucket, get/put/put-ACL under `deb/`, `rpm/`,
+     `gpg`, delete only deb-s3's lockfile). It is idempotent.
+  2. **Signing key:** RSA 4096, no passphrase (the job signs
+     non-interactively), generated with the `gpg --batch --quick-gen-key`
+     commands the script prints. Keep the secret key and its revocation
+     certificate offline.
+  3. **Environment `build`:** required reviewers; deployment branches/tags
+     limited to `master`, `[0-9]*.[0-9]*.[0-9]*` and `v[0-9]*.[0-9]*.[0-9]*`;
+     and a tag ruleset restricting who may create those tags (a dispatch runs
+     the dispatched ref's copy of the workflow's guards, so the reviewers are
+     the real gate). The script prints the `gh api` calls.
+  4. **Secrets** on `build`: `APT_S3_BUCKET=vdb-packages`,
+     `APT_S3_REGION=us-east-2`,
+     `APT_S3_IAM_ARN=arn:aws:iam::726902207197:role/vdb-packages-publisher`,
+     `APT_SIGNING_KEY` (the armored secret key).
+  5. **Variables:** `APT_SIGNING_FPR` on `build` = the new key's fingerprint
+     (the job refuses any other key, a `gpg` object holding another key, and
+     a codename whose InRelease another key signed; a codename with no
+     InRelease yet is new and accepted, which is how the first publish
+     starts), then the REPOSITORY variable `PACKAGES_PRODUCTION=true`.
+  6. **Publish 0.2.0**, which is already released:
+     `gh workflow run release-packages.yml --ref master -f release_type=public -f tag=0.2.0`,
+     approve the deployment, then install from the README's "Getting
+     Started" on a bare container and remove its "available once the first
+     package publish completes" notes.
 - **Crate version stays `X.Y.Z`, also for an rc.** The build scripts refuse a
   `-` in it. Packages carry that version without a suffix, so production only
   ever takes a final tag (`X.Y.Z` / `vX.Y.Z`, `check_production_tag`). An rc
@@ -171,7 +202,7 @@ container, and publishes them to packages.redis.io (the `build` environment).
   run's build artifacts (unsigned; the publish job signs them each time, and
   the identity check ignores signatures), so what is already published is
   skipped as the same build and the rest completes (this is also the fix when
-  publish-yum.sh's index check reports another product's RPM missing). It
+  publish-yum.sh's index check reports an RPM missing). It
   re-runs the run's OWN scripts, so it cannot pick up a fix to them.
   **Re-run all jobs**, or any new dispatch, rebuilds: the rebuilt packages
   are not byte-identical (changelog date, build time), deb-s3 and
@@ -181,8 +212,9 @@ container, and publishes them to packages.redis.io (the `build` environment).
   reached yet; both lists must name at least one target, and APT publishes
   before YUM. A release whose APT side, or one arch of an RPM distro, is
   already published cannot be finished by the workflow once the run can no
-  longer be re-run (or when the fix is in the scripts): that needs a manual
-  publish of the remaining artifacts with the packaging team.
+  longer be re-run (or when the fix is in the scripts): a maintainer with the
+  bucket's credentials then publishes the remaining artifacts by hand with
+  the same scripts.
 - **Stale deb-s3 lock:** a job killed mid-publish leaves
   `deb/dists/<codename>/main/binary-/lockfile`; the next run waits ten
   minutes logging "Repository is locked by another user", then fails with
@@ -192,8 +224,6 @@ container, and publishes them to packages.redis.io (the `build` environment).
   the check that every codename/distro still builds (PRs build jammy and el9
   only): `gh workflow run release-packages.yml --ref <branch>
   -f release_type=internal -f overwrite=true`.
-- **After the first production publish,** remove the "Coming soon" note from
-  the README's "Linux packages" section.
 
 ## Dataset Formats
 
