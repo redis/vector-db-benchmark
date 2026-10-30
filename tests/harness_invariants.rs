@@ -2042,13 +2042,23 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
 
     // The published images name their commit too (the Docker build context
     // has no `.git`, so without the build-arg they would report "unknown").
-    for wf_name in ["docker-publish-master.yml", "docker-publish-release.yml"] {
-        let wf = repo_file(&format!(".github/workflows/{wf_name}"));
-        assert!(
-            wf.contains("VDB_BUILD_GIT_SHA=${{ github.sha }}"),
-            "{wf_name} must build with VDB_BUILD_GIT_SHA=${{{{ github.sha }}}}"
-        );
-    }
+    let master_wf = repo_file(".github/workflows/docker-publish-master.yml");
+    assert!(
+        master_wf.contains("VDB_BUILD_GIT_SHA=${{ github.sha }}"),
+        "docker-publish-master.yml must build with VDB_BUILD_GIT_SHA=${{{{ github.sha }}}}"
+    );
+    // The release workflow can be dispatched from master for an existing tag,
+    // where github.sha is master's head: it names the TAG's commit instead,
+    // resolved (and checked against the checkout) by its `release` step.
+    let release_wf = repo_file(".github/workflows/docker-publish-release.yml");
+    assert!(
+        release_wf.contains("VDB_BUILD_GIT_SHA=${{ steps.release.outputs.sha }}")
+            && release_wf.contains(r#"sha="$GITHUB_SHA""#)
+            && release_wf.contains("commits/refs/tags/$tag")
+            && release_wf.contains(r#"[[ "$head" != "$EXPECTED_SHA" ]]"#),
+        "docker-publish-release.yml must set VDB_BUILD_GIT_SHA from steps.release.outputs.sha: \
+         github.sha on a release, the tag's commit (checked against HEAD) on a dispatch"
+    );
 
     // The dirty-tree scope is one list in two languages: what build.rs reports
     // as "dirty tree" and what package.sh refuses to package must agree.
