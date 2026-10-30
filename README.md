@@ -485,6 +485,9 @@ toolchain, and it adds and removes the package and a local repository).
 
 ### Docker
 
+Image tags: `latest` is the newest release, `X.Y.Z` that release, and `master`
+/ `sha-<7 chars>` are unreleased `master` builds.
+
 ```bash
 # Show help
 docker run --rm redis/vector-db-benchmark:latest --help

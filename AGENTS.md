@@ -141,6 +141,18 @@ digests differ and the run refuses. Rebuild a tag on purpose only with
 touch the archive's inputs: `make release-selftest` and
 `scripts/release/install-test.sh` run there.
 
+### Docker images (Docker Hub `redis/vector-db-benchmark`)
+
+`:latest` is the newest release, `:X.Y.Z` that release (both from
+`docker-publish-release.yml`, which needs the `DOCKER_USERNAME` /
+`DOCKER_PASSWORD` secrets and fails without them). `:latest` moves only for the
+repository's latest release (a backport or older tag warns and leaves it).
+`:master` and `:sha-<7 chars>` are master builds (`docker-publish-master.yml`,
+which never pushes `:latest` and skips quietly without the secrets).
+
+If the Docker publish fails, dispatch `docker-publish-release.yml` from `master`
+with `tag=<tag>` (a re-run would replay the tag's own copy of the workflow).
+
 ### Packages (`release-packages.yml`)
 
 The same `release: published` event also builds a .deb per codename and an

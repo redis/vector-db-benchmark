@@ -31,6 +31,15 @@ docker run --rm redis/vector-db-benchmark --describe datasets
 docker run --rm redis/vector-db-benchmark --describe engines
 ```
 
+## Tags
+
+| Tag | Image |
+|-----|-------|
+| `latest` | The newest release |
+| `X.Y.Z` (e.g. `0.2.0`) | That release |
+| `master` | The current `master` branch (unreleased) |
+| `sha-<7 chars>` | A specific `master` commit |
+
 ## Running a Benchmark
 
 ```bash

@@ -2080,12 +2080,63 @@ fn release_workflow_is_the_make_targets_and_its_pr_filter_covers_the_inputs() {
 
     // The published images name their commit too (the Docker build context
     // has no `.git`, so without the build-arg they would report "unknown").
-    for wf_name in ["docker-publish-master.yml", "docker-publish-release.yml"] {
-        let wf = repo_file(&format!(".github/workflows/{wf_name}"));
-        assert!(
-            wf.contains("VDB_BUILD_GIT_SHA=${{ github.sha }}"),
-            "{wf_name} must build with VDB_BUILD_GIT_SHA=${{{{ github.sha }}}}"
-        );
+    let master_wf = repo_file(".github/workflows/docker-publish-master.yml");
+    assert!(
+        master_wf.contains("VDB_BUILD_GIT_SHA=${{ github.sha }}"),
+        "docker-publish-master.yml must build with VDB_BUILD_GIT_SHA=${{{{ github.sha }}}}"
+    );
+    // The release workflow can be dispatched from master for an existing tag,
+    // where github.sha is master's head: it names the TAG's commit instead,
+    // resolved (and checked against the checkout) by its `release` step.
+    let release_wf = repo_file(".github/workflows/docker-publish-release.yml");
+    let revision_label = "org.opencontainers.image.revision=${{ steps.release.outputs.sha }}";
+    assert!(
+        release_wf.contains("VDB_BUILD_GIT_SHA=${{ steps.release.outputs.sha }}")
+            && release_wf.contains("tag=\"$RELEASE_TAG\"\n              sha=\"$GITHUB_SHA\"")
+            && release_wf.contains("commits/refs/tags/$tag")
+            && release_wf.contains("format('refs/tags/{0}', steps.release.outputs.tag)")
+            && release_wf.contains("EXPECTED_SHA: ${{ steps.release.outputs.sha }}")
+            && release_wf.contains(r#"[[ "$head" != "$EXPECTED_SHA" ]]"#)
+            && release_wf.contains(revision_label),
+        "docker-publish-release.yml must build the tag's commit (checkout ref checked against \
+         HEAD) and name it in VDB_BUILD_GIT_SHA and the revision label: github.sha on a \
+         release, commits/refs/tags/<tag> on a dispatch"
+    );
+
+    // `:latest` is the newest release, nothing else. metadata-action's
+    // latest=auto would tag every final X.Y.Z (a backport, or a dispatch of an
+    // older tag, would move it backwards), and master must never push it.
+    assert!(
+        release_wf.contains("latest=false")
+            && release_wf.contains(r#"releases/latest" --jq .tag_name"#)
+            && release_wf.contains(r#"if [[ "$tag" == "$newest" ]]; then"#)
+            && release_wf.matches("type=raw,value=latest").count() == 1,
+        "docker-publish-release.yml must add :latest only for the repository's latest release"
+    );
+    assert!(
+        master_wf.contains("latest=false")
+            && master_wf.contains("type=raw,value=master")
+            && master_wf.contains("type=sha,format=short")
+            && !master_wf.contains("value=latest"),
+        "docker-publish-master.yml must push :master and :sha-<short>, never :latest"
+    );
+
+    // Both publish workflows hold the Docker Hub password: every action they
+    // use is pinned by a full commit SHA, never by a movable tag.
+    for (wf_name, wf) in [
+        ("docker-publish-master.yml", &master_wf),
+        ("docker-publish-release.yml", &release_wf),
+    ] {
+        let uses = |l: &&str| l.trim_start().trim_start_matches("- ").starts_with("uses:");
+        for line in wf.lines().filter(uses) {
+            let reference = line.split('@').nth(1).unwrap_or("");
+            let sha = reference.split_whitespace().next().unwrap_or("");
+            assert!(
+                sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{wf_name}: action not pinned by commit SHA: {}",
+                line.trim()
+            );
+        }
     }
 
     // The dirty-tree scope is one list in two languages: what build.rs reports
