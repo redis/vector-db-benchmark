@@ -227,7 +227,7 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
   codename by codename, on each one's next rehearsal. An apt client pointed at
   the staging bucket then needs `apt-get update --allow-releaseinfo-change`
   once.
-- **Key expiry (5 years) and rotation.** Renewing the expiry
+- **Key expiry and rotation** (5-year expiry). Renewing the expiry
   (`gpg --quick-set-expire <fpr> 5y` on the vault copy, then update
   `APT_SIGNING_KEY`) re-uploads `<base>/gpg` on the next publish, but that only
   reaches NEW installs: existing apt users must re-run the README's

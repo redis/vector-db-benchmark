@@ -19,7 +19,7 @@
 #  * Does NOT set PACKAGES_PRODUCTION: that is switched on only once the code
 #    of PR #386 is on master (setup-production-repo.sh prints that step then).
 # Refuses to run if `build` already pins APT_SIGNING_FPR: that would rotate the
-# key, which is a manual procedure (AGENTS.md "Rotating the signing key").
+# key, which is a manual procedure (AGENTS.md "Packages", "Key expiry and rotation").
 set -euo pipefail
 unset GH_TOKEN
 
