@@ -85,9 +85,9 @@ configurations under `/usr/share/vector-db-benchmark`
 
 ### Installing prebuilt binaries (Linux and macOS)
 
-Every release carries checksum-verified archives for Linux x86_64, Linux aarch64
-(glibc 2.34 or newer: Amazon Linux 2023, RHEL 9, Ubuntu 22.04+, Debian 12+) and
-macOS arm64. Nothing else needs to be installed. To download the latest release
+Every release carries checksum-verified archives for Linux x86_64 and aarch64
+(both need glibc 2.34 or newer: Amazon Linux 2023, RHEL 9, Ubuntu 22.04+,
+Debian 12+) and macOS arm64. Nothing else needs to be installed. To download the latest release
 for this host into `./vector-db-benchmark-<tag>`:
 
 ```bash
@@ -131,7 +131,8 @@ checkout, or a copy of the packaged tree:
 ```bash
 # Linux packages: work from a copy of the packaged tree
 cp -r /usr/share/vector-db-benchmark ~/vdb && cd ~/vdb
-# prebuilt binaries: cd vector-db-benchmark-<tag>   (and run ./vector-db-benchmark)
+# prebuilt binaries: the extracted directory holds the binaries; put it on PATH
+#   cd vector-db-benchmark-<tag> && PATH="$PWD:$PATH"
 
 vector-db-benchmark --version     # vector-db-benchmark <version> (git <commit it was built from>)
 vector-db-benchmark --describe datasets
@@ -142,7 +143,9 @@ vector-db-benchmark --host localhost --engines redis-docker-test --datasets rand
 docker stop redis && docker rm redis
 ```
 
-The same run in Docker needs no install at all:
+The same run in Docker needs no install at all (once the `0.2.0` image is on
+Docker Hub, see [Using Docker](#using-docker); `--network=host` reaches the
+host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 `docker run --rm --network=host redis/vector-db-benchmark:0.2.0 --host localhost --engines redis-docker-test --datasets random-100`.
 
 ## Supported Engines
@@ -474,7 +477,15 @@ setup. The packages install `vector-db-benchmark`,
 micro-benchmarks under `/usr/lib/vector-db-benchmark` (`/usr/libexec` on RPM
 systems), and the dataset catalogue plus engine configurations under
 `/usr/share/vector-db-benchmark`. HDF5, zlib and OpenSSL are linked in; the
-package depends on glibc (and libgcc) only.
+package depends on glibc (and libgcc) only. The packaging itself is built and
+install-tested on every change to it (`.github/workflows/release-packages.yml`),
+on bare containers of each distribution.
+
+The signing key expires after five years and is then renewed. A host set up
+before a renewal keeps its old copy: if `apt-get update` reports `EXPKEYSIG`,
+re-run the `curl … | sudo gpg --dearmor …` line from
+[Getting Started](#getting-started); on dnf hosts re-fetch the key file and
+remove the old one with `sudo rpm -e gpg-pubkey-<short key id>`.
 
 To build a package yourself, on (a container of) the target distribution:
 `make release-deb DIST=$(lsb_release -cs) INSTALL_DEPS=1` or

@@ -370,6 +370,7 @@ expect "build -> packages.redis.io is refused" 1 check_publish_target build pack
 check "... naming it a shared Redis repository" grep -q 'shared Redis repository' "$t/last.out"
 expect "build -> the Redis-wide staging bucket is refused" 1 check_publish_target build redis-test-package-repository us-east-2 ""
 expect "build -> our staging bucket is refused" 1 check_publish_target build vdb-package-staging us-east-2 ""
+check "... naming the staging bucket" grep -q 'points at the staging bucket' "$t/last.out"
 expect "build -> any other bucket is refused" 1 check_publish_target build vdb-packages-2 us-east-2 ""
 expect "build in another region is refused" 1 check_publish_target build vdb-packages us-east-1 ""
 expect "build under a prefix is refused" 1 check_publish_target build vdb-packages us-east-2 rehearsal
@@ -389,6 +390,20 @@ check "... a binary key with a signing subkey -> its PRIMARY only" test "$(key_f
 check "a file with two keys -> two fingerprints" test "$(key_file_fprs "$t/two.asc" | wc -l | tr -d ' ')" = 2
 echo "not a key" > "$t/nokey.asc"
 check "a file with no key -> nothing" test -z "$(key_file_fprs "$t/nokey.asc")"
+
+echo "lib.sh check_served_key / s3_head_missing (the <base>/gpg guard)"
+expect "<base>/gpg holding exactly our key" 0 check_served_key "$t/one.asc" "$fpr"
+expect "... another key is refused" 1 check_served_key "$t/sub.gpg" "$fpr"
+check "... naming the key it holds" grep -q "'$sub_fpr'" "$t/last.out"
+expect "... ours plus another is refused" 1 check_served_key "$t/two.asc" "$fpr"
+expect "... no key at all is refused" 1 check_served_key "$t/nokey.asc" "$fpr"
+expect "... an empty pin never matches an empty file" 1 check_served_key "$t/nokey.asc" ""
+echo 'An error occurred (404) when calling the HeadObject operation: Not Found' > "$t/head404"
+echo 'An error occurred (403) when calling the HeadObject operation: Forbidden' > "$t/head403"
+: > "$t/head-empty"
+expect "head-object 404 -> missing (a first publish)" 0 s3_head_missing "$t/head404"
+expect "head-object 403 -> NOT missing (stop, never assume new)" 1 s3_head_missing "$t/head403"
+expect "no error text -> NOT missing" 1 s3_head_missing "$t/head-empty"
 
 echo "README Getting Started"
 # The install steps users copy must name the repository the workflow publishes
@@ -411,7 +426,7 @@ for c in $default_debs; do
   check "README lists codename $c" grep -qF "($c)" <<<"$apt_section"
 done
 check "README lists no codename the workflow does not build" test \
-  "$(grep -oE '\((focal|jammy|noble|resolute|oracular|plucky|questing|buster|bullseye|bookworm|trixie|forky)\)' <<<"$apt_section" | tr -d '()' | sort -u | paste -sd' ' -)" \
+  "$(grep -oE '\([a-z]+\)' <<<"$apt_section" | tr -d '()' | sort -u | paste -sd' ' -)" \
   = "$(tr ' ' '\n' <<<"$default_debs" | sort -u | paste -sd' ' -)"
 
 echo "lib.sh check_production_tag"

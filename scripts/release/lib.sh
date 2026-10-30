@@ -163,8 +163,9 @@ STAGING_BUCKET=vdb-package-staging
 # The Redis-wide staging bucket: its deb/ and rpm/ are the shared, Redis-signed
 # rehearsal repositories, so a staging rehearsal there needs a prefix.
 SHARED_STAGING_BUCKET=redis-test-package-repository
-# The shared production repository (packages.redis.io's bucket): never ours.
-SHARED_PRODUCTION_BUCKETS=(packages.redis.io "$SHARED_STAGING_BUCKET")
+# Every bucket shared by the Redis products (packages.redis.io's, and the
+# Redis-wide staging one): `build` refuses them all; keep BOTH entries.
+SHARED_REDIS_BUCKETS=(packages.redis.io "$SHARED_STAGING_BUCKET")
 # deb-s3 writes `Origin:` into each codename's Release (0.11.3 has no Label
 # option, so Release carries no Label); apt shows it in `apt-cache policy` and
 # pins can match it (o=vector-db-benchmark).
@@ -181,7 +182,7 @@ check_publish_target() {
   local env="$1" bucket="$2" region="$3" prefix="$4"
   case "$env" in
     build)
-      if in_list "$bucket" "${SHARED_PRODUCTION_BUCKETS[@]}"; then
+      if in_list "$bucket" "${SHARED_REDIS_BUCKETS[@]}"; then
         echo "environment 'build' has APT_S3_BUCKET=$bucket, a shared Redis repository; production is our own $PRODUCTION_BUCKET, and nothing here may write to the shared one" >&2
         return 1
       fi
@@ -400,6 +401,27 @@ key_file_fprs() {
   local listing
   listing="$(gpg --batch --no-tty --with-colons --import-options show-only --import "$1" 2>/dev/null)" || return 0
   awk -F: '/^pub:/ {want = 1; next} want && /^fpr:/ {print $10; want = 0}' <<<"$listing"
+}
+
+# `check_served_key <key file> <fpr>`: the repository's <base>/gpg holds
+# exactly one key, <fpr> (our signing key). Anything else (another key, two
+# keys, no key, not a key file) fails, saying what it holds. The publish job
+# refuses to overwrite such a gpg, and the verify step to call it served.
+check_served_key() {
+  local have
+  have="$(key_file_fprs "$1" | paste -sd' ' -)"
+  if [[ -z "$2" || "$have" != "$2" ]]; then
+    echo "$1 holds key(s) '${have:-none}', not exactly $2" >&2
+    return 1
+  fi
+}
+
+# `s3_head_missing <stderr of aws s3api head-object>`: the object does not
+# exist (404). Anything else, a 403 included, is NOT "missing": without
+# s3:ListBucket S3 answers 403 for a missing object too, and the caller must
+# then stop rather than assume the object is new.
+s3_head_missing() {
+  grep -qE '\(404\)|Not Found' "$1"
 }
 
 # `rpm_release_to_distro <Release tag>`: the rpm/<distro>/ directory an RPM

@@ -118,7 +118,8 @@ scripts/release/              # package.sh/verify.sh/checksums.sh/publish.sh/sel
                               #   (#366 archives), build-deb.sh/build-rpm.sh/test-package.sh
                               #   (packages), publish-apt.sh/publish-yum.sh (deb-s3 /
                               #   createrepo_c into the S3 package repository),
-                              #   setup-production-repo.sh (one-time AWS setup of it)
+                              #   setup-production-repo.sh / setup-signing-key.sh (its
+                              #   one-time AWS + GitHub setup, and the signing key)
 ```
 
 ## Cutting a release (prebuilt binaries, #366)
@@ -130,6 +131,11 @@ and `SHA256SUMS` to a published release. Its `plan` job runs `check_release_tag`
 tag containing `+`.
 
 So: **bump the version, merge, then tag that commit and publish the release.**
+Only repository **admins** can create, move or delete release tags: the tag
+ruleset "release tags" (id 26191613) covers `[0-9]*.[0-9]*.[0-9]*` and
+`v[0-9]*.[0-9]*.[0-9]*`, rc tags included, with only the admin role as bypass.
+A write-role collaborator's `gh release create X.Y.Z` (or a new tag from the
+release UI) is refused, and no release workflow fires.
 A release published without the bump gets no archives, but still becomes
 "latest", which breaks the README's install one-liner until it is fixed.
 
@@ -169,38 +175,74 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
 - **Production is off until the repository variable `PACKAGES_PRODUCTION` is
   `true`.** Until then a final release builds and tests the packages,
   publishes nothing, and says so in a `::notice::` (the run stays green);
-  `release_type=public` is refused. The one-time setup, in this order (none
-  of it is done yet; each step needs a maintainer):
-  1. **AWS:** `AWS_PROFILE=bench scripts/release/setup-production-repo.sh`
-     prints every change (dry run); re-run with `--apply` to create the
-     bucket (versioned, tagged `team`/`owner`, public reads through object
-     ACLs as staging, public writes denied) and the OIDC role
-     `vdb-packages-publisher` (assumable only by this repository's `build`
-     environment; list the bucket, get/put/put-ACL under `deb/`, `rpm/`,
-     `gpg`, delete only deb-s3's lockfile). It is idempotent.
-  2. **Signing key:** RSA 4096, no passphrase (the job signs
-     non-interactively), generated with the `gpg --batch --quick-gen-key`
-     commands the script prints. Keep the secret key and its revocation
-     certificate offline.
-  3. **Environment `build`:** required reviewers; deployment branches/tags
-     limited to `master`, `[0-9]*.[0-9]*.[0-9]*` and `v[0-9]*.[0-9]*.[0-9]*`;
-     and a tag ruleset restricting who may create those tags (a dispatch runs
-     the dispatched ref's copy of the workflow's guards, so the reviewers are
-     the real gate). The script prints the `gh api` calls.
-  4. **Secrets** on `build`: `APT_S3_BUCKET=vdb-packages`,
-     `APT_S3_REGION=us-east-2`,
+  `release_type=public` is refused. The setup, in this order:
+  0. **The code of PR #386 is on master.** Nothing in steps 3-4 may happen
+     before that: a release and a `--ref master` dispatch run MASTER's copy of
+     the workflow, and the older one accepts `vdb-packages` but publishes with
+     packages.redis.io as Origin and no `<base>/gpg` (and the next publish
+     after the merge would then change the Origin under every early user).
+     `setup-production-repo.sh` checks master and prints steps 3-4 only once
+     master has `check_publish_target`.
+  1. **AWS + GitHub:** `AWS_PROFILE=bench scripts/release/setup-production-repo.sh`
+     prints what differs from the live state (dry run); `--apply` converges it.
+     Done once on 2026-10-30 from the PR at 2969ca4 (bucket, role, `build`
+     environment with fcostaoliveira as required reviewer and the
+     master/tag deployment policies, tag ruleset 26191613); re-run `--apply`
+     after the merge for the hardened bucket policy, the lifecycle rule and the
+     immutable-subject-only trust. It protects `build` BEFORE touching the
+     role (GitHub creates an unprotected environment for any job naming one),
+     never re-posts existing branch policies or the ruleset, and refuses
+     `--apply` unless the caller is the SSO AdministratorAccess role, the one
+     principal (with the publisher role, for objects) the bucket policy lets
+     write: account 726902207197 is shared, and instance roles and CI users
+     there hold `s3:*` on `*`. The account root can always delete the bucket
+     policy if it ever has to.
+  2. **Signing key + secrets:** `scripts/release/setup-signing-key.sh`
+     (needs gpg): RSA 4096, no passphrase (the job signs non-interactively),
+     5-year expiry; the secret key, public key and revocation certificate go
+     to `~/vdb-packages-signing` (mode 700; refused inside a git checkout,
+     and `*.secret.asc` / `*.rev` are git-ignored). It sets the `build`
+     secrets `APT_S3_BUCKET=vdb-packages`, `APT_S3_REGION=us-east-2`,
      `APT_S3_IAM_ARN=arn:aws:iam::726902207197:role/vdb-packages-publisher`,
-     `APT_SIGNING_KEY` (the armored secret key).
-  5. **Variables:** `APT_SIGNING_FPR` on `build` = the new key's fingerprint
-     (the job refuses any other key, a `gpg` object holding another key, and
-     a codename whose InRelease another key signed; a codename with no
-     InRelease yet is new and accepted, which is how the first publish
-     starts), then the REPOSITORY variable `PACKAGES_PRODUCTION=true`.
-  6. **Publish 0.2.0**, which is already released:
+     `APT_SIGNING_KEY` and the variable `APT_SIGNING_FPR` (the job refuses any
+     other key, a `gpg` object holding another key, and a codename whose
+     InRelease another key signed; a codename with no InRelease yet is new and
+     accepted, which is how the first publish starts). Store the two key files
+     in the team vault, then delete the directory.
+  3. **Switch on** (only after step 0): the REPOSITORY variable
+     `gh variable set PACKAGES_PRODUCTION -R redis/vector-db-benchmark --body true`.
+  4. **Publish 0.2.0**, which is already released (only after step 0):
      `gh workflow run release-packages.yml --ref master -f release_type=public -f tag=0.2.0`,
      approve the deployment, then install from the README's "Getting
-     Started" on a bare container and remove its "available once the first
-     package publish completes" notes.
+     Started" on bare el8, el9, el10, amzn2023, jammy and trixie containers
+     (signature checking on), and remove the README's "available once the
+     first package publish completes" notes and, once Docker Hub has 0.2.0,
+     its Docker note.
+- **The reviewer gate** is one required reviewer (fcostaoliveira) with
+  `prevent_self_review` off, so the person who dispatches can approve: it
+  stops mistakes, not a compromised maintainer account. If
+  `prevent_self_review` is ever turned on, add a second reviewer in the same
+  change, or every `build` deployment waits for an approval nobody may give.
+- **Staging's Origin** switches from packages.redis.io to `vector-db-benchmark`
+  codename by codename, on each one's next rehearsal. An apt client pointed at
+  the staging bucket then needs `apt-get update --allow-releaseinfo-change`
+  once.
+- **Key expiry (5 years) and rotation.** Renewing the expiry
+  (`gpg --quick-set-expire <fpr> 5y` on the vault copy, then update
+  `APT_SIGNING_KEY`) re-uploads `<base>/gpg` on the next publish, but that only
+  reaches NEW installs: existing apt users must re-run the README's
+  `curl … | gpg --dearmor` line, and dnf users re-fetch the key file and
+  `rpm -e gpg-pubkey-<short id>` before the next install. Rotating to a NEW
+  key (compromise, loss) is manual, as admin, because every guard refuses a
+  new key on purpose (and re-publishing an existing version is refused: no
+  `--overwrite` in production): publish the revocation certificate and
+  announce it; replace `gpg` with the new public key; in every
+  `deb/dists/<codename>/`, re-sign the existing `Release` with the new key
+  (`gpg --clearsign -o InRelease Release`, `gpg -abs -o Release.gpg Release`)
+  and upload both `--acl public-read`; update `APT_SIGNING_KEY` and
+  `APT_SIGNING_FPR`. Published RPMs keep the old key's signature, so dnf users
+  need both keys until those versions age out (or re-sign the RPMs, upload
+  them and regenerate each `repodata/`). Users re-import the key as above.
 - **Crate version stays `X.Y.Z`, also for an rc.** The build scripts refuse a
   `-` in it. Packages carry that version without a suffix, so production only
   ever takes a final tag (`X.Y.Z` / `vX.Y.Z`, `check_production_tag`). An rc
@@ -224,14 +266,16 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
   reached yet; both lists must name at least one target, and APT publishes
   before YUM. A release whose APT side, or one arch of an RPM distro, is
   already published cannot be finished by the workflow once the run can no
-  longer be re-run (or when the fix is in the scripts): a maintainer with the
-  bucket's credentials then publishes the remaining artifacts by hand with
-  the same scripts.
+  longer be re-run (or when the fix is in the scripts): an admin (the SSO
+  AdministratorAccess role in 726902207197, the only other principal the
+  bucket policy lets write) then publishes the remaining artifacts by hand
+  with the same scripts.
 - **Stale deb-s3 lock:** a job killed mid-publish leaves
   `deb/dists/<codename>/main/binary-/lockfile`; the next run waits ten
   minutes logging "Repository is locked by another user", then fails with
   `uncaught throw "Unable to obtain a lock after 60, giving up."`. Delete that
-  object by hand after checking nothing else is publishing.
+  object by hand, as the SSO AdministratorAccess role, after checking nothing
+  else is publishing.
 - **Before tagging,** a green full-matrix staging rehearsal of the commit is
   the check that every codename/distro still builds (PRs build jammy and el9
   only): `gh workflow run release-packages.yml --ref <branch>

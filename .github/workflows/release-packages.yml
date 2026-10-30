@@ -52,25 +52,28 @@ name: Release packages (deb/rpm)
 # 'true'. Until then a published final release builds and tests every
 # package and publishes nothing (a ::notice:: says so; no `build` environment
 # is created), and release_type=public is refused. Switch it on only after
-# (AGENTS.md "Packages" has the commands; scripts/release/setup-production-repo.sh
-# creates the AWS side and prints the rest):
-#   1. creating the bucket and the publisher role (setup-production-repo.sh
-#      --apply), and our own signing key (RSA 4096, no passphrase);
-#   2. creating the `build` environment and protecting it: required reviewers,
-#      and deployment branches/tags limited to `master` plus the release tags
-#      (`[0-9]*.[0-9]*.[0-9]*`, `v[0-9]*.[0-9]*.[0-9]*`). workflow_dispatch runs
+# (AGENTS.md "Packages" has the runbook):
+#   0. THIS workflow is on master: master's copy is what a release and a
+#      `--ref master` dispatch run, and an older copy publishes with another
+#      Origin and no <base>/gpg;
+#   1. scripts/release/setup-production-repo.sh --apply: the `build`
+#      environment protected FIRST (required reviewer; deployment
+#      branches/tags limited to `master` plus `[0-9]*.[0-9]*.[0-9]*` and
+#      `v[0-9]*.[0-9]*.[0-9]*`; a ruleset letting only admins create release
+#      tags), then the bucket and the publisher role. workflow_dispatch runs
 #      the workflow file of the DISPATCHED ref, so a branch that edits the
-#      guards below out of its copy would otherwise reach `build`'s secrets.
-#      The tag rule alone does not stop that either: anyone who can push a
-#      matching tag can tag a modified workflow. Required reviewers are the
-#      real gate; also add a tag ruleset restricting who may create
-#      release-pattern tags;
-#   3. adding the secrets, and the environment VARIABLE APT_SIGNING_FPR = our
-#      key's fingerprint. The publish job refuses a key with another
-#      fingerprint, refuses a <base>/gpg that holds another key, and
-#      publish-apt.sh refuses a codename whose InRelease is not already signed
-#      by the key in use (the first publish creates each codename, unsigned
-#      before it; every later one must match).
+#      guards below out of its copy would otherwise reach `build`'s secrets,
+#      and anyone who can push a matching tag could tag a modified workflow.
+#      The required reviewer is the gate against both: today ONE maintainer
+#      who may approve their own dispatch (prevent_self_review off), which
+#      stops mistakes, not a compromised maintainer account;
+#   2. scripts/release/setup-signing-key.sh: our own key (RSA 4096, no
+#      passphrase), the secrets, and the environment VARIABLE APT_SIGNING_FPR.
+#      The publish job refuses a key with another fingerprint, refuses a
+#      <base>/gpg that holds another key, and publish-apt.sh refuses a
+#      codename whose InRelease is not already signed by the key in use (the
+#      first publish creates each codename, unsigned before it; every later
+#      one must match).
 # Production takes final tags only (X.Y.Z / vX.Y.Z, lib.sh
 # check_production_tag): packages carry the crate version without any
 # pre-release suffix, so an rc published there would be labelled as the final
@@ -141,6 +144,8 @@ on:
       - 'scripts/release/publish-yum.sh'
       - 'scripts/release/selftest-packages.sh'
       - 'scripts/release/lib.sh'
+      - 'scripts/release/setup-production-repo.sh'
+      - 'scripts/release/setup-signing-key.sh'
       - '.github/workflows/release-packages.yml'
       # What the packages ship besides compiled code, and the binary set (the
       # rest of src/ is built --features release-static by release-binaries.yml).
@@ -321,6 +326,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm createrepo-c dpkg-dev
       - run: make release-selftest-packages
+      # The release scripts, the one-time setup ones included, which no other
+      # job runs (shellcheck is preinstalled on the runner).
+      - run: shellcheck --version && shellcheck -x scripts/release/*.sh
 
   build-deb:
     name: deb ${{ matrix.dist }} ${{ matrix.arch }}
@@ -623,8 +631,9 @@ jobs:
         # What the README's install steps import, in both environments. It
         # must be the key we sign with: a gpg object holding any other key
         # is refused here, before a single package is written. The same key
-        # is uploaded again on every run (a renewed expiry or a new subkey
-        # reaches users that way); no other key ever replaces it.
+        # is uploaded again on every run (a renewed expiry reaches NEW
+        # installs that way; existing ones keep their local copy and must
+        # re-import it, see AGENTS.md); no other key ever replaces it.
         run: |
           set -euo pipefail
           # shellcheck source=scripts/release/lib.sh
@@ -633,11 +642,9 @@ jobs:
           rc=0; aws s3api head-object --bucket "$BUCKET" --key "$key" >/dev/null 2>head.err || rc=$?
           if [[ "$rc" -eq 0 ]]; then
             aws s3 cp "s3://$BUCKET/$key" served-gpg --only-show-errors
-            have="$(key_file_fprs served-gpg | paste -sd' ')"
-            [[ "$have" == "$signing_fpr" ]] ||
-              { echo "::error::s3://$BUCKET/$key holds key(s) '${have:-none}', not $signing_fpr; refusing to replace the key users trust (nothing was published)"; exit 1; }
+            check_served_key served-gpg "$signing_fpr" || { echo "::error::s3://$BUCKET/$key holds another key; refusing to replace the key users trust (nothing was published)"; exit 1; }
             echo "s3://$BUCKET/$key already holds $signing_fpr"
-          elif grep -qE '\(404\)|Not Found' head.err; then
+          elif s3_head_missing head.err; then
             echo "s3://$BUCKET/$key does not exist yet: first publish with $signing_fpr"
           else
             echo "::error::cannot read s3://$BUCKET/$key:"; cat head.err; exit 1
@@ -676,8 +683,7 @@ jobs:
           # form whose certificate covers any bucket name.
           base="$(s3_origin_url "$BUCKET" "$REGION" "$REPO_PREFIX")"
           curl -fsSL "$base/gpg" -o served-gpg
-          [[ "$(key_file_fprs served-gpg | paste -sd' ')" == "$signing_fpr" ]] ||
-            { echo "::error::$base/gpg does not serve exactly $signing_fpr"; exit 1; }
+          check_served_key served-gpg "$signing_fpr" || { echo "::error::$base/gpg does not serve exactly $signing_fpr"; exit 1; }
           echo "ok: $base/gpg serves $signing_fpr"
           while IFS= read -r -d '' f; do
             dist="$(dpkg-deb -f "$f" Version)"; dist="${dist##*~}"

@@ -1742,6 +1742,7 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "build-rpm.sh",
         "selftest-packages.sh",
         "setup-production-repo.sh",
+        "setup-signing-key.sh",
     ] {
         let name = format!("scripts/release/{script}");
         sources.push((name.clone(), repo_file(&name)));
@@ -1780,8 +1781,11 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "check_publish_target \"$PUBLISH_TO\" \"$BUCKET\" \"$REGION\" \"$REPO_PREFIX\" || { echo \"::error::environment '$PUBLISH_TO' may not publish to s3://$BUCKET (see above)\"; exit 1; }",
         // <base>/gpg must hold our key before anything is published, and
         // serve it afterwards.
-        "[[ \"$have\" == \"$signing_fpr\" ]] ||",
-        "[[ \"$(key_file_fprs served-gpg | paste -sd' ')\" == \"$signing_fpr\" ]] ||",
+        "check_served_key served-gpg \"$signing_fpr\" || { echo \"::error::s3://$BUCKET/$key holds another key; refusing to replace the key users trust (nothing was published)\"; exit 1; }",
+        "elif s3_head_missing head.err; then",
+        "check_served_key served-gpg \"$signing_fpr\" || { echo \"::error::$base/gpg does not serve exactly $signing_fpr\"; exit 1; }",
+        // Production never takes --overwrite.
+        "OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}",
         "args=(--bucket \"$BUCKET\" --region \"$REGION\" --in debs --prefix \"${REPO_PREFIX:+$REPO_PREFIX/}deb\" --origin \"$APT_ORIGIN\")",
     ] {
         assert!(
@@ -1804,26 +1808,54 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "PRODUCTION_REGION=us-east-2",
         "STAGING_BUCKET=vdb-package-staging",
         "SHARED_STAGING_BUCKET=redis-test-package-repository",
-        "SHARED_PRODUCTION_BUCKETS=(packages.redis.io \"$SHARED_STAGING_BUCKET\")",
+        "SHARED_REDIS_BUCKETS=(packages.redis.io \"$SHARED_STAGING_BUCKET\")",
     ] {
         assert!(
             lib_code.iter().any(|l| l == line),
             "scripts/release/lib.sh no longer has `{line}`"
         );
     }
+    // Compared with whitespace and quotes removed and case folded, so
+    // `5431 8fa4 ...`, `--origin "packages.redis.io"` and `Origin: ...` count.
     let mut docs = sources.clone();
     docs.push(("AGENTS.md".to_string(), repo_file("AGENTS.md")));
     for (name, src) in &docs {
+        let squashed: String = src
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect::<String>()
+            .to_lowercase();
         assert!(
-            !src.contains("54318FA4"),
+            !squashed.contains("54318fa4052d1e61"),
             "{name} names Redis's packages.redis.io signing key; production is signed with our own key (APT_SIGNING_FPR)"
         );
-        assert!(
-            !src.contains("--origin packages.redis.io")
-                && !src.contains("Origin=packages.redis.io"),
-            "{name} labels our repository with packages.redis.io's Origin; use lib.sh APT_ORIGIN"
-        );
+        for origin in [
+            "origin=packages.redis.io",
+            "origin:packages.redis.io",
+            "--originpackages.redis.io",
+        ] {
+            assert!(
+                !squashed.contains(origin),
+                "{name} labels our repository with packages.redis.io's Origin; use lib.sh APT_ORIGIN"
+            );
+        }
     }
+    // <base>/gpg is published before any package, unconditionally.
+    let gpg_step = packages
+        .find("- name: Publish the public key as <base>/gpg")
+        .expect("release-packages.yml has no `Publish the public key as <base>/gpg` step");
+    let apt_step = packages
+        .find("- name: Publish APT")
+        .expect("release-packages.yml has no `Publish APT` step");
+    assert!(
+        gpg_step < apt_step,
+        "release-packages.yml must publish <base>/gpg before the APT step"
+    );
+    let gpg_body = &packages[gpg_step..apt_step];
+    assert!(
+        !gpg_body.lines().any(|l| l.trim_start().starts_with("if:")),
+        "release-packages.yml's <base>/gpg step must not be conditional"
+    );
     // The verify step builds no URL from the bucket name itself (a two-line
     // `host=...; base="https://$BUCKET.$host"` would get past the scan above).
     assert!(
