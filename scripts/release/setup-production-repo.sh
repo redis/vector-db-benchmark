@@ -29,14 +29,15 @@
 #     (ObjectOwnership BucketOwnerPreferred: the publish scripts upload with
 #     --acl public-read; bucket ACL private; the public-access block allows
 #     object ACLs but no public policy); and a bucket policy of Deny statements:
-#       * any object write (s3:Put*, s3:Delete*, s3:Replicate*, restore,
-#         retention bypass) by anyone but the publisher role and the admin
-#         role (the account is shared: instance roles and CI users hold s3:*
-#         on *);
-#       * any bucket setting (s3:PutBucket*, s3:DeleteBucket*,
-#         s3:Put*Configuration: policy, ACL, ownership, public-access block,
-#         versioning, lifecycle, replication, encryption, object lock, CORS,
-#         website, tagging, request payment, ...) by anyone but the admin role;
+#       * on objects, every action but s3:Get* / s3:List* (NotAction: writes,
+#         deletes, ACLs, tagging, retention, replication, restore,
+#         UpdateObjectEncryption, aborting uploads, and any action S3 adds
+#         later) by anyone but the publisher role and the admin role (the
+#         account is shared: instance roles and CI users hold s3:* on *);
+#       * on the bucket, every action but s3:Get* / s3:List* (policy, ACL,
+#         ownership, public-access block, versioning, lifecycle, replication,
+#         encryption, object lock, CORS, website, tagging, metadata tables,
+#         deletion, ...) by anyone but the admin role;
 #       * any ACL outside deb/, rpm/ and gpg; public-read-write/authenticated
 #         canned ACLs anywhere; public bucket ACLs; any x-amz-grant-* header.
 #     Lock-out safety: --apply refuses unless the caller IS the admin role
@@ -82,6 +83,9 @@ for t in aws python3; do command -v "$t" >/dev/null || { echo "setup-production-
 
 bucket="$PRODUCTION_BUCKET" region="$PRODUCTION_REGION"
 base="$(s3_origin_url "$bucket" "$region")"
+# The staging rehearsal of the first production publish (printed at the end).
+staging_root="$(s3_origin_url "$STAGING_BUCKET" "$region")"
+staging_base="$(s3_origin_url "$STAGING_BUCKET" "$region" preprod-0.2.0)"
 arn="arn:aws:s3:::$bucket"
 oidc_host=token.actions.githubusercontent.com
 role_arn="arn:aws:iam::$account:role/$role"
@@ -307,7 +311,7 @@ cat > "$work/bucket-policy.json" <<JSON
       "Sid": "DenyObjectWritesExceptPublisherAndAdmin",
       "Effect": "Deny",
       "Principal": "*",
-      "Action": ["s3:Put*", "s3:Delete*", "s3:Replicate*", "s3:RestoreObject", "s3:BypassGovernanceRetention"],
+      "NotAction": ["s3:Get*", "s3:List*"],
       "Resource": "$arn/*",
       "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["$role_arn", "$admin_arn"]}}
     },
@@ -315,7 +319,7 @@ cat > "$work/bucket-policy.json" <<JSON
       "Sid": "DenyBucketChangesExceptAdmin",
       "Effect": "Deny",
       "Principal": "*",
-      "Action": ["s3:PutBucket*", "s3:DeleteBucket*", "s3:Put*Configuration"],
+      "NotAction": ["s3:Get*", "s3:List*"],
       "Resource": "$arn",
       "Condition": {"ArnNotLike": {"aws:PrincipalArn": "$admin_arn"}}
     },
@@ -420,9 +424,9 @@ cat > "$work/publish-policy.json" <<JSON
 {
   "Version": "2012-10-17",
   "Statement": [
-    {"Sid": "ListTheRepositoryBucket", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "$arn"},
+    {"Sid": "ListTheRepositoryBucket", "Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketLocation"], "Resource": "$arn"},
     {"Sid": "ReadAndPublishRepositoryObjects", "Effect": "Allow",
-     "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectAcl"],
+     "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectAcl", "s3:AbortMultipartUpload"],
      "Resource": ["$arn/deb/*", "$arn/rpm/*", "$arn/gpg"]},
     {"Sid": "ReleaseTheDebS3Lock", "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "$arn/deb/dists/*/lockfile"}
   ]
@@ -486,7 +490,7 @@ if [[ "$changes" -eq 0 || "$apply" == 1 ]]; then converged=1; fi
 if [[ "$master_ready" == 1 && "$converged" == 0 ]]; then
   cat <<EOF
 
-# 2-3. NOT YET: this run found $changes pending change(s). Run this script
+# 2-4. NOT YET: this run found $changes pending change(s). Run this script
 #      with --apply first; it prints the production steps once the live state
 #      matches (right after that --apply, or on a dry run that finds nothing
 #      to change).
@@ -494,12 +498,28 @@ EOF
 elif [[ "$master_ready" == 1 ]]; then
   cat <<EOF
 
-# 2. Switch production on (a REPOSITORY variable: the plan job reads it before
+# 2. Rehearse the real release on STAGING first, under a fresh prefix (no gpg,
+#    no InRelease yet: the first-publish path production will take). A
+#    production publish cannot be overwritten, so a bug found there leaves
+#    0.2.0 half-published for good; here it costs a new prefix.
+gh workflow run release-packages.yml -R $repo --ref master -f release_type=internal -f tag=0.2.0 -f repo_prefix=preprod-0.2.0
+#    When it is green, check against $staging_base:
+#    - gpg serves the STAGING key (the same one as the staging root's gpg):
+#        cmp <(curl -fsS $staging_base/gpg) <(curl -fsS $staging_root/gpg)
+#    - every codename's Release says Origin: vector-db-benchmark, e.g.
+#        curl -fsS $staging_base/deb/dists/jammy/Release | grep -x 'Origin: vector-db-benchmark'
+#    - the README's "Getting Started" installs work with $base replaced by
+#      $staging_base, on bare jammy, trixie, el9 and amzn2023 containers
+#      (signature checking on); vector-db-benchmark --version says 0.2.0.
+#    Any failure: fix, merge, and rehearse again under a new prefix
+#    (preprod-0.2.0-2, ...) before going on.
+
+# 3. Switch production on (a REPOSITORY variable: the plan job reads it before
 #    any environment is chosen). master has check_publish_target and the
 #    vector-db-benchmark Origin (checked just now).
 gh variable set PACKAGES_PRODUCTION -R $repo --body true
 
-# 3. Publish the release that is already out; approve the 'build' deployment.
+# 4. Publish the release that is already out; approve the 'build' deployment.
 gh workflow run release-packages.yml -R $repo --ref master -f release_type=public -f tag=0.2.0
 #    Then install from $base per the README's "Getting Started" on bare
 #    el8, el9, el10, amzn2023, jammy and trixie containers.
@@ -507,13 +527,13 @@ EOF
 else
   cat <<EOF
 
-# 2-3. STOP: master does not have this code yet (no check_publish_target /
+# 2-4. STOP: master does not have this code yet (no check_publish_target /
 #      APT_ORIGIN=vector-db-benchmark in master's scripts/release/lib.sh, or gh
 #      could not read it). Merge #386 first. Setting PACKAGES_PRODUCTION=true or
-#      dispatching release_type=public before that runs master's OLD workflow,
+#      dispatching (internal or public) before that runs master's OLD workflow,
 #      which publishes with packages.redis.io's Origin and no <base>/gpg.
 #      After the merge, re-run this script with --apply; it then prints
-#      those two commands.
+#      the staging rehearsal and the two production commands.
 EOF
 fi
 if [[ "$apply" != 1 ]]; then echo; echo "(dry run: nothing above was changed; re-run with --apply)"; fi

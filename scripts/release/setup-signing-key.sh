@@ -85,5 +85,6 @@ Next:
   2. Once #386 is merged to master (not before: master's older workflow would
      publish with the wrong Origin and no <base>/gpg), re-run
      scripts/release/setup-production-repo.sh --apply, which then prints the
-     PACKAGES_PRODUCTION=true and release_type=public tag=0.2.0 commands.
+     staging rehearsal (release_type=internal repo_prefix=preprod-0.2.0), and
+     the PACKAGES_PRODUCTION=true and release_type=public tag=0.2.0 commands.
 EOF

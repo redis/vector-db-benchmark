@@ -176,12 +176,12 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
   `true`.** Until then a final release builds and tests the packages,
   publishes nothing, and says so in a `::notice::` (the run stays green);
   `release_type=public` is refused. The setup, in this order:
-  0. **The code of PR #386 is on master.** Nothing in steps 3-4 may happen
+  0. **The code of PR #386 is on master.** Nothing in steps 3-5 may happen
      before that: a release and a `--ref master` dispatch run MASTER's copy of
      the workflow, and the older one accepts `vdb-packages` but publishes with
      packages.redis.io as Origin and no `<base>/gpg` (and the next publish
      after the merge would then change the Origin under every early user).
-     `setup-production-repo.sh` prints steps 3-4 only once master has
+     `setup-production-repo.sh` prints steps 3-5 only once master has
      `check_publish_target` AND the run leaves nothing pending (right after an
      `--apply`, or a dry run that finds nothing to change); otherwise it says
      to run `--apply` first.
@@ -215,9 +215,36 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
      InRelease another key signed; a codename with no InRelease yet is new and
      accepted, which is how the first publish starts). Store the two key files
      in the team vault, then delete the directory.
-  3. **Switch on** (only after step 0): the REPOSITORY variable
+  3. **Rehearse 0.2.0 on staging** (only after steps 0-1), under a fresh
+     prefix so the first-publish path runs (no `gpg`, no InRelease yet):
+     `gh workflow run release-packages.yml --ref master -f release_type=internal -f tag=0.2.0 -f repo_prefix=preprod-0.2.0`.
+     Production has no `--overwrite`, so a bug that shows up after APT or
+     `gpg` were written would leave 0.2.0 half-published there for good; this
+     run is the first time the new publish steps (`check_publish_target`, the
+     `<base>/gpg` guard, `--origin`, the served-repository verify) write to
+     S3. The `staging` environment already has its four secrets (bucket
+     `vdb-package-staging`, us-east-2, role `vdb-package-staging-publisher`,
+     the throwaway staging key; no `APT_SIGNING_FPR`, which staging does not
+     require). When it is green, against
+     `https://s3.us-east-2.amazonaws.com/vdb-package-staging/preprod-0.2.0`:
+     - `gpg` serves the staging key: byte-identical to the staging root's
+       `gpg` (`cmp <(curl -fsS <base>/gpg) <(curl -fsS <staging root>/gpg)`);
+     - every codename's `deb/dists/<codename>/Release` has
+       `Origin: vector-db-benchmark`;
+     - the README "Getting Started" installs, with the production URL
+       replaced by that base, work on bare jammy, trixie, el9 and amzn2023
+       containers with signature checking on, and
+       `vector-db-benchmark --version` says 0.2.0.
+
+     On any failure: fix, merge, and rehearse again under a new prefix
+     (`preprod-0.2.0-2`, …). The rehearsal does not exercise the production
+     role or key (staging's role and key sign it); `setup-production-repo.sh`
+     keeps the production role's permissions a superset of what the publish
+     needs (list, get-bucket-location, get/put/put-ACL/abort-upload under
+     `deb/`, `rpm/`, `gpg`, delete the lockfile).
+  4. **Switch on** (only after steps 0-3): the REPOSITORY variable
      `gh variable set PACKAGES_PRODUCTION -R redis/vector-db-benchmark --body true`.
-  4. **Publish 0.2.0**, which is already released (only after step 0):
+  5. **Publish 0.2.0**, which is already released (only after steps 0-4):
      `gh workflow run release-packages.yml --ref master -f release_type=public -f tag=0.2.0`,
      approve the deployment, then install from the README's "Getting
      Started" on bare el8, el9, el10, amzn2023, jammy and trixie containers
