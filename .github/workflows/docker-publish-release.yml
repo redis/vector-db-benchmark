@@ -1,13 +1,21 @@
 name: Docker Publish - Release
 
-# Builds and pushes redis/vector-db-benchmark:<version> (and :latest for a
-# final release) when a release is published.
+# Builds and pushes redis/vector-db-benchmark:<version> to Docker Hub when a
+# release is published, plus :latest when the tag is the repository's latest
+# release. Missing DOCKER_USERNAME / DOCKER_PASSWORD secrets fail the run: a
+# release with no image must be loud.
 #
 # workflow_dispatch publishes an EXISTING published release whose own run
 # failed: "Re-run" would replay the tag's own (possibly broken) copy of this
 # workflow, so dispatch this file from master with `tag=<tag>` instead. The
-# build context is the tag's commit, and the image tags are exactly the ones a
-# release event for that tag produces.
+# build context is the tag's commit, and the image tags are the ones a release
+# event for that tag produces.
+#
+# The vulnerability scan runs in a separate job that holds no registry
+# credentials, after the push, and cannot fail the publish.
+#
+# Every action is pinned by full commit SHA (the March 2026 trivy-action tag
+# hijack, GHSA-69fq-xp46-6x23, moved version tags to an infostealer).
 
 on:
   release:
@@ -28,21 +36,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
-      security-events: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+      digest: ${{ steps.build.outputs.digest }}
 
     steps:
       # Resolves the tag, its commit and the docker/metadata-action tag rules.
       # A release event keeps metadata-action's own rules. A dispatch replicates
       # them with type=raw, because there github.ref is the branch, not the tag.
       # For metadata-action v5 on a release event (ref refs/tags/<tag>):
-      #   type=semver,pattern={{version}} -> <tag> without a leading "v"; it is
-      #     processed first (priority 900 > 600) and so decides `latest`
-      #     (flavor latest=auto): true for X.Y.Z, false for a prerelease.
+      #   type=semver,pattern={{version}} -> <tag> without a leading "v"
       #   type=ref,event=tag              -> <tag> verbatim (deduplicated when
-      #     it equals the semver value).
-      # So 0.2.0 -> 0.2.0, latest; v0.2.0 -> 0.2.0, v0.2.0, latest;
-      # 0.2.0-rc.1 -> 0.2.0-rc.1 only.
+      #                                      it equals the semver value)
+      # `latest` is NOT left to metadata-action (flavor latest=false): its
+      # latest=auto tags every final X.Y.Z, so a backport release, or a
+      # dispatch of an older tag, would move :latest backwards. :latest is added
+      # only for a final (no "-") tag that is the repository's latest release.
+      # So, with 0.2.0 the latest release: 0.2.0 -> 0.2.0, latest;
+      # v0.2.0 -> 0.2.0, v0.2.0, latest; 0.2.0-rc.1 -> 0.2.0-rc.1;
+      # 0.1.0 -> 0.1.0 (and a ::warning::).
       - name: Resolve release tag
         id: release
         env:
@@ -56,6 +69,7 @@ jobs:
             release)
               tag="$RELEASE_TAG"
               sha="$GITHUB_SHA"
+              version="${tag#v}"
               rules=$'type=ref,event=tag\ntype=semver,pattern={{version}}'
               ;;
             workflow_dispatch)
@@ -64,7 +78,7 @@ jobs:
                 echo "::error::invalid tag '$tag' (expected X.Y.Z, vX.Y.Z or X.Y.Z-rc.N)"
                 exit 1
               fi
-              if ! info="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json tagName,isDraft,publishedAt)"; then
+              if ! info="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json tagName,isDraft,publishedAt,targetCommitish)"; then
                 echo "::error::no published release for tag '$tag'"
                 exit 1
               fi
@@ -76,13 +90,17 @@ jobs:
               fi
               # The tag's COMMIT (an annotated tag resolves through to it).
               sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha)"
+              # A release created from a commit records it: refuse a tag that
+              # has since been moved to another commit.
+              target="$(jq -r '.targetCommitish // ""' <<<"$info")"
+              if [[ "$target" =~ ^[0-9a-f]{40}$ && "$target" != "$sha" ]]; then
+                echo "::error::tag '$tag' is on $sha but its release was created at $target"
+                exit 1
+              fi
               version="${tag#v}"
               rules="type=raw,value=$version"
               if [[ "$tag" != "$version" ]]; then
                 rules+=$'\n'"type=raw,value=$tag"
-              fi
-              if [[ "$version" != *-* ]]; then
-                rules+=$'\n'"type=raw,value=latest"
               fi
               ;;
             *)
@@ -94,20 +112,34 @@ jobs:
             echo "::error::could not resolve a commit for '$tag'"
             exit 1
           fi
+          # A prerelease version never gets :latest (as metadata-action's semver
+          # rule). A final one only when it is the repository's latest release.
+          latest=false
+          if [[ "$version" != *-* ]]; then
+            newest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name || true)"
+            if [[ "$tag" == "$newest" ]]; then
+              latest=true
+              rules+=$'\n'"type=raw,value=latest"
+            else
+              echo "::warning::'$tag' is not the latest release ('${newest:-none}'); not moving :latest"
+            fi
+          fi
           {
             echo "tag=$tag"
             echo "sha=$sha"
+            echo "latest=$latest"
             echo "rules<<VDB_EOF"
             echo "$rules"
             echo "VDB_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "Building \`$tag\` from \`$sha\` ($EVENT)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Building \`$tag\` from \`$sha\` ($EVENT, latest: $latest)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Empty on a release event: the default, which is the release's tag.
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', steps.release.outputs.tag) || '' }}
+          persist-credentials: false
 
       - name: Verify the checkout is the tag's commit
         env:
@@ -120,10 +152,10 @@ jobs:
           fi
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Check Docker Hub credentials
         env:
@@ -131,14 +163,13 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
           if [[ -z "$DOCKER_USERNAME" || -z "$DOCKER_PASSWORD" ]]; then
-            echo "Docker Hub credentials not configured!"
-            echo "Please set DOCKER_USERNAME and DOCKER_PASSWORD secrets in repository settings."
+            echo "::error::Docker Hub credentials not configured! Set the DOCKER_USERNAME and DOCKER_PASSWORD repository secrets, then dispatch this workflow from master with tag=<tag>."
             exit 1
           fi
           echo "Docker Hub credentials are configured"
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -146,17 +177,20 @@ jobs:
 
       - name: Extract metadata for Docker
         id: docker_meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
           tags: ${{ steps.release.outputs.rules }}
           # On a dispatch github.sha is master's head, not the tag's commit.
           labels: |
             org.opencontainers.image.revision=${{ steps.release.outputs.sha }}
+            org.opencontainers.image.source=https://github.com/redis/vector-db-benchmark
 
       - name: Build and push Docker image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -171,32 +205,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # The scan is advisory: the image is already pushed, so a scanner failure
-      # must not fail the run or skip the steps below. Its outcome is reported
-      # in the summary. Pinned by SHA after the March 2026 trivy-action tag
-      # hijack (GHSA-69fq-xp46-6x23): v0.36.0 is a post-incident, signed tag
-      # on an immutable release. The Trivy binary is pinned too (>= v0.72.0
-      # fixes GHSA-mcj4-mphf-j9ff, GHSA-8rc5-4fr6-64pw, GHSA-q3fv-x8vg-qqm4).
-      - name: Run Trivy vulnerability scanner
-        id: trivy
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          # The manifest list that was just pushed, by digest.
-          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          version: 'v0.76.1'
-
-      - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
-        if: always() && hashFiles('trivy-results.sarif') != ''
-        continue-on-error: true
-        with:
-          sarif_file: 'trivy-results.sarif'
-
       - name: Update Docker Hub description
-        uses: peter-evans/dockerhub-description@v4
+        uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77 # v4.0.2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -210,8 +220,7 @@ jobs:
           VERSION: ${{ steps.docker_meta.outputs.version }}
           TAGS: ${{ steps.docker_meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
-          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
-          REPO: ${{ github.repository }}
+          LATEST: ${{ steps.release.outputs.latest }}
         run: |
           {
             echo "## Docker Release Published"
@@ -228,16 +237,73 @@ jobs:
             echo "\`\`\`bash"
             echo "# Specific version"
             echo "docker run --rm $IMAGE_NAME:$VERSION --help"
-            # A prerelease does not move :latest.
-            if grep -qx "$IMAGE_NAME:latest" <<<"$TAGS"; then
+            # Only a final release that is the repository's latest moves :latest.
+            if [[ "$LATEST" == "true" ]]; then
               echo ""
               echo "# Latest release"
               echo "docker run --rm $IMAGE_NAME:latest --help"
             fi
             echo "\`\`\`"
             echo ""
-            echo "**Trivy scan:** $TRIVY_OUTCOME"
-            echo ""
             echo "[View on Docker Hub](https://hub.docker.com/r/redis/vector-db-benchmark)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Advisory scan of the pushed manifest list, by digest. The Docker Hub
+  # repository is public, so this job pulls anonymously and holds no secrets;
+  # it cannot fail the release (the image is already pushed).
+  scan:
+    needs: docker-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout the release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.docker-publish.outputs.sha }}
+          persist-credentials: false
+
+      # trivy-action v0.36.0: a post-incident, signed tag on an immutable
+      # release. The Trivy binary is pinned too (>= v0.72.0 fixes
+      # GHSA-mcj4-mphf-j9ff, GHSA-8rc5-4fr6-64pw, GHSA-q3fv-x8vg-qqm4).
+      - name: Run Trivy vulnerability scanner
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}@${{ needs.docker-publish.outputs.digest }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          version: 'v0.76.1'
+
+      # File the results under the release tag and its commit, not under
+      # master (a dispatch's GITHUB_REF / GITHUB_SHA).
+      - name: Upload Trivy scan results to GitHub Security tab
+        id: sarif
+        uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        continue-on-error: true
+        with:
+          sarif_file: 'trivy-results.sarif'
+          ref: refs/tags/${{ needs.docker-publish.outputs.tag }}
+          sha: ${{ needs.docker-publish.outputs.sha }}
+
+      - name: Generate summary
+        if: always()
+        env:
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ needs.docker-publish.outputs.digest }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+          SARIF_OUTCOME: ${{ steps.sarif.outcome }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "## Trivy scan"
+            echo ""
+            echo "**Image:** \`$IMAGE_REF\`"
+            echo "**Scan:** ${TRIVY_OUTCOME:-not run}"
+            echo "**SARIF upload:** ${SARIF_OUTCOME:-skipped (no results file)}"
+            echo ""
             echo "[Security Scan Results](https://github.com/$REPO/security/code-scanning)"
           } >> "$GITHUB_STEP_SUMMARY"
