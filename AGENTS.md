@@ -140,6 +140,8 @@ digests differ and the run refuses. Rebuild a tag on purpose only with
 touch the archive's inputs: `make release-selftest` and
 `scripts/release/install-test.sh` run there.
 
+If the Docker publish (`docker-publish-release.yml`) fails, dispatch `docker-publish-release.yml` from `master` with `tag=<tag>` (a re-run would replay the tag's own copy of the workflow).
+
 ### Packages (`release-packages.yml`)
 
 The same `release: published` event also builds a .deb per codename and an
