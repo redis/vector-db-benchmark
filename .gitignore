@@ -32,3 +32,8 @@ debian/.debhelper/
 debian/*.substvars
 debian/*.debhelper.log
 debian/vector-db-benchmark/
+
+# Package signing key material (scripts/release/setup-signing-key.sh writes it
+# outside the checkout; never commit it)
+*.secret.asc
+*.rev

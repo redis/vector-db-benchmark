@@ -1649,9 +1649,11 @@ fn every_repo_path_named_in_the_agent_docs_exists() {
 /// run (INV-A4), and the binaries the packages install must be exactly cargo's
 /// bin targets (checked below), so a renamed or added binary fails here even
 /// when no package build runs. Production publishing is gated (variable,
-/// final tag, pinned signing key). A package built with a different
-/// toolchain than the archives of the same release, or by an inline `cargo
-/// build` no PR exercised, is exactly what the release pipeline must not ship.
+/// final tag, pinned signing key) and goes to OUR OWN bucket only
+/// (`vdb-packages`), never a staging bucket or the shared packages.redis.io.
+/// A package built with a different toolchain than the archives of the same
+/// release, or by an inline `cargo build` no PR exercised, is exactly what the
+/// release pipeline must not ship.
 #[test]
 fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_scripts() {
     fn pinned_toolchain(wf: &str, name: &str) -> String {
@@ -1688,10 +1690,10 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "make release-selftest-packages",
         "--dry-run",
         "VDB_BUILD_GIT_SHA",
-        // The publish job pins the bucket to the environment, and the shared,
-        // production-signed Redis staging bucket is taken only under a prefix.
-        "STAGING_BUCKET",
-        "SHARED_STAGING_BUCKET",
+        // The publish job pins the bucket to the environment (lib.sh
+        // check_publish_target: production is vdb-packages only; the shared,
+        // Redis-signed staging bucket is taken only under a prefix).
+        "check_publish_target",
         // The verify step reads the bucket over HTTPS through lib.sh's
         // path-style URL (see the scan below), and checks OUR stanza.
         "s3_origin_url",
@@ -1724,8 +1726,8 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
     }
     // No virtual-hosted S3 URL (`<bucket>.s3.<region>.amazonaws.com`, or the
     // legacy `<bucket>.s3-<region>`): S3's certificate is a one-label wildcard,
-    // so it fails TLS for a dotted bucket, and production is
-    // `packages.redis.io`. The verify step would go red AFTER publishing. Build
+    // so it fails TLS for a dotted bucket, and the README gives users the
+    // path-style URL. The verify step would go red AFTER publishing. Build
     // the URL with lib.sh's path-style `s3_origin_url` instead.
     let mut sources = vec![(
         ".github/workflows/release-packages.yml".to_string(),
@@ -1739,6 +1741,8 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "build-deb.sh",
         "build-rpm.sh",
         "selftest-packages.sh",
+        "setup-production-repo.sh",
+        "setup-signing-key.sh",
     ] {
         let name = format!("scripts/release/{script}");
         sources.push((name.clone(), repo_file(&name)));
@@ -1774,6 +1778,15 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
         "check_signing_fpr \"$EXPECTED_FPR\" \"$fpr\" \"$PUBLISH_TO\" || { echo \"::error::signing key does not match the environment's APT_SIGNING_FPR (see above)\"; exit 1; }",
         "base=\"$(s3_origin_url \"$BUCKET\" \"$REGION\" \"$REPO_PREFIX\")\"",
         "gpg_status_signed_by \"$signing_fpr\" <<<\"$status\" ||",
+        "check_publish_target \"$PUBLISH_TO\" \"$BUCKET\" \"$REGION\" \"$REPO_PREFIX\" || { echo \"::error::environment '$PUBLISH_TO' may not publish to s3://$BUCKET (see above)\"; exit 1; }",
+        // <base>/gpg must hold our key before anything is published, and
+        // serve it afterwards.
+        "check_served_key served-gpg \"$signing_fpr\" || { echo \"::error::s3://$BUCKET/$key holds another key; refusing to replace the key users trust (nothing was published)\"; exit 1; }",
+        "elif s3_head_missing head.err; then",
+        "check_served_key served-gpg \"$signing_fpr\" || { echo \"::error::$base/gpg does not serve exactly $signing_fpr\"; exit 1; }",
+        // Production never takes --overwrite.
+        "OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}",
+        "args=(--bucket \"$BUCKET\" --region \"$REGION\" --in debs --prefix \"${REPO_PREFIX:+$REPO_PREFIX/}deb\" --origin \"$APT_ORIGIN\")",
     ] {
         assert!(
             wf_code.iter().any(|l| l == call),
@@ -1785,6 +1798,63 @@ fn package_workflow_shares_the_release_toolchain_and_runs_only_the_tested_script
             .iter()
             .any(|l| l == "if ! gpg_status_signed_by \"$fpr\" <<<\"$status\"; then"),
         "publish-apt.sh no longer checks the existing InRelease's signer"
+    );
+    // Production is our own bucket. lib.sh names it, and the shared Redis
+    // buckets production refuses; nothing pins Redis's signing key any more
+    // (our key's fingerprint is the environment's APT_SIGNING_FPR).
+    let lib_code = code_lines(&repo_file("scripts/release/lib.sh"));
+    for line in [
+        "PRODUCTION_BUCKET=vdb-packages",
+        "PRODUCTION_REGION=us-east-2",
+        "STAGING_BUCKET=vdb-package-staging",
+        "SHARED_STAGING_BUCKET=redis-test-package-repository",
+        "SHARED_REDIS_BUCKETS=(packages.redis.io \"$SHARED_STAGING_BUCKET\")",
+    ] {
+        assert!(
+            lib_code.iter().any(|l| l == line),
+            "scripts/release/lib.sh no longer has `{line}`"
+        );
+    }
+    // Compared with whitespace and quotes removed and case folded, so
+    // `5431 8fa4 ...`, `--origin "packages.redis.io"` and `Origin: ...` count.
+    let mut docs = sources.clone();
+    docs.push(("AGENTS.md".to_string(), repo_file("AGENTS.md")));
+    for (name, src) in &docs {
+        let squashed: String = src
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect::<String>()
+            .to_lowercase();
+        assert!(
+            !squashed.contains("54318fa4052d1e61"),
+            "{name} names Redis's packages.redis.io signing key; production is signed with our own key (APT_SIGNING_FPR)"
+        );
+        for origin in [
+            "origin=packages.redis.io",
+            "origin:packages.redis.io",
+            "--originpackages.redis.io",
+        ] {
+            assert!(
+                !squashed.contains(origin),
+                "{name} labels our repository with packages.redis.io's Origin; use lib.sh APT_ORIGIN"
+            );
+        }
+    }
+    // <base>/gpg is published before any package, unconditionally.
+    let gpg_step = packages
+        .find("- name: Publish the public key as <base>/gpg")
+        .expect("release-packages.yml has no `Publish the public key as <base>/gpg` step");
+    let apt_step = packages
+        .find("- name: Publish APT")
+        .expect("release-packages.yml has no `Publish APT` step");
+    assert!(
+        gpg_step < apt_step,
+        "release-packages.yml must publish <base>/gpg before the APT step"
+    );
+    let gpg_body = &packages[gpg_step..apt_step];
+    assert!(
+        !gpg_body.lines().any(|l| l.trim_start().starts_with("if:")),
+        "release-packages.yml's <base>/gpg step must not be conditional"
     );
     // The verify step builds no URL from the bucket name itself (a two-line
     // `host=...; base="https://$BUCKET.$host"` would get past the scan above).

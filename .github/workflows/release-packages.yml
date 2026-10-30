@@ -1,63 +1,79 @@
 name: Release packages (deb/rpm)
 
-# Native .deb and .rpm packages for a release, published to the Redis APT and
-# YUM repositories (packages.redis.io, or its staging bucket) in the same
-# layout memtier-benchmark uses:
+# Native .deb and .rpm packages for a release, published to OUR OWN APT and
+# YUM repository (S3 bucket vdb-packages, us-east-2, AWS account 726902207197,
+# the account of the staging bucket), in the layout memtier-benchmark uses:
 #   deb/dists/<codename>/...   one build per codename (focal..resolute,
 #                              bullseye..trixie), amd64 + arm64, via deb-s3
 #   rpm/<distro>/<arch>/       el8, el9, el10, amzn2023 x x86_64, aarch64,
 #                              createrepo_c metadata, public-read objects
+#   gpg                        the signing key's public half
+# served at the bucket's path-style S3 URL (lib.sh s3_origin_url):
+#   https://s3.us-east-2.amazonaws.com/vdb-packages/{deb,rpm,gpg}
+# It is NOT packages.redis.io: that repository is shared by every Redis
+# product and signed with Redis's key, and the publish job refuses its buckets.
 #
 # Every package is built natively INSIDE a container of the distribution it is
 # for (memtier's model), with --features release-static from #366 and the Rust
 # toolchain release-binaries.yml pins, so a package depends on nothing but that
 # distro's glibc. Then it is installed and run on a bare container of that
 # distribution, both from the file and from a local repository laid out like
-# packages.redis.io (scripts/release/test-package.sh). The packages are served
-# by the repositories, not attached to the GitHub release (the release's
+# the production one (scripts/release/test-package.sh). The packages are served
+# by the repository, not attached to the GitHub release (the release's
 # assets are #366's archives + SHA256SUMS).
 #
 # Where it publishes is the GitHub ENVIRONMENT, and nothing else differs:
-#   staging  our own rehearsal bucket (vdb-package-staging, us-east-2, AWS
-#            account 726902207197), the production layout at its root (deb/,
-#            rpm/, and the throwaway signing key's public half as gpg) —
+#   staging  our rehearsal bucket (vdb-package-staging, us-east-2, same
+#            account), the production layout at its root (deb/, rpm/, and the
+#            throwaway signing key's public half as gpg) —
 #            workflow_dispatch with release_type=internal (the default),
 #            with or without a release tag (without one, the dispatched ref
 #            is built). An optional repo_prefix puts everything under a
 #            sub-path. The Redis-wide staging bucket
 #            (redis-test-package-repository) is accepted only under a
-#            prefix: its deb/ and rpm/ are signed with the PRODUCTION key,
-#            so publishing there would re-sign indexes other products rely on.
-#   build    production, packages.redis.io, no prefix — a published
+#            prefix: its deb/ and rpm/ are signed with Redis's key, so
+#            publishing there would re-sign indexes other products rely on.
+#   build    production, vdb-packages, no prefix — a published
 #            non-prerelease release, or workflow_dispatch release_type=public;
 #            only once vars.PACKAGES_PRODUCTION is 'true', final tags only
-# Each environment carries the same secret names as memtier-benchmark's `build`
+# The buckets, region and Origin live in scripts/release/lib.sh. Each
+# environment carries the same secret names as memtier-benchmark's `build`
 # environment: APT_S3_BUCKET, APT_S3_REGION, APT_SIGNING_KEY and either
 # APT_S3_IAM_ARN (OIDC role to assume) or APT_S3_ACCESS_KEY_ID +
 # APT_S3_SECRET_ACCESS_KEY. The publish job checks the bucket it was handed
-# matches the environment (staging MUST be the staging bucket, build MUST NOT
-# be), so a repository-level secret inherited by an environment cannot send a
-# rehearsal to production. Pull requests build, test and dry-run the publish
-# scripts; they never publish.
+# matches the environment (lib.sh check_publish_target: staging MUST be a
+# staging bucket; build MUST be vdb-packages in us-east-2, and is refused
+# outright for a staging bucket or packages.redis.io), so a repository-level
+# secret inherited by an environment cannot send a rehearsal to production,
+# or anything to the shared Redis repository. Pull requests build, test and
+# dry-run the publish scripts; they never publish.
 #
 # PRODUCTION IS OFF until the repository variable PACKAGES_PRODUCTION is
 # 'true'. Until then a published final release builds and tests every
 # package and publishes nothing (a ::notice:: says so; no `build` environment
-# is created), and release_type=public is refused. Switch it on only after:
-#   1. creating the `build` environment and protecting it: required reviewers,
-#      and deployment branches/tags limited to `master` plus the release tags
-#      (`[0-9]*.[0-9]*.[0-9]*`, `v[0-9]*.[0-9]*.[0-9]*`). workflow_dispatch runs
+# is created), and release_type=public is refused. Switch it on only after
+# (AGENTS.md "Packages" has the runbook):
+#   0. THIS workflow is on master: master's copy is what a release and a
+#      `--ref master` dispatch run, and an older copy publishes with another
+#      Origin and no <base>/gpg;
+#   1. scripts/release/setup-production-repo.sh --apply: the `build`
+#      environment protected FIRST (required reviewer; deployment
+#      branches/tags limited to `master` plus `[0-9]*.[0-9]*.[0-9]*` and
+#      `v[0-9]*.[0-9]*.[0-9]*`; a ruleset letting only admins create release
+#      tags), then the bucket and the publisher role. workflow_dispatch runs
 #      the workflow file of the DISPATCHED ref, so a branch that edits the
-#      guards below out of its copy would otherwise reach `build`'s secrets.
-#      The tag rule alone does not stop that either: anyone who can push a
-#      matching tag can tag a modified workflow. Required reviewers are the
-#      real gate; also add a tag ruleset restricting who may create
-#      release-pattern tags;
-#   2. adding the five secrets, and the environment VARIABLE APT_SIGNING_FPR =
-#      54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C (the key packages.redis.io/gpg
-#      serves). The publish job refuses a key with another fingerprint, and
-#      publish-apt.sh refuses a codename whose InRelease is not already signed
-#      by the key in use: deb-s3 re-signs every product's index of a codename.
+#      guards below out of its copy would otherwise reach `build`'s secrets,
+#      and anyone who can push a matching tag could tag a modified workflow.
+#      The required reviewer is the gate against both: today ONE maintainer
+#      who may approve their own dispatch (prevent_self_review off), which
+#      stops mistakes, not a compromised maintainer account;
+#   2. scripts/release/setup-signing-key.sh: our own key (RSA 4096, no
+#      passphrase), the secrets, and the environment VARIABLE APT_SIGNING_FPR.
+#      The publish job refuses a key with another fingerprint, refuses a
+#      <base>/gpg that holds another key, and publish-apt.sh refuses a
+#      codename whose InRelease is not already signed by the key in use (the
+#      first publish creates each codename, unsigned before it; every later
+#      one must match).
 # Production takes final tags only (X.Y.Z / vX.Y.Z, lib.sh
 # check_production_tag): packages carry the crate version without any
 # pre-release suffix, so an rc published there would be labelled as the final
@@ -67,18 +83,16 @@ name: Release packages (deb/rpm)
 # job). GitHub keeps one running and ONE pending: a third queued publish
 # cancels the pending one, which then shows as cancelled, not published.
 #
-# YUM has no cross-product lock: publish-yum.sh re-lists each directory before
-# uploading repodata/ and checks afterwards that every RPM there is indexed.
-# The residual risk is one-directional: another product's tool, with no such
-# check, can still upload a repodata/ built before our RPM landed, after our
-# check, and drop our RPM from the index while this run stays green.
+# YUM has no lock: publish-yum.sh re-lists each directory before uploading
+# repodata/ and checks afterwards that every RPM there is indexed. Production
+# holds only our packages and publishes one at a time, so that race only
+# matters in the shared staging bucket.
 #
-# Size of a production YUM publish: publish-yum.sh downloads every object in
-# each rpm/<distro>/<arch>/ it touches (createrepo_c --update needs them on
-# disk); a release touches 8. On 2026-10-29 each of those directories indexed
-# 27 RPMs, about 20 MB (from its public primary.xml.gz; objects that no index
-# lists are not visible without bucket listing rights), so roughly 160 MB of
-# downloads per release plus our own uploads.
+# Size of a YUM publish: publish-yum.sh downloads every object in each
+# rpm/<distro>/<arch>/ it touches (createrepo_c --update needs them on disk);
+# a release touches 8. In our own repository that is our own earlier RPMs
+# (about 17 MB each on 2026-10-30) plus metadata: roughly 8 x 17 MB = 140 MB
+# more download for every release already published.
 #
 # The matrix comes from repository variables when set (as in memtier):
 #   vars.DEB_DISTS / vars.RPM_DISTROS        JSON lists, release + dispatch
@@ -95,7 +109,7 @@ on:
         required: false
         type: string
       release_type:
-        description: Where to publish (internal = staging bucket, public = packages.redis.io, none = build and test only)
+        description: Where to publish (internal = staging bucket, public = our production repository vdb-packages, none = build and test only)
         type: choice
         options: [internal, public, none]
         default: internal
@@ -130,6 +144,8 @@ on:
       - 'scripts/release/publish-yum.sh'
       - 'scripts/release/selftest-packages.sh'
       - 'scripts/release/lib.sh'
+      - 'scripts/release/setup-production-repo.sh'
+      - 'scripts/release/setup-signing-key.sh'
       - '.github/workflows/release-packages.yml'
       # What the packages ship besides compiled code, and the binary set (the
       # rest of src/ is built --features release-static by release-binaries.yml).
@@ -156,8 +172,6 @@ env:
   # enough to prove the packaging, not 22 cold static builds per push.
   DEFAULT_PR_DEB_DISTS: '["jammy"]'
   DEFAULT_PR_RPM_DISTROS: '["el9"]'
-  STAGING_BUCKET: vdb-package-staging
-  SHARED_STAGING_BUCKET: redis-test-package-repository
 
 # Container steps otherwise run under `sh`, which is dash on Debian/Ubuntu
 # images: every step here may use bash (pipefail, [[ ]], arrays).
@@ -312,6 +326,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm createrepo-c dpkg-dev
       - run: make release-selftest-packages
+      # The release scripts, the one-time setup ones included, which no other
+      # job runs (shellcheck is preinstalled on the runner).
+      - run: shellcheck --version && shellcheck -x scripts/release/*.sh
 
   build-deb:
     name: deb ${{ matrix.dist }} ${{ matrix.arch }}
@@ -514,34 +531,6 @@ jobs:
       BUCKET: ${{ secrets.APT_S3_BUCKET }}
       REGION: ${{ secrets.APT_S3_REGION }}
     steps:
-      - name: Check the environment is configured, and is the one it claims to be
-        env:
-          ROLE: ${{ secrets.APT_S3_IAM_ARN }}
-          KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
-          SIGNING: ${{ secrets.APT_SIGNING_KEY }}
-        run: |
-          set -euo pipefail
-          [[ -n "$BUCKET" && -n "$REGION" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_S3_BUCKET / APT_S3_REGION"; exit 1; }
-          [[ -n "$ROLE" || -n "$KEY_ID" ]] || { echo "::error::environment '$PUBLISH_TO' has neither APT_S3_IAM_ARN nor APT_S3_ACCESS_KEY_ID"; exit 1; }
-          # Repository-level secrets are inherited by every environment: make
-          # sure 'staging' really points at the staging bucket and 'build' never does.
-          case "$PUBLISH_TO" in
-            staging)
-              case "$BUCKET" in
-                "$STAGING_BUCKET") ;;
-                "$SHARED_STAGING_BUCKET")
-                  # Its deb/ and rpm/ are the shared, production-signed repositories.
-                  [[ -n "$REPO_PREFIX" ]] || { echo "::error::$SHARED_STAGING_BUCKET is shared with every Redis product; a rehearsal there needs repo_prefix"; exit 1; } ;;
-                *) echo "::error::environment 'staging' has APT_S3_BUCKET set to '$BUCKET', not a staging bucket; refusing to rehearse against it"; exit 1 ;;
-              esac ;;
-            build)
-              [[ "$BUCKET" != "$STAGING_BUCKET" && "$BUCKET" != "$SHARED_STAGING_BUCKET" ]] || { echo "::error::environment 'build' points at a staging bucket"; exit 1; }
-              [[ -z "$REPO_PREFIX" ]] || { echo "::error::production publishes at the bucket root, got prefix '$REPO_PREFIX'"; exit 1; } ;;
-            *) echo "::error::unexpected publish target '$PUBLISH_TO'"; exit 1 ;;
-          esac
-          # Unsigned publishing is refused by the scripts; say so up front.
-          [[ -n "$SIGNING" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_SIGNING_KEY (staging takes a throwaway key, see the workflow header)"; exit 1; }
-          echo "use_oidc=$([[ -n "$ROLE" ]] && echo true || echo false)" >> "$GITHUB_ENV"
       # The publish scripts come from the workflow's OWN commit (github.sha),
       # the same one as the guards in this file and the selftest job, while
       # the packages were built from the planned commit (the tag), so the
@@ -553,6 +542,24 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: scripts/release
+      - name: Check the environment is configured, and is the one it claims to be
+        env:
+          ROLE: ${{ secrets.APT_S3_IAM_ARN }}
+          KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
+          SIGNING: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "$BUCKET" && -n "$REGION" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_S3_BUCKET / APT_S3_REGION"; exit 1; }
+          [[ -n "$ROLE" || -n "$KEY_ID" ]] || { echo "::error::environment '$PUBLISH_TO' has neither APT_S3_IAM_ARN nor APT_S3_ACCESS_KEY_ID"; exit 1; }
+          # shellcheck source=scripts/release/lib.sh
+          source scripts/release/lib.sh
+          # Repository-level secrets are inherited by every environment: make
+          # sure 'staging' really points at a staging bucket, and 'build' at
+          # our production bucket only (never staging, never packages.redis.io).
+          check_publish_target "$PUBLISH_TO" "$BUCKET" "$REGION" "$REPO_PREFIX" || { echo "::error::environment '$PUBLISH_TO' may not publish to s3://$BUCKET (see above)"; exit 1; }
+          # Unsigned publishing is refused by the scripts; say so up front.
+          [[ -n "$SIGNING" ]] || { echo "::error::environment '$PUBLISH_TO' has no APT_SIGNING_KEY (see the workflow header)"; exit 1; }
+          echo "use_oidc=$([[ -n "$ROLE" ]] && echo true || echo false)" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           pattern: deb-*
@@ -604,10 +611,10 @@ jobs:
       - name: Import the signing key
         env:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
-          # The fingerprint the environment's repositories are signed with
+          # The fingerprint the environment's repository is signed with
           # (environment variable, not a secret). Required for `build`, where
-          # it is production's 54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
-          # (https://packages.redis.io/gpg); optional for staging.
+          # it is our own production key's (the one <base>/gpg serves);
+          # optional for staging.
           EXPECTED_FPR: ${{ vars.APT_SIGNING_FPR }}
         run: |
           set -euo pipefail
@@ -620,12 +627,39 @@ jobs:
           source scripts/release/lib.sh
           check_signing_fpr "$EXPECTED_FPR" "$fpr" "$PUBLISH_TO" || { echo "::error::signing key does not match the environment's APT_SIGNING_FPR (see above)"; exit 1; }
           echo "signing_fpr=$fpr" >> "$GITHUB_ENV"
+      - name: Publish the public key as <base>/gpg
+        # What the README's install steps import, in both environments. It
+        # must be the key we sign with: a gpg object holding any other key
+        # is refused here, before a single package is written. The same key
+        # is uploaded again on every run (a renewed expiry reaches NEW
+        # installs that way; existing ones keep their local copy and must
+        # re-import it, see AGENTS.md); no other key ever replaces it.
+        run: |
+          set -euo pipefail
+          # shellcheck source=scripts/release/lib.sh
+          source scripts/release/lib.sh
+          key="${REPO_PREFIX:+$REPO_PREFIX/}gpg"
+          rc=0; aws s3api head-object --bucket "$BUCKET" --key "$key" >/dev/null 2>head.err || rc=$?
+          if [[ "$rc" -eq 0 ]]; then
+            aws s3 cp "s3://$BUCKET/$key" served-gpg --only-show-errors
+            check_served_key served-gpg "$signing_fpr" || { echo "::error::s3://$BUCKET/$key holds another key; refusing to replace the key users trust (nothing was published)"; exit 1; }
+            echo "s3://$BUCKET/$key already holds $signing_fpr"
+          elif s3_head_missing head.err; then
+            echo "s3://$BUCKET/$key does not exist yet: first publish with $signing_fpr"
+          else
+            echo "::error::cannot read s3://$BUCKET/$key:"; cat head.err; exit 1
+          fi
+          gpg --export --armor "$signing_fpr" > gpg.asc
+          aws s3 cp gpg.asc "s3://$BUCKET/$key" --acl public-read --content-type text/plain --only-show-errors
+          echo "ok: s3://$BUCKET/$key ($signing_fpr)"
       - name: Publish APT (scripts/release/publish-apt.sh)
         env:
           OVERWRITE: ${{ inputs.overwrite == true && needs.plan.outputs.publish_to == 'staging' }}
         run: |
           set -euo pipefail
-          args=(--bucket "$BUCKET" --region "$REGION" --in debs --prefix "${REPO_PREFIX:+$REPO_PREFIX/}deb" --origin packages.redis.io)
+          # shellcheck source=scripts/release/lib.sh
+          source scripts/release/lib.sh
+          args=(--bucket "$BUCKET" --region "$REGION" --in debs --prefix "${REPO_PREFIX:+$REPO_PREFIX/}deb" --origin "$APT_ORIGIN")
           [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
           bash scripts/release/publish-apt.sh "${args[@]}"
       - name: Publish YUM (scripts/release/publish-yum.sh)
@@ -636,28 +670,21 @@ jobs:
           args=(--bucket "$BUCKET" --in rpms --prefix "${REPO_PREFIX:+$REPO_PREFIX/}rpm")
           [[ "$OVERWRITE" == true ]] && args+=(--overwrite)
           bash scripts/release/publish-yum.sh "${args[@]}"
-      - name: Publish the public key next to the rehearsal repositories (staging only)
-        # Production's /gpg is the packaging team's; the staging bucket gets
-        # its own, so the README's install steps work against it verbatim with
-        # the base URL swapped.
-        if: needs.plan.outputs.publish_to == 'staging'
-        run: |
-          set -euo pipefail
-          gpg --export --armor "$signing_fpr" > gpg.asc
-          aws s3 cp gpg.asc "s3://$BUCKET/${REPO_PREFIX:+$REPO_PREFIX/}gpg" --acl public-read --content-type text/plain --only-show-errors
-          echo "ok: s3://$BUCKET/${REPO_PREFIX:+$REPO_PREFIX/}gpg ($signing_fpr)"
       - name: Verify what the repository now serves
-        # Against the S3 origin, not the CDN: CloudFront may still cache the
-        # previous index for hours, and the objects are public-read either way.
+        # Anonymously, over HTTPS, at the URL users configure (the path-style
+        # S3 origin; no CDN in front): what a fresh install would read.
         env:
           DEB_DISTS: ${{ needs.plan.outputs.deb_dists }}
         run: |
           set -euo pipefail
           # shellcheck source=scripts/release/lib.sh
           source scripts/release/lib.sh
-          # Path-style (lib.sh): production's bucket name has dots, which the
-          # virtual-hosted form's one-label wildcard certificate does not cover.
+          # Path-style (lib.sh): the URL the README gives users, and the only
+          # form whose certificate covers any bucket name.
           base="$(s3_origin_url "$BUCKET" "$REGION" "$REPO_PREFIX")"
+          curl -fsSL "$base/gpg" -o served-gpg
+          check_served_key served-gpg "$signing_fpr" || { echo "::error::$base/gpg does not serve exactly $signing_fpr"; exit 1; }
+          echo "ok: $base/gpg serves $signing_fpr"
           while IFS= read -r -d '' f; do
             dist="$(dpkg-deb -f "$f" Version)"; dist="${dist##*~}"
             arch="$(dpkg-deb -f "$f" Architecture)"; version="$(dpkg-deb -f "$f" Version)"
@@ -697,6 +724,6 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "## Packages for ${TAG} published to \`$PUBLISH_TO\` (s3://$BUCKET)"
+            echo "## Packages for ${TAG:-$GITHUB_SHA} published to \`$PUBLISH_TO\` (s3://$BUCKET${REPO_PREFIX:+/$REPO_PREFIX})"
             echo; echo '```'; find debs rpms -type f -printf '%f\n' | sort; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

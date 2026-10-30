@@ -133,20 +133,84 @@ production_gate() {
 # `check_signing_fpr <pinned> <actual> <environment>`: the signing key the job
 # imported must be the one the environment's repositories are signed with
 # (APT_SIGNING_FPR; whitespace and case ignored). The pin is required for
-# `build`, optional elsewhere. deb-s3 re-signs every product's index of a
-# codename, so a wrong key there breaks `apt update` for all of them.
+# `build`, optional elsewhere. deb-s3 re-signs a codename's whole index, so a
+# wrong key there breaks `apt update` for everyone who trusts the right one.
 check_signing_fpr() {
   local pinned="${1//[[:space:]]/}" actual="$2" env="$3"
   pinned="${pinned^^}"
   if [[ -z "$pinned" ]]; then
     [[ "$env" != build ]] && return 0
-    echo "environment 'build' has no APT_SIGNING_FPR variable; set it to the production key's fingerprint" >&2
+    echo "environment 'build' has no APT_SIGNING_FPR variable; set it to the fingerprint of our production signing key (the one $PRODUCTION_BUCKET/gpg serves)" >&2
     return 1
   fi
   if [[ "$pinned" != "$actual" ]]; then
-    echo "APT_SIGNING_KEY is $actual, but environment '$env' pins APT_SIGNING_FPR=$pinned; refusing to re-sign the shared repositories with another key" >&2
+    echo "APT_SIGNING_KEY is $actual, but environment '$env' pins APT_SIGNING_FPR=$pinned; refusing to re-sign the repository with another key" >&2
     return 1
   fi
+}
+
+# ---- Where packages are published (release-packages.yml, setup-production-repo.sh).
+#
+# Production is OUR OWN repository: bucket vdb-packages in us-east-2, in AWS
+# account 726902207197 (the account of the staging bucket), served at its
+# path-style S3 URL (s3_origin_url) with our own signing key's public half at
+# <base>/gpg. It is NOT packages.redis.io: that repository, and the buckets
+# behind it, belong to every Redis product and are signed with Redis's key,
+# so nothing here may write to them.
+PRODUCTION_BUCKET=vdb-packages
+PRODUCTION_REGION=us-east-2
+STAGING_BUCKET=vdb-package-staging
+# The Redis-wide staging bucket: its deb/ and rpm/ are the shared, Redis-signed
+# rehearsal repositories, so a staging rehearsal there needs a prefix.
+SHARED_STAGING_BUCKET=redis-test-package-repository
+# Every bucket shared by the Redis products (packages.redis.io's, and the
+# Redis-wide staging one): `build` refuses them all; keep BOTH entries.
+SHARED_REDIS_BUCKETS=(packages.redis.io "$SHARED_STAGING_BUCKET")
+# deb-s3 writes `Origin:` into each codename's Release (0.11.3 has no Label
+# option, so Release carries no Label); apt shows it in `apt-cache policy` and
+# pins can match it (o=vector-db-benchmark).
+APT_ORIGIN=vector-db-benchmark
+
+# `check_publish_target <environment> <bucket> <region> <prefix>`: may this
+# environment publish to that bucket? Repository-level secrets are inherited
+# by every environment, so the bucket is checked against the environment:
+#  * build   exactly $PRODUCTION_BUCKET in $PRODUCTION_REGION, at its root;
+#            never a staging bucket, never the shared Redis repository;
+#  * staging $STAGING_BUCKET, or $SHARED_STAGING_BUCKET under a prefix only;
+#            never the production bucket.
+check_publish_target() {
+  local env="$1" bucket="$2" region="$3" prefix="$4"
+  case "$env" in
+    build)
+      if in_list "$bucket" "${SHARED_REDIS_BUCKETS[@]}"; then
+        echo "environment 'build' has APT_S3_BUCKET=$bucket, a shared Redis repository; production is our own $PRODUCTION_BUCKET, and nothing here may write to the shared one" >&2
+        return 1
+      fi
+      if [[ "$bucket" == "$STAGING_BUCKET" ]]; then
+        echo "environment 'build' points at the staging bucket $STAGING_BUCKET" >&2
+        return 1
+      fi
+      if [[ "$bucket" != "$PRODUCTION_BUCKET" ]]; then
+        echo "environment 'build' has APT_S3_BUCKET=$bucket; production is $PRODUCTION_BUCKET only" >&2
+        return 1
+      fi
+      if [[ "$region" != "$PRODUCTION_REGION" ]]; then
+        echo "environment 'build' has APT_S3_REGION=$region; $PRODUCTION_BUCKET is in $PRODUCTION_REGION" >&2
+        return 1
+      fi
+      if [[ -n "$prefix" ]]; then
+        echo "production publishes at the bucket root, got prefix '$prefix'" >&2
+        return 1
+      fi ;;
+    staging)
+      case "$bucket" in
+        "$STAGING_BUCKET") ;;
+        "$SHARED_STAGING_BUCKET")
+          [[ -n "$prefix" ]] || { echo "$SHARED_STAGING_BUCKET is shared with every Redis product; a rehearsal there needs repo_prefix" >&2; return 1; } ;;
+        *) echo "environment 'staging' has APT_S3_BUCKET set to '$bucket', not a staging bucket; refusing to rehearse against it" >&2; return 1 ;;
+      esac ;;
+    *) echo "unexpected publish target '$env'" >&2; return 1 ;;
+  esac
 }
 
 crate_version() {
@@ -289,8 +353,8 @@ require_clean_head() {
 # public objects are read from, PATH-style: https://s3.<region>.amazonaws.com/
 # <bucket>[/<prefix>]. Never the virtual-hosted <bucket>.s3.<region>... form:
 # S3's certificate is *.s3.<region>.amazonaws.com, a wildcard of ONE label, so
-# a dotted bucket (production is `packages.redis.io`) fails TLS verification
-# there. The regional host exists for every region, us-east-1 included
+# a dotted bucket name fails TLS verification there (and one URL form for
+# every bucket keeps the README, the verify step and the scripts in step). The regional host exists for every region, us-east-1 included
 # (s3.us-east-1.amazonaws.com). INV-A5 refuses the virtual-hosted form in the
 # workflow and these scripts.
 s3_origin_url() {
@@ -303,9 +367,9 @@ s3_origin_url() {
 
 # `deb_index_entry <Packages file> <package> <version> <arch>`: "<SHA256>
 # <Filename>" of the ONE stanza for exactly that package, version and
-# architecture, nothing when there is none. The Packages index of a codename
-# is shared with every Redis product, so a bare `Version:` match could be
-# another package's stanza.
+# architecture, nothing when there is none. A Packages index can hold other
+# packages (the shared staging bucket's does), so a bare `Version:` match could
+# be another package's stanza.
 deb_index_entry() {
   awk -v RS= -v p="$2" -v v="$3" -v a="$4" '
     { pk = ""; ve = ""; ar = ""; sh = ""; fn = ""
@@ -328,6 +392,36 @@ deb_index_entry() {
 # refuses an expired key of ours).
 gpg_status_signed_by() {
   awk -v f="$1" '$1 == "[GNUPG:]" && $2 == "VALIDSIG" && ($3 == f || $NF == f) {ok = 1} END {exit !ok}'
+}
+
+# `key_file_fprs <file>`: the PRIMARY key fingerprints in an OpenPGP key file
+# (armored or binary), one per line, without importing it into any keyring.
+# Empty output for a file that holds no key. Used on the repository's <base>/gpg.
+key_file_fprs() {
+  local listing
+  listing="$(gpg --batch --no-tty --with-colons --import-options show-only --import "$1" 2>/dev/null)" || return 0
+  awk -F: '/^pub:/ {want = 1; next} want && /^fpr:/ {print $10; want = 0}' <<<"$listing"
+}
+
+# `check_served_key <key file> <fpr>`: the repository's <base>/gpg holds
+# exactly one key, <fpr> (our signing key). Anything else (another key, two
+# keys, no key, not a key file) fails, saying what it holds. The publish job
+# refuses to overwrite such a gpg, and the verify step to call it served.
+check_served_key() {
+  local have
+  have="$(key_file_fprs "$1" | paste -sd' ' -)"
+  if [[ -z "$2" || "$have" != "$2" ]]; then
+    echo "$1 holds key(s) '${have:-none}', not exactly $2" >&2
+    return 1
+  fi
+}
+
+# `s3_head_missing <stderr of aws s3api head-object>`: the object does not
+# exist (404). Anything else, a 403 included, is NOT "missing": without
+# s3:ListBucket S3 answers 403 for a missing object too, and the caller must
+# then stop rather than assume the object is new.
+s3_head_missing() {
+  grep -qE '\(404\)|Not Found' "$1"
 }
 
 # `rpm_release_to_distro <Release tag>`: the rpm/<distro>/ directory an RPM

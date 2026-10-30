@@ -2,6 +2,152 @@
 
 A benchmarking tool for vector databases, written in Rust. Measures upload throughput, search QPS, latency percentiles (p50/p90/p95/p99), and recall for vector search engines.
 
+## Getting Started
+
+### Installing on Debian and Ubuntu
+
+> **Available once the first package publish completes.** The APT and YUM
+> repositories below are our own (`https://s3.us-east-2.amazonaws.com/vdb-packages`); the first release is published to
+> them once the maintainers have set them up. Until then, use the
+> [prebuilt binaries](#installing-prebuilt-binaries-linux-and-macos) or
+> [Docker](#using-docker).
+
+Packages are built for Debian 11 (bullseye), 12 (bookworm) and 13 (trixie), and
+Ubuntu 20.04 (focal), 22.04 (jammy), 24.04 (noble) and 26.04 (resolute), on amd64
+and arm64. To configure the repository:
+
+```bash
+sudo apt install lsb-release curl gpg
+
+curl -fsSL https://s3.us-east-2.amazonaws.com/vdb-packages/gpg | sudo gpg --dearmor -o /usr/share/keyrings/vector-db-benchmark-archive-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/vector-db-benchmark-archive-keyring.gpg] https://s3.us-east-2.amazonaws.com/vdb-packages/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/vector-db-benchmark.list
+
+sudo apt-get update
+```
+
+Once configured, install vector-db-benchmark with:
+
+```bash
+sudo apt-get install vector-db-benchmark
+```
+
+### Installing on RHEL, Rocky Linux and AlmaLinux
+
+Packages are built for RHEL 8, 9 and 10 compatible distributions, on x86_64 and
+aarch64 (available once the first package publish completes, as above). To
+configure the repository:
+
+```bash
+sudo curl -fsSL https://s3.us-east-2.amazonaws.com/vdb-packages/gpg -o /etc/pki/rpm-gpg/vector-db-benchmark.gpg
+
+sudo tee /etc/yum.repos.d/vector-db-benchmark.repo <<'EOF'
+[vector-db-benchmark]
+name=vector-db-benchmark
+baseurl=https://s3.us-east-2.amazonaws.com/vdb-packages/rpm/el$releasever/$basearch
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/vector-db-benchmark.gpg
+EOF
+```
+
+Once configured, install vector-db-benchmark with:
+
+```bash
+sudo dnf install -y vector-db-benchmark
+```
+
+### Installing on Amazon Linux 2023
+
+Amazon Linux 2023 uses its own repository path, because its `$releasever` is a
+point release such as `2023.8.20250818`, not an `el<n>` value (available once the
+first package publish completes, as above):
+
+```bash
+sudo curl -fsSL https://s3.us-east-2.amazonaws.com/vdb-packages/gpg -o /etc/pki/rpm-gpg/vector-db-benchmark.gpg
+
+sudo tee /etc/yum.repos.d/vector-db-benchmark.repo <<'EOF'
+[vector-db-benchmark]
+name=vector-db-benchmark
+baseurl=https://s3.us-east-2.amazonaws.com/vdb-packages/rpm/amzn2023/$basearch
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/vector-db-benchmark.gpg
+EOF
+
+sudo dnf install -y vector-db-benchmark
+```
+
+The packages install `vector-db-benchmark`, `prepare-msmarco` and
+`generate-dataset` into `/usr/bin`, and the dataset catalogue and engine
+configurations under `/usr/share/vector-db-benchmark`
+([details](#linux-packages-what-they-install)).
+
+### Installing prebuilt binaries (Linux and macOS)
+
+Every release carries checksum-verified archives for Linux x86_64 and aarch64
+(both need glibc 2.34 or newer: Amazon Linux 2023, RHEL 9, Ubuntu 22.04+,
+Debian 12+) and macOS arm64. Nothing else needs to be installed. To download the latest release
+for this host into `./vector-db-benchmark-<tag>`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/redis/vector-db-benchmark/master/scripts/install-release.sh | bash
+```
+
+For a given tag and destination, add `bash -s -- 0.2.0 /opt/vdb` (or run
+`make install-release TAG=0.2.0 DEST=/opt/vdb` in a checkout). See
+[Prebuilt binaries](#prebuilt-binaries-what-the-archives-hold) for what the
+archive holds and how to verify a build.
+
+### Using Docker
+
+```bash
+docker run --rm redis/vector-db-benchmark:0.2.0 --help
+```
+
+> Release images are published to Docker Hub as `redis/vector-db-benchmark:<tag>`
+> (and `:latest`). The `0.2.0` image is available once its publish runs after a
+> follow-up fix to the release workflow (#385); on 2026-10-30 Docker Hub did not
+> have it yet, and `latest` still predates 0.2.0. More examples: [Docker](#docker).
+
+### Installing from source
+
+```bash
+# Prerequisites: Rust toolchain, libhdf5-dev, pkg-config (see Development below)
+git clone https://github.com/redis/vector-db-benchmark.git && cd vector-db-benchmark
+cargo build --release --bin vector-db-benchmark
+./target/release/vector-db-benchmark --help
+```
+
+See [Development](#development) for the per-OS prerequisites and the test suites.
+
+### First run
+
+The CLI reads `datasets/datasets.json` and `experiments/configurations/` from the
+working directory (or up to five parents) and writes `results/` next to them. So
+run it from a directory that holds them: the extracted archive, a source
+checkout, or a copy of the packaged tree:
+
+```bash
+# Linux packages: work from a copy of the packaged tree
+cp -r /usr/share/vector-db-benchmark ~/vdb && cd ~/vdb
+# prebuilt binaries: the extracted directory holds the binaries; put it on PATH
+#   cd vector-db-benchmark-<tag> && PATH="$PWD:$PATH"
+
+vector-db-benchmark --version     # vector-db-benchmark <version> (git <commit it was built from>)
+vector-db-benchmark --describe datasets
+
+# A first benchmark: a local Redis 8 and the small random-100 dataset every install ships
+docker run -d --name redis -p 6379:6379 redis:8.8.0
+vector-db-benchmark --host localhost --engines redis-docker-test --datasets random-100
+docker stop redis && docker rm redis
+```
+
+The same run in Docker needs no install at all (once the `0.2.0` image is on
+Docker Hub, see [Using Docker](#using-docker); `--network=host` reaches the
+host's Redis on Linux, and on Docker Desktop only with host networking enabled):
+`docker run --rm --network=host redis/vector-db-benchmark:0.2.0 --host localhost --engines redis-docker-test --datasets random-100`.
+
 ## Supported Engines
 
 | Engine | Client Library | Protocol | Distance Metrics | Metadata Filters |
@@ -248,9 +394,9 @@ Experiment stage: Done
 
 > [View published results](https://redis.io/blog/benchmarking-results-for-vector-databases/)
 
-## Quick Start
+## More on installing
 
-### Prebuilt binaries (no toolchain, no Docker)
+### Prebuilt binaries: what the archives hold
 
 Every release after 0.1.0 carries `vector-db-benchmark-<tag>-linux-x86_64.tar.gz`,
 `…-linux-aarch64.tar.gz`, `…-macos-aarch64.tar.gz` and a `SHA256SUMS` file. The
@@ -260,12 +406,10 @@ CI runs each one on bare `ubuntu:22.04` and `amazonlinux:2023` containers. Each 
 holds all the binaries next to `datasets/datasets.json` and
 `experiments/configurations/`, which the CLI reads from the working directory.
 
-```bash
-# Latest release for this host's OS/arch, checksum-verified, into ./vector-db-benchmark-<tag>
-curl -fsSL https://raw.githubusercontent.com/redis/vector-db-benchmark/master/scripts/install-release.sh | bash
-# A given tag and destination:   … | bash -s -- 0.2.0 /opt/vdb      (or: make install-release TAG=0.2.0 DEST=/opt/vdb)
+By hand, on Linux (on a Mac use `…-macos-aarch64.tar.gz`), extracting into the
+current directory:
 
-# Or by hand, on Linux (on a Mac use …-macos-aarch64.tar.gz): extract here
+```bash
 TAG=0.2.0; ARCH=$(uname -m)
 curl -fsSL "https://github.com/redis/vector-db-benchmark/releases/download/$TAG/vector-db-benchmark-$TAG-linux-$ARCH.tar.gz" | tar xz
 ./vector-db-benchmark --version   # vector-db-benchmark 0.2.0 (git <commit the archive was built from>)
@@ -321,64 +465,27 @@ digests differ from the ones already on the release, and the run refuses to
 mix builds. Rebuilding a tag on purpose is a `workflow_dispatch` with `tag`
 and `clobber: true`, which replaces the whole set.
 
-### Linux packages (APT / YUM)
+### Linux packages: what they install
 
-> **Coming soon.** Publishing to packages.redis.io is not switched on yet: the
-> production side (bucket credentials and the Redis signing key) is still to be
-> set up, so `apt-get install` / `dnf install` below do not find
-> `vector-db-benchmark` today. Use the release archives above until a release
-> announces its packages. The packaging itself is built and install-tested on
-> every change to it (`.github/workflows/release-packages.yml`).
-
-Native packages will be built for every release, from the same commit as the
-archives above, one per distribution, and published to the Redis package
-repositories. They install `vector-db-benchmark`,
+Final releases get native packages, built from the same commit as the archives,
+one per distribution, for our own APT/YUM repository at
+`https://s3.us-east-2.amazonaws.com/vdb-packages`, signed with our own key (its
+public half is served at `…/vdb-packages/gpg`). Publishing there starts with the
+first package publish; [Getting Started](#getting-started) has the repository
+setup. The packages install `vector-db-benchmark`,
 `prepare-msmarco` and `generate-dataset` into `/usr/bin`, the reader
 micro-benchmarks under `/usr/lib/vector-db-benchmark` (`/usr/libexec` on RPM
 systems), and the dataset catalogue plus engine configurations under
 `/usr/share/vector-db-benchmark`. HDF5, zlib and OpenSSL are linked in; the
-package depends on glibc (and libgcc) only.
+package depends on glibc (and libgcc) only. The packaging itself is built and
+install-tested on every change to it (`.github/workflows/release-packages.yml`),
+on bare containers of each distribution.
 
-**Debian 11/12/13 and Ubuntu 20.04/22.04/24.04/26.04** (amd64, arm64), from the
-[packages.redis.io](https://packages.redis.io) APT repository:
-
-```bash
-sudo apt install lsb-release curl gpg
-curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-sudo apt-get update
-sudo apt-get install vector-db-benchmark
-```
-
-**RHEL 8/9/10 compatible** (Rocky, Alma; x86_64, aarch64):
-
-```bash
-sudo curl -fsSL https://packages.redis.io/gpg -o /etc/pki/rpm-gpg/redis-archive-keyring.gpg
-sudo tee /etc/yum.repos.d/redis.repo <<'EOF'
-[redis]
-name=Redis
-baseurl=https://packages.redis.io/rpm/el$releasever/$basearch
-enabled=1
-gpgcheck=1
-gpgkey=file:///etc/pki/rpm-gpg/redis-archive-keyring.gpg
-EOF
-sudo dnf install -y vector-db-benchmark
-```
-
-**Amazon Linux 2023** uses its own, fixed path (its `$releasever` is a point
-release such as `2023.8.20250818`, not an `el<n>` value): replace the `baseurl`
-above with `https://packages.redis.io/rpm/amzn2023/$basearch`.
-
-The CLI looks for `datasets/datasets.json` in the working directory (and up to
-five parents) and writes `results/` next to it, so work from a copy of the
-packaged tree:
-
-```bash
-cp -r /usr/share/vector-db-benchmark ~/vdb && cd ~/vdb
-vector-db-benchmark --version            # vector-db-benchmark <version> (git <commit the package was built from>)
-vector-db-benchmark --describe datasets
-vector-db-benchmark --host localhost --engines 'redis-single*' --datasets glove-25-angular
-```
+The signing key expires after five years and is then renewed. A host set up
+before a renewal keeps its old copy: if `apt-get update` reports `EXPKEYSIG`,
+re-run the `curl … | sudo gpg --dearmor …` line from
+[Getting Started](#getting-started); on dnf hosts re-fetch the key file and
+remove the old one with `sudo rpm -e gpg-pubkey-<short key id>`.
 
 To build a package yourself, on (a container of) the target distribution:
 `make release-deb DIST=$(lsb_release -cs) INSTALL_DEPS=1` or
@@ -387,7 +494,7 @@ then installs and runs it the way the release workflow does; run that on a
 *bare* container of the same distribution (it refuses a host with a Rust
 toolchain, and it adds and removes the package and a local repository).
 
-### Docker (recommended)
+### Docker
 
 Image tags: `latest` is the newest release, `X.Y.Z` that release, and `master`
 / `sha-<7 chars>` are unreleased `master` builds.
@@ -408,7 +515,7 @@ docker run --rm --network=host \
   --host localhost --engines 'redis-single*' --datasets glove-25-angular
 ```
 
-### Using with Redis
+#### Using with Redis
 
 ```bash
 # Start Redis
@@ -425,7 +532,7 @@ docker run --rm --network=host \
 docker stop redis && docker rm redis
 ```
 
-### Using Docker Compose
+#### Using Docker Compose
 
 ```bash
 # Full integration test (downloads h-and-m dataset ~200MB)
@@ -433,19 +540,6 @@ make docker-integration
 
 # Fast smoke test (uses random-100 dataset baked into image, 228KB)
 make docker-integration-fast
-```
-
-### Build from source
-
-```bash
-# Prerequisites: Rust toolchain, libhdf5-dev, pkg-config
-cargo build --release --bin vector-db-benchmark
-
-# Run
-./target/release/vector-db-benchmark --help
-./target/release/vector-db-benchmark --describe datasets
-./target/release/vector-db-benchmark \
-  --host localhost --engines 'redis-single*' --datasets glove-25-angular
 ```
 
 ## CLI Options

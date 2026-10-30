@@ -20,6 +20,8 @@ on:
       - '.github/workflows/docker-publish-master.yml'
       - '.github/workflows/docker-publish-release.yml'
       - 'scripts/release/**'
+      # INV-A5 (harness_invariants) also scans AGENTS.md.
+      - 'AGENTS.md'
       - 'debian/**'
       - 'rpm/**'
   pull_request:
@@ -40,6 +42,8 @@ on:
       - '.github/workflows/docker-publish-master.yml'
       - '.github/workflows/docker-publish-release.yml'
       - 'scripts/release/**'
+      # INV-A5 (harness_invariants) also scans AGENTS.md.
+      - 'AGENTS.md'
       - 'debian/**'
       - 'rpm/**'
 

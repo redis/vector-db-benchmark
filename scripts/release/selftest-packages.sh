@@ -16,7 +16,9 @@
 # RPMs uploaded before repodata; another product's RPM in the same directory
 # kept and indexed; another product's RPM uploaded DURING our publish (caught
 # by the re-list, or failing the post-upload index check with a re-run hint);
-# lib.sh's path-style S3 URL for a dotted bucket.
+# lib.sh's path-style S3 URL for a dotted bucket; which bucket each environment
+# may publish to (production is our own vdb-packages, never staging or
+# packages.redis.io); the APT Origin; reading the fingerprints of a <base>/gpg.
 #
 # Needs: bash, gpg, dpkg-deb, rpm, rpmbuild, createrepo_c, gzip. No network.
 set -euo pipefail
@@ -196,12 +198,15 @@ expect "publishes two codenames from one tree" 0 bash "$here/publish-apt.sh" --b
 check "one deb-s3 call per codename" test "$(grep -c '^deb-s3 ' "$FAKE_LOG")" -eq 2
 check "jammy call carries both jammy debs and no noble one" bash -c "l=\$(grep -- '--codename=jammy' '$FAKE_LOG'); [[ \"\$l\" == *_amd64.deb* && \"\$l\" == *_arm64.deb* && \"\$l\" != *noble* ]]"
 check "--sign=<fingerprint> of the one secret key" grep -q -- "--sign=$fpr" "$FAKE_LOG"
-check "--suite, --origin, --fail-if-exists, --lock passed" bash -c "l=\$(grep -- '--codename=noble' '$FAKE_LOG'); [[ \"\$l\" == *--suite=noble* && \"\$l\" == *--origin=packages.redis.io* && \"\$l\" == *--fail-if-exists* && \"\$l\" == *--lock* ]]"
+check "--suite, --origin, --fail-if-exists, --lock passed" bash -c "l=\$(grep -- '--codename=noble' '$FAKE_LOG'); [[ \"\$l\" == *--suite=noble* && \"\$l\" == *--origin=vector-db-benchmark* && \"\$l\" == *--fail-if-exists* && \"\$l\" == *--lock* ]]"
+check "the default Origin is lib.sh's APT_ORIGIN" test "$APT_ORIGIN" = vector-db-benchmark
+check "test-package.sh's local repository carries the same Origin" grep -qF -- "-o \"APT::FTPArchive::Release::Origin=$APT_ORIGIN\"" "$here/test-package.sh"
 check "fake deb-s3 recorded the manifest" grep -qx 'vector-db-benchmark 9.9.9~noble amd64' "$FAKE_S3/bkt/deb/dists/noble/manifest"
 expect "re-run of the same version is refused (--fail-if-exists)" 1 bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs"
 expect "... unless --overwrite" 0 bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs" --overwrite
 check "--overwrite drops --fail-if-exists" bash -c "! tail -n 2 '$FAKE_LOG' | grep -q -- --fail-if-exists"
 mkdeb 9.9.9 amd64 "$t/debs-bad"
+expect "an --origin with a space is refused" 1 bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs" --origin "Redis Inc" --dry-run
 expect "a .deb without ~codename is refused" 1 bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs-bad"
 expect "--dry-run runs deb-s3 not at all" 0 bash "$here/publish-apt.sh" --bucket bkt --region us-east-2 --in "$t/debs" --dry-run
 check "dry run printed the commands" grep -q '^dry-run: deb-s3' "$t/last.out"
@@ -220,7 +225,7 @@ mkdir -m 0700 "$t/otherkey"
 GNUPGHOME="$t/otherkey" gpg --batch --quiet --passphrase '' --quick-gen-key 'other <other@example.invalid>' rsa2048 sign never 2>/dev/null
 GNUPGHOME="$t/otherkey" gpg --export --armor | gpg --batch --quiet --import 2>/dev/null  # its PUBLIC half is trusted-readable: the signature is valid, just not ours
 mkdir -p "$FAKE_S3/foreign/deb/dists/jammy"
-echo "Origin: packages.redis.io" > "$FAKE_S3/foreign/deb/dists/jammy/Release"
+echo "Origin: someone-else" > "$FAKE_S3/foreign/deb/dists/jammy/Release"
 GNUPGHOME="$t/otherkey" gpg --batch --yes --clearsign -o "$FAKE_S3/foreign/deb/dists/jammy/InRelease" "$FAKE_S3/foreign/deb/dists/jammy/Release" 2>/dev/null
 : > "$FAKE_LOG"
 expect "a codename signed by another key is refused" 1 bash "$here/publish-apt.sh" --bucket foreign --region us-east-2 --in "$t/debs"
@@ -342,19 +347,87 @@ expect "a repodata/ listing error is refused" 1 env FAKE_LS_FAIL='/repodata/$' b
 check "... before anything was uploaded" bash -c "! grep -qE '^aws s3 (cp|sync) [^ ]+ s3://' '$FAKE_LOG'"
 
 echo "lib.sh s3_origin_url"
-# Path-style only: production's bucket (packages.redis.io) has dots, and the
-# virtual-hosted host <bucket>.s3.<region>.amazonaws.com is not covered by
-# S3's one-label wildcard certificate *.s3.<region>.amazonaws.com.
-check "dotted bucket -> path-style URL" test "$(s3_origin_url packages.redis.io us-east-2)" = "https://s3.us-east-2.amazonaws.com/packages.redis.io"
-check "... with a prefix" test "$(s3_origin_url packages.redis.io us-east-2 rehearsal/x/)" = "https://s3.us-east-2.amazonaws.com/packages.redis.io/rehearsal/x"
+# Path-style only: the virtual-hosted host <bucket>.s3.<region>.amazonaws.com
+# is not covered by S3's one-label wildcard certificate for a dotted bucket.
+check "production's base URL (the README's)" test "$(s3_origin_url "$PRODUCTION_BUCKET" "$PRODUCTION_REGION")" = "https://s3.us-east-2.amazonaws.com/vdb-packages"
+check "dotted bucket -> path-style URL" test "$(s3_origin_url example.dotted.bucket us-east-2)" = "https://s3.us-east-2.amazonaws.com/example.dotted.bucket"
+check "... with a prefix" test "$(s3_origin_url example.dotted.bucket us-east-2 rehearsal/x/)" = "https://s3.us-east-2.amazonaws.com/example.dotted.bucket/rehearsal/x"
 check "us-east-1 uses its regional host too" test "$(s3_origin_url vdb-package-staging us-east-1)" = "https://s3.us-east-1.amazonaws.com/vdb-package-staging"
-for pair in packages.redis.io:us-east-2 vdb-package-staging:us-east-1 a.b.c:eu-west-1; do
+for pair in example.dotted.bucket:us-east-2 vdb-package-staging:us-east-1 a.b.c:eu-west-1; do
   u="$(s3_origin_url "${pair%%:*}" "${pair##*:}")"; host="${u#https://}"; host="${host%%/*}"
   check "${pair%%:*}: host $host is the regional endpoint, no bucket label in it" \
     test "$host" = "s3.${pair##*:}.amazonaws.com"
 done
-expect "an empty region is refused" 1 s3_origin_url packages.redis.io ""
-expect "a bucket with a slash is refused" 1 s3_origin_url "packages.redis.io/deb" us-east-2
+expect "an empty region is refused" 1 s3_origin_url example.dotted.bucket ""
+expect "a bucket with a slash is refused" 1 s3_origin_url "vdb-packages/deb" us-east-2
+
+echo "lib.sh check_publish_target"
+# Production is our own bucket only; staging only a staging bucket. Nothing
+# reaches the shared Redis repository, whatever an inherited secret says.
+check "production is vdb-packages in us-east-2" test "$PRODUCTION_BUCKET:$PRODUCTION_REGION" = vdb-packages:us-east-2
+expect "build -> vdb-packages, us-east-2, root" 0 check_publish_target build vdb-packages us-east-2 ""
+expect "build -> packages.redis.io is refused" 1 check_publish_target build packages.redis.io us-east-2 ""
+check "... naming it a shared Redis repository" grep -q 'shared Redis repository' "$t/last.out"
+expect "build -> the Redis-wide staging bucket is refused" 1 check_publish_target build redis-test-package-repository us-east-2 ""
+expect "build -> our staging bucket is refused" 1 check_publish_target build vdb-package-staging us-east-2 ""
+check "... naming the staging bucket" grep -q 'points at the staging bucket' "$t/last.out"
+expect "build -> any other bucket is refused" 1 check_publish_target build vdb-packages-2 us-east-2 ""
+expect "build in another region is refused" 1 check_publish_target build vdb-packages us-east-1 ""
+expect "build under a prefix is refused" 1 check_publish_target build vdb-packages us-east-2 rehearsal
+expect "staging -> vdb-package-staging" 0 check_publish_target staging vdb-package-staging us-east-2 ""
+expect "staging -> the shared staging bucket under a prefix" 0 check_publish_target staging redis-test-package-repository us-east-1 vdb/rehearsal
+expect "staging -> the shared staging bucket at its root is refused" 1 check_publish_target staging redis-test-package-repository us-east-1 ""
+expect "staging -> the production bucket is refused" 1 check_publish_target staging vdb-packages us-east-2 ""
+expect "staging -> packages.redis.io is refused" 1 check_publish_target staging packages.redis.io us-east-2 ""
+expect "an unknown environment is refused" 1 check_publish_target none vdb-packages us-east-2 ""
+
+echo "lib.sh key_file_fprs"
+gpg --export --armor "$fpr" > "$t/one.asc"
+check "an armored public key -> its primary fingerprint" test "$(key_file_fprs "$t/one.asc")" = "$fpr"
+GNUPGHOME="$t/subkey" gpg --export > "$t/sub.gpg"
+check "... a binary key with a signing subkey -> its PRIMARY only" test "$(key_file_fprs "$t/sub.gpg")" = "$sub_fpr"
+{ cat "$t/one.asc"; GNUPGHOME="$t/otherkey" gpg --export --armor; } > "$t/two.asc"
+check "a file with two keys -> two fingerprints" test "$(key_file_fprs "$t/two.asc" | wc -l | tr -d ' ')" = 2
+echo "not a key" > "$t/nokey.asc"
+check "a file with no key -> nothing" test -z "$(key_file_fprs "$t/nokey.asc")"
+
+echo "lib.sh check_served_key / s3_head_missing (the <base>/gpg guard)"
+expect "<base>/gpg holding exactly our key" 0 check_served_key "$t/one.asc" "$fpr"
+expect "... another key is refused" 1 check_served_key "$t/sub.gpg" "$fpr"
+check "... naming the key it holds" grep -q "'$sub_fpr'" "$t/last.out"
+expect "... ours plus another is refused" 1 check_served_key "$t/two.asc" "$fpr"
+expect "... no key at all is refused" 1 check_served_key "$t/nokey.asc" "$fpr"
+expect "... an empty pin never matches an empty file" 1 check_served_key "$t/nokey.asc" ""
+echo 'An error occurred (404) when calling the HeadObject operation: Not Found' > "$t/head404"
+echo 'An error occurred (403) when calling the HeadObject operation: Forbidden' > "$t/head403"
+: > "$t/head-empty"
+expect "head-object 404 -> missing (a first publish)" 0 s3_head_missing "$t/head404"
+expect "head-object 403 -> NOT missing (stop, never assume new)" 1 s3_head_missing "$t/head403"
+expect "no error text -> NOT missing" 1 s3_head_missing "$t/head-empty"
+
+echo "README Getting Started"
+# The install steps users copy must name the repository the workflow publishes
+# to, and every codename it builds by default (and no other).
+readme="$(cat "$here/../../README.md")"
+prod_base="$(s3_origin_url "$PRODUCTION_BUCKET" "$PRODUCTION_REGION")"
+for want in "curl -fsSL $prod_base/gpg | sudo gpg --dearmor" \
+            "] $prod_base/deb \$(lsb_release -cs) main\"" \
+            "baseurl=$prod_base/rpm/el\$releasever/\$basearch" \
+            "baseurl=$prod_base/rpm/amzn2023/\$basearch" \
+            "sudo curl -fsSL $prod_base/gpg -o /etc/pki/rpm-gpg/"; do
+  check "README has: $want" grep -qF -- "$want" <<<"$readme"
+done
+lacks() { ! grep -qE "$1" <<<"$2"; }
+check "README sends nobody to packages.redis.io for our packages" lacks 'packages\.redis\.io/(gpg|deb|rpm)' "$readme"
+default_debs="$(sed -n "s/^  DEFAULT_DEB_DISTS: '\(.*\)'$/\1/p" "$here/../../.github/workflows/release-packages.yml" | tr -d '[]" ' | tr ',' ' ')"
+check "DEFAULT_DEB_DISTS read from the workflow" test -n "$default_debs"
+apt_section="$(sed -n '/^### Installing on Debian and Ubuntu/,/^### /p' <<<"$readme")"
+for c in $default_debs; do
+  check "README lists codename $c" grep -qF "($c)" <<<"$apt_section"
+done
+check "README lists no codename the workflow does not build" test \
+  "$(grep -oE '\([a-z]+\)' <<<"$apt_section" | tr -d '()' | sort -u | paste -sd' ' -)" \
+  = "$(tr ' ' '\n' <<<"$default_debs" | sort -u | paste -sd' ' -)"
 
 echo "lib.sh check_production_tag"
 # Packages carry the crate version without a pre-release suffix: an rc tag
@@ -374,21 +447,21 @@ check "variable 'yes' is not 'true': none" test "$(production_gate release yes)"
 expect "variable off, public dispatch: refused" 1 production_gate workflow_dispatch ''
 
 echo "lib.sh check_signing_fpr"
-F=54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
+F=0123456789ABCDEF0123456789ABCDEF01234567   # stands in for our production key
 expect "build with the pinned key" 0 check_signing_fpr "$F" "$F" build
-expect "pin with spaces and lower case" 0 check_signing_fpr "5431 8fa4 052d 1e61 a6b6  f7bb 5f43 49d6 bf53 aa0c" "$F" build
+expect "pin with spaces and lower case" 0 check_signing_fpr "0123 4567 89ab cdef 0123  4567 89ab cdef 0123 4567" "$F" build
 expect "build without a pin: refused" 1 check_signing_fpr "" "$F" build
 expect "build with another key: refused" 1 check_signing_fpr "$F" FD183D88E9814786987424DAE26208135FFAAD25 build
 expect "staging without a pin" 0 check_signing_fpr "" FD183D88E9814786987424DAE26208135FFAAD25 staging
 expect "staging with another key: refused" 1 check_signing_fpr "$F" FD183D88E9814786987424DAE26208135FFAAD25 staging
-expect "a short key id is not a pin" 1 check_signing_fpr BF53AA0C "$F" build
+expect "a short key id is not a pin" 1 check_signing_fpr 01234567 "$F" build
 
 echo "lib.sh gpg_status_signed_by"
 st_primary="[GNUPG:] VALIDSIG $F 2026-10-29 1 0 4 0 1 10 01 $F"
 st_sub="[GNUPG:] VALIDSIG 48263292AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 2026-10-29 1 0 4 0 1 10 01 $F"
 expect "signed by the primary key" 0 gpg_status_signed_by "$F" <<<"$st_primary"
 expect "signed by its subkey (primary in the last field)" 0 gpg_status_signed_by "$F" <<<"$st_sub"
-expect "GOODSIG alone is not enough" 1 gpg_status_signed_by "$F" <<<"[GNUPG:] GOODSIG 5F4349D6BF53AA0C redis"
+expect "GOODSIG alone is not enough" 1 gpg_status_signed_by "$F" <<<"[GNUPG:] GOODSIG 89ABCDEF01234567 vdb"
 expect "another key" 1 gpg_status_signed_by FD183D88E9814786987424DAE26208135FFAAD25 <<<"$st_sub"
 expect "a fingerprint prefix does not match" 1 gpg_status_signed_by "${F:0:39}" <<<"$st_primary"
 
