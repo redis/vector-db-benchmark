@@ -52,8 +52,9 @@
 #     ONLY the subject GitHub issues for `build` (the repository's immutable
 #     `repo:<owner>@<id>/<name>@<id>` form, read from its OIDC customization;
 #     the plain-name form only if that cannot be read), with an inline policy
-#     limited to this bucket: list it; get, put and put-ACL objects under deb/,
-#     rpm/ and gpg; delete only deb-s3's lockfile.
+#     limited to this bucket: list it and get its location; get, put, put-ACL
+#     and abort multipart uploads of objects under deb/, rpm/ and gpg; delete
+#     only deb-s3's lockfile.
 # It does NOT create the signing key, the secrets or the variables: it prints
 # those steps (scripts/release/setup-signing-key.sh) at the end, gated on this
 # code being on master.
@@ -474,15 +475,29 @@ if [[ "$have_gh" == 1 ]] && ghc api "repos/$repo/contents/scripts/release/lib.sh
    grep -qx 'APT_ORIGIN=vector-db-benchmark' "$work/master-lib.sh" && grep -q '^check_publish_target()' "$work/master-lib.sh"; then
   master_ready=1
 fi
-cat <<EOF
+pinned_fpr=""
+if [[ "$have_gh" == 1 ]]; then
+  pinned_fpr="$(ghc api "repos/$repo/environments/build/variables/APT_SIGNING_FPR" --jq .value 2>/dev/null)" || pinned_fpr=""
+  [[ "$pinned_fpr" =~ ^[0-9A-Fa-f]{40}$ ]] || pinned_fpr=""
+fi
+echo
+echo "== Next steps (not done by this script), in order:"
+if [[ -n "$pinned_fpr" ]]; then
+  cat <<EOF
 
-== Next steps (not done by this script), in order:
+# 1. done: 'build' already pins APT_SIGNING_FPR=$pinned_fpr (keep its secret key
+#    and revocation certificate in the team vault; setup-signing-key.sh refuses
+#    to replace a pinned key).
+EOF
+else
+  cat <<EOF
 
 # 1. The signing key and the 'build' secrets + APT_SIGNING_FPR, from a machine
 #    with gpg. Writes the key material to ~/vdb-packages-signing (mode 700),
 #    never into the checkout:
 scripts/release/setup-signing-key.sh
 EOF
+fi
 # Only from a run that leaves nothing pending: an --apply that just converged
 # everything, or a dry run that found nothing to change.
 converged=0

@@ -190,8 +190,9 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
      Done once on 2026-10-30 from the PR at 2969ca4 (bucket, role, `build`
      environment with fcostaoliveira as required reviewer and the
      master/tag deployment policies, tag ruleset 26191613). After the merge, re-run
-     it with `--apply` for the hardened bucket policy, the lifecycle rule and
-     the immutable-subject-only trust. It protects `build` BEFORE touching the
+     it with `--apply` for the hardened bucket policy, the lifecycle rule,
+     the immutable-subject-only trust and the publisher's inline policy
+     (`s3:AbortMultipartUpload`, `s3:GetBucketLocation`). It protects `build` BEFORE touching the
      role (GitHub creates an unprotected environment for any job naming one),
      never re-posts existing branch policies or the ruleset, and refuses
      `--apply` unless the caller is the SSO AdministratorAccess role, the one
@@ -203,7 +204,11 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
      IAMFullAccess via its `PowerAccess` group) can re-point the publisher
      role's trust at itself and write as the publisher. Closing that needs a
      permissions boundary or SCP on `role/vdb-packages-*`, outside this script.
-  2. **Signing key + secrets:** `scripts/release/setup-signing-key.sh`
+  2. **Signing key + secrets** (done once on 2026-10-30: `build` pins
+     `APT_SIGNING_FPR=81F012D43C46AEE7F85981065B7109B16FF80907`, RSA 4096,
+     expires 2030-10-30; its secret key and revocation certificate are kept
+     in the team vault, and `setup-signing-key.sh` refuses to replace a pinned
+     key): `scripts/release/setup-signing-key.sh`
      (needs gpg): RSA 4096, no passphrase (the job signs non-interactively),
      5-year expiry; the secret key, public key and revocation certificate go
      to `~/vdb-packages-signing` (mode 700; refused inside a git checkout,
