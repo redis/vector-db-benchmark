@@ -1817,17 +1817,25 @@ fn derive_from_payloads(
     let f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut corpus = msmarco::derived::DerivedCorpus::new();
     let bar = progress(variant.limit, "derived fields");
-    for (i, line) in BufReader::with_capacity(1 << 22, f).lines().enumerate() {
+    let mut batch = Vec::with_capacity(8192);
+    let mut batch_bytes = 0;
+    for line in BufReader::with_capacity(1 << 22, f).lines() {
         let line = line.map_err(|e| format!("read {}: {e}", path.display()))?;
-        let payload: serde_json::Value = serde_json::from_str(&line)
-            .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))?;
-        corpus
-            .push_payload(&payload)
-            .map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))?;
-        if (i + 1) % 100_000 == 0 {
-            bar.inc(100_000);
+        batch_bytes += line.len();
+        batch.push(line);
+        if batch.len() == 8192 || batch_bytes >= 16 << 20 {
+            let first = corpus.len() + 1;
+            corpus
+                .push_json_batch(&batch)
+                .map_err(|e| format!("{} batch starting at line {first}: {e}", path.display()))?;
+            bar.inc(batch.len() as u64);
+            batch.clear();
+            batch_bytes = 0;
         }
     }
+    corpus
+        .push_json_batch(&batch)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     bar.finish_and_clear();
     if corpus.len() as u64 != variant.limit {
         return Err(format!(

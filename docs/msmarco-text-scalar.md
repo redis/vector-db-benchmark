@@ -123,6 +123,11 @@ times on the host; batch buffers alone are not a process memory measurement.
 Cloud host provisioning, private S3 publication/read-back, and cleanup remain
 in the orchestration repository.
 
+Scalar validation parses batches in parallel, using the existing field validator
+and preserving corpus/lookup-key order. Each batch is capped at 8,192 rows or
+16 MiB (plus the final row). The compact derived-field table still uses 16 bytes
+per passage, approximately 1.6 GB at 100M, in addition to process overhead.
+
 ## Recover an interrupted upstream scan
 
 Keep the same attempt's `parts.tmp` directory and run:

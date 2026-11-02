@@ -620,3 +620,5 @@ test-opensearch-query:
 test-msmarco-preparation:
 	cargo test --lib msmarco::preparation
 	cargo test --lib msmarco::preparation --release
+	cargo test --lib msmarco::derived
+	cargo test --lib msmarco::derived --release
