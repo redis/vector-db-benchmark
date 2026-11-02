@@ -80,7 +80,10 @@ This validates the recorded hashes and pinned query identity (allowing up to
 2e-6 coordinate drift from float32 normalization across builds), preserves and
 scores the stored query vectors, and computes truth from
 the existing vectors, cross-checks against upstream hits remapped by docid,
-then adds filtered truth. It rewrites only queries and manifest, never vectors
+then adds filtered truth. The remap decodes JSON docids, preserves existing row
+IDs and shipped rank, and requires sufficient independent hits before the
+oracles start. The final verifier independently enforces coverage on the ranking
+positions actually compared. It rewrites only queries and manifest, never vectors
 or payloads. An interrupted publication has no `COMPLETE` marker and is refused
 by benchmark loaders. Rerun the preparation/upgrade command to finish a sealed
 publication: it verifies every candidate file hash, corpus identity, NPY shape

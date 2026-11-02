@@ -1,6 +1,6 @@
 //! Preparation capabilities and integrity contract (#388). Legacy full artifacts
 //! remain readable; newly prepared artifacts are fail-closed and checksummed.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -368,6 +368,70 @@ pub fn input_row(query: &[f32], id: &str, text: &str, year: Option<i64>) -> Valu
     json!({"query": query, "query_id": id, "query_text": text, "trec_year": year})
 }
 
+#[derive(Deserialize)]
+struct PassageId {
+    docid: String,
+}
+
+#[derive(Debug)]
+pub struct RemappedHits {
+    pub hits: Vec<Vec<(i64, String, f32)>>,
+    pub docid_at: HashMap<i64, String>,
+}
+
+/// Map independent upstream hits onto the existing corpus row IDs. Retain only
+/// wanted docids in memory, decode JSON escapes, preserve shipped ranking order,
+/// and reject insufficient coverage BEFORE starting either expensive oracle.
+/// The final oracle verifier independently enforces coverage again on the
+/// positions it actually compares.
+pub fn remap_shipped_hits(
+    payloads: impl BufRead,
+    shipped: &[&[(i64, String, f32)]],
+    expected_rows: u64,
+) -> Result<RemappedHits, String> {
+    let wanted: HashSet<&str> = shipped
+        .iter()
+        .flat_map(|q| q.iter().map(|(_, pid, _)| pid.as_str()))
+        .collect();
+    let mut local_of = HashMap::new();
+    let mut docid_at = HashMap::new();
+    let mut rows = 0u64;
+    for (id, line) in payloads.lines().enumerate() {
+        let line = line.map_err(|e| e.to_string())?;
+        let row: PassageId =
+            serde_json::from_str(&line).map_err(|e| format!("payload row {id}: {e}"))?;
+        if wanted.contains(row.docid.as_str()) {
+            if local_of.insert(row.docid.clone(), id as i64).is_some() {
+                return Err(format!("duplicate oracle docid {:?}", row.docid));
+            }
+            docid_at.insert(id as i64, row.docid);
+        }
+        rows += 1;
+    }
+    if rows != expected_rows {
+        return Err(format!(
+            "oracle remap read {rows} payloads, expected {expected_rows}"
+        ));
+    }
+    let hits: Vec<Vec<_>> = shipped
+        .iter()
+        .map(|query| {
+            query
+                .iter()
+                .filter_map(|(_, pid, score)| {
+                    local_of.get(pid).map(|id| (*id, pid.clone(), *score))
+                })
+                .collect()
+        })
+        .collect();
+    super::check_coverage(
+        expected_rows,
+        hits.iter().filter(|query| !query.is_empty()).count(),
+        hits.iter().map(Vec::len).sum(),
+    )?;
+    Ok(RemappedHits { hits, docid_at })
+}
+
 /// The source query inputs must be identical before adding any rankings.
 pub fn check_query_inputs(expected: &[Value], stored: &[Value]) -> Result<Vec<Vec<f32>>, String> {
     if expected.len() != stored.len() {
@@ -478,11 +542,7 @@ pub fn sample_corpus(
             .map_err(|e| e.to_string())?;
         // Parse only docid on rejected rows: allocating all the text fields
         // for 100M passages would dominate a 1M nested sample.
-        #[derive(Deserialize)]
-        struct SampleId {
-            docid: String,
-        }
-        let id: SampleId = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+        let id: PassageId = serde_json::from_str(&line).map_err(|e| e.to_string())?;
         if !super::keeps(&id.docid, threshold) {
             continue;
         }
@@ -826,6 +886,57 @@ mod tests {
         assert!(check(dir.path(), &variant, false)
             .unwrap_err()
             .contains("truth is absent"));
+    }
+
+    #[test]
+    fn oracle_remap_preserves_existing_ids_rank_and_rejects_lost_coverage() {
+        let payloads = ["untargeted", "p\"quoted", "p#2"]
+            .iter()
+            .map(|id| format!("{}\n", json!({"docid": id})))
+            .collect::<String>();
+        let query = vec![
+            (999, "p#2".to_string(), 0.9),
+            (42, "missing".to_string(), 0.8),
+            (7, "p\"quoted".to_string(), 0.7),
+        ];
+        let queries = vec![query.as_slice(); 100];
+        let remapped = remap_shipped_hits(std::io::Cursor::new(&payloads), &queries, 3).unwrap();
+        assert_eq!(remapped.hits.len(), 100);
+        for hits in &remapped.hits {
+            assert_eq!(
+                hits,
+                &[
+                    (2, "p#2".to_string(), 0.9),
+                    (1, "p\"quoted".to_string(), 0.7)
+                ]
+            );
+        }
+        assert_eq!(remapped.docid_at.len(), 2);
+        assert_eq!(remapped.docid_at[&1], "p\"quoted");
+        let missing = vec![(1, "wrong-prefix".to_string(), 1.0)];
+        assert!(remap_shipped_hits(
+            std::io::Cursor::new(&payloads),
+            &vec![missing.as_slice(); 100],
+            3
+        )
+        .unwrap_err()
+        .contains("below the floor"));
+        assert!(
+            remap_shipped_hits(std::io::Cursor::new(&payloads), &queries[..1], 3)
+                .unwrap_err()
+                .contains("below the floor")
+        );
+        assert!(
+            remap_shipped_hits(std::io::Cursor::new(&payloads), &queries, 4)
+                .unwrap_err()
+                .contains("expected 4")
+        );
+        let duplicate = format!("{payloads}{}\n", json!({"docid":"p#2"}));
+        assert!(
+            remap_shipped_hits(std::io::Cursor::new(duplicate), &queries, 4)
+                .unwrap_err()
+                .contains("duplicate oracle docid")
+        );
     }
 
     #[test]

@@ -2052,30 +2052,17 @@ fn add_knn_truth(args: &Args) -> Result<(), String> {
         q.emb = vector;
     }
 
-    // Keep only upstream oracle docids, not the full corpus, in RAM. Local IDs
-    // remain the existing payload row positions (the vectors are untouched).
-    let wanted: std::collections::HashSet<String> = queries
-        .iter()
-        .flat_map(|q| q.shipped.iter().map(|(_, pid, _)| pid.clone()))
-        .collect();
-    let mut local_of = HashMap::new();
-    let mut docid_at = HashMap::new();
     let file = File::open(dir.join("payloads.jsonl")).map_err(|e| e.to_string())?;
-    for (id, line) in BufReader::with_capacity(1 << 22, file).lines().enumerate() {
-        let line = line.map_err(|e| e.to_string())?;
-        let docid = msmarco::extract_docid(&line).ok_or("payload has no docid")?;
-        if wanted.contains(&docid) {
-            local_of.insert(docid.clone(), id as i64);
-            docid_at.insert(id as i64, docid);
-        }
+    let shipped: Vec<_> = queries.iter().map(|q| q.shipped.as_slice()).collect();
+    let remapped = msmarco::preparation::remap_shipped_hits(
+        BufReader::with_capacity(1 << 22, file),
+        &shipped,
+        variant.limit,
+    )?;
+    for (query, hits) in queries.iter_mut().zip(remapped.hits) {
+        query.hits.hits = hits;
     }
-    for q in &mut queries {
-        q.hits.hits = q
-            .shipped
-            .iter()
-            .filter_map(|(_, pid, cos)| local_of.get(pid).map(|id| (*id, pid.clone(), *cos)))
-            .collect();
-    }
+    let docid_at = remapped.docid_at;
     let ranked = brute_force_ground_truth(&dir.join("vectors.npy"), variant, &queries)?;
     let stats = verify(variant.limit, &queries, &ranked, &docid_at)?;
     write_tests(&dir, &queries, Some(&ranked))?;
