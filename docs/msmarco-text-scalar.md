@@ -81,7 +81,12 @@ This validates the recorded hashes and pinned query identity (allowing up to
 scores the stored query vectors, and computes truth from
 the existing vectors, cross-checks against upstream hits remapped by docid,
 then adds filtered truth. It rewrites only queries and manifest, never vectors
-or payloads. An interrupted publication has no `COMPLETE` marker and is refused.
+or payloads. An interrupted publication has no `COMPLETE` marker and is refused
+by benchmark loaders. Rerun the preparation/upgrade command to finish a sealed
+publication: it verifies every candidate file hash, corpus identity, NPY shape
+and query schema before renaming any remaining `.part` files, then restores
+`COMPLETE`. Missing or corrupt candidates remain refused; unchanged corpus
+files are not rebuilt.
 A vector/hybrid workload on a text/scalar artifact fails before creating an
 engine and prints the upgrade command. `--add-derived-fields` still invalidates
 filtered truth and updates capabilities; rerun `--add-knn-truth` afterward.
@@ -108,6 +113,8 @@ sources are hash-verified before sampling. Legacy source archives have no file
 hashes; retain their download provenance and verify them separately. Sampling
 streams vectors and payloads in source order and applies the same docid hash
 threshold, preserving the IDs that a fresh preparation of that size assigns.
+The nested artifact records its source dataset and manifest SHA-256, and reports
+zero upstream shards read for that preparation.
 
 Allow roughly 600 GB for the 100M final corpus, plus temporary shard files and
 smaller variants. A 2 TiB working disk gives room for preparation and S3

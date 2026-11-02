@@ -135,13 +135,36 @@ pub fn check(
     variant: &super::Variant,
     hashes: bool,
 ) -> Result<Option<Capabilities>, String> {
-    if !dir.join("PREPARED.json").exists() {
+    inspect(dir, variant, hashes, false)
+}
+
+fn artifact_path(dir: &Path, name: &str, staged: bool) -> std::path::PathBuf {
+    let part = dir.join(format!("{name}.part"));
+    if staged && part.exists() {
+        part
+    } else {
+        dir.join(name)
+    }
+}
+
+/// Validate the exact post-publication view without copying any corpus bytes.
+/// Recovery may read staged files, but ordinary loaders never may.
+fn inspect(
+    dir: &Path,
+    variant: &super::Variant,
+    hashes: bool,
+    staged: bool,
+) -> Result<Option<Capabilities>, String> {
+    let manifest_path = artifact_path(dir, "PREPARED.json", staged);
+    if !manifest_path.exists() {
         // Legacy tarballs may omit the manifest, but cannot masquerade as
         // complete text/scalar preparation with the new ranking-free rows.
         check_legacy_truth(dir)?;
         return Ok(None);
     }
-    let manifest = read_manifest(dir)?;
+    let manifest: Value =
+        serde_json::from_reader(File::open(manifest_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     let Some(value) = manifest.get("preparation") else {
         check_legacy_truth(dir)?;
         return Ok(None);
@@ -156,7 +179,7 @@ pub fn check(
     {
         return Err("unsupported/incomplete preparation capabilities".into());
     }
-    if !dir.join("COMPLETE").is_file() {
+    if !staged && !dir.join("COMPLETE").is_file() {
         return Err("incomplete preparation: missing COMPLETE marker; finish/rebuild the interrupted preparation".into());
     }
     if manifest["dataset"] != variant.dataset_name
@@ -188,7 +211,7 @@ pub fn check(
             .files
             .get(name)
             .ok_or_else(|| format!("no integrity record for {name}"))?;
-        let path = dir.join(name);
+        let path = artifact_path(dir, name, staged);
         let actual = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         if actual.len() != expected.bytes
             || expected.sha256.len() != 64
@@ -200,7 +223,8 @@ pub fn check(
             return Err(format!("{name}: SHA-256 mismatch"));
         }
     }
-    let layout = crate::readers::stream_reader::f32_npy_layout(&dir.join("vectors.npy"))?;
+    let layout =
+        crate::readers::stream_reader::f32_npy_layout(&artifact_path(dir, "vectors.npy", staged))?;
     if layout.rows != variant.limit || layout.cols != super::DIM {
         return Err("vectors.npy: corpus shape mismatch".into());
     }
@@ -208,8 +232,55 @@ pub fn check(
         .as_u64()
         .filter(|n| *n > 0)
         .ok_or("manifest has no query count")?;
-    check_query_rows(dir, super::DIM, Some(count), caps.vector_truth)?;
+    check_query_rows(
+        &artifact_path(dir, "tests.jsonl", staged),
+        super::DIM,
+        Some(count),
+        caps.vector_truth,
+    )?;
     Ok(Some(caps))
+}
+
+/// Finish an interrupted sealed publication, including upgrades, without
+/// rebuilding unchanged corpus files. Validate ALL candidate hashes, identity,
+/// shape and query inputs before the first rename. A missing/truncated/mixed
+/// candidate remains incomplete. Call only from preparation commands, never a
+/// benchmark loader; there must be exactly one writer for the directory.
+pub fn recover_publication(dir: &Path, variant: &super::Variant) -> Result<bool, String> {
+    if dir.join("COMPLETE").exists() || !artifact_path(dir, "PREPARED.json", true).exists() {
+        return Ok(false);
+    }
+    let Some(caps) = inspect(dir, variant, true, true)? else {
+        return Ok(false);
+    };
+    // Drop invalidated filtered truth before publishing a replacement payload.
+    if !caps.filtered_truth {
+        match std::fs::remove_file(dir.join("hybrid_queries.jsonl")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    // Preserve the older derived-field publication invariant too: predicates
+    // are published only after the payloads they count, and are renamed last.
+    for name in [
+        "vectors.npy",
+        "payloads.jsonl",
+        "tests.jsonl",
+        "hybrid_queries.jsonl",
+        "PREPARED.json",
+        "filter_queries.jsonl",
+    ] {
+        if name != "PREPARED.json" && !caps.files.contains_key(name) {
+            continue;
+        }
+        let part = dir.join(format!("{name}.part"));
+        if part.exists() {
+            std::fs::rename(&part, dir.join(name)).map_err(|e| format!("recover {name}: {e}"))?;
+        }
+    }
+    std::fs::write(dir.join("COMPLETE"), "ok\n").map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// Old upload-only directories can omit queries. When queries are present,
@@ -239,8 +310,13 @@ fn check_legacy_truth(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn check_query_rows(dir: &Path, dim: usize, count: Option<u64>, truth: bool) -> Result<(), String> {
-    let file = File::open(dir.join("tests.jsonl")).map_err(|e| format!("tests.jsonl: {e}"))?;
+fn check_query_rows(
+    path: &Path,
+    dim: usize,
+    count: Option<u64>,
+    truth: bool,
+) -> Result<(), String> {
+    let file = File::open(path).map_err(|e| format!("tests.jsonl: {e}"))?;
     let mut rows = 0;
     for line in BufReader::new(file).lines() {
         let row: Value = serde_json::from_str(&line.map_err(|e| e.to_string())?)
@@ -407,7 +483,7 @@ pub fn sample_corpus(
             docid: String,
         }
         let id: SampleId = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-        if super::crc32_bucket(&id.docid) >= threshold {
+        if !super::keeps(&id.docid, threshold) {
             continue;
         }
         let row: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
@@ -619,6 +695,91 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_publication_recovers_every_rename_boundary_without_rebuilding_corpus() {
+        for done in 0..=3 {
+            let (dir, variant) = fixture();
+            let d = dir.path();
+            let before_vectors = digest(&d.join("vectors.npy")).unwrap().sha256;
+            let before_payloads = digest(&d.join("payloads.jsonl")).unwrap().sha256;
+            let mut query: Value = serde_json::from_str(
+                std::fs::read_to_string(d.join("tests.jsonl"))
+                    .unwrap()
+                    .trim(),
+            )
+            .unwrap();
+            query["closest_ids"] = json!([0]);
+            query["closest_scores"] = json!([1.0]);
+            std::fs::write(d.join("tests.jsonl.part"), format!("{query}\n")).unwrap();
+            std::fs::write(d.join("hybrid_queries.jsonl.part"), "{}\n").unwrap();
+            let mut manifest = read_manifest(d).unwrap();
+            seal(
+                d,
+                &mut manifest,
+                &["tests.jsonl", "hybrid_queries.jsonl"],
+                true,
+                true,
+            )
+            .unwrap();
+            std::fs::write(d.join("PREPARED.json.part"), manifest.to_string()).unwrap();
+            std::fs::remove_file(d.join("COMPLETE")).unwrap();
+            for name in ["PREPARED.json", "hybrid_queries.jsonl", "tests.jsonl"]
+                .iter()
+                .take(done)
+            {
+                std::fs::rename(d.join(format!("{name}.part")), d.join(name)).unwrap();
+            }
+            assert!(check(d, &variant, false).is_err());
+            assert!(recover_publication(d, &variant).unwrap(), "boundary {done}");
+            let caps = check(d, &variant, true).unwrap().unwrap();
+            assert!(caps.vector_truth && caps.filtered_truth);
+            assert_eq!(
+                digest(&d.join("vectors.npy")).unwrap().sha256,
+                before_vectors
+            );
+            assert_eq!(
+                digest(&d.join("payloads.jsonl")).unwrap().sha256,
+                before_payloads
+            );
+            assert!(!recover_publication(d, &variant).unwrap());
+        }
+    }
+
+    #[test]
+    fn publication_recovery_rejects_corruption_before_any_rename() {
+        let (dir, variant) = fixture();
+        let d = dir.path();
+        let mut manifest = read_manifest(d).unwrap();
+        std::fs::write(
+            d.join("payloads.jsonl.part"),
+            "{\"new\":1}\n{\"new\":2}\n{\"new\":3}\n",
+        )
+        .unwrap();
+        seal(d, &mut manifest, &["payloads.jsonl"], false, false).unwrap();
+        std::fs::write(d.join("PREPARED.json.part"), manifest.to_string()).unwrap();
+        std::fs::remove_file(d.join("COMPLETE")).unwrap();
+        let original_vectors = std::fs::read(d.join("vectors.npy")).unwrap();
+        let mut corrupt = original_vectors.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        std::fs::write(d.join("vectors.npy"), corrupt).unwrap();
+        assert!(recover_publication(d, &variant)
+            .unwrap_err()
+            .contains("SHA-256"));
+        assert!(d.join("payloads.jsonl.part").exists());
+        assert_eq!(
+            std::fs::read_to_string(d.join("payloads.jsonl")).unwrap(),
+            "{}\n{}\n{}\n"
+        );
+        assert!(!d.join("COMPLETE").exists());
+        std::fs::write(d.join("vectors.npy"), original_vectors).unwrap();
+        // Derived-field upgrades invalidate the previously published hybrid set.
+        std::fs::write(d.join("hybrid_queries.jsonl"), "stale\n").unwrap();
+        assert!(recover_publication(d, &variant).unwrap());
+        assert!(!d.join("hybrid_queries.jsonl").exists());
+        check(d, &variant, true).unwrap();
+    }
+
+    #[test]
     fn capabilities_reject_incomplete_corrupt_and_wrong_corpora() {
         let (dir, variant) = fixture();
         let caps = check(dir.path(), &variant, true).unwrap().unwrap();
@@ -710,7 +871,7 @@ mod tests {
         let chosen: Vec<usize> = payloads
             .iter()
             .enumerate()
-            .filter(|(_, p)| super::super::crc32_bucket(p["docid"].as_str().unwrap()) < 500_000)
+            .filter(|(_, p)| super::super::keeps(p["docid"].as_str().unwrap(), 500_000))
             .map(|(i, _)| i)
             .collect();
         assert!(!chosen.is_empty() && chosen.len() < vectors.len());

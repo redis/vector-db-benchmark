@@ -248,6 +248,9 @@ fn run(args: &Args) -> Result<(), String> {
     })?;
 
     let dir = args.out_dir.join(variant.dir);
+    if !args.force && msmarco::preparation::recover_publication(&dir, variant)? {
+        println!("Recovered sealed publication at {}", dir.display());
+    }
     if args.from_prepared.is_some()
         && args.workloads != msmarco::preparation::PreparationMode::TextScalar
     {
@@ -262,6 +265,11 @@ fn run(args: &Args) -> Result<(), String> {
         if source.canonicalize().ok() == dir.canonicalize().ok() && source.exists() {
             return Err("--from-prepared source and destination must differ".into());
         }
+        msmarco::derived::check_prepared_dir(
+            parent.dataset_name,
+            Some(&msmarco::derived::derived_schema()),
+            source,
+        )?;
         msmarco::preparation::check(source, parent, true)?;
     }
 
@@ -420,11 +428,13 @@ fn run(args: &Args) -> Result<(), String> {
     }
     let with_hits = queries.iter().filter(|q| !q.hits.hits.is_empty()).count();
     let total_hits: usize = queries.iter().map(|q| q.hits.hits.len()).sum();
-    println!(
-        "After sampling, {with_hits} queries retain {total_hits} of their shipped top-1k hits."
-    );
     if args.from_prepared.is_none() {
+        println!(
+            "After sampling, {with_hits} queries retain {total_hits} of their shipped top-1k hits."
+        );
         msmarco::check_coverage(variant.limit, with_hits, total_hits)?;
+    } else {
+        println!("Nested sample preserves corpus order; text/scalar preparation omits KNN truth.");
     }
     let (docid_at, max_field_bytes) = (corpus.docid_at, corpus.max_field_bytes);
 
@@ -469,6 +479,7 @@ fn run(args: &Args) -> Result<(), String> {
         &queries,
         &max_field_bytes,
         &extra_manifest,
+        args.from_prepared.as_deref(),
     )?;
     if truth.is_some() {
         publish(&dir, &OUTPUTS)?;
@@ -1683,6 +1694,7 @@ fn write_manifest(
     queries: &[Query],
     max_field_bytes: &HashMap<String, usize>,
     derived: &serde_json::Value,
+    source: Option<&Path>,
 ) -> Result<(), String> {
     let mut manifest = serde_json::json!({
         "dataset": variant.dataset_name,
@@ -1729,6 +1741,14 @@ fn write_manifest(
         });
     }
     merge_object(&mut manifest, derived)?;
+    if let Some(source) = source {
+        manifest["shards_read"] = serde_json::json!(0);
+        manifest["preparation_input"] = serde_json::json!({
+            "mode": "nested",
+            "dataset": msmarco::preparation::read_manifest(source)?["dataset"],
+            "manifest_sha256": msmarco::preparation::digest(&source.join("PREPARED.json"))?.sha256,
+        });
+    }
     msmarco::preparation::seal(
         dir,
         &mut manifest,
@@ -1867,6 +1887,10 @@ fn add_derived_fields(args: &Args) -> Result<(), String> {
     let variant =
         msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
     let dir = args.out_dir.join(variant.dir);
+    if msmarco::preparation::recover_publication(&dir, variant)? {
+        println!("{dataset}: recovered the sealed publication with derived fields and exact scalar counts");
+        return Ok(());
+    }
     if dir.join("PREPARED.json").exists()
         && msmarco::preparation::read_manifest(&dir)?
             .get("preparation")
@@ -1990,6 +2014,7 @@ fn add_knn_truth(args: &Args) -> Result<(), String> {
     let dataset = args.dataset.as_deref().ok_or("--dataset required")?;
     let variant = msmarco::variant(dataset).ok_or("unknown MS MARCO variant")?;
     let dir = args.out_dir.join(variant.dir);
+    msmarco::preparation::recover_publication(&dir, variant)?;
     let caps = msmarco::preparation::check(&dir, variant, true)?;
     if caps
         .as_ref()
@@ -2083,6 +2108,13 @@ fn add_hybrid_queries(args: &Args) -> Result<(), String> {
     let variant =
         msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
     let dir = args.out_dir.join(variant.dir);
+    if msmarco::preparation::recover_publication(&dir, variant)?
+        && msmarco::preparation::check(&dir, variant, false)?
+            .is_some_and(|caps| caps.filtered_truth)
+    {
+        println!("{dataset}: recovered the sealed publication with filtered KNN truth");
+        return Ok(());
+    }
     if dir.join("PREPARED.json").exists()
         && msmarco::preparation::read_manifest(&dir)?
             .get("preparation")
