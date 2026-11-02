@@ -100,7 +100,7 @@ const BLOCK_ROWS: usize = 8192;
 const COSINE_TOLERANCE: f32 = 2e-4;
 
 /// HTTP read timeout. Generous: these are multi-GB streams over the public CDN.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Metadata shards read at once during `--discover-crc32`. A single stream from
 /// the CDN measured ~12 MB/s, so the scan is bandwidth-bound per connection, not
@@ -114,10 +114,34 @@ const DISCOVER_CONCURRENCY: usize = 16;
     about = "Download and prepare an MS MARCO v2.1 + Cohere embed-v3 dataset (vectors + metadata)."
 )]
 struct Args {
+    /// Full preparation (default), or text/scalar with neither KNN oracle.
+    /// Both modes retain vectors.npy and the existing corpus selection.
+    #[arg(long, value_enum, default_value = "full")]
+    workloads: msmarco::preparation::PreparationMode,
+
+    /// Add both KNN truth sets to the exact corpus on disk, preserving IDs.
+    #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "force", "add_derived_fields", "add_hybrid_queries"])]
+    add_knn_truth: bool,
+
     /// Registered dataset name to build, e.g. `msmarco-cohere-1024-1M-cosine`.
     /// Not needed with `--discover-crc32`.
     #[arg(long, required_unless_present = "discover_crc32")]
     dataset: Option<String>,
+
+    /// Build text/scalar from a verified equal/larger prepared corpus on disk.
+    /// Avoids another upstream scan; selection and row ordering are unchanged.
+    #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "add_derived_fields", "add_hybrid_queries", "add_knn_truth"])]
+    from_prepared: Option<PathBuf>,
+
+    /// Recover shard parts from an interrupted attempt by rechecking every
+    /// selected payload against a fresh pinned metadata stream. Invalid or
+    /// truncated parts are downloaded again; only use this attempt's parts.
+    #[arg(long, conflicts_with_all = ["force", "from_prepared", "verify", "add_knn_truth", "add_derived_fields", "add_hybrid_queries", "discover_crc32"])]
+    resume_parts: bool,
+
+    /// Concurrent upstream shard streams (IDs remain sorted by shard).
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
+    shard_workers: u8,
 
     /// Base directory holding datasets (the variant gets its registered subdir).
     #[arg(long, default_value = "datasets")]
@@ -198,6 +222,9 @@ fn run(args: &Args) -> Result<(), String> {
     if args.verify {
         return verify_prepared(args);
     }
+    if args.add_knn_truth {
+        return add_knn_truth(args);
+    }
     if args.add_derived_fields {
         return add_derived_fields(args);
     }
@@ -221,6 +248,48 @@ fn run(args: &Args) -> Result<(), String> {
     })?;
 
     let dir = args.out_dir.join(variant.dir);
+    if args.from_prepared.is_some()
+        && args.workloads != msmarco::preparation::PreparationMode::TextScalar
+    {
+        return Err("--from-prepared requires --workloads text-scalar".into());
+    }
+    if let Some(source) = &args.from_prepared {
+        let manifest = msmarco::preparation::read_manifest(source)?;
+        let parent = msmarco::preparation::source_variant(&manifest)?;
+        if parent.threshold < variant.threshold {
+            return Err("source must contain the requested nested corpus".into());
+        }
+        if source.canonicalize().ok() == dir.canonicalize().ok() && source.exists() {
+            return Err("--from-prepared source and destination must differ".into());
+        }
+        msmarco::preparation::check(source, parent, true)?;
+    }
+
+    if !args.force
+        && dir.join("PREPARED.json").exists()
+        && msmarco::preparation::read_manifest(&dir)?
+            .get("preparation")
+            .is_some()
+    {
+        let caps = msmarco::preparation::check(&dir, variant, false)?;
+        if args.workloads == msmarco::preparation::PreparationMode::Full {
+            msmarco::preparation::require_workloads(
+                caps.as_ref(),
+                dataset,
+                &[
+                    vector_db_benchmark::workload::Workload::Vector,
+                    vector_db_benchmark::workload::Workload::Hybrid,
+                ],
+            )?;
+        }
+        println!(
+            "{} already prepared at {} for {:?}",
+            dataset,
+            dir.display(),
+            args.workloads
+        );
+        return Ok(());
+    }
     // A corpus without the filter query set — typically an extracted tarball
     // published before the derived fields existed (only the original 10M
     // tarball carries a COMPLETE marker; the -v2 tarballs carry none) — would
@@ -277,6 +346,17 @@ fn run(args: &Args) -> Result<(), String> {
     );
 
     let mut queries = load_queries(&client, &cache, args.hf_token.as_deref(), variant)?;
+    if let Some(source) = &args.from_prepared {
+        let inputs: Vec<_> = queries
+            .iter()
+            .map(|q| msmarco::preparation::input_row(&q.emb, &q.id, &q.text, q.trec_year))
+            .collect();
+        let stored = read_jsonl(&source.join("tests.jsonl"))?;
+        let vectors = msmarco::preparation::check_query_inputs(&inputs, &stored)?;
+        for (q, vector) in queries.iter_mut().zip(vectors) {
+            q.emb = vector;
+        }
+    }
 
     // WHICH offsets need a docid remembered depends on the sampling mode, and
     // getting it wrong is not harmless: a prefix build handed offsets beyond its
@@ -290,17 +370,29 @@ fn run(args: &Args) -> Result<(), String> {
         })
         .collect();
 
-    let shard_rows = all_shard_rows(&client, args.hf_token.as_deref())?;
-    let tmp = dir.join("parts.tmp");
-    let corpus = write_corpus_sampled(
-        &client,
-        args.hf_token.as_deref(),
-        variant.threshold,
-        &shard_rows,
-        &dir,
-        &tmp,
-        &wanted_offsets,
-    )?;
+    let corpus = if let Some(source) = &args.from_prepared {
+        let max_field_bytes =
+            msmarco::preparation::sample_corpus(source, &dir, variant.threshold, variant.limit)?;
+        SampledCorpus {
+            count: variant.limit,
+            max_field_bytes,
+            offset_to_local: HashMap::new(),
+            docid_at: HashMap::new(),
+        }
+    } else {
+        let shard_rows = all_shard_rows(&client, args.hf_token.as_deref())?;
+        write_corpus_sampled(
+            &client,
+            args.hf_token.as_deref(),
+            variant.threshold,
+            &shard_rows,
+            &dir,
+            &dir.join("parts.tmp"),
+            &wanted_offsets,
+            args.shard_workers as usize,
+            args.resume_parts,
+        )?
+    };
     if corpus.count != variant.limit {
         return Err(format!(
             "{} selected {} passages but the registry declares {}. The threshold's realized \
@@ -331,7 +423,9 @@ fn run(args: &Args) -> Result<(), String> {
     println!(
         "After sampling, {with_hits} queries retain {total_hits} of their shipped top-1k hits."
     );
-    msmarco::check_coverage(variant.limit, with_hits, total_hits)?;
+    if args.from_prepared.is_none() {
+        msmarco::check_coverage(variant.limit, with_hits, total_hits)?;
+    }
     let (docid_at, max_field_bytes) = (corpus.docid_at, corpus.max_field_bytes);
 
     // Derived fields and the filter query set, read back from the payload file
@@ -341,32 +435,54 @@ fn run(args: &Args) -> Result<(), String> {
     let filter_rows = derived.filter_query_rows()?;
     write_filter_queries(&staged(&dir, FILTER_QUERIES), &filter_rows)?;
 
-    let ranked = brute_force_ground_truth(&dir, variant, &queries)?;
-    let stats = verify(variant.limit, &queries, &ranked, &docid_at)?;
-    write_tests(&dir, &queries, &ranked)?;
-
-    // The hybrid query set, read back from the staged payloads / vectors /
-    // tests just written — the same bytes the engines will load.
-    let hybrid = msmarco::hybrid::prepare(
-        &msmarco::hybrid::HybridInputs {
-            payloads: staged(&dir, "payloads.jsonl"),
-            vectors: staged(&dir, "vectors.npy"),
-            tests: staged(&dir, "tests.jsonl"),
+    let truth = args.workloads.truth(
+        || {
+            let ranked = brute_force_ground_truth(&staged(&dir, "vectors.npy"), variant, &queries)?;
+            let stats = verify(variant.limit, &queries, &ranked, &docid_at)?;
+            write_tests(&dir, &queries, Some(&ranked))?;
+            Ok(stats)
         },
-        Some(variant.limit),
+        |_| {
+            let hybrid = msmarco::hybrid::prepare(
+                &msmarco::hybrid::HybridInputs {
+                    payloads: staged(&dir, "payloads.jsonl"),
+                    vectors: staged(&dir, "vectors.npy"),
+                    tests: staged(&dir, "tests.jsonl"),
+                },
+                Some(variant.limit),
+            )?;
+            msmarco::hybrid::write_rows(&staged(&dir, HYBRID_QUERIES), &hybrid.rows)?;
+            Ok(hybrid)
+        },
     )?;
-    msmarco::hybrid::write_rows(&staged(&dir, HYBRID_QUERIES), &hybrid.rows)?;
     let mut extra_manifest = msmarco::derived::manifest_entry(&derived, &filter_rows);
-    merge_object(&mut extra_manifest, &hybrid.manifest)?;
+    let stats = truth.as_ref().map(|(stats, _)| stats);
+    if let Some((_, hybrid)) = &truth {
+        merge_object(&mut extra_manifest, &hybrid.manifest)?;
+    } else {
+        write_tests(&dir, &queries, None)?;
+    }
     write_manifest(
         &dir,
         variant,
-        &stats,
+        stats,
         &queries,
         &max_field_bytes,
         &extra_manifest,
     )?;
-    publish(&dir, &OUTPUTS)?;
+    if truth.is_some() {
+        publish(&dir, &OUTPUTS)?;
+    } else {
+        let mut steps = vec![PublishStep::Remove(HYBRID_QUERIES)];
+        steps.extend(
+            OUTPUTS
+                .iter()
+                .rev()
+                .filter(|n| **n != HYBRID_QUERIES)
+                .map(|n| PublishStep::Rename(n)),
+        );
+        publish_steps(&dir, &steps)?;
+    }
 
     println!(
         "Done in {:.1}s. Register-ready at {} — run with --datasets {}",
@@ -520,17 +636,41 @@ fn get(
     token: Option<&str>,
     range: Option<(u64, u64)>,
 ) -> Result<reqwest::blocking::Response, String> {
-    let mut req = client.get(url);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
-    if let Some((start, end_inclusive)) = range {
-        req = req.header(
-            reqwest::header::RANGE,
-            format!("bytes={start}-{end_inclusive}"),
-        );
-    }
-    let resp = req.send().map_err(|e| format!("GET {url}: {e}"))?;
+    let mut attempt = 0;
+    let resp = loop {
+        let mut req = client.get(url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        if let Some((start, end_inclusive)) = range {
+            req = req.header(
+                reqwest::header::RANGE,
+                format!("bytes={start}-{end_inclusive}"),
+            );
+        }
+        let response = req.send();
+        let (status, retry_after) = match &response {
+            Ok(r) => (
+                r.status().as_u16(),
+                r.headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+            ),
+            Err(_) => (503, None),
+        };
+        if let Some(delay) = msmarco::preparation::retry_delay(status, retry_after, attempt) {
+            eprintln!(
+                "GET {url}: transient HTTP {status}; retry {} in {}s",
+                attempt + 1,
+                delay.as_secs()
+            );
+            drop(response);
+            std::thread::sleep(delay);
+            attempt += 1;
+            continue;
+        }
+        break response.map_err(|e| format!("GET {url}: {e}"))?;
+    };
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("GET {url}: HTTP {status}"));
@@ -670,6 +810,7 @@ fn verify_prepared(args: &Args) -> Result<(), String> {
         msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
     let dir = args.out_dir.join(variant.dir);
     let tol = args.tolerance.unwrap_or(COSINE_TOLERANCE);
+    let caps = msmarco::preparation::check(&dir, variant, true)?;
 
     // Local and cheap, so first: every payload's derived fields must equal the
     // derivation, and filter_queries.jsonl must be exactly the set (predicates
@@ -687,6 +828,14 @@ fn verify_prepared(args: &Args) -> Result<(), String> {
         summary.min_count,
         summary.max_count
     );
+
+    if caps.as_ref().is_some_and(|c| !c.vector_truth) {
+        println!(
+            "{} verified for text/scalar; KNN truth absent (not applicable).",
+            variant.dataset_name
+        );
+        return Ok(());
+    }
 
     // The hybrid query set: regenerated from the corpus on disk (predicates,
     // exact counts AND the brute-forced filtered top-1000) and compared row by
@@ -1059,6 +1208,8 @@ fn write_corpus_sampled(
     dir: &Path,
     tmp: &Path,
     wanted_offsets: &std::collections::HashSet<u64>,
+    shard_workers: usize,
+    resume_parts: bool,
 ) -> Result<SampledCorpus, String> {
     let first_id: Vec<u64> = shard_rows
         .iter()
@@ -1073,7 +1224,7 @@ fn write_corpus_sampled(
     let bar = progress(shard_rows.iter().sum::<u64>(), "scan+select");
 
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(DISCOVER_CONCURRENCY)
+        .num_threads(shard_workers)
         .build()
         .map_err(|e| format!("build scan pool: {e}"))?;
 
@@ -1081,17 +1232,37 @@ fn write_corpus_sampled(
         (0..shard_rows.len())
             .into_par_iter()
             .map(|shard| {
-                select_from_shard(
-                    client,
-                    token,
-                    threshold,
-                    shard,
-                    shard_rows[shard],
-                    first_id[shard],
-                    tmp,
-                    wanted_offsets,
-                    &bar,
-                )
+                if resume_parts && tmp.join(format!("shard_{shard:02}.f32")).exists()
+                    && tmp.join(format!("shard_{shard:02}.jsonl")).exists() {
+                    let recovered = (|| {
+                        let response = get(client, &msmarco::jsonl_url(shard), token, None)?;
+                        let source = BufReader::with_capacity(1 << 22, MultiGzDecoder::new(BufReader::with_capacity(1 << 22, response)));
+                        msmarco::preparation::recover_part(source,
+                            &tmp.join(format!("shard_{shard:02}.jsonl")), &tmp.join(format!("shard_{shard:02}.f32")),
+                            shard_rows[shard], first_id[shard], threshold, msmarco::DIM, wanted_offsets)
+                    })();
+                    match recovered {
+                        Ok(part) => {
+                            println!("Recovered shard {shard:02}: {} selected rows verified against pinned metadata", part.kept);
+                            bar.inc(shard_rows[shard]);
+                            return Ok(ShardSelection { shard, kept: part.kept, wanted: part.wanted, docids: part.docids, max_field_bytes: part.max_field_bytes });
+                        },
+                        Err(error) => eprintln!("Shard {shard:02} cannot be recovered ({error}); downloading it again"),
+                    }
+                }
+                let mut attempt = 0;
+                loop {
+                    match select_from_shard(client, token, threshold, shard, shard_rows[shard], first_id[shard], tmp, wanted_offsets, &bar) {
+                        Ok(part) => break Ok(part),
+                        Err(error) if attempt < 2 && (error.contains("request or response body") || error.contains("error sending request") || error.contains("timed out")) => {
+                            attempt += 1;
+                            eprintln!("Shard {shard:02}: retrying interrupted stream (attempt {attempt}/2): {error}");
+                            std::thread::sleep(Duration::from_secs(2_u64.pow(attempt)));
+                        },
+                        Err(error) => break Err(error),
+                    }
+                }
+
             })
             .collect()
     });
@@ -1362,7 +1533,7 @@ fn brute_force_ground_truth(
     variant: &Variant,
     queries: &[Query],
 ) -> Result<Vec<Vec<(f32, i64)>>, String> {
-    let path = staged(dir, "vectors.npy");
+    let path = dir.to_path_buf();
     let mut file = File::open(&path).map_err(|e| format!("open {}: {}", path.display(), e))?;
 
     let mut head = vec![0u8; 512];
@@ -1475,14 +1646,21 @@ fn verify(
     Ok(stats)
 }
 
-fn write_tests(dir: &Path, queries: &[Query], ranked: &[Vec<(f32, i64)>]) -> Result<(), String> {
+fn write_tests(
+    dir: &Path,
+    queries: &[Query],
+    ranked: Option<&[Vec<(f32, i64)>]>,
+) -> Result<(), String> {
     let path = staged(dir, "tests.jsonl");
     let mut out = BufWriter::with_capacity(
         1 << 20,
         File::create(&path).map_err(|e| format!("create {}: {}", path.display(), e))?,
     );
     for (i, q) in queries.iter().enumerate() {
-        let row = test_row(&q.emb, &q.id, &q.text, q.trec_year, &ranked[i]);
+        let row = match ranked {
+            Some(ranked) => test_row(&q.emb, &q.id, &q.text, q.trec_year, &ranked[i]),
+            None => msmarco::preparation::input_row(&q.emb, &q.id, &q.text, q.trec_year),
+        };
         serde_json::to_writer(&mut out, &row).map_err(|e| format!("write tests.jsonl: {e}"))?;
         out.write_all(b"\n")
             .map_err(|e| format!("write tests.jsonl: {e}"))?;
@@ -1501,7 +1679,7 @@ fn write_tests(dir: &Path, queries: &[Query], ranked: &[Vec<(f32, i64)>]) -> Res
 fn write_manifest(
     dir: &Path,
     variant: &Variant,
-    stats: &VerifyStats,
+    stats: Option<&VerifyStats>,
     queries: &[Query],
     max_field_bytes: &HashMap<String, usize>,
     derived: &serde_json::Value,
@@ -1527,7 +1705,15 @@ fn write_manifest(
                      depends on docid, so the whole corpus is read to build it.",
         },
         "shards_read": msmarco::SHARDS,
-        "ground_truth": {
+        // Machine-readable, because the console warning scrolls away and this is
+        // what decides whether an engine can ingest the corpus at all. Empty on
+        // the 100K prefix; the 1M one exceeds Milvus' ceiling (see below).
+        "engine_cap_violations": msmarco::cap_violations(max_field_bytes),
+        "payload_fields": payload_fields_manifest(max_field_bytes),
+        "prepared_at": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Some(stats) = stats {
+        manifest["ground_truth"] = serde_json::json!({
             "method": "brute force over this prefix, on the normalized float32 vectors in vectors.npy",
             "why_not_shipped_top1k":
                 "the shipped top1k_offsets rank the full 113,520,750-passage corpus; restricted \
@@ -1540,15 +1726,16 @@ fn write_manifest(
                 "tie_reorderings": stats.tie_swaps,
                 "tolerance": COSINE_TOLERANCE,
             },
-        },
-        // Machine-readable, because the console warning scrolls away and this is
-        // what decides whether an engine can ingest the corpus at all. Empty on
-        // the 100K prefix; the 1M one exceeds Milvus' ceiling (see below).
-        "engine_cap_violations": msmarco::cap_violations(max_field_bytes),
-        "payload_fields": payload_fields_manifest(max_field_bytes),
-        "prepared_at": chrono::Utc::now().to_rfc3339(),
-    });
+        });
+    }
     merge_object(&mut manifest, derived)?;
+    msmarco::preparation::seal(
+        dir,
+        &mut manifest,
+        &OUTPUTS,
+        stats.is_some(),
+        stats.is_some(),
+    )?;
     write_manifest_value(dir, &manifest)
 }
 
@@ -1680,6 +1867,13 @@ fn add_derived_fields(args: &Args) -> Result<(), String> {
     let variant =
         msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
     let dir = args.out_dir.join(variant.dir);
+    if dir.join("PREPARED.json").exists()
+        && msmarco::preparation::read_manifest(&dir)?
+            .get("preparation")
+            .is_some()
+    {
+        msmarco::preparation::check(&dir, variant, true)?;
+    }
     if !has_corpus_files(&dir, variant) {
         return Err(format!(
             "{} does not hold a complete {} corpus to upgrade",
@@ -1763,6 +1957,12 @@ fn add_derived_fields(args: &Args) -> Result<(), String> {
     // `msmarco::hybrid::DERIVED_UPGRADE_PUBLISH`); `--add-hybrid-queries`
     // regenerates it.
     msmarco::hybrid::drop_from_manifest(&mut manifest)?;
+    if manifest.get("preparation").is_some() {
+        let vector = manifest["preparation"]["vector_truth"]
+            .as_bool()
+            .ok_or("missing vector capability")?;
+        msmarco::preparation::seal(&dir, &mut manifest, &DERIVED_OUTPUTS, vector, false)?;
+    }
     write_manifest_value(&dir, &manifest)?;
     publish_steps(&dir, &msmarco::hybrid::DERIVED_UPGRADE_PUBLISH)?;
 
@@ -1785,6 +1985,93 @@ fn add_derived_fields(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Add truth from the already validated corpus; neither corpus file is written.
+fn add_knn_truth(args: &Args) -> Result<(), String> {
+    let dataset = args.dataset.as_deref().ok_or("--dataset required")?;
+    let variant = msmarco::variant(dataset).ok_or("unknown MS MARCO variant")?;
+    let dir = args.out_dir.join(variant.dir);
+    let caps = msmarco::preparation::check(&dir, variant, true)?;
+    if caps
+        .as_ref()
+        .is_some_and(|c| c.vector_truth && c.filtered_truth)
+    {
+        println!("{dataset} already has both KNN truth sets");
+        return Ok(());
+    }
+    let derived = derive_from_payloads(&dir.join("payloads.jsonl"), variant)?;
+    msmarco::derived::check_filter_queries(
+        &derived.filter_query_rows()?,
+        &read_jsonl(&dir.join(FILTER_QUERIES))?,
+    )?;
+    let cache = args
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| args.out_dir.join(".msmarco-cache"));
+    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let mut queries = load_queries(&http_client()?, &cache, args.hf_token.as_deref(), variant)?;
+    let stored = read_jsonl(&dir.join("tests.jsonl"))?;
+    let inputs: Vec<_> = queries
+        .iter()
+        .map(|q| msmarco::preparation::input_row(&q.emb, &q.id, &q.text, q.trec_year))
+        .collect();
+    let vectors = msmarco::preparation::check_query_inputs(&inputs, &stored)?;
+    for (q, vector) in queries.iter_mut().zip(vectors) {
+        q.emb = vector;
+    }
+
+    // Keep only upstream oracle docids, not the full corpus, in RAM. Local IDs
+    // remain the existing payload row positions (the vectors are untouched).
+    let wanted: std::collections::HashSet<String> = queries
+        .iter()
+        .flat_map(|q| q.shipped.iter().map(|(_, pid, _)| pid.clone()))
+        .collect();
+    let mut local_of = HashMap::new();
+    let mut docid_at = HashMap::new();
+    let file = File::open(dir.join("payloads.jsonl")).map_err(|e| e.to_string())?;
+    for (id, line) in BufReader::with_capacity(1 << 22, file).lines().enumerate() {
+        let line = line.map_err(|e| e.to_string())?;
+        let docid = msmarco::extract_docid(&line).ok_or("payload has no docid")?;
+        if wanted.contains(&docid) {
+            local_of.insert(docid.clone(), id as i64);
+            docid_at.insert(id as i64, docid);
+        }
+    }
+    for q in &mut queries {
+        q.hits.hits = q
+            .shipped
+            .iter()
+            .filter_map(|(_, pid, cos)| local_of.get(pid).map(|id| (*id, pid.clone(), *cos)))
+            .collect();
+    }
+    let ranked = brute_force_ground_truth(&dir.join("vectors.npy"), variant, &queries)?;
+    let stats = verify(variant.limit, &queries, &ranked, &docid_at)?;
+    write_tests(&dir, &queries, Some(&ranked))?;
+    let hybrid = msmarco::hybrid::prepare(
+        &msmarco::hybrid::HybridInputs {
+            payloads: dir.join("payloads.jsonl"),
+            vectors: dir.join("vectors.npy"),
+            tests: staged(&dir, "tests.jsonl"),
+        },
+        Some(variant.limit),
+    )?;
+    msmarco::hybrid::write_rows(&staged(&dir, HYBRID_QUERIES), &hybrid.rows)?;
+    let mut manifest = msmarco::preparation::read_manifest(&dir)?;
+    manifest["dataset"] = serde_json::json!(variant.dataset_name);
+    manifest["neighbours"] = serde_json::json!(msmarco::NEIGHBOURS);
+    manifest["ground_truth"] = serde_json::json!({
+        "method": "brute force over the unchanged prepared vectors.npy",
+        "cross_checked_against_shipped_top1k": {"queries": stats.queries_checked, "positions": stats.positions_compared,
+            "max_cosine_delta": stats.max_score_delta, "tie_reorderings": stats.tie_swaps, "tolerance": COSINE_TOLERANCE},
+    });
+    merge_object(&mut manifest, &hybrid.manifest)?;
+    let outputs = ["tests.jsonl", HYBRID_QUERIES, "PREPARED.json"];
+    msmarco::preparation::seal(&dir, &mut manifest, &outputs, true, true)?;
+    write_manifest_value(&dir, &manifest)?;
+    publish(&dir, &outputs)?;
+    println!("{dataset}: both KNN truth sets added; corpus files and document IDs unchanged");
+    Ok(())
+}
+
 /// `--add-hybrid-queries`: write `hybrid_queries.jsonl` for an already
 /// prepared corpus and record it in `PREPARED.json`. Staged and published
 /// like a build, so an interruption leaves the previous corpus intact.
@@ -1796,6 +2083,13 @@ fn add_hybrid_queries(args: &Args) -> Result<(), String> {
     let variant =
         msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
     let dir = args.out_dir.join(variant.dir);
+    if dir.join("PREPARED.json").exists()
+        && msmarco::preparation::read_manifest(&dir)?
+            .get("preparation")
+            .is_some()
+    {
+        msmarco::preparation::check(&dir, variant, true)?;
+    }
     if !has_corpus_files(&dir, variant) {
         return Err(format!(
             "{} does not hold a complete {} corpus to upgrade",
@@ -1830,6 +2124,9 @@ fn add_hybrid_queries(args: &Args) -> Result<(), String> {
         &mut manifest,
         &serde_json::json!({"hybrid_queries_added_at": chrono::Utc::now().to_rfc3339()}),
     )?;
+    if manifest.get("preparation").is_some() {
+        msmarco::preparation::seal(&dir, &mut manifest, &HYBRID_OUTPUTS, true, true)?;
+    }
     write_manifest_value(&dir, &manifest)?;
     publish(&dir, &HYBRID_OUTPUTS)?;
 
