@@ -2335,3 +2335,22 @@ The legacy `knn.algo_param.ef_search` knob is rejected before client setup or
 upload because Lucene ignores it. Migrate custom configs to `search_params.ef`
 to avoid measuring identical requests under different effort settings. See the
 [OpenSearch k-NN query documentation](https://docs.opensearch.org/latest/query-dsl/specialized/k-nn/index/).
+
+### Reduced TEXT/TAG compound profile for Redis Flex
+
+Set `fulltext.scalar_indexing` to `"text-tag-only"` on every search point in an
+engine config. This requires `analysis: "parity"`, explicit unit-boost text
+fields, `compound`, and `no_vector_index: true`. Only Redis and OpenSearch support
+this profile. It preserves every stored payload field and vector, but indexes
+only TEXT/TAG fields; numeric predicates are rejected before upload and on reuse.
+OpenSearch disables indexing and doc values on excluded fields, with
+`dynamic: false`. Redis omits SORTABLE/UNF and uses SKIPINITIALSCAN.
+
+For Redis, use `--keep-data` without `--reset-between-configs`. Fresh creation
+requires an absent index and an empty exclusively owned prefix. It never falls
+back from `FT.DROPINDEX ... DD` to keeping old keys. After an interrupted upload,
+use an explicitly disposable fresh database or fresh owned index/prefix; only a
+complete, verified corpus may use `--skip-upload`. The index marker and compound
+comparison fingerprint distinguish this reduced layout from the full scalar
+suite. Query-family names alone do not validate compatibility: actual predicates
+are compiled against the reduced schema.

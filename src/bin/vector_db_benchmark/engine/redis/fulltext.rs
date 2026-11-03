@@ -136,7 +136,17 @@ impl RedisEngine {
                 } else {
                     vector_db_benchmark::filter_only::validate_redis_full_schema
                 };
-                validate(&redis_value_to_json(&info), dataset.config.schema.as_ref())?;
+                let schema = dataset
+                    .config
+                    .schema
+                    .as_ref()
+                    .map(|s| profile.scalar_indexing.project(s));
+                validate(&redis_value_to_json(&info), schema.as_ref())?;
+                if profile.scalar_indexing.is_reduced() {
+                    vector_db_benchmark::text_tag_profile::validate_redis(&redis_value_to_json(
+                        &info,
+                    ))?;
+                }
             }
             fulltext::validate_redis_index_for(
                 &redis_value_to_json(&info),

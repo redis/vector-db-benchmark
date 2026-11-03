@@ -204,6 +204,9 @@ pub const PARITY_REMOVES: [&str; 3] = [KD_WHITESPACE_TOKENS, KD_STEM_TWICE, KD_M
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FulltextSpec {
+    /// Explicit reduced index contract for Flex: only TEXT/TAG, no sorting storage.
+    #[serde(default)]
+    pub scalar_indexing: crate::text_tag_profile::ScalarIndexing,
     /// Explicit schema-only layout, preserving text fields.
     #[serde(default)]
     pub no_vector_index: bool,
@@ -258,6 +261,7 @@ impl Analysis {
 /// shared by every search config of the engine config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexProfile {
+    pub scalar_indexing: crate::text_tag_profile::ScalarIndexing,
     pub analysis: Analysis,
     /// Parity: exactly the searched fields (the only fields indexed as text,
     /// and the only ones normalized). English: empty — every schema `text`
@@ -268,6 +272,7 @@ pub struct IndexProfile {
 impl IndexProfile {
     pub fn english() -> Self {
         IndexProfile {
+            scalar_indexing: crate::text_tag_profile::ScalarIndexing::All,
             analysis: Analysis::English,
             text_fields: BTreeSet::new(),
         }
@@ -292,11 +297,15 @@ impl IndexProfile {
     /// The record written into the index (Redis marker key, OpenSearch
     /// `_meta.vdbb_fulltext`) and required to match on reuse.
     pub fn marker(&self) -> Value {
-        json!({
+        let mut marker = json!({
             "analysis": self.analysis.as_str(),
             "normalize_whitespace": self.normalizes_whitespace(),
             "text_fields": self.text_fields.iter().collect::<Vec<_>>(),
-        })
+        });
+        if self.scalar_indexing.is_reduced() {
+            marker["scalar_indexing"] = json!(self.scalar_indexing);
+        }
+        marker
     }
 
     /// Check an index's recorded marker against this profile. `Null` means the
@@ -337,6 +346,7 @@ impl IndexProfile {
 pub fn index_profile<'a>(
     configs: impl IntoIterator<Item = (Workload, Option<&'a Value>)>,
 ) -> Result<Option<IndexProfile>, String> {
+    let mut scalar_indexing = None;
     let mut analysis: Option<Analysis> = None;
     let mut parity_fields: Option<BTreeSet<String>> = None;
     let mut other_workload: Option<Workload> = None;
@@ -346,6 +356,10 @@ pub fn index_profile<'a>(
             continue;
         }
         let spec = parse_spec(block)?;
+        if scalar_indexing.is_some_and(|old| old != spec.scalar_indexing) {
+            return Err("fulltext configs disagree on scalar_indexing".into());
+        }
+        scalar_indexing = Some(spec.scalar_indexing);
         match analysis {
             Some(a) if a != spec.analysis => {
                 return Err(format!(
@@ -395,6 +409,7 @@ pub fn index_profile<'a>(
         }
     }
     Ok(Some(IndexProfile {
+        scalar_indexing: scalar_indexing.unwrap_or_default(),
         analysis,
         text_fields: parity_fields.unwrap_or_default(),
     }))
@@ -434,7 +449,7 @@ pub fn check_redis_shared_prefix(
     if engine_type != "redis" {
         return Ok(());
     }
-    if profile.normalizes_whitespace() {
+    if profile.normalizes_whitespace() || profile.scalar_indexing.is_reduced() {
         return Err(
             "fulltext `analysis: parity` normalizes the uploaded text, which a shared corpus \
              (REDIS_KEY_PREFIX) would impose on every other config — unset REDIS_KEY_PREFIX"
@@ -684,7 +699,12 @@ pub fn check_fields_before_connecting<'a>(
         let spec = parse_spec(block)?;
         if let Some(compound) = &spec.compound {
             if compound.queries.is_some() {
-                compound.load(Path::new("."), schema.ok_or("compound needs schema")?)?;
+                compound.load(
+                    Path::new("."),
+                    &spec
+                        .scalar_indexing
+                        .project(schema.ok_or("compound needs schema")?),
+                )?;
             }
         }
         resolve_fields(&spec, schema)
@@ -753,6 +773,13 @@ pub fn parse_spec(block: Option<&Value>) -> Result<FulltextSpec, String> {
         Some(v) => serde_json::from_value(v.clone())
             .map_err(|e| format!("invalid `{SPEC_KEY}` block: {e}"))?,
     };
+    if spec.scalar_indexing.is_reduced()
+        && (spec.compound.is_none() || !spec.no_vector_index || spec.analysis != Analysis::Parity)
+    {
+        return Err(
+            "text-tag-only requires parity compound fulltext and no_vector_index=true".into(),
+        );
+    }
     if let Some(fields) = &spec.fields {
         if fields.is_empty() {
             return Err(format!("`{SPEC_KEY}.fields` must name at least one field"));
@@ -941,6 +968,8 @@ pub fn load_query_set(
         return build_query_set(&read_query_texts(dir)?);
     };
     let schema = schema.ok_or("compound suite needs a schema")?;
+    let projected = spec.scalar_indexing.project(schema);
+    let schema = &projected;
     let fields = resolve_fields(spec, Some(schema))?;
     let queries = compound
         .load(dir, schema)?
@@ -1852,11 +1881,14 @@ pub fn result_metadata_for(
             .filter_map(|q| q.compound.as_ref())
             .collect();
         let scoring_contract = "native-engine-scoring-v1";
-        let bytes =
-            serde_json::to_vec(&json!({"scoring_contract":scoring_contract,"queries":queries}))
-                .map_err(|e| e.to_string())?;
+        let mut identity = json!({"scoring_contract":scoring_contract,"queries":queries});
+        if profile.scalar_indexing.is_reduced() {
+            identity["scalar_indexing"] = json!(profile.scalar_indexing);
+        }
+        let bytes = serde_json::to_vec(&identity).map_err(|e| e.to_string())?;
         m["compound"] = json!({"version":2,"scoring_contract":scoring_contract,"queries":queries,"sha256":Sha256::digest(bytes).iter().map(|b|format!("{b:02x}")).collect::<String>(),
             "preparation_sha256":set.preparation_sha256,"exact_counts":true,"ordering":"engine score descending; ties unspecified; cross-engine ranks are not relevance truth"});
+        m["compound"]["scalar_indexing"] = json!(profile.scalar_indexing);
         m["query_source"] = json!("explicit compound suite; query_id indexes compound.queries");
         m["operator"] = json!("explicit Boolean AST");
         m["boosts_applied"] = json!("unit boosts; no field reweighting");
@@ -2023,6 +2055,48 @@ mod tests {
     }
 
     #[test]
+    fn text_tag_profile_is_explicit_and_cannot_mix_layouts() {
+        let block = json!({"analysis":"parity","fields":{"title":1.0},"no_vector_index":true,
+            "scalar_indexing":"text-tag-only","compound":{"queries":[{"name":"q","family":"tag_eq",
+            "conditions":{"title":{"match":{"text":"apple"}}},"minimum_count":1}]}});
+        let mut all = block.clone();
+        all.as_object_mut().unwrap().remove("scalar_indexing");
+        assert!(index_profile([
+            (Workload::Fulltext, Some(&block)),
+            (Workload::Fulltext, Some(&all))
+        ])
+        .is_err());
+        let profile = index_profile([(Workload::Fulltext, Some(&block))])
+            .unwrap()
+            .unwrap();
+        assert!(profile
+            .check_marker(
+                &index_profile([(Workload::Fulltext, Some(&all))])
+                    .unwrap()
+                    .unwrap()
+                    .marker()
+            )
+            .is_err());
+        for (key, value) in [
+            ("scalar_indexing", json!(false)),
+            ("no_vector_index", json!(false)),
+            ("analysis", json!("english")),
+        ] {
+            let mut bad = block.clone();
+            bad[key] = value;
+            assert!(parse_spec(Some(&bad)).is_err());
+        }
+        let mut numeric = block;
+        numeric["compound"]["queries"][0]["conditions"] = json!({"n":{"range":{"gte":1}}});
+        assert!(check_fields_before_connecting(
+            [(0, Some(&numeric))].into_iter(),
+            Some(&json!({"title":"text","n":"int"})),
+            "fixture"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn compound_fingerprints_bind_queries_counts_and_preparation_bytes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("PREPARED.json"), "{}").unwrap();
@@ -2033,6 +2107,7 @@ mod tests {
             let set = load_query_set(dir.path(), &spec, Some(&schema)).unwrap();
             let fields = resolve_fields(&spec, Some(&schema)).unwrap();
             let profile = IndexProfile {
+                scalar_indexing: spec.scalar_indexing,
                 analysis: Analysis::Parity,
                 text_fields: ["title".into()].into(),
             };
@@ -2040,6 +2115,23 @@ mod tests {
         };
         let original = metadata(&block);
         assert_eq!(original, metadata(&block));
+        let mut reduced = block.clone();
+        reduced["scalar_indexing"] = json!("text-tag-only");
+        reduced["no_vector_index"] = json!(true);
+        let reduced_meta = metadata(&reduced);
+        assert_ne!(
+            original["compound"]["sha256"],
+            reduced_meta["compound"]["sha256"]
+        );
+        assert_ne!(original["index_marker"], reduced_meta["index_marker"]);
+        assert_eq!(
+            original["compound"]["queries"],
+            reduced_meta["compound"]["queries"]
+        );
+        assert_eq!(
+            original["compound"]["preparation_sha256"],
+            reduced_meta["compound"]["preparation_sha256"]
+        );
         assert!(original["known_differences"]
             .as_array()
             .unwrap()

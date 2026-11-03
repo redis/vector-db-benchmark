@@ -36,6 +36,7 @@ pub mod redis_numeric_range;
 pub mod results_dump;
 pub mod start_gate;
 pub mod synthetic;
+pub mod text_tag_profile;
 pub mod upload_stream;
 pub mod workload;
 

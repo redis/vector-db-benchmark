@@ -366,8 +366,21 @@ impl OpenSearchEngine {
             );
         }
 
+        let reduced = self
+            .fulltext_profile()?
+            .is_some_and(|p| p.scalar_indexing.is_reduced());
+        if reduced {
+            vector_db_benchmark::text_tag_profile::disable_excluded(
+                &mut properties,
+                dataset
+                    .config
+                    .schema
+                    .as_ref()
+                    .ok_or("text-tag-only needs schema")?,
+            );
+        }
         let mut mappings = serde_json::json!({ "properties": properties });
-        if narrowed {
+        if narrowed || reduced {
             mappings["dynamic"] = serde_json::json!(false);
         }
         let mut body = serde_json::json!({

@@ -4407,6 +4407,64 @@ pub fn compound_search_params() -> serde_json::Value {
     serde_json::json!([point, point])
 }
 
+/// The reduced layout keeps the same independent membership fixture.
+pub fn text_tag_search_params() -> serde_json::Value {
+    let mut points = compound_search_params();
+    for point in points.as_array_mut().unwrap() {
+        let fulltext = &mut point["fulltext"];
+        fulltext["no_vector_index"] = serde_json::json!(true);
+        fulltext["scalar_indexing"] = serde_json::json!("text-tag-only");
+        fulltext["compound"]["queries"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|q| {
+                !matches!(
+                    q["name"].as_str(),
+                    Some("tag-range" | "range-union" | "text-tag-range" | "missing" | "precedence")
+                )
+            });
+    }
+    points
+}
+
+pub fn assert_text_tag_membership(dump: &Path) {
+    let expected = compound_queries();
+    let mut seen = std::collections::HashSet::new();
+    for file in fs::read_dir(dump).unwrap() {
+        for line in fs::read_to_string(file.unwrap().path()).unwrap().lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row["kind"] != "query" {
+                continue;
+            }
+            let query = expected
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["name"] == row["shape"])
+                .unwrap();
+            let mut ids = row["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>();
+            let mut wanted = query["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>();
+            ids.sort();
+            wanted.sort();
+            assert_eq!(ids, wanted, "{}", row["shape"]);
+            assert_eq!(row["total"], query["expected_count"]);
+            assert!(row["error"].is_null());
+            seen.insert(row["shape"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(seen.len(), 8);
+}
+
 pub fn write_compound_project(configs: &str) -> MatchAnyProject {
     let proj = write_bm25_project(configs);
     let path = proj

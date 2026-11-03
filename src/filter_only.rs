@@ -360,7 +360,7 @@ fn ft_info_entries(v: &Value) -> impl Iterator<Item = (&Value, Option<&Value>)> 
 }
 
 /// One FT.INFO field, from a RESP3 map or RESP2 pairs.
-fn ft_info_field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
+pub(crate) fn ft_info_field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
     if let Some(map) = v.as_object() {
         return map.get(name);
     }
@@ -368,7 +368,7 @@ fn ft_info_field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
 }
 
 /// Whether an FT.INFO attribute carries a standalone flag (RESP2 or RESP3).
-fn ft_info_has_flag(attr: &Value, flag: &str) -> bool {
+pub(crate) fn ft_info_has_flag(attr: &Value, flag: &str) -> bool {
     ft_info_entries(attr).any(|(key, value)| key == flag && value.is_none())
         || ft_info_field(attr, "flags")
             .and_then(Value::as_array)

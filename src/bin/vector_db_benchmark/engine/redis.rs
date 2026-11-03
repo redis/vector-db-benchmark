@@ -399,13 +399,66 @@ impl RedisEngine {
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
 
+        let ft_profile = self.fulltext_profile()?;
+        let reduced = ft_profile
+            .as_ref()
+            .is_some_and(|p| p.scalar_indexing.is_reduced());
+        if reduced {
+            // Flex cannot delete indexed hashes with DD. Never turn a rebuild
+            // into an incomplete SKIPINITIALSCAN index over stale keys.
+            if self.config.shared_corpus {
+                return Err("text-tag-only requires an exclusively owned prefix".into());
+            }
+            match redis::cmd("FT.INFO").arg(&self.config.index_name).query::<redis::Value>(conn) {
+                Ok(_) => return Err("text-tag-only fresh creation requires an absent index; use --skip-upload to reuse".into()),
+                Err(e) if e.code() == Some("SEARCH_INDEX_NOT_FOUND")
+                    || e.to_string().to_ascii_lowercase().contains("unknown index")
+                    || e.to_string().to_ascii_lowercase().contains("no such index") => {},
+                Err(e) => return Err(format!("Cannot inspect fresh index: {e}")),
+            }
+            // Escape glob syntax: index/config names are not Redis patterns.
+            let pattern = self
+                .config
+                .key_prefix
+                .chars()
+                .flat_map(|c| {
+                    if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+                        vec!['\\', c]
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect::<String>()
+                + "*";
+            let mut cursor = 0u64;
+            loop {
+                let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(1000)
+                    .query(conn)
+                    .map_err(|e| format!("Cannot inspect fresh prefix: {e}"))?;
+                if !keys.is_empty() {
+                    return Err(
+                        "text-tag-only SKIPINITIALSCAN requires an empty owned prefix".into(),
+                    );
+                }
+                cursor = next;
+                if cursor == 0 {
+                    break;
+                }
+            }
+        }
+
         // Drop existing index if any. Normally with DD, which deletes the indexed
         // docs too; because the index PREFIX is this config's `<config>:`, DD
         // removes only this config's keys — siblings untouched (#151-4). In
         // shared-corpus mode (#188) the docs are SHARED across configs and
         // uploaded once, so drop the index WITHOUT DD to preserve them for the
         // other configs' indexes (build-many over one corpus).
-        {
+        if !reduced {
             let mut cmd = redis::cmd("FT.DROPINDEX");
             cmd.arg(&self.config.index_name);
             if !self.config.shared_corpus {
@@ -429,7 +482,9 @@ impl RedisEngine {
         // #339: a config that runs the fulltext workload pins the stopword list
         // explicitly (it equals the RediSearch default) so FT.INFO reports it
         // and the fulltext arm can refuse an index built any other way.
-        let ft_profile = self.fulltext_profile()?;
+        if reduced {
+            cmd.arg("SKIPINITIALSCAN");
+        }
         if ft_profile.is_some() {
             for a in vector_db_benchmark::fulltext::redis_stopword_args() {
                 cmd.arg(a);
@@ -541,6 +596,11 @@ impl RedisEngine {
         } else {
             dataset.config.schema.clone()
         };
+        let schema = schema.map(|schema| {
+            ft_profile
+                .as_ref()
+                .map_or(schema.clone(), |p| p.scalar_indexing.project(&schema))
+        });
         if let Some(schema) = &schema {
             if let Some(schema_obj) = schema.as_object() {
                 for (field_name, field_type) in schema_obj {
@@ -561,7 +621,9 @@ impl RedisEngine {
                             {
                                 cmd.arg("CASESENSITIVE");
                             }
-                            cmd.arg("SORTABLE").arg("UNF");
+                            if !reduced {
+                                cmd.arg("SORTABLE").arg("UNF");
+                            }
                         }
                         "int" | "float" => {
                             cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
@@ -577,13 +639,16 @@ impl RedisEngine {
                         "text" => match &ft_profile {
                             Some(p) if !p.indexes_text_field(field_name) => {}
                             Some(p) if !p.stems() => {
-                                cmd.arg(field_name)
-                                    .arg("TEXT")
-                                    .arg("NOSTEM")
-                                    .arg("SORTABLE");
+                                cmd.arg(field_name).arg("TEXT").arg("NOSTEM");
+                                if !reduced {
+                                    cmd.arg("SORTABLE");
+                                }
                             }
                             _ => {
-                                cmd.arg(field_name).arg("TEXT").arg("SORTABLE");
+                                cmd.arg(field_name).arg("TEXT");
+                                if !reduced {
+                                    cmd.arg("SORTABLE");
+                                }
                             }
                         },
                         "geo" => {
@@ -3503,6 +3568,14 @@ impl Engine for RedisEngine {
     }
 
     fn delete(&mut self) -> Result<(), String> {
+        if self
+            .fulltext_profile()?
+            .is_some_and(|p| p.scalar_indexing.is_reduced())
+        {
+            return Err(
+                "text-tag-only Redis corpus must be retained; automatic teardown refused".into(),
+            );
+        }
         let mut conn = self.get_connection()?;
         // Normally DD (drop index + this config's docs). In shared-corpus mode
         // (#188) the docs are shared across configs, so drop the index only and

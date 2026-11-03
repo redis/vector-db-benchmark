@@ -2696,3 +2696,106 @@ fn test_binary_opensearch_compound_text_scalar_wrong_count_is_fatal() {
         std::fs::remove_dir_all(&proj.root).ok();
     }
 }
+
+#[test]
+fn test_binary_opensearch_text_tag_mapping_and_reuse() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{"name":"os-text-tag","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":common::text_tag_search_params()}]);
+    let proj = common::write_compound_project(&configs.to_string());
+    let dump = proj.root.join("reduced-dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let env = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", "bench_text_tag"),
+    ];
+    let run = |flags: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            "os-text-tag",
+            common::BM25_DATASET,
+            "http://127.0.0.1",
+            &env,
+            flags,
+        )
+    };
+    let out = run(&[
+        "--keep-data",
+        "--search-ids",
+        "1",
+        "--queries",
+        "8",
+        "--repetitions",
+        "1",
+        "--dump-results",
+        dump.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    common::assert_text_tag_membership(&dump);
+    let out = run(&[
+        "--skip-upload",
+        "--search-ids",
+        "1",
+        "--queries",
+        "8",
+        "--repetitions",
+        "1",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    os_client()
+        .put(format!("{}/bench_text_tag/_mapping", os_base_url()))
+        .json(&serde_json::json!({"dynamic":true}))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let out = run(&[
+        "--skip-upload",
+        "--search-ids",
+        "1",
+        "--queries",
+        "8",
+        "--repetitions",
+        "1",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("dynamic=false"));
+    os_client()
+        .put(format!("{}/bench_text_tag/_mapping", os_base_url()))
+        .json(&serde_json::json!({"dynamic":false}))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    // Foreign numeric mappings cannot be relabelled as the reduced layout.
+    os_client()
+        .put(format!("{}/bench_text_tag/_mapping", os_base_url()))
+        .json(&serde_json::json!({"properties":{"foreign_number":{"type":"long"}}}))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let out = run(&[
+        "--skip-upload",
+        "--search-ids",
+        "1",
+        "--queries",
+        "8",
+        "--repetitions",
+        "1",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("non-text/tag property"));
+    os_client()
+        .delete(format!("{}/bench_text_tag", os_base_url()))
+        .send()
+        .unwrap();
+    std::fs::remove_dir_all(&proj.root).ok();
+}

@@ -320,6 +320,15 @@ pub fn run(args: &Args) -> Result<(), String> {
             .collect::<Result<Vec<_>, String>>()?;
         let profile = vector_db_benchmark::fulltext::index_profile(profile_inputs)
             .map_err(|e| format!("config '{name}': {e}"))?;
+        if profile
+            .as_ref()
+            .is_some_and(|p| p.scalar_indexing.is_reduced())
+        {
+            vector_db_benchmark::text_tag_profile::validate_lifecycle(
+                &plan.engine_type,
+                args.skip_upload || (args.keep_data && !args.reset_between_configs),
+            )?;
+        }
         // Before any download: a fulltext profile on a Redis shared corpus
         // (parity, or a prefix overlapping the marker keys); the engine
         // re-checks it at configure.
@@ -1457,12 +1466,10 @@ fn run_single_experiment(
         dataset.config.schema.as_ref(),
         &dataset.config.name,
     )?;
-    if !args.skip_upload
-        && engine.search_params().iter().any(|sp| {
-            sp.knob("fulltext")
-                .is_some_and(|b| !b["compound"].is_null())
-        })
-    {
+    if engine.search_params().iter().any(|sp| {
+        sp.knob("fulltext")
+            .is_some_and(|b| !b["compound"].is_null())
+    }) {
         vector_db_benchmark::fulltext::check_compound_before_connecting(
             &dataset.get_path()?,
             engine

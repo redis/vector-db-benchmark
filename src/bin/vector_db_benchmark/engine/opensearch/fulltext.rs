@@ -102,6 +102,12 @@ impl OpenSearchEngine {
             })
             .map_err(|e| format!("fulltext: index check failed: {e}"))?;
         let mappings = &mapping[&self.index_name]["mappings"];
+        if profile.scalar_indexing.is_reduced()
+            && mappings["dynamic"] != false
+            && mappings["dynamic"] != "false"
+        {
+            return Err("text-tag-only OpenSearch requires dynamic=false".into());
+        }
         let recorded = mappings["_meta"][fulltext::OPENSEARCH_META_KEY].clone();
         let shards = fulltext::validate_opensearch_index_for(
             &mappings["properties"],
@@ -129,7 +135,25 @@ impl OpenSearchEngine {
             } else {
                 vector_db_benchmark::filter_only::validate_opensearch_full_schema
             };
-            validate(&properties, &index, dataset.config.schema.as_ref())?;
+            let profile = self
+                .fulltext_profile()?
+                .ok_or("compound requires fulltext profile")?;
+            let schema = dataset
+                .config
+                .schema
+                .as_ref()
+                .map(|s| profile.scalar_indexing.project(s));
+            validate(&properties, &index, schema.as_ref())?;
+            if profile.scalar_indexing.is_reduced() {
+                vector_db_benchmark::text_tag_profile::validate_opensearch(
+                    &properties,
+                    dataset
+                        .config
+                        .schema
+                        .as_ref()
+                        .ok_or("text-tag-only needs schema")?,
+                )?;
+            }
         }
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
         // The live index must have every searched field, as pinned. Refused
