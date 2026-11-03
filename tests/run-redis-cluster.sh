@@ -54,4 +54,9 @@ for attempt in $(seq 1 30); do
   sleep 1
 done
 read -r -a cargo_flags <<< "${CLUSTER_CARGO_FLAGS:-}"
+# Make exports a system HDF5_DIR by default. Static builds must clear it here,
+# after entering the recipe, just like scripts/release/package.sh does.
+if [[ "${CLUSTER_CARGO_FLAGS:-}" == *release-static* ]]; then
+  unset HDF5_DIR HDF5_VERSION OPENSSL_NO_VENDOR
+fi
 cargo test --test integration_redis_cluster --release "${cargo_flags[@]}" -- --nocapture --test-threads=1
