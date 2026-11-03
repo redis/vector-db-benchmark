@@ -1976,6 +1976,41 @@ pub fn apply_layout<'a>(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn compound_layout_preserves_legacy_ranked_no_vector_refusal() {
+        use crate::workload::{self, Workload};
+        for engine in ["redis", "opensearch"] {
+            assert!(workload::plan(engine, &[Some(Workload::Fulltext)], true)
+                .unwrap_err()
+                .contains("--skip-vector-index"));
+            let mut plan = workload::plan(engine, &[Some(Workload::Fulltext)], false).unwrap();
+            let explicit = json!({"no_vector_index":true});
+            apply_layout(&mut plan, [Some(&explicit)].into_iter()).unwrap();
+            let mut ranked = workload::plan(engine, &[Some(Workload::Fulltext)], false).unwrap();
+            apply_layout(&mut ranked, [None].into_iter()).unwrap();
+        }
+    }
+
+    #[test]
+    fn compound_opensearch_request_always_tracks_exact_totals() {
+        let query = TextQuery {
+            query_id: 0,
+            terms: vec![],
+            expression: Some(
+                crate::compound_text::Expr::compile(
+                    &json!({"title":{"match":{"text":"apple"}}}),
+                    &json!({"title":"text"}),
+                )
+                .unwrap(),
+            ),
+            compound: None,
+        };
+        assert_eq!(
+            query_opensearch(&[], &query, 10)["track_total_hits"],
+            json!(true)
+        );
+    }
+
+    #[test]
     fn compound_fingerprints_bind_queries_counts_and_preparation_bytes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("PREPARED.json"), "{}").unwrap();

@@ -333,6 +333,11 @@ pub fn compare_pair(
 
     let mut warnings = Vec::new();
     let ((rl, r_inferred), (cl, c_inferred)) = (dump_layout(rh), dump_layout(ch));
+    if rh.compound_identity.is_some() && rl != cl {
+        warnings.push(format!(
+            "Compound layout comparison: reference `{rl}`, candidate `{cl}`; retain both layout labels when reporting results."
+        ));
+    }
     {
         // `full` and `no-vector` type scalars the same way (filter-only's
         // CASESENSITIVE tags / `double` floats); only `vector` differs.
@@ -990,6 +995,14 @@ mod tests {
             .contains("fingerprints"));
         b.header.compound_identity = Some(identity.clone());
         assert!(compare_pair(("a", &a), ("b", &b)).is_ok());
+        a.header.index_layout = Some("full".into());
+        b.header.index_layout = Some("no-vector".into());
+        let pair = compare_pair(("a", &a), ("b", &b)).unwrap();
+        assert!(pair
+            .warnings
+            .iter()
+            .any(|w| w.contains("reference `full`, candidate `no-vector`")));
+        b.header.index_layout = Some("full".into());
         b.header.compound_identity.as_mut().unwrap().query_sha256 = "c".repeat(64);
         assert!(compare_pair(("a", &a), ("b", &b)).is_err());
         b.header.compound_identity = Some(identity.clone());
