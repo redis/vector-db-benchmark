@@ -486,6 +486,9 @@ pub fn check_query_inputs(expected: &[Value], stored: &[Value]) -> Result<Vec<Ve
 /// The published v2 tarballs predate removal of the `-crc32-` alias.
 /// Accept that alias only with the exact registered count/hash selection.
 pub fn source_variant(manifest: &Value) -> Result<&'static super::Variant, String> {
+    if manifest["source_revision"] != super::HF_REVISION {
+        return Err("nested source has a missing or different pinned source_revision; rebuild the source with the current prepare-msmarco before sampling (do not invent provenance for legacy files)".into());
+    }
     let name = manifest["dataset"]
         .as_str()
         .ok_or("source manifest has no dataset")?;
@@ -764,6 +767,35 @@ pub fn shard_retry_delay(error: &str, attempt: u32) -> Option<std::time::Duratio
         .iter()
         .any(|needle| error.contains(needle)))
     .then(|| std::time::Duration::from_secs(2_u64.pow(attempt + 1)))
+}
+
+/// Prefer a validated cached shard, falling back to a fresh selection when
+/// recovery is unavailable or fails. The callbacks keep filesystem/network I/O,
+/// logging and sleeping in the caller; this owns the bounded retry control flow.
+pub fn recover_or_select<T>(
+    recover: impl FnOnce() -> Result<Option<T>, String>,
+    mut select: impl FnMut() -> Result<T, String>,
+    mut on_recovery_error: impl FnMut(&str),
+    mut on_retry: impl FnMut(&str, u32, std::time::Duration),
+) -> Result<T, String> {
+    match recover() {
+        Ok(Some(part)) => return Ok(part),
+        Ok(None) => {}
+        Err(error) => on_recovery_error(&error),
+    }
+    let mut attempt = 0;
+    loop {
+        match select() {
+            Ok(part) => return Ok(part),
+            Err(error) => {
+                let Some(delay) = shard_retry_delay(&error, attempt) else {
+                    return Err(error);
+                };
+                attempt += 1;
+                on_retry(&error, attempt, delay);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1098,6 +1130,7 @@ mod tests {
     #[test]
     fn legacy_source_alias_requires_the_exact_registered_corpus() {
         let mut manifest = json!({"dataset": "msmarco-cohere-1024-100K-crc32-cosine", "passages": 99964, "dimensions": 1024,
+            "source_revision": super::super::HF_REVISION,
             "sampling": {"mode": "crc32", "threshold": 886, "buckets": 1000000}});
         assert_eq!(
             source_variant(&manifest).unwrap(),
@@ -1108,6 +1141,24 @@ mod tests {
         manifest["passages"] = json!(99964);
         manifest["sampling"]["threshold"] = json!(887);
         assert!(source_variant(&manifest).is_err());
+    }
+    #[test]
+    fn nested_sources_cannot_invent_or_change_the_pinned_revision() {
+        let manifest = json!({"dataset": "msmarco-cohere-1024-100K-cosine", "passages": 99964, "dimensions": 1024,
+            "source_revision": super::super::HF_REVISION,
+            "sampling": {"mode": "crc32", "threshold": 886, "buckets": 1000000}});
+        assert!(source_variant(&manifest).is_ok());
+        for revision in [Value::Null, json!("different-source-revision")] {
+            let mut unproven = manifest.clone();
+            unproven["source_revision"] = revision;
+            assert!(source_variant(&unproven)
+                .unwrap_err()
+                .contains("source_revision"));
+            unproven.as_object_mut().unwrap().remove("source_revision");
+            assert!(source_variant(&unproven)
+                .unwrap_err()
+                .contains("source_revision"));
+        }
     }
     #[test]
     fn transient_retry_is_bounded_and_honors_server_delay() {
@@ -1265,5 +1316,97 @@ mod tests {
         ] {
             assert!(shard_retry_delay(error, 0).is_none());
         }
+    }
+
+    #[test]
+    fn recovered_shard_skips_selection_and_retries() {
+        let result = recover_or_select(
+            || Ok(Some(7)),
+            || panic!("selection must not run after successful recovery"),
+            |_| panic!("successful recovery is not an error"),
+            |_, _, _| panic!("successful recovery must not retry"),
+        );
+        assert_eq!(result.unwrap(), 7);
+    }
+
+    #[test]
+    fn failed_recovery_falls_back_to_selection() {
+        let mut selected = 0;
+        let mut recovery_errors = Vec::new();
+        let result = recover_or_select(
+            || Err("cached shard SHA-256 mismatch".into()),
+            || {
+                selected += 1;
+                Ok(11)
+            },
+            |error| recovery_errors.push(error.to_string()),
+            |_, _, _| panic!("successful selection must not retry"),
+        );
+        assert_eq!(result.unwrap(), 11);
+        assert_eq!(selected, 1);
+        assert_eq!(recovery_errors, ["cached shard SHA-256 mismatch"]);
+    }
+
+    #[test]
+    fn unavailable_recovery_selects_without_reporting_an_error() {
+        let mut selected = 0;
+        let result = recover_or_select(
+            || Ok(None),
+            || {
+                selected += 1;
+                Ok(13)
+            },
+            |_| panic!("missing receipt means no recovery candidate"),
+            |_, _, _| panic!("successful selection must not retry"),
+        );
+        assert_eq!(result.unwrap(), 13);
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn transient_selection_failures_allow_exactly_two_retries() {
+        for final_success in [false, true] {
+            let mut selections = 0;
+            let mut retries = Vec::new();
+            let result = recover_or_select(
+                || Ok(None),
+                || {
+                    selections += 1;
+                    if final_success && selections == 3 {
+                        Ok(17)
+                    } else {
+                        Err("request or response body interrupted".into())
+                    }
+                },
+                |_| panic!("no recovery candidate cannot fail"),
+                |error, attempt, delay| {
+                    assert_eq!(error, "request or response body interrupted");
+                    retries.push((attempt, delay.as_secs()));
+                },
+            );
+            assert_eq!(selections, 3);
+            assert_eq!(retries, [(1, 2), (2, 4)]);
+            if final_success {
+                assert_eq!(result.unwrap(), 17);
+            } else {
+                assert_eq!(result.unwrap_err(), "request or response body interrupted");
+            }
+        }
+    }
+
+    #[test]
+    fn permanent_selection_failures_are_not_retried() {
+        let mut selections = 0;
+        let result: Result<(), String> = recover_or_select(
+            || Ok(None),
+            || {
+                selections += 1;
+                Err("no space left on device".into())
+            },
+            |_| panic!("no recovery candidate cannot fail"),
+            |_, _, _| panic!("permanent error must not retry"),
+        );
+        assert_eq!(result.unwrap_err(), "no space left on device");
+        assert_eq!(selections, 1);
     }
 }

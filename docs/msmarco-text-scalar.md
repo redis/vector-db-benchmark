@@ -111,9 +111,13 @@ On the 96-vCPU AWS preparation host, use 48 to exploit the network/disk capacity
 Retries honor upstream `Retry-After` up to 60 seconds; shard order, selection and IDs do not
 depend on concurrency. Use the same source for 1M and 100K. Source and destination must differ. The
 source must be an equal/larger registered corpus with the matching hash rule
-and realized count; query inputs must match the pinned upstream file. New
-sources are hash-verified before sampling. Legacy source archives have no file
-hashes; retain their download provenance and verify them separately. Sampling
+and realized count; query inputs must match the pinned upstream file. Every
+source must explicitly declare the current pinned `source_revision`. Legacy
+archives missing this provenance are refused for nested sampling: rebuild the
+source using the current preparer rather than assigning a revision to unknown
+bytes. Ordinary legacy full-artifact loading is unchanged. New sources are
+hash-verified before sampling; legacy sources with a declared matching revision
+still require separate file-integrity verification. Sampling
 streams vectors and payloads in source order and applies the same docid hash
 threshold, preserving the IDs that a fresh preparation of that size assigns.
 The nested artifact records its source dataset and manifest SHA-256, and reports

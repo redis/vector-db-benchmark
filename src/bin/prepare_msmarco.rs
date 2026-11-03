@@ -1255,39 +1255,29 @@ fn write_corpus_sampled(
         (0..shard_rows.len())
             .into_par_iter()
             .map(|shard| {
-                if resume_parts && tmp.join(format!("shard_{shard:02}.f32")).exists()
-                    && tmp.join(format!("shard_{shard:02}.jsonl")).exists() {
-                    let recovered = (|| {
+                msmarco::preparation::recover_or_select(
+                    || {
+                        let vectors = tmp.join(format!("shard_{shard:02}.f32"));
+                        let payloads = tmp.join(format!("shard_{shard:02}.jsonl"));
+                        if !resume_parts || !vectors.exists() || !payloads.exists()
+                            || !vectors.with_extension("receipt.json").exists() {
+                            return Ok(None);
+                        }
                         let response = get(client, &msmarco::jsonl_url(shard), token, None)?;
                         let source = BufReader::with_capacity(1 << 22, MultiGzDecoder::new(BufReader::with_capacity(1 << 22, response)));
-                        msmarco::preparation::recover_part(source,
-                            &tmp.join(format!("shard_{shard:02}.jsonl")), &tmp.join(format!("shard_{shard:02}.f32")),
-                            shard_rows[shard], first_id[shard], threshold, msmarco::DIM, wanted_offsets)
-                    })();
-                    match recovered {
-                        Ok(part) => {
-                            println!("Recovered shard {shard:02}: {} selected rows verified against pinned metadata", part.kept);
-                            bar.inc(shard_rows[shard]);
-                            return Ok(ShardSelection { shard, kept: part.kept, wanted: part.wanted, docids: part.docids, max_field_bytes: part.max_field_bytes });
-                        },
-                        Err(error) => eprintln!("Shard {shard:02} cannot be recovered ({error}); downloading it again"),
-                    }
-                }
-                let mut attempt = 0;
-                loop {
-                    match select_from_shard(client, token, threshold, shard, shard_rows[shard], first_id[shard], tmp, wanted_offsets, &bar) {
-                        Ok(part) => break Ok(part),
-                        Err(error) => {
-                            let Some(delay) = msmarco::preparation::shard_retry_delay(&error, attempt) else {
-                                break Err(error);
-                            };
-                            attempt += 1;
-                            eprintln!("Shard {shard:02}: retrying interrupted stream (attempt {attempt}/2): {error}");
-                            std::thread::sleep(delay);
-                        },
-                    }
-                }
-
+                        let part = msmarco::preparation::recover_part(source, &payloads, &vectors,
+                            shard_rows[shard], first_id[shard], threshold, msmarco::DIM, wanted_offsets)?;
+                        println!("Recovered shard {shard:02}: {} selected rows verified against pinned metadata", part.kept);
+                        bar.inc(shard_rows[shard]);
+                        Ok(Some(ShardSelection { shard, kept: part.kept, wanted: part.wanted, docids: part.docids, max_field_bytes: part.max_field_bytes }))
+                    },
+                    || select_from_shard(client, token, threshold, shard, shard_rows[shard], first_id[shard], tmp, wanted_offsets, &bar),
+                    |error| eprintln!("Shard {shard:02} cannot be recovered ({error}); downloading it again"),
+                    |error, attempt, delay| {
+                        eprintln!("Shard {shard:02}: retrying interrupted stream (attempt {attempt}/2): {error}");
+                        std::thread::sleep(delay);
+                    },
+                )
             })
             .collect()
     });
@@ -2217,7 +2207,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn forced_rebuild_can_resume_verified_shard_parts() {
+    fn cli_accepts_force_and_resume_parts_together() {
         let args = Args::try_parse_from([
             "prepare-msmarco",
             "--dataset",
