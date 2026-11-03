@@ -169,3 +169,11 @@ HTTP status retries cap `Retry-After` at 60 seconds; interrupted body streams
 retry the affected shard twice. Connections have a 30-second timeout, while the
 one-hour total request deadline allows large streams to finish while sharing
 bandwidth. This total deadline is not an idle-read timeout.
+
+The deadline also sets a minimum sustained rate per stream: shard vector bytes
+divided by 3,600 seconds. Upstream vectors are float16 (2 bytes per coordinate),
+so a 1.9-million-row, 1,024-dimensional shard is about 3.9 GB and needs roughly
+1.1 MB/s. Sixteen such streams need about 18 MB/s aggregate vector throughput,
+and 48 need about 53 MB/s, plus metadata traffic and headroom. Reduce
+`--shard-workers` on slower links. A timed-out stream restarts from the beginning
+up to twice, so three stalled attempts can consume about three hours.

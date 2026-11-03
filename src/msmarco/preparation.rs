@@ -357,7 +357,12 @@ pub fn require_workloads(
             if (*workload == Workload::Vector && !caps.vector_truth)
                 || (*workload == Workload::Hybrid && !caps.filtered_truth)
             {
-                return Err(format!("{dataset}: {workload} requires missing KNN truth. Upgrade the same corpus with `prepare-msmarco --dataset {dataset} --add-knn-truth --out-dir <datasets dir>`"));
+                let upgrade = if caps.vector_truth {
+                    "--add-hybrid-queries"
+                } else {
+                    "--add-knn-truth"
+                };
+                return Err(format!("{dataset}: {workload} requires missing KNN truth. Upgrade the same corpus with `prepare-msmarco --dataset {dataset} {upgrade} --out-dir <datasets dir>`"));
             }
         }
     }
@@ -893,6 +898,13 @@ mod tests {
                 .unwrap_err()
                 .contains("--add-knn-truth"));
         }
+        let mut filtered_only_missing = caps;
+        filtered_only_missing.vector_truth = true;
+        assert!(
+            require_workloads(Some(&filtered_only_missing), "fixture", &[Workload::Hybrid])
+                .unwrap_err()
+                .contains("--add-hybrid-queries")
+        );
     }
     fn fixture() -> (tempfile::TempDir, super::super::Variant) {
         let dir = tempfile::tempdir().unwrap();
