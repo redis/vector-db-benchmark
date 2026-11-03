@@ -637,3 +637,11 @@ integration-test-compound:
 	docker compose -f tests/docker-compose.test.yml up -d redis opensearch --wait
 	OPENSEARCH_PORT=9202 cargo test --test integration_redis --test integration_opensearch --release compound_text_scalar -- --nocapture --test-threads=1; \
 	EXIT_CODE=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$EXIT_CODE
+
+# Override COMPOUND_PROFILE= for the debug wiring check; release is CI's profile.
+COMPOUND_PROFILE ?= --release
+.PHONY: integration-test-compound-guards
+integration-test-compound-guards:
+	docker compose -f tests/docker-compose.test.yml up -d redis opensearch --wait
+	OPENSEARCH_PORT=9202 cargo test --test integration_redis --test integration_opensearch $(COMPOUND_PROFILE) compound_text_scalar_wrong_count_is_fatal -- --nocapture --test-threads=1; \
+	EXIT_CODE=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$EXIT_CODE

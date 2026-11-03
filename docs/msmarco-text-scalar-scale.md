@@ -41,7 +41,10 @@ hits can have tied scores, so arbitrary top-k membership is not a correctness
 failure when exact counts agree.
 
 `parity` pins both text fields, disables stemming, and normalizes whitespace at
-upload. `english` retains the existing pinned English pipelines and their
+upload. Parity still retains documented differences in Unicode punctuation and
+infix tokenization (RediSearch separators versus OpenSearch's standard tokenizer);
+it does not guarantee identical whole-corpus text counts. Inspect the emitted
+`known_differences` and exact totals. `english` retains the existing pinned English pipelines and their
 known tokenizer/stemming differences. They need separate indexes/corpora;
 never share an English corpus with a parity index. All compound queries use
 unit field boosts, Redis BM25STD / OpenSearch BM25 scoring, score-descending
@@ -164,7 +167,7 @@ in the result metadata. Inspect counts/errors per query, not just aggregate QPS.
 5. Run one untimed warmup invocation, then at least three separate measured
    invocations, each with `--repetitions 1`, fresh output/dump directories, and
    `--skip-if-exists false`. Keep engine order and cache policy explicit. Start
-   with `--queries=10000`; calibrate the count on the pilot so **every family at
+   with one complete query cycle; calibrate the count on the pilot so **every family at
    each concurrency runs at least 60 seconds**, and reject shorter headline
    cells. Do not treat a one-pass smoke result as performance evidence. Preserve
    every repetition; the driver's default best-of-three is not this protocol.
@@ -174,15 +177,22 @@ calibrate and measure one family/concurrency without renumbering its dump ID.
 This selector supports dedicated fulltext configs only and cannot combine with `--parallels` or `--ef-runtime`. Keep the
 complete engine config unchanged so index identity and schema remain fixed.
 A separate invocation per ID allows a different calibrated request count for
-each point; use the same count for the paired Redis/OpenSearch point. Run
-`--queries=1000` as warmup/calibration, choose `ceil(max(observed_pair_qps) * 75)`
-requests, then retain three independent runs and enforce the 60-second floor
-on the actual result. If a point finishes early, increase its shared count and
-repeat both engines. These are count-based closed-loop runs; the fulltext
+each point. Preserve the identical query definitions and uniform cyclic mix on
+both engines, but calibrate request counts independently so a large speed gap
+does not force an hours-long slow-arm run. Run `--queries=1000` as initial
+warmup/calibration (reduce it for a slow pilot), then choose
+`ceil(max(observed_engine_qps * 75, 10 * parallel) / family_query_count) * family_query_count`
+requests per engine. Complete cycles retain identical query weights; the minimum
+request count avoids a short batch that never sustains the configured concurrency.
+Very slow families can therefore take longer than 75 seconds. Keep three
+independent runs and enforce the 60-second floor on each actual result; increase
+that arm's count and repeat it if it finishes early. Record both requested and
+completed counts. These are count-based closed-loop runs; the fulltext
 harness rejects `--target-qps` and `--search-duration` rather than ignoring them.
 
-Use the same query counts/order on both engines; a faster arm needs a larger
-shared count to meet the duration floor. Do not claim a cold-cache run without
+Use the same query definitions, cyclic order and relative weights on both
+engines. These closed-loop measurements compare the declared concurrency and
+achieved throughput; they do not establish latency at matched offered load. Do not claim a cold-cache run without
 observable cache control. Capture retries, throttling and client saturation;
 count-only requests with tiny result pages can saturate a client first.
 

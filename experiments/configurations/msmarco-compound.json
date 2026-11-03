@@ -417,7 +417,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "segment"
@@ -435,7 +435,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "segment"
@@ -453,7 +453,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "title-and-segment"
@@ -471,7 +471,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "title-and-segment"
@@ -489,7 +489,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag-and-text"
@@ -507,7 +507,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag-and-text"
@@ -525,7 +525,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-tag-range"
@@ -543,7 +543,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-tag-range"
@@ -561,7 +561,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-exclusion"
@@ -579,7 +579,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-exclusion"
@@ -597,7 +597,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_eq"
@@ -615,7 +615,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_eq"
@@ -633,7 +633,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_point"
@@ -651,7 +651,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_point"
@@ -669,7 +669,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_range"
@@ -687,7 +687,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_range"
@@ -705,7 +705,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "repeated_value_range"
@@ -723,7 +723,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "repeated_value_range"
@@ -741,7 +741,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_and_range"
@@ -759,7 +759,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_and_range"
@@ -777,7 +777,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "range_or_range"
@@ -795,7 +795,7 @@
           },
           "analysis": "parity",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "range_or_range"
@@ -1222,7 +1222,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "segment"
@@ -1240,7 +1240,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "segment"
@@ -1258,7 +1258,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "title-and-segment"
@@ -1276,7 +1276,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "title-and-segment"
@@ -1294,7 +1294,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag-and-text"
@@ -1312,7 +1312,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag-and-text"
@@ -1330,7 +1330,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-tag-range"
@@ -1348,7 +1348,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-tag-range"
@@ -1366,7 +1366,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-exclusion"
@@ -1384,7 +1384,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-exclusion"
@@ -1402,7 +1402,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_eq"
@@ -1420,7 +1420,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_eq"
@@ -1438,7 +1438,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_point"
@@ -1456,7 +1456,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_point"
@@ -1474,7 +1474,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_range"
@@ -1492,7 +1492,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_range"
@@ -1510,7 +1510,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "repeated_value_range"
@@ -1528,7 +1528,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "repeated_value_range"
@@ -1546,7 +1546,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_and_range"
@@ -1564,7 +1564,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_and_range"
@@ -1582,7 +1582,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "range_or_range"
@@ -1600,7 +1600,7 @@
           },
           "analysis": "english",
           "no_vector_index": true,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "range_or_range"
@@ -2027,7 +2027,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "segment"
@@ -2045,7 +2045,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "segment"
@@ -2063,7 +2063,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "title-and-segment"
@@ -2081,7 +2081,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "title-and-segment"
@@ -2099,7 +2099,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag-and-text"
@@ -2117,7 +2117,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag-and-text"
@@ -2135,7 +2135,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-tag-range"
@@ -2153,7 +2153,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-tag-range"
@@ -2171,7 +2171,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-exclusion"
@@ -2189,7 +2189,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-exclusion"
@@ -2207,7 +2207,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_eq"
@@ -2225,7 +2225,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_eq"
@@ -2243,7 +2243,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_point"
@@ -2261,7 +2261,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_point"
@@ -2279,7 +2279,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_range"
@@ -2297,7 +2297,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_range"
@@ -2315,7 +2315,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "repeated_value_range"
@@ -2333,7 +2333,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "repeated_value_range"
@@ -2351,7 +2351,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_and_range"
@@ -2369,7 +2369,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_and_range"
@@ -2387,7 +2387,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "range_or_range"
@@ -2405,7 +2405,7 @@
           },
           "analysis": "parity",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "range_or_range"
@@ -2832,7 +2832,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "segment"
@@ -2850,7 +2850,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "segment"
@@ -2868,7 +2868,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "title-and-segment"
@@ -2886,7 +2886,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "title-and-segment"
@@ -2904,7 +2904,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag-and-text"
@@ -2922,7 +2922,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag-and-text"
@@ -2940,7 +2940,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-tag-range"
@@ -2958,7 +2958,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-tag-range"
@@ -2976,7 +2976,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-exclusion"
@@ -2994,7 +2994,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "text-exclusion"
@@ -3012,7 +3012,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_eq"
@@ -3030,7 +3030,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_eq"
@@ -3048,7 +3048,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_point"
@@ -3066,7 +3066,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_point"
@@ -3084,7 +3084,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_range"
@@ -3102,7 +3102,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "numeric_range"
@@ -3120,7 +3120,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "repeated_value_range"
@@ -3138,7 +3138,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "repeated_value_range"
@@ -3156,7 +3156,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_and_range"
@@ -3174,7 +3174,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "tag_and_range"
@@ -3192,7 +3192,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "range_or_range"
@@ -3210,7 +3210,7 @@
           },
           "analysis": "english",
           "no_vector_index": false,
-          "allow_multi_shard": true,
+          "allow_multi_shard": false,
           "compound": {
             "suite": "msmarco-v1",
             "family": "range_or_range"

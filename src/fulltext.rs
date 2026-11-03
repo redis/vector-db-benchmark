@@ -3238,6 +3238,39 @@ mod tests {
     }
 
     #[test]
+    fn compound_exact_total_requires_a_complete_page() {
+        let body = json!({"timed_out":false,"_shards":{"failed":0},"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"a","_score":1.0}]}});
+        assert!(opensearch_ranked_page(&body, 10, true)
+            .unwrap_err()
+            .contains("incomplete exact-total"));
+        let mut complete = body.clone();
+        complete["hits"]["total"]["value"] = json!(1);
+        assert_eq!(
+            opensearch_ranked_page(&complete, 10, true).unwrap().total,
+            Some(1)
+        );
+        let mut capped = body;
+        capped["hits"]["total"]["relation"] = json!("gte");
+        capped["hits"]["total"]["value"] = json!(1);
+        let page = opensearch_ranked_page(&capped, 10, true).unwrap();
+        let query = TextQuery {
+            query_id: 0,
+            terms: vec![],
+            expression: None,
+            compound: Some(crate::compound_text::Query {
+                name: "q".into(),
+                family: "f".into(),
+                conditions: json!({}),
+                expected_count: Some(1),
+                minimum_count: 0,
+            }),
+        };
+        assert!(check_query_count(&query, page.total)
+            .unwrap_err()
+            .contains("exact total"));
+    }
+
+    #[test]
     fn opensearch_reply_must_be_complete_and_ranked() {
         let body =
             |hits: Value| json!({"timed_out":false,"_shards":{"failed":0},"hits":{"hits":hits}});

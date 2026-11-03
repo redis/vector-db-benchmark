@@ -4543,3 +4543,19 @@ pub fn compound_add_missing_scalar(root: &Path) {
     registry[0]["schema"]["compound_extra"] = serde_json::json!("keyword");
     fs::write(path, registry.to_string()).unwrap();
 }
+
+/// One bad expected count AND one valid query: the suite must fail even with
+/// successful samples and without --fail-on-dropped-queries. This tests both
+/// the reply check and its run-level error propagation.
+pub fn compound_wrong_count_params(no_vector: bool) -> serde_json::Value {
+    let mut params = compound_search_params();
+    for point in params.as_array_mut().unwrap() {
+        let queries = point["fulltext"]["compound"]["queries"]
+            .as_array_mut()
+            .unwrap();
+        queries.truncate(2);
+        queries[0]["expected_count"] = serde_json::json!(2); // actual membership: d0 only
+        point["fulltext"]["no_vector_index"] = serde_json::json!(no_vector);
+    }
+    params
+}

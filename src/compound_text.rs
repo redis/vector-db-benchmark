@@ -349,15 +349,12 @@ fn msmarco_queries(dir: &Path) -> Result<Vec<Query>, String> {
         // Prefer the most frequent co-occurring title term; lexical tie-break
         // keeps this stable across executions and engines. No witness: skip
         // the seed instead of advertising a NOT that does no work.
-        let Some((exclusion, removed)) = candidates
+        let Some((exclusion, _removed)) = candidates
             .into_iter()
             .max_by(|(ta, ca), (tb, cb)| ca.cmp(cb).then_with(|| tb.cmp(ta)))
         else {
             continue;
         };
-        if removed == 0 {
-            return Err("compound exclusion has no removed-row witness".into());
-        }
         let i = queries.len() / 5;
         let text = |f: &str, t: &str| json!({f:{"match":{"text":t}}});
         let cat = json!({"category":{"match":{"value":row["category"]}}});

@@ -6670,3 +6670,34 @@ fn test_binary_redis_compound_text_scalar_english_inflection() {
     flush_db(&mut conn);
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+#[test]
+fn test_binary_redis_compound_text_scalar_wrong_count_is_fatal() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    for no_vector in [false, true] {
+        flush_db(&mut conn);
+        let configs = serde_json::json!([{"name":"redis-compound-count-guard","engine":"redis","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":common::compound_wrong_count_params(no_vector)}]);
+        let proj = common::write_compound_project(&configs.to_string());
+        let port = test_port().to_string();
+        let out = common::run_binary_output(
+            &proj.root,
+            "redis-compound-count-guard",
+            common::BM25_DATASET,
+            TEST_HOST,
+            &[("REDIS_PORT", &port)],
+            &["--search-ids", "1", "--queries", "2", "--repetitions", "1"],
+        );
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "a compound count mismatch must fail even without --fail-on-dropped-queries"
+        );
+        assert!(
+            error.contains("compound suite failed") && error.contains("exact count"),
+            "{error}"
+        );
+        flush_db(&mut conn);
+        std::fs::remove_dir_all(&proj.root).ok();
+    }
+}
