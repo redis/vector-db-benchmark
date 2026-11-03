@@ -3,6 +3,78 @@
 use redis::{ConnectionLike, Value};
 use vector_db_benchmark::redis_transport::Client;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn standalone_preserves_default_socket_timeouts_and_explicit_setters() {
+    use std::net::{SocketAddr, TcpStream};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::time::Duration;
+
+    // Validate the owned fixture and close its inspection connections so the
+    // transport below is the only connection to this peer in this test process.
+    // The fixture runner serializes this integration binary's tests.
+    let (_, nodes) = fixture();
+    drop(nodes);
+    let password = std::env::var("REDIS_CLUSTER_TEST_PASSWORD").unwrap();
+    let client = Client::open(&format!("redis://:{password}@127.0.0.1:17379/"), false).unwrap();
+    let connection = client.get_connection().unwrap();
+    let peer: SocketAddr = "127.0.0.1:17379".parse().unwrap();
+
+    unsafe extern "C" {
+        fn dup(fd: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    // Snapshot before duplicating so our own probe descriptors cannot appear
+    // as additional candidates during /proc enumeration.
+    let candidates: Vec<i32> = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !std::fs::read_link(entry.path())
+                .is_ok_and(|p| p.to_string_lossy().starts_with("socket:["))
+            {
+                return None;
+            }
+            entry.file_name().to_string_lossy().parse().ok()
+        })
+        .collect();
+    let mut matches = Vec::new();
+    for fd in candidates {
+        // SAFETY: dup accepts any integer descriptor and reports -1 if it has
+        // closed since enumeration. Success gives us a new owned descriptor;
+        // only that duplicate is ever closed, never the transport's original.
+        let copied = unsafe { dup(fd) };
+        if copied < 0 {
+            continue;
+        }
+        // SAFETY: a successful dup returned this valid, uniquely owned fd.
+        let socket = TcpStream::from(unsafe { OwnedFd::from_raw_fd(copied) });
+        if socket.peer_addr().ok() == Some(peer) {
+            matches.push(socket);
+        }
+    }
+    assert_eq!(
+        matches.len(),
+        1,
+        "fixture peer must identify one client socket"
+    );
+    let socket = &matches[0];
+    assert_eq!(socket.read_timeout().unwrap(), None);
+    assert_eq!(socket.write_timeout().unwrap(), None);
+
+    // Prove these observations concern the actual transport, not an unrelated
+    // fixture socket: its explicit overrides must be immediately observable.
+    let read = Some(Duration::from_millis(200));
+    let write = Some(Duration::from_millis(300));
+    connection.set_read_timeout(read).unwrap();
+    connection.set_write_timeout(write).unwrap();
+    assert_eq!(socket.read_timeout().unwrap(), read);
+    assert_eq!(socket.write_timeout().unwrap(), write);
+    connection.set_read_timeout(None).unwrap();
+    connection.set_write_timeout(None).unwrap();
+    assert_eq!(socket.read_timeout().unwrap(), None);
+    assert_eq!(socket.write_timeout().unwrap(), None);
+}
+
 fn fixture() -> (Client, Vec<redis::Connection>) {
     let port: u16 = std::env::var("REDIS_CLUSTER_TEST_PORT")
         .expect("use make integration-test-redis-cluster")

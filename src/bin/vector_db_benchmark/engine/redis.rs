@@ -13,7 +13,7 @@ use rand::SeedableRng;
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 
 use super::redis_utils;
-use vector_db_benchmark::redis_transport::{Client as RedisClient, Connection};
+use vector_db_benchmark::redis_transport::{Client as RedisClient, Connection, ScanLimits};
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::{Dataset, UploadSource};
@@ -41,6 +41,7 @@ mod stream_upload;
 #[derive(Clone)]
 pub struct RedisEngineConfig {
     pub cluster_api: bool,
+    pub prefix_scan_limits: ScanLimits,
     pub m: i64,
     pub ef_construction: i64,
     pub data_type: String,
@@ -207,6 +208,12 @@ impl RedisEngine {
                 .as_deref(),
         )?;
         crate::effective_config::record_effective("cluster_api", serde_json::json!(cluster_api));
+        let prefix_scan_limits =
+            ScanLimits::parse(cp_extra.and_then(|cp| cp.get("prefix_scan_limits")))?;
+        crate::effective_config::record_effective(
+            "prefix_scan_limits",
+            prefix_scan_limits.as_json(),
+        );
         let cp_str = |key: &str| {
             cp_extra
                 .and_then(|e| e.get(key))
@@ -343,6 +350,7 @@ impl RedisEngine {
             redis_url,
             config: RedisEngineConfig {
                 cluster_api,
+                prefix_scan_limits,
                 m,
                 ef_construction,
                 data_type,
@@ -379,7 +387,8 @@ impl RedisEngine {
 
     fn get_connection(&self) -> Result<Connection, String> {
         let client = RedisClient::open(self.redis_url.as_str(), self.config.cluster_api)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .with_scan_limits(self.config.prefix_scan_limits);
         client.get_connection().map_err(|e| e.to_string())
     }
 
@@ -4183,6 +4192,7 @@ mod tests {
         dt.insert("ts".to_string());
         let cfg = RedisEngineConfig {
             cluster_api: false,
+            prefix_scan_limits: super::ScanLimits::default(),
             m: 16,
             ef_construction: 128,
             data_type: "FLOAT32".to_string(),
@@ -4282,6 +4292,35 @@ mod tests {
         }))
         .unwrap();
         assert!(super::RedisEngine::new(&ec, "localhost").is_err());
+    }
+
+    #[test]
+    fn prefix_scan_limits_reach_engine_and_invalid_values_fail() {
+        let _env = isolated_engine_env();
+        let limits = serde_json::json!({
+            "timeout_secs": 7200,
+            "max_keys": 250_000_000,
+            "max_fingerprint_bytes": 8_589_934_592_u64
+        });
+        let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+            "name":"scan-limits", "engine":"redis",
+            "collection_params":{"prefix_scan_limits":limits}
+        }))
+        .unwrap();
+        assert_eq!(
+            super::RedisEngine::new(&ec, "localhost")
+                .unwrap()
+                .config
+                .prefix_scan_limits
+                .as_json(),
+            limits
+        );
+        let bad: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+            "name":"bad-scan-limits", "engine":"redis",
+            "collection_params":{"prefix_scan_limits":{"timeout_secs":0}}
+        }))
+        .unwrap();
+        assert!(super::RedisEngine::new(&bad, "localhost").is_err());
     }
 
     #[test]

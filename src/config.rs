@@ -9,7 +9,31 @@ pub struct RedisConfig {
 }
 
 impl RedisConfig {
+    /// Parse cluster mode using the same strict 0/1/false/true contract as the CLI.
+    pub fn try_from_env() -> Result<Self, String> {
+        let cluster = crate::redis_transport::resolve_cluster_api(
+            None,
+            Self::cluster_environment().as_deref(),
+        )?;
+        Ok(Self::connection_fields_from_env(cluster))
+    }
+
+    /// Legacy integer coercion: any nonzero integer enables cluster mode;
+    /// unparseable values, including "true", disable it. Retained for API compatibility.
+    #[deprecated(note = "use try_from_env for the CLI's strict cluster-mode parsing")]
     pub fn from_env() -> Self {
+        let cluster = Self::cluster_environment()
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|v| v != 0)
+            .unwrap_or(false);
+        Self::connection_fields_from_env(cluster)
+    }
+
+    fn cluster_environment() -> Option<String> {
+        env::var("REDIS_CLUSTER").ok()
+    }
+
+    fn connection_fields_from_env(cluster: bool) -> Self {
         Self {
             port: env::var("REDIS_PORT")
                 .ok()
@@ -17,11 +41,7 @@ impl RedisConfig {
                 .unwrap_or(6379),
             auth: env::var("REDIS_AUTH").ok(),
             user: env::var("REDIS_USER").ok(),
-            cluster: env::var("REDIS_CLUSTER")
-                .ok()
-                .and_then(|v| v.parse::<i32>().ok())
-                .map(|v| v != 0)
-                .unwrap_or(false),
+            cluster,
         }
     }
 
@@ -37,6 +57,7 @@ impl RedisConfig {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use std::sync::Mutex;
 
@@ -160,6 +181,30 @@ mod tests {
             // "true" is not a valid i32 → parse fails → unwrap_or(false).
             assert!(!RedisConfig::from_env().cluster);
         });
+    }
+
+    #[test]
+    fn strict_cluster_constructor_matches_cli_contract() {
+        for (input, expected) in [
+            (None, false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("1"), true),
+            (Some("true"), true),
+        ] {
+            with_env(Some("7000"), Some("pw"), Some("alice"), input, || {
+                let c = RedisConfig::try_from_env().unwrap();
+                assert_eq!(c.cluster, expected);
+                assert_eq!(c.port, 7000);
+                assert_eq!(c.auth.as_deref(), Some("pw"));
+                assert_eq!(c.user.as_deref(), Some("alice"));
+            });
+        }
+        for input in ["2", "-1", "yes", ""] {
+            with_env(None, None, None, Some(input), || {
+                assert!(RedisConfig::try_from_env().is_err());
+            });
+        }
     }
 
     #[test]

@@ -655,6 +655,8 @@ integration-test-redis-cluster:
 test-redis-cluster-guards:
 	cargo test --lib redis_transport:: --release
 	cargo test --lib redis_transport::
+	cargo test --lib config:: --release
+	cargo test --lib config::
 
 # Focused lifecycle/reuse regression, including deliberate guard mutations.
 TEXT_TAG_ENGINE ?= redis

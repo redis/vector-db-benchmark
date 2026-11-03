@@ -4,8 +4,126 @@ use redis::{
     cluster::{ClusterClient, ClusterConnection},
     Cmd, ConnectionInfo, ConnectionLike, RedisResult, Value,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, Instant};
+
+/// Bounds for prefix inspection, not the whole process RSS. Fingerprint storage
+/// excludes the current SCAN page and the separately bounded cursor set.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScanLimits {
+    timeout_secs: u64,
+    max_keys: usize,
+    max_fingerprint_bytes: usize,
+}
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 3600,
+            max_keys: 200_000_000,
+            max_fingerprint_bytes: 4_294_967_296,
+        }
+    }
+}
+impl ScanLimits {
+    pub fn parse(value: Option<&serde_json::Value>) -> Result<Self, String> {
+        let limits: Self = match value {
+            Some(value) if !value.is_object() => {
+                return Err("collection_params.prefix_scan_limits must be an object".into());
+            }
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|e| format!("collection_params.prefix_scan_limits: {e}"))?,
+            None => Self::default(),
+        };
+        if limits.timeout_secs == 0 || limits.max_keys == 0 || limits.max_fingerprint_bytes == 0 {
+            return Err(
+                "collection_params.prefix_scan_limits values must be positive integers".into(),
+            );
+        }
+        Ok(limits)
+    }
+    pub fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({"timeout_secs":self.timeout_secs,"max_keys":self.max_keys,"max_fingerprint_bytes":self.max_fingerprint_bytes})
+    }
+    fn failure(&self, reason: &str) -> redis::RedisError {
+        (
+            redis::ErrorKind::Client,
+            "Prefix scan resource limit exceeded",
+            format!(
+                "{reason}; collection_params.prefix_scan_limits={}",
+                self.as_json()
+            ),
+        )
+            .into()
+    }
+    fn check_elapsed(&self, elapsed: Duration) -> RedisResult<()> {
+        if elapsed >= Duration::from_secs(self.timeout_secs) {
+            return Err(self.failure(
+                "timeout_secs reached; increase the recorded scan limit for this corpus",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A 128-bit SHA-256 prefix retains neither keys nor payloads. A collision can
+/// only reduce the count, so it cannot falsely certify a complete corpus.
+fn key_fingerprint(key: &[u8]) -> [u8; 16] {
+    let digest = Sha256::digest(key);
+    let mut fingerprint = [0; 16];
+    fingerprint.copy_from_slice(&digest[..16]);
+    fingerprint
+}
+struct PrefixFingerprints {
+    keys: HashSet<[u8; 16]>,
+    limits: ScanLimits,
+}
+impl PrefixFingerprints {
+    fn new(limits: ScanLimits) -> Self {
+        Self {
+            keys: HashSet::new(),
+            limits,
+        }
+    }
+    fn insert(&mut self, key: &[u8]) -> RedisResult<()> {
+        self.insert_fingerprint(key_fingerprint(key))
+    }
+    fn insert_fingerprint(&mut self, fingerprint: [u8; 16]) -> RedisResult<()> {
+        if self.keys.contains(&fingerprint) {
+            return Ok(());
+        }
+        if self.keys.len() >= self.limits.max_keys {
+            return Err(self.limits.failure("max_keys reached"));
+        }
+        if self.keys.len() == self.keys.capacity() {
+            // Reserve one entry at a time only at growth boundaries. Twice the
+            // old capacity plus two bounds the next hash-table capacity; 32
+            // bytes/slot conservatively includes the 16-byte fingerprint,
+            // control bytes and spare buckets. Check BEFORE allocating.
+            let next_capacity = self
+                .keys
+                .capacity()
+                .checked_add(1)
+                .and_then(|n| n.checked_mul(2))
+                .map(|n| n.max(4));
+            let bytes = next_capacity.and_then(|n| n.checked_mul(32));
+            if bytes.is_none_or(|n| n > self.limits.max_fingerprint_bytes) {
+                return Err(self
+                    .limits
+                    .failure("max_fingerprint_bytes would be exceeded by hash-table growth"));
+            }
+            self.keys
+                .try_reserve(1)
+                .map_err(|_| self.limits.failure("fingerprint allocation failed"))?;
+        }
+        self.keys.insert(fingerprint);
+        Ok(())
+    }
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
 
 fn error(message: &'static str) -> redis::RedisError {
     (redis::ErrorKind::Client, message).into()
@@ -31,6 +149,7 @@ pub fn resolve_cluster_api(
 pub struct Client {
     info: ConnectionInfo,
     cluster_api: bool,
+    scan_limits: ScanLimits,
 }
 impl Client {
     pub fn open(url: &str, cluster_api: bool) -> RedisResult<Self> {
@@ -38,7 +157,15 @@ impl Client {
         if cluster_api && info.redis_settings().db() != 0 {
             return Err(error("OSS Cluster API requires database 0"));
         }
-        Ok(Self { info, cluster_api })
+        Ok(Self {
+            info,
+            cluster_api,
+            scan_limits: ScanLimits::default(),
+        })
+    }
+    pub fn with_scan_limits(mut self, limits: ScanLimits) -> Self {
+        self.scan_limits = limits;
+        self
     }
     pub fn with_protocol(mut self, protocol: redis::ProtocolVersion) -> Self {
         let settings = self.info.redis_settings().clone().set_protocol(protocol);
@@ -46,10 +173,17 @@ impl Client {
         self
     }
     pub fn get_connection(&self) -> RedisResult<Connection> {
-        let coordinator = redis::Client::open(self.info.clone())?
-            .get_connection_with_timeout(Duration::from_secs(5))?;
-        coordinator.set_read_timeout(Some(Duration::from_secs(120)))?;
-        coordinator.set_write_timeout(Some(Duration::from_secs(120)))?;
+        let client = redis::Client::open(self.info.clone())?;
+        let coordinator = if self.cluster_api {
+            let connection = client.get_connection_with_timeout(Duration::from_secs(5))?;
+            connection.set_read_timeout(Some(Duration::from_secs(120)))?;
+            connection.set_write_timeout(Some(Duration::from_secs(120)))?;
+            connection
+        } else {
+            // Preserve legacy standalone configure/upload defaults. Timed
+            // search workers continue to set their own socket timeouts.
+            client.get_connection()?
+        };
         let cluster = if self.cluster_api {
             Some(
                 ClusterClient::builder([self.info.clone()])
@@ -67,6 +201,7 @@ impl Client {
         Ok(Connection {
             coordinator,
             cluster,
+            scan_limits: self.scan_limits,
         })
     }
 }
@@ -74,6 +209,7 @@ impl Client {
 pub struct Connection {
     coordinator: redis::Connection,
     cluster: Option<ClusterConnection>,
+    scan_limits: ScanLimits,
 }
 impl Connection {
     pub fn set_read_timeout(&self, duration: Option<Duration>) -> RedisResult<()> {
@@ -150,6 +286,11 @@ impl Connection {
     /// Fail closed on partial scans, duplicate pages or changed slot ownership.
     /// Fresh-prefix checks stop at the first key; complete counts deduplicate.
     pub fn scan_prefix(&mut self, prefix: &str, stop_on_first: bool) -> RedisResult<usize> {
+        let start = Instant::now();
+        eprintln!(
+            "Redis prefix scan limits: {} (fingerprint storage excludes SCAN pages/cursors)",
+            self.scan_limits.as_json()
+        );
         let pattern = escape_glob(prefix) + "*";
         let topology = if self.cluster.is_some() {
             Some(self.topology()?)
@@ -167,16 +308,13 @@ impl Connection {
         } else {
             vec![None]
         };
-        let start = Instant::now();
-        let mut keys = HashSet::<Vec<u8>>::new();
+        let mut keys = PrefixFingerprints::new(self.scan_limits);
         for target in targets {
             let mut cursor = 0u64;
             let mut seen = HashSet::new();
             loop {
-                if start.elapsed() > Duration::from_secs(300)
-                    || !seen.insert(cursor)
-                    || seen.len() > 1_000_000
-                {
+                self.scan_limits.check_elapsed(start.elapsed())?;
+                if !seen.insert(cursor) || seen.len() > 1_000_000 {
                     return Err(error(
                         "Prefix scan exceeded its time/page budget or repeated a cursor",
                     ));
@@ -201,10 +339,13 @@ impl Connection {
                     self.coordinator.req_command(&cmd)?
                 };
                 let (next, page): (u64, Vec<Vec<u8>>) = redis::from_redis_value(value)?;
+                self.scan_limits.check_elapsed(start.elapsed())?;
                 if stop_on_first && !page.is_empty() {
                     return Ok(1);
                 }
-                keys.extend(page);
+                for key in page {
+                    keys.insert(&key)?;
+                }
                 if next == 0 {
                     break;
                 }
@@ -214,6 +355,7 @@ impl Connection {
         if let Some(before) = topology {
             ensure_same_topology(&before, &self.topology()?)?;
         }
+        self.scan_limits.check_elapsed(start.elapsed())?;
         Ok(keys.len())
     }
 }
@@ -370,6 +512,80 @@ fn escape_glob(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scan_limits_are_strict_and_default_covers_full_msmarco() {
+        let defaults = ScanLimits::parse(None).unwrap();
+        assert!(defaults.max_keys > 100_000_027);
+        assert_eq!(
+            defaults.as_json(),
+            serde_json::json!({"timeout_secs":3600,"max_keys":200_000_000,"max_fingerprint_bytes":4_294_967_296u64})
+        );
+        defaults.check_elapsed(Duration::from_secs(300)).unwrap();
+        assert!(defaults.check_elapsed(Duration::from_secs(3600)).is_err());
+        let custom = ScanLimits::parse(Some(&serde_json::json!({"timeout_secs":7200}))).unwrap();
+        custom.check_elapsed(Duration::from_secs(3601)).unwrap();
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"unknown":1}),
+            serde_json::json!({"timeout_secs":0}),
+            serde_json::json!({"max_keys":0}),
+            serde_json::json!({"max_fingerprint_bytes":0}),
+            serde_json::json!({"timeout_secs":1.5}),
+            serde_json::json!({"max_keys":-1}),
+            serde_json::json!({"max_fingerprint_bytes":"4096"}),
+        ] {
+            assert!(ScanLimits::parse(Some(&invalid)).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn compact_fingerprints_deduplicate_before_applying_key_limit() {
+        assert_eq!(
+            key_fingerprint(b"abc"),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23
+            ]
+        );
+        let limits = ScanLimits::parse(Some(&serde_json::json!({"max_keys":2}))).unwrap();
+        let mut keys = PrefixFingerprints::new(limits);
+        keys.insert(b"a\0b").unwrap();
+        keys.insert(b"ab").unwrap();
+        keys.insert(b"a\0b").unwrap();
+        assert_eq!(keys.len(), 2);
+        // Inject the same fingerprint as a different hypothetical input to
+        // prove collisions/duplicate pages never increase the accepted count.
+        keys.insert_fingerprint(key_fingerprint(b"ab")).unwrap();
+        assert_eq!(keys.len(), 2);
+        let err = keys.insert(b"third").unwrap_err().to_string();
+        assert!(err.contains("max_keys reached") && err.contains("prefix_scan_limits"));
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn fingerprint_budget_refuses_growth_before_allocation() {
+        let limits =
+            ScanLimits::parse(Some(&serde_json::json!({"max_fingerprint_bytes":127}))).unwrap();
+        let mut keys = PrefixFingerprints::new(limits);
+        assert!(keys
+            .insert(b"first")
+            .unwrap_err()
+            .to_string()
+            .contains("max_fingerprint_bytes"));
+        assert_eq!(keys.keys.capacity(), 0);
+        let limits =
+            ScanLimits::parse(Some(&serde_json::json!({"max_fingerprint_bytes":128}))).unwrap();
+        let mut keys = PrefixFingerprints::new(limits);
+        keys.insert(b"a").unwrap();
+        keys.insert(b"b").unwrap();
+        keys.insert(b"c").unwrap();
+        let capacity = keys.keys.capacity();
+        assert!(keys.insert(b"d").is_err());
+        assert_eq!(keys.keys.capacity(), capacity);
+        assert_eq!(keys.len(), 3);
+        keys.insert(b"c").unwrap();
+    }
     #[test]
     fn explicit_cluster_mode_is_strict_and_overrides_legacy_environment() {
         assert!(!resolve_cluster_api(None, None).unwrap());
