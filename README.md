@@ -577,12 +577,16 @@ these checks without concurrent writes or resharding; SCAN is not a snapshot.
 Complete counts retain 128-bit SHA-256 key fingerprints instead of full keys;
 a fingerprint collision can only undercount, never inflate the completeness
 count. The scan still uses memory proportional to the number of distinct keys.
+This applies to shared-prefix counting in both standalone and cluster mode.
 `collection_params.prefix_scan_limits` accepts positive integer `timeout_secs`
 (default 3600), `max_keys` (200,000,000) and `max_fingerprint_bytes`
 (4,294,967,296). The allocation check includes conservative hash-table overhead;
 it limits fingerprint storage, not total process RSS. The current SCAN page and
 cursor history are separate. Adjust these limits for the corpus and client;
 the effective configuration records them and an exceeded limit stops the run.
+The key and byte caps apply independently; increasing one does not increase
+the other. With the current hash-table growth policy, the default byte cap
+admits about 117 million distinct fingerprints, including MS MARCO 100M.
 The elapsed-time limit is checked between responses; it does not interrupt a
 blocked standalone socket whose upstream timeout remains unset.
 Fresh-prefix checks stop at the first key and do not collect the corpus.
@@ -600,6 +604,9 @@ its legacy integer coercion for compatibility (`2` enables it; `true` does not).
 `make integration-test-redis-cluster` runs an authenticated, disposable
 three-primary cluster on loopback, covering pipelines, markers, redirects and
 scan failures. It builds checksum-pinned Redis sources and requires no Docker.
+This fixture runs core Redis without Search modules and does not validate
+distributed `FT.*` execution. The coordinator path is validated separately
+against Redis Cloud; independent OSS Search nodes have no equivalent coordinator.
 It requires network access to download.redis.io, a C toolchain, curl, tar,
 sha256sum and flock. The normal `make integration-test` also runs this suite.
 
