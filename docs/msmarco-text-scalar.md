@@ -108,7 +108,7 @@ Build the largest required variant once, then stream nested samples from it:
 
 The default is 16 concurrent upstream shards; `--shard-workers` accepts 1–64.
 On the 96-vCPU AWS preparation host, use 48 to exploit the network/disk capacity.
-Retries honor upstream `Retry-After`; shard order, selection and IDs do not
+Retries honor upstream `Retry-After` up to 60 seconds; shard order, selection and IDs do not
 depend on concurrency. Use the same source for 1M and 100K. Source and destination must differ. The
 source must be an equal/larger registered corpus with the matching hash rule
 and realized count; query inputs must match the pinned upstream file. New
@@ -141,11 +141,20 @@ Keep the same attempt's `parts.tmp` directory and run:
   --shard-workers 48 --resume-parts
 ```
 
-Recovery rereads the complete pinned metadata for each cached shard and compares
-all selected payloads in order, then checks the exact raw vector byte count and
-all floats for finite values. A truncated, mismatched or reordered shard is
-redownloaded. Only use parts produced by this preparation attempt: they have no
-independent vector checksum until the final manifest is sealed. Completed files
-are still SHA-256 verified before publication. HTTP retries honor `Retry-After`;
-interrupted body streams retry the affected shard twice. A one-hour HTTP timeout
-allows large streams to finish while sharing bandwidth with the other shards.
+Each completed shard receives an atomic receipt binding the pinned source
+revision, source range, sampling threshold and dimensions to SHA-256 hashes of
+both part files. Recovery requires that receipt and verifies both hashes before
+rereading the complete pinned metadata and comparing all selected payloads in
+order. Exact vector byte counts and finite floats are checked as well. Missing
+receipts (including older builds), mismatched bytes and partial shards cause a
+fresh download. A receipt is invalidated before either part can be overwritten.
+
+To resume an interrupted `--force` rebuild over an older corpus, supply both
+`--force --resume-parts`. This discards incomplete assembly and reuses only
+receipt-verified shards; it avoids treating the old corpus manifest as a new
+sealed publication. The final dataset is still fully SHA-256 verified.
+
+HTTP status retries cap `Retry-After` at 60 seconds; interrupted body streams
+retry the affected shard twice. Connections have a 30-second timeout, while the
+one-hour total request deadline allows large streams to finish while sharing
+bandwidth. This total deadline is not an idle-read timeout.

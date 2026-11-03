@@ -99,7 +99,8 @@ const BLOCK_ROWS: usize = 8192;
 /// before.
 const COSINE_TOLERANCE: f32 = 2e-4;
 
-/// HTTP read timeout. Generous: these are multi-GB streams over the public CDN.
+/// Total HTTP request deadline, including the body (not an idle-read timeout).
+/// Generous because these are multi-GB streams sharing the public CDN.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Metadata shards read at once during `--discover-crc32`. A single stream from
@@ -133,10 +134,10 @@ struct Args {
     #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "add_derived_fields", "add_hybrid_queries", "add_knn_truth"])]
     from_prepared: Option<PathBuf>,
 
-    /// Recover shard parts from an interrupted attempt by rechecking every
-    /// selected payload against a fresh pinned metadata stream. Invalid or
-    /// truncated parts are downloaded again; only use this attempt's parts.
-    #[arg(long, conflicts_with_all = ["force", "from_prepared", "verify", "add_knn_truth", "add_derived_fields", "add_hybrid_queries", "discover_crc32"])]
+    /// Recover parts with source-bound SHA-256 receipts, then recheck every
+    /// selected payload against pinned metadata. Invalid parts are downloaded
+    /// again. Combine with --force when continuing an interrupted forced rebuild.
+    #[arg(long, conflicts_with_all = ["from_prepared", "verify", "add_knn_truth", "add_derived_fields", "add_hybrid_queries", "discover_crc32"])]
     resume_parts: bool,
 
     /// Concurrent upstream shard streams (IDs remain sorted by shard).
@@ -248,7 +249,13 @@ fn run(args: &Args) -> Result<(), String> {
     })?;
 
     let dir = args.out_dir.join(variant.dir);
-    if !args.force && msmarco::preparation::recover_publication(&dir, variant)? {
+    if !args.force && msmarco::preparation::recover_publication(&dir, variant).map_err(|e| {
+        if args.resume_parts {
+            format!("{e}; if this is an interrupted --force rebuild, rerun with --force --resume-parts to discard unsealed assembly and reuse only checksummed shard parts")
+        } else {
+            e
+        }
+    })? {
         println!("Recovered sealed publication at {}", dir.display());
     }
     if args.from_prepared.is_some()
@@ -636,6 +643,7 @@ fn has_corpus_files(dir: &Path, variant: &Variant) -> bool {
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| format!("build HTTP client: {e}"))
@@ -670,8 +678,12 @@ fn get(
             Err(_) => (503, None),
         };
         if let Some(delay) = msmarco::preparation::retry_delay(status, retry_after, attempt) {
+            let failure = match &response {
+                Ok(_) => format!("HTTP {status}"),
+                Err(e) => format!("transport error: {e}"),
+            };
             eprintln!(
-                "GET {url}: transient HTTP {status}; retry {} in {}s",
+                "GET {url}: transient {failure}; retry {} in {}s",
                 attempt + 1,
                 delay.as_secs()
             );
@@ -1265,12 +1277,14 @@ fn write_corpus_sampled(
                 loop {
                     match select_from_shard(client, token, threshold, shard, shard_rows[shard], first_id[shard], tmp, wanted_offsets, &bar) {
                         Ok(part) => break Ok(part),
-                        Err(error) if attempt < 2 && (error.contains("request or response body") || error.contains("error sending request") || error.contains("timed out")) => {
+                        Err(error) => {
+                            let Some(delay) = msmarco::preparation::shard_retry_delay(&error, attempt) else {
+                                break Err(error);
+                            };
                             attempt += 1;
                             eprintln!("Shard {shard:02}: retrying interrupted stream (attempt {attempt}/2): {error}");
-                            std::thread::sleep(Duration::from_secs(2_u64.pow(attempt)));
+                            std::thread::sleep(delay);
                         },
-                        Err(error) => break Err(error),
                     }
                 }
 
@@ -1437,6 +1451,10 @@ fn select_from_shard(
         )),
     );
 
+    // Invalidate a previous receipt before either part can be truncated.
+    let vector_part = tmp.join(format!("shard_{shard:02}.f32"));
+    let payload_part = tmp.join(format!("shard_{shard:02}.jsonl"));
+    msmarco::preparation::clear_part_receipt(&vector_part)?;
     let mut vout = BufWriter::with_capacity(
         1 << 22,
         File::create(tmp.join(format!("shard_{shard:02}.f32")))
@@ -1518,6 +1536,14 @@ fn select_from_shard(
         .map_err(|e| format!("flush shard {shard} vectors: {e}"))?;
     pout.flush()
         .map_err(|e| format!("flush shard {shard} payloads: {e}"))?;
+    msmarco::preparation::seal_part(
+        &payload_part,
+        &vector_part,
+        rows,
+        first_id,
+        threshold,
+        msmarco::DIM,
+    )?;
 
     Ok(ShardSelection {
         shard,
@@ -1540,11 +1566,11 @@ fn select_from_shard(
 /// the exact file the engines will upload, so a bug in the writer shows up as a
 /// ground-truth mismatch instead of hiding.
 fn brute_force_ground_truth(
-    dir: &Path,
+    vectors_path: &Path,
     variant: &Variant,
     queries: &[Query],
 ) -> Result<Vec<Vec<(f32, i64)>>, String> {
-    let path = dir.to_path_buf();
+    let path = vectors_path.to_path_buf();
     let mut file = File::open(&path).map_err(|e| format!("open {}: {}", path.display(), e))?;
 
     let mut head = vec![0u8; 512];
@@ -2115,7 +2141,12 @@ fn add_hybrid_queries(args: &Args) -> Result<(), String> {
             .get("preparation")
             .is_some()
     {
-        msmarco::preparation::check(&dir, variant, true)?;
+        let caps = msmarco::preparation::check(&dir, variant, true)?;
+        msmarco::preparation::require_workloads(
+            caps.as_ref(),
+            dataset,
+            &[vector_db_benchmark::workload::Workload::Vector],
+        )?;
     }
     if !has_corpus_files(&dir, variant) {
         return Err(format!(
@@ -2184,6 +2215,44 @@ fn add_hybrid_queries(args: &Args) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_rebuild_can_resume_verified_shard_parts() {
+        let args = Args::try_parse_from([
+            "prepare-msmarco",
+            "--dataset",
+            "msmarco-cohere-1024-100M-cosine",
+            "--workloads",
+            "text-scalar",
+            "--force",
+            "--resume-parts",
+        ])
+        .unwrap();
+        assert!(args.force);
+        assert!(args.resume_parts);
+        assert_eq!(
+            args.workloads,
+            msmarco::preparation::PreparationMode::TextScalar
+        );
+    }
+
+    #[test]
+    fn shard_resume_still_rejects_verification_and_nested_sources() {
+        for extra in [
+            vec!["--verify"],
+            vec!["--from-prepared", "/tmp/prepared-source"],
+        ] {
+            let mut command = vec![
+                "prepare-msmarco",
+                "--dataset",
+                "msmarco-cohere-1024-100M-cosine",
+                "--resume-parts",
+            ];
+            command.extend(extra);
+            let error = Args::try_parse_from(command).err().unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
 
     /// A publish that dies before every rename has landed must never leave
     /// `filter_queries.jsonl` next to un-upgraded payloads. Simulated by a

@@ -48,7 +48,7 @@ pub struct Capabilities {
     pub files: BTreeMap<String, FileIntegrity>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileIntegrity {
     pub bytes: u64,
@@ -585,6 +585,57 @@ pub struct RecoveredShard {
     pub max_field_bytes: std::collections::HashMap<String, usize>,
 }
 
+/// Written only after both selected shard files have been completely flushed.
+/// This binds recovery to the bytes produced from the pinned source, rather
+/// than allowing a later seal to certify arbitrary same-sized finite vectors.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartReceipt {
+    version: u32,
+    revision: String,
+    source_rows: u64,
+    first_id: u64,
+    threshold: u32,
+    dimensions: usize,
+    payloads: FileIntegrity,
+    vectors: FileIntegrity,
+}
+
+pub fn clear_part_receipt(vectors: &Path) -> Result<(), String> {
+    match std::fs::remove_file(vectors.with_extension("receipt.json")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub fn seal_part(
+    payloads: &Path,
+    vectors: &Path,
+    source_rows: u64,
+    first_id: u64,
+    threshold: u32,
+    dimensions: usize,
+) -> Result<(), String> {
+    let receipt = PartReceipt {
+        version: 1,
+        revision: super::HF_REVISION.to_string(),
+        source_rows,
+        first_id,
+        threshold,
+        dimensions,
+        payloads: digest(payloads)?,
+        vectors: digest(vectors)?,
+    };
+    let staged = vectors.with_extension("receipt.json.part");
+    std::fs::write(
+        &staged,
+        serde_json::to_vec(&receipt).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::rename(staged, vectors.with_extension("receipt.json")).map_err(|e| e.to_string())
+}
+
 /// Recover a prior attempt's selected shard only after re-reading ALL source
 /// metadata, comparing every selected payload in order, checking exact vector
 /// length and scanning all stored floats for non-finite values. No row-count
@@ -600,6 +651,23 @@ pub fn recover_part(
     dimensions: usize,
     wanted_offsets: &std::collections::HashSet<u64>,
 ) -> Result<RecoveredShard, String> {
+    let receipt: PartReceipt = serde_json::from_reader(
+        File::open(vectors.with_extension("receipt.json"))
+            .map_err(|e| format!("missing completed shard receipt: {e}"))?,
+    )
+    .map_err(|e| format!("invalid completed shard receipt: {e}"))?;
+    if receipt.version != 1
+        || receipt.revision != super::HF_REVISION
+        || receipt.source_rows != source_rows
+        || receipt.first_id != first_id
+        || receipt.threshold != threshold
+        || receipt.dimensions != dimensions
+    {
+        return Err("cached shard source identity differs".into());
+    }
+    if digest(payloads)? != receipt.payloads || digest(vectors)? != receipt.vectors {
+        return Err("cached shard SHA-256 mismatch".into());
+    }
     let mut stored =
         BufReader::with_capacity(4 << 20, File::open(payloads).map_err(|e| e.to_string())?).lines();
     let mut out = RecoveredShard {
@@ -678,8 +746,24 @@ pub fn retry_delay(
     Some(std::time::Duration::from_secs(
         retry_after
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2_u64.pow(attempt + 1)),
+            .unwrap_or(2_u64.pow(attempt + 1))
+            .min(60),
     ))
+}
+
+/// Errors rendered while reading a reqwest body can cross std::io boundaries.
+/// Keep this conservative classification in one tested place; corrupt data and
+/// local write failures must never trigger another upstream download.
+pub fn shard_retry_delay(error: &str, attempt: u32) -> Option<std::time::Duration> {
+    (attempt < 2
+        && [
+            "request or response body",
+            "error sending request",
+            "timed out",
+        ]
+        .iter()
+        .any(|needle| error.contains(needle)))
+    .then(|| std::time::Duration::from_secs(2_u64.pow(attempt + 1)))
 }
 
 #[cfg(test)]
@@ -1029,6 +1113,9 @@ mod tests {
     fn transient_retry_is_bounded_and_honors_server_delay() {
         assert_eq!(retry_delay(429, Some("17"), 0).unwrap().as_secs(), 17);
         assert_eq!(retry_delay(503, None, 2).unwrap().as_secs(), 8);
+        assert_eq!(retry_delay(429, Some("86400"), 0).unwrap().as_secs(), 60);
+        assert_eq!(retry_delay(429, Some("invalid"), 0).unwrap().as_secs(), 2);
+        assert_eq!(retry_delay(503, None, 5).unwrap().as_secs(), 60);
         assert!(retry_delay(429, None, 6).is_none());
         for status in [200, 206, 400, 401, 403, 404, 416] {
             assert!(retry_delay(status, None, 0).is_none());
@@ -1050,6 +1137,8 @@ mod tests {
         std::fs::write(&payloads, &expected).unwrap();
         let bytes: Vec<u8> = (0..8).flat_map(|n| (n as f32).to_le_bytes()).collect();
         std::fs::write(&vectors, &bytes).unwrap();
+        let seal = || seal_part(&payloads, &vectors, 4, 10, 1_000_000, 2).unwrap();
+        seal();
         let wanted = std::collections::HashSet::from([11]);
         let run = || {
             recover_part(
@@ -1068,6 +1157,7 @@ mod tests {
         assert_eq!(result.wanted, [(11, 1)]);
         assert_eq!(result.docids[&11], "source-1");
         std::fs::write(&vectors, &bytes[..28]).unwrap();
+        seal();
         assert!(run().unwrap_err().contains("truncated"));
         std::fs::write(&vectors, &bytes).unwrap();
         let reversed = expected
@@ -1076,6 +1166,7 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect::<String>();
         std::fs::write(&payloads, reversed).unwrap();
+        seal();
         assert!(run().unwrap_err().contains("order"));
         std::fs::write(
             &payloads,
@@ -1086,8 +1177,10 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
+        seal();
         assert!(run().unwrap_err().contains("truncated"));
         std::fs::write(&payloads, &expected).unwrap();
+        seal();
         assert!(recover_part(
             std::io::Cursor::new(input.as_bytes()),
             &payloads,
@@ -1099,6 +1192,78 @@ mod tests {
             &wanted
         )
         .unwrap_err()
-        .contains("counts"));
+        .contains("identity"));
+    }
+
+    #[test]
+    fn recovery_requires_receipt_and_rejects_same_length_finite_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let payloads = dir.path().join("shard_00.jsonl");
+        let vectors = dir.path().join("shard_00.f32");
+        let source = json!({"docid": "source-0", "title": "test"});
+        let input = format!("{source}\n");
+        let payload = format!("{}\n", super::super::payload_from_passage(&source).unwrap());
+        std::fs::write(&payloads, &payload).unwrap();
+        let bytes: Vec<_> = [1.0_f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        std::fs::write(&vectors, &bytes).unwrap();
+        let wanted = HashSet::new();
+        let run = || {
+            recover_part(
+                std::io::Cursor::new(&input),
+                &payloads,
+                &vectors,
+                1,
+                0,
+                1_000_000,
+                2,
+                &wanted,
+            )
+        };
+        assert!(run().unwrap_err().contains("receipt"));
+        seal_part(&payloads, &vectors, 1, 0, 1_000_000, 2).unwrap();
+        assert_eq!(run().unwrap().kept, 1);
+        let changed: Vec<_> = [3.0_f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        std::fs::write(&vectors, changed).unwrap();
+        assert!(run().unwrap_err().contains("SHA-256"));
+        std::fs::write(&vectors, &bytes).unwrap();
+        std::fs::write(&payloads, payload.replace("test", "best")).unwrap();
+        assert!(run().unwrap_err().contains("SHA-256"));
+        std::fs::write(&payloads, &payload).unwrap();
+        let receipt_path = vectors.with_extension("receipt.json");
+        let receipt = std::fs::read_to_string(&receipt_path).unwrap();
+        let mut wrong: Value = serde_json::from_str(&receipt).unwrap();
+        wrong["revision"] = json!("different-source");
+        std::fs::write(&receipt_path, wrong.to_string()).unwrap();
+        assert!(run().unwrap_err().contains("identity"));
+        std::fs::write(&receipt_path, receipt).unwrap();
+        clear_part_receipt(&vectors).unwrap();
+        assert!(run().unwrap_err().contains("receipt"));
+    }
+
+    #[test]
+    fn shard_retries_are_bounded_and_do_not_retry_data_or_disk_errors() {
+        for error in [
+            "request or response body",
+            "error sending request",
+            "timed out",
+        ] {
+            assert_eq!(shard_retry_delay(error, 0).unwrap().as_secs(), 2);
+            assert_eq!(shard_retry_delay(error, 1).unwrap().as_secs(), 4);
+            assert!(shard_retry_delay(error, 2).is_none());
+        }
+        for error in [
+            "invalid JSON",
+            "non-finite vector",
+            "no space left on device",
+            "SHA-256 mismatch",
+        ] {
+            assert!(shard_retry_delay(error, 0).is_none());
+        }
     }
 }
