@@ -210,6 +210,56 @@ impl ExternalIds {
     }
 }
 
+/// Compound requests must bind their numeric query IDs to actual predicates
+/// and, for prepared corpora, to the sealed manifest of all dataset files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompoundIdentity {
+    pub analysis: String,
+    pub query_sha256: String,
+    pub preparation_sha256: Option<String>,
+}
+
+impl CompoundIdentity {
+    pub fn from_metadata(metadata: Option<&serde_json::Value>) -> Result<Option<Self>, String> {
+        let Some(c) = metadata.and_then(|m| m.get("compound")) else {
+            return Ok(None);
+        };
+        let identity = Self {
+            analysis: metadata
+                .and_then(|m| m["analysis"].as_str())
+                .ok_or("compound metadata lacks analysis")?
+                .into(),
+            query_sha256: c["sha256"]
+                .as_str()
+                .ok_or("compound metadata lacks query SHA")?
+                .into(),
+            preparation_sha256: match c.get("preparation_sha256") {
+                Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                _ => return Err("compound metadata lacks preparation identity".into()),
+            },
+        };
+        identity.validate()?;
+        Ok(Some(identity))
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if !matches!(self.analysis.as_str(), "english" | "parity") {
+            return Err("invalid compound analysis identity".into());
+        }
+        for hash in std::iter::once(&self.query_sha256).chain(self.preparation_sha256.iter()) {
+            if hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("invalid compound SHA-256 identity".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// First line of every dump file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DumpHeader {
@@ -232,6 +282,8 @@ pub struct DumpHeader {
     /// written before #344.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_layout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compound_identity: Option<CompoundIdentity>,
 }
 
 /// One timed query, as written to the dump.
@@ -436,6 +488,9 @@ pub fn read_dump(r: impl BufRead) -> Result<Dump, String> {
                         h.schema_version
                     ));
                 }
+                if let Some(identity) = &h.compound_identity {
+                    identity.validate()?;
+                }
                 header = Some(h);
             }
             (DumpLine::Header(_), true) => {
@@ -490,6 +545,7 @@ mod tests {
             search_id: 0,
             id_space: IdSpace::Row,
             index_layout: None,
+            compound_identity: None,
         }
     }
 

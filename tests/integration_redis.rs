@@ -6536,3 +6536,168 @@ fn test_binary_redis_streaming_upload_refuses_a_short_payload_file_before_writin
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+#[test]
+fn test_binary_redis_compound_text_scalar() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{"name":"redis-compound","engine":"redis","upload_params":{"parallel":1},"search_params":common::compound_search_params()}]);
+    let proj = common::write_compound_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-compound",
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &[
+            "--keep-data",
+            "--search-ids",
+            "1",
+            "--queries",
+            "110",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_compound_run(&proj.root, &dump);
+    common::compound_add_missing_scalar(&proj.root);
+    let out = common::run_binary_output(
+        &proj.root,
+        "redis-compound",
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &["--skip-upload", "--queries", "1", "--repetitions", "1"],
+    );
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "missing compound scalar field must refuse reuse"
+    );
+    assert!(error.contains("compound_extra"), "{error}");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+#[test]
+fn test_binary_redis_compound_text_scalar_no_vector() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let mut configs = serde_json::json!([{"name":"redis-compound","engine":"redis","upload_params":{"parallel":1},"search_params":common::compound_search_params()}]);
+    for point in configs[0]["search_params"].as_array_mut().unwrap() {
+        point["fulltext"]["no_vector_index"] = serde_json::json!(true);
+    }
+    let proj = common::write_compound_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-compound",
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &[
+            "--keep-data",
+            "--search-ids",
+            "1",
+            "--queries",
+            "110",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_compound_run(&proj.root, &dump);
+    common::compound_add_missing_scalar(&proj.root);
+    let out = common::run_binary_output(
+        &proj.root,
+        "redis-compound",
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &["--skip-upload", "--queries", "1", "--repetitions", "1"],
+    );
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "missing compound scalar field must refuse reuse"
+    );
+    assert!(error.contains("compound_extra"), "{error}");
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+#[test]
+fn test_binary_redis_compound_text_scalar_english_inflection() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{"name":"redis-compound-inflection","engine":"redis","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":common::compound_inflection_params()}]);
+    let proj = common::write_compound_inflection_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-compound-inflection",
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &[
+            "--queries",
+            "1",
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    let path = std::fs::read_dir(&dump)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let rows = std::fs::read_to_string(path).unwrap();
+    let query: serde_json::Value = serde_json::from_str(rows.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(query["ids"], serde_json::json!(["d1"]));
+    assert_eq!(query["total"], 1);
+    flush_db(&mut conn);
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+#[test]
+fn test_binary_redis_compound_text_scalar_wrong_count_is_fatal() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    for no_vector in [false, true] {
+        flush_db(&mut conn);
+        let configs = serde_json::json!([{"name":"redis-compound-count-guard","engine":"redis","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":common::compound_wrong_count_params(no_vector)}]);
+        let proj = common::write_compound_project(&configs.to_string());
+        let port = test_port().to_string();
+        let out = common::run_binary_output(
+            &proj.root,
+            "redis-compound-count-guard",
+            common::BM25_DATASET,
+            TEST_HOST,
+            &[("REDIS_PORT", &port)],
+            &["--search-ids", "1", "--queries", "2", "--repetitions", "1"],
+        );
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "a compound count mismatch must fail even without --fail-on-dropped-queries"
+        );
+        assert!(
+            error.contains("compound suite failed") && error.contains("exact count"),
+            "{error}"
+        );
+        flush_db(&mut conn);
+        std::fs::remove_dir_all(&proj.root).ok();
+    }
+}

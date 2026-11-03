@@ -43,3 +43,5 @@ pub mod workload;
 pub use config::RedisConfig;
 pub use readers::metadata::{MetadataItem, MetadataValue};
 pub use readers::{read_compound_data, read_hdf5_vectors, read_jsonl_vectors, read_npy_vectors};
+
+pub mod compound_text;
