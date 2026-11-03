@@ -24,7 +24,8 @@ a SHA-256 fingerprint; per-query dumps retain the family and exact match count.
 Dumps also carry the query fingerprint, analysis mode, and SHA-256 of
 `PREPARED.json`; comparison rejects mismatched identities and pairs families by
 stable search ID. Compare only the same dataset/checksum, analysis, and query
-fingerprint. Deliberate full-index/no-vector comparisons retain a layout warning.
+fingerprint. Deliberate full-index/no-vector comparisons must retain and report
+both layout labels; count/rank agreement does not imply equal index costs.
 
 Scalar counts must equal preparation truth. Generated parity text queries require
 at least one match. English exclusions allow zero because stemming may turn an
