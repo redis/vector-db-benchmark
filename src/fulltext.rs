@@ -1851,9 +1851,11 @@ pub fn result_metadata_for(
             .iter()
             .filter_map(|q| q.compound.as_ref())
             .collect();
-        let bytes = serde_json::to_vec(&serde_json::to_value(&queries).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        m["compound"] = json!({"version":1,"queries":queries,"sha256":Sha256::digest(bytes).iter().map(|b|format!("{b:02x}")).collect::<String>(),
+        let scoring_contract = "text-only-scalar-filter-v1";
+        let bytes =
+            serde_json::to_vec(&json!({"scoring_contract":scoring_contract,"queries":queries}))
+                .map_err(|e| e.to_string())?;
+        m["compound"] = json!({"version":2,"scoring_contract":scoring_contract,"queries":queries,"sha256":Sha256::digest(bytes).iter().map(|b|format!("{b:02x}")).collect::<String>(),
             "preparation_sha256":set.preparation_sha256,"exact_counts":true,"ordering":"engine score descending; ties unspecified; cross-engine ranks are not relevance truth"});
         m["query_source"] = json!("explicit compound suite; query_id indexes compound.queries");
         m["operator"] = json!("explicit Boolean AST");
@@ -1863,6 +1865,8 @@ pub fn result_metadata_for(
             json!("explicit Boolean AST; engine translation recorded by compound.queries");
         if engine == "opensearch" {
             m["engine_settings"]["request"]["track_total_hits"] = json!(true);
+            m["engine_settings"]["scalar_context"] =
+                json!("bool.filter; no scalar score contribution");
         }
     }
 
@@ -2028,6 +2032,17 @@ mod tests {
         };
         let original = metadata(&block);
         assert_eq!(original, metadata(&block));
+        let legacy_bytes = serde_json::to_vec(&original["compound"]["queries"]).unwrap();
+        use sha2::{Digest, Sha256};
+        let legacy_hash = Sha256::digest(legacy_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_ne!(original["compound"]["sha256"], json!(legacy_hash));
+        assert_eq!(
+            original["compound"]["scoring_contract"],
+            "text-only-scalar-filter-v1"
+        );
         for (field, value) in [
             ("minimum_count", json!(2)),
             ("expected_count", json!(2)),

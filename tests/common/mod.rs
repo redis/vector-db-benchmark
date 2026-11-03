@@ -4386,6 +4386,12 @@ pub fn compound_queries() -> serde_json::Value {
             json!({"and":[{"or":[tag("X"),tag("x")]},{"not":range(1,4)}]}),
             vec!["d0"],
         ),
+        ("text-score", t("segment", "apple"), vec!["d1"]),
+        (
+            "mixed-or",
+            json!({"or":[t("segment","apple"),tag("x")]}),
+            vec!["d1", "d3"],
+        ),
     ];
     json!(cases.into_iter().map(|(name,conditions,ids)|json!({"name":name,"family":name,"conditions":conditions,"expected_count":ids.len(),"ids":ids})).collect::<Vec<_>>())
 }
@@ -4446,10 +4452,13 @@ pub fn assert_compound_run(root: &Path, dump: &Path) {
     let records = fs::read_to_string(&files[0]).unwrap();
     let expected = compound_queries();
     let mut seen = std::collections::HashSet::new();
+    let mut opensearch = false;
+    let mut scores = std::collections::HashMap::new();
     for line in records.lines() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
         if row["kind"] == "header" {
             assert_eq!(row["search_id"], 1);
+            opensearch = row["engine"] == "opensearch";
             continue;
         }
         if row["kind"] != "query" {
@@ -4457,6 +4466,28 @@ pub fn assert_compound_run(root: &Path, dump: &Path) {
         }
         let id = row["query_id"].as_u64().unwrap() as usize;
         let want = &expected[id];
+        if opensearch && !row["ids"].as_array().unwrap().is_empty() {
+            for (doc, score) in row["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(row["scores"].as_array().unwrap())
+            {
+                let family = row["shape"].as_str().unwrap();
+                let doc = doc.as_str().unwrap();
+                let score = score.as_f64().unwrap();
+                if matches!(
+                    family,
+                    "tag-range" | "range-union" | "escaping" | "case" | "missing" | "precedence"
+                ) || (family == "mixed-or" && doc == "d3")
+                {
+                    assert_eq!(score, 0.0, "scalar predicate contributed score: {row}");
+                }
+                if doc == "d1" {
+                    scores.insert(family.to_string(), score);
+                }
+            }
+        }
         assert_eq!(row["total"], want["expected_count"], "{row}");
         assert_eq!(row["shape"], want["family"], "{row}");
         let mut got = row["ids"]
@@ -4477,6 +4508,14 @@ pub fn assert_compound_run(root: &Path, dump: &Path) {
         seen.insert(id);
     }
     assert_eq!(seen.len(), expected.as_array().unwrap().len());
+    if opensearch {
+        for family in ["tag-text", "exclusion", "mixed-or"] {
+            assert_eq!(
+                scores[family], scores["text-score"],
+                "{family} changed the text score"
+            );
+        }
+    }
     let result = fs::read_dir(root.join("results"))
         .unwrap()
         .map(|p| p.unwrap().path())

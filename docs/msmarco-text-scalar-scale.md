@@ -49,6 +49,10 @@ known tokenizer/stemming differences. They need separate indexes/corpora;
 never share an English corpus with a parity index. All compound queries use
 unit field boosts, Redis BM25STD / OpenSearch BM25 scoring, score-descending
 order with unspecified ties, top 10, exact totals, and IDs/scores only.
+OpenSearch tag/numeric leaves run in non-scoring `bool.filter` context, including
+inside mixed OR branches; only positive text contributes to BM25 scores. The
+`text-only-scalar-filter-v1` contract is recorded and hashed into query identity,
+so earlier scoring-context diagnostic dumps cannot pair silently with these profiles.
 Unsupported predicates/types are refused, never silently discarded. Existing
 ranked BM25 profiles keep their original OR semantics.
 

@@ -228,7 +228,7 @@ impl Expr {
             Self::Leaf(Predicate::Leaf { field, leaf }) => match leaf {
                 Leaf::Text(t) => json!({"match":{field:{"query":t,"operator":"and"}}}),
                 Leaf::Match(ops) => {
-                    json!({"terms":{field:ops.iter().map(|v|match v {Operand::Keyword(s)=>json!(s),Operand::Int(n)=>json!(n)}).collect::<Vec<_>>()}})
+                    json!({"bool":{"filter":[{"terms":{field:ops.iter().map(|v|match v {Operand::Keyword(s)=>json!(s),Operand::Int(n)=>json!(n)}).collect::<Vec<_>>()}}]}})
                 }
                 Leaf::Range { gt, gte, lt, lte } => {
                     let mut b = serde_json::Map::new();
@@ -237,7 +237,7 @@ impl Expr {
                             b.insert(k.into(), json!(n));
                         }
                     }
-                    json!({"range":{field:b}})
+                    json!({"bool":{"filter":[{"range":{field:b}}]}})
                 }
             },
             Self::Leaf(_) => unreachable!("compiler creates leaf predicates only"),
@@ -475,7 +475,8 @@ mod tests {
             1
         );
         assert_eq!(
-            e.opensearch()["bool"]["must"][1]["bool"]["must_not"][0]["range"]["doc_len"]["lt"],
+            e.opensearch()["bool"]["must"][1]["bool"]["must_not"][0]["bool"]["filter"][0]["range"]
+                ["doc_len"]["lt"],
             10.0
         );
     }
@@ -501,8 +502,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.redis(), "(@category:{A\\|B\\ \\{C\\}})");
-        assert_eq!(e.opensearch(), json!({"terms":{"category":["A|B {C}"]}}));
+        assert_eq!(
+            e.opensearch(),
+            json!({"bool":{"filter":[{"terms":{"category":["A|B {C}"]}}]}})
+        );
         let e = Expr::compile(&json!({"doc_len":{"range":{"gt":3,"lte":5}}}), &schema()).unwrap();
+        assert_eq!(
+            e.opensearch(),
+            json!({"bool":{"filter":[{"range":{"doc_len":{"gt":3.0,"lte":5.0}}}]}})
+        );
         assert!(!e
             .matches(json!({"doc_len":3}).as_object().unwrap())
             .unwrap());
