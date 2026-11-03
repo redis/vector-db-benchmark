@@ -840,6 +840,9 @@ workload is refused at startup.
 
 ### Compound text/scalar profiles (#389, #390)
 
+`--search-ids` selects stable zero-based search points in dedicated fulltext
+configurations; it cannot combine with `--parallels` or `--ef-runtime`.
+
 The [MS MARCO scale-up runbook](docs/msmarco-text-scalar-scale.md) documents
 field-scoped AND/OR/NOT text/tag/numeric queries, separate English/parity and
 no-vector/full-index profiles, exact scalar count gates, streaming ingestion,

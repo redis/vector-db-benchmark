@@ -314,7 +314,16 @@ impl RedisEngine {
         })?;
         let total_time = measured_start.elapsed().as_secs_f64();
         if spec.compound.is_some() && !errors.is_empty() {
-            return Err(format!("compound suite failed: {}", errors.join("; ")));
+            return Err(format!(
+                "compound suite failed ({} errors): {}",
+                errors.len(),
+                errors
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
         }
         pb.finish_and_clear();
         for e in errors.iter().take(3) {

@@ -15,8 +15,11 @@ text exclusion, tag equality, numeric point, numeric range, repeated-value
 range, tag AND range, and range OR range.
 
 The first five families select terms and bounds deterministically from up to
-32 real passages in the first 4096 payload rows. Exclusions use actual corpus
-terms absent from the selected passage's title. The remaining six reuse all
+32 real passages in the first 4096 payload rows. For each selected segment term,
+exclusions use the most frequent co-occurring title term absent from the seed's
+title, with a lexical tie-break. The scanned window must contain both a retained
+seed and an excluded matching row; seeds without an exclusion witness are
+skipped. The remaining six reuse all
 31 prepared scalar queries and their corpus-wide exact counts. This is a
 reproducible diagnostic suite, not a representative sample of user traffic.
 Each result embeds the complete selected query AST, stable names/families, and
@@ -56,9 +59,9 @@ per-shard statistics and are not identical to single-shard BM25.
 
 ## Preparation and integrity
 
-Run compute on an AWS host, with a 2 TiB working disk and exact ownership tags
-`team=performance_analysis_optimization`, `owner=filipe_oliveira` on every
-supported resource, including disks. Cloud provisioning and private archive
+Run compute on an AWS host with a 2 TiB working disk and the orchestration
+repository's required FinOps ownership tags on every supported resource, including
+disks. Cloud provisioning and private archive
 upload belong to cloud-benchmarks-private, not this driver.
 
 The published 100M family contains 100,000,027 rows, about 410 GB of float32

@@ -295,45 +295,70 @@ impl Spec {
 /// Scalar families retain the prepared corpus-wide exact counts unchanged.
 fn msmarco_queries(dir: &Path) -> Result<Vec<Query>, String> {
     let file = std::fs::File::open(dir.join("payloads.jsonl")).map_err(|e| e.to_string())?;
-    let mut seeds = Vec::new();
-    let mut exclusion_terms = std::collections::BTreeSet::new();
+    // Index only the bounded sample. Each selected exclusion must have a
+    // witness that matches the segment term and contains the excluded title
+    // term, while the seed itself remains a positive parity match.
+    let mut rows = Vec::new();
+    let mut segment_rows = std::collections::BTreeMap::<String, Vec<usize>>::new();
     for line in std::io::BufReader::new(file).lines().take(4096) {
         let row: Value =
             serde_json::from_str(&line.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let term = |field: &str| {
-            row[field].as_str().and_then(|s| {
-                crate::fulltext::query_terms(s).into_iter().find(|t| {
-                    crate::msmarco::text_match::validate_term(t).is_ok()
-                        && crate::msmarco::text_match::classify(s, t)
-                            == crate::msmarco::text_match::TextMatch::Yes
+        let terms = |field: &str| -> Vec<String> {
+            row[field]
+                .as_str()
+                .map(|text| {
+                    crate::fulltext::query_terms(text)
+                        .into_iter()
+                        .filter(|term| {
+                            crate::msmarco::text_match::validate_term(term).is_ok()
+                                && crate::msmarco::text_match::classify(text, term)
+                                    == crate::msmarco::text_match::TextMatch::Yes
+                        })
+                        .collect()
                 })
-            })
+                .unwrap_or_default()
         };
-        if let Some(title) = row["title"].as_str() {
-            exclusion_terms.extend(
-                crate::fulltext::query_terms(title)
-                    .into_iter()
-                    .filter(|t| crate::msmarco::text_match::validate_term(t).is_ok()),
-            );
+        let title = terms("title");
+        let segment = terms("segment");
+        for term in &segment {
+            segment_rows
+                .entry(term.clone())
+                .or_default()
+                .push(rows.len());
         }
-        if seeds.len() < 32 {
-            if let (Some(title), Some(segment)) = (term("title"), term("segment")) {
-                seeds.push((row, title, segment));
-            }
-        }
-    }
-    if seeds.is_empty() {
-        return Err("no usable title/segment terms in first 4096 passages".into());
+        rows.push((row, title, segment));
     }
     let mut queries = Vec::new();
-    for (i, (row, title, segment)) in seeds.iter().enumerate() {
-        let exclusion = exclusion_terms
-            .iter()
-            .find(|t| {
-                crate::msmarco::text_match::classify(row["title"].as_str().unwrap(), t)
+    for (row, title_terms, segment_terms) in &rows {
+        if queries.len() >= 32 * 5 {
+            break;
+        }
+        let (Some(title), Some(segment)) = (title_terms.first(), segment_terms.first()) else {
+            continue;
+        };
+        let mut candidates = std::collections::BTreeMap::<&String, usize>::new();
+        for &other in &segment_rows[segment] {
+            for term in &rows[other].1 {
+                if crate::msmarco::text_match::classify(row["title"].as_str().unwrap(), term)
                     == crate::msmarco::text_match::TextMatch::No
-            })
-            .ok_or("no corpus-derived exclusion term absent from the selected title")?;
+                {
+                    *candidates.entry(term).or_default() += 1;
+                }
+            }
+        }
+        // Prefer the most frequent co-occurring title term; lexical tie-break
+        // keeps this stable across executions and engines. No witness: skip
+        // the seed instead of advertising a NOT that does no work.
+        let Some((exclusion, removed)) = candidates
+            .into_iter()
+            .max_by(|(ta, ca), (tb, cb)| ca.cmp(cb).then_with(|| tb.cmp(ta)))
+        else {
+            continue;
+        };
+        if removed == 0 {
+            return Err("compound exclusion has no removed-row witness".into());
+        }
+        let i = queries.len() / 5;
         let text = |f: &str, t: &str| json!({f:{"match":{"text":t}}});
         let cat = json!({"category":{"match":{"value":row["category"]}}});
         let len = row["doc_len"]
@@ -364,6 +389,9 @@ fn msmarco_queries(dir: &Path) -> Result<Vec<Query>, String> {
                 minimum_count: 1,
             });
         }
+    }
+    if queries.is_empty() {
+        return Err("no nontrivial text exclusion in first 4096 passages".into());
     }
     let manifest = crate::msmarco::preparation::read_manifest(dir)?;
     let dataset = manifest["dataset"]
@@ -489,7 +517,8 @@ mod tests {
     fn suite_is_deterministic_and_positive_examples_come_from_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let seed = json!({"title":"apples orchard","segment":"green trees","category":"cat00","doc_len":100});
-        let other = json!({"title":"apple","segment":"fruit","category":"cat01","doc_len":200});
+        let other =
+            json!({"title":"apple","segment":"green fruit","category":"cat01","doc_len":200});
         std::fs::write(
             dir.path().join("payloads.jsonl"),
             format!("{seed}\n{other}\n"),
@@ -520,6 +549,27 @@ mod tests {
             );
         }
         assert_eq!(q[10].expected_count, Some(1));
+        let base = Expr::compile(&q[0].conditions, &schema()).unwrap();
+        let excluded = Expr::compile(&q[4].conditions, &schema()).unwrap();
+        assert!(base.matches(other.as_object().unwrap()).unwrap());
+        assert!(!excluded.matches(other.as_object().unwrap()).unwrap());
+        // The real witness must be co-occurring, not merely a corpus term.
+        let isolated =
+            json!({"title":"apple","segment":"unrelated fruit","category":"cat01","doc_len":200});
+        std::fs::write(
+            dir.path().join("payloads.jsonl"),
+            format!("{seed}\n{isolated}\n"),
+        )
+        .unwrap();
+        assert!(spec
+            .load(dir.path(), &schema())
+            .unwrap_err()
+            .contains("no nontrivial"));
+        std::fs::write(
+            dir.path().join("payloads.jsonl"),
+            format!("{seed}\n{other}\n"),
+        )
+        .unwrap();
         for analysis in ["parity", "english"] {
             let full=crate::fulltext::parse_spec(Some(&json!({"analysis":analysis,"fields":{"title":1.0,"segment":1.0},"compound":{"suite":"msmarco-v1"}}))).unwrap();
             let set = crate::fulltext::load_query_set(dir.path(), &full, Some(&schema())).unwrap();
