@@ -565,6 +565,8 @@ pub fn run(args: &Args) -> Result<(), String> {
                 .with_upload_reader(args.upload_reader)
                 .with_memory_snapshots(memory_snapshots.clone());
 
+            dataset.require_workloads(&plan.workloads)?;
+
             // Hybrid (#341): the query set must exist and be valid before the
             // engine is built, so a corpus without `hybrid_queries.jsonl` fails
             // here rather than after configure + upload.

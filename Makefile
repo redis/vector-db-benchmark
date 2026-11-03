@@ -463,11 +463,12 @@ fmt:
 
 # Size is chosen by name, not by a flag: msmarco-cohere-1024-{100K,1M,10M}-cosine.
 MSMARCO_DATASET ?= msmarco-cohere-1024-100K-cosine
+MSMARCO_ARGS ?=
 
 .PHONY: prepare-msmarco
 prepare-msmarco:
 	@echo "=== Preparing $(MSMARCO_DATASET) (vectors + metadata) ==="
-	cargo run --release --bin prepare-msmarco -- --dataset $(MSMARCO_DATASET)
+	cargo run --release --bin prepare-msmarco -- --dataset $(MSMARCO_DATASET) $(MSMARCO_ARGS)
 
 # ============================================================
 # V0-CHECK - Compare Rust vs Python v0 precision/QPS/latency
@@ -613,3 +614,11 @@ test-opensearch-query:
 	cargo test --bin vector-db-benchmark engine::opensearch:: --release
 	cargo test --lib opensearch_query:: --release
 	cargo test --lib opensearch_query::
+
+# Focused preparation guards in both profiles (also included in agent-check).
+.PHONY: test-msmarco-preparation
+test-msmarco-preparation:
+	cargo test --lib msmarco::preparation
+	cargo test --lib msmarco::preparation --release
+	cargo test --lib msmarco::derived
+	cargo test --lib msmarco::derived --release

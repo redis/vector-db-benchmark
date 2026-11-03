@@ -1246,6 +1246,9 @@ and uses DIALECT 2 instead of 4 to avoid optimizations that can skip exact count
 old filter-only timings and Valkey's legacy filter-only path are not directly
 comparable. KNN behavior is unchanged.
 
+For preparation without either KNN oracle, capability checks, in-place truth upgrades,
+and streaming text/scalar commands, see [MS MARCO text/scalar preparation](docs/msmarco-text-scalar.md).
+
 #### Filter-only on MS MARCO: prepared queries and the per-query count gate (#340)
 
 ```bash

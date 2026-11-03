@@ -93,6 +93,7 @@ pub const QUERY_COUNT: usize = 1677;
 
 pub mod derived;
 pub mod hybrid;
+pub mod preparation;
 pub mod text_match;
 
 /// Payload fields carried over from the MS MARCO segmented-document records,
@@ -593,7 +594,7 @@ pub fn npy_f32_header(rows: u64, cols: usize) -> Vec<u8> {
 /// 64-byte boundary: every row count this corpus can produce renders to the same
 /// 128 bytes, which [`DeferredNpyF32Writer::finish`] asserts rather than assumes.
 pub struct DeferredNpyF32Writer {
-    file: std::fs::File,
+    file: std::io::BufWriter<std::fs::File>,
     cols: usize,
     rows_written: u64,
     header_len: usize,
@@ -602,8 +603,12 @@ pub struct DeferredNpyF32Writer {
 impl DeferredNpyF32Writer {
     pub fn create(path: &std::path::Path, cols: usize) -> Result<Self, String> {
         use std::io::Write as _;
-        let mut file =
-            std::fs::File::create(path).map_err(|e| format!("create {}: {}", path.display(), e))?;
+        // Coalesce small rows into large writes: one syscall per embedding
+        // otherwise makes assembly of the 100M corpus IOPS-bound.
+        let mut file = std::io::BufWriter::with_capacity(
+            4 << 20,
+            std::fs::File::create(path).map_err(|e| format!("create {}: {}", path.display(), e))?,
+        );
         // Reserve exactly what a plausible final count will render to.
         let header_len = npy_f32_header(1, cols).len();
         file.write_all(&vec![0u8; header_len])

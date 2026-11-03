@@ -816,6 +816,10 @@ impl DerivedCorpus {
     /// Append the passage with this `docid` (the next corpus id).
     pub fn push_docid(&mut self, docid: &str) -> DerivedFields {
         let d = DerivedFields::from_docid(docid);
+        self.push_checked(docid, d)
+    }
+
+    fn push_checked(&mut self, docid: &str, d: DerivedFields) -> DerivedFields {
         if self.lookup_keys.len() < POINT_LOOKUP_KEYS && is_point_lookup_source(docid) {
             self.lookup_keys.push(d.rand_key);
         }
@@ -826,11 +830,33 @@ impl DerivedCorpus {
     /// Append a stored payload, checking its derived fields against the
     /// derivation ([`check_payload`]).
     pub fn push_payload(&mut self, payload: &Value) -> Result<DerivedFields, String> {
-        check_payload(payload)?;
+        let fields = check_payload(payload)?;
         let docid = payload["docid"]
             .as_str()
             .ok_or("payload has no string 'docid'")?;
-        Ok(self.push_docid(docid))
+        Ok(self.push_checked(docid, fields))
+    }
+
+    /// Parse and validate a bounded batch in parallel, then append in original
+    /// row order. Keep the existing field validator as the single authority.
+    /// No row is appended if any payload in the batch fails validation.
+    pub fn push_json_batch(&mut self, lines: &[String]) -> Result<(), String> {
+        let checked: Vec<(String, DerivedFields)> = lines
+            .par_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let payload: Value =
+                    serde_json::from_str(line).map_err(|e| format!("batch row {}: {e}", i + 1))?;
+                let fields =
+                    check_payload(&payload).map_err(|e| format!("batch row {}: {e}", i + 1))?;
+                let docid = payload["docid"].as_str().ok_or("payload has no docid")?;
+                Ok((docid.to_string(), fields))
+            })
+            .collect::<Result<_, String>>()?;
+        for (docid, fields) in checked {
+            self.push_checked(&docid, fields);
+        }
+        Ok(())
     }
 
     pub fn rows(&self) -> &[DerivedFields] {
@@ -1332,6 +1358,47 @@ mod tests {
             c.push_docid(&d);
         }
         c
+    }
+
+    #[test]
+    fn parallel_payload_batches_preserve_ids_lookup_keys_and_exact_counts() {
+        let payloads: Vec<Value> = synthetic_docids(100_000).into_iter().map(|docid| {
+            let mut payload = json!({"docid": docid, "title": "Text that is irrelevant to scalar derivation"});
+            DerivedFields::from_docid(&docid).insert_into(payload.as_object_mut().unwrap()).unwrap();
+            payload
+        }).collect();
+        let lines: Vec<String> = payloads.iter().map(Value::to_string).collect();
+        let mut serial = DerivedCorpus::new();
+        for payload in &payloads {
+            serial.push_payload(payload).unwrap();
+        }
+        assert_eq!(serial.lookup_keys().len(), POINT_LOOKUP_KEYS);
+        for batch_size in [73, 8192] {
+            let mut parallel = DerivedCorpus::new();
+            for batch in lines.chunks(batch_size) {
+                parallel.push_json_batch(batch).unwrap();
+            }
+            assert_eq!(parallel.rows(), serial.rows());
+            assert_eq!(parallel.lookup_keys(), serial.lookup_keys());
+            assert_eq!(
+                parallel.filter_query_rows().unwrap(),
+                serial.filter_query_rows().unwrap()
+            );
+        }
+        for field in ["docid", "category", "doc_len", "tier", "rand_key"] {
+            let mut broken = payloads[9].clone();
+            broken[field] = Value::Null;
+            let mut batch = lines[..16].to_vec();
+            batch[9] = broken.to_string();
+            let mut corpus = DerivedCorpus::new();
+            assert!(
+                corpus.push_json_batch(&batch).is_err(),
+                "accepted invalid {field}"
+            );
+            assert!(corpus.is_empty(), "partially appended invalid batch");
+        }
+        let mut corpus = DerivedCorpus::new();
+        assert!(corpus.push_json_batch(&["not json".into()]).is_err());
     }
 
     #[test]

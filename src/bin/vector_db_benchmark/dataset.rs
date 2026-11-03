@@ -22,6 +22,11 @@ use vector_db_benchmark::upload_stream::{self, UploadPlan, UploadReader};
 /// Dataset wrapper that provides access to vectors and metadata
 pub struct Dataset {
     pub config: DatasetConfig,
+    /// Preparation capabilities checked once per run; dataset files are
+    /// immutable while a benchmark is using them.
+    preparation: std::sync::OnceLock<
+        Result<Option<vector_db_benchmark::msmarco::preparation::Capabilities>, String>,
+    >,
     /// The prepared filter-only query set, loaded once per `Dataset` (one per
     /// dataset per run): every filter-only step reads it, and the files do not
     /// change during a run.
@@ -55,6 +60,7 @@ impl Dataset {
     pub fn new(config: DatasetConfig) -> Self {
         Self {
             config,
+            preparation: std::sync::OnceLock::new(),
             filter_query_file: std::sync::OnceLock::new(),
             upload_reader: UploadReader::default(),
             upload_report: Mutex::new(None),
@@ -188,7 +194,39 @@ impl Dataset {
             self.config.schema.as_ref(),
             &path,
         )?;
+        self.preparation
+            .get_or_init(
+                || match vector_db_benchmark::msmarco::variant(&self.config.name) {
+                    Some(variant) => {
+                        vector_db_benchmark::msmarco::preparation::check(&path, variant, false)
+                    }
+                    None => Ok(None),
+                },
+            )
+            .as_ref()
+            .map_err(Clone::clone)?;
         Ok(path)
+    }
+
+    pub fn require_workloads(
+        &self,
+        workloads: &[vector_db_benchmark::workload::Workload],
+    ) -> Result<(), String> {
+        if vector_db_benchmark::msmarco::variant(&self.config.name).is_some() {
+            self.get_path()?;
+            let caps = self
+                .preparation
+                .get()
+                .ok_or("preparation not checked")?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            vector_db_benchmark::msmarco::preparation::require_workloads(
+                caps.as_ref(),
+                &self.config.name,
+                workloads,
+            )?;
+        }
+        Ok(())
     }
 
     fn resolve_path(&self) -> Result<PathBuf, String> {
