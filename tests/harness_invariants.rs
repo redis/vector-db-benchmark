@@ -764,6 +764,7 @@ fn inv_p7_the_scanned_test_target_set_is_pinned() {
         "integration_pgvector.rs",
         "integration_qdrant.rs",
         "integration_redis.rs",
+        "integration_redis_cluster.rs",
         "integration_valkey.rs",
         "integration_vectorsets.rs",
         "integration_vertex.rs",

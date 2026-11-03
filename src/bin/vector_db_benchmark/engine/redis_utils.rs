@@ -4,7 +4,6 @@
 //! and `collect_server_metadata` to snapshot server version / loaded modules /
 //! a full `INFO` dump for result reproducibility.
 
-use redis::Connection;
 use serde_json::{Map, Value as Json};
 use std::collections::HashMap;
 use vector_db_benchmark::parsers::parse_info;
@@ -21,7 +20,7 @@ use vector_db_benchmark::parsers::parse_info;
 ///   plain `INFO`, which works on every server.
 /// - `MODULE LIST` is parsed into `name -> { ver, path, args }`, handling both
 ///   the RESP2 (flat array of k/v) and RESP3 (map) module shapes.
-pub fn collect_server_metadata(conn: &mut Connection) -> Json {
+pub fn collect_server_metadata(conn: &mut dyn redis::ConnectionLike) -> Json {
     // INFO everything (rich); fall back to plain INFO when empty (Dragonfly).
     let everything: String = redis::cmd("INFO")
         .arg("everything")
@@ -279,7 +278,9 @@ fn parse_failed_calls(info: &str) -> HashMap<String, u64> {
 /// If CONFIG RESETSTAT is not permitted (e.g. Redis Cloud ACLs), captures
 /// a baseline snapshot of current failed_calls so check_commandstats can
 /// compare against it.
-pub fn reset_commandstats(conn: &mut Connection) -> Result<Option<CommandStatsBaseline>, String> {
+pub fn reset_commandstats(
+    conn: &mut dyn redis::ConnectionLike,
+) -> Result<Option<CommandStatsBaseline>, String> {
     match redis::cmd("CONFIG").arg("RESETSTAT").query::<()>(conn) {
         Ok(()) => Ok(None),
         Err(e) => {
@@ -305,7 +306,7 @@ pub fn reset_commandstats(conn: &mut Connection) -> Result<Option<CommandStatsBa
 /// Returns `Err` if any of the specified commands have new `failed_calls`,
 /// listing the offending commands and their failure counts.
 pub fn check_commandstats(
-    conn: &mut Connection,
+    conn: &mut dyn redis::ConnectionLike,
     commands: &[&str],
     context: &str,
     baseline: Option<&CommandStatsBaseline>,
@@ -363,7 +364,10 @@ fn evaluate(
 /// `--skip-upload` path a name/prefix mismatch (old→new upgrade, wrong config,
 /// missing prior upload) would otherwise write a silent `recall 0.0` result
 /// file. `FT.INFO <index_name>` errors when the index is absent → hard error.
-pub fn ensure_index_exists(conn: &mut Connection, index_name: &str) -> Result<(), String> {
+pub fn ensure_index_exists(
+    conn: &mut dyn redis::ConnectionLike,
+    index_name: &str,
+) -> Result<(), String> {
     redis::cmd("FT.INFO")
         .arg(index_name)
         .query::<redis::Value>(conn)
@@ -437,7 +441,10 @@ fn is_missing_index_error(e: &redis::RedisError) -> bool {
 ///   ("cannot tell"), never a fabricated zero.
 /// - the probe itself failed (`NOPERM`, connection dropped) → `Err`, so the
 ///   caller reports a probe failure rather than an imaginary empty corpus.
-pub fn ft_index_num_docs(conn: &mut Connection, index_name: &str) -> Result<Option<u64>, String> {
+pub fn ft_index_num_docs(
+    conn: &mut dyn redis::ConnectionLike,
+    index_name: &str,
+) -> Result<Option<u64>, String> {
     match redis::cmd("FT.INFO")
         .arg(index_name)
         .query::<redis::Value>(conn)
@@ -484,7 +491,11 @@ pub fn ft_info_index_memory_bytes(v: &redis::Value) -> Option<i64> {
 /// contains no metacharacters — it is a literal prefix. Runs OUTSIDE every timed
 /// window and every `check_commandstats` reset window. UNLINK (async) avoids the
 /// blocking spike a large synchronous `DEL` would cause.
-pub fn drop_index_and_keys(conn: &mut Connection, index_name: &str, key_prefix: &str) {
+pub fn drop_index_and_keys(
+    conn: &mut dyn redis::ConnectionLike,
+    index_name: &str,
+    key_prefix: &str,
+) {
     let _ = redis::cmd("FT.DROPINDEX").arg(index_name).query::<()>(conn);
     let pattern = format!("{key_prefix}*"); // key_prefix is sanitized → no glob metachars
     let mut cursor: u64 = 0;

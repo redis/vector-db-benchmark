@@ -6701,3 +6701,103 @@ fn test_binary_redis_compound_text_scalar_wrong_count_is_fatal() {
         std::fs::remove_dir_all(&proj.root).ok();
     }
 }
+
+#[test]
+fn test_binary_redis_text_tag_fresh_and_retained_reuse() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{"name":"redis-text-tag","engine":"redis","upload_params":{"parallel":1},"search_params":common::text_tag_search_params()}]);
+    let proj = common::write_compound_project(&configs.to_string());
+    let port = test_port().to_string();
+    let env = [("REDIS_PORT", port.as_str())];
+    let run = |flags: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            "redis-text-tag",
+            common::BM25_DATASET,
+            TEST_HOST,
+            &env,
+            flags,
+        )
+    };
+    // Lifecycle refusal must happen before configuring an index.
+    let out = run(&["--queries", "8"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("retained data"));
+    // Stale keys must not be skipped by SKIPINITIALSCAN.
+    redis::cmd("SET")
+        .arg("redis-text-tag:stale")
+        .arg("sentinel")
+        .query::<()>(&mut conn)
+        .unwrap();
+    let out = run(&["--keep-data", "--queries", "8"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("empty owned prefix"));
+    assert_eq!(
+        redis::cmd("GET")
+            .arg("redis-text-tag:stale")
+            .query::<String>(&mut conn)
+            .unwrap(),
+        "sentinel"
+    );
+    redis::cmd("DEL")
+        .arg("redis-text-tag:stale")
+        .query::<()>(&mut conn)
+        .unwrap();
+    let dump = proj.root.join("reduced-dumps");
+    let out = run(&[
+        "--keep-data",
+        "--search-ids",
+        "1",
+        "--queries",
+        "8",
+        "--repetitions",
+        "1",
+        "--dump-results",
+        dump.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    common::assert_text_tag_membership(&dump);
+    // A second fresh invocation must refuse, without dropping existing data.
+    let out = run(&["--keep-data", "--queries", "8"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("absent index"));
+    let out = run(&[
+        "--skip-upload",
+        "--search-ids",
+        "1",
+        "--queries",
+        "8",
+        "--repetitions",
+        "1",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    redis::cmd("DEL")
+        .arg("redis-text-tag:0")
+        .query::<()>(&mut conn)
+        .unwrap();
+    let out = run(&[
+        "--skip-upload",
+        "--search-ids",
+        "1",
+        "--queries",
+        "8",
+        "--repetitions",
+        "1",
+    ]);
+    assert!(
+        !out.status.success(),
+        "partial corpus must refuse reuse despite a valid marker"
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}

@@ -13,13 +13,13 @@ use vector_db_benchmark::fulltext;
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
 
-fn resp3_connection(url: &str) -> redis::RedisResult<redis::Connection> {
-    let info = redis::Client::open(url)?.get_connection_info().clone();
-    let settings = info
-        .redis_settings()
-        .clone()
-        .set_protocol(redis::ProtocolVersion::RESP3);
-    redis::Client::open(info.set_redis_settings(settings))?.get_connection()
+fn resp3_connection(
+    url: &str,
+    cluster_api: bool,
+) -> redis::RedisResult<vector_db_benchmark::redis_transport::Connection> {
+    vector_db_benchmark::redis_transport::Client::open(url, cluster_api)?
+        .with_protocol(redis::ProtocolVersion::RESP3)
+        .get_connection()
 }
 
 type WorkerOut = (Vec<f64>, Vec<String>, Vec<RawQueryResult>, Option<String>);
@@ -52,7 +52,7 @@ impl RedisEngine {
     /// at all for a config without a fulltext profile.
     pub(super) fn write_fulltext_marker(
         &self,
-        conn: &mut redis::Connection,
+        conn: &mut vector_db_benchmark::redis_transport::Connection,
         profile: Option<&fulltext::IndexProfile>,
     ) -> Result<(), String> {
         for args in fulltext::redis_marker_create_commands(&self.config.index_name, profile) {
@@ -105,7 +105,7 @@ impl RedisEngine {
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
         let (min_stem_len, recorded_marker) = {
-            let mut conn = resp3_connection(&self.redis_url)
+            let mut conn = resp3_connection(&self.redis_url, self.config.cluster_api)
                 .map_err(|e| format!("fulltext: Redis RESP3 connection failed: {e}"))?;
             let info: redis::Value = redis::cmd("FT.INFO")
                 .arg(&self.config.index_name)
@@ -136,7 +136,17 @@ impl RedisEngine {
                 } else {
                     vector_db_benchmark::filter_only::validate_redis_full_schema
                 };
-                validate(&redis_value_to_json(&info), dataset.config.schema.as_ref())?;
+                let schema = dataset
+                    .config
+                    .schema
+                    .as_ref()
+                    .map(|s| profile.scalar_indexing.project(s));
+                validate(&redis_value_to_json(&info), schema.as_ref())?;
+                if profile.scalar_indexing.is_reduced() {
+                    vector_db_benchmark::text_tag_profile::validate_redis(&redis_value_to_json(
+                        &info,
+                    ))?;
+                }
             }
             fulltext::validate_redis_index_for(
                 &redis_value_to_json(&info),
@@ -212,10 +222,11 @@ impl RedisEngine {
                 let (url, commands, order, queries) =
                     (&self.redis_url, &commands, &order, &set.queries);
                 let (next, pb) = (&next, &pb);
+                let cluster_api = self.config.cluster_api;
                 pool.spawn(move |ticket| -> WorkerOut {
                     let (mut samples, mut errs, mut cap) = (Vec::new(), Vec::new(), Vec::new());
                     let mut capture_error = None;
-                    let mut conn = match resp3_connection(url) {
+                    let mut conn = match resp3_connection(url, cluster_api) {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("Redis fulltext connection failed: {e}"));

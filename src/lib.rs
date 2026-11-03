@@ -33,9 +33,11 @@ pub mod readers;
 pub mod redis_client;
 pub mod redis_hnsw_sq8;
 pub mod redis_numeric_range;
+pub mod redis_transport;
 pub mod results_dump;
 pub mod start_gate;
 pub mod synthetic;
+pub mod text_tag_profile;
 pub mod upload_stream;
 pub mod workload;
 

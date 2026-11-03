@@ -13,7 +13,7 @@ use rand::SeedableRng;
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 
 use super::redis_utils;
-use redis::Connection;
+use vector_db_benchmark::redis_transport::{Client as RedisClient, Connection, ScanLimits};
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::{Dataset, UploadSource};
@@ -40,6 +40,8 @@ mod stream_upload;
 /// Redis engine configuration
 #[derive(Clone)]
 pub struct RedisEngineConfig {
+    pub cluster_api: bool,
+    pub prefix_scan_limits: ScanLimits,
     pub m: i64,
     pub ef_construction: i64,
     pub data_type: String,
@@ -128,30 +130,8 @@ fn shared_key_prefix() -> Option<String> {
 /// prefix is sanitized so `*` is the only glob metachar). Used by shared-corpus
 /// mode (#188) to detect whether the corpus is already fully uploaded so a
 /// sweep's later configs can skip the re-upload.
-fn count_prefix_keys(conn: &mut Connection, prefix: &str) -> usize {
-    let pattern = format!("{prefix}*");
-    let mut cursor: u64 = 0;
-    let mut count = 0usize;
-    loop {
-        let res: Result<(u64, Vec<String>), redis::RedisError> = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(1000)
-            .query(conn);
-        match res {
-            Ok((next, keys)) => {
-                count += keys.len();
-                if next == 0 {
-                    break;
-                }
-                cursor = next;
-            }
-            Err(_) => break,
-        }
-    }
-    count
+fn count_prefix_keys(conn: &mut Connection, prefix: &str) -> Result<usize, String> {
+    conn.scan_prefix(prefix, false).map_err(|e| e.to_string())
 }
 
 /// Shared-corpus completeness test (#188): may this config skip its re-upload?
@@ -221,6 +201,19 @@ impl RedisEngine {
             .collection_params
             .as_ref()
             .and_then(|cp| cp.extra.as_ref());
+        let cluster_api = vector_db_benchmark::redis_transport::resolve_cluster_api(
+            cp_extra.and_then(|cp| cp.get("cluster_api")),
+            crate::effective_config::env_var("REDIS_CLUSTER")
+                .ok()
+                .as_deref(),
+        )?;
+        crate::effective_config::record_effective("cluster_api", serde_json::json!(cluster_api));
+        let prefix_scan_limits =
+            ScanLimits::parse(cp_extra.and_then(|cp| cp.get("prefix_scan_limits")))?;
+        crate::effective_config::record_effective(
+            "prefix_scan_limits",
+            prefix_scan_limits.as_json(),
+        );
         let cp_str = |key: &str| {
             cp_extra
                 .and_then(|e| e.get(key))
@@ -356,6 +349,8 @@ impl RedisEngine {
             name: engine_config.name.clone(),
             redis_url,
             config: RedisEngineConfig {
+                cluster_api,
+                prefix_scan_limits,
                 m,
                 ef_construction,
                 data_type,
@@ -391,7 +386,9 @@ impl RedisEngine {
     }
 
     fn get_connection(&self) -> Result<Connection, String> {
-        let client = redis::Client::open(self.redis_url.as_str()).map_err(|e| e.to_string())?;
+        let client = RedisClient::open(self.redis_url.as_str(), self.config.cluster_api)
+            .map_err(|e| e.to_string())?
+            .with_scan_limits(self.config.prefix_scan_limits);
         client.get_connection().map_err(|e| e.to_string())
     }
 
@@ -399,13 +396,39 @@ impl RedisEngine {
         let distance = dataset.distance();
         let vector_size = dataset.vector_size();
 
+        let ft_profile = self.fulltext_profile()?;
+        let reduced = ft_profile
+            .as_ref()
+            .is_some_and(|p| p.scalar_indexing.is_reduced());
+        if reduced {
+            // Flex cannot delete indexed hashes with DD. Never turn a rebuild
+            // into an incomplete SKIPINITIALSCAN index over stale keys.
+            if self.config.shared_corpus {
+                return Err("text-tag-only requires an exclusively owned prefix".into());
+            }
+            match redis::cmd("FT.INFO").arg(&self.config.index_name).query::<redis::Value>(conn) {
+                Ok(_) => return Err("text-tag-only fresh creation requires an absent index; use --skip-upload to reuse".into()),
+                Err(e) if e.code() == Some("SEARCH_INDEX_NOT_FOUND")
+                    || e.to_string().to_ascii_lowercase().contains("unknown index")
+                    || e.to_string().to_ascii_lowercase().contains("no such index") => {},
+                Err(e) => return Err(format!("Cannot inspect fresh index: {e}")),
+            }
+            if conn
+                .scan_prefix(&self.config.key_prefix, true)
+                .map_err(|e| e.to_string())?
+                != 0
+            {
+                return Err("text-tag-only SKIPINITIALSCAN requires an empty owned prefix".into());
+            }
+        }
+
         // Drop existing index if any. Normally with DD, which deletes the indexed
         // docs too; because the index PREFIX is this config's `<config>:`, DD
         // removes only this config's keys — siblings untouched (#151-4). In
         // shared-corpus mode (#188) the docs are SHARED across configs and
         // uploaded once, so drop the index WITHOUT DD to preserve them for the
         // other configs' indexes (build-many over one corpus).
-        {
+        if !reduced {
             let mut cmd = redis::cmd("FT.DROPINDEX");
             cmd.arg(&self.config.index_name);
             if !self.config.shared_corpus {
@@ -429,7 +452,9 @@ impl RedisEngine {
         // #339: a config that runs the fulltext workload pins the stopword list
         // explicitly (it equals the RediSearch default) so FT.INFO reports it
         // and the fulltext arm can refuse an index built any other way.
-        let ft_profile = self.fulltext_profile()?;
+        if reduced {
+            cmd.arg("SKIPINITIALSCAN");
+        }
         if ft_profile.is_some() {
             for a in vector_db_benchmark::fulltext::redis_stopword_args() {
                 cmd.arg(a);
@@ -541,6 +566,11 @@ impl RedisEngine {
         } else {
             dataset.config.schema.clone()
         };
+        let schema = schema.map(|schema| {
+            ft_profile
+                .as_ref()
+                .map_or(schema.clone(), |p| p.scalar_indexing.project(&schema))
+        });
         if let Some(schema) = &schema {
             if let Some(schema_obj) = schema.as_object() {
                 for (field_name, field_type) in schema_obj {
@@ -561,7 +591,9 @@ impl RedisEngine {
                             {
                                 cmd.arg("CASESENSITIVE");
                             }
-                            cmd.arg("SORTABLE").arg("UNF");
+                            if !reduced {
+                                cmd.arg("SORTABLE").arg("UNF");
+                            }
                         }
                         "int" | "float" => {
                             cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
@@ -577,13 +609,16 @@ impl RedisEngine {
                         "text" => match &ft_profile {
                             Some(p) if !p.indexes_text_field(field_name) => {}
                             Some(p) if !p.stems() => {
-                                cmd.arg(field_name)
-                                    .arg("TEXT")
-                                    .arg("NOSTEM")
-                                    .arg("SORTABLE");
+                                cmd.arg(field_name).arg("TEXT").arg("NOSTEM");
+                                if !reduced {
+                                    cmd.arg("SORTABLE");
+                                }
                             }
                             _ => {
-                                cmd.arg(field_name).arg("TEXT").arg("SORTABLE");
+                                cmd.arg(field_name).arg("TEXT");
+                                if !reduced {
+                                    cmd.arg("SORTABLE");
+                                }
                             }
                         },
                         "geo" => {
@@ -664,7 +699,7 @@ impl RedisEngine {
                 let pb = &pb;
 
                 s.spawn(move || {
-                    let client = match redis::Client::open(redis_url.as_str()) {
+                    let client = match RedisClient::open(redis_url.as_str(), config.cluster_api) {
                         Ok(c) => c,
                         Err(e) => {
                             *error.lock().unwrap() = Some(e.to_string());
@@ -955,6 +990,7 @@ impl RedisEngine {
             let mut pool = WorkerPool::new(scope, "redis-filter-only", parallel);
             for _ in 0..parallel {
                 let redis_url = &self.redis_url;
+                let cluster_api = self.config.cluster_api;
                 let commands = &commands;
                 let command_query_ids = &command_query_ids;
                 let query_idx = &query_idx;
@@ -968,15 +1004,11 @@ impl RedisEngine {
                     let mut cap: Vec<RawQueryResult> = Vec::new();
                     let mut capture_error: Option<String> = None;
                     let mut totals: Vec<(usize, u64)> = Vec::new();
-                    let mut conn = match redis::Client::open(redis_url.as_str()).and_then(|c| {
-                        let info = c.get_connection_info();
-                        let settings = info
-                            .redis_settings()
-                            .clone()
-                            .set_protocol(redis::ProtocolVersion::RESP3);
-                        redis::Client::open(info.clone().set_redis_settings(settings))?
-                            .get_connection()
-                    }) {
+                    let mut conn = match RedisClient::open(redis_url.as_str(), cluster_api)
+                        .and_then(|c| {
+                            c.with_protocol(redis::ProtocolVersion::RESP3)
+                                .get_connection()
+                        }) {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("Redis filter-only connection failed: {e}"));
@@ -1302,7 +1334,7 @@ fn is_transient_conn_error(msg: &str) -> bool {
 /// NOT transient and fail fast. Shared by the in-memory and the streaming
 /// (#342) uploads, so both have the same retry policy.
 fn upload_batch_with_retry(
-    client: &redis::Client,
+    client: &RedisClient,
     conn: &mut Connection,
     config: &RedisEngineConfig,
     label: &str,
@@ -1315,7 +1347,12 @@ fn upload_batch_with_retry(
         match upload_batch_internal(conn, config, ids, vectors, metadata) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if !is_transient_conn_error(&e) || attempt >= MAX_UPLOAD_RETRIES {
+                // Cluster transport already has bounded redirects/reconnection;
+                // do not multiply those attempts by the standalone replay loop.
+                if config.cluster_api
+                    || !is_transient_conn_error(&e)
+                    || attempt >= MAX_UPLOAD_RETRIES
+                {
                     return Err(format!(
                         "{label} failed after {attempt} reconnect attempt(s): {e}"
                     ));
@@ -1341,7 +1378,7 @@ fn upload_batch_internal(
     vectors: &[Vec<f32>],
     metadata: &[Option<MetadataItem>],
 ) -> Result<(), String> {
-    let mut pipe = redis::pipe();
+    let mut commands = Vec::with_capacity(ids.len());
 
     for i in 0..ids.len() {
         let key = format!("{}{}", config.key_prefix, ids[i]);
@@ -1381,10 +1418,10 @@ fn upload_batch_internal(
         for (field_key, field_val) in &fields {
             hset_cmd.arg(&field_key[..]).arg(&field_val[..]);
         }
-        pipe.add_command(hset_cmd);
+        commands.push(hset_cmd);
     }
 
-    pipe.query::<()>(conn).map_err(|e| e.to_string())?;
+    conn.pipeline(&commands).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2522,7 +2559,7 @@ impl Engine for RedisEngine {
         if self.config.shared_corpus {
             if let Some(expected) = dataset.corpus_completeness_target()? {
                 let mut conn = self.get_connection()?;
-                let existing = count_prefix_keys(&mut conn, &self.config.key_prefix);
+                let existing = count_prefix_keys(&mut conn, &self.config.key_prefix)?;
                 if shared_corpus_is_complete(existing, expected) {
                     // The same pre-upload gate as the upload path below (#344
                     // review): an earlier config (e.g. a `vector` one, which
@@ -2872,6 +2909,7 @@ impl Engine for RedisEngine {
             let mut pool = WorkerPool::new(s, "redis-search", parallel);
             for _ in 0..parallel {
                 let redis_url = self.redis_url.clone();
+                let cluster_api = self.config.cluster_api;
                 let algorithm = self.config.algorithm.clone();
                 let hybrid_policy = hybrid_policy.clone();
                 let neighbors = &neighbors;
@@ -2899,7 +2937,7 @@ impl Engine for RedisEngine {
                     // latency sample is taken.
                     let mut cap: Vec<RawQueryResult> = Vec::new();
 
-                    let client = match redis::Client::open(redis_url.as_str()) {
+                    let client = match RedisClient::open(redis_url.as_str(), cluster_api) {
                         Ok(c) => c,
                         Err(e) => {
                             // A worker that cannot set itself up would leave the
@@ -3291,7 +3329,7 @@ impl Engine for RedisEngine {
                     let mut ut = crate::engine::UpdateTally::default();
                     let mut pb_pending: u64 = 0;
 
-                    let client = match redis::Client::open(redis_url.as_str()) {
+                    let client = match RedisClient::open(redis_url.as_str(), config.cluster_api) {
                         Ok(c) => c,
                         Err(_) => return (t, p, r, mr, nd, ut),
                     };
@@ -3503,6 +3541,14 @@ impl Engine for RedisEngine {
     }
 
     fn delete(&mut self) -> Result<(), String> {
+        if self
+            .fulltext_profile()?
+            .is_some_and(|p| p.scalar_indexing.is_reduced())
+        {
+            return Err(
+                "text-tag-only Redis corpus must be retained; automatic teardown refused".into(),
+            );
+        }
         let mut conn = self.get_connection()?;
         // Normally DD (drop index + this config's docs). In shared-corpus mode
         // (#188) the docs are shared across configs, so drop the index only and
@@ -4145,6 +4191,8 @@ mod tests {
         let mut dt = HashSet::new();
         dt.insert("ts".to_string());
         let cfg = RedisEngineConfig {
+            cluster_api: false,
+            prefix_scan_limits: super::ScanLimits::default(),
             m: 16,
             ef_construction: 128,
             data_type: "FLOAT32".to_string(),
@@ -4223,6 +4271,58 @@ mod tests {
     // Legacy SVS configs (dbpedia-calibration.json shape) nest algorithm,
     // data_type, and the svs-vamana_config block under collection_params. new()
     // must resolve all of them so the config actually selects + configures SVS.
+    #[test]
+    fn cluster_api_reaches_the_engine_and_invalid_values_fail() {
+        let _env = isolated_engine_env();
+        for mode in [true, false] {
+            let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+                "name":"cluster-mode","engine":"redis","collection_params":{"cluster_api":mode}
+            }))
+            .unwrap();
+            assert_eq!(
+                super::RedisEngine::new(&ec, "localhost")
+                    .unwrap()
+                    .config
+                    .cluster_api,
+                mode
+            );
+        }
+        let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+            "name":"bad-mode","engine":"redis","collection_params":{"cluster_api":"true"}
+        }))
+        .unwrap();
+        assert!(super::RedisEngine::new(&ec, "localhost").is_err());
+    }
+
+    #[test]
+    fn prefix_scan_limits_reach_engine_and_invalid_values_fail() {
+        let _env = isolated_engine_env();
+        let limits = serde_json::json!({
+            "timeout_secs": 7200,
+            "max_keys": 250_000_000,
+            "max_fingerprint_bytes": 8_589_934_592_u64
+        });
+        let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+            "name":"scan-limits", "engine":"redis",
+            "collection_params":{"prefix_scan_limits":limits}
+        }))
+        .unwrap();
+        assert_eq!(
+            super::RedisEngine::new(&ec, "localhost")
+                .unwrap()
+                .config
+                .prefix_scan_limits
+                .as_json(),
+            limits
+        );
+        let bad: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+            "name":"bad-scan-limits", "engine":"redis",
+            "collection_params":{"prefix_scan_limits":{"timeout_secs":0}}
+        }))
+        .unwrap();
+        assert!(super::RedisEngine::new(&bad, "localhost").is_err());
+    }
+
     #[test]
     fn resolves_nested_svs_collection_params() {
         let _env = isolated_engine_env();

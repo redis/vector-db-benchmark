@@ -152,8 +152,8 @@ host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 
 | Engine | Client Library | Protocol | Distance Metrics | Metadata Filters |
 |--------|---------------|----------|-----------------|-----------------|
-| **Redis** (RediSearch) | `redis` 1.3 | Redis protocol | L2, Cosine, IP | Yes |
-| **VectorSets** | `redis` 1.3 | Redis protocol | L2, Cosine | Yes |
+| **Redis** (RediSearch) | `redis` 1.8.1 | Redis protocol | L2, Cosine, IP | Yes |
+| **VectorSets** | `redis` 1.8.1 | Redis protocol | L2, Cosine | Yes |
 | **Elasticsearch** | `elasticsearch` 8.15 | HTTP/REST | L2, Cosine | Yes |
 | **OpenSearch** | `opensearch` 2.4 | HTTP/REST | L2, Cosine | Yes [\*\*\*\*\*\*\*](#opensearch-note) |
 | **Qdrant** | `qdrant-client` 1.18 | gRPC | L2, Cosine, Dot | Yes |
@@ -161,12 +161,12 @@ host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 | **Weaviate** | `tonic` 0.12 / `prost` 0.13 (gRPC) + `reqwest` (REST) | gRPC (search) + HTTP/REST (schema) [\*\*](#weaviate-protocol-note) | L2, Cosine, Dot | Yes |
 | **Milvus** | `reqwest` (REST API v2) | HTTP/REST | L2, Cosine, IP | Yes |
 | **MongoDB** (Atlas Search) | `mongodb` 3 (sync) | MongoDB protocol | Euclidean, Cosine, Dot | Yes [\*\*\*\*\*\*\*\*](#mongodb-note) |
-| **Valkey** (Valkey Search) | `redis` 1.3 [\*](#valkey-client-note) | RESP protocol | L2, Cosine, IP | Yes |
+| **Valkey** (Valkey Search) | `redis` 1.8.1 [\*](#valkey-client-note) | RESP protocol | L2, Cosine, IP | Yes |
 | **Turbopuffer** | `turbopuffer-client` 0.0.4 | HTTP/REST (cloud) | Cosine, Euclidean | Yes |
-| **Dragonfly** (Dragonfly Search) | `redis` 1.3 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*](#dragonfly-note) |
+| **Dragonfly** (Dragonfly Search) | `redis` 1.8.1 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*](#dragonfly-note) |
 | **Vertex AI** (Vector Search) | `reqwest` (Vertex AI REST v1) | HTTP/REST (cloud) | L2, Cosine, Dot | Yes [\*\*\*\*](#vertex-note) |
 | **Chroma** | `reqwest` (Chroma v2 REST API) | HTTP/REST | L2, Cosine, IP | Yes [\*\*\*\*\*](#chroma-note) |
-| **KiviDB** | `redis` 1.3 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*\*\*\*](#kividb-note) |
+| **KiviDB** | `redis` 1.8.1 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*\*\*\*](#kividb-note) |
 
 <a id="valkey-client-note"></a>
 \* **Valkey client note:** Valkey GLIDE has no published Rust crate ([valkey-io/valkey-glide#828](https://github.com/valkey-io/valkey-glide/issues/828), closed NOT_PLANNED). The GLIDE maintainers recommend using `redis-rs` for Rust and upstream their improvements to it. The `redis` crate works with Valkey since it speaks the same RESP protocol.
@@ -541,6 +541,74 @@ make docker-integration
 # Fast smoke test (uses random-100 dataset baked into image, 228KB)
 make docker-integration-fast
 ```
+
+### Redis OSS Cluster API
+
+For the `redis` engine, enable Redis Cloud's OSS Cluster API routing explicitly:
+
+```json
+{
+  "name": "redis-cluster",
+  "engine": "redis",
+  "collection_params": { "cluster_api": true },
+  "upload_params": { "parallel": 8, "batch_size": 1000 }
+}
+```
+
+Add the normal search parameters for your workload. Alternatively set
+`REDIS_CLUSTER=1` (`true` also works); an explicit boolean `cluster_api` takes
+precedence, and the resolved mode is recorded in the effective configuration.
+Cluster mode defaults to off. The client must reach every primary address
+advertised by the database; a reachable seed endpoint alone is insufficient.
+Cluster mode requires database 0 and uses primary reads.
+
+The transport uses upstream [`redis` 1.8.1](https://docs.rs/redis/1.8.1/redis/cluster/index.html)
+`ClusterClient`, `ClusterConnection` and `cluster_pipe` for slot discovery,
+`MOVED`/`ASK`, reconnection and pipelines across slots. There is no local slot
+hashing or redirect implementation. Uploads from memory and streaming files,
+metadata hashes and profile marker keys use this routing. Search commands
+(`FT.*`) go once to the configured database coordinator, which must provide
+cluster-wide Search results, as Redis Cloud does. This does not implement a
+Search coordinator for independent OSS Search nodes.
+
+Fresh-prefix and shared-corpus checks scan every primary, deduplicate keys and
+refuse incomplete scans, active migration or observed topology changes. Run
+these checks without concurrent writes or resharding; SCAN is not a snapshot.
+Complete counts retain 128-bit SHA-256 key fingerprints instead of full keys;
+a fingerprint collision can only undercount, never inflate the completeness
+count. The scan still uses memory proportional to the number of distinct keys.
+This applies to shared-prefix counting in both standalone and cluster mode.
+`collection_params.prefix_scan_limits` accepts positive integer `timeout_secs`
+(default 3600), `max_keys` (200,000,000) and `max_fingerprint_bytes`
+(4,294,967,296). The allocation check includes conservative hash-table overhead;
+it limits fingerprint storage, not total process RSS. The current SCAN page and
+cursor history are separate. Adjust these limits for the corpus and client;
+the effective configuration records them and an exceeded limit stops the run.
+The key and byte caps apply independently; increasing one does not increase
+the other. With the current hash-table growth policy, the default byte cap
+admits about 117 million distinct fingerprints, including MS MARCO 100M.
+The elapsed-time limit is checked between responses; it does not interrupt a
+blocked standalone socket whose upstream timeout remains unset.
+Fresh-prefix checks stop at the first key and do not collect the corpus.
+
+Cluster mode bounds connection, response and redirect retries. Standalone
+configure/upload connections retain upstream default timeouts; search workers
+keep their explicit deadlines. Configure
+this option for the `redis` engine; it does not enable cluster routing for
+VectorSets, Valkey, Dragonfly or KiviDB adapters.
+
+Library consumers can use `RedisConfig::try_from_env()` for the same strict
+cluster flag parsing as the CLI. The deprecated `RedisConfig::from_env()` keeps
+its legacy integer coercion for compatibility (`2` enables it; `true` does not).
+
+`make integration-test-redis-cluster` runs an authenticated, disposable
+three-primary cluster on loopback, covering pipelines, markers, redirects and
+scan failures. It builds checksum-pinned Redis sources and requires no Docker.
+This fixture runs core Redis without Search modules and does not validate
+distributed `FT.*` execution. The coordinator path is validated separately
+against Redis Cloud; independent OSS Search nodes have no equivalent coordinator.
+It requires network access to download.redis.io, a C toolchain, curl, tar,
+sha256sum and flock. The normal `make integration-test` also runs this suite.
 
 ## CLI Options
 
@@ -2335,3 +2403,22 @@ The legacy `knn.algo_param.ef_search` knob is rejected before client setup or
 upload because Lucene ignores it. Migrate custom configs to `search_params.ef`
 to avoid measuring identical requests under different effort settings. See the
 [OpenSearch k-NN query documentation](https://docs.opensearch.org/latest/query-dsl/specialized/k-nn/index/).
+
+### Reduced TEXT/TAG compound profile for Redis Flex
+
+Set `fulltext.scalar_indexing` to `"text-tag-only"` on every search point in an
+engine config. This requires `analysis: "parity"`, explicit unit-boost text
+fields, `compound`, and `no_vector_index: true`. Only Redis and OpenSearch support
+this profile. It preserves every stored payload field and vector, but indexes
+only TEXT/TAG fields; numeric predicates are rejected before upload and on reuse.
+OpenSearch disables indexing and doc values on excluded fields, with
+`dynamic: false`. Redis omits SORTABLE/UNF and uses SKIPINITIALSCAN.
+
+For Redis, use `--keep-data` without `--reset-between-configs`. Fresh creation
+requires an absent index and an empty exclusively owned prefix. It never falls
+back from `FT.DROPINDEX ... DD` to keeping old keys. After an interrupted upload,
+use an explicitly disposable fresh database or fresh owned index/prefix; only a
+complete, verified corpus may use `--skip-upload`. The index marker and compound
+comparison fingerprint distinguish this reduced layout from the full scalar
+suite. Query-family names alone do not validate compatibility: actual predicates
+are compiled against the reduced schema.
