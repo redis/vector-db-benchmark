@@ -152,8 +152,8 @@ host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 
 | Engine | Client Library | Protocol | Distance Metrics | Metadata Filters |
 |--------|---------------|----------|-----------------|-----------------|
-| **Redis** (RediSearch) | `redis` 1.3 | Redis protocol | L2, Cosine, IP | Yes |
-| **VectorSets** | `redis` 1.3 | Redis protocol | L2, Cosine | Yes |
+| **Redis** (RediSearch) | `redis` 1.8.1 | Redis protocol | L2, Cosine, IP | Yes |
+| **VectorSets** | `redis` 1.8.1 | Redis protocol | L2, Cosine | Yes |
 | **Elasticsearch** | `elasticsearch` 8.15 | HTTP/REST | L2, Cosine | Yes |
 | **OpenSearch** | `opensearch` 2.4 | HTTP/REST | L2, Cosine | Yes [\*\*\*\*\*\*\*](#opensearch-note) |
 | **Qdrant** | `qdrant-client` 1.18 | gRPC | L2, Cosine, Dot | Yes |
@@ -161,12 +161,12 @@ host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 | **Weaviate** | `tonic` 0.12 / `prost` 0.13 (gRPC) + `reqwest` (REST) | gRPC (search) + HTTP/REST (schema) [\*\*](#weaviate-protocol-note) | L2, Cosine, Dot | Yes |
 | **Milvus** | `reqwest` (REST API v2) | HTTP/REST | L2, Cosine, IP | Yes |
 | **MongoDB** (Atlas Search) | `mongodb` 3 (sync) | MongoDB protocol | Euclidean, Cosine, Dot | Yes [\*\*\*\*\*\*\*\*](#mongodb-note) |
-| **Valkey** (Valkey Search) | `redis` 1.3 [\*](#valkey-client-note) | RESP protocol | L2, Cosine, IP | Yes |
+| **Valkey** (Valkey Search) | `redis` 1.8.1 [\*](#valkey-client-note) | RESP protocol | L2, Cosine, IP | Yes |
 | **Turbopuffer** | `turbopuffer-client` 0.0.4 | HTTP/REST (cloud) | Cosine, Euclidean | Yes |
-| **Dragonfly** (Dragonfly Search) | `redis` 1.3 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*](#dragonfly-note) |
+| **Dragonfly** (Dragonfly Search) | `redis` 1.8.1 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*](#dragonfly-note) |
 | **Vertex AI** (Vector Search) | `reqwest` (Vertex AI REST v1) | HTTP/REST (cloud) | L2, Cosine, Dot | Yes [\*\*\*\*](#vertex-note) |
 | **Chroma** | `reqwest` (Chroma v2 REST API) | HTTP/REST | L2, Cosine, IP | Yes [\*\*\*\*\*](#chroma-note) |
-| **KiviDB** | `redis` 1.3 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*\*\*\*](#kividb-note) |
+| **KiviDB** | `redis` 1.8.1 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*\*\*\*](#kividb-note) |
 
 <a id="valkey-client-note"></a>
 \* **Valkey client note:** Valkey GLIDE has no published Rust crate ([valkey-io/valkey-glide#828](https://github.com/valkey-io/valkey-glide/issues/828), closed NOT_PLANNED). The GLIDE maintainers recommend using `redis-rs` for Rust and upstream their improvements to it. The `redis` crate works with Valkey since it speaks the same RESP protocol.
@@ -541,6 +541,47 @@ make docker-integration
 # Fast smoke test (uses random-100 dataset baked into image, 228KB)
 make docker-integration-fast
 ```
+
+### Redis OSS Cluster API
+
+For the `redis` engine, enable Redis Cloud's OSS Cluster API routing explicitly:
+
+```json
+{
+  "name": "redis-cluster",
+  "engine": "redis",
+  "collection_params": { "cluster_api": true },
+  "upload_params": { "parallel": 8, "batch_size": 1000 }
+}
+```
+
+Add the normal search parameters for your workload. Alternatively set
+`REDIS_CLUSTER=1` (`true` also works); an explicit boolean `cluster_api` takes
+precedence, and the resolved mode is recorded in the effective configuration.
+Cluster mode defaults to off. The client must reach every primary address
+advertised by the database; a reachable seed endpoint alone is insufficient.
+Cluster mode requires database 0 and uses primary reads.
+
+The transport uses upstream [`redis` 1.8.1](https://docs.rs/redis/1.8.1/redis/cluster/index.html)
+`ClusterClient`, `ClusterConnection` and `cluster_pipe` for slot discovery,
+`MOVED`/`ASK`, reconnection and pipelines across slots. There is no local slot
+hashing or redirect implementation. Uploads from memory and streaming files,
+metadata hashes and profile marker keys use this routing. Search commands
+(`FT.*`) go once to the configured database coordinator, which must provide
+cluster-wide Search results, as Redis Cloud does. This does not implement a
+Search coordinator for independent OSS Search nodes.
+
+Fresh-prefix and shared-corpus checks scan every primary, deduplicate keys and
+refuse incomplete scans, active migration or observed topology changes. Run
+these checks without concurrent writes or resharding; SCAN is not a snapshot.
+The transport bounds connection, response and redirect retries. Configure
+this option for the `redis` engine; it does not enable cluster routing for
+VectorSets, Valkey, Dragonfly or KiviDB adapters.
+
+`make integration-test-redis-cluster` runs an authenticated, disposable
+three-primary cluster on loopback, covering pipelines, markers, redirects and
+scan failures. It builds checksum-pinned Redis sources and requires no Docker.
+The normal `make integration-test` also runs this suite.
 
 ## CLI Options
 

@@ -6781,6 +6781,23 @@ fn test_binary_redis_text_tag_fresh_and_retained_reuse() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    redis::cmd("DEL")
+        .arg("redis-text-tag:0")
+        .query::<()>(&mut conn)
+        .unwrap();
+    let out = run(&[
+        "--skip-upload",
+        "--search-ids",
+        "1",
+        "--queries",
+        "8",
+        "--repetitions",
+        "1",
+    ]);
+    assert!(
+        !out.status.success(),
+        "partial corpus must refuse reuse despite a valid marker"
+    );
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }

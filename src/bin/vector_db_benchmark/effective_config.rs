@@ -1498,6 +1498,7 @@ mod recorder_coverage_guard {
             "config takes precedence, then trim + positivity filter; resolved \
              value recorded as `svs_reduce`",
         ),
+        ("REDIS_CLUSTER", "strict cluster-mode flag; config overrides it and resolved value is recorded as `cluster_api`"),
         ("REDIS_AUTH", "credential, used verbatim; redacted in `env`"),
         (
             "REDIS_URI",

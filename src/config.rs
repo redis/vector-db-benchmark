@@ -5,7 +5,6 @@ pub struct RedisConfig {
     pub port: u16,
     pub auth: Option<String>,
     pub user: Option<String>,
-    #[allow(dead_code)]
     pub cluster: bool,
 }
 

@@ -13,7 +13,7 @@ use rand::SeedableRng;
 use indicatif::{HumanCount, ProgressBar, ProgressState, ProgressStyle};
 
 use super::redis_utils;
-use redis::Connection;
+use vector_db_benchmark::redis_transport::{Client as RedisClient, Connection};
 
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::{Dataset, UploadSource};
@@ -40,6 +40,7 @@ mod stream_upload;
 /// Redis engine configuration
 #[derive(Clone)]
 pub struct RedisEngineConfig {
+    pub cluster_api: bool,
     pub m: i64,
     pub ef_construction: i64,
     pub data_type: String,
@@ -128,30 +129,8 @@ fn shared_key_prefix() -> Option<String> {
 /// prefix is sanitized so `*` is the only glob metachar). Used by shared-corpus
 /// mode (#188) to detect whether the corpus is already fully uploaded so a
 /// sweep's later configs can skip the re-upload.
-fn count_prefix_keys(conn: &mut Connection, prefix: &str) -> usize {
-    let pattern = format!("{prefix}*");
-    let mut cursor: u64 = 0;
-    let mut count = 0usize;
-    loop {
-        let res: Result<(u64, Vec<String>), redis::RedisError> = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(1000)
-            .query(conn);
-        match res {
-            Ok((next, keys)) => {
-                count += keys.len();
-                if next == 0 {
-                    break;
-                }
-                cursor = next;
-            }
-            Err(_) => break,
-        }
-    }
-    count
+fn count_prefix_keys(conn: &mut Connection, prefix: &str) -> Result<usize, String> {
+    conn.scan_prefix(prefix, false).map_err(|e| e.to_string())
 }
 
 /// Shared-corpus completeness test (#188): may this config skip its re-upload?
@@ -221,6 +200,13 @@ impl RedisEngine {
             .collection_params
             .as_ref()
             .and_then(|cp| cp.extra.as_ref());
+        let cluster_api = vector_db_benchmark::redis_transport::resolve_cluster_api(
+            cp_extra.and_then(|cp| cp.get("cluster_api")),
+            crate::effective_config::env_var("REDIS_CLUSTER")
+                .ok()
+                .as_deref(),
+        )?;
+        crate::effective_config::record_effective("cluster_api", serde_json::json!(cluster_api));
         let cp_str = |key: &str| {
             cp_extra
                 .and_then(|e| e.get(key))
@@ -356,6 +342,7 @@ impl RedisEngine {
             name: engine_config.name.clone(),
             redis_url,
             config: RedisEngineConfig {
+                cluster_api,
                 m,
                 ef_construction,
                 data_type,
@@ -391,7 +378,8 @@ impl RedisEngine {
     }
 
     fn get_connection(&self) -> Result<Connection, String> {
-        let client = redis::Client::open(self.redis_url.as_str()).map_err(|e| e.to_string())?;
+        let client = RedisClient::open(self.redis_url.as_str(), self.config.cluster_api)
+            .map_err(|e| e.to_string())?;
         client.get_connection().map_err(|e| e.to_string())
     }
 
@@ -416,39 +404,12 @@ impl RedisEngine {
                     || e.to_string().to_ascii_lowercase().contains("no such index") => {},
                 Err(e) => return Err(format!("Cannot inspect fresh index: {e}")),
             }
-            // Escape glob syntax: index/config names are not Redis patterns.
-            let pattern = self
-                .config
-                .key_prefix
-                .chars()
-                .flat_map(|c| {
-                    if matches!(c, '*' | '?' | '[' | ']' | '\\') {
-                        vec!['\\', c]
-                    } else {
-                        vec![c]
-                    }
-                })
-                .collect::<String>()
-                + "*";
-            let mut cursor = 0u64;
-            loop {
-                let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("MATCH")
-                    .arg(&pattern)
-                    .arg("COUNT")
-                    .arg(1000)
-                    .query(conn)
-                    .map_err(|e| format!("Cannot inspect fresh prefix: {e}"))?;
-                if !keys.is_empty() {
-                    return Err(
-                        "text-tag-only SKIPINITIALSCAN requires an empty owned prefix".into(),
-                    );
-                }
-                cursor = next;
-                if cursor == 0 {
-                    break;
-                }
+            if conn
+                .scan_prefix(&self.config.key_prefix, true)
+                .map_err(|e| e.to_string())?
+                != 0
+            {
+                return Err("text-tag-only SKIPINITIALSCAN requires an empty owned prefix".into());
             }
         }
 
@@ -729,7 +690,7 @@ impl RedisEngine {
                 let pb = &pb;
 
                 s.spawn(move || {
-                    let client = match redis::Client::open(redis_url.as_str()) {
+                    let client = match RedisClient::open(redis_url.as_str(), config.cluster_api) {
                         Ok(c) => c,
                         Err(e) => {
                             *error.lock().unwrap() = Some(e.to_string());
@@ -1020,6 +981,7 @@ impl RedisEngine {
             let mut pool = WorkerPool::new(scope, "redis-filter-only", parallel);
             for _ in 0..parallel {
                 let redis_url = &self.redis_url;
+                let cluster_api = self.config.cluster_api;
                 let commands = &commands;
                 let command_query_ids = &command_query_ids;
                 let query_idx = &query_idx;
@@ -1033,15 +995,11 @@ impl RedisEngine {
                     let mut cap: Vec<RawQueryResult> = Vec::new();
                     let mut capture_error: Option<String> = None;
                     let mut totals: Vec<(usize, u64)> = Vec::new();
-                    let mut conn = match redis::Client::open(redis_url.as_str()).and_then(|c| {
-                        let info = c.get_connection_info();
-                        let settings = info
-                            .redis_settings()
-                            .clone()
-                            .set_protocol(redis::ProtocolVersion::RESP3);
-                        redis::Client::open(info.clone().set_redis_settings(settings))?
-                            .get_connection()
-                    }) {
+                    let mut conn = match RedisClient::open(redis_url.as_str(), cluster_api)
+                        .and_then(|c| {
+                            c.with_protocol(redis::ProtocolVersion::RESP3)
+                                .get_connection()
+                        }) {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("Redis filter-only connection failed: {e}"));
@@ -1367,7 +1325,7 @@ fn is_transient_conn_error(msg: &str) -> bool {
 /// NOT transient and fail fast. Shared by the in-memory and the streaming
 /// (#342) uploads, so both have the same retry policy.
 fn upload_batch_with_retry(
-    client: &redis::Client,
+    client: &RedisClient,
     conn: &mut Connection,
     config: &RedisEngineConfig,
     label: &str,
@@ -1380,7 +1338,12 @@ fn upload_batch_with_retry(
         match upload_batch_internal(conn, config, ids, vectors, metadata) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if !is_transient_conn_error(&e) || attempt >= MAX_UPLOAD_RETRIES {
+                // Cluster transport already has bounded redirects/reconnection;
+                // do not multiply those attempts by the standalone replay loop.
+                if config.cluster_api
+                    || !is_transient_conn_error(&e)
+                    || attempt >= MAX_UPLOAD_RETRIES
+                {
                     return Err(format!(
                         "{label} failed after {attempt} reconnect attempt(s): {e}"
                     ));
@@ -1406,7 +1369,7 @@ fn upload_batch_internal(
     vectors: &[Vec<f32>],
     metadata: &[Option<MetadataItem>],
 ) -> Result<(), String> {
-    let mut pipe = redis::pipe();
+    let mut commands = Vec::with_capacity(ids.len());
 
     for i in 0..ids.len() {
         let key = format!("{}{}", config.key_prefix, ids[i]);
@@ -1446,10 +1409,10 @@ fn upload_batch_internal(
         for (field_key, field_val) in &fields {
             hset_cmd.arg(&field_key[..]).arg(&field_val[..]);
         }
-        pipe.add_command(hset_cmd);
+        commands.push(hset_cmd);
     }
 
-    pipe.query::<()>(conn).map_err(|e| e.to_string())?;
+    conn.pipeline(&commands).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2587,7 +2550,7 @@ impl Engine for RedisEngine {
         if self.config.shared_corpus {
             if let Some(expected) = dataset.corpus_completeness_target()? {
                 let mut conn = self.get_connection()?;
-                let existing = count_prefix_keys(&mut conn, &self.config.key_prefix);
+                let existing = count_prefix_keys(&mut conn, &self.config.key_prefix)?;
                 if shared_corpus_is_complete(existing, expected) {
                     // The same pre-upload gate as the upload path below (#344
                     // review): an earlier config (e.g. a `vector` one, which
@@ -2937,6 +2900,7 @@ impl Engine for RedisEngine {
             let mut pool = WorkerPool::new(s, "redis-search", parallel);
             for _ in 0..parallel {
                 let redis_url = self.redis_url.clone();
+                let cluster_api = self.config.cluster_api;
                 let algorithm = self.config.algorithm.clone();
                 let hybrid_policy = hybrid_policy.clone();
                 let neighbors = &neighbors;
@@ -2964,7 +2928,7 @@ impl Engine for RedisEngine {
                     // latency sample is taken.
                     let mut cap: Vec<RawQueryResult> = Vec::new();
 
-                    let client = match redis::Client::open(redis_url.as_str()) {
+                    let client = match RedisClient::open(redis_url.as_str(), cluster_api) {
                         Ok(c) => c,
                         Err(e) => {
                             // A worker that cannot set itself up would leave the
@@ -3356,7 +3320,7 @@ impl Engine for RedisEngine {
                     let mut ut = crate::engine::UpdateTally::default();
                     let mut pb_pending: u64 = 0;
 
-                    let client = match redis::Client::open(redis_url.as_str()) {
+                    let client = match RedisClient::open(redis_url.as_str(), config.cluster_api) {
                         Ok(c) => c,
                         Err(_) => return (t, p, r, mr, nd, ut),
                     };
@@ -4218,6 +4182,7 @@ mod tests {
         let mut dt = HashSet::new();
         dt.insert("ts".to_string());
         let cfg = RedisEngineConfig {
+            cluster_api: false,
             m: 16,
             ef_construction: 128,
             data_type: "FLOAT32".to_string(),
@@ -4296,6 +4261,29 @@ mod tests {
     // Legacy SVS configs (dbpedia-calibration.json shape) nest algorithm,
     // data_type, and the svs-vamana_config block under collection_params. new()
     // must resolve all of them so the config actually selects + configures SVS.
+    #[test]
+    fn cluster_api_reaches_the_engine_and_invalid_values_fail() {
+        let _env = isolated_engine_env();
+        for mode in [true, false] {
+            let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+                "name":"cluster-mode","engine":"redis","collection_params":{"cluster_api":mode}
+            }))
+            .unwrap();
+            assert_eq!(
+                super::RedisEngine::new(&ec, "localhost")
+                    .unwrap()
+                    .config
+                    .cluster_api,
+                mode
+            );
+        }
+        let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+            "name":"bad-mode","engine":"redis","collection_params":{"cluster_api":"true"}
+        }))
+        .unwrap();
+        assert!(super::RedisEngine::new(&ec, "localhost").is_err());
+    }
+
     #[test]
     fn resolves_nested_svs_collection_params() {
         let _env = isolated_engine_env();

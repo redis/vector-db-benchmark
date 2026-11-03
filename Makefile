@@ -196,7 +196,7 @@ test-verbose:
 # ============================================================
 
 .PHONY: integration-test
-integration-test:
+integration-test: integration-test-redis-cluster
 	@echo "=== Starting redis:8.6.0 for integration tests ==="
 	docker compose -f tests/docker-compose.test.yml up -d redis --wait
 	@echo "=== Running integration tests ==="
@@ -645,3 +645,22 @@ integration-test-compound-guards:
 	docker compose -f tests/docker-compose.test.yml up -d redis opensearch --wait
 	OPENSEARCH_PORT=9202 cargo test --test integration_redis --test integration_opensearch $(COMPOUND_PROFILE) compound_text_scalar_wrong_count_is_fatal -- --nocapture --test-threads=1; \
 	EXIT_CODE=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$EXIT_CODE
+
+# Cluster-aware transport gates use a separate disposable three-primary cluster.
+.PHONY: integration-test-redis-cluster
+integration-test-redis-cluster:
+	bash tests/run-redis-cluster.sh
+
+.PHONY: test-redis-cluster-guards
+test-redis-cluster-guards:
+	cargo test --lib redis_transport:: --release
+	cargo test --lib redis_transport::
+
+# Focused lifecycle/reuse regression, including deliberate guard mutations.
+TEXT_TAG_ENGINE ?= redis
+.PHONY: integration-test-text-tag-profile
+integration-test-text-tag-profile:
+	@case "$(TEXT_TAG_ENGINE)" in redis|opensearch) ;; *) echo 'TEXT_TAG_ENGINE must be redis or opensearch'; exit 2;; esac
+	docker compose -f tests/docker-compose.test.yml up -d $(TEXT_TAG_ENGINE) --wait
+	OPENSEARCH_PORT=9202 cargo test --test integration_$(TEXT_TAG_ENGINE) --release text_tag_ -- --nocapture --test-threads=1; \
+	status=$$?; docker compose -f tests/docker-compose.test.yml down; exit $$status
