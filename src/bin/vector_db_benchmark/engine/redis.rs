@@ -536,7 +536,7 @@ impl RedisEngine {
         // query set, filter-only indexes only the fields its predicates
         // reference (#340); the rest stay stored in the hash, unindexed.
         // Without one the layout is the declared schema.
-        let schema = if self.config.skip_vector_index {
+        let schema = if self.config.skip_vector_index && self.fulltext_profile()?.is_none() {
             dataset.filter_only_index_schema()?
         } else {
             dataset.config.schema.clone()
@@ -554,7 +554,11 @@ impl RedisEngine {
                             cmd.arg(field_name).arg("TAG").arg("SEPARATOR").arg(";");
                             // Filter-only's exact-match contract, on its own
                             // index or on the shared `full` one (#344).
-                            if self.config.layout.serves(Workload::FilterOnly) {
+                            if self.config.layout.serves(Workload::FilterOnly)
+                                || self.search_params.iter().any(|s| {
+                                    s.knob("fulltext").is_some_and(|v| !v["compound"].is_null())
+                                })
+                            {
                                 cmd.arg("CASESENSITIVE");
                             }
                             cmd.arg("SORTABLE").arg("UNF");

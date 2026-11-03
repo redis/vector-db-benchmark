@@ -470,6 +470,7 @@ fn compare_results_self_passes_and_a_one_sided_answer_fails() {
                 field: "docid".into(),
             },
             index_layout: None,
+            compound_identity: None,
         };
         let records: Vec<QueryRecord> = (0..3)
             .map(|q| QueryRecord {

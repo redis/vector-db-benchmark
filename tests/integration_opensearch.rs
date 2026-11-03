@@ -2521,3 +2521,144 @@ fn test_binary_opensearch_streaming_upload_refuses_a_short_payload_file_before_w
         .send();
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+#[test]
+fn test_binary_opensearch_compound_text_scalar() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{"name":"os-compound","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":common::compound_search_params()}]);
+    let proj = common::write_compound_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-compound",
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_compound")
+        ],
+        &[
+            "--keep-data",
+            "--search-ids",
+            "1",
+            "--queries",
+            "110",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_compound_run(&proj.root, &dump);
+    common::compound_add_missing_scalar(&proj.root);
+    let out = common::run_binary_output(
+        &proj.root,
+        "os-compound",
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_compound"),
+        ],
+        &["--skip-upload", "--queries", "1", "--repetitions", "1"],
+    );
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "missing compound scalar field must refuse reuse"
+    );
+    assert!(error.contains("compound_extra"), "{error}");
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+#[test]
+fn test_binary_opensearch_compound_text_scalar_no_vector() {
+    wait_for_opensearch();
+    let mut configs = serde_json::json!([{"name":"os-compound","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":common::compound_search_params()}]);
+    for point in configs[0]["search_params"].as_array_mut().unwrap() {
+        point["fulltext"]["no_vector_index"] = serde_json::json!(true);
+    }
+    let proj = common::write_compound_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-compound",
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_compound")
+        ],
+        &[
+            "--keep-data",
+            "--search-ids",
+            "1",
+            "--queries",
+            "110",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    common::assert_compound_run(&proj.root, &dump);
+    common::compound_add_missing_scalar(&proj.root);
+    let out = common::run_binary_output(
+        &proj.root,
+        "os-compound",
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_compound"),
+        ],
+        &["--skip-upload", "--queries", "1", "--repetitions", "1"],
+    );
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "missing compound scalar field must refuse reuse"
+    );
+    assert!(error.contains("compound_extra"), "{error}");
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
+#[test]
+fn test_binary_opensearch_compound_text_scalar_english_inflection() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{"name":"opensearch-compound-inflection","engine":"opensearch","collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},"search_params":common::compound_inflection_params()}]);
+    let proj = common::write_compound_inflection_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "opensearch-compound-inflection",
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_compound_inflection")
+        ],
+        &[
+            "--queries",
+            "1",
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    let path = std::fs::read_dir(&dump)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let rows = std::fs::read_to_string(path).unwrap();
+    let query: serde_json::Value = serde_json::from_str(rows.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(query["ids"], serde_json::json!(["d1"]));
+    assert_eq!(query["total"], 1);
+
+    std::fs::remove_dir_all(&proj.root).ok();
+}

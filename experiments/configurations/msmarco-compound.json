@@ -1,0 +1,3222 @@
+[
+  {
+    "name": "redis-msmarco-compound-parity-no-vector",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 500
+    },
+    "search_params": [
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "opensearch-msmarco-compound-parity-no-vector",
+    "engine": "opensearch",
+    "collection_params": {
+      "number_of_shards": 1,
+      "method": {
+        "parameters": {
+          "m": 16,
+          "ef_construction": 64
+        }
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 500
+    },
+    "search_params": [
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "redis-msmarco-compound-english-no-vector",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 500
+    },
+    "search_params": [
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "opensearch-msmarco-compound-english-no-vector",
+    "engine": "opensearch",
+    "collection_params": {
+      "number_of_shards": 1,
+      "method": {
+        "parameters": {
+          "m": 16,
+          "ef_construction": 64
+        }
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 500
+    },
+    "search_params": [
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": true,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "redis-msmarco-compound-parity-full-index",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 500
+    },
+    "search_params": [
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "opensearch-msmarco-compound-parity-full-index",
+    "engine": "opensearch",
+    "collection_params": {
+      "number_of_shards": 1,
+      "method": {
+        "parameters": {
+          "m": 16,
+          "ef_construction": 64
+        }
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 500
+    },
+    "search_params": [
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "parity",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "redis-msmarco-compound-english-full-index",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 500
+    },
+    "search_params": [
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "opensearch-msmarco-compound-english-full-index",
+    "engine": "opensearch",
+    "collection_params": {
+      "number_of_shards": 1,
+      "method": {
+        "parameters": {
+          "m": 16,
+          "ef_construction": 64
+        }
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 500
+    },
+    "search_params": [
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "title-and-segment"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag-and-text"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-tag-range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "text-exclusion"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_eq"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_point"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "numeric_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "repeated_value_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "tag_and_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 1,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      },
+      {
+        "workload": "fulltext",
+        "parallel": 100,
+        "top": 10,
+        "fulltext": {
+          "fields": {
+            "title": 1.0,
+            "segment": 1.0
+          },
+          "analysis": "english",
+          "no_vector_index": false,
+          "allow_multi_shard": true,
+          "compound": {
+            "suite": "msmarco-v1",
+            "family": "range_or_range"
+          }
+        }
+      }
+    ]
+  }
+]

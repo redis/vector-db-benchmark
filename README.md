@@ -838,6 +838,14 @@ engine/workload without per-query capture (today: Redis and OpenSearch,
 vector and filter-only), and `calibration_param` on a declared non-vector
 workload is refused at startup.
 
+### Compound text/scalar profiles (#389, #390)
+
+The [MS MARCO scale-up runbook](docs/msmarco-text-scalar-scale.md) documents
+field-scoped AND/OR/NOT text/tag/numeric queries, separate English/parity and
+no-vector/full-index profiles, exact scalar count gates, streaming ingestion,
+and the measured-pilot requirements for 100M. Existing ranked BM25 profiles
+retain their original meaning. Large cloud execution is separate evidence.
+
 ### Ranked full-text (BM25): `"workload": "fulltext"` (#339)
 
 Redis `FT.SEARCH` vs OpenSearch `multi_match` over a dataset's `text` fields,

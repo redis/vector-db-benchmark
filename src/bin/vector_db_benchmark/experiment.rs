@@ -222,12 +222,31 @@ pub fn run(args: &Args) -> Result<(), String> {
             .flatten()
             .map(|sp| sp.workload)
             .collect();
-        let plan = vector_db_benchmark::workload::plan(
+        vector_db_benchmark::workload::check_search_id_filters(
+            &args.search_ids,
+            !args.parallels.is_empty(),
+            !args.ef_runtime.is_empty(),
+        )?;
+        vector_db_benchmark::workload::select_search_ids(
+            &(0..declared.len()).collect::<Vec<_>>(),
+            &args.search_ids,
+        )?;
+        let mut plan = vector_db_benchmark::workload::plan(
             config.engine.as_deref().unwrap_or("unknown"),
             &declared,
             args.skip_vector_index,
         )
         .map_err(|e| format!("config '{name}': {e}"))?;
+        vector_db_benchmark::fulltext::apply_layout(
+            &mut plan,
+            config
+                .search_params
+                .iter()
+                .flatten()
+                .filter(|sp| sp.workload == Some(Workload::Fulltext))
+                .map(|sp| sp.knob("fulltext")),
+        )?;
+        vector_db_benchmark::workload::check_search_id_workloads(&args.search_ids, &plan)?;
         let calibration_declared: Vec<bool> = config
             .search_params
             .iter()
@@ -322,6 +341,12 @@ pub fn run(args: &Args) -> Result<(), String> {
         let cli_target_qps = (args.target_qps > 0.0).then_some(args.target_qps);
         let cli_duration = (args.search_duration > 0.0).then_some(args.search_duration);
         for (i, sp) in config.search_params.iter().flatten().enumerate() {
+            if plan.workload(i)? == Workload::Fulltext {
+                vector_db_benchmark::fulltext::check_execution_params(
+                    sp.target_qps.or(cli_target_qps),
+                    sp.duration_seconds.or(cli_duration),
+                )?;
+            }
             if plan.workload(i)? == Workload::Hybrid {
                 vector_db_benchmark::hybrid::check_params(
                     sp.top,
@@ -695,6 +720,7 @@ pub(crate) fn invocation_provenance(args: &Args) -> serde_json::Value {
         // and both are recorded by hand for that reason. Widening the guard past
         // booleans is #274.
         "repetitions": args.repetitions,
+        "search_ids": args.search_ids,
         "warmup_seconds": args.warmup_seconds,
         // Which directory the sweep globbed its configurations from, and where
         // the artifacts landed. `project_root()` resolves both from the process
@@ -1431,6 +1457,22 @@ fn run_single_experiment(
         dataset.config.schema.as_ref(),
         &dataset.config.name,
     )?;
+    if !args.skip_upload
+        && engine.search_params().iter().any(|sp| {
+            sp.knob("fulltext")
+                .is_some_and(|b| !b["compound"].is_null())
+        })
+    {
+        vector_db_benchmark::fulltext::check_compound_before_connecting(
+            &dataset.get_path()?,
+            engine
+                .search_params()
+                .iter()
+                .filter(|sp| sp.workload == Some(Workload::Fulltext))
+                .map(|sp| sp.knob("fulltext")),
+            dataset.config.schema.as_ref(),
+        )?;
+    }
     if vector_db_benchmark::fulltext::mixes_with_filtered_workloads(&plan.workloads) {
         let text_fields =
             vector_db_benchmark::fulltext::schema_text_fields(dataset.config.schema.as_ref());
@@ -1658,7 +1700,7 @@ fn run_single_experiment(
     // just as much to a hard search failure, and matters more now that a
     // short-staffed worker pool is one of them (#214).
     let mut fatal_search_error: Option<String> = None;
-    let skip_vector_index = no_vector_layout;
+    let skip_vector_index = no_vector_layout && !plan.workloads.contains(&Workload::Fulltext);
 
     if !args.skip_search {
         // --skip-vector-index + no query conditions = nothing to search for
@@ -1734,6 +1776,18 @@ fn run_single_experiment(
         } else {
             all_search_params.into_iter().enumerate().collect()
         };
+
+        let selected = vector_db_benchmark::workload::select_search_ids(
+            &effective_search_params
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            &args.search_ids,
+        )?;
+        let effective_search_params: Vec<_> = effective_search_params
+            .into_iter()
+            .filter(|(id, _)| selected.contains(id))
+            .collect();
 
         'search_phase: for phase in &search_phases {
             // --skip-vector-index: skip mixed phases (no vector updates to benchmark)
@@ -2717,7 +2771,19 @@ fn write_query_dumps(
             } else {
                 None
             };
-            let shape = |q: usize| filter_set.as_ref().and_then(|s| s.shape(q));
+            let shape = |q: usize| {
+                filter_set.as_ref().and_then(|s| s.shape(q)).or_else(|| {
+                    results
+                        .fulltext
+                        .as_ref()?
+                        .get("compound")?
+                        .get("queries")?
+                        .get(q)?
+                        .get("family")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+            };
             dump::resolve_records(&raw, &ids, gt, results.top, &shape)?
         };
         let header = dump::DumpHeader {
@@ -2731,6 +2797,7 @@ fn write_query_dumps(
             search_id: *search_id,
             id_space: ids.space(),
             index_layout: results.index_layout.map(|l| l.as_str().to_string()),
+            compound_identity: dump::CompoundIdentity::from_metadata(results.fulltext.as_ref())?,
         };
         let path = dir.join(dump::dump_file_name(&header));
         let file = fs::OpenOptions::new()
@@ -3796,6 +3863,7 @@ mod tests {
                 "configurations_dir",
                 "results_dir",
                 "upload_reader",
+                "search_ids",
             ] {
                 assert!(
                     recorded.contains_key(required),
@@ -3814,6 +3882,7 @@ mod tests {
                 "dump_results",
                 // #342: `--upload-reader` (an enum flag).
                 "upload_reader",
+                "search_ids",
             ];
             let fabricated: Vec<&String> = recorded
                 .keys()

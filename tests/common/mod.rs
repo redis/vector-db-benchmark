@@ -4329,3 +4329,217 @@ pub fn run_binary_text(
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
 }
+
+/// Compound fixture: expected membership is hand-written, independent of both
+/// translators and the library evaluator. Each omitted/inverted clause changes
+/// at least one result. Missing fields and empty matches are deliberate.
+pub fn compound_queries() -> serde_json::Value {
+    use serde_json::json;
+    let t = |f: &str, w: &str| json!({f:{"match":{"text":w}}});
+    let tag = |s: &str| json!({"category":{"match":{"value":s}}});
+    let range = |lo: i64, hi: i64| json!({"doc_len":{"range":{"gte":lo,"lt":hi}}});
+    let cases = vec![
+        (
+            "intersection",
+            json!({"and":[t("title","apple"),t("segment","trees")]}),
+            vec!["d0"],
+        ),
+        (
+            "tag-text",
+            json!({"and":[tag("X"),t("segment","apple")]}),
+            vec!["d1"],
+        ),
+        (
+            "exclusion",
+            json!({"and":[t("segment","apple"),{"not":t("title","apple")}]}),
+            vec!["d1"],
+        ),
+        (
+            "tag-range",
+            json!({"and":[tag("X"),range(0,1)]}),
+            vec!["d0"],
+        ),
+        (
+            "range-union",
+            json!({"or":[range(0,2),range(5,7)]}),
+            vec!["d0", "d1", "d5", "d6"],
+        ),
+        (
+            "text-tag-range",
+            json!({"and":[t("segment","trees"),tag("X"),range(1,2)]}),
+            vec!["d1"],
+        ),
+        ("escaping", tag("A|B {C}"), vec!["d2"]),
+        ("case", tag("x"), vec!["d3"]),
+        (
+            "missing",
+            json!({"not":{"doc_len":{"range":{"gte":0}}}}),
+            vec!["d7"],
+        ),
+        (
+            "empty",
+            json!({"and":[t("title","apple"),tag("x")]}),
+            vec![],
+        ),
+        (
+            "precedence",
+            json!({"and":[{"or":[tag("X"),tag("x")]},{"not":range(1,4)}]}),
+            vec!["d0"],
+        ),
+    ];
+    json!(cases.into_iter().map(|(name,conditions,ids)|json!({"name":name,"family":name,"conditions":conditions,"expected_count":ids.len(),"ids":ids})).collect::<Vec<_>>())
+}
+
+pub fn compound_search_params() -> serde_json::Value {
+    let mut queries = compound_queries();
+    for q in queries.as_array_mut().unwrap() {
+        q.as_object_mut().unwrap().remove("ids");
+    }
+    let point = serde_json::json!({"parallel":1,"top":10,"workload":"fulltext","fulltext":{
+        "analysis":"parity","fields":{"title":1.0,"segment":1.0},"compound":{"queries":queries}
+    }});
+    serde_json::json!([point, point])
+}
+
+pub fn write_compound_project(configs: &str) -> MatchAnyProject {
+    let proj = write_bm25_project(configs);
+    let path = proj
+        .root
+        .join("datasets")
+        .join(BM25_DATASET)
+        .join("payloads.jsonl");
+    let payloads = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["category"] = serde_json::json!(match i {
+                0 | 1 => "X",
+                2 => "A|B {C}",
+                3 => "x",
+                _ => "Z",
+            });
+            if i != 7 {
+                v["doc_len"] = serde_json::json!(i);
+            }
+            v.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, payloads).unwrap();
+    let path = proj.root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    registry[0]["schema"]["category"] = serde_json::json!("keyword");
+    registry[0]["schema"]["doc_len"] = serde_json::json!("int");
+    fs::write(path, registry.to_string()).unwrap();
+    proj
+}
+
+pub fn assert_compound_run(root: &Path, dump: &Path) {
+    let files = fs::read_dir(dump)
+        .unwrap()
+        .map(|p| p.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 1);
+    let records = fs::read_to_string(&files[0]).unwrap();
+    let expected = compound_queries();
+    let mut seen = std::collections::HashSet::new();
+    for line in records.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        if row["kind"] == "header" {
+            assert_eq!(row["search_id"], 1);
+            continue;
+        }
+        if row["kind"] != "query" {
+            continue;
+        }
+        let id = row["query_id"].as_u64().unwrap() as usize;
+        let want = &expected[id];
+        assert_eq!(row["total"], want["expected_count"], "{row}");
+        assert_eq!(row["shape"], want["family"], "{row}");
+        let mut got = row["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let mut ids = want["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>();
+        got.sort_unstable();
+        ids.sort_unstable();
+        assert_eq!(got, ids, "query {id}");
+        seen.insert(id);
+    }
+    assert_eq!(seen.len(), expected.as_array().unwrap().len());
+    let result = fs::read_dir(root.join("results"))
+        .unwrap()
+        .map(|p| p.unwrap().path())
+        .find(|p| p.to_string_lossy().contains("-search-"))
+        .unwrap();
+    let result: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(result).unwrap()).unwrap();
+    let compound = &result["params"]["fulltext"]["compound"];
+    assert_eq!(compound["sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(compound["queries"].as_array().unwrap().len(), seen.len());
+}
+
+/// English stemming can remove the literal-positive seed of an exclusion.
+pub fn compound_inflection_params() -> serde_json::Value {
+    serde_json::json!([{"parallel":1,"top":10,"workload":"fulltext","fulltext":{
+        "analysis":"english","no_vector_index":true,"fields":{"title":1.0,"segment":1.0},
+        "compound":{"queries":[{"name":"stem-exclusion","family":"text-exclusion","conditions":{"and":[
+            {"category":{"match":{"value":"X"}}},{"not":{"title":{"match":{"text":"apple"}}}}
+        ]},"expected_count":1}]}
+    }}])
+}
+
+pub fn write_compound_inflection_project(configs: &str) -> MatchAnyProject {
+    let project = write_compound_project(configs);
+    let path = project
+        .root
+        .join("datasets")
+        .join(BM25_DATASET)
+        .join("payloads.jsonl");
+    let rows = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+            if i == 0 {
+                v["title"] = serde_json::json!("Apples orchard guide");
+            }
+            v.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, rows).unwrap();
+    project
+}
+
+/// The prepared filter workload references only category. Compound reuse must
+/// still validate every declared scalar field, including ones absent here.
+pub fn compound_add_missing_scalar(root: &Path) {
+    fs::write(
+        root.join("datasets")
+            .join(BM25_DATASET)
+            .join("filter_queries.jsonl"),
+        serde_json::json!({
+            "query_id":"tag","shape":"tag_eq","corpus_size":8,"expected_count":2,
+            "conditions":{"and":[{"category":{"match":{"value":"X"}}}]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let path = root.join("datasets/datasets.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    registry[0]["schema"]["compound_extra"] = serde_json::json!("keyword");
+    fs::write(path, registry.to_string()).unwrap();
+}

@@ -121,14 +121,16 @@ impl OpenSearchEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        if self.config.skip_vector_index {
-            return Err(
-                "fulltext search requested on a no-vector (filter-only) index; fulltext needs \
-                 the vector layout's text fields"
-                    .into(),
-            );
-        }
         let spec = fulltext::parse_spec(params.knob(fulltext::SPEC_KEY))?;
+        if self.config.skip_vector_index || spec.compound.is_some() {
+            let (properties, index) = self.realized_schema("compound fulltext")?;
+            let validate = if self.config.skip_vector_index {
+                vector_db_benchmark::filter_only::validate_opensearch_schema
+            } else {
+                vector_db_benchmark::filter_only::validate_opensearch_full_schema
+            };
+            validate(&properties, &index, dataset.config.schema.as_ref())?;
+        }
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
@@ -142,8 +144,8 @@ impl OpenSearchEngine {
             &fulltext::schema_text_fields(dataset.config.schema.as_ref()),
         )?;
 
-        let texts = fulltext::read_query_texts(&dataset.get_path()?)?;
-        let set = fulltext::build_query_set(&texts)?;
+        let set =
+            fulltext::load_query_set(&dataset.get_path()?, &spec, dataset.config.schema.as_ref())?;
         if !set.skipped.is_empty() {
             eprintln!(
                 "\tfulltext: {} of {} queries have no searchable term and are skipped",
@@ -160,7 +162,7 @@ impl OpenSearchEngine {
             .queries
             .iter()
             .map(|q| {
-                serde_json::value::to_raw_value(&fulltext::opensearch_body(&fields, &q.terms, top))
+                serde_json::value::to_raw_value(&fulltext::query_opensearch(&fields, q, top))
                     .map_err(|e| e.to_string())
             })
             .collect::<Result<_, _>>()?;
@@ -217,7 +219,10 @@ impl OpenSearchEngine {
                         let reply = knn_send(&rt, &client, index_name, &bodies[i], policy);
                         let elapsed = start.elapsed();
                         match reply.and_then(|(body, cost)| {
-                            fulltext::opensearch_ranked_page(&body, top, capture).map(|p| (p, cost))
+                            fulltext::opensearch_ranked_page(&body, top, capture).and_then(|p| {
+                                fulltext::check_query_count(&queries[i], p.total)?;
+                                Ok((p, cost))
+                            })
                         }) {
                             Ok((page, cost)) => {
                                 // Bill only the attempt that produced the result
@@ -237,8 +242,13 @@ impl OpenSearchEngine {
                                         })
                                         .collect::<Result<Vec<_>, _>>();
                                     match rows {
-                                        Ok(rows) => cap
-                                            .push(RawQueryResult::ok(query_id, seq, rows, None, t)),
+                                        Ok(rows) => cap.push(RawQueryResult::ok(
+                                            query_id,
+                                            seq,
+                                            rows,
+                                            queries[i].compound.as_ref().and(page.total),
+                                            t,
+                                        )),
                                         Err(e) => {
                                             capture_error = Some(e);
                                             break;
@@ -280,6 +290,9 @@ impl OpenSearchEngine {
             Ok(start)
         })?;
         let total_time = measured_start.elapsed().as_secs_f64();
+        if spec.compound.is_some() && !errors.is_empty() {
+            return Err(format!("compound suite failed: {}", errors.join("; ")));
+        }
         pb.finish_and_clear();
         for e in errors.iter().take(3) {
             eprintln!("{e}");

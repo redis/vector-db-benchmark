@@ -204,6 +204,11 @@ pub const PARITY_REMOVES: [&str; 3] = [KD_WHITESPACE_TOKENS, KD_STEM_TWICE, KD_M
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FulltextSpec {
+    /// Explicit schema-only layout, preserving text fields.
+    #[serde(default)]
+    pub no_vector_index: bool,
+    #[serde(default)]
+    pub compound: Option<crate::compound_text::Spec>,
     #[serde(default)]
     pub fields: Option<BTreeMap<String, f64>>,
     /// OpenSearch only: accept an index with more than one shard (per-shard
@@ -598,6 +603,18 @@ pub fn validate_declared(
     }
 }
 
+/// The fulltext harness schedules a declared number of requests. Refuse time
+/// and offered-rate knobs it does not implement rather than mislabel a run.
+pub fn check_execution_params(
+    target_qps: Option<f64>,
+    duration_seconds: Option<f64>,
+) -> Result<(), String> {
+    if target_qps.is_some_and(|v| v != 0.0) || duration_seconds.is_some_and(|v| v != 0.0) {
+        return Err("fulltext supports query-count scheduling only; use --queries, not target-qps/search-duration".into());
+    }
+    Ok(())
+}
+
 /// Every field a query's `conditions` filter on, whatever the condition type
 /// (`match.text`, `match.value`, `match.any`, `range`, `geo`, …), through any
 /// nesting of `and` / `or` groups. An entry carrying `and` / `or` is a group;
@@ -664,8 +681,29 @@ pub fn check_fields_before_connecting<'a>(
     dataset: &str,
 ) -> Result<(), String> {
     for (i, block) in blocks {
-        resolve_fields(&parse_spec(block)?, schema)
+        let spec = parse_spec(block)?;
+        if let Some(compound) = &spec.compound {
+            if compound.queries.is_some() {
+                compound.load(Path::new("."), schema.ok_or("compound needs schema")?)?;
+            }
+        }
+        resolve_fields(&spec, schema)
             .map_err(|e| format!("search config #{i} (fulltext) on dataset '{dataset}': {e}"))?;
+    }
+    Ok(())
+}
+
+/// Validate/generate every compound request before engine creation/upload.
+pub fn check_compound_before_connecting<'a>(
+    dir: &Path,
+    blocks: impl Iterator<Item = Option<&'a Value>>,
+    schema: Option<&Value>,
+) -> Result<(), String> {
+    for block in blocks {
+        let spec = parse_spec(block)?;
+        if spec.compound.is_some() {
+            load_query_set(dir, &spec, schema)?;
+        }
     }
     Ok(())
 }
@@ -725,6 +763,16 @@ pub fn parse_spec(block: Option<&Value>) -> Result<FulltextSpec, String> {
                     "`{SPEC_KEY}.fields.{name}` boost must be a finite number > 0, got {boost}"
                 ));
             }
+        }
+    }
+    if let Some(compound) = &spec.compound {
+        compound.validate()?;
+        if spec
+            .fields
+            .as_ref()
+            .is_none_or(|f| f.values().any(|b| *b != 1.0))
+        {
+            return Err("compound matching requires explicit text fields with unit boosts".into());
         }
     }
     Ok(spec)
@@ -864,6 +912,8 @@ pub fn query_terms(text: &str) -> Vec<String> {
 /// One runnable query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextQuery {
+    pub compound: Option<crate::compound_text::Query>,
+    pub expression: Option<crate::compound_text::Expr>,
     /// Line of `tests.jsonl` (the dataset query index).
     pub query_id: usize,
     pub terms: Vec<String>,
@@ -873,10 +923,97 @@ pub struct TextQuery {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuerySet {
     pub queries: Vec<TextQuery>,
+    /// SHA-256 of the sealed PREPARED.json; absent for unprepared tiny fixtures.
+    pub preparation_sha256: Option<String>,
     /// Query ids with no term left after [`query_terms`]; skipped on both engines.
     pub skipped: Vec<usize>,
     /// Lines in `tests.jsonl`.
     pub total: usize,
+}
+
+/// Resolve the explicitly named compound suite independently of ranked BM25.
+pub fn load_query_set(
+    dir: &Path,
+    spec: &FulltextSpec,
+    schema: Option<&Value>,
+) -> Result<QuerySet, String> {
+    let Some(compound) = &spec.compound else {
+        return build_query_set(&read_query_texts(dir)?);
+    };
+    let schema = schema.ok_or("compound suite needs a schema")?;
+    let fields = resolve_fields(spec, Some(schema))?;
+    let queries = compound
+        .load(dir, schema)?
+        .into_iter()
+        .enumerate()
+        .map(|(query_id, mut q)| {
+            // The literal classifier proves an exclusion only without stemming.
+            // English may stem the excluded title term into an existing token.
+            if compound.suite.as_deref() == Some("msmarco-v1")
+                && spec.analysis == Analysis::English
+                && q.family == "text-exclusion"
+            {
+                q.minimum_count = 0;
+            }
+            let expression = crate::compound_text::Expr::compile(&q.conditions, schema)?;
+            let mut used = HashSet::new();
+            expression.text_fields(&mut used);
+            if used.iter().any(|f| !fields.iter().any(|b| &b.field == f)) {
+                return Err(
+                    "compound query references text outside the declared indexed fields".into(),
+                );
+            }
+            Ok(TextQuery {
+                query_id,
+                terms: vec![],
+                compound: Some(q),
+                expression: Some(expression),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let preparation_sha256 = match std::fs::read(dir.join("PREPARED.json")) {
+        Ok(bytes) => {
+            use sha2::{Digest, Sha256};
+            Some(
+                Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            )
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && compound.suite.is_none() => None,
+        Err(e) => return Err(format!("compound preparation identity: {e}")),
+    };
+    Ok(QuerySet {
+        total: queries.len(),
+        queries,
+        skipped: vec![],
+        preparation_sha256,
+    })
+}
+
+pub fn query_redis(fields: &[FieldBoost], q: &TextQuery) -> String {
+    q.expression
+        .as_ref()
+        .map(|e| e.redis())
+        .unwrap_or_else(|| redis_query(fields, &q.terms))
+}
+pub fn query_opensearch(fields: &[FieldBoost], q: &TextQuery, top: usize) -> Value {
+    match &q.expression {
+        Some(e) => {
+            json!({"size":top,"_source":false,"track_total_hits":true,"query":e.opensearch()})
+        }
+        None => opensearch_body(fields, &q.terms, top),
+    }
+}
+pub fn check_query_count(q: &TextQuery, total: Option<u64>) -> Result<(), String> {
+    if let Some(c) = &q.compound {
+        crate::compound_text::check_count(
+            c,
+            total.ok_or("compound query requires an exact total")?,
+        )?;
+    }
+    Ok(())
 }
 
 /// Build the query set from per-line query texts. No runnable query is an
@@ -889,7 +1026,12 @@ pub fn build_query_set(texts: &[String]) -> Result<QuerySet, String> {
         if terms.is_empty() {
             skipped.push(query_id);
         } else {
-            queries.push(TextQuery { query_id, terms });
+            queries.push(TextQuery {
+                query_id,
+                terms,
+                compound: None,
+                expression: None,
+            });
         }
     }
     if queries.is_empty() {
@@ -902,6 +1044,7 @@ pub fn build_query_set(texts: &[String]) -> Result<QuerySet, String> {
         queries,
         skipped,
         total: texts.len(),
+        preparation_sha256: None,
     })
 }
 
@@ -1486,6 +1629,7 @@ pub type RankedHits = Vec<(String, f64)>;
 /// non-capturing run builds no id strings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankedPage {
+    pub total: Option<u64>,
     pub returned: usize,
     pub hits: Option<RankedHits>,
 }
@@ -1557,6 +1701,7 @@ pub fn redis_ranked_page(
         }
     }
     Ok(RankedPage {
+        total: Some(total as u64),
         returned: results.len(),
         hits,
     })
@@ -1598,7 +1743,14 @@ pub fn opensearch_ranked_page(
             out.push((id.to_string(), score));
         }
     }
+    let total = (body["hits"]["total"]["relation"] == "eq")
+        .then(|| body["hits"]["total"]["value"].as_u64())
+        .flatten();
+    if total.is_some_and(|n| results.len() != (n as usize).min(top)) {
+        return Err("fulltext: incomplete exact-total OpenSearch page".into());
+    }
     Ok(RankedPage {
+        total,
         returned: results.len(),
         hits,
     })
@@ -1692,6 +1844,28 @@ pub fn result_metadata_for(
     recorded_marker: &Value,
 ) -> Result<Value, String> {
     let mut m = result_metadata_english(engine, fields, set, top)?;
+    if set.queries.iter().any(|q| q.compound.is_some()) {
+        use sha2::{Digest, Sha256};
+        let queries: Vec<_> = set
+            .queries
+            .iter()
+            .filter_map(|q| q.compound.as_ref())
+            .collect();
+        let bytes = serde_json::to_vec(&serde_json::to_value(&queries).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        m["compound"] = json!({"version":1,"queries":queries,"sha256":Sha256::digest(bytes).iter().map(|b|format!("{b:02x}")).collect::<String>(),
+            "preparation_sha256":set.preparation_sha256,"exact_counts":true,"ordering":"engine score descending; ties unspecified; cross-engine ranks are not relevance truth"});
+        m["query_source"] = json!("explicit compound suite; query_id indexes compound.queries");
+        m["operator"] = json!("explicit Boolean AST");
+        m["boosts_applied"] = json!("unit boosts; no field reweighting");
+        m["query_terms"] = json!({"method":"one validated field-scoped ASCII term per text leaf; exact Boolean AST retained"});
+        m["engine_settings"]["query"] =
+            json!("explicit Boolean AST; engine translation recorded by compound.queries");
+        if engine == "opensearch" {
+            m["engine_settings"]["request"]["track_total_hits"] = json!(true);
+        }
+    }
+
     m["analysis"] = json!(profile.analysis.as_str());
     m["normalize_whitespace"] = json!(profile.normalizes_whitespace());
     m["index_marker"] = recorded_marker.clone();
@@ -1766,8 +1940,127 @@ fn result_metadata_english(
     }))
 }
 
+/// Opt-in text/scalar layout. Existing ranked profiles retain their layout.
+/// No-vector declarations must agree across every fulltext search point and
+/// can never coexist with KNN. Compound tags use the exact scalar contract.
+pub fn apply_layout<'a>(
+    plan: &mut crate::workload::WorkloadPlan,
+    blocks: impl Iterator<Item = Option<&'a Value>>,
+) -> Result<(), String> {
+    use crate::workload::{IndexLayout, Workload};
+    let specs = blocks.map(parse_spec).collect::<Result<Vec<_>, _>>()?;
+    let no_vector = specs.iter().any(|s| s.no_vector_index);
+    let compound = specs.iter().any(|s| s.compound.is_some());
+    if no_vector {
+        if specs.iter().any(|s| !s.no_vector_index)
+            || plan.workloads.iter().any(|w| w.has_ground_truth())
+        {
+            return Err(
+                "no_vector_index must agree across fulltext configs and cannot serve KNN".into(),
+            );
+        }
+        plan.layout = IndexLayout::NoVector;
+    } else if compound {
+        if plan
+            .workloads
+            .iter()
+            .any(|w| matches!(w, Workload::Vector | Workload::Hybrid))
+        {
+            return Err("compound matching requires a dedicated text/scalar engine config".into());
+        }
+        plan.layout = IndexLayout::Full;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compound_fingerprints_bind_queries_counts_and_preparation_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PREPARED.json"), "{}").unwrap();
+        let schema = json!({"title":"text"});
+        let block = json!({"analysis":"parity","fields":{"title":1.0},"compound":{"queries":[{"name":"q","family":"f","conditions":{"title":{"match":{"text":"apple"}}},"minimum_count":1}]}});
+        let metadata = |block: &Value| {
+            let spec = parse_spec(Some(block)).unwrap();
+            let set = load_query_set(dir.path(), &spec, Some(&schema)).unwrap();
+            let fields = resolve_fields(&spec, Some(&schema)).unwrap();
+            let profile = IndexProfile {
+                analysis: Analysis::Parity,
+                text_fields: ["title".into()].into(),
+            };
+            result_metadata_for("redis", &fields, &set, 10, &profile, &profile.marker()).unwrap()
+        };
+        let original = metadata(&block);
+        assert_eq!(original, metadata(&block));
+        for (field, value) in [
+            ("minimum_count", json!(2)),
+            ("expected_count", json!(2)),
+            ("conditions", json!({"title":{"match":{"text":"orange"}}})),
+        ] {
+            let mut changed = block.clone();
+            changed["compound"]["queries"][0][field] = value;
+            assert_ne!(
+                original["compound"]["sha256"],
+                metadata(&changed)["compound"]["sha256"]
+            );
+        }
+        std::fs::write(dir.path().join("PREPARED.json"), "{}\n").unwrap();
+        let changed = metadata(&block);
+        assert_eq!(
+            original["compound"]["sha256"],
+            changed["compound"]["sha256"]
+        );
+        assert_ne!(
+            original["compound"]["preparation_sha256"],
+            changed["compound"]["preparation_sha256"]
+        );
+    }
+
+    #[test]
+    fn compound_cannot_silently_ignore_duration_or_offered_rate() {
+        assert!(check_execution_params(None, None).is_ok());
+        assert!(check_execution_params(Some(100.0), None).is_err());
+        assert!(check_execution_params(None, Some(60.0)).is_err());
+    }
+    #[test]
+    fn compound_layout_is_explicit_and_refuses_knn_or_conflicting_search_points() {
+        use crate::workload::{self, IndexLayout, Workload};
+        let block = json!({"fields":{"title":1.0,"segment":1.0},"compound":{"suite":"msmarco-v1"},"no_vector_index":true});
+        let mut plan = workload::plan("redis", &[Some(Workload::Fulltext)], false).unwrap();
+        apply_layout(&mut plan, [Some(&block)].into_iter()).unwrap();
+        assert_eq!(plan.layout, IndexLayout::NoVector);
+        let mut full = block.clone();
+        full["no_vector_index"] = json!(false);
+        apply_layout(&mut plan, [Some(&full)].into_iter()).unwrap();
+        assert_eq!(plan.layout, IndexLayout::Full);
+        assert!(apply_layout(&mut plan, [Some(&block), Some(&full)].into_iter()).is_err());
+        let mut plan = workload::plan(
+            "opensearch",
+            &[Some(Workload::Fulltext), Some(Workload::Vector)],
+            false,
+        )
+        .unwrap();
+        assert!(apply_layout(&mut plan, [Some(&block)].into_iter()).is_err());
+        assert!(apply_layout(&mut plan, [Some(&full)].into_iter()).is_err());
+    }
+    #[test]
+    fn compound_preflight_rejects_wrong_field_type_and_unindexed_text() {
+        let schema = json!({"title":"text","segment":"text","category":"keyword"});
+        let block = json!({"fields":{"title":1.0},"compound":{"queries":[{"name":"q","family":"f","conditions":{"category":{"match":{"text":"apple"}}}}]}});
+        assert!(check_fields_before_connecting(
+            [(0, Some(&block))].into_iter(),
+            Some(&schema),
+            "fixture"
+        )
+        .is_err());
+        let mut wrong = block.clone();
+        wrong["compound"]["queries"][0]["conditions"] =
+            json!({"segment":{"match":{"text":"apple"}}});
+        let spec = parse_spec(Some(&wrong)).unwrap();
+        assert!(load_query_set(Path::new("."), &spec, Some(&schema)).is_err());
+    }
+
     use super::*;
 
     /// The list both engines are pinned to, written out from the two sources

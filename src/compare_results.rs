@@ -243,6 +243,11 @@ pub fn compare_pair(
     let (rf, rd) = reference;
     let (cf, cd) = candidate;
     let (rh, ch) = (&rd.header, &cd.header);
+    if rh.compound_identity != ch.compound_identity {
+        return Err(format!(
+            "{rf} and {cf} have different compound query/preparation fingerprints"
+        ));
+    }
     if rh.dataset != ch.dataset {
         return Err(format!(
             "{rf} and {cf} are different datasets ({} vs {})",
@@ -390,7 +395,11 @@ fn shape_report(
             }
         }
     }
-    let count_agreement = (!workload.is_ranked()).then(|| {
+    let count_agreement = (!workload.is_ranked()
+        || qs
+            .iter()
+            .any(|(r, c)| r.total.is_some() && c.total.is_some()))
+    .then(|| {
         let mut exact = 0;
         let mut max_diff = 0u64;
         let mut complete = 0;
@@ -443,7 +452,7 @@ fn names(d: &Dump, engine: &str) -> bool {
     d.header.engine == engine || d.header.config == engine
 }
 
-type PairKey = (String, Workload, usize, usize, String);
+type PairKey = (String, Workload, usize, usize, String, Option<usize>);
 
 fn key(d: &Dump) -> PairKey {
     let space = match &d.header.id_space {
@@ -456,6 +465,10 @@ fn key(d: &Dump) -> PairKey {
         d.header.parallel,
         d.header.top,
         space,
+        d.header
+            .compound_identity
+            .as_ref()
+            .map(|_| d.header.search_id),
     )
 }
 
@@ -673,6 +686,7 @@ mod tests {
                 search_id: 0,
                 id_space: IdSpace::Row,
                 index_layout: None,
+                compound_identity: None,
             },
             records,
         }
@@ -834,6 +848,27 @@ mod tests {
     }
 
     #[test]
+    fn compound_ranked_results_also_report_exact_count_agreement() {
+        let mut a = dump(
+            "opensearch",
+            Workload::Fulltext,
+            1,
+            vec![rec(0, &["a"], Some(2), true)],
+        );
+        a.records[0].expected = None;
+        let mut b = a.clone();
+        b.header.engine = "redis".into();
+        b.records[0].total = Some(3);
+        let report = compare(&[("a".into(), a)], &[("b".into(), b)], "opensearch").unwrap();
+        let shape = one(&report);
+        assert_eq!(shape.overlap_at_k, Some(1.0));
+        let counts = shape.count_agreement.as_ref().unwrap();
+        assert_eq!(counts.queries, 1);
+        assert_eq!(counts.exact_matches, 0);
+        assert_eq!(counts.max_abs_diff, 1);
+    }
+
+    #[test]
     fn filter_only_reports_count_agreement_not_rank() {
         let a = dump(
             "opensearch",
@@ -937,6 +972,60 @@ mod tests {
         old.as_object_mut().unwrap().remove("index_layout");
         let parsed: DumpHeader = serde_json::from_value(old).unwrap();
         assert_eq!(parsed.index_layout, None);
+    }
+
+    #[test]
+    fn compound_fingerprints_must_match_on_both_sides() {
+        use crate::results_dump::CompoundIdentity;
+        let mut a = vector_dump("opensearch");
+        let mut b = vector_dump("redis");
+        let identity = CompoundIdentity {
+            analysis: "parity".into(),
+            query_sha256: "a".repeat(64),
+            preparation_sha256: Some("b".repeat(64)),
+        };
+        a.header.compound_identity = Some(identity.clone());
+        assert!(compare_pair(("a", &a), ("b", &b))
+            .unwrap_err()
+            .contains("fingerprints"));
+        b.header.compound_identity = Some(identity.clone());
+        assert!(compare_pair(("a", &a), ("b", &b)).is_ok());
+        b.header.compound_identity.as_mut().unwrap().query_sha256 = "c".repeat(64);
+        assert!(compare_pair(("a", &a), ("b", &b)).is_err());
+        b.header.compound_identity = Some(identity.clone());
+        b.header.compound_identity.as_mut().unwrap().analysis = "english".into();
+        assert!(compare_pair(("a", &a), ("b", &b)).is_err());
+        // Separate families at the same concurrency must pair by stable search ID.
+        let mut a2 = a.clone();
+        a2.header.search_id = 1;
+        let mut b2 = b.clone();
+        b2.header.search_id = 1;
+        b.header.compound_identity = Some(identity.clone());
+        b2.header.compound_identity = Some(identity.clone());
+        assert_eq!(
+            compare(
+                &[("a".into(), a.clone()), ("a2".into(), a2)],
+                &[("b".into(), b.clone()), ("b2".into(), b2)],
+                "opensearch"
+            )
+            .unwrap()
+            .pairs
+            .len(),
+            2
+        );
+        b.header.compound_identity = Some(identity);
+        b.header
+            .compound_identity
+            .as_mut()
+            .unwrap()
+            .preparation_sha256 = Some("d".repeat(64));
+        assert!(compare_pair(("a", &a), ("b", &b)).is_err());
+        b.header
+            .compound_identity
+            .as_mut()
+            .unwrap()
+            .preparation_sha256 = None;
+        assert!(compare_pair(("a", &a), ("b", &b)).is_err());
     }
 
     #[test]

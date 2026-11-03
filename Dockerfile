@@ -64,6 +64,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     libhdf5-103-1 \
     ca-certificates \
+    time \
     && rm -rf /var/lib/apt/lists/* \
     && ldconfig
 

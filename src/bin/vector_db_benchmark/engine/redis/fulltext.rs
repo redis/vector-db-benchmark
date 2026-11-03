@@ -95,13 +95,6 @@ impl RedisEngine {
         params: &SearchParams,
         num_queries: i64,
     ) -> Result<SearchResults, String> {
-        if self.config.skip_vector_index {
-            return Err(
-                "fulltext search requested on a no-vector (filter-only) index; fulltext needs \
-                 the vector layout's TEXT fields"
-                    .into(),
-            );
-        }
         self.prepare_search(dataset)?;
         let spec = fulltext::parse_spec(params.knob(fulltext::SPEC_KEY))?;
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
@@ -137,6 +130,14 @@ impl RedisEngine {
                 Some(m) => serde_json::from_str(&m)
                     .map_err(|e| format!("fulltext: unreadable index marker {m:?}: {e}"))?,
             };
+            if self.config.skip_vector_index || spec.compound.is_some() {
+                let validate = if self.config.skip_vector_index {
+                    vector_db_benchmark::filter_only::validate_redis_schema
+                } else {
+                    vector_db_benchmark::filter_only::validate_redis_full_schema
+                };
+                validate(&redis_value_to_json(&info), dataset.config.schema.as_ref())?;
+            }
             fulltext::validate_redis_index_for(
                 &redis_value_to_json(&info),
                 &fields,
@@ -162,8 +163,8 @@ impl RedisEngine {
             (fulltext::check_redis_min_stem_len(value)?, marker)
         };
 
-        let texts = fulltext::read_query_texts(&dataset.get_path()?)?;
-        let set = fulltext::build_query_set(&texts)?;
+        let set =
+            fulltext::load_query_set(&dataset.get_path()?, &spec, dataset.config.schema.as_ref())?;
         if !set.skipped.is_empty() {
             eprintln!(
                 "\tfulltext: {} of {} queries have no searchable term and are skipped",
@@ -183,7 +184,7 @@ impl RedisEngine {
                 let mut cmd = redis::cmd("FT.SEARCH");
                 for a in fulltext::redis_args_for(
                     &self.config.index_name,
-                    &fulltext::redis_query(&fields, &q.terms),
+                    &fulltext::query_redis(&fields, q),
                     top,
                     query_timeout,
                     profile.analysis,
@@ -245,10 +246,11 @@ impl RedisEngine {
                         let reply = commands[i].query::<redis::Value>(&mut conn);
                         let elapsed = start.elapsed().as_secs_f64();
                         let query_id = queries[i].query_id;
-                        match reply
-                            .map_err(|e| e.to_string())
-                            .and_then(|v| fulltext::redis_ranked_page(&v, top, capture))
-                        {
+                        match reply.map_err(|e| e.to_string()).and_then(|v| {
+                            let p = fulltext::redis_ranked_page(&v, top, capture)?;
+                            fulltext::check_query_count(&queries[i], p.total)?;
+                            Ok(p)
+                        }) {
                             Ok(page) => {
                                 samples.push(elapsed);
                                 // `Some` only under capture: the plain timed
@@ -270,7 +272,11 @@ impl RedisEngine {
                                             .collect::<Result<Vec<_>, _>>();
                                     match rows {
                                         Ok(rows) => cap.push(RawQueryResult::ok(
-                                            query_id, seq, rows, None, elapsed,
+                                            query_id,
+                                            seq,
+                                            rows,
+                                            queries[i].compound.as_ref().and(page.total),
+                                            elapsed,
                                         )),
                                         Err(e) => {
                                             capture_error = Some(e);
@@ -307,6 +313,9 @@ impl RedisEngine {
             Ok(start)
         })?;
         let total_time = measured_start.elapsed().as_secs_f64();
+        if spec.compound.is_some() && !errors.is_empty() {
+            return Err(format!("compound suite failed: {}", errors.join("; ")));
+        }
         pb.finish_and_clear();
         for e in errors.iter().take(3) {
             eprintln!("{e}");

@@ -307,8 +307,10 @@ impl OpenSearchEngine {
         // filter-only maps only the fields its predicates reference (#340);
         // with `dynamic: false` below, every other payload field stays in
         // `_source`, unindexed. Without one the layout is the declared schema.
-        let narrowed = self.config.skip_vector_index && dataset.filter_query_file()?.is_some();
-        let schema = if self.config.skip_vector_index {
+        let narrowed = self.config.skip_vector_index
+            && self.fulltext_profile()?.is_none()
+            && dataset.filter_query_file()?.is_some();
+        let schema = if self.config.skip_vector_index && self.fulltext_profile()?.is_none() {
             dataset.filter_only_index_schema()?
         } else {
             dataset.config.schema.clone()
@@ -3490,6 +3492,9 @@ mod tests {
             // statistics are per shard) unless a config opts in; these
             // english/parity configs compare against Redis on one shard.
             ("opensearch-msmarco-fulltext.json", (1_i64, 2)),
+            // #389/#390: paired English/parity, with/without vector indexes.
+            // Single-shard baseline; orchestration records any explicit scale override.
+            ("msmarco-compound.json", (1_i64, 8)),
         ]);
 
         let dir = crate::config::project_root().join("experiments/configurations");
@@ -3601,6 +3606,7 @@ mod tests {
                 );
                 let mut grid: Vec<(i64, i64)> = raw
                     .iter()
+                    .filter(|c| c["engine"] == "opensearch")
                     .map(|c| {
                         let p = &c["collection_params"]["method"]["parameters"];
                         let m = p["m"]

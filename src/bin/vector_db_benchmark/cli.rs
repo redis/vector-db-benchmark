@@ -44,6 +44,11 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub parallels: Vec<i32>,
 
+    /// Run selected zero-based fulltext search config IDs, preserving their dump IDs.
+    /// Index layout and compatibility still come from the complete engine config.
+    #[arg(long, value_delimiter = ',')]
+    pub search_ids: Vec<usize>,
+
     /// Redis host
     #[arg(long, default_value = "localhost")]
     pub host: String,

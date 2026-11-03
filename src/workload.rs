@@ -340,11 +340,14 @@ pub fn ef_runtime_keeps(workload: Workload, ef: Option<i64>, ef_filter: &[i64]) 
 /// the shared `full` layout (filter-only + vector) and vector + fulltext /
 /// hybrid on the `vector` layout.
 ///
-/// The `no-vector` layout is exempt: it holds only filter-only, and the run
+/// Pure filter-only on the `no-vector` layout is exempt; the run
 /// keeps skipping its mixed phases as it always has (there are no vector
 /// updates to benchmark there).
 pub fn check_update_search_ratio(plan: &WorkloadPlan, has_ratio: bool) -> Result<(), String> {
-    if !has_ratio || plan.layout == IndexLayout::NoVector {
+    if !has_ratio
+        || (plan.layout == IndexLayout::NoVector
+            && plan.workloads.iter().all(|w| *w == Workload::FilterOnly))
+    {
         return Ok(());
     }
     match plan
@@ -526,8 +529,74 @@ pub fn verify_result_shape(workload: Workload, filter_only_stats: bool) -> Resul
     }
 }
 
+/// Keep search-ID selection unambiguous with the older grid filters.
+/// Search IDs currently select fulltext points only, whose grid is never
+/// collapsed by legacy filter-only deduplication.
+pub fn check_search_id_workloads(ids: &[usize], plan: &WorkloadPlan) -> Result<(), String> {
+    if !ids.is_empty() && !plan.workloads.iter().all(|w| *w == Workload::Fulltext) {
+        return Err("--search-ids requires a dedicated fulltext configuration".into());
+    }
+    Ok(())
+}
+
+pub fn check_search_id_filters(
+    ids: &[usize],
+    parallels: bool,
+    ef_runtime: bool,
+) -> Result<(), String> {
+    if !ids.is_empty() && (parallels || ef_runtime) {
+        return Err("--search-ids cannot combine with --parallels or --ef-runtime; select the exact configured IDs".into());
+    }
+    Ok(())
+}
+
+/// Select search points without renumbering their identities. Validate against
+/// the effective grid so a point removed by another selector cannot disappear
+/// silently. Empty selection preserves the entire configured grid.
+pub fn select_search_ids(available: &[usize], requested: &[usize]) -> Result<Vec<usize>, String> {
+    let mut unique = std::collections::HashSet::new();
+    for id in requested {
+        if !unique.insert(*id) {
+            return Err(format!("duplicate search id {id}"));
+        }
+        if !available.contains(id) {
+            return Err(format!(
+                "search id {id} is not in the effective search grid"
+            ));
+        }
+    }
+    Ok(available
+        .iter()
+        .copied()
+        .filter(|id| requested.is_empty() || unique.contains(id))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compound_search_selection_preserves_ids_and_refuses_missing_points() {
+        assert_eq!(select_search_ids(&[0, 2, 5], &[5, 2]).unwrap(), vec![2, 5]);
+        assert_eq!(select_search_ids(&[0, 2, 5], &[]).unwrap(), vec![0, 2, 5]);
+        assert!(select_search_ids(&[0, 2, 5], &[1]).is_err());
+        assert!(select_search_ids(&[0, 2, 5], &[2, 2]).is_err());
+        assert!(check_search_id_filters(&[2], true, false).is_err());
+        assert!(check_search_id_filters(&[2], false, true).is_err());
+        assert!(check_search_id_filters(&[2], false, false).is_ok());
+        let mut text = plan("redis", &[Some(Workload::Fulltext)], false).unwrap();
+        check_search_id_workloads(&[0], &text).unwrap();
+        text.layout = IndexLayout::NoVector;
+        assert!(check_update_search_ratio(&text, true).is_err());
+        for workloads in [
+            vec![Some(Workload::FilterOnly)],
+            vec![None, Some(Workload::Fulltext)],
+        ] {
+            let p = plan("redis", &workloads, false).unwrap();
+            assert!(check_search_id_workloads(&[0], &p).is_err());
+            check_search_id_workloads(&[], &p).unwrap();
+        }
+    }
+
     use super::*;
 
     #[test]
