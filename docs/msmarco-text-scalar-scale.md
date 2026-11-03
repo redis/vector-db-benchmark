@@ -50,8 +50,11 @@ never share an English corpus with a parity index. All compound queries use
 unit field boosts, Redis BM25STD / OpenSearch BM25 scoring, score-descending
 order with unspecified ties, top 10, exact totals, and IDs/scores only.
 OpenSearch tag/numeric leaves run in non-scoring `bool.filter` context, including
-inside mixed OR branches; only positive text contributes to BM25 scores. The
-`text-only-scalar-filter-v1` contract is recorded and hashed into query identity,
+inside mixed OR branches; on OpenSearch only positive text contributes to BM25
+scores. Redis retains native BM25STD, including native TAG/nontext iterator
+contributions that may be nonzero. This difference is emitted in
+`known_differences`; no identical score or ranking contract is claimed. The
+`native-engine-scoring-v1` contract is recorded and hashed into query identity,
 so earlier scoring-context diagnostic dumps cannot pair silently with these profiles.
 Unsupported predicates/types are refused, never silently discarded. Existing
 ranked BM25 profiles keep their original OR semantics.

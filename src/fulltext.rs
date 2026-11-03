@@ -1851,7 +1851,7 @@ pub fn result_metadata_for(
             .iter()
             .filter_map(|q| q.compound.as_ref())
             .collect();
-        let scoring_contract = "text-only-scalar-filter-v1";
+        let scoring_contract = "native-engine-scoring-v1";
         let bytes =
             serde_json::to_vec(&json!({"scoring_contract":scoring_contract,"queries":queries}))
                 .map_err(|e| e.to_string())?;
@@ -1867,6 +1867,9 @@ pub fn result_metadata_for(
             m["engine_settings"]["request"]["track_total_hits"] = json!(true);
             m["engine_settings"]["scalar_context"] =
                 json!("bool.filter; no scalar score contribution");
+        } else if engine == "redis" {
+            m["engine_settings"]["scalar_context"] =
+                json!("native BM25STD; TAG/nontext iterator contributions may be nonzero");
         }
     }
 
@@ -1875,6 +1878,11 @@ pub fn result_metadata_for(
     m["index_marker"] = recorded_marker.clone();
     m["index_marker_expected"] = profile.marker();
     m["known_differences"] = json!(known_differences(profile.analysis));
+    if set.queries.iter().any(|q| q.compound.is_some()) {
+        m["known_differences"].as_array_mut().unwrap().push(json!(
+            "Compound scoring is engine-native: Redis BM25STD can score TAG/nontext iterators; OpenSearch scalar bool.filter clauses contribute zero. Matching/counts are the contract; cross-engine scores/ranks are diagnostic."
+        ));
+    }
     if profile.analysis == Analysis::Parity {
         m["stemmer"] = json!("none on either engine (parity)");
         m["indexed_text_fields"] = json!(profile.text_fields);
@@ -2032,6 +2040,14 @@ mod tests {
         };
         let original = metadata(&block);
         assert_eq!(original, metadata(&block));
+        assert!(original["known_differences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v
+                .as_str()
+                .unwrap()
+                .contains("Compound scoring is engine-native")));
         let legacy_bytes = serde_json::to_vec(&original["compound"]["queries"]).unwrap();
         use sha2::{Digest, Sha256};
         let legacy_hash = Sha256::digest(legacy_bytes)
@@ -2041,7 +2057,7 @@ mod tests {
         assert_ne!(original["compound"]["sha256"], json!(legacy_hash));
         assert_eq!(
             original["compound"]["scoring_contract"],
-            "text-only-scalar-filter-v1"
+            "native-engine-scoring-v1"
         );
         for (field, value) in [
             ("minimum_count", json!(2)),

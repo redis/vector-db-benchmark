@@ -4452,8 +4452,8 @@ pub fn assert_compound_run(root: &Path, dump: &Path) {
     let records = fs::read_to_string(&files[0]).unwrap();
     let expected = compound_queries();
     let mut seen = std::collections::HashSet::new();
-    let mut opensearch = false;
     let mut scores = std::collections::HashMap::new();
+    let mut opensearch = false;
     for line in records.lines() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
         if row["kind"] == "header" {
@@ -4466,7 +4466,7 @@ pub fn assert_compound_run(root: &Path, dump: &Path) {
         }
         let id = row["query_id"].as_u64().unwrap() as usize;
         let want = &expected[id];
-        if opensearch && !row["ids"].as_array().unwrap().is_empty() {
+        if !row["ids"].as_array().unwrap().is_empty() {
             for (doc, score) in row["ids"]
                 .as_array()
                 .unwrap()
@@ -4476,12 +4476,24 @@ pub fn assert_compound_run(root: &Path, dump: &Path) {
                 let family = row["shape"].as_str().unwrap();
                 let doc = doc.as_str().unwrap();
                 let score = score.as_f64().unwrap();
-                if matches!(
-                    family,
-                    "tag-range" | "range-union" | "escaping" | "case" | "missing" | "precedence"
-                ) || (family == "mixed-or" && doc == "d3")
+                if opensearch
+                    && (matches!(
+                        family,
+                        "tag-range"
+                            | "range-union"
+                            | "escaping"
+                            | "case"
+                            | "missing"
+                            | "precedence"
+                    ) || (family == "mixed-or" && doc == "d3"))
                 {
                     assert_eq!(score, 0.0, "scalar predicate contributed score: {row}");
+                }
+                if !opensearch
+                    && (matches!(family, "tag-range" | "escaping" | "case")
+                        || (family == "mixed-or" && doc == "d3"))
+                {
+                    assert!(score > 0.0, "native Redis TAG scoring changed: {row}");
                 }
                 if doc == "d1" {
                     scores.insert(family.to_string(), score);
@@ -4515,6 +4527,11 @@ pub fn assert_compound_run(root: &Path, dump: &Path) {
                 "{family} changed the text score"
             );
         }
+    } else {
+        assert!(
+            scores["tag-text"] > scores["text-score"],
+            "native Redis TAG contribution changed"
+        );
     }
     let result = fs::read_dir(root.join("results"))
         .unwrap()
