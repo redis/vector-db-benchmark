@@ -264,20 +264,7 @@ fn run(args: &Args) -> Result<(), String> {
         return Err("--from-prepared requires --workloads text-scalar".into());
     }
     if let Some(source) = &args.from_prepared {
-        let manifest = msmarco::preparation::read_manifest(source)?;
-        let parent = msmarco::preparation::source_variant(&manifest)?;
-        if parent.threshold < variant.threshold {
-            return Err("source must contain the requested nested corpus".into());
-        }
-        if source.canonicalize().ok() == dir.canonicalize().ok() && source.exists() {
-            return Err("--from-prepared source and destination must differ".into());
-        }
-        msmarco::derived::check_prepared_dir(
-            parent.dataset_name,
-            Some(&msmarco::derived::derived_schema()),
-            source,
-        )?;
-        msmarco::preparation::check(source, parent, true)?;
+        msmarco::preparation::check_nested_source(source, &dir, variant)?;
     }
 
     if !args.force
@@ -2040,10 +2027,7 @@ fn add_knn_truth(args: &Args) -> Result<(), String> {
     let dir = args.out_dir.join(variant.dir);
     msmarco::preparation::recover_publication(&dir, variant)?;
     let caps = msmarco::preparation::check(&dir, variant, true)?;
-    if caps
-        .as_ref()
-        .is_some_and(|c| c.vector_truth && c.filtered_truth)
-    {
+    if !msmarco::preparation::knn_upgrade_needed(caps.as_ref())? {
         println!("{dataset} already has both KNN truth sets");
         return Ok(());
     }

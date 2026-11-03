@@ -92,7 +92,14 @@ and query schema before renaming any remaining `.part` files, then restores
 files are not rebuilt.
 A vector/hybrid workload on a text/scalar artifact fails before creating an
 engine and prints the upgrade command. `--add-derived-fields` still invalidates
-filtered truth and updates capabilities; rerun `--add-knn-truth` afterward.
+filtered truth and updates capabilities. If unfiltered vector truth is already
+present, rerun `--add-hybrid-queries` to regenerate only the filtered truth;
+`--add-knn-truth` is needed when unfiltered truth is absent too.
+
+`--add-knn-truth` requires the versioned preparation contract. Legacy artifacts
+already carry truth but lack its source/integrity contract; rebuild them with the
+current preparer to adopt that contract rather than assigning new provenance to
+unknown legacy bytes. Ordinary legacy benchmark loading is unchanged.
 
 ## Avoid repeated upstream scans
 

@@ -364,6 +364,14 @@ pub fn require_workloads(
     Ok(())
 }
 
+/// Only a validated preparation contract can be upgraded and resealed with
+/// pinned provenance. Legacy full artifacts remain readable, but their existing
+/// truth does not establish the source identity of every corpus byte.
+pub fn knn_upgrade_needed(caps: Option<&Capabilities>) -> Result<bool, String> {
+    let caps = caps.ok_or("--add-knn-truth requires a validated preparation contract; legacy artifacts already carry vector truth and remain readable, but cannot be assigned pinned source provenance by this upgrade. Rebuild with the current prepare-msmarco to adopt the checksummed contract")?;
+    Ok(!(caps.vector_truth && caps.filtered_truth))
+}
+
 pub fn input_row(query: &[f32], id: &str, text: &str, year: Option<i64>) -> Value {
     json!({"query": query, "query_id": id, "query_text": text, "trec_year": year})
 }
@@ -509,6 +517,52 @@ pub fn source_variant(manifest: &Value) -> Result<&'static super::Variant, Strin
         return Err("source corpus identity/sampling does not match its registered name".into());
     }
     Ok(variant)
+}
+
+/// Validate every source precondition before nested sampling creates output.
+/// Registered source identity is resolved here; callers cannot skip the parent
+/// selection, path-alias, derived-field or complete-file-integrity checks.
+pub fn check_nested_source(
+    source: &Path,
+    destination: &Path,
+    target: &super::Variant,
+) -> Result<(), String> {
+    let parent = source_variant(&read_manifest(source)?)?;
+    check_nested_source_with_parent(source, destination, parent, target)
+}
+
+fn check_nested_source_with_parent(
+    source: &Path,
+    destination: &Path,
+    parent: &super::Variant,
+    target: &super::Variant,
+) -> Result<(), String> {
+    if parent.threshold < target.threshold {
+        return Err("source must contain the requested nested corpus".into());
+    }
+    let source_path = source
+        .canonicalize()
+        .map_err(|e| format!("resolve nested source {}: {e}", source.display()))?;
+    match destination.canonicalize() {
+        Ok(destination_path) if destination_path == source_path => {
+            return Err("--from-prepared source and destination must differ".into());
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "resolve nested destination {}: {e}",
+                destination.display()
+            ));
+        }
+    }
+    super::derived::check_prepared_dir(
+        parent.dataset_name,
+        Some(&super::derived::derived_schema()),
+        source,
+    )?;
+    check(source, parent, true)?;
+    Ok(())
 }
 
 /// Stream a nested sample from an existing prepared corpus. Selection is the
@@ -868,6 +922,168 @@ mod tests {
         std::fs::write(dir.path().join("PREPARED.json"), manifest.to_string()).unwrap();
         std::fs::write(dir.path().join("COMPLETE"), "ok\n").unwrap();
         (dir, variant)
+    }
+
+    #[test]
+    fn knn_upgrade_refuses_legacy_truth_without_a_preparation_contract() {
+        let (dir, variant) = fixture();
+        let d = dir.path();
+        let mut query: Value = serde_json::from_str(
+            std::fs::read_to_string(d.join("tests.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        query["closest_ids"] = json!([0]);
+        query["closest_scores"] = json!([1.0]);
+        std::fs::write(d.join("tests.jsonl"), format!("{query}\n")).unwrap();
+        let mut manifest = read_manifest(d).unwrap();
+        manifest.as_object_mut().unwrap().remove("preparation");
+        manifest.as_object_mut().unwrap().remove("source_revision");
+        std::fs::write(d.join("PREPARED.json"), manifest.to_string()).unwrap();
+
+        // Ordinary legacy loading stays supported; resealing unknown corpus
+        // provenance through the new truth-upgrade path must not be allowed.
+        let caps = check(d, &variant, true).unwrap();
+        assert!(caps.is_none());
+        let error = knn_upgrade_needed(caps.as_ref()).unwrap_err();
+        assert!(error.contains("legacy artifacts"));
+        assert!(error.contains("Rebuild"));
+    }
+
+    #[test]
+    fn knn_upgrade_only_runs_for_validated_contracts_missing_truth() {
+        let (dir, variant) = fixture();
+        let mut caps = check(dir.path(), &variant, true).unwrap().unwrap();
+        assert!(knn_upgrade_needed(Some(&caps)).unwrap());
+        caps.vector_truth = true;
+        assert!(knn_upgrade_needed(Some(&caps)).unwrap());
+        caps.filtered_truth = true;
+        assert!(!knn_upgrade_needed(Some(&caps)).unwrap());
+    }
+
+    fn nested_source_fixture() -> (tempfile::TempDir, super::super::Variant) {
+        let (dir, mut parent) = fixture();
+        // Keep the registered name so the real derived-field gate executes,
+        // while the private resolved-parent helper permits a three-row fixture.
+        parent.dataset_name = super::super::VARIANTS[0].dataset_name;
+        let payloads = (0..parent.limit)
+            .map(|i| {
+                let docid = format!("nested-source-{i}");
+                let mut payload = json!({"docid": docid, "title": "source title"});
+                super::super::derived::DerivedFields::from_docid(&docid)
+                    .insert_into(payload.as_object_mut().unwrap())
+                    .unwrap();
+                format!("{payload}\n")
+            })
+            .collect::<String>();
+        std::fs::write(dir.path().join("payloads.jsonl"), payloads).unwrap();
+        let mut manifest = read_manifest(dir.path()).unwrap();
+        manifest["dataset"] = json!(parent.dataset_name);
+        manifest["sampling"]["mode"] = json!("crc32");
+        seal(dir.path(), &mut manifest, &[], false, false).unwrap();
+        std::fs::write(dir.path().join("PREPARED.json"), manifest.to_string()).unwrap();
+        (dir, parent)
+    }
+
+    #[test]
+    fn nested_source_preflight_requires_large_enough_parent_and_distinct_directory() {
+        let (source, parent) = nested_source_fixture();
+        let output_root = tempfile::tempdir().unwrap();
+        let destination = output_root.path().join("not-created");
+        check_nested_source_with_parent(source.path(), &destination, &parent, &parent).unwrap();
+        let smaller = super::super::Variant {
+            threshold: parent.threshold - 1,
+            ..parent
+        };
+        check_nested_source_with_parent(source.path(), &destination, &parent, &smaller).unwrap();
+        let larger = super::super::Variant {
+            threshold: parent.threshold + 1,
+            ..parent
+        };
+        assert!(
+            check_nested_source_with_parent(source.path(), &destination, &parent, &larger)
+                .unwrap_err()
+                .contains("source must contain")
+        );
+        assert!(
+            check_nested_source_with_parent(source.path(), source.path(), &parent, &parent)
+                .unwrap_err()
+                .contains("must differ")
+        );
+        assert!(!destination.exists(), "preflight created sampling output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_source_preflight_rejects_symlink_to_source() {
+        let (source, parent) = nested_source_fixture();
+        let output_root = tempfile::tempdir().unwrap();
+        let alias = output_root.path().join("source-alias");
+        std::os::unix::fs::symlink(source.path(), &alias).unwrap();
+        assert!(
+            check_nested_source_with_parent(source.path(), &alias, &parent, &parent)
+                .unwrap_err()
+                .contains("must differ")
+        );
+    }
+
+    #[test]
+    fn nested_source_preflight_checks_full_hashes_and_derived_contract_before_sampling() {
+        let (source, parent) = nested_source_fixture();
+        let output_root = tempfile::tempdir().unwrap();
+        let destination = output_root.path().join("not-created");
+        let vectors = source.path().join("vectors.npy");
+        let original = std::fs::read(&vectors).unwrap();
+        let mut corrupted = original.clone();
+        *corrupted.last_mut().unwrap() ^= 1;
+        std::fs::write(&vectors, corrupted).unwrap();
+        assert!(
+            check_nested_source_with_parent(source.path(), &destination, &parent, &parent)
+                .unwrap_err()
+                .contains("SHA-256")
+        );
+        std::fs::write(&vectors, original).unwrap();
+        let payloads = source.path().join("payloads.jsonl");
+        let invalid = std::fs::read_to_string(&payloads)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: Value = serde_json::from_str(line).unwrap();
+                row.as_object_mut().unwrap().remove("category");
+                format!("{row}\n")
+            })
+            .collect::<String>();
+        std::fs::write(&payloads, invalid).unwrap();
+        // Reseal only to isolate the derived-field contract: byte integrity is
+        // now correct, but the payload must still be refused before sampling.
+        let mut manifest = read_manifest(source.path()).unwrap();
+        seal(source.path(), &mut manifest, &[], false, false).unwrap();
+        std::fs::write(source.path().join("PREPARED.json"), manifest.to_string()).unwrap();
+        assert!(
+            check_nested_source_with_parent(source.path(), &destination, &parent, &parent)
+                .unwrap_err()
+                .contains("derived field")
+        );
+        assert!(!destination.exists(), "preflight created sampling output");
+    }
+
+    #[test]
+    fn nested_source_preflight_resolves_registered_source_identity_first() {
+        let (source, _) = nested_source_fixture();
+        let output_root = tempfile::tempdir().unwrap();
+        let destination = output_root.path().join("not-created");
+        let registered = super::super::VARIANTS[0];
+        let mut manifest = read_manifest(source.path()).unwrap();
+        manifest["passages"] = json!(registered.limit);
+        manifest.as_object_mut().unwrap().remove("source_revision");
+        std::fs::write(source.path().join("PREPARED.json"), manifest.to_string()).unwrap();
+        assert!(
+            check_nested_source(source.path(), &destination, &registered)
+                .unwrap_err()
+                .contains("source_revision")
+        );
+        assert!(!destination.exists(), "preflight created sampling output");
     }
 
     #[test]
