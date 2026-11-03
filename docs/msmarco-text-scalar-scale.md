@@ -93,7 +93,7 @@ restored bytes before upload. Never fabricate KNN truth for a scalar run.
 ## Ingest, correctness, and reuse
 
 Set connection secrets in the process environment (never in a committed command
-or result). Redis uses `REDIS_PORT` / `REDIS_PASSWORD`; OpenSearch uses
+or result). Redis uses `REDIS_PORT` / `REDIS_AUTH`; OpenSearch uses
 `OPENSEARCH_PORT` / `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD`. Hosts below are
 placeholders for the actual private endpoints. Run from the checkout root.
 Set a dedicated OpenSearch index before ingestion and keep it unchanged for
