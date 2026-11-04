@@ -249,7 +249,8 @@ other than `vdb-packages`, for `build`. The bucket names, region and the APT
      `deb/`, `rpm/`, `gpg`, delete the lockfile).
   4. **Switch on** (only after steps 0-3): the REPOSITORY variable
      `gh variable set PACKAGES_PRODUCTION -R redis/vector-db-benchmark --body true`.
-  5. **Publish 0.2.0**, which is already released (only after steps 0-4):
+  5. **Publish 0.2.0** (done 2026-10-30, run 41032852240; staging rehearsal
+     run 41031202146 under `preprod-0.2.0`), which is already released (only after steps 0-4):
      `gh workflow run release-packages.yml --ref master -f release_type=public -f tag=0.2.0`,
      approve the deployment, then install from the README's "Getting
      Started" on bare el8, el9, el10, amzn2023, jammy and trixie containers

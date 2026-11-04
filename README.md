@@ -6,11 +6,9 @@ A benchmarking tool for vector databases, written in Rust. Measures upload throu
 
 ### Installing on Debian and Ubuntu
 
-> **Available once the first package publish completes.** The APT and YUM
-> repositories below are our own (`https://s3.us-east-2.amazonaws.com/vdb-packages`); the first release is published to
-> them once the maintainers have set them up. Until then, use the
-> [prebuilt binaries](#installing-prebuilt-binaries-linux-and-macos) or
-> [Docker](#using-docker).
+> The APT and YUM repositories below are our own
+> (`https://s3.us-east-2.amazonaws.com/vdb-packages`), signed with our own key
+> (fingerprint `81F0 12D4 3C46 AEE7 F859  8106 5B71 09B1 6FF8 0907`).
 
 Packages are built for Debian 11 (bullseye), 12 (bookworm) and 13 (trixie), and
 Ubuntu 20.04 (focal), 22.04 (jammy), 24.04 (noble) and 26.04 (resolute), on amd64
@@ -35,8 +33,7 @@ sudo apt-get install vector-db-benchmark
 ### Installing on RHEL, Rocky Linux and AlmaLinux
 
 Packages are built for RHEL 8, 9 and 10 compatible distributions, on x86_64 and
-aarch64 (available once the first package publish completes, as above). To
-configure the repository:
+aarch64. To configure the repository:
 
 ```bash
 sudo curl -fsSL https://s3.us-east-2.amazonaws.com/vdb-packages/gpg -o /etc/pki/rpm-gpg/vector-db-benchmark.gpg
@@ -60,8 +57,7 @@ sudo dnf install -y vector-db-benchmark
 ### Installing on Amazon Linux 2023
 
 Amazon Linux 2023 uses its own repository path, because its `$releasever` is a
-point release such as `2023.8.20250818`, not an `el<n>` value (available once the
-first package publish completes, as above):
+point release such as `2023.8.20250818`, not an `el<n>` value:
 
 ```bash
 sudo curl -fsSL https://s3.us-east-2.amazonaws.com/vdb-packages/gpg -o /etc/pki/rpm-gpg/vector-db-benchmark.gpg
@@ -106,9 +102,8 @@ docker run --rm redis/vector-db-benchmark:0.2.0 --help
 ```
 
 > Release images are published to Docker Hub as `redis/vector-db-benchmark:<tag>`
-> (and `:latest`). The `0.2.0` image is available once its publish runs after a
-> follow-up fix to the release workflow (#385); on 2026-10-30 Docker Hub did not
-> have it yet, and `latest` still predates 0.2.0. More examples: [Docker](#docker).
+> (and `:latest`, the newest release), for linux/amd64 and linux/arm64. More
+> examples: [Docker](#docker).
 
 ### Installing from source
 
@@ -470,9 +465,8 @@ and `clobber: true`, which replaces the whole set.
 Final releases get native packages, built from the same commit as the archives,
 one per distribution, for our own APT/YUM repository at
 `https://s3.us-east-2.amazonaws.com/vdb-packages`, signed with our own key (its
-public half is served at `…/vdb-packages/gpg`). Publishing there starts with the
-first package publish; [Getting Started](#getting-started) has the repository
-setup. The packages install `vector-db-benchmark`,
+public half is served at `…/vdb-packages/gpg`), starting with 0.2.0;
+[Getting Started](#getting-started) has the repository setup. The packages install `vector-db-benchmark`,
 `prepare-msmarco` and `generate-dataset` into `/usr/bin`, the reader
 micro-benchmarks under `/usr/lib/vector-db-benchmark` (`/usr/libexec` on RPM
 systems), and the dataset catalogue plus engine configurations under
