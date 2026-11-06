@@ -128,6 +128,10 @@ impl OpenSearchEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         let spec = fulltext::parse_spec(params.knob(fulltext::SPEC_KEY))?;
+        let total_hits = fulltext::total_hits_plan("opensearch", &spec)?;
+        if !total_hits.symmetric {
+            eprintln!("⚠  {}", fulltext::ASYMMETRIC_TOTAL_HITS_WARNING);
+        }
         if self.config.skip_vector_index || spec.compound.is_some() {
             let (properties, index) = self.realized_schema("compound fulltext")?;
             let validate = if self.config.skip_vector_index {
@@ -186,8 +190,13 @@ impl OpenSearchEngine {
             .queries
             .iter()
             .map(|q| {
-                serde_json::value::to_raw_value(&fulltext::query_opensearch(&fields, q, top))
-                    .map_err(|e| e.to_string())
+                serde_json::value::to_raw_value(&fulltext::query_opensearch_with(
+                    &fields,
+                    q,
+                    top,
+                    total_hits.mode,
+                ))
+                .map_err(|e| e.to_string())
             })
             .collect::<Result<_, _>>()?;
         let order = fulltext::schedule(bodies.len(), num_queries);
@@ -243,7 +252,13 @@ impl OpenSearchEngine {
                         let reply = knn_send(&rt, &client, index_name, &bodies[i], policy);
                         let elapsed = start.elapsed();
                         match reply.and_then(|(body, cost)| {
-                            fulltext::opensearch_ranked_page(&body, top, capture).and_then(|p| {
+                            fulltext::opensearch_ranked_page_with(
+                                &body,
+                                top,
+                                capture,
+                                total_hits.mode,
+                            )
+                            .and_then(|p| {
                                 fulltext::check_query_count(&queries[i], p.total)?;
                                 Ok((p, cost))
                             })
@@ -360,6 +375,7 @@ impl OpenSearchEngine {
             &profile,
             &recorded_marker,
         )?;
+        fulltext::record_total_hits(&mut meta, "opensearch", &total_hits)?;
         meta["retried_queries"] = serde_json::json!(retried_queries);
         // Read back from the live index (`_settings`), not from the config.
         meta["number_of_shards"] = serde_json::json!(shards);

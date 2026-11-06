@@ -5463,6 +5463,75 @@ fn run_redis_hybrid_rrf(parity: bool) {
     fs::remove_dir_all(&proj.root).ok();
 }
 
+/// `fulltext.total_hits`: each mode reaches the server as configured. The
+/// run records the mode it sent per search config; then the exact command
+/// the library builds for each mode is sent to the live index: `exact`
+/// returns the full count, `none` (`WITHOUTCOUNT`) a `total_results` clamped
+/// to the page, with the same top hit and score (ranking unchanged).
+#[test]
+fn test_binary_redis_fulltext_total_hits_modes() {
+    use vector_db_benchmark::fulltext::{self, Analysis, TotalHits};
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-bm25-totals";
+    let configs = serde_json::json!([{
+        "name": name, "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": common::bm25_total_hits_search_params()
+    }]);
+    let proj = common::write_bm25_project(&configs.to_string());
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        name,
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &["--fail-on-dropped-queries", "--keep-data"]
+    ));
+    common::assert_bm25_total_hits_run(&proj.root, "redis", name);
+
+    let query = fulltext::redis_query(&common::bm25_total_hits_fields(), &["apple".to_string()]);
+    // RESP2 reply: [total, id, score, …] (NOCONTENT WITHSCORES).
+    let search = |conn: &mut redis::Connection, mode| {
+        let mut cmd = redis::cmd("FT.SEARCH");
+        for a in fulltext::redis_args_with(
+            &format!("idx:{name}"),
+            &query,
+            1,
+            5000,
+            Analysis::English,
+            mode,
+        ) {
+            cmd.arg(a);
+        }
+        let reply: Vec<redis::Value> = cmd.query(conn).unwrap();
+        let total = match &reply[0] {
+            redis::Value::Int(n) => *n as u64,
+            v => panic!("total: {v:?}"),
+        };
+        let hit: Vec<String> = reply[1..]
+            .iter()
+            .map(|v| redis::from_redis_value::<String>(v.clone()).unwrap())
+            .collect();
+        (total, hit)
+    };
+    let (exact_total, exact_hit) = search(&mut conn, TotalHits::Exact);
+    let (none_total, none_hit) = search(&mut conn, TotalHits::None);
+    assert_eq!(exact_total, common::BM25_APPLE_MATCHES, "exact count");
+    assert_eq!(
+        none_total, 1,
+        "WITHOUTCOUNT must not count: total_results is clamped to LIMIT 0 1"
+    );
+    assert_eq!(exact_hit.len(), 2, "one id + score: {exact_hit:?}");
+    assert_eq!(none_hit, exact_hit, "WITHOUTCOUNT changed the ranked page");
+    flush_db(&mut conn);
+    let _ = redis::cmd("DEL")
+        .arg(format!("vdbb:fulltext-profile:idx:{name}"))
+        .query::<()>(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
 /// #339: the fulltext arm refuses, before the timed window, an index that
 /// was not built with the pinned settings (a vector-only config's index: no
 /// explicit stopword list) and an index missing a searched text field. Both

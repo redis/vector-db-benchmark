@@ -170,6 +170,10 @@ impl RedisEngine {
     ) -> Result<SearchResults, String> {
         self.prepare_search(dataset)?;
         let spec = fulltext::parse_spec(params.knob(fulltext::SPEC_KEY))?;
+        let total_hits = fulltext::total_hits_plan("redis", &spec)?;
+        if !total_hits.symmetric {
+            eprintln!("⚠  {}", fulltext::ASYMMETRIC_TOTAL_HITS_WARNING);
+        }
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
 
         let profile = self
@@ -199,12 +203,13 @@ impl RedisEngine {
             .iter()
             .map(|q| {
                 let mut cmd = redis::cmd("FT.SEARCH");
-                for a in fulltext::redis_args_for(
+                for a in fulltext::redis_args_with(
                     &self.config.index_name,
                     &fulltext::query_redis(&fields, q),
                     top,
                     query_timeout,
                     profile.analysis,
+                    total_hits.mode,
                 ) {
                     cmd.arg(a);
                 }
@@ -265,7 +270,12 @@ impl RedisEngine {
                         let elapsed = start.elapsed().as_secs_f64();
                         let query_id = queries[i].query_id;
                         match reply.map_err(|e| e.to_string()).and_then(|v| {
-                            let p = fulltext::redis_ranked_page(&v, top, capture)?;
+                            let p = fulltext::redis_ranked_page_with(
+                                &v,
+                                top,
+                                capture,
+                                total_hits.mode,
+                            )?;
                             fulltext::check_query_count(&queries[i], p.total)?;
                             Ok(p)
                         }) {
@@ -374,6 +384,7 @@ impl RedisEngine {
         let mut meta =
             fulltext::result_metadata_for("redis", &fields, &set, top, &profile, &recorded_marker)?;
         meta["redis_min_stem_len"] = min_stem_len;
+        fulltext::record_total_hits(&mut meta, "redis", &total_hits)?;
         result.fulltext = Some(meta);
         Ok(result)
     }

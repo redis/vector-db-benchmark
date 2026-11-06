@@ -228,7 +228,16 @@ fn redis_filter_only_commands_are_checked_as_sent() {
     for args in ok {
         check_redis_command(args).unwrap();
     }
-    let bad: [(&[&[u8]], &str); 7] = [
+    let bad: [(&[&[u8]], &str); 9] = [
+        // Exact totals only: no WITHOUTCOUNT, and no dialect that implies it.
+        (
+            &[b"FT.SEARCH", b"idx", b"*", b"WITHOUTCOUNT"],
+            "unexpected argument \"WITHOUTCOUNT\"",
+        ),
+        (
+            &[b"FT.SEARCH", b"idx", b"*", b"DIALECT", b"4"],
+            "implies WITHOUTCOUNT",
+        ),
         (
             &[
                 b"FT.SEARCH",

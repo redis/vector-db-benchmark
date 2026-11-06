@@ -25,7 +25,8 @@
             "title": 5.0,
             "headings": 3.0,
             "segment": 1.0
-          }
+          },
+          "total_hits": "none"
         }
       },
       {
@@ -35,7 +36,8 @@
         "fulltext": {
           "fields": {
             "segment": 1.0
-          }
+          },
+          "total_hits": "none"
         }
       }
     ]
@@ -65,7 +67,8 @@
           "analysis": "parity",
           "fields": {
             "segment": 1.0
-          }
+          },
+          "total_hits": "none"
         }
       }
     ]

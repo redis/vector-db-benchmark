@@ -1003,6 +1003,27 @@ claims — e.g. an index built by a vector-only config and reused with
   `params.fulltext.number_of_shards` either way. (`dfs_query_then_fetch` would
   globalize IDF but adds a round trip to every timed query, so it is not used.)
 
+**Total-hits contract** (`fulltext.total_hits`). Counting every match is work,
+so both engines must be asked for the same count:
+
+| `total_hits` | OpenSearch | Redis |
+|---|---|---|
+| `"exact"` | `track_total_hits: true`; the reply must carry `hits.total.relation: eq` | `FT.SEARCH` default; `total_results` is the exact count |
+| `"none"` | `track_total_hits: false`; the reply must carry no `hits.total` | `WITHOUTCOUNT` (RediSearch 8.2+); `total_results` is clamped to the page, so it is not published |
+| not stated | `track_total_hits: false` (legacy) | counted (legacy) |
+
+The mode sent is recorded per engine as `params.fulltext.total_hits` (`mode`,
+`declared`, `sent`, `server_total`) and in `engine_settings`. When a ranked
+config does not state it, the legacy defaults still run (so old configs measure
+what they always did), but the pair does different work: the result carries
+`total_hits_symmetric: false` and a `warnings` entry. `"none"` with `compound`
+is refused at startup, because the compound suite checks every query's exact
+total; an unstated compound config runs `exact` on both engines, as before.
+`WITHOUTCOUNT` does not make RediSearch skip work on a text query: its optimizer
+still scores every match (no WAND/MaxScore pruning) and returns the same
+score-ordered page. The shipped `*-msmarco-fulltext` configs state `"none"`,
+and `msmarco-compound.json` states `"exact"`.
+
 **What cannot be pinned** (published as `params.fulltext.known_differences`):
 
 - RediSearch does not split tokens on `\n`/`\r` (only on its ASCII separator

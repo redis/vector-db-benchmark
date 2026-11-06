@@ -3456,6 +3456,16 @@ pub fn assert_bm25_run(root: &Path, dump: &Path, engine: &str, config: &str) {
         assert_eq!(ft["index_marker"], ft["index_marker_expected"], "{ft}");
         assert_eq!(ft["index_marker"]["analysis"], "english");
         assert!(!ft["known_differences"].as_array().unwrap().is_empty());
+        // `total_hits` not stated: the legacy per-engine mode ran, and the
+        // result says the Redis/OpenSearch pair is asymmetric.
+        let legacy = if engine == "redis" { "exact" } else { "none" };
+        assert_eq!(ft["total_hits"]["mode"], legacy, "{ft}");
+        assert_eq!(ft["total_hits"]["declared"], false);
+        assert_eq!(ft["total_hits_symmetric"], false);
+        assert_eq!(
+            ft["warnings"],
+            serde_json::json!([vector_db_benchmark::fulltext::ASYMMETRIC_TOTAL_HITS_WARNING])
+        );
         match engine {
             "redis" => {
                 assert_eq!(ft["engine_settings"]["scorer"], "BM25STD");
@@ -3543,6 +3553,77 @@ pub fn assert_bm25_run(root: &Path, dump: &Path, engine: &str, config: &str) {
     for pair in report["pairs"].as_array().unwrap() {
         assert_eq!(pair["workload"], "fulltext", "{pair}");
     }
+}
+
+// ── total-hits contract on the BM25 fixture ───────────────────────────────
+
+/// The fields [`bm25_total_hits_search_params`] search, all at boost 1.0.
+pub fn bm25_total_hits_fields() -> Vec<vector_db_benchmark::fulltext::FieldBoost> {
+    ["headings", "segment", "title"]
+        .iter()
+        .map(|f| vector_db_benchmark::fulltext::FieldBoost {
+            field: f.to_string(),
+            boost: 1.0,
+        })
+        .collect()
+}
+
+/// Two search configs that differ only in `total_hits`: `none` (search
+/// config 0) and `exact` (search config 1). `top: 1`, so "apple" (2 matches:
+/// d0 by title, d1 by segment) has more matches than the page.
+pub fn bm25_total_hits_search_params() -> serde_json::Value {
+    let fields = serde_json::json!({"headings": 1.0, "segment": 1.0, "title": 1.0});
+    serde_json::json!([
+        {"parallel": 1, "top": 1, "workload": "fulltext",
+         "fulltext": {"fields": fields, "total_hits": "none"}},
+        {"parallel": 1, "top": 1, "workload": "fulltext",
+         "fulltext": {"fields": fields, "total_hits": "exact"}}
+    ])
+}
+
+/// "apple" matches 2 documents of the BM25 fixture.
+pub const BM25_APPLE_MATCHES: u64 = 2;
+
+/// Each result of a [`bm25_total_hits_search_params`] run records the mode
+/// it sent, as declared and symmetric, with no asymmetry warning; every
+/// query was answered (each engine's reply parser checks the server honoured
+/// the mode, so a failed query would show here).
+pub fn assert_bm25_total_hits_run(root: &Path, engine: &str, config: &str) {
+    let mut modes = Vec::new();
+    for entry in fs::read_dir(root.join("results")).unwrap() {
+        let p = entry.unwrap().path();
+        let n = p.file_name().unwrap().to_string_lossy().to_string();
+        if !(n.starts_with(&format!("{config}-")) && n.contains("-search-")) {
+            continue;
+        }
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let ft = &doc["params"]["fulltext"];
+        let mode = ft["total_hits"]["mode"].as_str().unwrap().to_string();
+        assert_eq!(ft["total_hits"]["declared"], true, "{ft}");
+        assert_eq!(ft["total_hits_symmetric"], true, "{ft}");
+        assert!(ft.get("warnings").is_none(), "{ft}");
+        let none = mode == "none";
+        match engine {
+            "redis" => assert_eq!(
+                ft["engine_settings"]["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(" WITHOUTCOUNT"),
+                none,
+                "{ft}"
+            ),
+            _ => assert_eq!(
+                ft["engine_settings"]["request"]["track_total_hits"], !none,
+                "{ft}"
+            ),
+        }
+        assert_eq!(doc["results"]["failed_queries"], 0, "{mode}: {doc}");
+        assert_eq!(doc["results"]["requested_queries"], 5);
+        modes.push(mode);
+    }
+    modes.sort();
+    assert_eq!(modes, ["exact", "none"]);
 }
 
 // ── #339 follow-up: parity analysis on the BM25 fixture ───────────────────
