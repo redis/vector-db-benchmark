@@ -221,6 +221,11 @@ pub struct FulltextSpec {
     /// Text analysis mode (see [`Analysis`]). Default `english`.
     #[serde(default)]
     pub analysis: Analysis,
+    /// Whether each engine is asked for an exact total match count (see
+    /// [`TotalHits`]). Absent = the legacy per-engine default, recorded in the
+    /// result as asymmetric for the ranked query ([`total_hits_plan`]).
+    #[serde(default)]
+    pub total_hits: Option<TotalHits>,
 }
 
 /// How both engines analyze text for the fulltext workload.
@@ -254,6 +259,111 @@ impl Analysis {
             Analysis::Parity => "parity",
         }
     }
+}
+
+/// The total-hits contract of a fulltext search config (`fulltext.total_hits`):
+/// what each engine is asked to count besides the top-`k` page. Counting is
+/// work, and the two engines must be asked to do the same work.
+///
+/// | mode | OpenSearch | Redis (RediSearch) |
+/// |---|---|---|
+/// | `exact` | `track_total_hits: true` (`hits.total.relation` must be `eq`) | `FT.SEARCH` default: `total_results` is the exact count |
+/// | `none` | `track_total_hits: false` (`hits.total` must be absent) | `WITHOUTCOUNT`: `total_results` is `min(count, LIMIT)` per shard, not a count |
+///
+/// `none` frees OpenSearch to skip non-competitive blocks (block-max WAND).
+/// On Redis, `WITHOUTCOUNT` turns on the query optimizer. From RediSearch 8.4
+/// the optimizer recognises `SCORER BM25STD`, so for a query with a text term
+/// and no `SORTBY` it still visits and scores every match
+/// (`src/query_optimizer.c`, `Q_OPT_NONE`) and keeps the score-ordered top
+/// `k`: the ranking is unchanged and only the reported total is clamped.
+/// RediSearch 8.0/8.2 parse `WITHOUTCOUNT`, but their optimizer does not know
+/// the `BM25STD` scorer name, so it drops the score sorter and returns the
+/// first `k` matches in document-id order. The ranking is therefore never
+/// assumed: before the timed window, [`probe_withoutcount`] compares counted
+/// and `WITHOUTCOUNT` pages on the live server and refuses `none` unless they
+/// are identical, and a `none` run fails if any timed reply is out of score
+/// order ([`check_rank_violations`]). `none` is refused for the compound
+/// suite, whose per-query count gate needs the exact total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TotalHits {
+    Exact,
+    None,
+}
+
+impl TotalHits {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TotalHits::Exact => "exact",
+            TotalHits::None => "none",
+        }
+    }
+}
+
+/// The total-hits mode one engine runs a fulltext search config with, and
+/// whether the Redis/OpenSearch pair does the same counting work. Resolved
+/// once per search config by [`total_hits_plan`]. The request builders and
+/// the result metadata ([`record_total_hits`]) both take it, so what is
+/// recorded is what was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TotalHitsPlan {
+    pub mode: TotalHits,
+    /// The config stated `fulltext.total_hits`.
+    pub declared: bool,
+    /// Both engines run this search config with the same mode.
+    pub symmetric: bool,
+}
+
+/// The total-hits mode `engine` sends for `spec`.
+///
+/// - Stated: that mode on every engine (symmetric), or an error when it
+///   cannot be honoured. There is never a silent fallback.
+/// - Not stated, compound suite: `exact` on both engines, as before (the
+///   count gate needs it), so symmetric.
+/// - Not stated, ranked BM25: the legacy defaults, kept so a shipped config
+///   measures what it always measured: Redis `exact`, OpenSearch `none`. The
+///   pair is asymmetric, and [`record_total_hits`] says so in the result.
+pub fn total_hits_plan(engine: &str, spec: &FulltextSpec) -> Result<TotalHitsPlan, String> {
+    if !matches!(engine, "redis" | "opensearch") {
+        return Err(format!(
+            "fulltext: engine '{engine}' has no total-hits contract"
+        ));
+    }
+    check_total_hits(spec)?;
+    Ok(match (spec.total_hits, spec.compound.is_some()) {
+        (Some(mode), _) => TotalHitsPlan {
+            mode,
+            declared: true,
+            symmetric: true,
+        },
+        (None, true) => TotalHitsPlan {
+            mode: TotalHits::Exact,
+            declared: false,
+            symmetric: true,
+        },
+        (None, false) => TotalHitsPlan {
+            mode: if engine == "opensearch" {
+                TotalHits::None
+            } else {
+                TotalHits::Exact
+            },
+            declared: false,
+            symmetric: false,
+        },
+    })
+}
+
+/// `total_hits: "none"` cannot be honoured by the compound suite: every
+/// compound query's total is checked against its expected count.
+fn check_total_hits(spec: &FulltextSpec) -> Result<(), String> {
+    if spec.compound.is_some() && spec.total_hits == Some(TotalHits::None) {
+        return Err(format!(
+            "`{SPEC_KEY}.total_hits: \"none\"` cannot be used with `{SPEC_KEY}.compound`: \
+             the compound suite checks every query's exact total against its expected \
+             count; use \"exact\""
+        ));
+    }
+    Ok(())
 }
 
 /// What an engine config's fulltext search configs require of the index:
@@ -798,6 +908,7 @@ pub fn parse_spec(block: Option<&Value>) -> Result<FulltextSpec, String> {
             }
         }
     }
+    check_total_hits(&spec)?;
     if let Some(compound) = &spec.compound {
         compound.validate()?;
         if spec
@@ -1033,13 +1144,35 @@ pub fn query_redis(fields: &[FieldBoost], q: &TextQuery) -> String {
         .map(|e| e.redis())
         .unwrap_or_else(|| redis_query(fields, &q.terms))
 }
+/// The OpenSearch request for `q` with the legacy totals: exact for a
+/// compound query, none for the ranked one.
 pub fn query_opensearch(fields: &[FieldBoost], q: &TextQuery, top: usize) -> Value {
+    let legacy = if q.expression.is_some() {
+        TotalHits::Exact
+    } else {
+        TotalHits::None
+    };
+    query_opensearch_with(fields, q, top, legacy)
+}
+
+/// The OpenSearch request for `q`, with `track_total_hits` set by `total`
+/// (resolved by [`total_hits_plan`]).
+pub fn query_opensearch_with(
+    fields: &[FieldBoost],
+    q: &TextQuery,
+    top: usize,
+    total: TotalHits,
+) -> Value {
     match &q.expression {
-        Some(e) => {
-            json!({"size":top,"_source":false,"track_total_hits":true,"query":e.opensearch()})
-        }
-        None => opensearch_body(fields, &q.terms, top),
+        Some(e) => json!({"size":top,"_source":false,
+            "track_total_hits":opensearch_track_total_hits(total),"query":e.opensearch()}),
+        None => opensearch_body_with(fields, &q.terms, top, total),
     }
+}
+
+/// `track_total_hits` for `total`.
+pub fn opensearch_track_total_hits(total: TotalHits) -> bool {
+    total == TotalHits::Exact
 }
 pub fn check_query_count(q: &TextQuery, total: Option<u64>) -> Result<(), String> {
     if let Some(c) = &q.compound {
@@ -1152,7 +1285,7 @@ pub fn redis_args(index: &str, query: &str, top: usize, timeout_ms: i64) -> Vec<
 }
 
 /// [`redis_args`] for `analysis`: parity adds `VERBATIM` (no query-time stem
-/// expansion).
+/// expansion). Counts the total (the legacy Redis default).
 pub fn redis_args_for(
     index: &str,
     query: &str,
@@ -1160,9 +1293,30 @@ pub fn redis_args_for(
     timeout_ms: i64,
     analysis: Analysis,
 ) -> Vec<String> {
+    redis_args_with(index, query, top, timeout_ms, analysis, TotalHits::Exact)
+}
+
+/// The `FT.SEARCH` flag that turns counting off. It keeps the BM25 ranking
+/// only on RediSearch 8.4+ ([`TotalHits`]); [`probe_withoutcount`] checks that
+/// on the live server before a `none` run uses it.
+pub const REDIS_WITHOUTCOUNT: &str = "WITHOUTCOUNT";
+
+/// [`redis_args_for`] with the total-hits mode resolved by
+/// [`total_hits_plan`]: `none` appends [`REDIS_WITHOUTCOUNT`].
+pub fn redis_args_with(
+    index: &str,
+    query: &str,
+    top: usize,
+    timeout_ms: i64,
+    analysis: Analysis,
+    total: TotalHits,
+) -> Vec<String> {
     let mut args = redis_args_base(index, query, top, timeout_ms);
     if analysis == Analysis::Parity {
         args.insert(3, "VERBATIM".to_string());
+    }
+    if total == TotalHits::None {
+        args.push(REDIS_WITHOUTCOUNT.to_string());
     }
     args
 }
@@ -1188,12 +1342,24 @@ fn redis_args_base(index: &str, query: &str, top: usize, timeout_ms: i64) -> Vec
     .collect()
 }
 
-/// The OpenSearch search body.
+/// The OpenSearch search body, without a total (the legacy OpenSearch
+/// default).
 pub fn opensearch_body(fields: &[FieldBoost], terms: &[String], top: usize) -> Value {
+    opensearch_body_with(fields, terms, top, TotalHits::None)
+}
+
+/// [`opensearch_body`] with the total-hits mode resolved by
+/// [`total_hits_plan`].
+pub fn opensearch_body_with(
+    fields: &[FieldBoost],
+    terms: &[String],
+    top: usize,
+    total: TotalHits,
+) -> Value {
     json!({
         "size": top,
         "_source": false,
-        "track_total_hits": false,
+        "track_total_hits": opensearch_track_total_hits(total),
         "query": {"multi_match": {
             "query": terms.join(" "),
             "type": OPENSEARCH_MULTI_MATCH_TYPE,
@@ -1632,6 +1798,34 @@ pub fn validate_opensearch_index_for(
     Ok(shards)
 }
 
+/// The error [`RankCheck`] returns for a page that is not score-ordered.
+pub const RANK_VIOLATION: &str = "fulltext: reply is not ranked by descending score";
+
+/// The error [`RankCheck`] returns for a NaN or infinite score.
+const NON_FINITE_SCORE: &str = "fulltext: non-finite score in a ranked reply";
+
+/// `true` for a query error that says the reply was not a ranked page (out
+/// of score order, or a non-finite score).
+pub fn is_rank_violation(error: &str) -> bool {
+    error.contains(RANK_VIOLATION) || error.contains(NON_FINITE_SCORE)
+}
+
+/// Under `total_hits: "none"`, a Redis reply that is not score-ordered means
+/// `WITHOUTCOUNT` changed the ranking on this server, so the run is refused
+/// instead of reporting the other queries' QPS and latency as a BM25 top-k
+/// result. Other modes keep the existing behaviour (the failed query is
+/// dropped and reported).
+pub fn check_rank_violations(total_hits: TotalHits, violations: usize) -> Result<(), String> {
+    if total_hits == TotalHits::None && violations > 0 {
+        return Err(format!(
+            "fulltext: {violations} Redis replies sent with {REDIS_WITHOUTCOUNT} \
+             (`total_hits: \"none\"`) were not ranked by descending score: this server \
+             does not keep the BM25 ranking under {REDIS_WITHOUTCOUNT}; use \"exact\""
+        ));
+    }
+    Ok(())
+}
+
 /// Streaming rank check: every score finite and none above its predecessor.
 /// Holds no buffer, so the non-capturing path validates without allocating.
 #[derive(Default)]
@@ -1642,13 +1836,11 @@ struct RankCheck {
 impl RankCheck {
     fn push(&mut self, score: f64) -> Result<(), String> {
         if !score.is_finite() {
-            return Err("fulltext: non-finite score in a ranked reply".into());
+            return Err(NON_FINITE_SCORE.into());
         }
         if let Some(prev) = self.prev {
             if score > prev {
-                return Err(format!(
-                    "fulltext: reply is not ranked by descending score ({score} after {prev})"
-                ));
+                return Err(format!("{RANK_VIOLATION} ({score} after {prev})"));
             }
         }
         self.prev = Some(score);
@@ -1676,6 +1868,19 @@ pub fn redis_ranked_page(
     value: &redis::Value,
     top: usize,
     keep_hits: bool,
+) -> Result<RankedPage, String> {
+    redis_ranked_page_with(value, top, keep_hits, TotalHits::Exact)
+}
+
+/// [`redis_ranked_page`] for a request sent with `total`. Under `none`
+/// (`WITHOUTCOUNT`) `total_results` is the page size clamped per shard, not a
+/// count: the page is still checked against it, but [`RankedPage::total`] is
+/// `None` so the clamped value is never published as a total.
+pub fn redis_ranked_page_with(
+    value: &redis::Value,
+    top: usize,
+    keep_hits: bool,
+    total_hits: TotalHits,
 ) -> Result<RankedPage, String> {
     use redis::Value as V;
     fn text(v: &V) -> Option<&str> {
@@ -1736,10 +1941,134 @@ pub fn redis_ranked_page(
         }
     }
     Ok(RankedPage {
-        total: Some(total as u64),
+        total: (total_hits == TotalHits::Exact).then_some(total as u64),
         returned: results.len(),
         hits,
     })
+}
+
+/// How many queries with more matches than the page [`probe_withoutcount`]
+/// compares before it stops.
+pub const WITHOUTCOUNT_PROBE_QUERIES: usize = 8;
+
+/// What [`probe_withoutcount`] compared: `compared` queries with at least one
+/// match, of which `over_limit` had more matches than the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WithoutCountProbe {
+    pub compared: usize,
+    pub over_limit: usize,
+}
+
+/// Check, before the timed window, that `WITHOUTCOUNT` does not change the
+/// ranked page on this server. `send(i, mode)` runs query `i` of the query
+/// set built with `mode` ([`redis_args_with`]) and returns the raw reply.
+///
+/// Queries are taken in order; each with at least one match is sent counted
+/// and with `WITHOUTCOUNT`, and the two pages must hold the same `(id, score)`
+/// hits in the same order (ids may differ only inside the tied-score group cut
+/// by the page boundary). It stops after [`WITHOUTCOUNT_PROBE_QUERIES`] queries
+/// with more matches than `top`, and fails if it found none: a page that is
+/// not truncated cannot show that the server still selects the top `k`.
+/// RediSearch 8.0/8.2 fail it (their optimizer does not recognise
+/// `SCORER BM25STD` and returns the first `k` matches in document-id order).
+pub fn probe_withoutcount<F>(
+    queries: usize,
+    top: usize,
+    mut send: F,
+) -> Result<WithoutCountProbe, String>
+where
+    F: FnMut(usize, TotalHits) -> Result<redis::Value, String>,
+{
+    let refuse = |why: String| {
+        format!(
+            "fulltext: `total_hits: \"none\"` refused before the timed window: {why}. \
+             {REDIS_WITHOUTCOUNT} must return the same BM25-ranked page as a counted \
+             FT.SEARCH (RediSearch before 8.4 does not recognise SCORER {REDIS_SCORER} \
+             under {REDIS_WITHOUTCOUNT} and returns the first matches in document-id \
+             order); use \"exact\" on this server"
+        )
+    };
+    let mut probe = WithoutCountProbe {
+        compared: 0,
+        over_limit: 0,
+    };
+    for i in 0..queries {
+        if probe.over_limit >= WITHOUTCOUNT_PROBE_QUERIES {
+            break;
+        }
+        let counted = send(i, TotalHits::Exact)
+            .and_then(|v| redis_ranked_page_with(&v, top, true, TotalHits::Exact))
+            .map_err(|e| refuse(format!("query #{i} (counted): {e}")))?;
+        let total = counted
+            .total
+            .ok_or("fulltext: counted page without a total")?;
+        if total == 0 {
+            continue;
+        }
+        let uncounted = send(i, TotalHits::None)
+            .and_then(|v| redis_ranked_page_with(&v, top, true, TotalHits::None))
+            .map_err(|e| refuse(format!("query #{i} ({REDIS_WITHOUTCOUNT}): {e}")))?;
+        let truncated = total > top as u64;
+        same_ranked_page(
+            counted.hits.as_deref().unwrap_or_default(),
+            uncounted.hits.as_deref().unwrap_or_default(),
+            truncated,
+        )
+        .map_err(|e| refuse(format!("query #{i}: {e}")))?;
+        probe.compared += 1;
+        if truncated {
+            probe.over_limit += 1;
+        }
+    }
+    if probe.over_limit == 0 {
+        return Err(refuse(format!(
+            "no query has more than {top} matches, so the probe cannot show that \
+             {REDIS_WITHOUTCOUNT} still selects the top {top}"
+        )));
+    }
+    Ok(probe)
+}
+
+/// `counted` and `uncounted` hold the same hits: equal scores rank by rank,
+/// and the same ids within each tied-score group. When the page is cut by
+/// the limit (`truncated`), the last group may hold other ids of that score.
+fn same_ranked_page(
+    counted: &[(String, f64)],
+    uncounted: &[(String, f64)],
+    truncated: bool,
+) -> Result<(), String> {
+    let scores = |p: &[(String, f64)]| p.iter().map(|h| h.1).collect::<Vec<_>>();
+    if counted.len() != uncounted.len() || scores(counted) != scores(uncounted) {
+        return Err(format!(
+            "the {REDIS_WITHOUTCOUNT} page {uncounted:?} differs from the counted page \
+             {counted:?}"
+        ));
+    }
+    let mut start = 0;
+    while start < counted.len() {
+        let score = counted[start].1;
+        let end = start + counted[start..].iter().take_while(|h| h.1 == score).count();
+        let ids = |p: &[(String, f64)]| -> HashSet<String> {
+            p[start..end].iter().map(|h| h.0.clone()).collect()
+        };
+        if !(truncated && end == counted.len()) && ids(counted) != ids(uncounted) {
+            return Err(format!(
+                "the {REDIS_WITHOUTCOUNT} page {uncounted:?} holds other documents than \
+                 the counted page {counted:?}"
+            ));
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+/// Record the [`probe_withoutcount`] outcome under `total_hits`.
+pub fn record_withoutcount_probe(meta: &mut Value, probe: &WithoutCountProbe) {
+    meta["total_hits"]["withoutcount_probe"] = json!({
+        "compared_queries": probe.compared,
+        "queries_over_limit": probe.over_limit,
+        "page": "identical (id, score) to the counted FT.SEARCH, checked before the timed window",
+    });
 }
 
 /// Parse an OpenSearch search response: no timeout, no failed shard, at most
@@ -1749,6 +2078,44 @@ pub fn opensearch_ranked_page(
     top: usize,
     keep_hits: bool,
 ) -> Result<RankedPage, String> {
+    opensearch_page_checked(body, top, keep_hits, None)
+}
+
+/// [`opensearch_ranked_page`] for a request sent with `total`. The reply must
+/// show the server honoured it: `exact` needs `hits.total.relation == "eq"`,
+/// `none` needs `hits.total` absent.
+pub fn opensearch_ranked_page_with(
+    body: &Value,
+    top: usize,
+    keep_hits: bool,
+    total: TotalHits,
+) -> Result<RankedPage, String> {
+    opensearch_page_checked(body, top, keep_hits, Some(total))
+}
+
+fn opensearch_page_checked(
+    body: &Value,
+    top: usize,
+    keep_hits: bool,
+    expect: Option<TotalHits>,
+) -> Result<RankedPage, String> {
+    match expect {
+        Some(TotalHits::Exact) if body["hits"]["total"]["relation"] != "eq" => {
+            return Err(format!(
+                "fulltext: exact total requested (track_total_hits: true) but the reply's \
+                 hits.total is {}",
+                body["hits"]["total"]
+            ))
+        }
+        Some(TotalHits::None) if body["hits"].get("total").is_some() => {
+            return Err(format!(
+                "fulltext: no total requested (track_total_hits: false) but the reply carries \
+                 hits.total {}",
+                body["hits"]["total"]
+            ))
+        }
+        _ => {}
+    }
     if body["timed_out"] != false || body["_shards"]["failed"] != 0 {
         return Err("fulltext: timed out, failed shards, or missing completion metadata".into());
     }
@@ -1952,6 +2319,80 @@ pub fn result_metadata_for(
         }
     }
     Ok(m)
+}
+
+/// The warning a ranked fulltext result carries when its config does not
+/// state `fulltext.total_hits` (printed at run time, and in `warnings`).
+pub const ASYMMETRIC_TOTAL_HITS_WARNING: &str =
+    "total_hits_symmetric: false: `fulltext.total_hits` is not stated, so the legacy \
+     per-engine default ran (Redis counts every match exactly; OpenSearch sends \
+     track_total_hits: false and may skip non-competitive documents). The Redis and \
+     OpenSearch results of this config do different work; state \"exact\" or \"none\" \
+     to compare them.";
+
+/// Record in the result metadata the total-hits mode `plan` that `engine`'s
+/// requests were built with: `total_hits`, `total_hits_symmetric`, and the
+/// `engine_settings` request/command that carry it. A plan the config did not
+/// state that leaves the pair asymmetric also adds a `warnings` entry.
+pub fn record_total_hits(
+    meta: &mut Value,
+    engine: &str,
+    plan: &TotalHitsPlan,
+) -> Result<(), String> {
+    let (sent, server_total) = match (engine, plan.mode) {
+        ("opensearch", TotalHits::Exact) => (
+            "track_total_hits: true",
+            "exact: hits.total with relation eq (checked on every reply)",
+        ),
+        ("opensearch", TotalHits::None) => (
+            "track_total_hits: false",
+            "not computed: hits.total absent (checked on every reply)",
+        ),
+        ("redis", TotalHits::Exact) => (
+            "FT.SEARCH without WITHOUTCOUNT (counted)",
+            "exact: total_results",
+        ),
+        ("redis", TotalHits::None) => (
+            "FT.SEARCH … WITHOUTCOUNT",
+            "not computed: total_results is min(count, LIMIT) per shard and is not published",
+        ),
+        (other, _) => {
+            return Err(format!(
+                "fulltext: engine '{other}' has no total-hits contract"
+            ))
+        }
+    };
+    meta["total_hits"] = json!({
+        "mode": plan.mode.as_str(),
+        "declared": plan.declared,
+        "sent": sent,
+        "server_total": server_total,
+    });
+    meta["total_hits_symmetric"] = json!(plan.symmetric);
+    match engine {
+        "opensearch" => {
+            meta["engine_settings"]["request"]["track_total_hits"] =
+                json!(opensearch_track_total_hits(plan.mode));
+        }
+        _ => {
+            if plan.mode == TotalHits::None {
+                let command = meta["engine_settings"]["command"]
+                    .as_str()
+                    .ok_or("fulltext: Redis engine_settings has no command")?
+                    .to_string();
+                meta["engine_settings"]["command"] =
+                    json!(format!("{command} {REDIS_WITHOUTCOUNT}"));
+            }
+        }
+    }
+    if !plan.symmetric {
+        let warning = ASYMMETRIC_TOTAL_HITS_WARNING;
+        match meta["warnings"].as_array_mut() {
+            Some(w) => w.push(json!(warning)),
+            None => meta["warnings"] = json!([warning]),
+        }
+    }
+    Ok(())
 }
 
 fn result_metadata_english(
@@ -3495,5 +3936,351 @@ mod tests {
             "BM25STD"
         );
         assert!(result_metadata("qdrant", &fields, &set, 10).is_err());
+    }
+
+    // ── total-hits contract ───────────────────────────────────────────────
+
+    fn compound_block(total_hits: Option<&str>) -> Value {
+        let mut b = json!({"fields":{"title":1.0},"compound":{"suite":"msmarco-v1"}});
+        if let Some(t) = total_hits {
+            b["total_hits"] = json!(t);
+        }
+        b
+    }
+
+    fn plan(engine: &str, block: &Value) -> Result<TotalHitsPlan, String> {
+        total_hits_plan(engine, &parse_spec(Some(block))?)
+    }
+
+    #[test]
+    fn total_hits_plan_is_symmetric_when_stated_and_legacy_otherwise() {
+        let p = |mode, declared, symmetric| TotalHitsPlan {
+            mode,
+            declared,
+            symmetric,
+        };
+        // Stated: the same mode on both engines.
+        for (value, mode) in [("exact", TotalHits::Exact), ("none", TotalHits::None)] {
+            let block = json!({"fields":{"segment":1.0},"total_hits":value});
+            for engine in ["redis", "opensearch"] {
+                assert_eq!(plan(engine, &block), Ok(p(mode, true, true)), "{engine}");
+            }
+        }
+        // Not stated, ranked: legacy per-engine defaults, marked asymmetric.
+        let ranked = json!({"fields":{"segment":1.0}});
+        assert_eq!(
+            plan("redis", &ranked),
+            Ok(p(TotalHits::Exact, false, false))
+        );
+        assert_eq!(
+            plan("opensearch", &ranked),
+            Ok(p(TotalHits::None, false, false))
+        );
+        // Not stated, compound: exact on both, as before.
+        for engine in ["redis", "opensearch"] {
+            assert_eq!(
+                plan(engine, &compound_block(None)),
+                Ok(p(TotalHits::Exact, false, true))
+            );
+            assert_eq!(
+                plan(engine, &compound_block(Some("exact"))),
+                Ok(p(TotalHits::Exact, true, true))
+            );
+        }
+        // An engine without a fulltext arm has no contract.
+        assert!(plan("qdrant", &ranked).is_err());
+    }
+
+    #[test]
+    fn total_hits_refuses_what_cannot_be_honoured() {
+        // The compound count gate needs exact totals: refused at parse time,
+        // i.e. at startup, before anything connects.
+        let e = parse_spec(Some(&compound_block(Some("none")))).unwrap_err();
+        assert!(e.contains("cannot be used with `fulltext.compound`"), "{e}");
+        let mut spec = parse_spec(Some(&compound_block(None))).unwrap();
+        spec.total_hits = Some(TotalHits::None);
+        assert!(total_hits_plan("redis", &spec).is_err());
+        // Unknown values are refused, not defaulted.
+        for bad in [json!("all"), json!(true), json!("EXACT")] {
+            assert!(
+                parse_spec(Some(&json!({ "total_hits": bad }))).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn redis_command_adds_withoutcount_only_for_none() {
+        for analysis in [Analysis::English, Analysis::Parity] {
+            let exact = redis_args_with("idx", "q", 7, 500, analysis, TotalHits::Exact);
+            // `exact` is byte-for-byte the legacy command.
+            assert_eq!(exact, redis_args_for("idx", "q", 7, 500, analysis));
+            assert!(!exact.iter().any(|a| a == REDIS_WITHOUTCOUNT));
+            let none = redis_args_with("idx", "q", 7, 500, analysis, TotalHits::None);
+            assert_eq!(none.last().map(String::as_str), Some("WITHOUTCOUNT"));
+            assert_eq!(none.iter().filter(|a| *a == "WITHOUTCOUNT").count(), 1);
+            assert_eq!(&none[..none.len() - 1], &exact[..]);
+        }
+    }
+
+    #[test]
+    fn opensearch_request_tracks_total_hits_by_mode() {
+        let fields = [fb("segment", 1.0)];
+        let terms = vec!["apple".to_string()];
+        assert_eq!(
+            opensearch_body_with(&fields, &terms, 5, TotalHits::Exact)["track_total_hits"],
+            json!(true)
+        );
+        let none = opensearch_body_with(&fields, &terms, 5, TotalHits::None);
+        assert_eq!(none["track_total_hits"], json!(false));
+        // The legacy builder is `none`, unchanged.
+        assert_eq!(none, opensearch_body(&fields, &terms, 5));
+        let ranked = TextQuery {
+            query_id: 0,
+            terms: terms.clone(),
+            expression: None,
+            compound: None,
+        };
+        for mode in [TotalHits::Exact, TotalHits::None] {
+            assert_eq!(
+                query_opensearch_with(&fields, &ranked, 5, mode),
+                opensearch_body_with(&fields, &terms, 5, mode)
+            );
+        }
+        let compound = TextQuery {
+            expression: Some(
+                crate::compound_text::Expr::compile(
+                    &json!({"title":{"match":{"text":"apple"}}}),
+                    &json!({"title":"text"}),
+                )
+                .unwrap(),
+            ),
+            ..ranked
+        };
+        assert_eq!(
+            query_opensearch_with(&fields, &compound, 5, TotalHits::Exact)["track_total_hits"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn replies_must_show_the_requested_total_contract() {
+        // Redis `none`: total_results is clamped, never published as a total,
+        // but the page is still checked against it.
+        let r = reply(2, &[("k:1", 3.0), ("k:2", 1.5)], vec![]);
+        let total = |v: &redis::Value, m| redis_ranked_page_with(v, 2, false, m).map(|p| p.total);
+        assert_eq!(total(&r, TotalHits::Exact), Ok(Some(2)));
+        assert_eq!(total(&r, TotalHits::None), Ok(None));
+        let short = reply(2, &[("k:1", 3.0)], vec![]);
+        assert!(total(&short, TotalHits::None).is_err());
+        // OpenSearch: the reply must match what was asked for.
+        let hits = json!([{"_id":"a","_score":1.0}]);
+        let exact = json!({"timed_out":false,"_shards":{"failed":0},
+            "hits":{"total":{"value":1,"relation":"eq"},"hits":hits}});
+        let none = json!({"timed_out":false,"_shards":{"failed":0},"hits":{"hits":hits}});
+        let mut gte = exact.clone();
+        gte["hits"]["total"]["relation"] = json!("gte");
+        let page = |b: &Value, m| opensearch_ranked_page_with(b, 10, false, m);
+        assert_eq!(page(&exact, TotalHits::Exact).unwrap().total, Some(1));
+        assert_eq!(page(&none, TotalHits::None).unwrap().total, None);
+        assert!(page(&none, TotalHits::Exact)
+            .unwrap_err()
+            .contains("exact total requested"));
+        assert!(page(&gte, TotalHits::Exact).is_err());
+        assert!(page(&exact, TotalHits::None)
+            .unwrap_err()
+            .contains("no total requested"));
+    }
+
+    /// A fake server for [`probe_withoutcount`]: each query's matches as
+    /// `(id, score)` in document-id order. Counted replies are BM25-ranked;
+    /// `WITHOUTCOUNT` replies are ranked (`keeps_ranking`, RediSearch 8.4+)
+    /// or the first `top` matches in document-id order (8.0/8.2).
+    fn probe_server(
+        matches: &[Vec<(&'static str, f64)>],
+        top: usize,
+        keeps_ranking: bool,
+    ) -> Result<WithoutCountProbe, String> {
+        probe_withoutcount(matches.len(), top, |i, mode| {
+            let mut page = matches[i].clone();
+            if mode == TotalHits::Exact || keeps_ranking {
+                page.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+            page.truncate(top);
+            let total = match mode {
+                TotalHits::Exact => matches[i].len(),
+                TotalHits::None => page.len(),
+            };
+            Ok(reply(total as i64, &page, vec![]))
+        })
+    }
+
+    #[test]
+    fn withoutcount_probe_refuses_a_server_that_drops_the_ranking() {
+        let matches = vec![
+            vec![("k:1", 0.5), ("k:2", 2.0), ("k:3", 1.0)],
+            vec![("k:4", 3.0), ("k:5", 1.0)],
+            vec![],
+        ];
+        // 8.4+: same pages; two queries have more matches than the page.
+        assert_eq!(
+            probe_server(&matches, 1, true),
+            Ok(WithoutCountProbe {
+                compared: 2,
+                over_limit: 2
+            })
+        );
+        // 8.0/8.2: first match by doc id. Query 0's page is (k:1, 0.5), not
+        // (k:2, 2.0): it is score-ordered (one hit) but not the top-1.
+        let e = probe_server(&matches, 1, false).unwrap_err();
+        assert!(e.contains("query #0") && e.contains("differs"), "{e}");
+        // With a two-hit page the doc-id order is also out of score order.
+        let e = probe_server(&matches, 2, false).unwrap_err();
+        assert!(e.contains(RANK_VIOLATION), "{e}");
+        // Query 1's doc-id order happens to be ranked; only query 0 shows it.
+        let e = probe_server(&matches[1..], 1, false);
+        assert!(e.is_ok(), "{e:?}");
+        // No query with more matches than the page: nothing can be shown.
+        let e = probe_server(&matches, 3, true).unwrap_err();
+        assert!(e.contains("no query has more than 3 matches"), "{e}");
+    }
+
+    #[test]
+    fn withoutcount_probe_stops_after_enough_truncated_queries() {
+        let matches = vec![vec![("k:1", 2.0), ("k:2", 1.0)]; WITHOUTCOUNT_PROBE_QUERIES + 5];
+        let mut sent = 0;
+        let probe = probe_withoutcount(matches.len(), 1, |i, mode| {
+            sent += 1;
+            let mut page = matches[i].clone();
+            page.truncate(1);
+            let total = if mode == TotalHits::Exact { 2 } else { 1 };
+            Ok(reply(total, &page, vec![]))
+        })
+        .unwrap();
+        assert_eq!(probe.over_limit, WITHOUTCOUNT_PROBE_QUERIES);
+        assert_eq!(sent, 2 * WITHOUTCOUNT_PROBE_QUERIES);
+    }
+
+    #[test]
+    fn withoutcount_page_comparison_allows_only_boundary_ties() {
+        let p = |h: &[(&str, f64)]| {
+            h.iter()
+                .map(|(i, s)| (i.to_string(), *s))
+                .collect::<Vec<_>>()
+        };
+        let counted = p(&[("a", 3.0), ("b", 2.0), ("c", 2.0), ("d", 1.0)]);
+        // Reordered inside a tie: same page.
+        let swapped = p(&[("a", 3.0), ("c", 2.0), ("b", 2.0), ("d", 1.0)]);
+        assert!(same_ranked_page(&counted, &swapped, false).is_ok());
+        // Another document of the boundary score: only when truncated.
+        let boundary = p(&[("a", 3.0), ("b", 2.0), ("c", 2.0), ("e", 1.0)]);
+        assert!(same_ranked_page(&counted, &boundary, true).is_ok());
+        assert!(same_ranked_page(&counted, &boundary, false).is_err());
+        // Another document inside the page is never the same page.
+        let inner = p(&[("a", 3.0), ("b", 2.0), ("e", 2.0), ("d", 1.0)]);
+        assert!(same_ranked_page(&counted, &inner, true).is_err());
+        // Different scores or length.
+        let scored = p(&[("a", 3.0), ("b", 2.0), ("c", 2.0), ("d", 0.5)]);
+        assert!(same_ranked_page(&counted, &scored, true).is_err());
+        assert!(same_ranked_page(&counted, &counted[..3], true).is_err());
+    }
+
+    #[test]
+    fn none_fails_closed_on_any_out_of_order_reply() {
+        let e = rp(&reply(2, &[("k:1", 1.0), ("k:2", 2.0)], vec![]), 2).unwrap_err();
+        assert!(is_rank_violation(&e), "{e}");
+        let e = rp(&reply(1, &[("k:1", f64::NAN)], vec![]), 2).unwrap_err();
+        assert!(is_rank_violation(&e), "{e}");
+        assert!(!is_rank_violation("fulltext: incomplete Redis page"));
+        assert!(check_rank_violations(TotalHits::None, 1)
+            .unwrap_err()
+            .contains("WITHOUTCOUNT"));
+        assert!(check_rank_violations(TotalHits::None, 0).is_ok());
+        assert!(check_rank_violations(TotalHits::Exact, 3).is_ok());
+    }
+
+    #[test]
+    fn result_records_the_total_hits_mode_sent() {
+        let fields = [fb("segment", 1.0)];
+        let set = build_query_set(&["apple".to_string()]).unwrap();
+        let meta = |engine: &str, block: &Value| {
+            let mut m = result_metadata(engine, &fields, &set, 10).unwrap();
+            record_total_hits(&mut m, engine, &plan(engine, block).unwrap()).unwrap();
+            m
+        };
+        let none = json!({"fields":{"segment":1.0},"total_hits":"none"});
+        let exact = json!({"fields":{"segment":1.0},"total_hits":"exact"});
+        let legacy = json!({"fields":{"segment":1.0}});
+
+        let os = meta("opensearch", &exact);
+        assert_eq!(os["engine_settings"]["request"]["track_total_hits"], true);
+        assert_eq!(os["total_hits"]["mode"], "exact");
+        assert_eq!(os["total_hits"]["declared"], true);
+        assert_eq!(os["total_hits"]["sent"], "track_total_hits: true");
+        assert_eq!(os["total_hits_symmetric"], true);
+        assert!(os.get("warnings").is_none());
+        let os = meta("opensearch", &none);
+        assert_eq!(os["engine_settings"]["request"]["track_total_hits"], false);
+        assert_eq!(os["total_hits"]["mode"], "none");
+
+        let redis = meta("redis", &none);
+        assert!(redis["engine_settings"]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" WITHOUTCOUNT"));
+        assert_eq!(redis["total_hits"]["mode"], "none");
+        assert_eq!(redis["total_hits_symmetric"], true);
+        let redis = meta("redis", &exact);
+        assert!(!redis["engine_settings"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("WITHOUTCOUNT"));
+
+        // Not stated: each engine records its legacy mode, the pair is marked
+        // asymmetric, and the result carries the warning.
+        for (engine, mode) in [("redis", "exact"), ("opensearch", "none")] {
+            let m = meta(engine, &legacy);
+            assert_eq!(m["total_hits"]["mode"], mode, "{engine}");
+            assert_eq!(m["total_hits"]["declared"], false);
+            assert_eq!(m["total_hits_symmetric"], false);
+            assert_eq!(m["warnings"], json!([ASYMMETRIC_TOTAL_HITS_WARNING]));
+        }
+        assert!(
+            record_total_hits(&mut json!({}), "qdrant", &plan("redis", &legacy).unwrap()).is_err()
+        );
+    }
+
+    /// The configs of the Redis vs OpenSearch comparison state the mode, so
+    /// their pairs are symmetric: ranked BM25 `none` (OpenSearch's measured
+    /// behaviour kept; Redis gets WITHOUTCOUNT), compound `exact` (its count
+    /// gate needs it, and it is the behaviour it always had).
+    #[test]
+    fn shipped_msmarco_text_configs_state_a_symmetric_total_hits_mode() {
+        for (file, want) in [
+            ("redis-msmarco-fulltext.json", TotalHits::None),
+            ("opensearch-msmarco-fulltext.json", TotalHits::None),
+            ("msmarco-compound.json", TotalHits::Exact),
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("experiments/configurations")
+                .join(file);
+            let configs: Vec<Value> =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let mut n = 0;
+            for c in &configs {
+                let engine = c["engine"].as_str().unwrap();
+                for sp in c["search_params"].as_array().unwrap() {
+                    let got = plan(engine, &sp[SPEC_KEY]).unwrap();
+                    assert_eq!(
+                        (got.mode, got.declared, got.symmetric),
+                        (want, true, true),
+                        "{file} [{}]",
+                        c["name"]
+                    );
+                    n += 1;
+                }
+            }
+            assert!(n > 0, "{file}");
+        }
     }
 }

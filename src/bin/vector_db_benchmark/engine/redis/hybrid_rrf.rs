@@ -48,6 +48,8 @@ impl RedisEngine {
         self.prepare_search(dataset)?;
         let spec = hr::parse_spec(params.knob(hr::SPEC_KEY))?;
         let text_spec = hr::parse_text_spec(params.knob(fulltext::SPEC_KEY))?;
+        // FT.HYBRID has no counting option: the plan is `none` (or refused).
+        let total_hits = hr::total_hits_plan("redis", &text_spec)?;
         let ef = params.search_params.as_ref().and_then(|p| p.ef);
         let top = hr::check_params(
             params.top,
@@ -356,7 +358,7 @@ impl RedisEngine {
             "reference_dialect": 2,
             "protocol": "RESP3; a reply with any warning fails its query",
         });
-        result.hybrid_rrf = Some(hr::result_metadata(
+        let mut meta = hr::result_metadata(
             &spec,
             top,
             ef,
@@ -364,7 +366,9 @@ impl RedisEngine {
             engine,
             &hr::ReferenceStats::of(&references, spec.window),
             mean_strict,
-        ));
+        );
+        hr::record_total_hits(&mut meta, "redis", &total_hits)?;
+        result.hybrid_rrf = Some(meta);
         Ok(result)
     }
 }

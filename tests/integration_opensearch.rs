@@ -1740,6 +1740,70 @@ fn run_opensearch_hybrid_rrf(parity: bool) {
     std::fs::remove_dir_all(&proj.root).ok();
 }
 
+/// `fulltext.total_hits`: each mode reaches the server as configured. The
+/// run records the mode it sent per search config (its reply parser already
+/// refuses a reply whose `hits.total` contradicts the mode); then the exact
+/// body the library builds for each mode is sent to the live index: `exact`
+/// returns `hits.total` `{value: 2, relation: eq}`, `none` returns no
+/// `hits.total` at all, with the same top hit.
+#[test]
+fn test_binary_opensearch_fulltext_total_hits_modes() {
+    use vector_db_benchmark::fulltext::{self, TotalHits};
+    wait_for_opensearch();
+    let index = "bench_bm25_totals";
+    let name = "os-bm25-totals";
+    let client = os_client();
+    let _ = client.delete(format!("{}/{index}", os_base_url())).send();
+    let configs = serde_json::json!([{
+        "name": name, "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1}, "upload_params": {"parallel": 1},
+        "search_params": common::bm25_total_hits_search_params()
+    }]);
+    let proj = common::write_bm25_project(&configs.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        name,
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &[("OPENSEARCH_PORT", &port), ("OPENSEARCH_INDEX", index)],
+        &["--fail-on-dropped-queries", "--keep-data"]
+    ));
+    common::assert_bm25_total_hits_run(&proj.root, "opensearch", name);
+
+    let fields = common::bm25_total_hits_fields();
+    let terms = vec!["apple".to_string()];
+    let search = |mode| -> serde_json::Value {
+        client
+            .post(format!("{}/{index}/_search", os_base_url()))
+            .json(&fulltext::opensearch_body_with(&fields, &terms, 1, mode))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap()
+    };
+    let exact = search(TotalHits::Exact);
+    let none = search(TotalHits::None);
+    assert_eq!(
+        exact["hits"]["total"],
+        serde_json::json!({"value": common::BM25_APPLE_MATCHES, "relation": "eq"}),
+        "{exact}"
+    );
+    assert!(
+        none["hits"].get("total").is_none(),
+        "track_total_hits: false must omit hits.total: {none}"
+    );
+    assert_eq!(none["hits"]["hits"].as_array().unwrap().len(), 1, "{none}");
+    assert_eq!(
+        none["hits"]["hits"][0]["_id"], exact["hits"]["hits"][0]["_id"],
+        "same top hit"
+    );
+    let _ = client.delete(format!("{}/{index}", os_base_url())).send();
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
 /// #339: the fulltext arm refuses, before the timed window, an index whose
 /// text fields use the default analyzer (built by a vector-only config) and an
 /// index missing a searched text field — both reached through `--skip-upload`.

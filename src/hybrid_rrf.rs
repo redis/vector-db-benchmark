@@ -71,7 +71,7 @@
 //! server that ignored the fusion (raw BM25, linear or min-max scores) is
 //! refused, never scored.
 
-use crate::fulltext::{self, Analysis, FieldBoost, FulltextSpec};
+use crate::fulltext::{self, Analysis, FieldBoost, FulltextSpec, TotalHits};
 use crate::workload::Workload;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -173,6 +173,82 @@ pub fn check_text_spec(spec: &FulltextSpec) -> Result<(), String> {
                 .into(),
         );
     }
+    if spec.total_hits == Some(TotalHits::Exact) {
+        return Err(
+            "hybrid-rrf refuses `fulltext.total_hits: \"exact\"`: Redis FT.HYBRID has no \
+             counting option (its total_results is the size of the fused result set, not a \
+             match count), so only OpenSearch could count and the pair would do different \
+             work. Use \"none\" (or leave it unset, which is \"none\" on both engines)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The total-hits mode of a hybrid-rrf config: always [`TotalHits::None`].
+///
+/// - OpenSearch: the `hybrid` query is sent with `track_total_hits: false`,
+///   and a reply carrying `hits.total` is refused.
+/// - Redis: `FT.HYBRID` has no `WITHCOUNT` / `WITHOUTCOUNT`, and its
+///   `total_results` is the fused result count, never a match count.
+///
+/// So neither engine returns a match count. `"exact"` cannot be expressed on
+/// Redis and is refused by [`check_text_spec`]. `"none"` stated is recorded as
+/// declared, and unset is the same request on both engines (symmetric).
+pub fn total_hits_plan(
+    engine: &str,
+    spec: &FulltextSpec,
+) -> Result<fulltext::TotalHitsPlan, String> {
+    if !matches!(engine, "redis" | "opensearch") {
+        return Err(format!(
+            "hybrid-rrf: engine '{engine}' has no total-hits contract"
+        ));
+    }
+    check_text_spec(spec)?;
+    Ok(fulltext::TotalHitsPlan {
+        mode: TotalHits::None,
+        declared: spec.total_hits.is_some(),
+        symmetric: true,
+    })
+}
+
+/// Record `plan` in a hybrid-rrf result block (`params.hybrid_rrf`):
+/// `total_hits` (`mode`, `declared`, `sent`, `server_total`) and
+/// `total_hits_symmetric`, as the fulltext workload does.
+pub fn record_total_hits(
+    meta: &mut Value,
+    engine: &str,
+    plan: &fulltext::TotalHitsPlan,
+) -> Result<(), String> {
+    if plan.mode != TotalHits::None {
+        return Err(format!(
+            "hybrid-rrf: total_hits \"{}\" cannot be sent",
+            plan.mode.as_str()
+        ));
+    }
+    let (sent, server_total) = match engine {
+        "opensearch" => (
+            "track_total_hits: false on the hybrid query",
+            "not computed: hits.total absent (checked on every reply)",
+        ),
+        "redis" => (
+            "FT.HYBRID (no counting option exists)",
+            "not computed: total_results is the fused result count and is not published",
+        ),
+        other => {
+            return Err(format!(
+                "hybrid-rrf: engine '{other}' has no total-hits contract"
+            ))
+        }
+    };
+    meta["total_hits"] = json!({
+        "mode": plan.mode.as_str(),
+        "declared": plan.declared,
+        "sent": sent,
+        "server_total": server_total,
+        "reference": "the untimed reference requests are not affected",
+    });
+    meta["total_hits_symmetric"] = json!(plan.symmetric);
     Ok(())
 }
 
@@ -1012,7 +1088,8 @@ pub fn check_opensearch_pipeline(
 /// The hybrid search body: `size: top`, a `hybrid` query whose subqueries are
 /// the fulltext workload's `multi_match` and a lucene `knn` with `k: W` and
 /// `method_parameters.ef_search`, `pagination_depth: W` (each subquery keeps
-/// its top W per shard). Sent with `?search_pipeline=<id>`.
+/// its top W per shard). Sent with `?search_pipeline=<id>`. `track_total_hits`
+/// comes from `total`, the mode of [`total_hits_plan`].
 pub fn opensearch_hybrid_body(
     fields: &[FieldBoost],
     terms: &[String],
@@ -1020,12 +1097,13 @@ pub fn opensearch_hybrid_body(
     ef: i64,
     spec: &RrfSpec,
     top: usize,
+    total: TotalHits,
 ) -> Value {
     let text = fulltext::opensearch_body(fields, terms, spec.window)["query"].clone();
     json!({
         "size": top,
         "_source": false,
-        "track_total_hits": false,
+        "track_total_hits": fulltext::opensearch_track_total_hits(total),
         "query": {"hybrid": {
             "pagination_depth": spec.window,
             "queries": [
@@ -1734,6 +1812,109 @@ mod tests {
         assert!(check_opensearch_pipeline(&json!({ name.clone(): stringy }), &name, &s).is_ok());
     }
 
+    /// `fulltext.total_hits` on a hybrid-rrf config is never read and then
+    /// ignored. `"exact"` is refused at startup (FT.HYBRID cannot count);
+    /// `"none"` and unset both plan `none`, and a stated `"none"` is recorded
+    /// as declared.
+    #[test]
+    fn hybrid_total_hits_is_honoured_or_refused_never_ignored() {
+        let block = |t: Option<&str>| {
+            let mut b = json!({"fields": {"segment": 1.0}});
+            if let Some(t) = t {
+                b["total_hits"] = json!(t);
+            }
+            b
+        };
+        // Startup (the path `experiment` runs before connecting) and the arm.
+        let exact = block(Some("exact"));
+        let e =
+            fulltext::validate_declared("redis", Workload::HybridRrf, Some(&exact)).unwrap_err();
+        assert!(e.contains("FT.HYBRID has no counting option"), "{e}");
+        assert!(parse_text_spec(Some(&exact)).is_err());
+        // Even a spec that bypassed the parser cannot plan `exact`.
+        let mut forced = fulltext::parse_spec(Some(&block(None))).unwrap();
+        forced.total_hits = Some(TotalHits::Exact);
+        assert!(total_hits_plan("opensearch", &forced).is_err());
+        // The same block is fine on the fulltext workload, so the refusal is
+        // hybrid's own.
+        assert!(fulltext::validate_declared("redis", Workload::Fulltext, Some(&exact)).is_ok());
+
+        for (t, declared) in [(Some("none"), true), (None, false)] {
+            let spec = parse_text_spec(Some(&block(t))).unwrap();
+            for engine in ["redis", "opensearch"] {
+                let plan = total_hits_plan(engine, &spec).unwrap();
+                assert_eq!(plan.mode, TotalHits::None, "{engine} {t:?}");
+                assert_eq!(plan.declared, declared, "{engine} {t:?}");
+                assert!(plan.symmetric);
+                let mut meta = json!({});
+                record_total_hits(&mut meta, engine, &plan).unwrap();
+                assert_eq!(meta["total_hits"]["mode"], "none");
+                assert_eq!(meta["total_hits"]["declared"], declared);
+                assert_eq!(meta["total_hits_symmetric"], true);
+            }
+        }
+        let plan = total_hits_plan("redis", &parse_text_spec(None).unwrap()).unwrap();
+        assert!(total_hits_plan("qdrant", &parse_text_spec(None).unwrap()).is_err());
+        assert!(record_total_hits(&mut json!({}), "qdrant", &plan).is_err());
+        let exact_plan = fulltext::TotalHitsPlan {
+            mode: TotalHits::Exact,
+            ..plan
+        };
+        assert!(record_total_hits(&mut json!({}), "redis", &exact_plan).is_err());
+    }
+
+    /// The hybrid body's `track_total_hits` follows the mode it is given (not
+    /// a constant), and the reply check refuses a total under `none`.
+    #[test]
+    fn opensearch_hybrid_body_takes_track_total_hits_from_the_mode() {
+        let f = vec![FieldBoost {
+            field: "segment".into(),
+            boost: 1.0,
+        }];
+        let terms = vec!["zebra".to_string()];
+        let s = spec(100, 60);
+        for (mode, want) in [(TotalHits::None, false), (TotalHits::Exact, true)] {
+            let b = opensearch_hybrid_body(&f, &terms, &[0.5, 0.25], 200, &s, 10, mode);
+            assert_eq!(b["track_total_hits"], json!(want), "{mode:?}");
+        }
+        let with_total = json!({"timed_out":false,"_shards":{"failed":0},
+            "hits":{"total":{"value":3,"relation":"eq"},"hits":[{"_id":"a","_score":0.03}]}});
+        assert!(
+            fulltext::opensearch_ranked_page_with(&with_total, 10, true, TotalHits::None).is_err()
+        );
+    }
+
+    /// The shipped hybrid-rrf configs state `none`, so their results record
+    /// `declared: true`.
+    #[test]
+    fn shipped_hybrid_rrf_configs_state_total_hits_none() {
+        for file in [
+            "redis-msmarco-hybrid-rrf.json",
+            "opensearch-msmarco-hybrid-rrf.json",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("experiments/configurations")
+                .join(file);
+            let configs: Vec<Value> =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let mut n = 0;
+            for c in &configs {
+                let engine = c["engine"].as_str().unwrap();
+                for sp in c["search_params"].as_array().unwrap() {
+                    let spec = parse_text_spec(sp.get(fulltext::SPEC_KEY)).unwrap();
+                    let plan = total_hits_plan(engine, &spec).unwrap();
+                    assert_eq!(
+                        (plan.mode, plan.declared),
+                        (TotalHits::None, true),
+                        "{file}"
+                    );
+                    n += 1;
+                }
+            }
+            assert!(n > 0, "{file}");
+        }
+    }
+
     #[test]
     fn opensearch_body_fuses_the_fulltext_query_and_a_window_deep_knn() {
         let f = vec![FieldBoost {
@@ -1742,7 +1923,7 @@ mod tests {
         }];
         let terms = vec!["zebra".to_string()];
         let s = spec(100, 60);
-        let b = opensearch_hybrid_body(&f, &terms, &[0.5, 0.25], 200, &s, 10);
+        let b = opensearch_hybrid_body(&f, &terms, &[0.5, 0.25], 200, &s, 10, TotalHits::None);
         assert_eq!(b["size"], 10);
         let h = &b["query"]["hybrid"];
         assert_eq!(h["pagination_depth"], 100);

@@ -88,7 +88,18 @@ pub fn check_redis_command(args: &[&[u8]]) -> Result<(), String> {
         let option = text(args[i]).to_ascii_uppercase();
         let operands = match option.as_str() {
             "NOCONTENT" => 0,
-            "DIALECT" | "TIMEOUT" => 1,
+            // The contract is an exact total. DIALECT 4+ turns RediSearch's
+            // optimizer on, which clamps `total_results` to the page like
+            // WITHOUTCOUNT (itself refused below as an unexpected argument).
+            "DIALECT" => match args.get(i + 1).map(|a| text(a).parse::<u32>()) {
+                Some(Ok(d)) if d >= 4 => {
+                    return refuse(format!(
+                        "DIALECT {d} implies WITHOUTCOUNT, and filter-only needs exact totals"
+                    ))
+                }
+                _ => 1,
+            },
+            "TIMEOUT" => 1,
             "LIMIT" => 2,
             "PARAMS" => {
                 let n = args

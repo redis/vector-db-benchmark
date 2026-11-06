@@ -4945,10 +4945,18 @@ fn test_binary_redis_filter_only_rejects_vector_index_reuse() {
     fs::remove_dir_all(proj.root).unwrap();
 }
 
-/// Inspect what the CLI actually sent, not a separately hand-written range.
-/// Restoring logging before any assertions prevents a failed regression from
-/// changing how subsequent tests exercise the isolated Redis instance.
-fn capture_bounded_range_search(conn: &mut Connection, run: impl FnOnce() -> bool) -> Vec<Vec<u8>> {
+/// Every command the server executed while `run` ran, oldest first, as its
+/// argument vector (SLOWLOG with a zero threshold: what was on the wire, not
+/// what a test rebuilt). `max` bounds the log; the capture fails rather than
+/// return a log that may have dropped entries. Logging is restored before
+/// `run`'s outcome is asserted, so a failed regression does not change how
+/// subsequent tests exercise the isolated Redis instance.
+fn capture_commands(
+    conn: &mut Connection,
+    max: usize,
+    what: &str,
+    run: impl FnOnce() -> bool,
+) -> Vec<Vec<Vec<u8>>> {
     let old: Vec<String> = redis::cmd("CONFIG")
         .arg("GET")
         .arg("slowlog-log-slower-than")
@@ -4960,7 +4968,7 @@ fn capture_bounded_range_search(conn: &mut Connection, run: impl FnOnce() -> boo
         .arg("slowlog-log-slower-than")
         .arg(0)
         .arg("slowlog-max-len")
-        .arg(256)
+        .arg(max)
         .query::<()>(conn)
         .unwrap();
     redis::cmd("SLOWLOG")
@@ -4970,22 +4978,37 @@ fn capture_bounded_range_search(conn: &mut Connection, run: impl FnOnce() -> boo
     let succeeded = run();
     let entries = redis::cmd("SLOWLOG")
         .arg("GET")
-        .arg(256)
+        .arg(max)
         .query::<Vec<redis::Value>>(conn);
     redis::cmd("CONFIG")
         .arg("SET")
         .arg(&old)
         .query::<()>(conn)
         .unwrap();
-    assert!(succeeded, "bounded range CLI query failed");
-    let searches: Vec<Vec<Vec<u8>>> = entries
-        .unwrap()
+    assert!(succeeded, "{what} CLI run failed");
+    let entries = entries.unwrap();
+    assert!(
+        entries.len() < max,
+        "SLOWLOG filled ({max} entries): {what} commands may have been dropped"
+    );
+    // SLOWLOG GET is newest first.
+    entries
         .into_iter()
-        .filter_map(|entry| {
+        .rev()
+        .map(|entry| {
             let redis::Value::Array(fields) = entry else {
                 panic!("unexpected SLOWLOG entry: {entry:?}");
             };
-            let args: Vec<Vec<u8>> = redis::from_redis_value(fields[3].clone()).unwrap();
+            redis::from_redis_value(fields[3].clone()).unwrap()
+        })
+        .collect()
+}
+
+/// Inspect what the CLI actually sent, not a separately hand-written range.
+fn capture_bounded_range_search(conn: &mut Connection, run: impl FnOnce() -> bool) -> Vec<Vec<u8>> {
+    let searches: Vec<Vec<Vec<u8>>> = capture_commands(conn, 1024, "bounded range", run)
+        .into_iter()
+        .filter_map(|args: Vec<Vec<u8>>| {
             // Upload/reuse validation also sends FT.SEARCH * LIMIT 0 0.
             // Select the driver's parameterized numeric predicate, captured
             // before this test sends any replay or EXPLAIN request of its own.
@@ -5460,6 +5483,133 @@ fn run_redis_hybrid_rrf(parity: bool) {
         "{engine}"
     );
     flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// `fulltext.total_hits`: each mode reaches the server as configured. The
+/// run records the mode per search config, and the server's SLOWLOG shows
+/// every ranked `FT.SEARCH` was sent with that mode; then the command
+/// the library builds for each mode is sent to the live index: `exact`
+/// returns the full count, `none` (`WITHOUTCOUNT`) a `total_results` clamped
+/// to the page, with the same top hit and score (ranking unchanged).
+#[test]
+fn test_binary_redis_fulltext_total_hits_modes() {
+    use vector_db_benchmark::fulltext::{self, Analysis, TotalHits};
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let name = "redis-bm25-totals";
+    let configs = serde_json::json!([{
+        "name": name, "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": common::bm25_total_hits_search_params()
+    }]);
+    let proj = common::write_bm25_project(&configs.to_string());
+    let port = test_port().to_string();
+    let sent = capture_commands(&mut conn, 4096, "fulltext total-hits", || {
+        common::run_binary_extra(
+            &proj.root,
+            name,
+            common::BM25_DATASET,
+            TEST_HOST,
+            &[("REDIS_PORT", &port)],
+            &["--fail-on-dropped-queries", "--keep-data"],
+        )
+    });
+    common::assert_bm25_total_hits_run(&proj.root, "redis", name);
+    // The recorded mode comes from the plan; check the engine arm actually
+    // sent it. Search config 0 (`none`) first probes the server: counted /
+    // WITHOUTCOUNT pairs of the same query. Then every one of its ranked
+    // queries (WITHSCORES, prime + 5 timed) carries WITHOUTCOUNT, and all of
+    // them run before those of search config 1 (`exact`), none of which
+    // does. Reverting the arm to a counted (or an always-WITHOUTCOUNT)
+    // builder, or dropping the probe, fails here, not only in the metadata.
+    let has = |args: &[Vec<u8>], flag: &[u8]| args.iter().any(|a| a.eq_ignore_ascii_case(flag));
+    let ranked: Vec<(bool, Vec<u8>)> = sent
+        .iter()
+        .filter(|args| {
+            args.first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(b"FT.SEARCH"))
+                && has(args, b"WITHSCORES")
+        })
+        .map(|args| {
+            (
+                has(args, fulltext::REDIS_WITHOUTCOUNT.as_bytes()),
+                args[2].clone(),
+            )
+        })
+        .collect();
+    let flags: Vec<bool> = ranked.iter().map(|r| r.0).collect();
+    let exact_tail = flags.iter().rev().take_while(|w| !**w).count();
+    assert!(
+        exact_tail >= 5,
+        "search config 1 (total_hits: exact) must send no WITHOUTCOUNT: {flags:?}"
+    );
+    // Search config 0 runs once per repetition, each as: the probe (a query
+    // with no match is sent counted only; otherwise counted then WITHOUTCOUNT
+    // for the same query), then one priming query and the 5 timed ones, all
+    // WITHOUTCOUNT. Parse that shape; anything else fails.
+    let body = &ranked[..flags.len() - exact_tail];
+    let (mut i, mut runs) = (0, 0);
+    while i < body.len() {
+        let mut pairs = 0;
+        while i < body.len() && !body[i].0 {
+            if body.get(i + 1).is_some_and(|n| n.0 && n.1 == body[i].1) {
+                pairs += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let timed = body[i..].iter().take_while(|r| r.0).count();
+        assert!(
+            pairs >= 1 && timed == 6,
+            "search config 0 (total_hits: none) must probe counted / WITHOUTCOUNT pairs \
+             of the same query, then send its 6 ranked FT.SEARCH with WITHOUTCOUNT: \
+             {flags:?}"
+        );
+        i += timed;
+        runs += 1;
+    }
+    assert!(runs >= 1, "search config 0 sent nothing: {flags:?}");
+
+    let query = fulltext::redis_query(&common::bm25_total_hits_fields(), &["apple".to_string()]);
+    // RESP2 reply: [total, id, score, …] (NOCONTENT WITHSCORES).
+    let search = |conn: &mut redis::Connection, mode| {
+        let mut cmd = redis::cmd("FT.SEARCH");
+        for a in fulltext::redis_args_with(
+            &format!("idx:{name}"),
+            &query,
+            1,
+            5000,
+            Analysis::English,
+            mode,
+        ) {
+            cmd.arg(a);
+        }
+        let reply: Vec<redis::Value> = cmd.query(conn).unwrap();
+        let total = match &reply[0] {
+            redis::Value::Int(n) => *n as u64,
+            v => panic!("total: {v:?}"),
+        };
+        let hit: Vec<String> = reply[1..]
+            .iter()
+            .map(|v| redis::from_redis_value::<String>(v.clone()).unwrap())
+            .collect();
+        (total, hit)
+    };
+    let (exact_total, exact_hit) = search(&mut conn, TotalHits::Exact);
+    let (none_total, none_hit) = search(&mut conn, TotalHits::None);
+    assert_eq!(exact_total, common::BM25_APPLE_MATCHES, "exact count");
+    assert_eq!(
+        none_total, 1,
+        "WITHOUTCOUNT must not count: total_results is clamped to LIMIT 0 1"
+    );
+    assert_eq!(exact_hit.len(), 2, "one id + score: {exact_hit:?}");
+    assert_eq!(none_hit, exact_hit, "WITHOUTCOUNT changed the ranked page");
+    flush_db(&mut conn);
+    let _ = redis::cmd("DEL")
+        .arg(format!("vdbb:fulltext-profile:idx:{name}"))
+        .query::<()>(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
 

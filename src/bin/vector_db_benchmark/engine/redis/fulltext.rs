@@ -170,6 +170,10 @@ impl RedisEngine {
     ) -> Result<SearchResults, String> {
         self.prepare_search(dataset)?;
         let spec = fulltext::parse_spec(params.knob(fulltext::SPEC_KEY))?;
+        let total_hits = fulltext::total_hits_plan("redis", &spec)?;
+        if !total_hits.symmetric {
+            eprintln!("⚠  {}", fulltext::ASYMMETRIC_TOTAL_HITS_WARNING);
+        }
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
 
         let profile = self
@@ -199,18 +203,44 @@ impl RedisEngine {
             .iter()
             .map(|q| {
                 let mut cmd = redis::cmd("FT.SEARCH");
-                for a in fulltext::redis_args_for(
+                for a in fulltext::redis_args_with(
                     &self.config.index_name,
                     &fulltext::query_redis(&fields, q),
                     top,
                     query_timeout,
                     profile.analysis,
+                    total_hits.mode,
                 ) {
                     cmd.arg(a);
                 }
                 cmd
             })
             .collect();
+        // `none`: WITHOUTCOUNT keeps the BM25 ranking only on some RediSearch
+        // versions, so it is checked on this server before the timed window.
+        let withoutcount_probe = if total_hits.mode == fulltext::TotalHits::None {
+            let mut conn = resp3_connection(&self.redis_url, self.config.cluster_api)
+                .map_err(|e| format!("fulltext: Redis RESP3 connection failed: {e}"))?;
+            let probe = fulltext::probe_withoutcount(set.queries.len(), top, |i, mode| {
+                let mut cmd = redis::cmd("FT.SEARCH");
+                for a in fulltext::redis_args_with(
+                    &self.config.index_name,
+                    &fulltext::query_redis(&fields, &set.queries[i]),
+                    top,
+                    query_timeout,
+                    profile.analysis,
+                    mode,
+                ) {
+                    cmd.arg(a);
+                }
+                cmd.query::<redis::Value>(&mut conn)
+                    .map_err(|e| e.to_string())
+            })?;
+            Some(probe)
+        } else {
+            None
+        };
+        let rank_violations = AtomicUsize::new(0);
         let order = fulltext::schedule(commands.len(), num_queries);
         let num_to_run = order.len();
         let parallel = params.parallel.unwrap_or(1).max(1) as usize;
@@ -228,7 +258,7 @@ impl RedisEngine {
             for _ in 0..parallel {
                 let (url, commands, order, queries) =
                     (&self.redis_url, &commands, &order, &set.queries);
-                let (next, pb) = (&next, &pb);
+                let (next, pb, rank_violations) = (&next, &pb, &rank_violations);
                 let cluster_api = self.config.cluster_api;
                 pool.spawn(move |ticket| -> WorkerOut {
                     let (mut samples, mut errs, mut cap) = (Vec::new(), Vec::new(), Vec::new());
@@ -265,7 +295,12 @@ impl RedisEngine {
                         let elapsed = start.elapsed().as_secs_f64();
                         let query_id = queries[i].query_id;
                         match reply.map_err(|e| e.to_string()).and_then(|v| {
-                            let p = fulltext::redis_ranked_page(&v, top, capture)?;
+                            let p = fulltext::redis_ranked_page_with(
+                                &v,
+                                top,
+                                capture,
+                                total_hits.mode,
+                            )?;
                             fulltext::check_query_count(&queries[i], p.total)?;
                             Ok(p)
                         }) {
@@ -304,6 +339,9 @@ impl RedisEngine {
                                 }
                             }
                             Err(e) => {
+                                if fulltext::is_rank_violation(&e) {
+                                    rank_violations.fetch_add(1, Ordering::Relaxed);
+                                }
                                 if capture {
                                     cap.push(RawQueryResult::failed(query_id, seq, elapsed, &e));
                                 }
@@ -347,6 +385,7 @@ impl RedisEngine {
         for e in errors.iter().take(3) {
             eprintln!("{e}");
         }
+        fulltext::check_rank_violations(total_hits.mode, rank_violations.into_inner())?;
         if let Some(e) = capture_failure {
             return Err(format!("--dump-results: {e}"));
         }
@@ -374,6 +413,10 @@ impl RedisEngine {
         let mut meta =
             fulltext::result_metadata_for("redis", &fields, &set, top, &profile, &recorded_marker)?;
         meta["redis_min_stem_len"] = min_stem_len;
+        fulltext::record_total_hits(&mut meta, "redis", &total_hits)?;
+        if let Some(probe) = &withoutcount_probe {
+            fulltext::record_withoutcount_probe(&mut meta, probe);
+        }
         result.fulltext = Some(meta);
         Ok(result)
     }

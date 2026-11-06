@@ -78,6 +78,7 @@ impl OpenSearchEngine {
         }
         let spec = hr::parse_spec(params.knob(hr::SPEC_KEY))?;
         let text_spec = hr::parse_text_spec(params.knob(fulltext::SPEC_KEY))?;
+        let total_hits = hr::total_hits_plan("opensearch", &text_spec)?;
         let ef = params.search_params.as_ref().and_then(|p| p.ef);
         let top = hr::check_params(
             params.top,
@@ -145,6 +146,7 @@ impl OpenSearchEngine {
             &pipeline,
             params,
             num_queries,
+            total_hits.mode,
         );
         // Drop the pipeline whatever happened; a failure to drop is reported
         // but does not hide the run's own error.
@@ -180,7 +182,7 @@ impl OpenSearchEngine {
             "number_of_shards": shards,
             "retried_queries": retried,
         });
-        result.hybrid_rrf = Some(hr::result_metadata(
+        let mut meta = hr::result_metadata(
             &spec,
             top,
             ef,
@@ -188,7 +190,9 @@ impl OpenSearchEngine {
             engine,
             &hr::ReferenceStats::of(&references, spec.window),
             mean_strict,
-        ));
+        );
+        hr::record_total_hits(&mut meta, "opensearch", &total_hits)?;
+        result.hybrid_rrf = Some(meta);
         Ok(result)
     }
 
@@ -206,6 +210,7 @@ impl OpenSearchEngine {
         pipeline: &str,
         params: &SearchParams,
         num_queries: i64,
+        total: fulltext::TotalHits,
     ) -> Result<(SearchResults, Vec<hr::Reference>, f64, u64), String> {
         let policy = SearchRetryPolicy::from_env();
         let to_raw =
@@ -247,6 +252,7 @@ impl OpenSearchEngine {
                     ef,
                     spec,
                     top,
+                    total,
                 ))
             })
             .collect::<Result<_, _>>()?;
@@ -262,7 +268,7 @@ impl OpenSearchEngine {
             Some(pipeline),
         )
         .map_err(|e| format!("hybrid-rrf: probe query failed (OpenSearch hybrid + RRF): {e}"))?;
-        parse_page(&probe, top)
+        parse_page(&probe, top, total)
             .and_then(|p| hr::score_page(&p, &references[0], spec, top))
             .map_err(|e| format!("hybrid-rrf: probe query: {e}"))?;
 
@@ -323,7 +329,7 @@ impl OpenSearchEngine {
                                 retried += u64::from(cost.retried);
                                 (
                                     elapsed.saturating_sub(cost.overhead).as_secs_f64(),
-                                    parse_page(&body, top),
+                                    parse_page(&body, top, total),
                                 )
                             }
                             Err(e) => (elapsed.as_secs_f64(), Err(e)),
@@ -365,9 +371,13 @@ impl OpenSearchEngine {
 
 /// A hybrid reply's page as `(row, fused score)`: the fulltext workload's
 /// completeness checks (no timeout, no failed shard, ranked, no duplicate,
-/// at most `top`), ids mapped to rows.
-fn parse_page(body: &serde_json::Value, top: usize) -> Result<Vec<(i64, f64)>, String> {
-    fulltext::opensearch_ranked_page(body, top, true)?
+/// at most `top`, `hits.total` as `total` asked for), ids mapped to rows.
+fn parse_page(
+    body: &serde_json::Value,
+    top: usize,
+    total: fulltext::TotalHits,
+) -> Result<Vec<(i64, f64)>, String> {
+    fulltext::opensearch_ranked_page_with(body, top, true, total)?
         .hits
         .unwrap_or_default()
         .iter()
