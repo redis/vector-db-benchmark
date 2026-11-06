@@ -1188,8 +1188,16 @@ hybrid-rrf has no filter clause, and its KNN truth would be the filtered one.
   ranked query, untimed) and the **exact** KNN top `W` (the dataset's
   brute-forced neighbours, which must be at least `W` deep);
 - `mean_recall` is tie-aware recall@`top`. A returned document counts as a hit
-  when its reference score is at least the reference score at position `top`.
-  Both scores are the client's own f64 fusion, so the comparison is exact (to
+  when its reference score is strictly above the reference score at position
+  `top`. Returned documents tied at that cut-off score also count, but only up
+  to the slots the reference gives the tie group (`top` minus the number of
+  reference documents strictly above the cut-off), so an extra tied document
+  never stands in for a missed higher-scoring one: with BM25 `[1,2,3]` and KNN
+  `[4,5,6]` (reference 1,4,2,5,3,6; 1/4, 2/5 and 3/6 tied), `top` = 3 cuts
+  inside the 2/5 tie, which owns one slot, so the page `[1,5,2]` (4 missed)
+  scores 2/3, not 1.
+  Precision uses the same hits; the denominator is `min(top, |reference|)`.
+  Both scores are the client's own f64 fusion, so ties compare exactly (to
   `1e-12` relative, for last-ulp rounding of equal sums): distinct RRF values
   can be ~1e-6 apart, and a document strictly below the cut-off is a miss.
   The wider `1e-5` tolerance applies only to engine-returned scores (OpenSearch

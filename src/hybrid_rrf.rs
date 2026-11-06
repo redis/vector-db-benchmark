@@ -504,6 +504,16 @@ pub struct QueryScore {
 /// below the cutoff would count as a hit.
 pub const REFERENCE_TIE_TOLERANCE: f64 = 1e-12;
 
+/// How `mean_recall` is computed, as published in every result JSON
+/// (`params.hybrid_rrf.quality.mean_recall`). Must describe [`score_query`].
+pub const MEAN_RECALL_DEFINITION: &str = "tie-aware recall@top: a returned id is a hit when its \
+     reference RRF score is strictly above the reference score at position top; returned ids \
+     tied at that score also count, but only up to the slots the reference gives the tie group \
+     (top minus the number of reference ids strictly above the cutoff), so a tied id never \
+     stands in for a missed higher-scoring one. Ties compare within tie_tolerance_relative \
+     (both scores client-side f64, exact lattice ties only). Precision uses the same hits; \
+     denominator min(top, |reference|)";
+
 /// Score one fused page (row ids, rank order) against its reference. See the
 /// module docs: the denominator is `min(top, |reference|)`; a hit is a
 /// returned id whose reference score is strictly above the reference score at
@@ -1106,10 +1116,7 @@ pub fn result_metadata(
             "mean_ids_in_both_lists": stats.mean_in_both,
         },
         "quality": {
-            "mean_recall": "tie-aware recall@top: a returned id is a hit when its reference RRF \
-                            score is >= the reference score at position top (both client-side \
-                            f64; relative tolerance below, exact lattice ties only); \
-                            denominator min(top, |reference|)",
+            "mean_recall": MEAN_RECALL_DEFINITION,
             "tie_tolerance_relative": REFERENCE_TIE_TOLERANCE,
             "engine_score_tolerance_relative": TIE_TOLERANCE,
             "mean_strict_recall": mean_strict_recall,
@@ -1801,5 +1808,42 @@ mod tests {
         assert_eq!(m["bm25"]["analysis"], "english");
         assert_eq!(m["quality"]["mean_strict_recall"], 0.9);
         assert_eq!(m["reference"]["queries"], 2);
+        assert_eq!(m["quality"]["mean_recall"], MEAN_RECALL_DEFINITION);
+    }
+
+    /// The published definitions of `mean_recall` (result JSON and README)
+    /// must state the rule [`score_query`] implements: strictly above the
+    /// cutoff, plus cutoff-tie members capped at the group's reference slots.
+    /// A ">= cutoff" wording describes the pre-cap rule, under which the
+    /// documented example page [1,5,2] would score 1.0 instead of 2/3.
+    #[test]
+    fn mean_recall_definition_matches_score_query() {
+        let readme = include_str!("../README.md");
+        for (what, text) in [
+            ("result JSON", MEAN_RECALL_DEFINITION.to_string()),
+            (
+                "README",
+                readme.split_whitespace().collect::<Vec<_>>().join(" "),
+            ),
+        ] {
+            assert!(
+                text.contains("strictly above the reference score at position"),
+                "{what}: mean_recall definition lost the strict-above rule"
+            );
+            assert!(
+                text.contains("only up to the slots the reference gives the tie group"),
+                "{what}: mean_recall definition lost the tie-group slot cap"
+            );
+            assert!(
+                !text.contains(">= the reference score at position")
+                    && !text.contains("at least the reference score at position"),
+                "{what}: stale >= cutoff definition of mean_recall"
+            );
+        }
+        // The README's worked example is what score_query reports.
+        let r = reference(&[1, 2, 3], &[4, 5, 6], &spec(10, 60)).unwrap();
+        let sub = score_query(&[1, 5, 2], &r, 3);
+        assert!((sub.recall - 2.0 / 3.0).abs() < 1e-12, "{sub:?}");
+        assert!(readme.contains("the page `[1,5,2]` (4 missed)"));
     }
 }
