@@ -1,6 +1,7 @@
 [
   {
     "name": "redis-msmarco-hybrid-rrf-english",
+    "_comment": "hybrid-rrf (README). Verified live on the 8-doc fixture only; not yet run on MS MARCO \u2014 record mean_recall, mean_strict_recall, score_check_lattice_coverage before quoting numbers.",
     "engine": "redis",
     "collection_params": {
       "hnsw_config": {
@@ -55,6 +56,7 @@
   },
   {
     "name": "redis-msmarco-hybrid-rrf-parity",
+    "_comment": "hybrid-rrf (README). Verified live on the 8-doc fixture only; not yet run on MS MARCO \u2014 record mean_recall, mean_strict_recall, score_check_lattice_coverage before quoting numbers.",
     "engine": "redis",
     "collection_params": {
       "hnsw_config": {

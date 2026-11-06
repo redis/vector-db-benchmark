@@ -209,6 +209,13 @@ impl RedisEngine {
                 .as_deref(),
         )?;
         crate::effective_config::record_effective("cluster_api", serde_json::json!(cluster_api));
+        let workloads: Vec<Workload> = engine_config
+            .search_params
+            .iter()
+            .flatten()
+            .filter_map(|sp| sp.workload)
+            .collect();
+        vector_db_benchmark::hybrid_rrf::check_redis_deployment(cluster_api, &workloads)?;
         let prefix_scan_limits =
             ScanLimits::parse(cp_extra.and_then(|cp| cp.get("prefix_scan_limits")))?;
         crate::effective_config::record_effective(
@@ -4302,6 +4309,14 @@ mod tests {
         }))
         .unwrap();
         assert!(super::RedisEngine::new(&ec, "localhost").is_err());
+        // hybrid-rrf is refused through the Cluster API, at construction.
+        let ec: crate::config::EngineConfig = serde_json::from_value(serde_json::json!({
+            "name":"hrrf-cluster","engine":"redis","collection_params":{"cluster_api":true},
+            "search_params":[{"workload":"hybrid-rrf"}]
+        }))
+        .unwrap();
+        let e = super::RedisEngine::new(&ec, "localhost").err().unwrap();
+        assert!(e.contains("Cluster API"), "{e}");
     }
 
     #[test]

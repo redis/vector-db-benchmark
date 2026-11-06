@@ -186,6 +186,24 @@ pub fn validate_declared(workload: Workload, block: Option<&Value>) -> Result<()
     }
 }
 
+/// Redis deployment check, at engine construction: hybrid-rrf is refused
+/// through the OSS Cluster API. The reference is the GLOBAL top W of each
+/// list. How the RediSearch coordinator merges FT.HYBRID's subquery lists
+/// across shards before fusing is not verified live. A shard-local fusion
+/// still yields scores on the RRF lattice, so the probe could not tell. This
+/// is the Redis counterpart of the OpenSearch `allow_multi_shard` refusal.
+pub fn check_redis_deployment(cluster_api: bool, workloads: &[Workload]) -> Result<(), String> {
+    if cluster_api && workloads.contains(&Workload::HybridRrf) {
+        return Err(
+            "hybrid-rrf refuses the Redis Cluster API (cluster_api / REDIS_CLUSTER): the \
+             reference is the global top W per list and FT.HYBRID's cross-shard merge is not \
+             verified live — run it against a single-shard endpoint"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Startup check of a `hybrid-rrf` config's typed keys. Returns `top`.
 ///
 /// - `top` is required (never derived from the ground-truth width) and at
@@ -1114,6 +1132,14 @@ mod tests {
         // query-count scheduling only
         assert!(check_params(Some(10), Some(100), &s, Some(50.0), None).is_err());
         assert!(check_params(Some(10), Some(100), &s, None, Some(5.0)).is_err());
+    }
+
+    #[test]
+    fn redis_cluster_api_is_refused_for_hybrid_rrf_only() {
+        let e = check_redis_deployment(true, &[Workload::Vector, Workload::HybridRrf]).unwrap_err();
+        assert!(e.contains("Cluster API"), "{e}");
+        assert!(check_redis_deployment(false, &[Workload::HybridRrf]).is_ok());
+        assert!(check_redis_deployment(true, &[Workload::Vector, Workload::Fulltext]).is_ok());
     }
 
     #[test]
