@@ -5517,30 +5517,60 @@ fn test_binary_redis_fulltext_total_hits_modes() {
     });
     common::assert_bm25_total_hits_run(&proj.root, "redis", name);
     // The recorded mode comes from the plan; check the engine arm actually
-    // sent it. Every ranked query (WITHSCORES) of search config 0 (`none`)
-    // carries WITHOUTCOUNT and runs before those of search config 1
-    // (`exact`), none of which does. Reverting the arm to a counted (or an
-    // always-WITHOUTCOUNT) builder fails here, not only in the metadata.
+    // sent it. Search config 0 (`none`) first probes the server: counted /
+    // WITHOUTCOUNT pairs of the same query. Then every one of its ranked
+    // queries (WITHSCORES, prime + 5 timed) carries WITHOUTCOUNT, and all of
+    // them run before those of search config 1 (`exact`), none of which
+    // does. Reverting the arm to a counted (or an always-WITHOUTCOUNT)
+    // builder, or dropping the probe, fails here, not only in the metadata.
     let has = |args: &[Vec<u8>], flag: &[u8]| args.iter().any(|a| a.eq_ignore_ascii_case(flag));
-    let ranked: Vec<bool> = sent
+    let ranked: Vec<(bool, Vec<u8>)> = sent
         .iter()
         .filter(|args| {
             args.first()
                 .is_some_and(|c| c.eq_ignore_ascii_case(b"FT.SEARCH"))
                 && has(args, b"WITHSCORES")
         })
-        .map(|args| has(args, fulltext::REDIS_WITHOUTCOUNT.as_bytes()))
+        .map(|args| {
+            (
+                has(args, fulltext::REDIS_WITHOUTCOUNT.as_bytes()),
+                args[2].clone(),
+            )
+        })
         .collect();
-    let without = ranked.iter().take_while(|w| **w).count();
+    let flags: Vec<bool> = ranked.iter().map(|r| r.0).collect();
+    let exact_tail = flags.iter().rev().take_while(|w| !**w).count();
     assert!(
-        without >= 5,
-        "search config 0 (total_hits: none) must send every ranked FT.SEARCH with \
-         WITHOUTCOUNT: {ranked:?}"
+        exact_tail >= 5,
+        "search config 1 (total_hits: exact) must send no WITHOUTCOUNT: {flags:?}"
     );
-    assert!(
-        ranked.len() - without >= 5 && ranked[without..].iter().all(|w| !w),
-        "search config 1 (total_hits: exact) must send no WITHOUTCOUNT: {ranked:?}"
-    );
+    // Search config 0 runs once per repetition, each as: the probe (a query
+    // with no match is sent counted only; otherwise counted then WITHOUTCOUNT
+    // for the same query), then one priming query and the 5 timed ones, all
+    // WITHOUTCOUNT. Parse that shape; anything else fails.
+    let body = &ranked[..flags.len() - exact_tail];
+    let (mut i, mut runs) = (0, 0);
+    while i < body.len() {
+        let mut pairs = 0;
+        while i < body.len() && !body[i].0 {
+            if body.get(i + 1).is_some_and(|n| n.0 && n.1 == body[i].1) {
+                pairs += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let timed = body[i..].iter().take_while(|r| r.0).count();
+        assert!(
+            pairs >= 1 && timed == 6,
+            "search config 0 (total_hits: none) must probe counted / WITHOUTCOUNT pairs \
+             of the same query, then send its 6 ranked FT.SEARCH with WITHOUTCOUNT: \
+             {flags:?}"
+        );
+        i += timed;
+        runs += 1;
+    }
+    assert!(runs >= 1, "search config 0 sent nothing: {flags:?}");
 
     let query = fulltext::redis_query(&common::bm25_total_hits_fields(), &["apple".to_string()]);
     // RESP2 reply: [total, id, score, …] (NOCONTENT WITHSCORES).

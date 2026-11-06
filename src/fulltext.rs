@@ -271,12 +271,19 @@ impl Analysis {
 /// | `none` | `track_total_hits: false` (`hits.total` must be absent) | `WITHOUTCOUNT`: `total_results` is `min(count, LIMIT)` per shard, not a count |
 ///
 /// `none` frees OpenSearch to skip non-competitive blocks (block-max WAND).
-/// RediSearch 8.2+ parses `WITHOUTCOUNT` (`src/aggregate/aggregate_request.c`),
-/// but for a query with a text term and no `SORTBY` its optimizer still visits
-/// and scores every match (`src/query_optimizer.c`, `Q_OPT_NONE`) and keeps the
-/// score-ordered top `k`: the ranking is unchanged and only the reported total
-/// is clamped. `none` is refused for the compound suite, whose per-query count
-/// gate needs the exact total.
+/// On Redis, `WITHOUTCOUNT` turns on the query optimizer. From RediSearch 8.4
+/// the optimizer recognises `SCORER BM25STD`, so for a query with a text term
+/// and no `SORTBY` it still visits and scores every match
+/// (`src/query_optimizer.c`, `Q_OPT_NONE`) and keeps the score-ordered top
+/// `k`: the ranking is unchanged and only the reported total is clamped.
+/// RediSearch 8.0/8.2 parse `WITHOUTCOUNT`, but their optimizer does not know
+/// the `BM25STD` scorer name, so it drops the score sorter and returns the
+/// first `k` matches in document-id order. The ranking is therefore never
+/// assumed: before the timed window, [`probe_withoutcount`] compares counted
+/// and `WITHOUTCOUNT` pages on the live server and refuses `none` unless they
+/// are identical, and a `none` run fails if any timed reply is out of score
+/// order ([`check_rank_violations`]). `none` is refused for the compound
+/// suite, whose per-query count gate needs the exact total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TotalHits {
@@ -1289,7 +1296,9 @@ pub fn redis_args_for(
     redis_args_with(index, query, top, timeout_ms, analysis, TotalHits::Exact)
 }
 
-/// The `FT.SEARCH` flag that turns counting off (RediSearch 8.2+).
+/// The `FT.SEARCH` flag that turns counting off. It keeps the BM25 ranking
+/// only on RediSearch 8.4+ ([`TotalHits`]); [`probe_withoutcount`] checks that
+/// on the live server before a `none` run uses it.
 pub const REDIS_WITHOUTCOUNT: &str = "WITHOUTCOUNT";
 
 /// [`redis_args_for`] with the total-hits mode resolved by
@@ -1789,6 +1798,34 @@ pub fn validate_opensearch_index_for(
     Ok(shards)
 }
 
+/// The error [`RankCheck`] returns for a page that is not score-ordered.
+pub const RANK_VIOLATION: &str = "fulltext: reply is not ranked by descending score";
+
+/// The error [`RankCheck`] returns for a NaN or infinite score.
+const NON_FINITE_SCORE: &str = "fulltext: non-finite score in a ranked reply";
+
+/// `true` for a query error that says the reply was not a ranked page (out
+/// of score order, or a non-finite score).
+pub fn is_rank_violation(error: &str) -> bool {
+    error.contains(RANK_VIOLATION) || error.contains(NON_FINITE_SCORE)
+}
+
+/// Under `total_hits: "none"`, a Redis reply that is not score-ordered means
+/// `WITHOUTCOUNT` changed the ranking on this server, so the run is refused
+/// instead of reporting the other queries' QPS and latency as a BM25 top-k
+/// result. Other modes keep the existing behaviour (the failed query is
+/// dropped and reported).
+pub fn check_rank_violations(total_hits: TotalHits, violations: usize) -> Result<(), String> {
+    if total_hits == TotalHits::None && violations > 0 {
+        return Err(format!(
+            "fulltext: {violations} Redis replies sent with {REDIS_WITHOUTCOUNT} \
+             (`total_hits: \"none\"`) were not ranked by descending score: this server \
+             does not keep the BM25 ranking under {REDIS_WITHOUTCOUNT}; use \"exact\""
+        ));
+    }
+    Ok(())
+}
+
 /// Streaming rank check: every score finite and none above its predecessor.
 /// Holds no buffer, so the non-capturing path validates without allocating.
 #[derive(Default)]
@@ -1799,13 +1836,11 @@ struct RankCheck {
 impl RankCheck {
     fn push(&mut self, score: f64) -> Result<(), String> {
         if !score.is_finite() {
-            return Err("fulltext: non-finite score in a ranked reply".into());
+            return Err(NON_FINITE_SCORE.into());
         }
         if let Some(prev) = self.prev {
             if score > prev {
-                return Err(format!(
-                    "fulltext: reply is not ranked by descending score ({score} after {prev})"
-                ));
+                return Err(format!("{RANK_VIOLATION} ({score} after {prev})"));
             }
         }
         self.prev = Some(score);
@@ -1910,6 +1945,130 @@ pub fn redis_ranked_page_with(
         returned: results.len(),
         hits,
     })
+}
+
+/// How many queries with more matches than the page [`probe_withoutcount`]
+/// compares before it stops.
+pub const WITHOUTCOUNT_PROBE_QUERIES: usize = 8;
+
+/// What [`probe_withoutcount`] compared: `compared` queries with at least one
+/// match, of which `over_limit` had more matches than the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WithoutCountProbe {
+    pub compared: usize,
+    pub over_limit: usize,
+}
+
+/// Check, before the timed window, that `WITHOUTCOUNT` does not change the
+/// ranked page on this server. `send(i, mode)` runs query `i` of the query
+/// set built with `mode` ([`redis_args_with`]) and returns the raw reply.
+///
+/// Queries are taken in order; each with at least one match is sent counted
+/// and with `WITHOUTCOUNT`, and the two pages must hold the same `(id, score)`
+/// hits in the same order (ids may differ only inside the tied-score group cut
+/// by the page boundary). It stops after [`WITHOUTCOUNT_PROBE_QUERIES`] queries
+/// with more matches than `top`, and fails if it found none: a page that is
+/// not truncated cannot show that the server still selects the top `k`.
+/// RediSearch 8.0/8.2 fail it (their optimizer does not recognise
+/// `SCORER BM25STD` and returns the first `k` matches in document-id order).
+pub fn probe_withoutcount<F>(
+    queries: usize,
+    top: usize,
+    mut send: F,
+) -> Result<WithoutCountProbe, String>
+where
+    F: FnMut(usize, TotalHits) -> Result<redis::Value, String>,
+{
+    let refuse = |why: String| {
+        format!(
+            "fulltext: `total_hits: \"none\"` refused before the timed window: {why}. \
+             {REDIS_WITHOUTCOUNT} must return the same BM25-ranked page as a counted \
+             FT.SEARCH (RediSearch before 8.4 does not recognise SCORER {REDIS_SCORER} \
+             under {REDIS_WITHOUTCOUNT} and returns the first matches in document-id \
+             order); use \"exact\" on this server"
+        )
+    };
+    let mut probe = WithoutCountProbe {
+        compared: 0,
+        over_limit: 0,
+    };
+    for i in 0..queries {
+        if probe.over_limit >= WITHOUTCOUNT_PROBE_QUERIES {
+            break;
+        }
+        let counted = send(i, TotalHits::Exact)
+            .and_then(|v| redis_ranked_page_with(&v, top, true, TotalHits::Exact))
+            .map_err(|e| refuse(format!("query #{i} (counted): {e}")))?;
+        let total = counted
+            .total
+            .ok_or("fulltext: counted page without a total")?;
+        if total == 0 {
+            continue;
+        }
+        let uncounted = send(i, TotalHits::None)
+            .and_then(|v| redis_ranked_page_with(&v, top, true, TotalHits::None))
+            .map_err(|e| refuse(format!("query #{i} ({REDIS_WITHOUTCOUNT}): {e}")))?;
+        let truncated = total > top as u64;
+        same_ranked_page(
+            counted.hits.as_deref().unwrap_or_default(),
+            uncounted.hits.as_deref().unwrap_or_default(),
+            truncated,
+        )
+        .map_err(|e| refuse(format!("query #{i}: {e}")))?;
+        probe.compared += 1;
+        if truncated {
+            probe.over_limit += 1;
+        }
+    }
+    if probe.over_limit == 0 {
+        return Err(refuse(format!(
+            "no query has more than {top} matches, so the probe cannot show that \
+             {REDIS_WITHOUTCOUNT} still selects the top {top}"
+        )));
+    }
+    Ok(probe)
+}
+
+/// `counted` and `uncounted` hold the same hits: equal scores rank by rank,
+/// and the same ids within each tied-score group. When the page is cut by
+/// the limit (`truncated`), the last group may hold other ids of that score.
+fn same_ranked_page(
+    counted: &[(String, f64)],
+    uncounted: &[(String, f64)],
+    truncated: bool,
+) -> Result<(), String> {
+    let scores = |p: &[(String, f64)]| p.iter().map(|h| h.1).collect::<Vec<_>>();
+    if counted.len() != uncounted.len() || scores(counted) != scores(uncounted) {
+        return Err(format!(
+            "the {REDIS_WITHOUTCOUNT} page {uncounted:?} differs from the counted page \
+             {counted:?}"
+        ));
+    }
+    let mut start = 0;
+    while start < counted.len() {
+        let score = counted[start].1;
+        let end = start + counted[start..].iter().take_while(|h| h.1 == score).count();
+        let ids = |p: &[(String, f64)]| -> HashSet<String> {
+            p[start..end].iter().map(|h| h.0.clone()).collect()
+        };
+        if !(truncated && end == counted.len()) && ids(counted) != ids(uncounted) {
+            return Err(format!(
+                "the {REDIS_WITHOUTCOUNT} page {uncounted:?} holds other documents than \
+                 the counted page {counted:?}"
+            ));
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+/// Record the [`probe_withoutcount`] outcome under `total_hits`.
+pub fn record_withoutcount_probe(meta: &mut Value, probe: &WithoutCountProbe) {
+    meta["total_hits"]["withoutcount_probe"] = json!({
+        "compared_queries": probe.compared,
+        "queries_over_limit": probe.over_limit,
+        "page": "identical (id, score) to the counted FT.SEARCH, checked before the timed window",
+    });
 }
 
 /// Parse an OpenSearch search response: no timeout, no failed shard, at most
@@ -3931,6 +4090,113 @@ mod tests {
         assert!(page(&exact, TotalHits::None)
             .unwrap_err()
             .contains("no total requested"));
+    }
+
+    /// A fake server for [`probe_withoutcount`]: each query's matches as
+    /// `(id, score)` in document-id order. Counted replies are BM25-ranked;
+    /// `WITHOUTCOUNT` replies are ranked (`keeps_ranking`, RediSearch 8.4+)
+    /// or the first `top` matches in document-id order (8.0/8.2).
+    fn probe_server(
+        matches: &[Vec<(&'static str, f64)>],
+        top: usize,
+        keeps_ranking: bool,
+    ) -> Result<WithoutCountProbe, String> {
+        probe_withoutcount(matches.len(), top, |i, mode| {
+            let mut page = matches[i].clone();
+            if mode == TotalHits::Exact || keeps_ranking {
+                page.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+            page.truncate(top);
+            let total = match mode {
+                TotalHits::Exact => matches[i].len(),
+                TotalHits::None => page.len(),
+            };
+            Ok(reply(total as i64, &page, vec![]))
+        })
+    }
+
+    #[test]
+    fn withoutcount_probe_refuses_a_server_that_drops_the_ranking() {
+        let matches = vec![
+            vec![("k:1", 0.5), ("k:2", 2.0), ("k:3", 1.0)],
+            vec![("k:4", 3.0), ("k:5", 1.0)],
+            vec![],
+        ];
+        // 8.4+: same pages; two queries have more matches than the page.
+        assert_eq!(
+            probe_server(&matches, 1, true),
+            Ok(WithoutCountProbe {
+                compared: 2,
+                over_limit: 2
+            })
+        );
+        // 8.0/8.2: first match by doc id. Query 0's page is (k:1, 0.5), not
+        // (k:2, 2.0): it is score-ordered (one hit) but not the top-1.
+        let e = probe_server(&matches, 1, false).unwrap_err();
+        assert!(e.contains("query #0") && e.contains("differs"), "{e}");
+        // With a two-hit page the doc-id order is also out of score order.
+        let e = probe_server(&matches, 2, false).unwrap_err();
+        assert!(e.contains(RANK_VIOLATION), "{e}");
+        // Query 1's doc-id order happens to be ranked; only query 0 shows it.
+        let e = probe_server(&matches[1..], 1, false);
+        assert!(e.is_ok(), "{e:?}");
+        // No query with more matches than the page: nothing can be shown.
+        let e = probe_server(&matches, 3, true).unwrap_err();
+        assert!(e.contains("no query has more than 3 matches"), "{e}");
+    }
+
+    #[test]
+    fn withoutcount_probe_stops_after_enough_truncated_queries() {
+        let matches = vec![vec![("k:1", 2.0), ("k:2", 1.0)]; WITHOUTCOUNT_PROBE_QUERIES + 5];
+        let mut sent = 0;
+        let probe = probe_withoutcount(matches.len(), 1, |i, mode| {
+            sent += 1;
+            let mut page = matches[i].clone();
+            page.truncate(1);
+            let total = if mode == TotalHits::Exact { 2 } else { 1 };
+            Ok(reply(total, &page, vec![]))
+        })
+        .unwrap();
+        assert_eq!(probe.over_limit, WITHOUTCOUNT_PROBE_QUERIES);
+        assert_eq!(sent, 2 * WITHOUTCOUNT_PROBE_QUERIES);
+    }
+
+    #[test]
+    fn withoutcount_page_comparison_allows_only_boundary_ties() {
+        let p = |h: &[(&str, f64)]| {
+            h.iter()
+                .map(|(i, s)| (i.to_string(), *s))
+                .collect::<Vec<_>>()
+        };
+        let counted = p(&[("a", 3.0), ("b", 2.0), ("c", 2.0), ("d", 1.0)]);
+        // Reordered inside a tie: same page.
+        let swapped = p(&[("a", 3.0), ("c", 2.0), ("b", 2.0), ("d", 1.0)]);
+        assert!(same_ranked_page(&counted, &swapped, false).is_ok());
+        // Another document of the boundary score: only when truncated.
+        let boundary = p(&[("a", 3.0), ("b", 2.0), ("c", 2.0), ("e", 1.0)]);
+        assert!(same_ranked_page(&counted, &boundary, true).is_ok());
+        assert!(same_ranked_page(&counted, &boundary, false).is_err());
+        // Another document inside the page is never the same page.
+        let inner = p(&[("a", 3.0), ("b", 2.0), ("e", 2.0), ("d", 1.0)]);
+        assert!(same_ranked_page(&counted, &inner, true).is_err());
+        // Different scores or length.
+        let scored = p(&[("a", 3.0), ("b", 2.0), ("c", 2.0), ("d", 0.5)]);
+        assert!(same_ranked_page(&counted, &scored, true).is_err());
+        assert!(same_ranked_page(&counted, &counted[..3], true).is_err());
+    }
+
+    #[test]
+    fn none_fails_closed_on_any_out_of_order_reply() {
+        let e = rp(&reply(2, &[("k:1", 1.0), ("k:2", 2.0)], vec![]), 2).unwrap_err();
+        assert!(is_rank_violation(&e), "{e}");
+        let e = rp(&reply(1, &[("k:1", f64::NAN)], vec![]), 2).unwrap_err();
+        assert!(is_rank_violation(&e), "{e}");
+        assert!(!is_rank_violation("fulltext: incomplete Redis page"));
+        assert!(check_rank_violations(TotalHits::None, 1)
+            .unwrap_err()
+            .contains("WITHOUTCOUNT"));
+        assert!(check_rank_violations(TotalHits::None, 0).is_ok());
+        assert!(check_rank_violations(TotalHits::Exact, 3).is_ok());
     }
 
     #[test]

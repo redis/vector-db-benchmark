@@ -3604,6 +3604,14 @@ pub fn assert_bm25_total_hits_run(root: &Path, engine: &str, config: &str) {
         assert_eq!(ft["total_hits_symmetric"], true, "{ft}");
         assert!(ft.get("warnings").is_none(), "{ft}");
         let none = mode == "none";
+        // Redis `none` is run only after the WITHOUTCOUNT ranking probe passed
+        // on this server ("apple" has more matches than `top: 1`).
+        let probe = &ft["total_hits"]["withoutcount_probe"];
+        if engine == "redis" && none {
+            assert!(probe["queries_over_limit"].as_u64() >= Some(1), "{ft}");
+        } else {
+            assert!(probe.is_null(), "{ft}");
+        }
         match engine {
             "redis" => assert_eq!(
                 ft["engine_settings"]["command"]
