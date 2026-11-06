@@ -1666,11 +1666,23 @@ fn test_binary_opensearch_fulltext_bm25() {
 /// and deleted after it. See `common::assert_hybrid_rrf_run`.
 #[test]
 fn test_binary_opensearch_hybrid_rrf() {
+    run_opensearch_hybrid_rrf(false);
+}
+
+/// hybrid-rrf in parity mode on OpenSearch: the hybrid query's multi_match
+/// uses the parity (no-stem) analyzer; fused scores must equal client-side
+/// RRF over the parity BM25 lists the fulltext fixture pins.
+#[test]
+fn test_binary_opensearch_hybrid_rrf_parity() {
+    run_opensearch_hybrid_rrf(true);
+}
+
+fn run_opensearch_hybrid_rrf(parity: bool) {
     wait_for_opensearch();
     let configs = serde_json::json!([{
         "name": "os-hrrf", "engine": "opensearch",
         "collection_params": {"number_of_shards": 1}, "upload_params": {"parallel": 1},
-        "search_params": common::hybrid_rrf_search_params()
+        "search_params": common::hybrid_rrf_search_params(parity)
     }]);
     let (proj, closest) = common::write_hybrid_rrf_project(&configs.to_string());
     let dump = proj.root.join("dumps");
@@ -1690,7 +1702,8 @@ fn test_binary_opensearch_hybrid_rrf() {
             "--fail-on-dropped-queries"
         ]
     ));
-    let h = common::assert_hybrid_rrf_run(&proj.root, &dump, "opensearch", "os-hrrf", &closest);
+    let h =
+        common::assert_hybrid_rrf_run(&proj.root, &dump, "opensearch", "os-hrrf", &closest, parity);
     let engine = &h["engine"];
     let pipeline = engine["search_pipeline"].as_str().unwrap();
     assert_eq!(

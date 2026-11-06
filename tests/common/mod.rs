@@ -4720,14 +4720,20 @@ pub fn write_hybrid_rrf_project(engine_configs_json: &str) -> (MatchAnyProject, 
     (proj, closest)
 }
 
-/// One hybrid-rrf search config: the title-boosted BM25 arm of
-/// [`bm25_search_params`], KNN at `ef` 16, RRF at [`HYBRID_RRF_K`] over
-/// [`HYBRID_RRF_W`] candidates per list, [`HYBRID_RRF_TOP`] fused results.
-pub fn hybrid_rrf_search_params() -> serde_json::Value {
+/// One hybrid-rrf search config: KNN at `ef` 16, RRF at [`HYBRID_RRF_K`]
+/// over [`HYBRID_RRF_W`] candidates per list, [`HYBRID_RRF_TOP`] fused
+/// results. Its BM25 arm is the title-boosted english arm of
+/// [`bm25_search_params`], or with `parity` the parity arm of
+/// [`bm25_parity_search_params`] (headings + segment, no stemming).
+pub fn hybrid_rrf_search_params(parity: bool) -> serde_json::Value {
+    let fulltext = if parity {
+        serde_json::json!({"analysis": "parity", "fields": {"headings": 1.0, "segment": 1.0}})
+    } else {
+        serde_json::json!({"fields": {"title": 5.0, "headings": 1.0, "segment": 1.0}})
+    };
     serde_json::json!([
         {"parallel": 2, "top": HYBRID_RRF_TOP, "workload": "hybrid-rrf",
-         "search_params": {"ef": 16},
-         "fulltext": {"fields": {"title": 5.0, "headings": 1.0, "segment": 1.0}},
+         "search_params": {"ef": 16}, "fulltext": fulltext,
          "rrf": {"window": HYBRID_RRF_W, "rank_constant": HYBRID_RRF_K}}
     ])
 }
@@ -4744,7 +4750,12 @@ pub fn hybrid_rrf_search_params() -> serde_json::Value {
 ///   the fused scores at each position equal client-side RRF at `k` = 20 over
 ///   that list and the exact KNN top `W` (the engines' default `k` = 60
 ///   would give other values), and every returned id is in the reference's
-///   top group;
+///   top group. With `parity` every query is pinned (`apple` → d1 only, the
+///   title is not indexed; `generously` and `crossings` → nothing, no
+///   stemming; `zebra crossings` → nothing; `beta` → d4 on both engines):
+///   the BM25 arm INSIDE the fused query must match verbatim exactly as the
+///   fulltext workload's parity query does (on Redis, quoted terms in
+///   FT.HYBRID vs `VERBATIM` in FT.SEARCH);
 /// - dump records carry the reference top ids as `expected`, and
 ///   `compare-results` accepts hybrid-rrf dumps.
 pub fn assert_hybrid_rrf_run(
@@ -4753,6 +4764,7 @@ pub fn assert_hybrid_rrf_run(
     engine: &str,
     config: &str,
     closest: &[Vec<i64>],
+    parity: bool,
 ) -> serde_json::Value {
     use vector_db_benchmark::hybrid_rrf::{rrf_fuse, SEMANTICS};
     let docs: Vec<serde_json::Value> = fs::read_dir(root.join("results"))
@@ -4777,13 +4789,20 @@ pub fn assert_hybrid_rrf_run(
     assert_eq!(h["bm25"]["engine"], engine);
     assert_eq!(
         h["bm25"]["fields"],
-        serde_json::json!({"title": 5.0, "headings": 1.0, "segment": 1.0})
+        if parity {
+            serde_json::json!({"headings": 1.0, "segment": 1.0})
+        } else {
+            serde_json::json!({"title": 5.0, "headings": 1.0, "segment": 1.0})
+        }
     );
     assert_eq!(
         h["bm25"]["queries_skipped_no_terms"],
         serde_json::json!([2])
     );
-    assert_eq!(h["bm25"]["index_marker"]["analysis"], "english");
+    assert_eq!(
+        h["bm25"]["index_marker"]["analysis"],
+        if parity { "parity" } else { "english" }
+    );
     assert_eq!(h["reference"]["queries"], 5);
     assert_eq!(h["engine"]["engine"], engine);
     let r = &doc["results"];
@@ -4797,12 +4816,21 @@ pub fn assert_hybrid_rrf_run(
     }
     assert_eq!(doc["metrics_schema"]["workload"], "hybrid-rrf");
 
-    // BM25 lists the fulltext fixture pins (title boost), as row ids.
+    // BM25 lists the fulltext fixture pins, as row ids (`assert_bm25_run`,
+    // `assert_bm25_parity_run`).
     let mut bm25: std::collections::BTreeMap<usize, Vec<i64>> = Default::default();
-    bm25.insert(0, vec![0, 1]);
-    bm25.insert(1, vec![2]);
-    bm25.insert(3, if engine == "redis" { vec![] } else { vec![4] });
-    bm25.insert(5, vec![5]);
+    if parity {
+        bm25.insert(0, vec![1]);
+        bm25.insert(1, vec![]);
+        bm25.insert(3, vec![4]);
+        bm25.insert(4, vec![]);
+        bm25.insert(5, vec![]);
+    } else {
+        bm25.insert(0, vec![0, 1]);
+        bm25.insert(1, vec![2]);
+        bm25.insert(3, if engine == "redis" { vec![] } else { vec![4] });
+        bm25.insert(5, vec![5]);
+    }
     let row = |id: &str| -> i64 { id.trim_start_matches('d').parse().unwrap() };
 
     let dumps = read_dumps(dump);
@@ -4857,7 +4885,7 @@ pub fn assert_hybrid_rrf_run(
         assert_eq!(rec.expected.as_ref(), Some(&reference), "{rec:?}");
         checked += 1;
     }
-    assert_eq!(checked, 4, "every pinned query was answered");
+    assert_eq!(checked, bm25.len(), "every pinned query was answered");
     let (ok, report) = run_compare(dump, dump, engine);
     assert!(ok, "self-comparison must pass: {report}");
     for pair in report["pairs"].as_array().unwrap() {

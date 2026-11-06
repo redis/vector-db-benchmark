@@ -468,7 +468,10 @@ fn close(a: f64, b: f64) -> bool {
 /// linear, min-max — all outside the range or off the lattice), but it cannot
 /// tell `k` from a nearby constant (`1/(60+a) = 1/(61+(a-1))`); the rank
 /// constant itself is verified on the request (Redis) or the pipeline
-/// read-back (OpenSearch).
+/// read-back (OpenSearch). The lattice has ~W²/2 pair sums, so its power
+/// falls as `W` grows: at W = 100, k = 60 the tolerance windows cover a few
+/// percent of the range, at W ≈ 1000 they cover all of it and the check is
+/// effectively range-only ([`lattice_coverage`] records which).
 pub fn check_rrf_score(score: f64, spec: &RrfSpec) -> Result<(), String> {
     let k = f64::from(spec.rank_constant);
     let w = spec.window as f64;
@@ -503,6 +506,25 @@ pub fn check_rrf_score(score: f64, spec: &RrfSpec) -> Result<(), String> {
         }
     }
     Err(off())
+}
+
+/// Rough fraction of the RRF score range `[1/(k+W), 2/(k+1)]` covered by
+/// the lattice's tolerance windows (single-list values plus pair sums,
+/// overlaps ignored, capped at 1): how much [`check_rrf_score`] can refuse
+/// beyond the range check at this `k` and `W`.
+pub fn lattice_coverage(spec: &RrfSpec) -> f64 {
+    let k = f64::from(spec.rank_constant);
+    let w = spec.window;
+    let (lo, hi) = (1.0 / (k + w as f64), 2.0 / (k + 1.0));
+    let mut covered = 0.0;
+    for a in 1..=w {
+        let one = 1.0 / (k + a as f64);
+        covered += 2.0 * TIE_TOLERANCE * one;
+        for b in a..=w {
+            covered += 2.0 * TIE_TOLERANCE * (one + 1.0 / (k + b as f64));
+        }
+    }
+    (covered / (hi - lo)).min(1.0)
 }
 
 /// Check a whole fused page's scores: each an RRF score, non-increasing.
@@ -735,26 +757,31 @@ pub fn commandstats_calls(info: &str, command: &str) -> Option<u64> {
 }
 
 /// The server executed at least `expected` `FT.HYBRID` calls during the run
-/// (`calls` delta of `INFO commandstats`). `None` on either side: the server
-/// would not say (managed services may hide it) — recorded as unverified.
+/// (`calls` delta of `INFO commandstats`, read after the untimed probe and
+/// before the workers prime, so the delta also counts one prime call per
+/// worker). `None` on EITHER side — the server would not say (managed
+/// services may hide it) or a read failed — is recorded as unverified: a
+/// one-sided read would compare the server's lifetime count.
 pub fn check_redis_calls(
     before: Option<u64>,
     after: Option<u64>,
     expected: usize,
 ) -> Result<Value, String> {
     match (before, after) {
-        (b, Some(a)) => {
-            let delta = a.saturating_sub(b.unwrap_or(0));
+        (Some(b), Some(a)) => {
+            let delta = a.saturating_sub(b);
             if delta < expected as u64 {
                 return Err(format!(
                     "hybrid-rrf: INFO commandstats counts {delta} FT.HYBRID calls during a run \
                      that sent {expected} — the server did not run them as FT.HYBRID"
                 ));
             }
-            Ok(json!({"ft_hybrid_calls_delta": delta, "verified": true}))
+            Ok(json!({"ft_hybrid_calls_delta": delta, "verified": true,
+                      "note": "includes one untimed prime call per worker"}))
         }
         _ => Ok(json!({"ft_hybrid_calls_delta": null, "verified": false,
-                       "note": "INFO commandstats did not report FT.HYBRID"})),
+                       "note": "INFO commandstats did not report FT.HYBRID before and \
+                                after the run"})),
     }
 }
 
@@ -781,9 +808,12 @@ pub const OPENSEARCH_PROCESSOR: &str = "score-ranker-processor";
 
 /// Per-config search pipeline id: `vdbb-hybrid-rrf-<config>-k<k>`, the
 /// config name lowercased with anything outside `[a-z0-9_-]` mapped to `_`.
-/// Per engine config so two configs (or two benchmark processes) on one
-/// cluster never fuse through each other's pipeline; per `k` so search
-/// configs of one engine config with different constants do not either.
+/// Per engine config so two different configs on one cluster never fuse
+/// through each other's pipeline; per `k` so search configs of one engine
+/// config with different constants do not either. Two processes running the
+/// SAME config against one cluster share the id (identical bodies): the
+/// first to finish deletes it and the other fails loudly on the missing
+/// pipeline, never silently.
 pub fn opensearch_pipeline_name(config_name: &str, spec: &RrfSpec) -> String {
     let token: String = config_name
         .chars()
@@ -971,6 +1001,7 @@ pub fn result_metadata(
             "score_check": "every returned score is an RRF score at this rank_constant and \
                             window (range and 1/(k+a) [+ 1/(k+b)] lattice) and the page is \
                             non-increasing",
+            "score_check_lattice_coverage": lattice_coverage(spec),
         },
         "engine": engine,
     })
@@ -1216,6 +1247,10 @@ mod tests {
         assert!(check_rrf_score(mid, &small).is_err());
         // A different constant's top score is out of range.
         assert!(check_rrf_score(2.0 / 21.0, &s).is_err());
+        // Coverage: small at small W, saturating at large W.
+        assert!(lattice_coverage(&small) < 0.01);
+        assert!(lattice_coverage(&s) < 0.2, "{}", lattice_coverage(&s));
+        assert_eq!(lattice_coverage(&spec(5000, 60)), 1.0);
         // Page order.
         assert!(check_page_scores(&[one(1.0) * 2.0, one(1.0), one(2.0)], &s).is_ok());
         assert!(check_page_scores(&[one(2.0), one(1.0)], &s).is_err());
@@ -1384,7 +1419,9 @@ mod tests {
         assert_eq!(commandstats_calls(info, "ft.search"), Some(12));
         assert_eq!(commandstats_calls(info, "FT.AGGREGATE"), None);
         assert!(check_redis_calls(Some(10), Some(40), 30).unwrap()["verified"] == true);
-        assert!(check_redis_calls(None, Some(30), 30).is_ok());
+        // One-sided reads never verify (else: the lifetime count passes).
+        assert!(check_redis_calls(None, Some(30), 30).unwrap()["verified"] == false);
+        assert!(check_redis_calls(None, Some(1_000_000), 30).unwrap()["verified"] == false);
         assert!(check_redis_calls(Some(10), Some(39), 30).is_err());
         assert!(check_redis_calls(Some(10), None, 30).unwrap()["verified"] == false);
     }

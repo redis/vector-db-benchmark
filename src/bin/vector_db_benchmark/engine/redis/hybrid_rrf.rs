@@ -172,7 +172,18 @@ impl RedisEngine {
                     server_version.as_deref().unwrap_or("version unknown")
                 )
             })
-            .and_then(|v| hr::parse_redis_hybrid_reply(&v, top).map(|_| ()))?;
+            .and_then(|v| {
+                // Same checks as every timed reply, scored against its
+                // reference: a server that accepted COMBINE RRF but fused
+                // differently is refused before anything is timed.
+                let page = hr::parse_redis_hybrid_reply(&v, top)?
+                    .into_iter()
+                    .map(|(key, score)| redis_key_row(&key, &key_prefix).map(|row| (row, score)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                hr::score_page(&page, &references[0], &spec, top)
+                    .map(|_| ())
+                    .map_err(|e| format!("hybrid-rrf: probe query: {e}"))
+            })?;
         // One node's INFO cannot count a cluster's calls: verified standalone only.
         let cluster_api = self.config.cluster_api;
         let calls_before = (!cluster_api).then(|| ft_hybrid_calls(&mut conn)).flatten();
