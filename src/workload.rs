@@ -5,7 +5,7 @@
 //!
 //! A search config (one entry of `search_params` in an engine configuration
 //! file) may declare `"workload": "vector" | "hybrid" | "fulltext" |
-//! "filter-only"`. Undeclared means `vector`, so every existing config keeps its
+//! "filter-only" | "hybrid-rrf"`. Undeclared means `vector`, so every existing config keeps its
 //! meaning. The runner resolves every config's workload ONCE, before any engine
 //! is constructed, through [`plan`], and then sends every measured query of that
 //! config through the single dispatch point `engine::search_workload` in the
@@ -18,6 +18,7 @@
 //! | `hybrid`      | `search_hybrid`        | yes          | recall@k, overlap@k, rank corr. |
 //! | `fulltext`    | `search_fulltext`      | no           | overlap@k, Jaccard@k, rank corr.|
 //! | `filter-only` | `search_filter_only`   | no           | exact-count agreement           |
+//! | `hybrid-rrf`  | `search_hybrid_rrf`    | client RRF   | tie-aware recall@k (`hybrid_rrf`)|
 //!
 //! To add an arm for an engine:
 //!
@@ -81,14 +82,18 @@ pub enum Workload {
     Fulltext,
     /// Exact-match tag + numeric predicates, no vector clause (#328, #340).
     FilterOnly,
+    /// BM25 full-text + vector KNN fused by reciprocal rank fusion
+    /// (`crate::hybrid_rrf`). Distinct from `Hybrid` (prefilter + KNN).
+    HybridRrf,
 }
 
 impl Workload {
-    pub const ALL: [Workload; 4] = [
+    pub const ALL: [Workload; 5] = [
         Workload::Vector,
         Workload::Hybrid,
         Workload::Fulltext,
         Workload::FilterOnly,
+        Workload::HybridRrf,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -97,13 +102,24 @@ impl Workload {
             Workload::Hybrid => "hybrid",
             Workload::Fulltext => "fulltext",
             Workload::FilterOnly => "filter-only",
+            Workload::HybridRrf => "hybrid-rrf",
         }
     }
 
     /// Whether the dataset's brute-forced neighbours are the oracle for this
     /// workload. For the others the declared reference engine is.
     pub fn has_ground_truth(self) -> bool {
-        matches!(self, Workload::Vector | Workload::Hybrid)
+        matches!(
+            self,
+            Workload::Vector | Workload::Hybrid | Workload::HybridRrf
+        )
+    }
+
+    /// Whether the workload searches the index's text fields with the pinned
+    /// analyzer of `crate::fulltext` (its `fulltext` block takes part in the
+    /// engine config's index profile).
+    pub fn uses_text_index(self) -> bool {
+        matches!(self, Workload::Fulltext | Workload::HybridRrf)
     }
 
     /// Whether result order is meaningful (ranked) — false for filter-only,
@@ -125,7 +141,9 @@ impl Workload {
             // config with a fulltext search config builds its text fields with
             // the pinned analyzer (`crate::fulltext`), which then also governs
             // any text `match` filter its vector configs run.
-            Workload::Vector | Workload::Hybrid | Workload::Fulltext => IndexLayout::Vector,
+            Workload::Vector | Workload::Hybrid | Workload::Fulltext | Workload::HybridRrf => {
+                IndexLayout::Vector
+            }
         }
     }
 }
@@ -143,7 +161,7 @@ impl std::str::FromStr for Workload {
             .into_iter()
             .find(|w| w.as_str() == s)
             .ok_or_else(|| {
-                format!("unknown workload {s:?}; expected vector, hybrid, fulltext or filter-only")
+                format!("unknown workload {s:?}; expected vector, hybrid, fulltext, filter-only or hybrid-rrf")
             })
     }
 }
@@ -254,6 +272,7 @@ pub fn implemented(engine_type: &str) -> &'static [Workload] {
             Workload::Hybrid,
             Workload::FilterOnly,
             Workload::Fulltext,
+            Workload::HybridRrf,
         ],
         _ => &[Workload::Vector],
     }
@@ -272,7 +291,11 @@ pub fn captures(engine_type: &str, workload: Workload) -> bool {
         (engine_type, workload),
         (
             "redis" | "opensearch",
-            Workload::Vector | Workload::Hybrid | Workload::FilterOnly | Workload::Fulltext
+            Workload::Vector
+                | Workload::Hybrid
+                | Workload::FilterOnly
+                | Workload::Fulltext
+                | Workload::HybridRrf
         )
     )
 }
@@ -287,7 +310,7 @@ pub fn check_capture(plan: &WorkloadPlan) -> Result<(), String> {
     {
         Some(w) => Err(format!(
             "--dump-results: engine '{}' does not capture per-query results for workload \
-             \"{w}\"; per-query capture exists for redis and opensearch (vector, hybrid, filter-only, fulltext)",
+             \"{w}\"; per-query capture exists for redis and opensearch (vector, hybrid, filter-only, fulltext, hybrid-rrf)",
             plan.engine_type
         )),
         None => Ok(()),

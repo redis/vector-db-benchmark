@@ -351,7 +351,9 @@ pub fn index_profile<'a>(
     let mut parity_fields: Option<BTreeSet<String>> = None;
     let mut other_workload: Option<Workload> = None;
     for (i, (w, block)) in configs.into_iter().enumerate() {
-        if w != Workload::Fulltext {
+        // `hybrid-rrf` searches the same text fields through the same block
+        // (its BM25 arm), so it takes part in the profile like `fulltext`.
+        if !w.uses_text_index() {
             other_workload.get_or_insert(w);
             continue;
         }
@@ -601,8 +603,11 @@ pub fn validate_declared(
     block: Option<&Value>,
 ) -> Result<(), String> {
     match (workload, block) {
-        (Workload::Fulltext, b) => {
+        (Workload::Fulltext | Workload::HybridRrf, b) => {
             let spec = parse_spec(b)?;
+            if workload == Workload::HybridRrf {
+                crate::hybrid_rrf::check_text_spec(&spec)?;
+            }
             if spec.allow_multi_shard && engine_type != "opensearch" {
                 return Err(format!(
                     "`{SPEC_KEY}.allow_multi_shard` only applies to OpenSearch; engine \
@@ -612,7 +617,8 @@ pub fn validate_declared(
             Ok(())
         }
         (w, Some(_)) => Err(format!(
-            "a `{SPEC_KEY}` block is only valid on a fulltext search config, not workload \"{w}\""
+            "a `{SPEC_KEY}` block is only valid on a fulltext or hybrid-rrf search config, not \
+             workload \"{w}\""
         )),
         (_, None) => Ok(()),
     }
@@ -731,7 +737,7 @@ pub fn check_compound_before_connecting<'a>(
 /// Whether an engine config's workloads need [`check_mixed_text_filters`]: a
 /// fulltext config sharing the index with a vector or hybrid config.
 pub fn mixes_with_filtered_workloads(workloads: &[Workload]) -> bool {
-    workloads.contains(&Workload::Fulltext)
+    workloads.iter().any(|w| w.uses_text_index())
         && workloads
             .iter()
             .any(|w| matches!(w, Workload::Vector | Workload::Hybrid))
@@ -2008,7 +2014,7 @@ pub fn apply_layout<'a>(
         if plan
             .workloads
             .iter()
-            .any(|w| matches!(w, Workload::Vector | Workload::Hybrid))
+            .any(|w| matches!(w, Workload::Vector | Workload::Hybrid | Workload::HybridRrf))
         {
             return Err("compound matching requires a dedicated text/scalar engine config".into());
         }
@@ -3016,6 +3022,8 @@ mod tests {
         for file in [
             "redis-msmarco-fulltext.json",
             "opensearch-msmarco-fulltext.json",
+            "redis-msmarco-hybrid-rrf.json",
+            "opensearch-msmarco-hybrid-rrf.json",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("experiments/configurations")

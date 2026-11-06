@@ -8,6 +8,7 @@
 //! - `workload` - per-search-config query family and the engine/workload table
 //! - `ingest` - ingestion phases (upload, index wait, total) for the upload results
 //! - `hybrid` - the hybrid (prefilter + KNN) query set, buckets and per-bucket report
+//! - `hybrid_rrf` - BM25 + KNN fused by reciprocal rank fusion: semantics, requests, reference
 //! - `results_dump` - per-query result records and the `--dump-results` format
 //! - `compare_results` - scores one engine's dumps against a declared reference
 //! - `config` - Redis configuration from environment
@@ -20,6 +21,7 @@ pub mod config;
 pub mod filter_only;
 pub mod fulltext;
 pub mod hybrid;
+pub mod hybrid_rrf;
 pub mod indexing_wait;
 pub mod ingest;
 pub mod kividb_caps;

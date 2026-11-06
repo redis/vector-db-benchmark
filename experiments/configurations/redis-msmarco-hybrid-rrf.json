@@ -1,0 +1,92 @@
+[
+  {
+    "name": "redis-msmarco-hybrid-rrf-english",
+    "_comment": "hybrid-rrf (README). Verified live on the 8-doc fixture only; not yet run on MS MARCO \u2014 record mean_recall, mean_strict_recall, score_check_lattice_coverage before quoting numbers. Single-shard search DB only: a multi-shard Redis Cloud/Software DB is refused even through its proxy endpoint (FT.PROFILE shard count, recorded as engine.shards).",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 64
+    },
+    "search_params": [
+      {
+        "parallel": 8,
+        "top": 10,
+        "workload": "hybrid-rrf",
+        "search_params": {
+          "ef": 200
+        },
+        "fulltext": {
+          "fields": {
+            "title": 5.0,
+            "headings": 3.0,
+            "segment": 1.0
+          }
+        },
+        "rrf": {
+          "window": 100,
+          "rank_constant": 60
+        }
+      },
+      {
+        "parallel": 1,
+        "top": 10,
+        "workload": "hybrid-rrf",
+        "search_params": {
+          "ef": 200
+        },
+        "fulltext": {
+          "fields": {
+            "title": 5.0,
+            "headings": 3.0,
+            "segment": 1.0
+          }
+        },
+        "rrf": {
+          "window": 100,
+          "rank_constant": 60
+        }
+      }
+    ]
+  },
+  {
+    "name": "redis-msmarco-hybrid-rrf-parity",
+    "_comment": "hybrid-rrf (README). Verified live on the 8-doc fixture only; not yet run on MS MARCO \u2014 record mean_recall, mean_strict_recall, score_check_lattice_coverage before quoting numbers. Single-shard search DB only: a multi-shard Redis Cloud/Software DB is refused even through its proxy endpoint (FT.PROFILE shard count, recorded as engine.shards).",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 64
+    },
+    "search_params": [
+      {
+        "parallel": 1,
+        "top": 10,
+        "workload": "hybrid-rrf",
+        "search_params": {
+          "ef": 200
+        },
+        "fulltext": {
+          "analysis": "parity",
+          "fields": {
+            "segment": 1.0
+          }
+        },
+        "rrf": {
+          "window": 100,
+          "rank_constant": 60
+        }
+      }
+    ]
+  }
+]
