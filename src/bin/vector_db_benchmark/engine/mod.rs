@@ -32,7 +32,7 @@ mod weaviate_grpc;
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 use std::time::{Duration, Instant};
-use vector_db_benchmark::results_dump::RawQueryResult;
+use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::workload::Workload;
 
 pub use chroma::ChromaEngine;
@@ -237,6 +237,15 @@ pub struct SearchResults {
     /// Hybrid workload only (#341): the per-selectivity-bucket report and the
     /// width profile of the FILTERED ground truth the run was scored against.
     pub hybrid: Option<HybridOutcome>,
+    /// Hybrid-RRF workload only: the `vector_db_benchmark::hybrid_rrf::result_metadata`
+    /// block (semantics, BM25 arm, reference, engine record). Its presence is
+    /// the hybrid-rrf fingerprint checked by [`search_workload`].
+    pub hybrid_rrf: Option<serde_json::Value>,
+    /// Hybrid-RRF only: each query's reference top ids (client-side RRF over
+    /// exact BM25 + exact KNN), indexed by query id (empty for a skipped
+    /// query). `--dump-results` records carry these as `expected`, never the
+    /// dataset's KNN neighbours, which are not the truth of a fused query.
+    pub hybrid_rrf_expected: Option<Vec<Vec<i64>>>,
 }
 
 /// What a hybrid run publishes beyond the common search statistics.
@@ -554,6 +563,91 @@ pub fn percentile_linear(sorted: &[f64], q: f64) -> f64 {
     sorted[lo] * (1.0 - frac) + sorted[hi] * frac
 }
 
+/// One timed hybrid-rrf query: `(position in the query set, dispatch seq,
+/// latency, fused page as (row, score) or the error)`.
+pub type HybridRrfOutcome = (usize, usize, f64, Result<Vec<(i64, f64)>, String>);
+
+/// Shared tail of both hybrid-rrf arms: every timed query must have
+/// succeeded (a dropped query would change the score silently), every page
+/// must pass `hybrid_rrf::score_page`, then the common search statistics.
+/// Returns the results (with `hybrid_rrf_expected` and, under capture, the
+/// records) and the mean strict recall; the arm adds its metadata block.
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid_rrf_results(
+    set: &vector_db_benchmark::hybrid_rrf::QuerySet,
+    references: &[vector_db_benchmark::hybrid_rrf::Reference],
+    spec: &vector_db_benchmark::hybrid_rrf::RrfSpec,
+    outcomes: Vec<HybridRrfOutcome>,
+    total_time: f64,
+    top: usize,
+    parallel: usize,
+    capture: bool,
+) -> Result<(SearchResults, f64), String> {
+    use vector_db_benchmark::hybrid_rrf as hr;
+    let requested = outcomes.len();
+    let mut times = Vec::with_capacity(requested);
+    let mut precisions = Vec::with_capacity(requested);
+    let mut recalls = Vec::with_capacity(requested);
+    let mut strict = Vec::with_capacity(requested);
+    let mut records = capture.then(Vec::new);
+    let mut errors = Vec::new();
+    for (pos, seq, latency, page) in outcomes {
+        let query_id = set.queries[pos].query_id;
+        let scored = page
+            .and_then(|p| hr::score_page(&p, &references[pos], spec, top).map(|score| (p, score)));
+        match scored {
+            Ok((p, score)) => {
+                times.push(latency);
+                precisions.push(score.precision);
+                recalls.push(score.recall);
+                strict.push(score.strict_recall);
+                if let Some(r) = records.as_mut() {
+                    let hits = p
+                        .iter()
+                        .map(|&(row, s)| RawHit {
+                            row,
+                            score: Some(s),
+                        })
+                        .collect();
+                    r.push(RawQueryResult::ok(query_id, seq, hits, None, latency));
+                }
+            }
+            Err(e) => errors.push(format!("query {query_id}: {e}")),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!(
+            "hybrid-rrf: {} of {requested} queries failed (none is dropped from the score): {}",
+            errors.len(),
+            errors
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    let mut result = compute_search_stats(
+        &times,
+        &precisions,
+        &recalls,
+        &[],
+        &[],
+        total_time,
+        top,
+        parallel,
+        requested,
+    )?;
+    let mut expected = vec![Vec::new(); set.total];
+    for (q, r) in set.queries.iter().zip(references) {
+        expected[q.query_id] = hr::reference_top_ids(r, top);
+    }
+    result.hybrid_rrf_expected = Some(expected);
+    result.query_records = records;
+    let mean_strict = strict.iter().sum::<f64>() / strict.len().max(1) as f64;
+    Ok((result, mean_strict))
+}
+
 /// Build `SearchResults` for a search-only run from the per-query samples
 /// collected by an engine's parallel harness. Centralizes rps/means/std/
 /// percentile computation so every engine reports metrics identically.
@@ -756,6 +850,18 @@ pub trait Engine {
         Err(workload_not_implemented(self.name(), Workload::Hybrid))
     }
 
+    /// BM25 + KNN fused by server-side reciprocal rank fusion
+    /// (`vector_db_benchmark::hybrid_rrf`). Must set `SearchResults::hybrid_rrf`.
+    /// Default: hard error.
+    fn search_hybrid_rrf(
+        &mut self,
+        _dataset: &Dataset,
+        _search_params: &SearchParams,
+        _num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        Err(workload_not_implemented(self.name(), Workload::HybridRrf))
+    }
+
     /// Read back the realized index and refuse one that is not `layout` (#344),
     /// so every search result's `params.index_layout` names the index it ran
     /// on. Runs once after configure/upload (or the `--skip-upload` reuse
@@ -890,6 +996,7 @@ pub fn search_workload(
         Workload::Hybrid => engine.search_hybrid(dataset, params, num_queries),
         Workload::Fulltext => engine.search_fulltext(dataset, params, num_queries),
         Workload::FilterOnly => engine.search_filter_only(dataset, params, num_queries),
+        Workload::HybridRrf => engine.search_hybrid_rrf(dataset, params, num_queries),
     }?;
     vector_db_benchmark::workload::verify_engine_result_shape(
         engine_type,
@@ -901,6 +1008,8 @@ pub fn search_workload(
     vector_db_benchmark::workload::verify_fulltext_shape(workload, results.fulltext.is_some())
         .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
     vector_db_benchmark::hybrid::verify_fingerprint(workload, results.hybrid.is_some())
+        .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
+    vector_db_benchmark::hybrid_rrf::verify_fingerprint(workload, results.hybrid_rrf.is_some())
         .map_err(|e| format!("engine '{}': {e}", engine.name()))?;
     if params.capture_query_results {
         let records = results.query_records.as_ref().ok_or_else(|| {

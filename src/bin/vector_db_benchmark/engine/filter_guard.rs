@@ -1061,8 +1061,10 @@ fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
     assert_eq!(
         (reads_total, resolves_total),
         // +1 (#340): filter-only's `filter_only_queries`; +2 (#341): the Redis
-        // and OpenSearch hybrid arms' `read_hybrid_query_set`.
-        (26, 26),
+        // and OpenSearch hybrid arms' `read_hybrid_query_set`; +2: the Redis
+        // and OpenSearch hybrid-rrf arms' `read_queries`, each resolved with
+        // `hybrid_rrf::refuse_conditions` (a declared condition is an error).
+        (28, 28),
         "the read/resolve census changed; confirm the new site is guarded"
     );
 }

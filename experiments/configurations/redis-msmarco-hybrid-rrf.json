@@ -1,0 +1,90 @@
+[
+  {
+    "name": "redis-msmarco-hybrid-rrf-english",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 64
+    },
+    "search_params": [
+      {
+        "parallel": 8,
+        "top": 10,
+        "workload": "hybrid-rrf",
+        "search_params": {
+          "ef": 200
+        },
+        "fulltext": {
+          "fields": {
+            "title": 5.0,
+            "headings": 3.0,
+            "segment": 1.0
+          }
+        },
+        "rrf": {
+          "window": 100,
+          "rank_constant": 60
+        }
+      },
+      {
+        "parallel": 1,
+        "top": 10,
+        "workload": "hybrid-rrf",
+        "search_params": {
+          "ef": 200
+        },
+        "fulltext": {
+          "fields": {
+            "title": 5.0,
+            "headings": 3.0,
+            "segment": 1.0
+          }
+        },
+        "rrf": {
+          "window": 100,
+          "rank_constant": 60
+        }
+      }
+    ]
+  },
+  {
+    "name": "redis-msmarco-hybrid-rrf-parity",
+    "engine": "redis",
+    "collection_params": {
+      "hnsw_config": {
+        "M": 16,
+        "EF_CONSTRUCTION": 64
+      }
+    },
+    "upload_params": {
+      "parallel": 16,
+      "batch_size": 64
+    },
+    "search_params": [
+      {
+        "parallel": 1,
+        "top": 10,
+        "workload": "hybrid-rrf",
+        "search_params": {
+          "ef": 200
+        },
+        "fulltext": {
+          "analysis": "parity",
+          "fields": {
+            "segment": 1.0
+          }
+        },
+        "rrf": {
+          "window": 100,
+          "rank_constant": 60
+        }
+      }
+    ]
+  }
+]

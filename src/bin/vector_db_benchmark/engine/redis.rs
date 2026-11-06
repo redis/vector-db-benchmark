@@ -34,6 +34,7 @@ use vector_db_benchmark::workload::{IndexLayout, Workload};
 
 /// Ranked full-text workload (#339).
 mod fulltext;
+mod hybrid_rrf;
 /// Streaming upload from disk (#342).
 mod stream_upload;
 
@@ -2760,6 +2761,15 @@ impl Engine for RedisEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         self.search_hybrid_buckets(dataset, params, num_queries)
+    }
+
+    fn search_hybrid_rrf(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_hybrid_rrf_harness(dataset, params, num_queries)
     }
 
     fn search(

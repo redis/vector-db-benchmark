@@ -13,7 +13,7 @@ use vector_db_benchmark::fulltext;
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
 
-fn resp3_connection(
+pub(super) fn resp3_connection(
     url: &str,
     cluster_api: bool,
 ) -> redis::RedisResult<vector_db_benchmark::redis_transport::Connection> {
@@ -89,6 +89,79 @@ impl RedisEngine {
         Ok(())
     }
 
+    /// The live index serves the ranked BM25 query as pinned: every searched
+    /// field indexed as `profile` says (FT.INFO), the recorded marker matches,
+    /// and the server's minimum stem length is the default. Refused before
+    /// any timed window. Returns `(redis_min_stem_len record, marker read)`.
+    /// Shared by the fulltext and hybrid-rrf arms.
+    pub(super) fn validate_fulltext_live_index(
+        &self,
+        dataset: &Dataset,
+        spec: &fulltext::FulltextSpec,
+        fields: &[fulltext::FieldBoost],
+        profile: &fulltext::IndexProfile,
+    ) -> Result<(serde_json::Value, serde_json::Value), String> {
+        let mut conn = resp3_connection(&self.redis_url, self.config.cluster_api)
+            .map_err(|e| format!("fulltext: Redis RESP3 connection failed: {e}"))?;
+        let info: redis::Value = redis::cmd("FT.INFO")
+            .arg(&self.config.index_name)
+            .query(&mut conn)
+            .map_err(|e| format!("fulltext: FT.INFO failed: {e}"))?;
+        let marker: Option<String> = match redis::cmd("GET")
+            .arg(fulltext::redis_marker_key(&self.config.index_name))
+            .query(&mut conn)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                // English: read as "no marker"; parity: refused.
+                eprintln!(
+                    "{}",
+                    fulltext::redis_marker_failure(profile, "read", &e.to_string())?
+                );
+                None
+            }
+        };
+        let marker = match marker {
+            None => serde_json::Value::Null,
+            Some(m) => serde_json::from_str(&m)
+                .map_err(|e| format!("fulltext: unreadable index marker {m:?}: {e}"))?,
+        };
+        if self.config.skip_vector_index || spec.compound.is_some() {
+            let validate = if self.config.skip_vector_index {
+                vector_db_benchmark::filter_only::validate_redis_schema
+            } else {
+                vector_db_benchmark::filter_only::validate_redis_full_schema
+            };
+            let schema = dataset
+                .config
+                .schema
+                .as_ref()
+                .map(|s| profile.scalar_indexing.project(s));
+            validate(&redis_value_to_json(&info), schema.as_ref())?;
+            if profile.scalar_indexing.is_reduced() {
+                vector_db_benchmark::text_tag_profile::validate_redis(&redis_value_to_json(&info))?;
+            }
+        }
+        fulltext::validate_redis_index_for(&redis_value_to_json(&info), fields, profile, &marker)?;
+        // Server-wide, not in FT.INFO: which tokens get stemmed at all.
+        let mut read = |cmd: &mut redis::Cmd, name: &str| {
+            cmd.query::<redis::Value>(&mut conn)
+                .ok()
+                .and_then(|v| fulltext::config_get_value(&redis_value_to_json(&v), name))
+        };
+        let value = read(
+            redis::cmd("CONFIG").arg("GET").arg("search-min-stem-len"),
+            "search-min-stem-len",
+        )
+        .or_else(|| {
+            read(
+                redis::cmd("FT.CONFIG").arg("GET").arg("MINSTEMLEN"),
+                "MINSTEMLEN",
+            )
+        });
+        Ok((fulltext::check_redis_min_stem_len(value)?, marker))
+    }
+
     pub(super) fn search_fulltext_harness(
         &mut self,
         dataset: &Dataset,
@@ -104,74 +177,8 @@ impl RedisEngine {
             .ok_or("fulltext: no fulltext search config resolved an index profile")?;
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
-        let (min_stem_len, recorded_marker) = {
-            let mut conn = resp3_connection(&self.redis_url, self.config.cluster_api)
-                .map_err(|e| format!("fulltext: Redis RESP3 connection failed: {e}"))?;
-            let info: redis::Value = redis::cmd("FT.INFO")
-                .arg(&self.config.index_name)
-                .query(&mut conn)
-                .map_err(|e| format!("fulltext: FT.INFO failed: {e}"))?;
-            let marker: Option<String> = match redis::cmd("GET")
-                .arg(fulltext::redis_marker_key(&self.config.index_name))
-                .query(&mut conn)
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    // English: read as "no marker"; parity: refused.
-                    eprintln!(
-                        "{}",
-                        fulltext::redis_marker_failure(&profile, "read", &e.to_string())?
-                    );
-                    None
-                }
-            };
-            let marker = match marker {
-                None => serde_json::Value::Null,
-                Some(m) => serde_json::from_str(&m)
-                    .map_err(|e| format!("fulltext: unreadable index marker {m:?}: {e}"))?,
-            };
-            if self.config.skip_vector_index || spec.compound.is_some() {
-                let validate = if self.config.skip_vector_index {
-                    vector_db_benchmark::filter_only::validate_redis_schema
-                } else {
-                    vector_db_benchmark::filter_only::validate_redis_full_schema
-                };
-                let schema = dataset
-                    .config
-                    .schema
-                    .as_ref()
-                    .map(|s| profile.scalar_indexing.project(s));
-                validate(&redis_value_to_json(&info), schema.as_ref())?;
-                if profile.scalar_indexing.is_reduced() {
-                    vector_db_benchmark::text_tag_profile::validate_redis(&redis_value_to_json(
-                        &info,
-                    ))?;
-                }
-            }
-            fulltext::validate_redis_index_for(
-                &redis_value_to_json(&info),
-                &fields,
-                &profile,
-                &marker,
-            )?;
-            // Server-wide, not in FT.INFO: which tokens get stemmed at all.
-            let mut read = |cmd: &mut redis::Cmd, name: &str| {
-                cmd.query::<redis::Value>(&mut conn)
-                    .ok()
-                    .and_then(|v| fulltext::config_get_value(&redis_value_to_json(&v), name))
-            };
-            let value = read(
-                redis::cmd("CONFIG").arg("GET").arg("search-min-stem-len"),
-                "search-min-stem-len",
-            )
-            .or_else(|| {
-                read(
-                    redis::cmd("FT.CONFIG").arg("GET").arg("MINSTEMLEN"),
-                    "MINSTEMLEN",
-                )
-            });
-            (fulltext::check_redis_min_stem_len(value)?, marker)
-        };
+        let (min_stem_len, recorded_marker) =
+            self.validate_fulltext_live_index(dataset, &spec, &fields, &profile)?;
 
         let set =
             fulltext::load_query_set(&dataset.get_path()?, &spec, dataset.config.schema.as_ref())?;

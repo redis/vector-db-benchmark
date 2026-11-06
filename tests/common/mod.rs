@@ -4673,3 +4673,195 @@ pub fn compound_wrong_count_params(no_vector: bool) -> serde_json::Value {
     }
     params
 }
+
+// ── hybrid-rrf: BM25 + KNN fused by reciprocal rank fusion ────────────────
+
+/// RRF constant of [`hybrid_rrf_search_params`]: NOT the engines' default
+/// (60), so a server that ignored it returns different scores.
+pub const HYBRID_RRF_K: u32 = 20;
+/// Candidate window (`W`) of [`hybrid_rrf_search_params`]; the corpus has 8.
+pub const HYBRID_RRF_W: usize = 4;
+/// Fused page size of [`hybrid_rrf_search_params`].
+pub const HYBRID_RRF_TOP: usize = 3;
+
+/// The BM25 fixture's corpus and query texts, with a random query vector per
+/// `tests.jsonl` line and its exact (brute-force L2) neighbours over all 8
+/// documents, so the KNN arm's truth is `W`-deep. Returns the project and
+/// the neighbours (row ids, nearest first).
+pub fn write_hybrid_rrf_project(engine_configs_json: &str) -> (MatchAnyProject, Vec<Vec<i64>>) {
+    let proj = write_bm25_project(engine_configs_json);
+    let ds = proj.root.join("datasets").join(BM25_DATASET);
+    // Same generator and seed as `write_bm25_project`: the corpus vectors.
+    let mut rng = StdRng::seed_from_u64(0xB325);
+    let corpus: Vec<Vec<f32>> = (0..BM25_DOCS.len())
+        .map(|_| (0..4).map(|_| rng.gen_range(-1.0f32..1.0)).collect())
+        .collect();
+    let mut qrng = StdRng::seed_from_u64(0x4B1D);
+    let mut closest = Vec::new();
+    let tests = BM25_QUERIES
+        .iter()
+        .map(|q| {
+            let v: Vec<f32> = (0..4).map(|_| qrng.gen_range(-1.0f32..1.0)).collect();
+            let mut ids: Vec<i64> = (0..corpus.len() as i64).collect();
+            let d = |i: i64| -> f32 {
+                corpus[i as usize]
+                    .iter()
+                    .zip(&v)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum()
+            };
+            ids.sort_by(|a, b| d(*a).total_cmp(&d(*b)));
+            closest.push(ids.clone());
+            serde_json::json!({"query": v, "closest_ids": ids, "query_text": q}).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(ds.join("tests.jsonl"), tests).unwrap();
+    (proj, closest)
+}
+
+/// One hybrid-rrf search config: the title-boosted BM25 arm of
+/// [`bm25_search_params`], KNN at `ef` 16, RRF at [`HYBRID_RRF_K`] over
+/// [`HYBRID_RRF_W`] candidates per list, [`HYBRID_RRF_TOP`] fused results.
+pub fn hybrid_rrf_search_params() -> serde_json::Value {
+    serde_json::json!([
+        {"parallel": 2, "top": HYBRID_RRF_TOP, "workload": "hybrid-rrf",
+         "search_params": {"ef": 16},
+         "fulltext": {"fields": {"title": 5.0, "headings": 1.0, "segment": 1.0}},
+         "rrf": {"window": HYBRID_RRF_W, "rank_constant": HYBRID_RRF_K}}
+    ])
+}
+
+/// Every claim of a hybrid-rrf run of [`hybrid_rrf_search_params`] on the
+/// fixture of [`write_hybrid_rrf_project`], with `--dump-results <dump>`:
+///
+/// - result JSON: `workload: hybrid-rrf`, the semantics, `k`, `W`, `top`,
+///   `ef`, the BM25 arm's metadata, the skipped termless query; tie-aware
+///   recall and precision 1.0 (8 documents: HNSW is exact), no MRR/NDCG;
+/// - the fusion happened ON THE SERVER at this `k`: for every query whose BM25
+///   list the fulltext fixture pins (`apple` → d0, d1 under the title boost;
+///   `generously` → d2; `crossings` → d5; `beta` → d4 on OpenSearch only),
+///   the fused scores at each position equal client-side RRF at `k` = 20 over
+///   that list and the exact KNN top `W` (the engines' default `k` = 60
+///   would give other values), and every returned id is in the reference's
+///   top group;
+/// - dump records carry the reference top ids as `expected`, and
+///   `compare-results` accepts hybrid-rrf dumps.
+pub fn assert_hybrid_rrf_run(
+    root: &Path,
+    dump: &Path,
+    engine: &str,
+    config: &str,
+    closest: &[Vec<i64>],
+) -> serde_json::Value {
+    use vector_db_benchmark::hybrid_rrf::{rrf_fuse, SEMANTICS};
+    let docs: Vec<serde_json::Value> = fs::read_dir(root.join("results"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().to_string();
+            n.starts_with(&format!("{config}-")) && n.contains("-search-")
+        })
+        .map(|p| serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(docs.len(), 1, "one result file");
+    let doc = &docs[0];
+    let p = &doc["params"];
+    assert_eq!(p["workload"], "hybrid-rrf", "{doc}");
+    let h = &p["hybrid_rrf"];
+    assert_eq!(h["semantics"], SEMANTICS);
+    assert_eq!(h["rank_constant"], HYBRID_RRF_K);
+    assert_eq!(h["window"], HYBRID_RRF_W);
+    assert_eq!(h["result_limit"], HYBRID_RRF_TOP);
+    assert_eq!(h["ef"], 16);
+    assert_eq!(h["bm25"]["engine"], engine);
+    assert_eq!(
+        h["bm25"]["fields"],
+        serde_json::json!({"title": 5.0, "headings": 1.0, "segment": 1.0})
+    );
+    assert_eq!(
+        h["bm25"]["queries_skipped_no_terms"],
+        serde_json::json!([2])
+    );
+    assert_eq!(h["bm25"]["index_marker"]["analysis"], "english");
+    assert_eq!(h["reference"]["queries"], 5);
+    assert_eq!(h["engine"]["engine"], engine);
+    let r = &doc["results"];
+    assert_eq!(r["requested_queries"], 5, "termless query not dispatched");
+    assert_eq!(r["failed_queries"], 0);
+    assert_eq!(r["mean_recall"], 1.0, "{r}");
+    assert_eq!(r["mean_precision_at_returned"], 1.0, "{r}");
+    assert!(h["quality"]["mean_strict_recall"].as_f64().is_some());
+    for key in ["mean_mrr", "mean_ndcg"] {
+        assert!(r.get(key).is_none(), "hybrid-rrf result carries {key}");
+    }
+    assert_eq!(doc["metrics_schema"]["workload"], "hybrid-rrf");
+
+    // BM25 lists the fulltext fixture pins (title boost), as row ids.
+    let mut bm25: std::collections::BTreeMap<usize, Vec<i64>> = Default::default();
+    bm25.insert(0, vec![0, 1]);
+    bm25.insert(1, vec![2]);
+    bm25.insert(3, if engine == "redis" { vec![] } else { vec![4] });
+    bm25.insert(5, vec![5]);
+    let row = |id: &str| -> i64 { id.trim_start_matches('d').parse().unwrap() };
+
+    let dumps = read_dumps(dump);
+    assert_eq!(dumps.len(), 1, "one dump");
+    let d = &dumps[0];
+    assert_eq!(d.header.engine, engine);
+    assert_eq!(d.header.workload.as_str(), "hybrid-rrf");
+    assert_eq!(d.header.top, HYBRID_RRF_TOP);
+    assert_eq!(d.records.len(), 5, "a record per eligible query");
+    let mut checked = 0;
+    for rec in &d.records {
+        assert!(
+            rec.error.is_none(),
+            "query {} failed: {:?}",
+            rec.query_id,
+            rec.error
+        );
+        assert_ne!(rec.query_id, 2, "the termless query must not be dispatched");
+        assert_eq!(rec.ids.len(), HYBRID_RRF_TOP, "{rec:?}");
+        let scores = rec
+            .scores
+            .as_ref()
+            .expect("hybrid-rrf records carry scores");
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+        let Some(text) = bm25.get(&rec.query_id) else {
+            continue;
+        };
+        let knn = &closest[rec.query_id][..HYBRID_RRF_W];
+        let want = rrf_fuse(&[text, knn], HYBRID_RRF_K);
+        for (i, s) in scores.iter().enumerate() {
+            assert!(
+                (s - want[i].1).abs() <= want[i].1 * 1e-5,
+                "{engine} query {}: fused score {i} is {s}, client RRF at k={HYBRID_RRF_K} \
+                 says {} ({want:?})",
+                rec.query_id,
+                want[i].1
+            );
+        }
+        let cutoff = want[HYBRID_RRF_TOP - 1].1 * (1.0 - 1e-5);
+        for id in &rec.ids {
+            let s = want.iter().find(|(r, _)| *r == row(id)).map(|x| x.1);
+            assert!(
+                s.is_some_and(|s| s >= cutoff),
+                "{engine} query {}: {id} is not in the reference top group ({want:?})",
+                rec.query_id
+            );
+        }
+        let reference: Vec<String> = want[..HYBRID_RRF_TOP]
+            .iter()
+            .map(|(r, _)| format!("d{r}"))
+            .collect();
+        assert_eq!(rec.expected.as_ref(), Some(&reference), "{rec:?}");
+        checked += 1;
+    }
+    assert_eq!(checked, 4, "every pinned query was answered");
+    let (ok, report) = run_compare(dump, dump, engine);
+    assert!(ok, "self-comparison must pass: {report}");
+    for pair in report["pairs"].as_array().unwrap() {
+        assert_eq!(pair["workload"], "hybrid-rrf", "{pair}");
+    }
+    h.clone()
+}

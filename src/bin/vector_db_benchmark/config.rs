@@ -2589,13 +2589,35 @@ mod shipped_config_knob_guard {
                         // validated with the real parser instead of by token
                         // matching an engine's source.
                         let mut sp = sp.clone();
+                        // The `fulltext` block is also the BM25 arm of
+                        // hybrid-rrf: validated under the entry's workload.
+                        let text_workload = match sp.get("workload").and_then(|w| w.as_str()) {
+                            Some("hybrid-rrf") => {
+                                vector_db_benchmark::workload::Workload::HybridRrf
+                            }
+                            _ => vector_db_benchmark::workload::Workload::Fulltext,
+                        };
+                        // The `rrf` block is typed (deny_unknown_fields) too.
+                        if let Some(block) = sp
+                            .as_object_mut()
+                            .and_then(|o| o.remove(vector_db_benchmark::hybrid_rrf::SPEC_KEY))
+                        {
+                            if let Err(e) = vector_db_benchmark::hybrid_rrf::validate_declared(
+                                text_workload,
+                                Some(&block),
+                            ) {
+                                violations.push(format!(
+                                    "{file_name} [{name}] has an invalid rrf block: {e}"
+                                ));
+                            }
+                        }
                         if let Some(block) = sp
                             .as_object_mut()
                             .and_then(|o| o.remove(vector_db_benchmark::fulltext::SPEC_KEY))
                         {
                             if let Err(e) = vector_db_benchmark::fulltext::validate_declared(
                                 engine,
-                                vector_db_benchmark::workload::Workload::Fulltext,
+                                text_workload,
                                 Some(&block),
                             ) {
                                 violations.push(format!(

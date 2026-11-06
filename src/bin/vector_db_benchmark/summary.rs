@@ -38,6 +38,8 @@ fn entry_workload(e: &SearchEntry) -> Workload {
         Workload::FilterOnly
     } else if e.results.fulltext.is_some() {
         Workload::Fulltext
+    } else if e.results.hybrid_rrf.is_some() {
+        Workload::HybridRrf
     } else {
         Workload::Vector
     }
@@ -94,6 +96,11 @@ fn analyze_precision_performance(entries: &[SearchEntry]) -> Vec<PrecisionBucket
     for entry in entries {
         // #339: fulltext has no ground truth, so no precision bucket.
         if entry.results.fulltext.is_some() {
+            continue;
+        }
+        // Hybrid-RRF is scored against its fused reference, not the KNN
+        // truth: its precision is not a point on the vector curve.
+        if entry.results.hybrid_rrf.is_some() {
             continue;
         }
         let key = format_precision_key(entry.results.mean_precision_at_returned);

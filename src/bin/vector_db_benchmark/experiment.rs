@@ -302,6 +302,11 @@ pub fn run(args: &Args) -> Result<(), String> {
                 sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
             )
             .map_err(|e| format!("config '{name}', search config #{i}: {e}"))?;
+            vector_db_benchmark::hybrid_rrf::validate_declared(
+                plan.workload(i)?,
+                sp.knob(vector_db_benchmark::hybrid_rrf::SPEC_KEY),
+            )
+            .map_err(|e| format!("config '{name}', search config #{i}: {e}"))?;
         }
         // #339 parity: the index profile all fulltext search configs share
         // (analysis mode, indexed text fields) must be resolvable, and parity
@@ -355,6 +360,20 @@ pub fn run(args: &Args) -> Result<(), String> {
                     sp.target_qps.or(cli_target_qps),
                     sp.duration_seconds.or(cli_duration),
                 )?;
+            }
+            if plan.workload(i)? == Workload::HybridRrf {
+                let spec = vector_db_benchmark::hybrid_rrf::parse_spec(
+                    sp.knob(vector_db_benchmark::hybrid_rrf::SPEC_KEY),
+                )
+                .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
+                vector_db_benchmark::hybrid_rrf::check_params(
+                    sp.top,
+                    sp.search_params.as_ref().and_then(|p| p.ef),
+                    &spec,
+                    sp.target_qps.or(cli_target_qps),
+                    sp.duration_seconds.or(cli_duration),
+                )
+                .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
             }
             if plan.workload(i)? == Workload::Hybrid {
                 vector_db_benchmark::hybrid::check_params(
@@ -1461,7 +1480,7 @@ fn run_single_experiment(
             .search_params()
             .iter()
             .enumerate()
-            .filter(|(i, _)| plan.workload(*i).ok() == Some(Workload::Fulltext))
+            .filter(|(i, _)| plan.workload(*i).is_ok_and(|w| w.uses_text_index()))
             .map(|(i, sp)| (i, sp.knob(vector_db_benchmark::fulltext::SPEC_KEY))),
         dataset.config.schema.as_ref(),
         &dataset.config.name,
@@ -2763,7 +2782,14 @@ fn write_query_dumps(
                 buckets.get(q).cloned()
             })?
         } else {
-            let gt = if workload.has_ground_truth() {
+            let gt = if workload == Workload::HybridRrf {
+                Some(
+                    results
+                        .hybrid_rrf_expected
+                        .as_deref()
+                        .ok_or("hybrid-rrf result without its reference ids")?,
+                )
+            } else if workload.has_ground_truth() {
                 if expected.is_none() {
                     expected = Some(dataset.read_queries()?.1);
                 }
@@ -3076,6 +3102,27 @@ fn build_search_result_json(
         }
     }
 
+    // Hybrid-RRF: the fused workload HAS a reference (client-side RRF over
+    // exact BM25 + exact KNN), so `mean_recall` stays; MRR/NDCG are not
+    // computed for it and are dropped rather than published as 0.
+    if let Some(meta) = &results.hybrid_rrf {
+        result["params"]["workload"] = serde_json::json!("hybrid-rrf");
+        result["params"]["hybrid_rrf"] = meta.clone();
+        result["metrics_schema"] = serde_json::json!({
+            "version": 2, "workload": "hybrid-rrf",
+            "semantics": vector_db_benchmark::hybrid_rrf::SEMANTICS,
+            "result_order": "ranked by the engine's fused RRF score (descending)",
+            "returned_fields": "IDs and fused RRF scores",
+            "ground_truth_source": "client-side RRF over the engine's exact BM25 top-window                                     and the dataset's brute-forced KNN top-window (params.hybrid_rrf.reference)",
+            "mean_recall": "tie-aware recall@top against that reference (params.hybrid_rrf.quality)",
+            "mean_precision_at_returned": "tie-aware hits / ids returned",
+            "latency": "OpenSearch excludes retry/backoff (as on its vector path); Redis uses one attempt; connection setup, priming and the reference pass excluded"
+        });
+        for key in ["mean_mrr", "mean_ndcg", "mrr_dist", "ndcg_dist"] {
+            result["results"].as_object_mut().unwrap().remove(key);
+        }
+    }
+
     // How the swept parameter was chosen, and — crucially — whether the target
     // was actually reached. A calibration that converged on the maximum value
     // without reaching its target is not a calibration.
@@ -3124,7 +3171,10 @@ fn build_search_result_json(
         let results_obj = result["results"].as_object_mut().unwrap();
         // `precisions` is another upstream key name carrying upstream's per-query
         // recall@top values, so our array ships under an unambiguous name too.
-        if results.filter_only.is_none() && results.fulltext.is_none() {
+        if results.filter_only.is_none()
+            && results.fulltext.is_none()
+            && results.hybrid_rrf.is_none()
+        {
             results_obj.insert(
                 "precisions_at_returned".to_string(),
                 json!(results.precisions_at_returned),

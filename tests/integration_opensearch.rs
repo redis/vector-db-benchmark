@@ -1658,6 +1658,69 @@ fn test_binary_opensearch_fulltext_bm25() {
     std::fs::remove_dir_all(&proj.root).ok();
 }
 
+/// hybrid-rrf end to end on OpenSearch: a `hybrid` query (the fulltext
+/// workload's multi_match + lucene knn) fused by a per-config search pipeline
+/// whose `score-ranker-processor` combines with `rrf` at the configured
+/// (non-default) constant — the fused scores match client-side RRF at that
+/// constant position by position. The pipeline is read back before the run
+/// and deleted after it. See `common::assert_hybrid_rrf_run`.
+#[test]
+fn test_binary_opensearch_hybrid_rrf() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-hrrf", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1}, "upload_params": {"parallel": 1},
+        "search_params": common::hybrid_rrf_search_params()
+    }]);
+    let (proj, closest) = common::write_hybrid_rrf_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-hrrf",
+        common::BM25_DATASET,
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_hrrf")
+        ],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    let h = common::assert_hybrid_rrf_run(&proj.root, &dump, "opensearch", "os-hrrf", &closest);
+    let engine = &h["engine"];
+    let pipeline = engine["search_pipeline"].as_str().unwrap();
+    assert_eq!(
+        pipeline,
+        format!("vdbb-hybrid-rrf-os-hrrf-k{}", common::HYBRID_RRF_K)
+    );
+    // As the server reported it before the run.
+    let combination = &engine["search_pipeline_read_back"]["phase_results_processors"][0]
+        ["score-ranker-processor"]["combination"];
+    assert_eq!(combination["technique"], "rrf", "{engine}");
+    assert_eq!(
+        combination["rank_constant"],
+        common::HYBRID_RRF_K,
+        "{engine}"
+    );
+    assert_eq!(engine["number_of_shards"], 1);
+    // Dropped after the run: nothing of this config is left on the cluster.
+    let status = os_client()
+        .get(format!("{}/_search/pipeline/{pipeline}", os_base_url()))
+        .send()
+        .unwrap()
+        .status();
+    assert_eq!(
+        status.as_u16(),
+        404,
+        "search pipeline {pipeline} left behind"
+    );
+    std::fs::remove_dir_all(&proj.root).ok();
+}
+
 /// #339: the fulltext arm refuses, before the timed window, an index whose
 /// text fields use the default analyzer (built by a vector-only config) and an
 /// index missing a searched text field — both reached through `--skip-upload`.

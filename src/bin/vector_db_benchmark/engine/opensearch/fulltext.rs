@@ -70,7 +70,7 @@ impl OpenSearchEngine {
         Ok(())
     }
 
-    fn validate_fulltext_index(
+    pub(super) fn validate_fulltext_index(
         &self,
         fields: &[fulltext::FieldBoost],
         allow_multi_shard: bool,

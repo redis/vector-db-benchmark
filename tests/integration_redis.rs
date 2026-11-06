@@ -5402,6 +5402,48 @@ fn test_binary_redis_fulltext_bm25() {
     fs::remove_dir_all(&proj.root).ok();
 }
 
+/// hybrid-rrf end to end on Redis: `FT.HYBRID … COMBINE RRF` fuses the
+/// fulltext workload's BM25 query with HNSW KNN on the server, at the
+/// configured (non-default) constant — the fused scores match client-side RRF
+/// at that constant position by position — and the server's commandstats
+/// count the FT.HYBRID calls. See `common::assert_hybrid_rrf_run`.
+#[test]
+fn test_binary_redis_hybrid_rrf() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{
+        "name": "redis-hrrf", "engine": "redis", "upload_params": {"parallel": 1},
+        "search_params": common::hybrid_rrf_search_params()
+    }]);
+    let (proj, closest) = common::write_hybrid_rrf_project(&configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-hrrf",
+        common::BM25_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", &port)],
+        &[
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries"
+        ]
+    ));
+    let h = common::assert_hybrid_rrf_run(&proj.root, &dump, "redis", "redis-hrrf", &closest);
+    let engine = &h["engine"];
+    assert_eq!(engine["vector_algorithm"], "HNSW", "{engine}");
+    // Standalone server: the FT.HYBRID calls are counted, not assumed.
+    assert_eq!(engine["commandstats"]["verified"], true, "{engine}");
+    assert!(
+        engine["commandstats"]["ft_hybrid_calls_delta"].as_u64() >= Some(5),
+        "{engine}"
+    );
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
 /// #339: the fulltext arm refuses, before the timed window, an index that
 /// was not built with the pinned settings (a vector-only config's index: no
 /// explicit stopword list) and an index missing a searched text field. Both

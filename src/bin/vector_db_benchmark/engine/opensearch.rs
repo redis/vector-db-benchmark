@@ -31,6 +31,7 @@ use vector_db_benchmark::readers::metadata::MetadataItem;
 
 /// Ranked full-text workload (#339).
 mod fulltext;
+mod hybrid_rrf;
 /// Streaming upload from disk (#342).
 mod stream_upload;
 
@@ -1684,6 +1685,19 @@ fn knn_send(
     raw_body: &serde_json::value::RawValue,
     policy: SearchRetryPolicy,
 ) -> Result<(serde_json::Value, RetryCost), String> {
+    search_send(rt, client, index_name, raw_body, policy, None)
+}
+
+/// [`knn_send`] with an optional `?search_pipeline=<id>` (hybrid-rrf): same
+/// retry policy and cost accounting.
+fn search_send(
+    rt: &tokio::runtime::Runtime,
+    client: &OpenSearch,
+    index_name: &str,
+    raw_body: &serde_json::value::RawValue,
+    policy: SearchRetryPolicy,
+    search_pipeline: Option<&str>,
+) -> Result<(serde_json::Value, RetryCost), String> {
     // Search-path back-pressure matters because the caller does not fail on it: a
     // failed query is logged and DROPPED from the timing and recall vectors, so
     // recall ends up averaged over the queries that survived. Since 429s arrive
@@ -1702,12 +1716,29 @@ fn knn_send(
 
     let resp = loop {
         let attempt_start = std::time::Instant::now();
-        let outcome = match rt.block_on(
-            client
-                .search(SearchParts::Index(&[index_name]))
-                .body(raw_body)
-                .send(),
-        ) {
+        let outcome = match rt.block_on(async {
+            match search_pipeline {
+                None => {
+                    client
+                        .search(SearchParts::Index(&[index_name]))
+                        .body(raw_body)
+                        .send()
+                        .await
+                }
+                Some(pipeline) => {
+                    client
+                        .send(
+                            opensearch::http::Method::Post,
+                            &format!("/{index_name}/_search"),
+                            opensearch::http::headers::HeaderMap::new(),
+                            Some(&[("search_pipeline", pipeline)]),
+                            Some(JsonBody::new(raw_body)),
+                            None,
+                        )
+                        .await
+                }
+            }
+        }) {
             Ok(r) => {
                 let status = r.status_code().as_u16();
                 if r.status_code().is_success() {
@@ -2595,6 +2626,15 @@ impl Engine for OpenSearchEngine {
         num_queries: i64,
     ) -> Result<SearchResults, String> {
         self.search_fulltext_impl(dataset, params, num_queries)
+    }
+
+    fn search_hybrid_rrf(
+        &mut self,
+        dataset: &Dataset,
+        params: &SearchParams,
+        num_queries: i64,
+    ) -> Result<SearchResults, String> {
+        self.search_hybrid_rrf_impl(dataset, params, num_queries)
     }
 
     /// The hybrid workload (#341): lucene `knn` with the predicate as its
@@ -3505,6 +3545,9 @@ mod tests {
             // statistics are per shard) unless a config opts in; these
             // english/parity configs compare against Redis on one shard.
             ("opensearch-msmarco-fulltext.json", (1_i64, 2)),
+            // Hybrid-RRF's BM25 arm is the fulltext query, under the same
+            // one-shard rule.
+            ("opensearch-msmarco-hybrid-rrf.json", (1_i64, 2)),
             // #389/#390: paired English/parity, with/without vector indexes.
             // Single-shard baseline; orchestration records any explicit scale override.
             ("msmarco-compound.json", (1_i64, 8)),

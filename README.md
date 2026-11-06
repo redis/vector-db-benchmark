@@ -1117,6 +1117,99 @@ the result (retry backoff and discarded attempts are excluded and counted in
 Compare QPS columns only from runs with zero retries and no client-saturation
 warning.
 
+### Hybrid search, BM25 + KNN fused by RRF: `"workload": "hybrid-rrf"`
+
+Not the same as `"workload": "hybrid"` (#341), which is a filtered KNN query.
+`hybrid-rrf` fuses two ranked lists, a BM25 full-text list and a vector KNN
+list, with Reciprocal Rank Fusion (RRF). Fusion runs on the server, on Redis
+and OpenSearch only.
+
+```json
+{"workload": "hybrid-rrf", "top": 10, "parallel": 8,
+ "search_params": {"ef": 200},
+ "fulltext": {"fields": {"title": 5.0, "headings": 3.0, "segment": 1.0}},
+ "rrf": {"window": 100, "rank_constant": 60}}
+```
+
+**Semantics (`rrf-v1`), identical on both engines.** For each query, with page
+size `top`, window `W` and rank constant `k`:
+
+1. **BM25 candidates.** The top `W` of the `fulltext` workload's ranked query,
+   built from this config's own `fulltext` block. It uses the same query
+   terms, field boosts, analyzer mode (`english` or `parity`), stopwords and
+   scorer, and the same index checks and markers.
+2. **KNN candidates.** The top `W` of HNSW KNN on the vector field, at
+   `ef = search_params.ef`.
+3. **Fusion.** A document's score is `Σ 1/(k + rank)` over the lists it
+   appears in, with 1-based ranks. The page is the `top` highest scores.
+
+| | Redis 8.4+ | OpenSearch 2.19+ |
+|---|---|---|
+| Request | `FT.HYBRID <idx> SEARCH <bm25 query> SCORER BM25STD VSIM @vector $BLOB KNN 4 K W EF_RUNTIME ef COMBINE RRF 4 CONSTANT k WINDOW W LIMIT 0 top` | a `hybrid` query (`pagination_depth: W`) with two subqueries: the fulltext `multi_match` and `knn` (`k: W`, `method_parameters.ef_search: ef`) |
+| Fusion | `COMBINE RRF`, verified through the `INFO commandstats` FT.HYBRID call count (standalone only) | a per-config search pipeline whose `score-ranker-processor` uses `rrf` at `rank_constant: k`, sent as `?search_pipeline=`. The pipeline is read back and checked before the run, then deleted afterwards |
+| Parity | every term is quoted, which makes it verbatim (FT.HYBRID's SEARCH takes no `VERBATIM`) | the fulltext parity analyzer |
+| Older server | refused, with the server version | refused below 2.19 |
+
+**No silent fallback.** A server that cannot fuse on the server side is
+refused before the timed window. There is no client-side fusion mode.
+
+**Every knob is explicit.** Refused at startup, before anything is downloaded
+or connected:
+- the `rrf` block missing, or `rrf` on another workload;
+- `top` missing, or `top > W`;
+- `ef` missing, or `ef < W`, so an engine default never decides it;
+- `rank_constant` that is not an integer in 1..=10000 (OpenSearch's bounds);
+- `W > 10000`;
+- `target_qps` or `duration`;
+- a `fulltext.compound`, `no_vector_index` or text-tag-only layout.
+
+The Redis arm needs an HNSW index, because FT.HYBRID's KNN clause takes only
+`K` and `EF_RUNTIME`. A dataset whose queries declare `conditions` is refused:
+hybrid-rrf has no filter clause, and its KNN truth would be the filtered one.
+
+**Reference and quality.** Computed client-side before the timed window:
+- RRF at the same `k` and `W` over the **exact** BM25 top `W` (the engine's own
+  ranked query, untimed) and the **exact** KNN top `W` (the dataset's
+  brute-forced neighbours, which must be at least `W` deep);
+- `mean_recall` is tie-aware recall@`top`. A returned document counts as a hit
+  when its reference score is at least the reference score at position `top`.
+  RRF ties by construction: a BM25-only document at rank `r` and a KNN-only
+  document at rank `r` score the same, and the engines break such ties
+  differently;
+- `params.hybrid_rrf.quality.mean_strict_recall` is recall against the
+  id-tie-broken reference list.
+
+What the reference measures is what server-side fusion loses against fusing
+exact candidate lists, mostly the approximate KNN arm. Cross-engine agreement
+is a separate question: run `compare-results` on the dumps.
+
+**Checks on every result.**
+- Every returned score must be an RRF score at this `k` and `W` and the page
+  must be non-increasing. Raw BM25 or linear scores are refused.
+- Any FT.HYBRID warning, OpenSearch timeout or failed shard fails the query.
+- Any failed query fails the run, because none is dropped from the score.
+
+The result JSON carries `params.hybrid_rrf`: the semantics, `k`, `W`, `top`,
+`ef`, the BM25 arm's fulltext metadata, the reference statistics and the
+engine record (command template, or pipeline read-back, server version and
+shard count). `--dump-results` records carry each query's reference top ids as
+`expected`.
+
+The OpenSearch index is the shared `OPENSEARCH_INDEX`, as for every OpenSearch
+workload, and the fulltext marker guards it. The search pipeline is named per
+config: `vdbb-hybrid-rrf-<config>-k<k>`. On Redis the index is already per
+config (`idx:<config>`). `experiments/configurations/redis-msmarco-hybrid-rrf.json`
+and `opensearch-msmarco-hybrid-rrf.json` ship `english` and `parity` configs
+with `W` = 100, `k` = 60, `ef` = 200 and `top` = 10.
+
+```bash
+vector-db-benchmark --engines 'redis-msmarco-hybrid-rrf-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/redis-hrrf
+vector-db-benchmark --engines 'opensearch-msmarco-hybrid-rrf-*' \
+  --datasets msmarco-cohere-1024-100K-cosine --dump-results dumps/opensearch-hrrf
+vector-db-benchmark compare-results dumps/opensearch-hrrf dumps/redis-hrrf --reference opensearch
+```
+
 ### `--skip-upload`: reuse means reuse (issue #238)
 
 `--skip-upload` asserts *"the server already holds the corpus I want"*. Three
