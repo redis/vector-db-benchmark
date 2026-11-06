@@ -58,8 +58,10 @@
 //! RRF produces ties by construction (a document ranked `r` by BM25 only and
 //! one ranked `r` by KNN only score the same), and the engines break them
 //! differently. [`score_query`] is therefore tie-aware: a returned document is
-//! a hit when its reference score is at least the reference score at position
-//! `top` (within [`REFERENCE_TIE_TOLERANCE`]: both scores are the client's own
+//! a hit when its reference score is strictly above the reference score at
+//! position `top`, and members of the tie group AT that score count only up
+//! to the slots the reference gives the group (so an extra tied document can
+//! never stand in for a missed higher-scoring one). Ties compare within [`REFERENCE_TIE_TOLERANCE`]: both scores are the client's own
 //! f64 fusion, so only exact lattice ties count; [`TIE_TOLERANCE`], which
 //! absorbs OpenSearch's float32, applies to engine-returned scores only). `mean_recall` is that tie-aware recall@top; the strict recall
 //! against the id-tie-broken reference list is published next to it.
@@ -504,8 +506,11 @@ pub const REFERENCE_TIE_TOLERANCE: f64 = 1e-12;
 
 /// Score one fused page (row ids, rank order) against its reference. See the
 /// module docs: the denominator is `min(top, |reference|)`; a hit is a
-/// returned id whose reference score is at least the reference score at that
-/// position (within [`REFERENCE_TIE_TOLERANCE`]: both are client-side f64).
+/// returned id whose reference score is strictly above the reference score at
+/// that position, plus returned members of the cutoff tie group up to the
+/// number of slots the reference gives that group (`expected` minus the
+/// reference ids strictly above it). Ties compare within
+/// [`REFERENCE_TIE_TOLERANCE`]: both are client-side f64.
 pub fn score_query(returned: &[i64], reference: &Reference, top: usize) -> QueryScore {
     let expected = top.min(reference.fused.len());
     let mut seen = HashSet::new();
@@ -525,12 +530,22 @@ pub fn score_query(returned: &[i64], reference: &Reference, top: usize) -> Query
     }
     let cutoff = reference.fused[expected - 1].1;
     let floor = cutoff - cutoff.abs() * REFERENCE_TIE_TOLERANCE;
+    let ceil = cutoff + cutoff.abs() * REFERENCE_TIE_TOLERANCE;
+    // The cutoff tie group only owns the slots the reference leaves it: a
+    // tied member can stand in for another tied member, never for a missed
+    // document that scores strictly above the cutoff.
+    let above_in_reference = reference.fused.iter().filter(|(_, s)| *s > ceil).count();
+    let tie_slots = expected.saturating_sub(above_in_reference);
     let ref_score: HashMap<i64, f64> = reference.fused.iter().copied().collect();
-    let hits = page
-        .iter()
-        .filter(|id| ref_score.get(id).is_some_and(|s| *s >= floor))
-        .count()
-        .min(expected);
+    let (mut above_hits, mut tie_hits) = (0usize, 0usize);
+    for id in &page {
+        match ref_score.get(id) {
+            Some(s) if *s > ceil => above_hits += 1,
+            Some(s) if *s >= floor => tie_hits += 1,
+            _ => {}
+        }
+    }
+    let hits = above_hits + tie_hits.min(tie_slots);
     let strict: HashSet<i64> = reference.fused[..expected]
         .iter()
         .map(|(id, _)| *id)
@@ -1370,6 +1385,19 @@ mod tests {
         assert!((junk.recall - 1.0 / 3.0).abs() < 1e-12);
         assert!((junk.precision - 0.5).abs() < 1e-12);
         assert_eq!(score_query(&[], &r, 3).recall, 0.0);
+        // A tied document cannot stand in for a missed higher-scoring one:
+        // the engine missed 4 (above the cutoff) and returned both members
+        // of the (2,5) cutoff tie, which owns only one slot.
+        let sub = score_query(&[1, 5, 2], &r, 3);
+        assert!((sub.recall - 2.0 / 3.0).abs() < 1e-12, "{sub:?}");
+        assert!((sub.precision - 2.0 / 3.0).abs() < 1e-12, "{sub:?}");
+        assert!((sub.strict_recall - 2.0 / 3.0).abs() < 1e-12);
+        let sub = score_query(&[1, 2, 5], &r, 3);
+        assert!((sub.recall - 2.0 / 3.0).abs() < 1e-12, "{sub:?}");
+        // Both 1 and 4 missed; the tie group still owns one slot.
+        let sub = score_query(&[2, 5, 3], &r, 3);
+        assert!((sub.recall - 1.0 / 3.0).abs() < 1e-12, "{sub:?}");
+        assert!((sub.precision - 1.0 / 3.0).abs() < 1e-12, "{sub:?}");
         // Hits are capped at the denominator: a whole tie group returned in
         // a larger page cannot push recall above 1.
         let r2 = reference(&[1], &[2], &s).unwrap();
