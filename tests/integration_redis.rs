@@ -5449,6 +5449,9 @@ fn run_redis_hybrid_rrf(parity: bool) {
         common::assert_hybrid_rrf_run(&proj.root, &dump, "redis", "redis-hrrf", &closest, parity);
     let engine = &h["engine"];
     assert_eq!(engine["vector_algorithm"], "HNSW", "{engine}");
+    // The search shard count is read live (FT.PROFILE through any
+    // coordinator), not inferred from cluster_api, and recorded.
+    assert_eq!(engine["shards"], 1, "{engine}");
     // Standalone server: the FT.HYBRID calls are counted, not assumed.
     assert_eq!(engine["commandstats"]["verified"], true, "{engine}");
     assert!(

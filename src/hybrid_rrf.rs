@@ -59,8 +59,9 @@
 //! one ranked `r` by KNN only score the same), and the engines break them
 //! differently. [`score_query`] is therefore tie-aware: a returned document is
 //! a hit when its reference score is at least the reference score at position
-//! `top` (within [`TIE_TOLERANCE`], which absorbs OpenSearch's float32
-//! scores). `mean_recall` is that tie-aware recall@top; the strict recall
+//! `top` (within [`REFERENCE_TIE_TOLERANCE`]: both scores are the client's own
+//! f64 fusion, so only exact lattice ties count; [`TIE_TOLERANCE`], which
+//! absorbs OpenSearch's float32, applies to engine-returned scores only). `mean_recall` is that tie-aware recall@top; the strict recall
 //! against the id-tie-broken reference list is published next to it.
 //!
 //! Every returned score must also be an RRF score at this `k` and `W` (in
@@ -192,6 +193,12 @@ pub fn validate_declared(workload: Workload, block: Option<&Value>) -> Result<()
 /// across shards before fusing is not verified live. A shard-local fusion
 /// still yields scores on the RRF lattice, so the probe could not tell. This
 /// is the Redis counterpart of the OpenSearch `allow_multi_shard` refusal.
+///
+/// The flag alone is not the deployment: a multi-shard Redis Cloud /
+/// Software database reached through its proxy endpoint (`cluster_api`
+/// off) runs FT.* through the same coordinator. That case is caught live,
+/// before the reference and the timed window, by [`redis_profile_shards`]
+/// + [`check_redis_shards`] on an `FT.PROFILE` of the reference query.
 pub fn check_redis_deployment(cluster_api: bool, workloads: &[Workload]) -> Result<(), String> {
     if cluster_api && workloads.contains(&Workload::HybridRrf) {
         return Err(
@@ -200,6 +207,50 @@ pub fn check_redis_deployment(cluster_api: bool, workloads: &[Workload]) -> Resu
              verified live — run it against a single-shard endpoint"
                 .into(),
         );
+    }
+    Ok(())
+}
+
+/// Search shards behind a Redis endpoint, from ONE flattened `FT.PROFILE`
+/// reply (every scalar, in order). A standalone or single-shard server
+/// reports one profile and no `Shard ID`; through a RediSearch coordinator
+/// (OSS cluster, or a multi-shard Redis Cloud / Software database behind its
+/// proxy) the reply carries one `Shard ID …` profile per shard (the same
+/// tally `hybrid::redis_profile_modes` uses). Every shard profile has its own
+/// `Total profile time`; a reply whose profile count disagrees with its
+/// shard count is not one this check understands, and is refused rather
+/// than read as one shard.
+pub fn redis_profile_shards(profile: &[String]) -> Result<u64, String> {
+    let ids = profile.iter().filter(|s| *s == "Shard ID").count();
+    let profiles = profile
+        .iter()
+        .filter(|s| *s == "Total profile time")
+        .count();
+    let shards = ids.max(1);
+    if profiles != shards {
+        return Err(format!(
+            "hybrid-rrf: FT.PROFILE reply reports {profiles} shard profile(s) for {ids} \
+             `Shard ID` entr(ies); the shard count behind this endpoint cannot be read, so \
+             hybrid-rrf is refused (it must run on one shard)"
+        ));
+    }
+    Ok(shards as u64)
+}
+
+/// hybrid-rrf runs on ONE search shard only, on Redis as on OpenSearch
+/// (`allow_multi_shard` is refused there). The reference is the global top W
+/// of each list; on a multi-shard database the coordinator's cross-shard
+/// merge of FT.HYBRID's subquery lists is not verified live, and a
+/// shard-local fusion still yields lattice-valid scores the probe cannot
+/// tell apart. This holds whether the client uses the Cluster API or the
+/// proxy endpoint.
+pub fn check_redis_shards(shards: u64) -> Result<(), String> {
+    if shards != 1 {
+        return Err(format!(
+            "hybrid-rrf refuses a {shards}-shard Redis search database (FT.PROFILE through the \
+             coordinator): the reference is the global top W per list and FT.HYBRID's \
+             cross-shard merge is not verified live — run it against a single-shard database"
+        ));
     }
     Ok(())
 }
@@ -441,10 +492,20 @@ pub struct QueryScore {
     pub precision: f64,
 }
 
+/// Relative tolerance for comparing two REFERENCE scores with each other
+/// (the tie-aware hit test of [`score_query`]). Both sides come from the same
+/// f64 [`rrf_fuse`], so engine float32 never enters it: it only has to
+/// absorb the last-ulp rounding of mathematically equal sums
+/// (`1/72 + 1/88 = 1/66 + 1/99`). [`TIE_TOLERANCE`] is far too wide here:
+/// distinct lattice values at k = 60, W = 100 can differ by ~1.5e-6
+/// relatively (`1/70 + 1/137` vs `1/69 + 1/141`), so a document strictly
+/// below the cutoff would count as a hit.
+pub const REFERENCE_TIE_TOLERANCE: f64 = 1e-12;
+
 /// Score one fused page (row ids, rank order) against its reference. See the
 /// module docs: the denominator is `min(top, |reference|)`; a hit is a
 /// returned id whose reference score is at least the reference score at that
-/// position (within [`TIE_TOLERANCE`]).
+/// position (within [`REFERENCE_TIE_TOLERANCE`]: both are client-side f64).
 pub fn score_query(returned: &[i64], reference: &Reference, top: usize) -> QueryScore {
     let expected = top.min(reference.fused.len());
     let mut seen = HashSet::new();
@@ -463,7 +524,7 @@ pub fn score_query(returned: &[i64], reference: &Reference, top: usize) -> Query
         };
     }
     let cutoff = reference.fused[expected - 1].1;
-    let floor = cutoff - cutoff.abs() * TIE_TOLERANCE;
+    let floor = cutoff - cutoff.abs() * REFERENCE_TIE_TOLERANCE;
     let ref_score: HashMap<i64, f64> = reference.fused.iter().copied().collect();
     let hits = page
         .iter()
@@ -1031,9 +1092,11 @@ pub fn result_metadata(
         },
         "quality": {
             "mean_recall": "tie-aware recall@top: a returned id is a hit when its reference RRF \
-                            score is >= the reference score at position top (relative tolerance \
-                            below); denominator min(top, |reference|)",
-            "tie_tolerance_relative": TIE_TOLERANCE,
+                            score is >= the reference score at position top (both client-side \
+                            f64; relative tolerance below, exact lattice ties only); \
+                            denominator min(top, |reference|)",
+            "tie_tolerance_relative": REFERENCE_TIE_TOLERANCE,
+            "engine_score_tolerance_relative": TIE_TOLERANCE,
             "mean_strict_recall": mean_strict_recall,
             "strict_recall": "recall@top against the id-tie-broken reference list",
             "score_check": "every returned score is an RRF score at this rank_constant and \
@@ -1140,6 +1203,60 @@ mod tests {
         assert!(e.contains("Cluster API"), "{e}");
         assert!(check_redis_deployment(false, &[Workload::HybridRrf]).is_ok());
         assert!(check_redis_deployment(true, &[Workload::Vector, Workload::Fulltext]).is_ok());
+    }
+
+    /// Flattened FT.PROFILE replies of the reference FT.SEARCH: standalone
+    /// Redis 8.8 (captured: one profile, no `Shard ID`) and a coordinator
+    /// fan-out (one `Shard ID` profile per shard, as in
+    /// `hybrid::tests::profile_fixture`). Trimmed to the keys that matter.
+    fn search_profile(shards: usize) -> Vec<String> {
+        let mut out: Vec<String> = ["2", "d:2", "0.21", "d:1", "0.16", "Shards"]
+            .map(String::from)
+            .to_vec();
+        let one = [
+            "Total profile time",
+            "7.19",
+            "Warning",
+            "None",
+            "Iterators profile",
+            "Type",
+            "TEXT",
+            "Term",
+            "hello",
+        ]
+        .map(String::from);
+        if shards == 1 {
+            out.extend(one);
+            out.push("Coordinator".into());
+        } else {
+            for i in 0..shards {
+                out.push("Shard ID".into());
+                out.push(format!("{i:040x}"));
+                out.extend(one.clone());
+            }
+            out.extend(["Coordinator", "Total Coordinator time", "1.04"].map(String::from));
+        }
+        out
+    }
+
+    #[test]
+    fn redis_shard_count_is_read_from_the_profile_and_multi_shard_refused() {
+        assert_eq!(redis_profile_shards(&search_profile(1)), Ok(1));
+        assert!(check_redis_shards(1).is_ok());
+        // The 10-shard Flex target behind its proxy: read, then refused.
+        let ten = redis_profile_shards(&search_profile(10)).unwrap();
+        assert_eq!(ten, 10);
+        let e = check_redis_shards(ten).unwrap_err();
+        assert!(e.contains("10-shard") && e.contains("single-shard"), "{e}");
+        assert!(check_redis_shards(2).is_err());
+        assert!(check_redis_shards(0).is_err());
+        // A reply whose profiles disagree with its Shard IDs (or has none)
+        // is refused, never read as one shard.
+        let mut odd = search_profile(3);
+        let at = odd.iter().position(|s| s == "Shard ID").unwrap();
+        odd.drain(at..at + 2);
+        assert!(redis_profile_shards(&odd).is_err());
+        assert!(redis_profile_shards(&["2".to_string()]).is_err());
     }
 
     #[test]
@@ -1259,6 +1376,51 @@ mod tests {
         assert_eq!(score_query(&[1, 2], &r2, 1).recall, 1.0);
         // Denominator: min(top, |reference|).
         assert_eq!(score_query(&[1, 4, 2, 5, 3, 6], &r, 10).recall, 1.0);
+    }
+
+    /// Two DISTINCT lattice values closer than the engine-score tolerance:
+    /// at k = 60, W = 100, `1/(60+10) + 1/(60+77)` and `1/(60+9) + 1/(60+81)`
+    /// differ by ~1.5e-6 relatively. The lower one is a strict miss and must
+    /// not count as a tie-aware hit; a genuine exact tie whose f64 sums differ
+    /// in the last ulp (`1/72 + 1/88 = 1/66 + 1/99`) still does.
+    #[test]
+    fn tie_aware_hit_uses_exact_reference_comparison() {
+        let s = spec(100, 60);
+        // A at BM25 rank 10 + KNN rank 77; B at BM25 rank 9 + KNN rank 81.
+        // Every other id is in one list only (<= 1/61, below both pairs).
+        let (a, b) = (1, 2);
+        let mut bm25: Vec<i64> = (1..=100).map(|r| 1000 + r).collect();
+        let mut knn: Vec<i64> = (1..=100).map(|r| 2000 + r).collect();
+        bm25[9] = a;
+        knn[76] = a;
+        bm25[8] = b;
+        knn[80] = b;
+        let r = reference(&bm25, &knn, &s).unwrap();
+        assert_eq!((r.fused[0].0, r.fused[1].0), (a, b));
+        let (sa, sb) = (r.fused[0].1, r.fused[1].1);
+        assert!(sa > sb && (sa - sb) / sa < TIE_TOLERANCE, "{sa} {sb}");
+        let lower = score_query(&[b], &r, 1);
+        assert_eq!(
+            lower.recall, 0.0,
+            "a strictly lower lattice value is a miss"
+        );
+        assert_eq!(lower.strict_recall, 0.0);
+        assert_eq!(score_query(&[a], &r, 1).recall, 1.0);
+
+        // Exact tie in exact arithmetic, different f64 summation: C at
+        // (12, 28), D at (6, 39). Both must count at a cutoff on either.
+        let (c, d) = (3, 4);
+        let mut bm25: Vec<i64> = (1..=100).map(|r| 1000 + r).collect();
+        let mut knn: Vec<i64> = (1..=100).map(|r| 2000 + r).collect();
+        bm25[11] = c;
+        knn[27] = c;
+        bm25[5] = d;
+        knn[38] = d;
+        let r = reference(&bm25, &knn, &s).unwrap();
+        let top2: HashSet<i64> = r.fused[..2].iter().map(|x| x.0).collect();
+        assert_eq!(top2, HashSet::from([c, d]));
+        let other = r.fused[1].0;
+        assert_eq!(score_query(&[other], &r, 1).recall, 1.0);
     }
 
     #[test]

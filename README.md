@@ -1146,7 +1146,7 @@ size `top`, window `W` and rank constant `k`:
 | | Redis 8.4+ | OpenSearch 2.19+ |
 |---|---|---|
 | Request | `FT.HYBRID <idx> SEARCH <bm25 query> SCORER BM25STD VSIM @vector $BLOB KNN 4 K W EF_RUNTIME ef COMBINE RRF 4 CONSTANT k WINDOW W LIMIT 0 top` | a `hybrid` query (`pagination_depth: W`) with two subqueries: the fulltext `multi_match` and `knn` (`k: W`, `method_parameters.ef_search: ef`) |
-| Fusion | `COMBINE RRF`, verified through the `INFO commandstats` FT.HYBRID call count (standalone only) | a per-config search pipeline whose `score-ranker-processor` uses `rrf` at `rank_constant: k`, sent as `?search_pipeline=`. The pipeline is read back and checked before the run, then deleted afterwards |
+| Fusion | `COMBINE RRF`, verified through the `INFO commandstats` FT.HYBRID call count (standalone only; behind a managed proxy it is recorded `verified: false`) | a per-config search pipeline whose `score-ranker-processor` uses `rrf` at `rank_constant: k`, sent as `?search_pipeline=`. The pipeline is read back and checked before the run, then deleted afterwards |
 | Parity | every term is quoted, which makes it verbatim (FT.HYBRID's SEARCH takes no `VERBATIM`) | the fulltext parity analyzer |
 | Older server | refused, with the server version | refused below 2.19 |
 
@@ -1166,6 +1166,19 @@ or connected:
   subquery, while the reference is the global top `W`, and multi-shard RRF
   ranking is not verified live yet. Run on one shard.
 
+**Redis runs on one search shard too.** The Redis Cluster API
+(`cluster_api` / `REDIS_CLUSTER`) is refused at engine construction. That
+flag is not the deployment, though: a multi-shard Redis Cloud or Redis
+Software database reached through its **proxy endpoint** (the default, with
+`cluster_api` off) runs FT.* through the same RediSearch coordinator, whose
+cross-shard FT.HYBRID merge is not verified, and a shard-local fusion still
+yields scores on the RRF lattice that the probe cannot tell apart. So before
+the reference and the timed window the Redis arm sends `FT.PROFILE` of the
+first reference FT.SEARCH and counts its per-shard (`Shard ID`) profiles. More
+than one shard, or a reply whose shard count cannot be read, is refused; the
+count is recorded as `params.hybrid_rrf.engine.shards`. Run headline numbers on
+a single-shard database until the multi-shard merge is verified live.
+
 The Redis arm needs an HNSW index, because FT.HYBRID's KNN clause takes only
 `K` and `EF_RUNTIME`. A dataset whose queries declare `conditions` is refused:
 hybrid-rrf has no filter clause, and its KNN truth would be the filtered one.
@@ -1176,6 +1189,11 @@ hybrid-rrf has no filter clause, and its KNN truth would be the filtered one.
   brute-forced neighbours, which must be at least `W` deep);
 - `mean_recall` is tie-aware recall@`top`. A returned document counts as a hit
   when its reference score is at least the reference score at position `top`.
+  Both scores are the client's own f64 fusion, so the comparison is exact (to
+  `1e-12` relative, for last-ulp rounding of equal sums): distinct RRF values
+  can be ~1e-6 apart, and a document strictly below the cut-off is a miss.
+  The wider `1e-5` tolerance applies only to engine-returned scores (OpenSearch
+  sums in float32).
   RRF ties by construction: a BM25-only document at rank `r` and a KNN-only
   document at rank `r` score the same, and the engines break such ties
   differently;

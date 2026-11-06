@@ -105,6 +105,37 @@ impl RedisEngine {
             .map(|q| hr::redis_search_query(&fields, &q.terms, profile.analysis))
             .collect();
 
+        // Shard count (untimed, before the reference): FT.PROFILE of the
+        // first reference FT.SEARCH, counted through the coordinator. A
+        // multi-shard database behind a proxy endpoint (cluster_api off)
+        // is refused here, like the Cluster API at construction.
+        let shards = {
+            let mut search = redis::cmd("FT.SEARCH");
+            for a in hr::redis_reference_args(
+                &index,
+                &search_queries[0],
+                &spec,
+                query_timeout,
+                profile.analysis,
+            ) {
+                search.arg(a);
+            }
+            let reply: redis::Value = super::profile_cmd(&search)?
+                .query(&mut self.get_connection()?)
+                .map_err(|e| {
+                    format!(
+                        "hybrid-rrf: FT.PROFILE of the reference query failed; the search \
+                         shard count behind this endpoint cannot be read, so hybrid-rrf is \
+                         refused (it must run on one shard): {e}"
+                    )
+                })?;
+            let mut flat = Vec::new();
+            super::flatten_reply(&reply, &mut flat);
+            let shards = hr::redis_profile_shards(&flat)?;
+            hr::check_redis_shards(shards)?;
+            shards
+        };
+
         // Reference (untimed): the engine's exact BM25 top W per query.
         let mut conn = resp3_connection(&self.redis_url, self.config.cluster_api)
             .map_err(|e| format!("hybrid-rrf: Redis RESP3 connection failed: {e}"))?;
@@ -317,6 +348,9 @@ impl RedisEngine {
                                   in parity)",
             "vector_algorithm": self.vector_algorithm_token(),
             "vector_field": "verified via FT.INFO (algorithm, compression)",
+            "shards": shards,
+            "shards_source": "FT.PROFILE of the reference FT.SEARCH (Shard ID profiles through \
+                              the coordinator); more than one is refused",
             "commandstats": calls,
             "search_default_dialect": default_dialect,
             "reference_dialect": 2,
