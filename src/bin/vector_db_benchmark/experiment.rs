@@ -3113,7 +3113,9 @@ fn build_search_result_json(
             "semantics": vector_db_benchmark::hybrid_rrf::SEMANTICS,
             "result_order": "ranked by the engine's fused RRF score (descending)",
             "returned_fields": "IDs and fused RRF scores",
-            "ground_truth_source": "client-side RRF over the engine's exact BM25 top-window                                     and the dataset's brute-forced KNN top-window (params.hybrid_rrf.reference)",
+            "ground_truth_source": "client-side RRF over the engine's exact BM25 top-window \
+                                    and the dataset's brute-forced KNN top-window \
+                                    (params.hybrid_rrf.reference)",
             "mean_recall": "tie-aware recall@top against that reference (params.hybrid_rrf.quality)",
             "mean_precision_at_returned": "tie-aware hits / ids returned",
             "latency": "OpenSearch excludes retry/backoff (as on its vector path); Redis uses one attempt; connection setup, priming and the reference pass excluded"

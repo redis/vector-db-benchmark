@@ -5452,7 +5452,8 @@ fn run_redis_hybrid_rrf(parity: bool) {
     // Standalone server: the FT.HYBRID calls are counted, not assumed.
     assert_eq!(engine["commandstats"]["verified"], true, "{engine}");
     assert!(
-        engine["commandstats"]["ft_hybrid_calls_delta"].as_u64() >= Some(5),
+        // 5 timed queries + one untimed prime per worker (parallel 2).
+        engine["commandstats"]["ft_hybrid_calls_delta"].as_u64() >= Some(7),
         "{engine}"
     );
     flush_db(&mut conn);

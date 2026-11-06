@@ -47,8 +47,10 @@
 //!   engine independent.
 //!
 //! The run therefore measures what the server-side fusion loses against
-//! fusing exact candidate lists: the approximate KNN arm (HNSW at `ef`) and
-//! anything in the fusion itself. Cross-engine agreement is a separate
+//! fusing exact candidate lists: the approximate KNN arm (HNSW at `ef`),
+//! anything in the fusion itself, and equal-BM25-score documents inside the
+//! window that the server's BM25 arm and the reference order differently
+//! (tie-aware recall absorbs only ties in the FUSED score). Cross-engine agreement is a separate
 //! question, answered by `compare-results` on the dumps.
 //!
 //! # Score
@@ -150,6 +152,14 @@ pub fn check_text_spec(spec: &FulltextSpec) -> Result<(), String> {
         return Err(
             "hybrid-rrf fuses the ranked BM25 query; `fulltext.compound` (a Boolean match \
              suite) cannot be its text arm"
+                .into(),
+        );
+    }
+    if spec.allow_multi_shard {
+        return Err(
+            "hybrid-rrf refuses `fulltext.allow_multi_shard`: each shard keeps its own top W \
+             per subquery while the reference is the global top W, and multi-shard RRF ranking \
+             has not been verified live — run it on one shard"
                 .into(),
         );
     }
@@ -806,8 +816,9 @@ pub fn check_opensearch_version(version: &str) -> Result<(), String> {
 /// Processor type of OpenSearch's RRF search-phase-results processor.
 pub const OPENSEARCH_PROCESSOR: &str = "score-ranker-processor";
 
-/// Per-config search pipeline id: `vdbb-hybrid-rrf-<config>-k<k>`, the
-/// config name lowercased with anything outside `[a-z0-9_-]` mapped to `_`.
+/// Per-config search pipeline id: `vdbb-hybrid-rrf-<config>-<hash>-k<k>`,
+/// the config name lowercased with anything outside `[a-z0-9_-]` mapped to
+/// `_`, plus a 32-bit FNV-1a hash of the exact name.
 /// Per engine config so two different configs on one cluster never fuse
 /// through each other's pipeline; per `k` so search configs of one engine
 /// config with different constants do not either. Two processes running the
@@ -826,7 +837,16 @@ pub fn opensearch_pipeline_name(config_name: &str, spec: &RrfSpec) -> String {
             }
         })
         .collect();
-    format!("vdbb-hybrid-rrf-{token}-k{}", spec.rank_constant)
+    // The mapping above is lossy (`a.b` and `a_b`, `A` and `a`), so the id
+    // also carries an FNV-1a hash of the exact name: distinct configs never
+    // share a pipeline.
+    let hash = config_name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!(
+        "vdbb-hybrid-rrf-{token}-{:08x}-k{}",
+        hash as u32, spec.rank_constant
+    )
 }
 
 /// The search pipeline body.
@@ -1065,6 +1085,8 @@ mod tests {
             parse_text_spec(Some(&json!({"analysis": "parity", "fields": {"t": 1.0}}))).is_ok()
         );
         assert!(parse_text_spec(Some(&json!({"no_vector_index": true}))).is_err());
+        let e = parse_text_spec(Some(&json!({"allow_multi_shard": true}))).unwrap_err();
+        assert!(e.contains("one shard"), "{e}");
         assert!(parse_text_spec(Some(&json!({"fields": {"title": 1.0},
             "compound": {"suite": "msmarco-v1", "family": "segment"}})))
         .is_err());
@@ -1440,8 +1462,25 @@ mod tests {
     fn opensearch_pipeline_is_per_config_and_read_back_exactly() {
         let s = spec(100, 60);
         let name = opensearch_pipeline_name("OpenSearch MS:MARCO hybrid", &s);
-        assert_eq!(name, "vdbb-hybrid-rrf-opensearch_ms_marco_hybrid-k60");
+        assert!(
+            name.starts_with("vdbb-hybrid-rrf-opensearch_ms_marco_hybrid-")
+                && name.ends_with("-k60"),
+            "{name}"
+        );
         assert_ne!(name, opensearch_pipeline_name("other", &s));
+        // The lossy token alone would collide; the hash keeps them apart.
+        assert_ne!(
+            opensearch_pipeline_name("a.b", &s),
+            opensearch_pipeline_name("a_b", &s)
+        );
+        assert_ne!(
+            opensearch_pipeline_name("A", &s),
+            opensearch_pipeline_name("a", &s)
+        );
+        assert_eq!(
+            name,
+            opensearch_pipeline_name("OpenSearch MS:MARCO hybrid", &s)
+        );
         assert_ne!(
             name,
             opensearch_pipeline_name("OpenSearch MS:MARCO hybrid", &spec(100, 20))

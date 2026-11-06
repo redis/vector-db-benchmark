@@ -1708,7 +1708,13 @@ fn run_opensearch_hybrid_rrf(parity: bool) {
     let pipeline = engine["search_pipeline"].as_str().unwrap();
     assert_eq!(
         pipeline,
-        format!("vdbb-hybrid-rrf-os-hrrf-k{}", common::HYBRID_RRF_K)
+        vector_db_benchmark::hybrid_rrf::opensearch_pipeline_name(
+            "os-hrrf",
+            &vector_db_benchmark::hybrid_rrf::RrfSpec {
+                window: common::HYBRID_RRF_W,
+                rank_constant: common::HYBRID_RRF_K,
+            }
+        )
     );
     // As the server reported it before the run.
     let combination = &engine["search_pipeline_read_back"]["phase_results_processors"][0]

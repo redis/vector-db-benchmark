@@ -266,6 +266,20 @@ impl RedisEngine {
             self.commandstats_baseline.as_ref(),
         )?;
         let calls = hr::check_redis_calls(calls_before, calls_after, num_to_run)?;
+        // FT.HYBRID's SEARCH takes no DIALECT while the reference pins
+        // DIALECT 2: the server default is recorded so a non-default
+        // deployment is visible next to the numbers.
+        let default_dialect = redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("search-default-dialect")
+            .query::<redis::Value>(&mut conn)
+            .ok()
+            .and_then(|v| {
+                fulltext::config_get_value(
+                    &super::redis_value_to_json(&v),
+                    "search-default-dialect",
+                )
+            });
 
         let (mut result, mean_strict) = crate::engine::hybrid_rrf_results(
             &set,
@@ -304,6 +318,8 @@ impl RedisEngine {
             "vector_algorithm": self.vector_algorithm_token(),
             "vector_field": "verified via FT.INFO (algorithm, compression)",
             "commandstats": calls,
+            "search_default_dialect": default_dialect,
+            "reference_dialect": 2,
             "protocol": "RESP3; a reply with any warning fails its query",
         });
         result.hybrid_rrf = Some(hr::result_metadata(

@@ -1161,7 +1161,10 @@ or connected:
 - `rank_constant` that is not an integer in 1..=10000 (OpenSearch's bounds);
 - `W > 10000`;
 - `target_qps` or `duration`;
-- a `fulltext.compound`, `no_vector_index` or text-tag-only layout.
+- a `fulltext.compound`, `no_vector_index` or text-tag-only layout;
+- `fulltext.allow_multi_shard`. Each shard keeps its own top `W` per
+  subquery, while the reference is the global top `W`, and multi-shard RRF
+  ranking is not verified live yet. Run on one shard.
 
 The Redis arm needs an HNSW index, because FT.HYBRID's KNN clause takes only
 `K` and `EF_RUNTIME`. A dataset whose queries declare `conditions` is refused:
@@ -1180,8 +1183,19 @@ hybrid-rrf has no filter clause, and its KNN truth would be the filtered one.
   id-tie-broken reference list.
 
 What the reference measures is what server-side fusion loses against fusing
-exact candidate lists, mostly the approximate KNN arm. Cross-engine agreement
-is a separate question: run `compare-results` on the dumps.
+exact candidate lists. That loss comes from the approximate KNN arm and from
+anything in the fusion itself. It can also come from documents with **equal
+BM25 scores** inside the window, which the server's BM25 arm and the reference
+query may order differently. That changes their RRF ranks without either one
+being wrong, and tie-aware recall absorbs only ties in the fused score. Do not
+attribute the whole gap to HNSW on corpora with near-duplicate passages.
+
+On Redis the reference pins `DIALECT 2`, while FT.HYBRID's SEARCH takes no
+`DIALECT`. The server's `search-default-dialect` is therefore recorded in
+`params.hybrid_rrf.engine`.
+
+Cross-engine agreement is a separate question: run `compare-results` on the
+dumps.
 
 **Checks on every result.**
 - Every returned score must be an RRF score at this `k` and `W` and the page
@@ -1197,7 +1211,8 @@ shard count). `--dump-results` records carry each query's reference top ids as
 
 The OpenSearch index is the shared `OPENSEARCH_INDEX`, as for every OpenSearch
 workload, and the fulltext marker guards it. The search pipeline is named per
-config: `vdbb-hybrid-rrf-<config>-k<k>`. On Redis the index is already per
+config: `vdbb-hybrid-rrf-<config>-<hash>-k<k>`, where the hash is of the exact
+name, so names that sanitize alike never share a pipeline. On Redis the index is already per
 config (`idx:<config>`). `experiments/configurations/redis-msmarco-hybrid-rrf.json`
 and `opensearch-msmarco-hybrid-rrf.json` ship `english` and `parity` configs
 with `W` = 100, `k` = 60, `ef` = 200 and `top` = 10.
