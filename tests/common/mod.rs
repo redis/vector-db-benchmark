@@ -4816,7 +4816,9 @@ pub fn write_hybrid_rrf_project(engine_configs_json: &str) -> (MatchAnyProject, 
 /// [`bm25_parity_search_params`] (headings + segment, no stemming).
 pub fn hybrid_rrf_search_params(parity: bool) -> serde_json::Value {
     let fulltext = if parity {
-        serde_json::json!({"analysis": "parity", "fields": {"headings": 1.0, "segment": 1.0}})
+        // States `total_hits` (the english variant leaves it unset).
+        serde_json::json!({"analysis": "parity", "fields": {"headings": 1.0, "segment": 1.0},
+                           "total_hits": "none"})
     } else {
         serde_json::json!({"fields": {"title": 5.0, "headings": 1.0, "segment": 1.0}})
     };
@@ -4876,6 +4878,12 @@ pub fn assert_hybrid_rrf_run(
     assert_eq!(h["result_limit"], HYBRID_RRF_TOP);
     assert_eq!(h["ef"], 16);
     assert_eq!(h["bm25"]["engine"], engine);
+    // Total hits: `none` on both engines (FT.HYBRID cannot count), declared
+    // by the parity params and defaulted by the english ones. On OpenSearch
+    // every reply was also checked to carry no `hits.total`.
+    assert_eq!(h["total_hits"]["mode"], "none", "{h}");
+    assert_eq!(h["total_hits"]["declared"], parity, "{h}");
+    assert_eq!(h["total_hits_symmetric"], true, "{h}");
     assert_eq!(
         h["bm25"]["fields"],
         if parity {

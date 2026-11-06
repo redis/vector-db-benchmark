@@ -1212,6 +1212,16 @@ The Redis arm needs an HNSW index, because FT.HYBRID's KNN clause takes only
 `K` and `EF_RUNTIME`. A dataset whose queries declare `conditions` is refused:
 hybrid-rrf has no filter clause, and its KNN truth would be the filtered one.
 
+**Total hits.** hybrid-rrf runs `fulltext.total_hits: "none"` on both
+engines. OpenSearch sends `track_total_hits: false` on the `hybrid` query and
+refuses a reply that carries `hits.total`. `FT.HYBRID` has no counting option,
+and its `total_results` is the fused result count, not a match count. `"exact"`
+cannot be expressed on Redis, so it is refused at startup, never ignored.
+`"none"` or unset are accepted. The mode is recorded as
+`params.hybrid_rrf.total_hits` (`declared` says whether the config stated it)
+with `total_hits_symmetric: true`. The untimed reference requests are not
+affected. The shipped hybrid-rrf configs state `"none"`.
+
 **Reference and quality.** Computed client-side before the timed window:
 - RRF at the same `k` and `W` over the **exact** BM25 top `W` (the engine's own
   ranked query, untimed) and the **exact** KNN top `W` (the dataset's
