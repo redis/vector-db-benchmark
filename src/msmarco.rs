@@ -92,6 +92,7 @@ pub const NEIGHBOURS: usize = 1000;
 pub const QUERY_COUNT: usize = 1677;
 
 pub mod derived;
+pub mod disk_queries;
 pub mod hybrid;
 pub mod preparation;
 pub mod text_match;

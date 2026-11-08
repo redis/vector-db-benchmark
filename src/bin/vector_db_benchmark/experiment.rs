@@ -360,6 +360,11 @@ pub fn run(args: &Args) -> Result<(), String> {
                     sp.target_qps.or(cli_target_qps),
                     sp.duration_seconds.or(cli_duration),
                 )?;
+                vector_db_benchmark::fulltext::check_disk_repetitions(
+                    std::iter::once(sp.knob(vector_db_benchmark::fulltext::SPEC_KEY)),
+                    args.repetitions,
+                )
+                .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
             }
             if plan.workload(i)? == Workload::HybridRrf {
                 let spec = vector_db_benchmark::hybrid_rrf::parse_spec(
@@ -1495,8 +1500,16 @@ fn run_single_experiment(
                 .search_params()
                 .iter()
                 .filter(|sp| sp.workload == Some(Workload::Fulltext))
-                .map(|sp| sp.knob("fulltext")),
+                .map(|sp| {
+                    (
+                        sp.knob("fulltext"),
+                        sp.top
+                            .map(|t| t as usize)
+                            .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT),
+                    )
+                }),
             dataset.config.schema.as_ref(),
+            args.queries,
         )?;
     }
     if vector_db_benchmark::fulltext::mixes_with_filtered_workloads(&plan.workloads) {
@@ -2806,15 +2819,13 @@ fn write_query_dumps(
             };
             let shape = |q: usize| {
                 filter_set.as_ref().and_then(|s| s.shape(q)).or_else(|| {
-                    results
-                        .fulltext
-                        .as_ref()?
-                        .get("compound")?
-                        .get("queries")?
-                        .get(q)?
-                        .get("family")?
-                        .as_str()
-                        .map(str::to_owned)
+                    let compound = results.fulltext.as_ref()?.get("compound")?;
+                    match compound.get("queries") {
+                        Some(queries) => queries.get(q)?.get("family")?.as_str(),
+                        // msmarco-disk-v1: one family per window.
+                        None => compound.get("family")?.as_str(),
+                    }
+                    .map(str::to_owned)
                 })
             };
             dump::resolve_records(&raw, &ids, gt, results.top, &shape)?

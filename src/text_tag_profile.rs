@@ -164,6 +164,56 @@ mod tests {
                 .is_ok()
         );
     }
+    /// The msmarco-disk-v1 `url-eq` / `docid-eq` families need no new index
+    /// flag: the reduced layout already keeps every keyword field, and the
+    /// pre-search validators already require each one as a CASESENSITIVE
+    /// TAG (Redis) / case-sensitive keyword (OpenSearch). A reduced index
+    /// missing `url` is refused before anything is timed.
+    #[test]
+    fn reduced_layout_indexes_and_requires_url_and_docid() {
+        let schema = json!({"docid":"keyword","url":"keyword","title":"text","segment":"text",
+            "category":"keyword","doc_len":"int"});
+        let projected = ScalarIndexing::TextTagOnly.project(&schema);
+        for f in ["docid", "url", "category"] {
+            assert_eq!(projected[f], "keyword", "{f}");
+        }
+        let tag = |name: &str| {
+            json!([
+                "identifier",
+                name,
+                "attribute",
+                name,
+                "type",
+                "TAG",
+                "SEPARATOR",
+                ";",
+                "CASESENSITIVE"
+            ])
+        };
+        let text = |name: &str| json!(["identifier", name, "attribute", name, "type", "TEXT"]);
+        let full = json!({"attributes":[tag("docid"), tag("url"), tag("category"),
+            text("title"), text("segment")]});
+        crate::filter_only::validate_redis_schema(&full, Some(&projected)).unwrap();
+        validate_redis(&full).unwrap();
+        let no_url = json!({"attributes":[tag("docid"), tag("category"), text("title"),
+            text("segment")]});
+        assert!(
+            crate::filter_only::validate_redis_schema(&no_url, Some(&projected))
+                .unwrap_err()
+                .contains("url")
+        );
+        let mut props = json!({"vector":{"type":"float","index":false,"doc_values":false},
+            "docid":{"type":"keyword"},"url":{"type":"keyword"},"category":{"type":"keyword"},
+            "title":{"type":"text"},"segment":{"type":"text"}});
+        let index = json!({"knn":false});
+        crate::filter_only::validate_opensearch_schema(&props, &index, Some(&projected)).unwrap();
+        props["url"]["index"] = json!(false);
+        assert!(
+            crate::filter_only::validate_opensearch_schema(&props, &index, Some(&projected))
+                .unwrap_err()
+                .contains("url")
+        );
+    }
     #[test]
     fn teardown_and_other_engines_refused() {
         assert!(validate_lifecycle("redis", false).is_err());

@@ -304,6 +304,86 @@ pub fn classify(text: &str, term: &str) -> TextMatch {
     }
 }
 
+/// One document's [`classify`] verdict for EVERY valid term at once, in one
+/// pass over the text (the corpus-wide document-frequency table of
+/// `msmarco::disk_queries` needs this for every term of every passage, where
+/// calling [`classify`] per term would rescan the text once per term).
+///
+/// `verdicts` receives `term -> Yes | Ambiguous` for every valid term
+/// ([`validate_term`]) the document is not `No` for, EXCEPT the one rule a
+/// per-document map cannot enumerate: an ASCII run longer than
+/// [`LUCENE_MAX_TOKEN_LEN`] is `Ambiguous` for every term it contains as a
+/// substring. Those runs are appended, lowercased, to `long_runs`; a caller
+/// that needs exact agreement must treat every term contained in any of them
+/// as ambiguous (see `disk_queries::LongRunPoison`). With that rule applied,
+/// `verdicts` equals [`classify`] term by term (pinned by
+/// `doc_verdicts_equal_classify_term_by_term`).
+pub fn doc_verdicts(
+    text: &str,
+    verdicts: &mut HashMap<String, TextMatch>,
+    long_runs: &mut Vec<String>,
+) {
+    verdicts.clear();
+    let chars: Vec<char> = text.chars().collect();
+    for (start, end) in ascii_runs(&chars) {
+        let len = end - start;
+        if len > LUCENE_MAX_TOKEN_LEN {
+            long_runs.push(
+                chars[start..end]
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect(),
+            );
+            continue;
+        }
+        if !(MIN_TERM_LEN..=MAX_TERM_LEN).contains(&len)
+            || !chars[start..end].iter().all(|c| c.is_ascii_alphabetic())
+        {
+            continue;
+        }
+        let term: String = chars[start..end]
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if validate_term(&term).is_err() {
+            continue;
+        }
+        let here = match (
+            side(&chars, start as isize - 1, -1),
+            side(&chars, end as isize, 1),
+        ) {
+            (Side::Joined, _) | (_, Side::Joined) => TextMatch::No,
+            (Side::Boundary, Side::Boundary) => TextMatch::Yes,
+            _ => TextMatch::Ambiguous,
+        };
+        let v = verdicts.entry(term).or_insert(TextMatch::No);
+        *v = v.or(here);
+    }
+    verdicts.retain(|_, v| *v != TextMatch::No);
+    // Folding: the same rule as `folded_could_spell`, for every term at once.
+    if chars.iter().any(|&c| ascii_fold(c).is_some()) {
+        let mut folded = String::with_capacity(chars.len() + 8);
+        for &c in &chars {
+            if c.is_ascii() {
+                folded.push(c.to_ascii_lowercase());
+            } else if let Some(s) = ascii_fold(c) {
+                folded.push_str(s);
+            } else {
+                folded.push('\u{0}');
+            }
+        }
+        // `No` entries were removed above, so an existing entry is `Yes`
+        // (which folding never overrides) or already `Ambiguous`.
+        for run in folded.split(|c: char| !c.is_ascii_alphanumeric()) {
+            if validate_term(run).is_ok() {
+                verdicts
+                    .entry(run.to_string())
+                    .or_insert(TextMatch::Ambiguous);
+            }
+        }
+    }
+}
+
 /// Per-term document frequency over the RAW view (every candidate term that
 /// is a whole ASCII-letter run somewhere), used to rank candidates before the
 /// exact [`classify`] scan confirms one.
@@ -488,6 +568,83 @@ mod tests {
         assert_eq!(classify("run.x", "run"), Ambiguous);
         assert_eq!(classify("x.run", "run"), Ambiguous);
         assert_eq!(classify("'run'", "run"), Yes);
+    }
+
+    /// `doc_verdicts` is `classify` for every valid term at once: compared
+    /// term by term over texts covering each rule (sides, mid separators,
+    /// escapes, folding, joined runs, stopwords, long runs), for every term
+    /// the text could spell plus terms it cannot.
+    #[test]
+    fn doc_verdicts_equal_classify_term_by_term() {
+        let long = format!("{}quora{} short quora", "x".repeat(200), "y".repeat(100));
+        let texts = [
+            "run fast",
+            "the run",
+            "u.s.a run",
+            "(run)",
+            "run-walk",
+            "Health.",
+            "RUN",
+            "Students' union",
+            "na\u{ef}ve run",
+            "Running shoes",
+            "rerun",
+            "run_fast",
+            "run2",
+            "",
+            "Nature's Way",
+            "nature.com",
+            "a:run",
+            "run.Net",
+            "x\\-run",
+            "abc|run",
+            "run/walk",
+            "run\twalk",
+            "Nature\u{2019}s",
+            "\u{0130}stanbul",
+            "\u{FB01}le",
+            "caf\u{e9}",
+            "\u{212A}ey",
+            "Nature's nature",
+            "caf\u{e9} cafe",
+            "run. walk",
+            "run.x",
+            "x.run",
+            "'run'",
+            "with the and",
+            "cafe caf\u{e9}s",
+            long.as_str(),
+        ];
+        let mut verdicts = HashMap::new();
+        for text in texts {
+            let mut long_runs = Vec::new();
+            doc_verdicts(text, &mut verdicts, &mut long_runs);
+            let mut terms: Vec<String> = verdicts.keys().cloned().collect();
+            for w in text.split(|c: char| !c.is_alphanumeric()) {
+                terms.push(w.to_lowercase());
+            }
+            terms
+                .extend(["run", "nature", "cafe", "file", "key", "quora", "zzz"].map(String::from));
+            for term in terms {
+                if validate_term(&term).is_err() {
+                    assert!(!verdicts.contains_key(&term), "{text:?} {term:?}");
+                    continue;
+                }
+                let in_long_run = long_runs.iter().any(|r| r.contains(term.as_str()));
+                let got = verdicts.get(&term).copied().unwrap_or(No);
+                let want = classify(text, &term);
+                if in_long_run {
+                    // The caller poisons it: never a Yes it could not prove.
+                    assert_ne!(want, No, "{text:?} {term:?}");
+                } else {
+                    assert_eq!(got, want, "{text:?} / {term:?}");
+                }
+            }
+        }
+        let mut long_runs = Vec::new();
+        doc_verdicts(&long, &mut verdicts, &mut long_runs);
+        assert_eq!(long_runs.len(), 1);
+        assert!(long_runs[0].contains("quora"));
     }
 
     #[test]

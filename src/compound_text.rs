@@ -15,7 +15,30 @@ pub struct Spec {
     pub suite: Option<String>,
     pub queries: Option<Vec<Query>>,
     /// Select one family for separately attributable throughput/latency.
+    /// Required for `msmarco-disk-v1`.
     pub family: Option<String>,
+    /// `msmarco-disk-v1` only: the first query of the family's timed pool this
+    /// search config dispatches. Each window must use its own range, since a
+    /// disk-bound family must never repeat a query (default 0).
+    #[serde(default)]
+    pub offset: Option<u64>,
+}
+
+/// The disk-bound family of a validated spec, when its suite is
+/// `msmarco-disk-v1`.
+pub fn disk_family(spec: &Spec) -> Result<Option<crate::msmarco::disk_queries::Family>, String> {
+    use crate::msmarco::disk_queries as dq;
+    if spec.suite.as_deref() != Some(dq::SUITE) {
+        return Ok(None);
+    }
+    let family = spec.family.as_deref().ok_or_else(|| {
+        format!(
+            "compound suite {} needs `family` (one of: {})",
+            dq::SUITE,
+            dq::Family::ALL.map(dq::Family::name).join(", ")
+        )
+    })?;
+    dq::Family::parse(family).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,22 +270,38 @@ impl Expr {
 
 impl Spec {
     pub fn validate(&self) -> Result<(), String> {
+        use crate::msmarco::disk_queries as dq;
         match (&self.suite, &self.queries) {
-            (Some(s), None) if s == "msmarco-v1" => {}
+            (Some(s), None) if s == "msmarco-v1" || s == dq::SUITE => {}
             (None, Some(q)) if !q.is_empty() => {}
             _ => {
-                return Err(
-                    "compound requires suite: msmarco-v1 OR nonempty explicit queries".into(),
-                )
+                return Err(format!(
+                    "compound requires suite: msmarco-v1 or {} OR nonempty explicit queries",
+                    dq::SUITE
+                ))
             }
         }
         if self.family.as_ref().is_some_and(|s| s.is_empty()) {
             return Err("empty compound family".into());
         }
+        if self.offset.is_some() && self.suite.as_deref() != Some(dq::SUITE) {
+            return Err(format!(
+                "compound `offset` only applies to suite {} (the other suites run their whole \
+                 query list)",
+                dq::SUITE
+            ));
+        }
+        disk_family(self)?;
         Ok(())
     }
     pub fn load(&self, dir: &Path, schema: &Value) -> Result<Vec<Query>, String> {
         self.validate()?;
+        if disk_family(self)?.is_some() {
+            return Err(format!(
+                "compound suite {} is loaded per window (fulltext::load_query_set_for)",
+                crate::msmarco::disk_queries::SUITE
+            ));
+        }
         let mut queries = match &self.queries {
             Some(q) => q.clone(),
             None => msmarco_queries(dir)?,
@@ -539,6 +578,7 @@ mod tests {
             suite: Some("msmarco-v1".into()),
             queries: None,
             family: None,
+            offset: None,
         };
         let q = spec.load(dir.path(), &schema()).unwrap();
         assert_eq!(q, spec.load(dir.path(), &schema()).unwrap());

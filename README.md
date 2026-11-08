@@ -1016,9 +1016,12 @@ The mode sent is recorded per engine as `params.fulltext.total_hits` (`mode`,
 `declared`, `sent`, `server_total`) and in `engine_settings`. When a ranked
 config does not state it, the legacy defaults still run (so old configs measure
 what they always did), but the pair does different work: the result carries
-`total_hits_symmetric: false` and a `warnings` entry. `"none"` with `compound`
-is refused at startup, because the compound suite checks every query's exact
-total; an unstated compound config runs `exact` on both engines, as before.
+`total_hits_symmetric: false` and a `warnings` entry. `"none"` with the
+`msmarco-v1` compound suite is refused at startup, because that suite checks
+every query's exact total; an unstated compound config runs `exact` on both
+engines, as before. The `msmarco-disk-v1` suite (below) accepts `"none"`: each
+of its queries carries an exact count, so a page must then hold exactly
+`min(count, top)` ids.
 On RediSearch 8.4+, `WITHOUTCOUNT` does not make RediSearch skip work on a text
 query: its optimizer still scores every match (no WAND/MaxScore pruning) and
 returns the same score-ordered page. RediSearch 8.0/8.2 accept `WITHOUTCOUNT`
@@ -2595,3 +2598,65 @@ complete, verified corpus may use `--skip-upload`. The index marker and compound
 comparison fingerprint distinguish this reduced layout from the full scalar
 suite. Query-family names alone do not validate compatibility: actual predicates
 are compiled against the reduced schema.
+
+### Disk-bound text/tag suite (`msmarco-disk-v1`)
+
+The `msmarco-v1` suite repeats 32 queries per family over common terms, so the
+working set stays in memory. `msmarco-disk-v1` is opt-in and identical on both
+engines; each family has at least 100,000 distinct queries, none repeated
+within a run:
+
+| Family | Query | Selection |
+|---|---|---|
+| `rare-term` | one `segment` term | document frequency 1–100 |
+| `two-rare-terms` | AND of two `segment` terms that co-occur | each df 100–1000 |
+| `rare-term-and-category` | a rare term AND `category` | df 1–100, category of one of its passages |
+| `url-eq` | exact `url` | URLs that are safe tags |
+| `docid-eq` | exact `docid` | every passage |
+| `deep-fetch` | one rare term, `top: 100`, with `fetch` | df 11–100 |
+
+Generate the query files once per prepared corpus (deterministic for a seed;
+a rerun verifies the existing files byte for byte):
+
+```bash
+prepare-msmarco --dataset msmarco-cohere-1024-10M-cosine --add-disk-queries \
+  [--disk-queries-per-family 1000000] [--disk-queries-seed 1]
+```
+
+This writes `msmarco-disk-v1/` beside `payloads.jsonl`: one JSONL file per
+family and a `manifest.json` with the seed, the df bands, pool sizes, count
+statistics, file SHA-256s and the corpus identity (`PREPARED.json` SHA-256,
+`payloads.jsonl` size and SHA-256). Terms are only those whose match the two
+engines agree on in every passage (`text_match`), so every query's count is
+exact on both engines; a family below 100,000 eligible items is an error.
+
+A search point selects one family and a window:
+
+```json
+{"parallel": 8, "top": 10, "workload": "fulltext",
+ "fulltext": {"analysis": "parity", "fields": {"title": 1.0, "segment": 1.0},
+   "no_vector_index": true, "scalar_indexing": "text-tag-only", "total_hits": "none",
+   "fetch": ["title", "segment", "url"],
+   "compound": {"suite": "msmarco-disk-v1", "family": "rare-term", "offset": 0}}}
+```
+
+- `compound.family` is required; `compound.offset` (default 0) is the first
+  timed line of the family. `--queries N` runs lines `offset .. offset + N`
+  once each (`--queries -1`: the rest of the family). A window past the end of
+  the family is refused before connecting — queries are never cycled — as are
+  overlapping windows of one family in one invocation and `--repetitions`
+  above 1. Windows across invocations are the caller's to keep disjoint;
+  each result records its window (`params.fulltext.compound.window`) and the
+  SHA-256 of the queries it served.
+- The first line of each family file is the (untimed) prime query and the
+  next 64 are reserved for the Redis `WITHOUTCOUNT` probe, which runs only
+  when some timed query has more matches than `top`.
+- `fulltext.fetch` (any workload of the fulltext path, not hybrid-rrf) returns
+  stored fields: Redis `RETURN n <fields>` instead of `NOCONTENT`, OpenSearch
+  `_source.includes`. Each field must be a `text` or `keyword` schema field;
+  `vector` is refused. Every hit of every reply must carry exactly those
+  fields, as strings; recorded as `params.fulltext.fetch` (`hits`, `bytes`).
+- `url-eq` and `docid-eq` need no new index option: the text-tag-only layout
+  already indexes every keyword field (Redis `TAG SEPARATOR ; CASESENSITIVE`,
+  OpenSearch `keyword`), and the pre-search validator requires them.
+- `deep-fetch` requires `top: 100` and `fetch`.

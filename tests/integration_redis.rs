@@ -7012,3 +7012,60 @@ fn test_binary_redis_text_tag_fresh_and_retained_reuse() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// msmarco-disk-v1 on the reduced text/tag layout: every family, fetch on
+/// and off, `total_hits` exact and none, checked against a corpus oracle;
+/// a window that would repeat a query is refused before connecting.
+#[test]
+fn test_binary_redis_disk_suite_families_fetch_and_windows() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{"name":"redis-disk","engine":"redis",
+        "upload_params":{"parallel":1},"search_params":common::disk_search_params()}]);
+    let proj = common::write_disk_project(&configs.to_string());
+    let port = test_port().to_string();
+    let env = [("REDIS_PORT", port.as_str())];
+    let run = |flags: &[&str]| {
+        common::run_binary_output(
+            &proj.root,
+            "redis-disk",
+            common::DISK_DATASET,
+            TEST_HOST,
+            &env,
+            flags,
+        )
+    };
+    let n = common::DISK_QUERIES.to_string();
+    // More queries than the window holds, or best-of repetitions: refused.
+    for flags in [
+        vec!["--keep-data", "--queries", "100000", "--repetitions", "1"],
+        vec!["--keep-data", "--queries", n.as_str()],
+    ] {
+        let out = run(&flags);
+        assert!(!out.status.success(), "{flags:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("never repeated") || err.contains("--repetitions"),
+            "{err}"
+        );
+    }
+    let dump = proj.root.join("disk-dumps");
+    let out = run(&[
+        "--keep-data",
+        "--queries",
+        n.as_str(),
+        "--repetitions",
+        "1",
+        "--dump-results",
+        dump.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    common::assert_disk_run(&proj.root, "redis", "redis-disk", &dump);
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
