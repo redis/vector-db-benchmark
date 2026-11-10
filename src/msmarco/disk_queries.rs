@@ -1093,10 +1093,27 @@ pub fn load_window(
 /// terms (df 1), `mid*` terms (df n/150, the deep band at n = 3000), `pair*`
 /// terms (df ≈ n/10), a term ambiguous in some passages (`edge`), a term
 /// that only reaches df through newline normalization (`newl`), a term
-/// inside an over-long run, a folding collision (`cafe`), unsafe URLs, and
-/// unsafe URLs and docids whose Redis tag pieces equal a safe value of
-/// another passage (`<url>;jsessionid=<i>`, `<url> `, `<docid> `).
+/// inside an over-long run, a folding collision (`cafe`) and unsafe URLs.
+/// Every value passes the upload validator (`filter_only::domain`), so both
+/// engines can ingest it.
 pub fn write_fixture_corpus(dir: &Path, n: usize, dim: usize) -> Result<(), String> {
+    write_fixture(dir, n, dim, false)
+}
+
+/// [`write_fixture_corpus`] plus unsafe URLs and docids whose Redis tag
+/// pieces equal a safe value of another passage (`<url>;jsessionid=<i>`,
+/// `<url> `, `<docid> `), so the generator's tag-piece exclusion has
+/// something to exclude. The upload validator refuses such values (no `;`,
+/// no edge whitespace), so this corpus is for generator tests only.
+pub fn write_fixture_corpus_with_tag_piece_collisions(
+    dir: &Path,
+    n: usize,
+    dim: usize,
+) -> Result<(), String> {
+    write_fixture(dir, n, dim, true)
+}
+
+fn write_fixture(dir: &Path, n: usize, dim: usize, collisions: bool) -> Result<(), String> {
     use rand::{Rng, SeedableRng};
     fn letters(mut i: usize) -> String {
         let mut s = String::new();
@@ -1142,12 +1159,12 @@ pub fn write_fixture_corpus(dir: &Path, n: usize, dim: usize) -> Result<(), Stri
             4 => format!("http://x/caf\u{e9}/{i}"),
             // Redis tags `https://example.org/<k>` (k % 100 == 15 / 16, a
             // safe url of other passages) for these two unsafe values.
-            5 => format!("https://example.org/{};jsessionid={i}", i % 400 + 10),
-            6 => format!("https://example.org/{} ", i % 400 + 10),
+            5 if collisions => format!("https://example.org/{};jsessionid={i}", i % 400 + 10),
+            6 if collisions => format!("https://example.org/{} ", i % 400 + 10),
             _ => format!("https://example.org/{}", i % 400),
         };
         // Redis trims this unsafe docid to the docid of the next passage.
-        let docid = if i % 1000 == 7 {
+        let docid = if collisions && i % 1000 == 7 {
             format!("fix_doc_{}#0_{} ", i + 1, i + 1)
         } else {
             format!("fix_doc_{i}#0_{i}")
@@ -1194,7 +1211,7 @@ mod tests {
     fn fixture(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("corpus");
-        write_fixture_corpus(&dir, n, 4).unwrap();
+        write_fixture_corpus_with_tag_piece_collisions(&dir, n, 4).unwrap();
         (tmp, dir)
     }
 
