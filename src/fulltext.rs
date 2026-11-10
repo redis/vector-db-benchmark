@@ -1267,6 +1267,47 @@ impl QuerySet {
             ProbePlan::NotNeeded(PROBE_NOT_NEEDED)
         }
     }
+
+    /// For a disk window under `total_hits: "none"`, refuse — before
+    /// connecting, and on both engines so the pair stays symmetric — a window
+    /// whose `WITHOUTCOUNT` probe could not succeed: some timed query has more
+    /// matches than `top` (so [`Self::withoutcount_probe_plan`] runs the
+    /// probe) but no reserve line does (so [`probe_withoutcount`] would find
+    /// no truncated page to compare). The generator puts the highest counts
+    /// in the reserve ([`crate::msmarco::disk_queries::probe_layout`]), so
+    /// this holds for any file it wrote; legacy sets have no reserve.
+    pub fn check_probe_reserve(&self, top: usize) -> Result<(), String> {
+        let Some(w) = &self.window else {
+            return Ok(());
+        };
+        let count = |q: &TextQuery| q.compound.as_ref().and_then(|c| c.expected_count);
+        let timed_max = self.queries[w.timed_from..]
+            .iter()
+            .map(count)
+            .max()
+            .flatten();
+        let Some(timed_max) = timed_max.filter(|m| *m > top as u64) else {
+            return Ok(());
+        };
+        if self.queries[1..w.timed_from]
+            .iter()
+            .any(|q| count(q).is_some_and(|c| c > top as u64))
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "{} family {} (seed {}): a timed query matches {timed_max} documents, more than \
+             `top` {top}, but no probe-reserve line (1..{}) matches more than {top}, so the \
+             Redis WITHOUTCOUNT probe could not compare a truncated page; `total_hits: \
+             \"none\"` is refused on both engines for this window — regenerate the family \
+             files with --add-disk-queries (generator {}), or use \"exact\"",
+            crate::msmarco::disk_queries::SUITE,
+            w.family.name(),
+            w.record["seed"],
+            w.timed_from - 1,
+            crate::msmarco::disk_queries::GENERATOR
+        ))
+    }
 }
 
 /// Resolve the explicitly named compound suite independently of ranked BM25.
@@ -1338,7 +1379,7 @@ pub fn load_query_set_for(
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        return Ok(QuerySet {
+        let set = QuerySet {
             total: queries.len(),
             queries,
             skipped: vec![],
@@ -1348,7 +1389,11 @@ pub fn load_query_set_for(
                 timed_from,
                 record,
             }),
-        });
+        };
+        if spec.total_hits == Some(TotalHits::None) {
+            set.check_probe_reserve(top)?;
+        }
+        return Ok(set);
     }
     let queries = compound
         .load(dir, schema)?
@@ -2425,10 +2470,14 @@ where
         }
     }
     if probe.over_limit == 0 {
-        return Err(refuse(format!(
-            "no query has more than {top} matches, so the probe cannot show that \
-             {REDIS_WITHOUTCOUNT} still selects the top {top}"
-        )));
+        // A property of the probed queries, not of the server: say so rather
+        // than blame the RediSearch version.
+        return Err(format!(
+            "fulltext: `total_hits: \"none\"` refused before the timed window: none of the \
+             {} probed queries with a match has more than {top}, so the probe cannot show that \
+             {REDIS_WITHOUTCOUNT} still selects the top {top}; use \"exact\" for this query set",
+            probe.compared
+        ));
     }
     Ok(probe)
 }
@@ -4676,7 +4725,8 @@ mod tests {
         assert!(e.is_ok(), "{e:?}");
         // No query with more matches than the page: nothing can be shown.
         let e = probe_server(&matches, 3, true).unwrap_err();
-        assert!(e.contains("no query has more than 3 matches"), "{e}");
+        assert!(e.contains("has more than 3, so the probe cannot"), "{e}");
+        assert!(!e.contains("RediSearch before 8.4"), "{e}");
     }
 
     #[test]
@@ -5161,8 +5211,10 @@ mod tests {
         // Never more, never cycling.
         assert!(set.dispatch_order(8).is_err());
         assert!(set.dispatch_order(-1).is_ok());
-        // The probe never touches a timed query.
-        match set.withoutcount_probe_plan(1) {
+        // The probe never touches a timed query. (The whole pool: the reserve
+        // took the highest counts, so a short window may need no probe.)
+        let whole = load("two-rare-terms", json!({}), 1, -1).unwrap();
+        match whole.withoutcount_probe_plan(1) {
             ProbePlan::Run(p) => assert!(p.iter().all(|&i| i > 0 && i < w.timed_from)),
             other => panic!("{other:?}"),
         }
@@ -5233,6 +5285,66 @@ mod tests {
             Some(&schema)
         )
         .is_err());
+    }
+
+    #[test]
+    fn disk_none_refuses_before_connecting_when_the_reserve_cannot_prove_the_probe() {
+        use crate::msmarco::disk_queries as dq;
+        let (_tmp, dir) = disk_fixture();
+        let schema = disk_schema();
+        // The generator's reserve covers every top below the timed maximum,
+        // for every family, so `none` loads and the probe has truncated
+        // pages to compare.
+        for family in dq::Family::ALL {
+            let fetch = family == dq::Family::DeepFetch;
+            let mut extra = json!({"total_hits":"none"});
+            if fetch {
+                extra["fetch"] = json!(["title", "segment", "url"]);
+            }
+            let spec = parse_spec(Some(&disk_block(family.name(), extra))).unwrap();
+            let tops: Vec<usize> = if fetch { vec![100] } else { vec![1, 2, 5, 10] };
+            for top in tops {
+                let set = load_query_set_for(&dir, &spec, Some(&schema), top, 50).unwrap();
+                let w = set.window.as_ref().unwrap();
+                let count = |q: &TextQuery| q.compound.as_ref().unwrap().expected_count.unwrap();
+                if set.queries[w.timed_from..]
+                    .iter()
+                    .any(|q| count(q) > top as u64)
+                {
+                    assert!(
+                        set.queries[1..w.timed_from]
+                            .iter()
+                            .any(|q| count(q) > top as u64),
+                        "{family:?} top {top}"
+                    );
+                }
+            }
+        }
+        // A window whose timed queries are cut by the page but whose reserve
+        // is not (a uniform reserve over a typically-1 family): refused with
+        // the family, top and seed, instead of after deployment by the probe.
+        let spec = parse_spec(Some(&disk_block("url-eq", json!({"total_hits":"none"})))).unwrap();
+        let mut set = load_query_set_for(&dir, &spec, Some(&schema), 1, 50).unwrap();
+        let timed_from = set.window.as_ref().unwrap().timed_from;
+        for (i, q) in set.queries.iter_mut().enumerate() {
+            let c = q.compound.as_mut().unwrap();
+            c.expected_count = Some(if i == timed_from + 3 { 37 } else { 1 });
+        }
+        let e = set.check_probe_reserve(10).unwrap_err();
+        assert!(
+            e.contains("url-eq") && e.contains("seed 1") && e.contains("`top` 10"),
+            "{e}"
+        );
+        assert!(!e.contains("RediSearch before 8.4"), "{e}");
+        // A reserve line over `top` is enough; and no timed query over
+        // `top` needs no probe at all.
+        set.queries[2].compound.as_mut().unwrap().expected_count = Some(11);
+        assert!(set.check_probe_reserve(10).is_ok());
+        set.queries[2].compound.as_mut().unwrap().expected_count = Some(1);
+        assert!(set.check_probe_reserve(37).is_ok());
+        // Legacy sets have no reserve to check.
+        let legacy = build_query_set(&["a b".to_string()]).unwrap();
+        assert!(legacy.check_probe_reserve(1).is_ok());
     }
 
     #[test]

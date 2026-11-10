@@ -2650,7 +2650,13 @@ A search point selects one family and a window:
   SHA-256 of the queries it served.
 - The first line of each family file is the (untimed) prime query and the
   next 64 are reserved for the Redis `WITHOUTCOUNT` probe, which runs only
-  when some timed query has more matches than `top`.
+  when some timed query has more matches than `top`. The reserve holds the 64
+  selected items with the highest counts (the timed lines stay in seeded
+  order), so every reserve count is at least every timed count: whenever the
+  probe must run, every query it sends is cut by the page, for any `top`.
+  The manifest records the reserve's counts (`expected_count_probe_reserve`).
+  A `"none"` window whose reserve cannot show this (files from another
+  generator) is refused on both engines before connecting.
 - `fulltext.fetch` (any workload of the fulltext path, not hybrid-rrf) returns
   stored fields: Redis `RETURN n <fields>` instead of `NOCONTENT`, OpenSearch
   `_source.includes`. Each field must be a `text` or `keyword` schema field;

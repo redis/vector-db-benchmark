@@ -32,16 +32,23 @@
 //! # Deterministic, uniform, never repeated
 //!
 //! Each family's items are ranked by a seeded SHA-256 key of the item and the
-//! first `per_family + RESERVED` are kept, in key order, so any contiguous
-//! slice of a family file is a uniform sample of that family's eligible pool.
+//! first `per_family + RESERVED` are kept. The timed lines are in key order,
+//! so any contiguous slice of them is a uniform sample of that family's
+//! selection, less the [`PROBE_RESERVE`] items taken for the probe reserve.
 //! The rare-term and rare-term-and-category term sets are disjoint;
 //! deep-fetch is drawn from its own band independently (the overlap is
 //! recorded in the manifest).
-//! Line 0 of each family file is the connection-priming query and lines
-//! 1..=[`PROBE_RESERVE`] are reserved for the Redis `WITHOUTCOUNT` probe:
-//! neither ever appears in a timed window. A timed window is
-//! `compound.offset` + `--queries` lines of the rest; the loader refuses a
-//! window that runs past the end of the file instead of cycling.
+//! Line 0 of each family file is the connection-priming query (the first
+//! item in key order) and lines 1..=[`PROBE_RESERVE`] are reserved for the
+//! Redis `WITHOUTCOUNT` probe: neither ever appears in a timed window. The
+//! reserve holds the [`PROBE_RESERVE`] other items with the highest expected
+//! count (ties in key order), so every reserve count is at least every timed
+//! count ([`probe_layout`]): whenever a timed query has more matches than the
+//! page, every probe query does too, and the probe always has truncated pages
+//! to compare. A uniform reserve would usually hold none for the families
+//! whose count is typically 1, and the probe would refuse the run. A timed
+//! window is `compound.offset` + `--queries` lines of the rest; the loader
+//! refuses a window that runs past the end of the file instead of cycling.
 //!
 //! # Files
 //!
@@ -68,8 +75,13 @@ pub const SUITE: &str = "msmarco-disk-v1";
 /// Directory (inside the prepared dataset) holding the query files.
 pub const DIR: &str = "msmarco-disk-v1";
 pub const MANIFEST: &str = "manifest.json";
-/// Version of the selection rules below. Bump it when any rule changes.
-pub const GENERATOR: &str = "vdb-msmarco-disk/v1";
+/// Version of the selection and layout rules below. Bump it when any rule
+/// changes. v2: the probe reserve holds the highest-count items
+/// ([`probe_layout`]); v1 files are refused.
+pub const GENERATOR: &str = "vdb-msmarco-disk/v2";
+/// Domain of the seeded rank keys ([`rank_key`]). It stays at its first value
+/// while only the file layout changes, so the same items are selected.
+pub const KEY_DOMAIN: &str = "vdb-msmarco-disk/v1";
 /// The only text field the families query.
 pub const TEXT_FIELD: &str = "segment";
 /// Document-frequency band of `rare-term` and `rare-term-and-category` terms.
@@ -266,7 +278,7 @@ pub fn preparation_sha256(dir: &Path) -> Result<String, String> {
 /// The seeded rank key of one item of one family.
 pub fn rank_key(seed: u64, family: &str, item: &str) -> u64 {
     let mut h = Sha256::new();
-    h.update(GENERATOR.as_bytes());
+    h.update(KEY_DOMAIN.as_bytes());
     h.update([0]);
     h.update(seed.to_be_bytes());
     h.update(family.as_bytes());
@@ -474,6 +486,41 @@ fn stats(counts: &[u64]) -> Value {
         "mean": counts.iter().sum::<u64>() as f64 / counts.len() as f64,
         "histogram": buckets,
     })
+}
+
+/// Arrange one family's selected items (in seeded key order) into the file
+/// layout: line 0 the first item (the prime); lines 1..=[`PROBE_RESERVE`] the
+/// [`PROBE_RESERVE`] remaining items with the highest expected count (ties in
+/// key order), kept in key order; then every other item in key order (the
+/// timed pool). Every reserve line's count is therefore at least every timed
+/// line's count, so for any `top` below some timed query's count every probe
+/// query is cut by the page too.
+pub fn probe_layout(family: Family, items: Vec<Value>) -> Result<Vec<Value>, String> {
+    if items.len() < RESERVED {
+        return Err(format!(
+            "{SUITE}: family {} has {} items, fewer than its {RESERVED} reserved lines",
+            family.name(),
+            items.len()
+        ));
+    }
+    let counts = items
+        .iter()
+        .map(|l| family.conditions(l).map(|(_, n)| n))
+        .collect::<Result<Vec<u64>, String>>()?;
+    let mut rest: Vec<usize> = (1..items.len()).collect();
+    rest.sort_unstable_by_key(|&i| (std::cmp::Reverse(counts[i]), i));
+    let mut in_reserve = vec![false; items.len()];
+    for &i in &rest[..PROBE_RESERVE] {
+        in_reserve[i] = true;
+    }
+    let reserve = (1..items.len()).filter(|&i| in_reserve[i]);
+    let timed = (1..items.len()).filter(|&i| !in_reserve[i]);
+    let order: Vec<usize> = std::iter::once(0).chain(reserve).chain(timed).collect();
+    let mut items: Vec<Option<Value>> = items.into_iter().map(Some).collect();
+    Ok(order
+        .into_iter()
+        .map(|i| items[i].take().expect("each line once"))
+        .collect())
 }
 
 pub struct GenerateOptions {
@@ -753,13 +800,13 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     let mut families = serde_json::Map::new();
     for family in Family::ALL {
-        let l = &lines[&family];
+        let l = probe_layout(family, lines.remove(&family).expect("every family"))?;
         let path = out.join(family.file_name());
         let mut w = std::io::BufWriter::new(
             std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?,
         );
         let mut counts = Vec::with_capacity(l.len());
-        for line in l {
+        for line in &l {
             let (_, n) = family.conditions(line)?;
             counts.push(n);
             writeln!(w, "{line}").map_err(|e| format!("{}: {e}", path.display()))?;
@@ -779,6 +826,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
                 "eligible_pool": pools[&family],
                 "expected_count": stats(&counts),
                 "expected_count_timed": stats(&counts[RESERVED..]),
+                "expected_count_probe_reserve": stats(&counts[1..RESERVED]),
             }),
         );
     }
@@ -795,7 +843,8 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         "text_match_rules": text_match::RULE_VERSION,
         "analysis": "parity: segment text with every whitespace other than U+0020 replaced by a space (as uploaded), no stemming",
         "df_bands": {"rare": RARE_DF, "pair": PAIR_DF, "deep": DEEP_DF},
-        "layout": {"prime_line": 0, "probe_reserve_lines": [1, PROBE_RESERVE], "timed_from_line": RESERVED},
+        "layout": {"prime_line": 0, "probe_reserve_lines": [1, PROBE_RESERVE], "timed_from_line": RESERVED,
+                   "rule": "line 0: the first selected item in key order (the prime); lines 1..=64: the 64 other selected items with the highest expected count, ties in key order, written in key order (the WITHOUTCOUNT probe reserve; every reserve count >= every timed count); then the rest in key order (the timed pool)"},
         "vocabulary": {
             "eligible_terms_by_df": df_profile,
             "terms": vocabulary.len(),
@@ -1223,7 +1272,8 @@ mod tests {
             );
         }
         assert_eq!(df(&corpus, "newl").1, 0, "newline normalization is applied");
-        // Single-term families are in seeded key order (uniform slices).
+        // Single-term families: the prime is the first key, then the reserve
+        // and the timed pool are each in seeded key order (uniform slices).
         for family in [
             Family::RareTerm,
             Family::DeepFetch,
@@ -1234,7 +1284,27 @@ mod tests {
                 .iter()
                 .map(|l| rank_key(7, family.name(), l[0].as_str().unwrap()))
                 .collect();
-            assert!(keys.windows(2).all(|w| w[0] < w[1]), "{family:?}");
+            assert!(keys[1..].iter().all(|k| *k > keys[0]), "{family:?}");
+            for part in [&keys[1..RESERVED], &keys[RESERVED..]] {
+                assert!(part.windows(2).all(|w| w[0] < w[1]), "{family:?}");
+            }
+        }
+        // The probe reserve holds the highest counts: every reserve line
+        // matches at least as many passages as every timed line, so whenever
+        // a timed query is cut by the page every probe query is too.
+        for family in Family::ALL {
+            let counts: Vec<u64> = lines(&out, family)
+                .iter()
+                .map(|l| family.conditions(l).unwrap().1)
+                .collect();
+            let reserve_min = counts[1..RESERVED].iter().min().unwrap();
+            let timed_max = counts[RESERVED..].iter().max().unwrap();
+            assert!(reserve_min >= timed_max, "{family:?}");
+            assert_eq!(
+                m["families"][family.name()]["expected_count_probe_reserve"]["min"],
+                *reserve_min,
+                "{family:?}"
+            );
         }
         // Unsafe URLs never become queries.
         for l in lines(&out, Family::UrlEq) {
@@ -1282,6 +1352,52 @@ mod tests {
             std::fs::read(out.join("rare-term.jsonl")).unwrap(),
             std::fs::read(other.join("rare-term.jsonl")).unwrap()
         );
+    }
+
+    #[test]
+    fn probe_layout_reserves_the_highest_counts_and_keeps_key_order() {
+        // Key order: counts mostly 1 with a sparse tail, as url-eq and
+        // rare-term-and-category have; the uniform v1 reserve (lines 1..=64)
+        // held no count above 1 here.
+        let n = RESERVED + 200;
+        let items: Vec<Value> = (0..n)
+            .map(|i| {
+                let c = if i > RESERVED && i % 50 == 0 {
+                    30 + i as u64
+                } else {
+                    1
+                };
+                json!([format!("u{i:04}"), c])
+            })
+            .collect();
+        let laid = probe_layout(Family::UrlEq, items.clone()).unwrap();
+        assert_eq!(laid.len(), n);
+        assert_eq!(laid[0], items[0]);
+        let count = |l: &Value| l[1].as_u64().unwrap();
+        let timed_max = laid[RESERVED..].iter().map(count).max().unwrap();
+        let reserve: Vec<&Value> = laid[1..RESERVED].iter().collect();
+        assert!(reserve.iter().all(|l| count(l) >= timed_max));
+        // Every truncating item is in the reserve; ties fill the rest of it
+        // by key, and the reserve is written in key order.
+        let over: Vec<&Value> = items[1..].iter().filter(|l| count(l) > 1).collect();
+        assert_eq!(over.len(), 4);
+        let mut want: Vec<&Value> = items[1..=PROBE_RESERVE - over.len()].iter().collect();
+        want.extend(over);
+        assert_eq!(reserve, want);
+        // The timed pool keeps key order and holds every other item once.
+        let names = |v: &[Value]| {
+            v.iter()
+                .map(|l| l[0].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let timed = names(&laid[RESERVED..]);
+        let mut sorted = timed.clone();
+        sorted.sort();
+        assert_eq!(timed, sorted);
+        let mut all = names(&laid);
+        all.sort();
+        assert_eq!(all, names(&items));
+        assert!(probe_layout(Family::UrlEq, items[..RESERVED - 1].to_vec()).is_err());
     }
 
     #[test]
