@@ -77,8 +77,10 @@ pub const DIR: &str = "msmarco-disk-v1";
 pub const MANIFEST: &str = "manifest.json";
 /// Version of the selection and layout rules below. Bump it when any rule
 /// changes. v2: the probe reserve holds the highest-count items
-/// ([`probe_layout`]); v1 files are refused.
-pub const GENERATOR: &str = "vdb-msmarco-disk/v2";
+/// ([`probe_layout`]); v1 files are refused. v3: a safe `url` / `docid`
+/// that is also a Redis tag piece of an unsafe value ([`redis_tag_pieces`])
+/// is never selected; v2 files are refused.
+pub const GENERATOR: &str = "vdb-msmarco-disk/v3";
 /// Domain of the seeded rank keys ([`rank_key`]). It stays at its first value
 /// while only the file layout changes, so the same items are selected.
 pub const KEY_DOMAIN: &str = "vdb-msmarco-disk/v1";
@@ -239,6 +241,21 @@ pub fn is_safe_tag(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| (0x21..=0x7e).contains(&b) && b != b';')
+}
+
+/// The tags Redis indexes for one stored value of a `TAG SEPARATOR ;` field:
+/// the value split on `;`, each piece trimmed of the whitespace RediSearch
+/// trims (C `isspace`: space, `\t`, `\n`, `\v`, `\f`, `\r`), empty pieces
+/// dropped. OpenSearch indexes the whole value as one keyword, so a safe
+/// value that is also a piece of a *different* (unsafe) value matches more
+/// passages on Redis than on OpenSearch: `http://e.com/p;jsessionid=1` and
+/// `http://e.com/p ` both carry the tag `http://e.com/p`. Such values are
+/// not selected ([`generate`]).
+pub fn redis_tag_pieces(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(';')
+        .map(|p| p.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')))
+        .filter(|p| !p.is_empty())
 }
 
 fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
@@ -562,12 +579,12 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
     let cap = opts.per_family + RESERVED;
     let seed = opts.seed;
 
-    // Pass 1: document frequencies, URL and docid selection.
+    // Pass 1: document frequencies, and the safe Redis tag pieces of every
+    // unsafe url / docid (a safe value equal to one is not selectable).
     let mut vocabulary: HashMap<String, (u64, u64)> = HashMap::new();
     let mut long_runs: Vec<String> = Vec::new();
-    let mut docids = Smallest::<(u64, String)>::new(cap);
-    let mut urls = Smallest::<(u64, String)>::new(cap);
-    let mut url_keys = HashSet::<u64>::new();
+    let mut url_pieces = HashSet::<String>::new();
+    let mut docid_pieces = HashSet::<String>::new();
     let mut urls_unsafe = 0u64;
     let mut docids_unsafe = 0u64;
     let mut rows = 0u64;
@@ -582,17 +599,18 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             }
         }
         long_runs.extend(s.long_runs);
-        if is_safe_tag(&s.docid) {
-            docids.add((rank_key(seed, "docid-eq", &s.docid), s.docid));
-        } else {
-            docids_unsafe += 1;
-        }
-        if is_safe_tag(&s.url) {
-            let k = rank_key(seed, "url-eq", &s.url);
-            url_keys.insert(k);
-            urls.add((k, s.url));
-        } else {
-            urls_unsafe += 1;
+        for (value, pieces, unsafe_rows) in [
+            (&s.docid, &mut docid_pieces, &mut docids_unsafe),
+            (&s.url, &mut url_pieces, &mut urls_unsafe),
+        ] {
+            if !is_safe_tag(value) {
+                *unsafe_rows += 1;
+                for p in redis_tag_pieces(value).filter(|p| is_safe_tag(p)) {
+                    if !pieces.contains(p) {
+                        pieces.insert(p.to_string());
+                    }
+                }
+            }
         }
         Ok(())
     })?;
@@ -709,7 +727,16 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         .map(|(i, (t, _))| (*t, i as u32))
         .collect();
 
-    // Pass 2: postings of the rare-term-and-category terms, and pairs.
+    // Pass 2: postings of the rare-term-and-category terms, pairs, and the
+    // URL and docid selection.
+    let mut docids = Smallest::<(u64, String)>::new(cap);
+    let mut urls = Smallest::<(u64, String)>::new(cap);
+    let mut url_keys = HashSet::<u64>::new();
+    let mut docid_rows = 0u64;
+    let mut urls_colliding = HashSet::<String>::new();
+    let mut docids_colliding = HashSet::<String>::new();
+    let mut url_rows_colliding = 0u64;
+    let mut docid_rows_colliding = 0u64;
     let mut rac_cats: Vec<Vec<String>> = vec![Vec::new(); rac_terms.len()];
     let mut rac_best: Vec<Option<(u64, String)>> = vec![None; rac_terms.len()];
     let mut pairs = Smallest::<(u64, u32, u32)>::new(cap);
@@ -736,6 +763,25 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             for &b in &ids[x + 1..] {
                 let k = pair_key(pair_terms[a as usize].1, pair_terms[b as usize].1);
                 pairs.add((k, a, b));
+            }
+        }
+        if is_safe_tag(&s.docid) {
+            if docid_pieces.contains(&s.docid) {
+                docid_rows_colliding += 1;
+                docids_colliding.insert(s.docid);
+            } else {
+                docid_rows += 1;
+                docids.add((rank_key(seed, "docid-eq", &s.docid), s.docid));
+            }
+        }
+        if is_safe_tag(&s.url) {
+            if url_pieces.contains(&s.url) {
+                url_rows_colliding += 1;
+                urls_colliding.insert(s.url);
+            } else {
+                let k = rank_key(seed, "url-eq", &s.url);
+                url_keys.insert(k);
+                urls.add((k, s.url));
             }
         }
         Ok(())
@@ -778,7 +824,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
     );
     for (family, sel, distinct) in [
         (Family::UrlEq, urls, url_keys.len()),
-        (Family::DocidEq, docids, (rows - docids_unsafe) as usize),
+        (Family::DocidEq, docids, docid_rows as usize),
     ] {
         let sel = sel.into_sorted();
         if sel.len() < min + RESERVED {
@@ -853,7 +899,12 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             "terms_in_long_runs": poison.len(),
         },
         "tags": {"urls_not_safe": urls_unsafe, "docids_not_safe": docids_unsafe,
-                 "safe": "printable ASCII 0x21-0x7E, no ';', at most 2048 bytes"},
+                 "safe": "printable ASCII 0x21-0x7E, no ';', at most 2048 bytes",
+                 "urls_excluded_redis_piece_collision": urls_colliding.len(),
+                 "url_rows_excluded_redis_piece_collision": url_rows_colliding,
+                 "docids_excluded_redis_piece_collision": docids_colliding.len(),
+                 "docid_rows_excluded_redis_piece_collision": docid_rows_colliding,
+                 "redis_piece_rule": "a safe value equal to a Redis tag piece (split on ';', C-isspace trimmed, non-empty) of an unsafe value is not selected: Redis TAG SEPARATOR ; would match the unsafe value's passages too, an OpenSearch keyword would not"},
         "term_overlap": term_overlap,
         "selection": "per family: eligible items ranked by SHA-256(generator, seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys.",
         "families": families,
@@ -1042,7 +1093,9 @@ pub fn load_window(
 /// terms (df 1), `mid*` terms (df n/150, the deep band at n = 3000), `pair*`
 /// terms (df ≈ n/10), a term ambiguous in some passages (`edge`), a term
 /// that only reaches df through newline normalization (`newl`), a term
-/// inside an over-long run, a folding collision (`cafe`), and unsafe URLs.
+/// inside an over-long run, a folding collision (`cafe`), unsafe URLs, and
+/// unsafe URLs and docids whose Redis tag pieces equal a safe value of
+/// another passage (`<url>;jsessionid=<i>`, `<url> `, `<docid> `).
 pub fn write_fixture_corpus(dir: &Path, n: usize, dim: usize) -> Result<(), String> {
     use rand::{Rng, SeedableRng};
     fn letters(mut i: usize) -> String {
@@ -1087,9 +1140,18 @@ pub fn write_fixture_corpus(dir: &Path, n: usize, dim: usize) -> Result<(), Stri
         let url = match i % 100 {
             3 => format!("http://bad site/{i}"),
             4 => format!("http://x/caf\u{e9}/{i}"),
+            // Redis tags `https://example.org/<k>` (k % 100 == 15 / 16, a
+            // safe url of other passages) for these two unsafe values.
+            5 => format!("https://example.org/{};jsessionid={i}", i % 400 + 10),
+            6 => format!("https://example.org/{} ", i % 400 + 10),
             _ => format!("https://example.org/{}", i % 400),
         };
-        let docid = format!("fix_doc_{i}#0_{i}");
+        // Redis trims this unsafe docid to the docid of the next passage.
+        let docid = if i % 1000 == 7 {
+            format!("fix_doc_{}#0_{} ", i + 1, i + 1)
+        } else {
+            format!("fix_doc_{i}#0_{i}")
+        };
         payloads.push_str(
             &json!({
                 "docid": docid,
@@ -1310,7 +1372,34 @@ mod tests {
         for l in lines(&out, Family::UrlEq) {
             assert!(is_safe_tag(l[0].as_str().unwrap()), "{l}");
         }
-        assert_eq!(m["tags"]["urls_not_safe"], 60);
+        assert_eq!(m["tags"]["urls_not_safe"], 120);
+        assert_eq!(m["tags"]["docids_not_safe"], 3);
+        // The exact counts hold on Redis too (`TAG SEPARATOR ;`: a passage
+        // matches when any of its tag pieces equals the value), not only on
+        // an OpenSearch keyword: a safe value that is a piece of an unsafe
+        // one (`<url>;jsessionid=…`, `<url> `, `<docid> `) is never selected.
+        for (family, field) in [(Family::UrlEq, "url"), (Family::DocidEq, "docid")] {
+            for l in lines(&out, family) {
+                let v = l[0].as_str().unwrap();
+                let redis = corpus
+                    .iter()
+                    .filter(|r| redis_tag_pieces(r[field].as_str().unwrap()).any(|p| p == v))
+                    .count() as u64;
+                assert_eq!(redis, l[1].as_u64().unwrap(), "{family:?} {l}");
+            }
+        }
+        let colliding_urls: HashSet<String> = [15, 115, 215, 315, 16, 116, 216, 316]
+            .iter()
+            .map(|k| format!("https://example.org/{k}"))
+            .collect();
+        assert!(lines(&out, Family::UrlEq)
+            .iter()
+            .all(|l| !colliding_urls.contains(l[0].as_str().unwrap())));
+        assert_eq!(m["tags"]["urls_excluded_redis_piece_collision"], 8);
+        assert_eq!(m["tags"]["url_rows_excluded_redis_piece_collision"], 60);
+        assert_eq!(m["tags"]["docids_excluded_redis_piece_collision"], 3);
+        assert_eq!(m["tags"]["docid_rows_excluded_redis_piece_collision"], 3);
+        assert_eq!(m["families"]["docid-eq"]["eligible_pool"], 3000 - 3 - 3);
         // rare-term-and-category: the category of the term's passage with the
         // smallest seeded docid key (the documented rule, not just any one).
         for l in lines(&out, Family::RareTermAndCategory) {
@@ -1481,6 +1570,21 @@ mod tests {
                 .collect();
             assert_eq!(s.into_sorted(), want, "cap {cap}");
         }
+    }
+
+    #[test]
+    fn redis_tag_pieces_split_and_trim_like_redisearch() {
+        fn p(v: &str) -> Vec<&str> {
+            redis_tag_pieces(v).collect()
+        }
+        assert_eq!(p("http://e.com/p"), ["http://e.com/p"]);
+        assert_eq!(
+            p("http://e.com/p;jsessionid=1"),
+            ["http://e.com/p", "jsessionid=1"]
+        );
+        assert_eq!(p("http://e.com/p "), ["http://e.com/p"]);
+        assert_eq!(p("\t a \x0b;; b\r\n;  "), ["a", "b"]);
+        assert!(p(" ; ").is_empty());
     }
 
     #[test]

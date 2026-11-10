@@ -2611,8 +2611,8 @@ within a run:
 | `rare-term` | one `segment` term | document frequency 1–100 |
 | `two-rare-terms` | AND of two `segment` terms that co-occur | each df 100–1000 |
 | `rare-term-and-category` | a rare term AND `category` | df 1–100, category of one of its passages |
-| `url-eq` | exact `url` | URLs that are safe tags |
-| `docid-eq` | exact `docid` | every passage |
+| `url-eq` | exact `url` | URLs that are safe tags (see below) |
+| `docid-eq` | exact `docid` | every passage with a safe-tag docid (see below) |
 | `deep-fetch` | one rare term, `top: 100`, with `fetch` | df 11–100 |
 
 Generate the query files once per prepared corpus (deterministic for a seed;
@@ -2668,5 +2668,13 @@ A search point selects one family and a window:
   fields, as strings; recorded as `params.fulltext.fetch` (`hits`, `bytes`).
 - `url-eq` and `docid-eq` need no new index option: the text-tag-only layout
   already indexes every keyword field (Redis `TAG SEPARATOR ; CASESENSITIVE`,
-  OpenSearch `keyword`), and the pre-search validator requires them.
+  OpenSearch `keyword`), and the pre-search validator requires them. A
+  selected value is a safe tag (printable ASCII, no space, no `;`) and is
+  never a Redis tag piece of another, unsafe value of the same field: Redis
+  splits a stored value on `;` and trims whitespace around each piece, so
+  `http://e.com/p;jsessionid=1` and `http://e.com/p ` both carry the tag
+  `http://e.com/p`, while OpenSearch indexes each as one keyword. Such values
+  are excluded, so every expected count is exact on both engines; the
+  manifest's `tags` block records how many values and rows were excluded.
+  Query files from an earlier generator are refused; regenerate them.
 - `deep-fetch` requires `top: 100` and `fetch`.
