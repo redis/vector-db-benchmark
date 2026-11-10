@@ -1094,8 +1094,9 @@ pub fn load_window(
 /// terms (df ≈ n/10), a term ambiguous in some passages (`edge`), a term
 /// that only reaches df through newline normalization (`newl`), a term
 /// inside an over-long run, a folding collision (`cafe`) and unsafe URLs.
-/// Every value passes the upload validator (`filter_only::domain`), so both
-/// engines can ingest it.
+/// Every value passes the upload validator (`filter_only::domain`) even with
+/// `url` and `docid` declared `keyword` and no prepared filter-only query set
+/// (as in the integration tests), so both engines can ingest it.
 pub fn write_fixture_corpus(dir: &Path, n: usize, dim: usize) -> Result<(), String> {
     write_fixture(dir, n, dim, false)
 }
@@ -1103,8 +1104,12 @@ pub fn write_fixture_corpus(dir: &Path, n: usize, dim: usize) -> Result<(), Stri
 /// [`write_fixture_corpus`] plus unsafe URLs and docids whose Redis tag
 /// pieces equal a safe value of another passage (`<url>;jsessionid=<i>`,
 /// `<url> `, `<docid> `), so the generator's tag-piece exclusion has
-/// something to exclude. The upload validator refuses such values (no `;`,
-/// no edge whitespace), so this corpus is for generator tests only.
+/// something to exclude. With `url`/`docid` in the filter-only index schema
+/// the upload validator refuses such values (no `;`, no edge whitespace), so
+/// this corpus is for generator tests only. A real MS MARCO corpus is not
+/// protected that way: its `filter_queries.jsonl` narrows the validated schema
+/// to the derived fields, so its `;` / edge-whitespace URLs upload, and the
+/// exclusion is what keeps `url-eq` / `docid-eq` counts exact on Redis.
 pub fn write_fixture_corpus_with_tag_piece_collisions(
     dir: &Path,
     n: usize,
@@ -1213,6 +1218,29 @@ mod tests {
         let dir = tmp.path().join("corpus");
         write_fixture_corpus_with_tag_piece_collisions(&dir, n, 4).unwrap();
         (tmp, dir)
+    }
+
+    /// The default fixture is what the integration tests upload: it must pass
+    /// the upload validator with `url`/`docid` as keywords (the schema of
+    /// `tests/common` `write_disk_project`); the collision fixture must not.
+    #[test]
+    fn default_fixture_passes_the_upload_validator_collision_fixture_does_not() {
+        let schema = serde_json::json!({"docid":"keyword","url":"keyword","title":"text",
+            "segment":"text","category":"keyword","doc_len":"int"});
+        let check = |dir: &Path| {
+            crate::readers::visit_compound_metadata(dir, |item| {
+                crate::filter_only::domain::validate_metadata(
+                    std::slice::from_ref(&item),
+                    Some(&schema),
+                )
+            })
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("corpus");
+        write_fixture_corpus(&dir, 3000, 4).unwrap();
+        check(&dir).unwrap();
+        let (_tmp, dir) = fixture(3000);
+        assert!(check(&dir).is_err());
     }
 
     fn opts(per_family: usize, seed: u64) -> GenerateOptions {
