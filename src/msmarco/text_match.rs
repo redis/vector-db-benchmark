@@ -51,6 +51,13 @@
 //! uses terms with ZERO ambiguous documents in the whole corpus
 //! ([`choose_term`]); on the 100K MS MARCO corpus ~49K title terms qualify.
 //!
+//! [`classify`] does not model RediSearch's backslash escape across a space
+//! (`\ term` is the Redis token ` term`) or tokens RediSearch joins across an
+//! escape or a control byte (`plant\n` is `plantn`). [`redis_escape_terms`]
+//! names every term such a passage could affect; `msmarco::disk_queries`
+//! never selects one. [`classify`] itself is unchanged, so `RULE_VERSION`
+//! and the hybrid query sets built on it stay as they were.
+//!
 //! This is exact agreement by construction for every document of a corpus the
 //! term was chosen on — the guarantee is about the chosen (term, corpus) pair,
 //! not a claim that the classifier models either engine in general.
@@ -384,6 +391,178 @@ pub fn doc_verdicts(
     }
 }
 
+/// RediSearch's token separators: `ToksepMap_g` in `src/toksep.h` (the same
+/// on the 8.6 branch and master): space, tab and every printable ASCII
+/// punctuation character except `_` and `\`.
+pub const REDIS_TOKSEP: &[u8] = b" \t,./(){}[]:;~!@#$%^&*-=+|'`\"<>?";
+
+/// Version of [`redis_escape_terms`], recorded with every query set that
+/// applies it.
+pub const REDIS_ESCAPE_RULE: &str = "vdb-redis-escape/v1";
+
+/// C `iscntrl` in the C locale: RediSearch's `DefaultNormalize` drops these
+/// bytes from a token even when escaped.
+fn is_c_cntrl(b: u8) -> bool {
+    b < 0x20 || b == 0x7f
+}
+
+/// Lowercase ASCII-alphanumeric runs of `s` that are valid terms, raw and
+/// through [`ascii_fold`] (the two views [`classify`] reads a text in).
+fn push_valid_terms(s: &str, out: &mut Vec<String>) {
+    for run in s.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let run = run.to_ascii_lowercase();
+        if validate_term(&run).is_ok() {
+            out.push(run);
+        }
+    }
+    if s.chars().any(|c| ascii_fold(c).is_some()) {
+        let mut folded = String::with_capacity(s.len() + 8);
+        for c in s.chars() {
+            if c.is_ascii() {
+                folded.push(c.to_ascii_lowercase());
+            } else if let Some(f) = ascii_fold(c) {
+                folded.push_str(f);
+            } else {
+                folded.push('\u{0}');
+            }
+        }
+        for run in folded.split(|c: char| !c.is_ascii_alphanumeric()) {
+            if validate_term(run).is_ok() {
+                out.push(run.to_string());
+            }
+        }
+    }
+}
+
+/// Every valid term ([`validate_term`]) whose membership in `text` could
+/// differ between the [`classify`] model and RediSearch because of a
+/// backslash escape or a control character, appended to `out` (unsorted,
+/// possibly repeated). Nothing for a text with neither.
+///
+/// # What RediSearch does (`src/toksep.h`, `src/tokenize.c`)
+///
+/// `toksep` cuts the text into pieces at every [`REDIS_TOKSEP`] byte that is
+/// not escaped; a `\` escapes the NEXT byte, whatever it is (separator,
+/// letter, space or `\`), and the escape lasts exactly one byte. Each piece is
+/// then normalized (`DefaultNormalize`): an unescaped `\` is dropped, an
+/// unescaped blank (space, tab) is dropped, every control byte is dropped
+/// even when escaped, and the rest is kept and Unicode-lowercased. So
+/// `\ malingered` is the one token ` malingered` (no token `malingered`),
+/// `plant\n` is the token `plantn` (no `plant`, no `n`), and `foo<DEL>bar` is
+/// `foobar`. The scan stops at a NUL byte.
+///
+/// # Why this set is a superset of the affected terms
+///
+/// A piece with no `\` and no control byte normalizes to itself lowercased,
+/// and it is bounded by unescaped separators, which [`classify`] already
+/// treats as RediSearch does (a `Yes` side is a space, a [`SAFE_SEPARATORS`]
+/// or [`MID_SEPARATORS`] character, all of them in [`REDIS_TOKSEP`]; a
+/// separator preceded by `\` is never a `Yes` side unless it is a space,
+/// which is the case v1 missed). A disagreement can therefore only come from
+/// a piece holding a `\` or a control byte, or from text past a NUL. For each
+/// such piece this returns every term of the piece as [`classify`] sees it
+/// (its lowercase ASCII-alphanumeric runs, so a `Yes` the model could claim
+/// there is caught) and every term of the token RediSearch makes of it (the
+/// runs of the normalized piece, so a token the model cannot see is caught),
+/// each also through the same ASCII folding [`classify`] uses (RediSearch
+/// lowercases Unicode; the Kelvin sign becomes `k`). Past a NUL, every term
+/// of the rest of the text is returned. A caller that never selects a term
+/// in this set, for any document of the corpus, only selects terms for which
+/// [`classify`]'s `Yes`/`No` is also RediSearch's.
+pub fn redis_escape_terms(text: &str, out: &mut Vec<String>) {
+    let bytes = text.as_bytes();
+    if !bytes.iter().any(|&b| b == b'\\' || is_c_cntrl(b)) {
+        return;
+    }
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    // Separators are ASCII, so every piece is a valid UTF-8 slice; the
+    // normalized piece only loses ASCII bytes, so it is valid UTF-8 too.
+    let special_piece = |raw: &[u8], out: &mut Vec<String>| {
+        push_valid_terms(std::str::from_utf8(raw).expect("ASCII cut"), out);
+        let mut norm = Vec::with_capacity(raw.len());
+        let mut esc = false;
+        for &b in raw {
+            if (matches!(b, b' ' | b'\t') && !esc) || is_c_cntrl(b) {
+                // Dropped.
+            } else if b == b'\\' && !esc {
+                esc = true;
+                continue;
+            } else {
+                norm.push(b);
+            }
+            esc = false;
+        }
+        push_valid_terms(std::str::from_utf8(&norm).expect("ASCII removed"), out);
+    };
+    // Every `toksep` piece, cut exactly as RediSearch cuts them.
+    let mut start = 0;
+    let mut escaped = false;
+    let mut special = false;
+    for (pos, &b) in bytes[..end].iter().enumerate() {
+        if REDIS_TOKSEP.contains(&b) && !escaped {
+            if special {
+                special_piece(&bytes[start..pos], out);
+            }
+            start = pos + 1;
+            special = false;
+            continue;
+        }
+        special |= b == b'\\' || is_c_cntrl(b);
+        escaped = !escaped && b == b'\\';
+    }
+    if special {
+        special_piece(&bytes[start..end], out);
+    }
+    if end < bytes.len() {
+        // RediSearch stops at the NUL; the model reads on.
+        push_valid_terms(std::str::from_utf8(&bytes[end..]).expect("ASCII cut"), out);
+    }
+}
+
+/// Reference model of RediSearch's tokens for `text` (`toksep` then
+/// `DefaultNormalize`, lowercased, stopwords kept), transcribed directly from
+/// the C source for tests: an oracle independent of [`classify`] and of
+/// [`redis_escape_terms`].
+#[cfg(test)]
+pub(crate) fn redis_tokens(text: &str) -> std::collections::HashSet<String> {
+    let bytes = text.as_bytes();
+    let bytes = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
+    let mut toks = std::collections::HashSet::new();
+    let mut pos = 0;
+    while pos <= bytes.len() {
+        // toksep
+        let orig = pos;
+        let mut escaped = false;
+        while pos < bytes.len() {
+            if REDIS_TOKSEP.contains(&bytes[pos]) && !escaped {
+                break;
+            }
+            escaped = !escaped && bytes[pos] == b'\\';
+            pos += 1;
+        }
+        let tok = &bytes[orig..pos];
+        pos += 1;
+        // DefaultNormalize
+        let mut dst = Vec::new();
+        let mut escaped = false;
+        for &c in tok {
+            if ((c == b' ' || c == b'\t') && !escaped) || c < 0x20 || c == 0x7f {
+                // Dropped.
+            } else if c == b'\\' && !escaped {
+                escaped = true;
+                continue;
+            } else {
+                dst.push(c);
+            }
+            escaped = false;
+        }
+        if !dst.is_empty() {
+            toks.insert(String::from_utf8(dst).unwrap().to_lowercase());
+        }
+    }
+    toks
+}
+
 /// Per-term document frequency over the RAW view (every candidate term that
 /// is a whole ASCII-letter run somewhere), used to rank candidates before the
 /// exact [`classify`] scan confirms one.
@@ -645,6 +824,122 @@ mod tests {
         doc_verdicts(&long, &mut verdicts, &mut long_runs);
         assert_eq!(long_runs.len(), 1);
         assert!(long_runs[0].contains("quora"));
+    }
+
+    fn escape_terms(text: &str) -> std::collections::HashSet<String> {
+        let mut out = Vec::new();
+        redis_escape_terms(text, &mut out);
+        out.into_iter().collect()
+    }
+
+    /// The two disagreements a live Redis Flex 8.6.2 / OpenSearch 3.x run on
+    /// MS MARCO found: the classifier says `Yes`/`No`, RediSearch's escape
+    /// handling says otherwise, and the escape rule names the term.
+    #[test]
+    fn escape_rule_covers_the_observed_redis_disagreements() {
+        // Passage 7898869: `\ ` joins the escaped space onto the next token.
+        let text = "(audio) \\ malingered;";
+        assert_eq!(classify(text, "malingered"), Yes);
+        assert!(!redis_tokens(text).contains("malingered"));
+        assert!(redis_tokens(text).contains(" malingered"));
+        assert!(escape_terms(text).contains("malingered"));
+        assert!(!escape_terms(text).contains("audio"), "a clean piece");
+        // Passage 1512903: a literal `plant\n` is the Redis token `plantn`.
+        let text = "a plant\\n here";
+        assert_eq!(classify(text, "plantn"), No);
+        assert!(redis_tokens(text).contains("plantn"));
+        let t = escape_terms(text);
+        assert!(t.contains("plantn") && t.contains("plant"), "{t:?}");
+        assert!(!t.contains("here"));
+        // No backslash, no control byte: nothing.
+        assert!(escape_terms("Nature's way, run-walk (x) a.b").is_empty());
+    }
+
+    /// Every byte RediSearch treats specially in a token: each separator
+    /// escaped, a letter, a space and a backslash escaped, a control byte
+    /// (dropped even when escaped) and a NUL (the end of the text).
+    #[test]
+    fn escape_rule_covers_every_special_byte() {
+        let mut escaped: Vec<u8> = REDIS_TOKSEP.to_vec();
+        escaped.extend(b"nN\\_x0");
+        for c in escaped {
+            let text = format!("foo\\{}bar", c as char);
+            let t = escape_terms(&text);
+            for run in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+                let run = run.to_ascii_lowercase();
+                if validate_term(&run).is_ok() {
+                    assert!(t.contains(&run), "{text:?} {t:?}");
+                }
+            }
+            assert!(t.contains("foo"), "{text:?} {t:?}");
+            assert!(!redis_tokens(&text).contains("foo"), "{text:?}");
+            for tok in redis_tokens(&text) {
+                if validate_term(&tok).is_ok() {
+                    assert!(t.contains(&tok), "{text:?} {tok:?}");
+                }
+            }
+        }
+        // `\\` escapes the second backslash only: the space then separates.
+        assert!(redis_tokens("x\\\\ run").contains("run"));
+        assert!(!escape_terms("x\\\\ run").contains("run"));
+        for cntrl in ['\u{1}', '\u{1f}', '\u{7f}'] {
+            let text = format!("foo{cntrl}bar");
+            assert!(redis_tokens(&text).contains("foobar"), "{text:?}");
+            assert!(escape_terms(&text).contains("foobar"), "{text:?}");
+            let text = format!("x \\{cntrl}bar");
+            assert!(redis_tokens(&text).contains("bar"), "{text:?}");
+            assert!(escape_terms(&text).contains("bar"), "{text:?}");
+        }
+        let text = "run\u{0}walk now";
+        assert!(!redis_tokens(text).contains("walk"));
+        assert_eq!(classify(text, "now"), Yes);
+        assert!(escape_terms(text).contains("now") && escape_terms(text).contains("walk"));
+        // RediSearch lowercases Unicode: an escaped Kelvin sign spells `key`.
+        let text = "a \\\u{212A}ey";
+        assert!(redis_tokens(text).contains("key"));
+        assert!(escape_terms(text).contains("key"));
+    }
+
+    /// The superset claim, checked exhaustively on random short texts over
+    /// the characters that matter: for every valid term outside the escape
+    /// set that the classifier answers `Yes` or `No` for, RediSearch's token
+    /// set (the reference transcription of `toksep` + `DefaultNormalize`)
+    /// agrees.
+    #[test]
+    fn outside_the_escape_set_the_classifier_agrees_with_redisearch() {
+        use rand::{Rng, SeedableRng};
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'n', 'a', 'b', 'n', 'a', 'b', 'n', 'a', 'b', 'n', ' ', ' ', ' ', '\\', '\\',
+            ',', '.', '\'', ':', '-', '_', '/', '|', '?', '`', '\t', '\u{1}', '\u{7f}', '\u{0}',
+            '\u{e9}', '\u{212A}', 'B',
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xE5C);
+        let mut checked = 0u64;
+        for _ in 0..200_000 {
+            let len = rng.gen_range(0..14);
+            let text: String = (0..len)
+                .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())])
+                .collect();
+            let redis = redis_tokens(&text);
+            let excluded = escape_terms(&text);
+            let mut terms: Vec<String> = redis.iter().cloned().collect();
+            terms.extend(
+                text.split(|c: char| !c.is_ascii_alphanumeric())
+                    .map(str::to_ascii_lowercase),
+            );
+            for t in terms {
+                if validate_term(&t).is_err() || excluded.contains(&t) {
+                    continue;
+                }
+                let model = classify(&text, &t);
+                if model == Ambiguous {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(model == Yes, redis.contains(&t), "{text:?} / {t:?}");
+            }
+        }
+        assert!(checked > 10_000, "{checked}");
     }
 
     #[test]

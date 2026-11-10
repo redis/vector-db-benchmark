@@ -2629,6 +2629,20 @@ statistics, file SHA-256s and the corpus identity (`PREPARED.json` SHA-256,
 `payloads.jsonl` size and SHA-256). Terms are only those whose match the two
 engines agree on in every passage (`text_match`), so every query's count is
 exact on both engines; a family below 100,000 eligible items is an error.
+That excludes every term next to a RediSearch backslash escape or control
+byte in any passage. RediSearch keeps the byte after a `\` in the token and
+drops the backslash: `\ malingered` is the Redis token ` malingered` (no
+`malingered`), and `plant\n` is the token `plantn`, which OpenSearch indexes as
+`plant` and `n`. The generator cuts each passage into RediSearch tokenizer
+pieces (`toksep`). For each piece that holds a `\` or a control byte, it drops
+every term the piece spells, both as written and as Redis normalizes it, and
+it does the same for any text after a NUL. Pairs and categories are built only
+from the remaining terms. The manifest records the rule (`redis_escape_rules`
+and `vocabulary.redis_escape_rule`), the number of passages it applied to
+(`vocabulary.passages_with_redis_escape`) and how many otherwise eligible terms
+it removed, overall (`vocabulary.terms_excluded_redis_escape`) and per text
+family (`families.<family>.terms_excluded_redis_escape`). Query files from
+generator v3 or earlier are refused; regenerate them.
 
 A search point selects one family and a window:
 
