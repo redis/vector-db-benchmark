@@ -202,6 +202,25 @@ struct Args {
     #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "force", "add_derived_fields"])]
     add_hybrid_queries: bool,
 
+    /// Write the `msmarco-disk-v1` compound query families (rare terms, term
+    /// pairs, rare term AND category, url/docid exact match, deep fetch) into
+    /// `<dataset>/msmarco-disk-v1/` from the corpus on disk: two passes over
+    /// `payloads.jsonl`, nothing else read or rewritten (`PREPARED.json` is
+    /// unchanged). If the directory already exists the families are
+    /// regenerated and must be byte-identical (a verification); a difference
+    /// is an error, never a silent replacement.
+    #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "force", "add_derived_fields", "add_hybrid_queries", "add_knn_truth", "from_prepared", "resume_parts"])]
+    add_disk_queries: bool,
+
+    /// Timed queries per disk family (`--add-disk-queries`), capped by each
+    /// family's eligible pool; at least 100000.
+    #[arg(long, default_value_t = msmarco::disk_queries::DEFAULT_PER_FAMILY, requires = "add_disk_queries")]
+    disk_queries_per_family: usize,
+
+    /// Selection seed for `--add-disk-queries`.
+    #[arg(long, default_value_t = msmarco::disk_queries::DEFAULT_SEED, requires = "add_disk_queries")]
+    disk_queries_seed: u64,
+
     /// Hugging Face token, for rate-limited or gated access. Also read from
     /// `HF_TOKEN`.
     #[arg(long, env = "HF_TOKEN", hide_env_values = true)]
@@ -231,6 +250,9 @@ fn run(args: &Args) -> Result<(), String> {
     }
     if args.add_hybrid_queries {
         return add_hybrid_queries(args);
+    }
+    if args.add_disk_queries {
+        return add_disk_queries(args);
     }
     let dataset = args
         .dataset
@@ -2089,6 +2111,88 @@ fn add_knn_truth(args: &Args) -> Result<(), String> {
     write_manifest_value(&dir, &manifest)?;
     publish(&dir, &outputs)?;
     println!("{dataset}: both KNN truth sets added; corpus files and document IDs unchanged");
+    Ok(())
+}
+
+/// `--add-disk-queries`: generate the `msmarco-disk-v1` families into a
+/// staging directory, then publish it, or, when it already exists, require
+/// the regenerated files to be identical.
+fn add_disk_queries(args: &Args) -> Result<(), String> {
+    use msmarco::disk_queries as dq;
+    let dataset = args
+        .dataset
+        .as_deref()
+        .ok_or("--dataset is required with --add-disk-queries")?;
+    let variant =
+        msmarco::variant(dataset).ok_or_else(|| format!("unknown dataset {dataset:?}"))?;
+    let dir = args.out_dir.join(variant.dir);
+    for need in ["PREPARED.json", "payloads.jsonl"] {
+        if !dir.join(need).is_file() {
+            return Err(format!(
+                "{} has no {need}; prepare or download the corpus first",
+                dir.display()
+            ));
+        }
+    }
+    let staging = dir.join(format!(".{}.staging", dq::DIR));
+    let _ = std::fs::remove_dir_all(&staging);
+    let started = Instant::now();
+    let manifest = dq::generate(
+        &dir,
+        &dq::GenerateOptions {
+            per_family: args.disk_queries_per_family,
+            seed: args.disk_queries_seed,
+            min_per_family: dq::MIN_PER_FAMILY,
+        },
+        &staging,
+    )?;
+    let target = dir.join(dq::DIR);
+    if target.exists() {
+        let mut names: Vec<String> = dq::Family::ALL.iter().map(|f| f.file_name()).collect();
+        names.push(dq::MANIFEST.to_string());
+        for name in &names {
+            let old = std::fs::read(target.join(name))
+                .map_err(|e| format!("{}: {e}", target.join(name).display()))?;
+            let new = std::fs::read(staging.join(name))
+                .map_err(|e| format!("{}: {e}", staging.join(name).display()))?;
+            if old != new {
+                return Err(format!(
+                    "{} differs from a fresh generation ({name}); the new files are in {} — \
+                     remove {} yourself to replace it",
+                    target.display(),
+                    staging.display(),
+                    target.display()
+                ));
+            }
+        }
+        std::fs::remove_dir_all(&staging).map_err(|e| e.to_string())?;
+        println!(
+            "{}: verified identical to a fresh generation ({:.1}s)",
+            target.display(),
+            started.elapsed().as_secs_f64()
+        );
+    } else {
+        std::fs::rename(&staging, &target)
+            .map_err(|e| format!("publish {}: {e}", target.display()))?;
+        println!(
+            "Wrote {} in {:.1}s",
+            target.display(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    for family in dq::Family::ALL {
+        let f = &manifest["families"][family.name()];
+        println!(
+            "  {:<24} timed {:>9}  pool {:>9}  df {}  expected count p50 {} p90 {} max {}",
+            family.name(),
+            f["timed_queries"],
+            f["eligible_pool"],
+            f["df_band"],
+            f["expected_count_timed"]["p50"],
+            f["expected_count_timed"]["p90"],
+            f["expected_count_timed"]["max"],
+        );
+    }
     Ok(())
 }
 

@@ -226,6 +226,13 @@ pub struct FulltextSpec {
     /// result as asymmetric for the ranked query ([`total_hits_plan`]).
     #[serde(default)]
     pub total_hits: Option<TotalHits>,
+    /// Fetch these stored fields of every hit (Redis `RETURN n f…` instead of
+    /// `NOCONTENT`; OpenSearch `_source.includes` instead of `_source: false`).
+    /// Absent = ids and scores only, as before. Each must be a `text` or
+    /// `keyword` schema field (never the vector); every hit must come back with
+    /// exactly these fields, checked on every reply on both engines.
+    #[serde(default)]
+    pub fetch: Option<Vec<String>>,
 }
 
 /// How both engines analyze text for the fulltext workload.
@@ -353,10 +360,19 @@ pub fn total_hits_plan(engine: &str, spec: &FulltextSpec) -> Result<TotalHitsPla
     })
 }
 
+/// Whether `spec` runs the `msmarco-disk-v1` compound suite.
+pub fn is_disk_suite(spec: &FulltextSpec) -> bool {
+    spec.compound.as_ref().and_then(|c| c.suite.as_deref())
+        == Some(crate::msmarco::disk_queries::SUITE)
+}
+
 /// `total_hits: "none"` cannot be honoured by the compound suite: every
-/// compound query's total is checked against its expected count.
+/// compound query's total is checked against its expected count. The
+/// `msmarco-disk-v1` suite is the exception: every one of its queries has an
+/// exact expected count, so under `none` the runner checks the page length
+/// against it instead (`min(expected, top)`, [`check_query_page`]).
 fn check_total_hits(spec: &FulltextSpec) -> Result<(), String> {
-    if spec.compound.is_some() && spec.total_hits == Some(TotalHits::None) {
+    if spec.compound.is_some() && spec.total_hits == Some(TotalHits::None) && !is_disk_suite(spec) {
         return Err(format!(
             "`{SPEC_KEY}.total_hits: \"none\"` cannot be used with `{SPEC_KEY}.compound`: \
              the compound suite checks every query's exact total against its expected \
@@ -825,20 +841,204 @@ pub fn check_fields_before_connecting<'a>(
         }
         resolve_fields(&spec, schema)
             .map_err(|e| format!("search config #{i} (fulltext) on dataset '{dataset}': {e}"))?;
+        resolve_fetch(&spec, schema)
+            .map_err(|e| format!("search config #{i} (fulltext) on dataset '{dataset}': {e}"))?;
     }
     Ok(())
 }
 
+/// `msmarco-disk-v1` windows already claimed in one invocation, so no two
+/// search configs run the same queries against one engine: within one engine
+/// config ([`check_compound_before_connecting`]) and across the engine configs
+/// of the invocation ([`check_disk_windows_across_configs`]).
+#[derive(Debug, Default)]
+pub struct DiskWindows {
+    claimed: Vec<ClaimedWindow>,
+}
+
+#[derive(Debug)]
+struct ClaimedWindow {
+    /// Engine type and dataset: the cache a window warms. `--host` is one per
+    /// invocation, so it is the same for every claim.
+    scope: String,
+    /// The engine config that claimed it (`None`: this engine config).
+    owner: Option<String>,
+    search_config: usize,
+    family: &'static str,
+    first: usize,
+    last: usize,
+}
+
 /// Validate/generate every compound request before engine creation/upload.
+/// `blocks` are each fulltext search config's block and result size `top`;
+/// `num_queries` is `--queries`. `msmarco-disk-v1` windows are loaded as the
+/// run will load them, and two windows of one family in the same engine
+/// config must not overlap (each would repeat the other's queries).
 pub fn check_compound_before_connecting<'a>(
     dir: &Path,
-    blocks: impl Iterator<Item = Option<&'a Value>>,
+    blocks: impl Iterator<Item = (Option<&'a Value>, usize)>,
     schema: Option<&Value>,
+    num_queries: i64,
+) -> Result<(), String> {
+    claim_compound_windows(
+        dir,
+        blocks,
+        schema,
+        num_queries,
+        &mut DiskWindows::default(),
+        "",
+        None,
+    )
+}
+
+/// [`check_compound_before_connecting`], recording each `msmarco-disk-v1`
+/// window in `claimed` under `scope` (engine type + dataset). A window of a
+/// family overlapping one already claimed in the same scope is refused,
+/// whether the earlier claim came from this engine config or (`owner` naming
+/// this one) from an earlier engine config of the invocation. Different
+/// scopes (a Redis and an OpenSearch config, two datasets) may share a window.
+pub fn claim_compound_windows<'a>(
+    dir: &Path,
+    blocks: impl Iterator<Item = (Option<&'a Value>, usize)>,
+    schema: Option<&Value>,
+    num_queries: i64,
+    claimed: &mut DiskWindows,
+    scope: &str,
+    owner: Option<&str>,
+) -> Result<(), String> {
+    for (i, (block, top)) in blocks.enumerate() {
+        let spec = parse_spec(block)?;
+        if spec.compound.is_none() {
+            continue;
+        }
+        let set = load_query_set_for(dir, &spec, schema, top, num_queries)?;
+        let Some(w) = &set.window else {
+            continue;
+        };
+        let first = set.queries[w.timed_from].query_id;
+        let last = set.queries[set.queries.len() - 1].query_id;
+        let family = w.family.name();
+        if let Some(c) = claimed
+            .claimed
+            .iter()
+            .find(|c| c.scope == scope && c.family == family && first <= c.last && c.first <= last)
+        {
+            let name = |o: Option<&str>, n: usize| match o {
+                Some(o) => format!("engine config '{o}' search config #{n}"),
+                None => format!("search config #{n}"),
+            };
+            let on = if scope.is_empty() {
+                String::new()
+            } else {
+                format!(" on {scope}")
+            };
+            return Err(format!(
+                "fulltext {} and {} both run {} family {family}{on} over overlapping lines \
+                 ({}..={} and {first}..={last}); give each its own `compound.offset` range: \
+                 a disk-bound window never repeats a query, and the second would be served \
+                 from the cache the first warmed",
+                name(c.owner.as_deref(), c.search_config),
+                name(owner, i),
+                crate::msmarco::disk_queries::SUITE,
+                c.first,
+                c.last,
+            ));
+        }
+        claimed.claimed.push(ClaimedWindow {
+            scope: scope.to_string(),
+            owner: owner.map(str::to_string),
+            search_config: i,
+            family,
+            first,
+            last,
+        });
+    }
+    Ok(())
+}
+
+/// One engine config's fulltext search blocks, for
+/// [`check_disk_windows_across_configs`].
+pub struct DiskConfig<'a> {
+    pub name: &'a str,
+    pub engine_type: &'a str,
+    /// Each fulltext search config's block and result size `top`.
+    pub blocks: Vec<(Option<&'a Value>, usize)>,
+}
+
+/// A dataset a [`DiskConfig`] runs on: name, directory, schema.
+pub type DiskDataset = (String, std::path::PathBuf, Option<Value>);
+
+/// Refuse, before any engine config of the invocation connects, two engine
+/// configs of one engine type that run overlapping `msmarco-disk-v1` windows
+/// of one family on one dataset: the second would serve the first's queries
+/// from the cache the first warmed (`--host` is one per invocation). Fewer
+/// than two configs with a disk-suite block (every existing config has none)
+/// returns before `datasets` is called. Only disk-suite blocks are claimed;
+/// each config's own check still validates all of its compound blocks.
+pub fn check_disk_windows_across_configs(
+    configs: &[DiskConfig<'_>],
+    datasets: impl FnOnce() -> Result<Vec<DiskDataset>, String>,
+    num_queries: i64,
+) -> Result<(), String> {
+    let is_disk = |b: Option<&Value>| parse_spec(b).is_ok_and(|s| is_disk_suite(&s));
+    let disk: Vec<&DiskConfig<'_>> = configs
+        .iter()
+        .filter(|c| c.blocks.iter().any(|&(b, _)| is_disk(b)))
+        .collect();
+    if disk.len() < 2 {
+        return Ok(());
+    }
+    let datasets = datasets()?;
+    let mut claimed = DiskWindows::default();
+    for c in disk {
+        // Non-disk blocks become `None` (no compound), keeping each block's
+        // search-config index for the message.
+        let blocks: Vec<(Option<&Value>, usize)> = c
+            .blocks
+            .iter()
+            .map(|&(b, top)| (b.filter(|b| is_disk(Some(b))), top))
+            .collect();
+        for (dataset, dir, schema) in &datasets {
+            // A pair whose windows do not load (a dataset without disk query
+            // files, a window past the end) is refused by its own per-config
+            // check when it runs, as before; it never runs a window here.
+            if check_compound_before_connecting(
+                dir,
+                blocks.iter().copied(),
+                schema.as_ref(),
+                num_queries,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            claim_compound_windows(
+                dir,
+                blocks.iter().copied(),
+                schema.as_ref(),
+                num_queries,
+                &mut claimed,
+                &format!("{} on dataset '{dataset}'", c.engine_type),
+                Some(c.name),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `--repetitions` above 1 for a disk-bound suite: every repetition
+/// would run the same window again, from cache.
+pub fn check_disk_repetitions<'a>(
+    blocks: impl Iterator<Item = Option<&'a Value>>,
+    repetitions: usize,
 ) -> Result<(), String> {
     for block in blocks {
-        let spec = parse_spec(block)?;
-        if spec.compound.is_some() {
-            load_query_set(dir, &spec, schema)?;
+        if repetitions > 1 && is_disk_suite(&parse_spec(block)?) {
+            return Err(format!(
+                "--repetitions {repetitions} would rerun the same {} window; run each \
+                 repetition as its own invocation with its own `compound.offset`",
+                crate::msmarco::disk_queries::SUITE
+            ));
         }
     }
     Ok(())
@@ -909,6 +1109,16 @@ pub fn parse_spec(block: Option<&Value>) -> Result<FulltextSpec, String> {
         }
     }
     check_total_hits(&spec)?;
+    if let Some(fetch) = &spec.fetch {
+        check_fetch_names(fetch)?;
+    }
+    if is_disk_suite(&spec) && spec.analysis != Analysis::Parity {
+        return Err(format!(
+            "compound suite {} needs `analysis: parity`: its exact counts are document \
+             frequencies of unstemmed, whitespace-normalized terms",
+            crate::msmarco::disk_queries::SUITE
+        ));
+    }
     if let Some(compound) = &spec.compound {
         compound.validate()?;
         if spec
@@ -920,6 +1130,52 @@ pub fn parse_spec(block: Option<&Value>) -> Result<FulltextSpec, String> {
         }
     }
     Ok(spec)
+}
+
+/// Names-only check of `fulltext.fetch` (the schema check is
+/// [`resolve_fetch`]): nonempty, unique, plain identifiers, never `vector`.
+fn check_fetch_names(fetch: &[String]) -> Result<(), String> {
+    if fetch.is_empty() {
+        return Err(format!(
+            "`{SPEC_KEY}.fetch` must name at least one field (omit it to fetch ids only)"
+        ));
+    }
+    let mut seen = HashSet::new();
+    for f in fetch {
+        if !is_plain_field_name(f) || f == "vector" {
+            return Err(format!(
+                "`{SPEC_KEY}.fetch` field {f:?} must be a plain identifier and never the vector"
+            ));
+        }
+        if !seen.insert(f) {
+            return Err(format!("`{SPEC_KEY}.fetch` names {f:?} twice"));
+        }
+    }
+    Ok(())
+}
+
+/// The fields to fetch, checked against the dataset schema: each a `text` or
+/// `keyword` field (string-valued, stored by both engines). `None` = ids only.
+pub fn resolve_fetch(
+    spec: &FulltextSpec,
+    schema: Option<&Value>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(fetch) = &spec.fetch else {
+        return Ok(None);
+    };
+    check_fetch_names(fetch)?;
+    for f in fetch {
+        match schema.and_then(|s| s.get(f)).and_then(Value::as_str) {
+            Some("text" | "keyword") => {}
+            other => {
+                return Err(format!(
+                    "`{SPEC_KEY}.fetch` field {f:?} must be a `text` or `keyword` field of the \
+                     dataset schema (got {other:?})"
+                ))
+            }
+        }
+    }
+    Ok(Some(fetch.clone()))
 }
 
 /// One searched field and its query-time boost.
@@ -1073,13 +1329,152 @@ pub struct QuerySet {
     pub skipped: Vec<usize>,
     /// Lines in `tests.jsonl`.
     pub total: usize,
+    /// `msmarco-disk-v1`: the loaded window (see [`DiskWindow`]). `None` for
+    /// every other query set, which keeps the legacy schedule.
+    pub window: Option<DiskWindow>,
+}
+
+/// A `msmarco-disk-v1` window inside a [`QuerySet`]: `queries[0]` is the
+/// connection-priming query, `queries[1..timed_from]` the `WITHOUTCOUNT`
+/// probe reserve, and `queries[timed_from..]` the timed window, each
+/// dispatched exactly once. `query_id` is the line of the family file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiskWindow {
+    pub family: crate::msmarco::disk_queries::Family,
+    pub timed_from: usize,
+    /// [`crate::msmarco::disk_queries::Window::record`].
+    pub record: Value,
+}
+
+/// Which queries the Redis `WITHOUTCOUNT` probe may send.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbePlan {
+    /// Probe with these indices of [`QuerySet::queries`], in order.
+    Run(Vec<usize>),
+    /// No probe is needed; the reason is recorded.
+    NotNeeded(&'static str),
+}
+
+/// Recorded when a disk window needs no `WITHOUTCOUNT` probe.
+pub const PROBE_NOT_NEEDED: &str = "not needed: every timed query's exact match count is at \
+     most the page size, so each page is the whole match set; the page length is checked \
+     against the exact count on every reply";
+
+impl QuerySet {
+    /// The query each worker sends once to prime its connection, outside the
+    /// timed window: query 0 (for a disk window, its reserved priming line).
+    pub fn prime_index(&self) -> usize {
+        0
+    }
+
+    /// Which entries of `queries` the timed window dispatches, in order. The
+    /// legacy sets keep [`schedule`] (all once, or `num_queries` cycling); a
+    /// disk window dispatches each of its timed queries exactly once — it was
+    /// loaded with exactly `num_queries` of them, and anything else is refused.
+    pub fn dispatch_order(&self, num_queries: i64) -> Result<Vec<usize>, String> {
+        let Some(w) = &self.window else {
+            return Ok(schedule(self.queries.len(), num_queries));
+        };
+        let order: Vec<usize> = (w.timed_from..self.queries.len()).collect();
+        if order.is_empty() || (num_queries > 0 && num_queries as usize != order.len()) {
+            return Err(format!(
+                "{}: the loaded window holds {} timed queries but --queries is {num_queries}; \
+                 a disk-bound window never repeats a query",
+                crate::msmarco::disk_queries::SUITE,
+                order.len()
+            ));
+        }
+        Ok(order)
+    }
+
+    /// The queries [`probe_withoutcount`] may send: every query of a legacy
+    /// set, the probe reserve of a disk window (never a timed query, which
+    /// the probe would warm), or no probe when no timed query can be cut by
+    /// the page.
+    pub fn withoutcount_probe_plan(&self, top: usize) -> ProbePlan {
+        let Some(w) = &self.window else {
+            return ProbePlan::Run((0..self.queries.len()).collect());
+        };
+        let over = self.queries[w.timed_from..].iter().any(|q| {
+            q.compound
+                .as_ref()
+                .is_none_or(|c| c.expected_count.is_none_or(|e| e > top as u64))
+        });
+        if over {
+            ProbePlan::Run((1..w.timed_from).collect())
+        } else {
+            ProbePlan::NotNeeded(PROBE_NOT_NEEDED)
+        }
+    }
+
+    /// For a disk window under `total_hits: "none"`, refuse — before
+    /// connecting, and on both engines so the pair stays symmetric — a window
+    /// whose `WITHOUTCOUNT` probe could not succeed: some timed query has more
+    /// matches than `top` (so [`Self::withoutcount_probe_plan`] runs the
+    /// probe) but no reserve line does (so [`probe_withoutcount`] would find
+    /// no truncated page to compare). The generator puts the highest counts
+    /// in the reserve ([`crate::msmarco::disk_queries::probe_layout`]), so
+    /// this holds for any file it wrote; legacy sets have no reserve.
+    pub fn check_probe_reserve(&self, top: usize) -> Result<(), String> {
+        let Some(w) = &self.window else {
+            return Ok(());
+        };
+        let count = |q: &TextQuery| q.compound.as_ref().and_then(|c| c.expected_count);
+        let timed_max = self.queries[w.timed_from..]
+            .iter()
+            .map(count)
+            .max()
+            .flatten();
+        let Some(timed_max) = timed_max.filter(|m| *m > top as u64) else {
+            return Ok(());
+        };
+        if self.queries[1..w.timed_from]
+            .iter()
+            .any(|q| count(q).is_some_and(|c| c > top as u64))
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "{} family {} (seed {}): a timed query matches {timed_max} documents, more than \
+             `top` {top}, but no probe-reserve line (1..{}) matches more than {top}, so the \
+             Redis WITHOUTCOUNT probe could not compare a truncated page; `total_hits: \
+             \"none\"` is refused on both engines for this window — regenerate the family \
+             files with --add-disk-queries (generator {}), or use \"exact\"",
+            crate::msmarco::disk_queries::SUITE,
+            w.family.name(),
+            w.record["seed"],
+            w.timed_from - 1,
+            crate::msmarco::disk_queries::GENERATOR
+        ))
+    }
 }
 
 /// Resolve the explicitly named compound suite independently of ranked BM25.
+/// Not for `msmarco-disk-v1`, which is loaded per window
+/// ([`load_query_set_for`]).
 pub fn load_query_set(
     dir: &Path,
     spec: &FulltextSpec,
     schema: Option<&Value>,
+) -> Result<QuerySet, String> {
+    if is_disk_suite(spec) {
+        return Err(format!(
+            "{} needs the search config's top and --queries: use load_query_set_for",
+            crate::msmarco::disk_queries::SUITE
+        ));
+    }
+    load_query_set_for(dir, spec, schema, 0, -1)
+}
+
+/// [`load_query_set`] for one search config: `top` and `num_queries`
+/// (`--queries`) size an `msmarco-disk-v1` window and check its family's
+/// parameters; every other query set ignores them.
+pub fn load_query_set_for(
+    dir: &Path,
+    spec: &FulltextSpec,
+    schema: Option<&Value>,
+    top: usize,
+    num_queries: i64,
 ) -> Result<QuerySet, String> {
     let Some(compound) = &spec.compound else {
         return build_query_set(&read_query_texts(dir)?);
@@ -1088,6 +1483,57 @@ pub fn load_query_set(
     let projected = spec.scalar_indexing.project(schema);
     let schema = &projected;
     let fields = resolve_fields(spec, Some(schema))?;
+    let check_text = |expression: &crate::compound_text::Expr| -> Result<(), String> {
+        let mut used = HashSet::new();
+        expression.text_fields(&mut used);
+        if used.iter().any(|f| !fields.iter().any(|b| &b.field == f)) {
+            return Err(
+                "compound query references text outside the declared indexed fields".into(),
+            );
+        }
+        Ok(())
+    };
+    if let Some(family) = crate::compound_text::disk_family(compound)? {
+        family.check_params(top, spec.fetch.is_some())?;
+        let count = (num_queries > 0).then_some(num_queries as usize);
+        let w = crate::msmarco::disk_queries::load_window(
+            dir,
+            family,
+            compound.offset.unwrap_or(0),
+            count,
+        )?;
+        let record = w.record();
+        let timed_from = w.timed_from;
+        let queries = w
+            .queries
+            .into_iter()
+            .map(|(line, q)| {
+                let expression = crate::compound_text::Expr::compile(&q.conditions, schema)?;
+                check_text(&expression)?;
+                Ok(TextQuery {
+                    query_id: line,
+                    terms: vec![],
+                    compound: Some(q),
+                    expression: Some(expression),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let set = QuerySet {
+            total: queries.len(),
+            queries,
+            skipped: vec![],
+            preparation_sha256: Some(crate::msmarco::disk_queries::preparation_sha256(dir)?),
+            window: Some(DiskWindow {
+                family,
+                timed_from,
+                record,
+            }),
+        };
+        if spec.total_hits == Some(TotalHits::None) {
+            set.check_probe_reserve(top)?;
+        }
+        return Ok(set);
+    }
     let queries = compound
         .load(dir, schema)?
         .into_iter()
@@ -1102,13 +1548,7 @@ pub fn load_query_set(
                 q.minimum_count = 0;
             }
             let expression = crate::compound_text::Expr::compile(&q.conditions, schema)?;
-            let mut used = HashSet::new();
-            expression.text_fields(&mut used);
-            if used.iter().any(|f| !fields.iter().any(|b| &b.field == f)) {
-                return Err(
-                    "compound query references text outside the declared indexed fields".into(),
-                );
-            }
+            check_text(&expression)?;
             Ok(TextQuery {
                 query_id,
                 terms: vec![],
@@ -1135,6 +1575,7 @@ pub fn load_query_set(
         queries,
         skipped: vec![],
         preparation_sha256,
+        window: None,
     })
 }
 
@@ -1163,11 +1604,34 @@ pub fn query_opensearch_with(
     top: usize,
     total: TotalHits,
 ) -> Value {
-    match &q.expression {
+    query_opensearch_fetch(fields, q, top, total, None)
+}
+
+/// `_source` of an OpenSearch request: `false` (ids only) or the fetched
+/// fields.
+pub fn opensearch_source(fetch: Option<&[String]>) -> Value {
+    match fetch {
+        None => json!(false),
+        Some(f) => json!({"includes": f}),
+    }
+}
+
+/// [`query_opensearch_with`] fetching `fetch` (`None` = ids only, the same
+/// request as before).
+pub fn query_opensearch_fetch(
+    fields: &[FieldBoost],
+    q: &TextQuery,
+    top: usize,
+    total: TotalHits,
+    fetch: Option<&[String]>,
+) -> Value {
+    let mut body = match &q.expression {
         Some(e) => json!({"size":top,"_source":false,
             "track_total_hits":opensearch_track_total_hits(total),"query":e.opensearch()}),
         None => opensearch_body_with(fields, &q.terms, top, total),
-    }
+    };
+    body["_source"] = opensearch_source(fetch);
+    body
 }
 
 /// `track_total_hits` for `total`.
@@ -1182,6 +1646,33 @@ pub fn check_query_count(q: &TextQuery, total: Option<u64>) -> Result<(), String
         )?;
     }
     Ok(())
+}
+
+/// [`check_query_count`] for a validated page. With a total, the total is
+/// checked. Without one (`total_hits: none`), a compound query with an exact
+/// expected count must return exactly `min(expected, top)` hits — the page
+/// parsers already refuse an incomplete or duplicated page — and one without
+/// an expected count is refused, as before.
+pub fn check_query_page(
+    q: &TextQuery,
+    total: Option<u64>,
+    returned: usize,
+    top: usize,
+) -> Result<(), String> {
+    let Some(c) = &q.compound else {
+        return Ok(());
+    };
+    match (total, c.expected_count) {
+        (Some(_), _) => check_query_count(q, total),
+        (None, Some(e)) if returned as u64 == e.min(top as u64) => Ok(()),
+        (None, Some(e)) => Err(format!(
+            "compound {} returned {returned} hits without a total; its exact count {e} with \
+             top {top} requires {}",
+            c.name,
+            e.min(top as u64)
+        )),
+        (None, None) => Err("compound query requires an exact total".into()),
+    }
 }
 
 /// Build the query set from per-line query texts. No runnable query is an
@@ -1213,6 +1704,7 @@ pub fn build_query_set(texts: &[String]) -> Result<QuerySet, String> {
         skipped,
         total: texts.len(),
         preparation_sha256: None,
+        window: None,
     })
 }
 
@@ -1311,12 +1803,32 @@ pub fn redis_args_with(
     analysis: Analysis,
     total: TotalHits,
 ) -> Vec<String> {
+    redis_args_fetch(index, query, top, timeout_ms, analysis, total, None)
+}
+
+/// [`redis_args_with`] fetching `fetch`: `RETURN <n> <fields…>` takes the
+/// place of `NOCONTENT`. `None` is the same command as before.
+pub fn redis_args_fetch(
+    index: &str,
+    query: &str,
+    top: usize,
+    timeout_ms: i64,
+    analysis: Analysis,
+    total: TotalHits,
+    fetch: Option<&[String]>,
+) -> Vec<String> {
     let mut args = redis_args_base(index, query, top, timeout_ms);
     if analysis == Analysis::Parity {
         args.insert(3, "VERBATIM".to_string());
     }
     if total == TotalHits::None {
         args.push(REDIS_WITHOUTCOUNT.to_string());
+    }
+    if let Some(fetch) = fetch {
+        assert_eq!(args[2], "NOCONTENT", "redis_args_base layout changed");
+        let mut ret = vec!["RETURN".to_string(), fetch.len().to_string()];
+        ret.extend(fetch.iter().cloned());
+        args.splice(2..3, ret);
     }
     args
 }
@@ -1859,6 +2371,47 @@ pub struct RankedPage {
     pub total: Option<u64>,
     pub returned: usize,
     pub hits: Option<RankedHits>,
+    /// Bytes of fetched field values in the page (0 without `fetch`).
+    pub fetched_bytes: u64,
+}
+
+/// Check one hit's fetched fields: with `fetch`, exactly those fields, each a
+/// string, and the value bytes are returned; without, none at all (`fields`
+/// absent, or an empty map). `fields` yields `(name, value)` with the value
+/// `None` when it is not a string.
+fn check_fetched(
+    fetch: Option<&[String]>,
+    fields: Option<Vec<(&str, Option<usize>)>>,
+    engine: &str,
+) -> Result<u64, String> {
+    let fields = fields.unwrap_or_default();
+    let Some(fetch) = fetch else {
+        if fields.is_empty() {
+            return Ok(0);
+        }
+        return Err(format!(
+            "fulltext: {engine} returned document fields for an ids-only request"
+        ));
+    };
+    let mut bytes = 0u64;
+    let mut seen = HashSet::new();
+    for (name, len) in &fields {
+        if !fetch.iter().any(|f| f == name) || !seen.insert(*name) {
+            return Err(format!(
+                "fulltext: {engine} returned field {name:?}, which fetch {fetch:?} did not ask for"
+            ));
+        }
+        bytes += len.ok_or_else(|| {
+            format!("fulltext: {engine} returned a non-string value for fetched field {name:?}")
+        })? as u64;
+    }
+    if seen.len() != fetch.len() {
+        return Err(format!(
+            "fulltext: {engine} hit is missing fetched fields: got {:?}, asked for {fetch:?}",
+            fields.iter().map(|f| f.0).collect::<Vec<_>>()
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Parse a RESP3 `FT.SEARCH … NOCONTENT WITHSCORES` reply. Any warning
@@ -1881,6 +2434,19 @@ pub fn redis_ranked_page_with(
     top: usize,
     keep_hits: bool,
     total_hits: TotalHits,
+) -> Result<RankedPage, String> {
+    redis_ranked_page_fetch(value, top, keep_hits, total_hits, None)
+}
+
+/// [`redis_ranked_page_with`] for a request sent with `fetch`
+/// ([`redis_args_fetch`]): every hit's `extra_attributes` must hold exactly
+/// those fields as strings; without `fetch`, it must be absent or empty.
+pub fn redis_ranked_page_fetch(
+    value: &redis::Value,
+    top: usize,
+    keep_hits: bool,
+    total_hits: TotalHits,
+    fetch: Option<&[String]>,
 ) -> Result<RankedPage, String> {
     use redis::Value as V;
     fn text(v: &V) -> Option<&str> {
@@ -1918,10 +2484,31 @@ pub fn redis_ranked_page_with(
     let mut seen = HashSet::new();
     let mut rank = RankCheck::default();
     let mut hits = keep_hits.then(|| Vec::with_capacity(results.len()));
+    let mut fetched_bytes = 0u64;
     for r in results {
         let V::Map(r) = r else {
             return Err("fulltext: invalid Redis result entry".into());
         };
+        let attrs = match field(r, "extra_attributes") {
+            None => None,
+            Some(V::Map(m)) => Some(
+                m.iter()
+                    .map(|(k, v)| {
+                        let len = match v {
+                            V::BulkString(b) => Some(b.len()),
+                            V::SimpleString(s) => Some(s.len()),
+                            V::VerbatimString { text, .. } => Some(text.len()),
+                            _ => None,
+                        };
+                        text(k)
+                            .map(|k| (k, len))
+                            .ok_or("fulltext: Redis field name is not a string")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Some(_) => return Err("fulltext: Redis extra_attributes is not a map".into()),
+        };
+        fetched_bytes += check_fetched(fetch, attrs, "Redis")?;
         let id = field(r, "id")
             .and_then(text)
             .ok_or("fulltext: Redis hit without id")?;
@@ -1944,6 +2531,7 @@ pub fn redis_ranked_page_with(
         total: (total_hits == TotalHits::Exact).then_some(total as u64),
         returned: results.len(),
         hits,
+        fetched_bytes,
     })
 }
 
@@ -2021,10 +2609,14 @@ where
         }
     }
     if probe.over_limit == 0 {
-        return Err(refuse(format!(
-            "no query has more than {top} matches, so the probe cannot show that \
-             {REDIS_WITHOUTCOUNT} still selects the top {top}"
-        )));
+        // A property of the probed queries, not of the server: say so rather
+        // than blame the RediSearch version.
+        return Err(format!(
+            "fulltext: `total_hits: \"none\"` refused before the timed window: none of the \
+             {} probed queries with a match has more than {top}, so the probe cannot show that \
+             {REDIS_WITHOUTCOUNT} still selects the top {top}; use \"exact\" for this query set",
+            probe.compared
+        ));
     }
     Ok(probe)
 }
@@ -2062,6 +2654,52 @@ fn same_ranked_page(
     Ok(())
 }
 
+/// Record that a disk window ran `total_hits: none` without the
+/// [`probe_withoutcount`] probe, and why ([`QuerySet::withoutcount_probe_plan`]).
+pub fn record_withoutcount_probe_skipped(meta: &mut Value, reason: &str) {
+    meta["total_hits"]["withoutcount_probe"] = json!({"skipped": reason});
+}
+
+/// Record what a fetch run returned, and the request/command that asked for
+/// it. `fetch` `None` records `null` (ids only) for a disk window, so the
+/// pair always states it; other ids-only results are left as before.
+pub fn record_fetch(
+    meta: &mut Value,
+    engine: &str,
+    fetch: Option<&[String]>,
+    hits: u64,
+    bytes: u64,
+) -> Result<(), String> {
+    let Some(fields) = fetch else {
+        if meta["compound"]["suite"] == crate::msmarco::disk_queries::SUITE {
+            meta["fetch"] = Value::Null;
+        }
+        return Ok(());
+    };
+    meta["fetch"] = json!({
+        "fields": fields,
+        "hits": hits,
+        "bytes": bytes,
+        "checked": "every hit of every reply returned exactly these fields, each a string",
+    });
+    match engine {
+        "opensearch" => meta["engine_settings"]["request"]["_source"] = opensearch_source(fetch),
+        "redis" => {
+            let command = meta["engine_settings"]["command"]
+                .as_str()
+                .ok_or("fulltext: Redis engine_settings has no command")?
+                .replacen(
+                    "NOCONTENT",
+                    &format!("RETURN {} {}", fields.len(), fields.join(" ")),
+                    1,
+                );
+            meta["engine_settings"]["command"] = json!(command);
+        }
+        other => return Err(format!("fulltext: engine '{other}' has no fetch")),
+    }
+    Ok(())
+}
+
 /// Record the [`probe_withoutcount`] outcome under `total_hits`.
 pub fn record_withoutcount_probe(meta: &mut Value, probe: &WithoutCountProbe) {
     meta["total_hits"]["withoutcount_probe"] = json!({
@@ -2078,7 +2716,7 @@ pub fn opensearch_ranked_page(
     top: usize,
     keep_hits: bool,
 ) -> Result<RankedPage, String> {
-    opensearch_page_checked(body, top, keep_hits, None)
+    opensearch_page_checked(body, top, keep_hits, None, None)
 }
 
 /// [`opensearch_ranked_page`] for a request sent with `total`. The reply must
@@ -2090,7 +2728,20 @@ pub fn opensearch_ranked_page_with(
     keep_hits: bool,
     total: TotalHits,
 ) -> Result<RankedPage, String> {
-    opensearch_page_checked(body, top, keep_hits, Some(total))
+    opensearch_page_checked(body, top, keep_hits, Some(total), None)
+}
+
+/// [`opensearch_ranked_page_with`] for a request sent with `fetch`
+/// ([`query_opensearch_fetch`]): every hit's `_source` must hold exactly those
+/// fields as strings; without `fetch`, `_source` must be absent.
+pub fn opensearch_ranked_page_fetch(
+    body: &Value,
+    top: usize,
+    keep_hits: bool,
+    total: TotalHits,
+    fetch: Option<&[String]>,
+) -> Result<RankedPage, String> {
+    opensearch_page_checked(body, top, keep_hits, Some(total), fetch)
 }
 
 fn opensearch_page_checked(
@@ -2098,6 +2749,7 @@ fn opensearch_page_checked(
     top: usize,
     keep_hits: bool,
     expect: Option<TotalHits>,
+    fetch: Option<&[String]>,
 ) -> Result<RankedPage, String> {
     match expect {
         Some(TotalHits::Exact) if body["hits"]["total"]["relation"] != "eq" => {
@@ -2131,7 +2783,23 @@ fn opensearch_page_checked(
     let mut seen = HashSet::new();
     let mut rank = RankCheck::default();
     let mut hits = keep_hits.then(|| Vec::with_capacity(results.len()));
+    let mut fetched_bytes = 0u64;
     for h in results {
+        let source = match h.get("_source") {
+            None => None,
+            Some(Value::Object(o)) => Some(
+                o.iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str().map(str::len)))
+                    .collect::<Vec<_>>(),
+            ),
+            Some(_) => return Err("fulltext: OpenSearch _source is not an object".into()),
+        };
+        // An ids-only request must not carry `_source` at all (an empty
+        // object would mean the request asked for a source).
+        if fetch.is_none() && h.get("_source").is_some() {
+            return Err("fulltext: OpenSearch returned _source for an ids-only request".into());
+        }
+        fetched_bytes += check_fetched(fetch, source, "OpenSearch")?;
         let id = h["_id"]
             .as_str()
             .or_else(|| h["fields"]["_id"][0].as_str())
@@ -2155,6 +2823,7 @@ fn opensearch_page_checked(
         total,
         returned: results.len(),
         hits,
+        fetched_bytes,
     })
 }
 
@@ -2246,7 +2915,53 @@ pub fn result_metadata_for(
     recorded_marker: &Value,
 ) -> Result<Value, String> {
     let mut m = result_metadata_english(engine, fields, set, top)?;
-    if set.queries.iter().any(|q| q.compound.is_some()) {
+    if let Some(w) = &set.window {
+        // A disk window can hold a million queries: the result records the
+        // window and the SHA-256 of exactly the timed queries served, not the
+        // queries themselves (they are lines of the recorded family file).
+        use sha2::{Digest, Sha256};
+        let hex = |b: &[u8]| -> String {
+            Sha256::digest(b)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let timed: Vec<_> = set.queries[w.timed_from..]
+            .iter()
+            .map(|q| (q.query_id, q.compound.as_ref()))
+            .collect();
+        let served = hex(&serde_json::to_vec(&timed).map_err(|e| e.to_string())?);
+        let scoring_contract = "native-engine-scoring-v1";
+        let mut identity = json!({"scoring_contract":scoring_contract,"window":w.record,
+            "served_sha256":served});
+        if profile.scalar_indexing.is_reduced() {
+            identity["scalar_indexing"] = json!(profile.scalar_indexing);
+        }
+        let sha = hex(&serde_json::to_vec(&identity).map_err(|e| e.to_string())?);
+        m["compound"] = json!({"version":2,"suite":crate::msmarco::disk_queries::SUITE,
+            "family":w.family.name(),"scoring_contract":scoring_contract,"window":w.record,
+            "served_sha256":served,"sha256":sha,"preparation_sha256":set.preparation_sha256,
+            "exact_counts":true,"scalar_indexing":profile.scalar_indexing,
+            "ordering":"engine score descending; ties unspecified; cross-engine ranks are not relevance truth"});
+        m["query_source"] = json!(format!(
+            "{} family file; query_id is its line (compound.window)",
+            crate::msmarco::disk_queries::SUITE
+        ));
+        m["queries_total"] = json!(set.queries.len() - w.timed_from);
+        m["queries_eligible"] = json!(set.queries.len() - w.timed_from);
+        m["operator"] = json!("explicit Boolean AST");
+        m["boosts_applied"] = json!("unit boosts; no field reweighting");
+        m["query_terms"] = json!({"method":"one validated field-scoped ASCII term per text leaf; exact Boolean AST retained"});
+        m["engine_settings"]["query"] =
+            json!("explicit Boolean AST; engine translation of the family file's lines");
+        if engine == "opensearch" {
+            m["engine_settings"]["scalar_context"] =
+                json!("bool.filter; no scalar score contribution");
+        } else if engine == "redis" {
+            m["engine_settings"]["scalar_context"] =
+                json!("native BM25STD; TAG/nontext iterator contributions may be nonzero");
+        }
+    } else if set.queries.iter().any(|q| q.compound.is_some()) {
         use sha2::{Digest, Sha256};
         let queries: Vec<_> = set
             .queries
@@ -2368,6 +3083,13 @@ pub fn record_total_hits(
         "sent": sent,
         "server_total": server_total,
     });
+    if meta["compound"]["suite"] == crate::msmarco::disk_queries::SUITE {
+        meta["compound"]["count_check"] = json!(match plan.mode {
+            TotalHits::Exact => "every reply's exact total equals the query's expected count",
+            TotalHits::None =>
+                "every reply's page length equals min(expected count, top); no total is computed",
+        });
+    }
     meta["total_hits_symmetric"] = json!(plan.symmetric);
     match engine {
         "opensearch" => {
@@ -4142,7 +4864,8 @@ mod tests {
         assert!(e.is_ok(), "{e:?}");
         // No query with more matches than the page: nothing can be shown.
         let e = probe_server(&matches, 3, true).unwrap_err();
-        assert!(e.contains("no query has more than 3 matches"), "{e}");
+        assert!(e.contains("has more than 3, so the probe cannot"), "{e}");
+        assert!(!e.contains("RediSearch before 8.4"), "{e}");
     }
 
     #[test]
@@ -4281,6 +5004,654 @@ mod tests {
                 }
             }
             assert!(n > 0, "{file}");
+        }
+    }
+
+    // ---- msmarco-disk-v1 and fetch -------------------------------------
+
+    fn disk_schema() -> Value {
+        json!({"docid":"keyword","url":"keyword","title":"text","segment":"text",
+               "category":"keyword","doc_len":"int"})
+    }
+
+    fn disk_block(family: &str, extra: Value) -> Value {
+        let mut b = json!({"analysis":"parity","fields":{"title":1.0,"segment":1.0},
+            "no_vector_index":true,"scalar_indexing":"text-tag-only",
+            "compound":{"suite":"msmarco-disk-v1","family":family}});
+        for (k, v) in extra.as_object().unwrap() {
+            if k == "offset" {
+                b["compound"]["offset"] = v.clone();
+            } else {
+                b[k] = v.clone();
+            }
+        }
+        b
+    }
+
+    fn disk_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        use crate::msmarco::disk_queries as dq;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("corpus");
+        dq::write_fixture_corpus(&dir, 3000, 4).unwrap();
+        dq::generate(
+            &dir,
+            &dq::GenerateOptions {
+                per_family: 100,
+                seed: 1,
+                min_per_family: 5,
+            },
+            &dir.join(dq::DIR),
+        )
+        .unwrap();
+        (tmp, dir)
+    }
+
+    #[test]
+    fn disk_suite_and_fetch_spec_rules() {
+        assert!(parse_spec(Some(&disk_block("rare-term", json!({})))).is_ok());
+        for (block, why) in [
+            (
+                disk_block(
+                    "rare-term",
+                    json!({"analysis":"english",
+                "scalar_indexing":"all"}),
+                ),
+                "parity",
+            ),
+            (disk_block("bogus", json!({})), "unknown"),
+            (
+                json!({"analysis":"parity","fields":{"segment":1.0},
+                "compound":{"suite":"msmarco-disk-v1"}}),
+                "family",
+            ),
+            (
+                json!({"analysis":"parity","fields":{"segment":1.0},
+                "compound":{"suite":"msmarco-v1","offset":3}}),
+                "offset",
+            ),
+            (
+                json!({"analysis":"parity","fields":{"segment":1.0},"total_hits":"none",
+                "compound":{"suite":"msmarco-v1"}}),
+                "none",
+            ),
+            (disk_block("rare-term", json!({"fetch":[]})), "at least one"),
+            (
+                disk_block("rare-term", json!({"fetch":["title","title"]})),
+                "twice",
+            ),
+            (
+                disk_block("rare-term", json!({"fetch":["vector"]})),
+                "vector",
+            ),
+            (
+                disk_block("rare-term", json!({"fetch":["a-b"]})),
+                "identifier",
+            ),
+        ] {
+            let e = parse_spec(Some(&block)).unwrap_err();
+            assert!(e.contains(why), "{block}: {e}");
+        }
+        // The disk suite may run without totals: every query has an exact count.
+        let none = parse_spec(Some(&disk_block("docid-eq", json!({"total_hits":"none"})))).unwrap();
+        assert_eq!(
+            total_hits_plan("redis", &none).unwrap().mode,
+            TotalHits::None
+        );
+        let schema = disk_schema();
+        let fetch = |f: Value| {
+            resolve_fetch(
+                &parse_spec(Some(&disk_block("rare-term", json!({"fetch": f})))).unwrap(),
+                Some(&schema),
+            )
+        };
+        assert_eq!(
+            fetch(json!(["title", "segment", "url"])).unwrap().unwrap(),
+            ["title", "segment", "url"]
+        );
+        assert!(fetch(json!(["doc_len"])).unwrap_err().contains("text"));
+        assert!(fetch(json!(["missing"])).is_err());
+        assert_eq!(
+            resolve_fetch(&FulltextSpec::default(), Some(&schema)).unwrap(),
+            None
+        );
+        let rrf = parse_spec(Some(&json!({"fetch":["title"]}))).unwrap();
+        assert!(crate::hybrid_rrf::check_text_spec(&rrf)
+            .unwrap_err()
+            .contains("fetch"));
+    }
+
+    #[test]
+    fn fetch_requests_replace_ids_only_and_leave_it_unchanged_otherwise() {
+        let f: Vec<String> = ["title", "segment", "url"].map(String::from).to_vec();
+        for analysis in [Analysis::English, Analysis::Parity] {
+            for mode in [TotalHits::Exact, TotalHits::None] {
+                assert_eq!(
+                    redis_args_fetch("i", "q", 10, 5, analysis, mode, None),
+                    redis_args_with("i", "q", 10, 5, analysis, mode)
+                );
+            }
+        }
+        assert_eq!(
+            redis_args_fetch("i", "q", 10, 5, Analysis::Parity, TotalHits::None, Some(&f)),
+            [
+                "i",
+                "q",
+                "RETURN",
+                "3",
+                "title",
+                "segment",
+                "url",
+                "VERBATIM",
+                "WITHSCORES",
+                "SCORER",
+                "BM25STD",
+                "LIMIT",
+                "0",
+                "10",
+                "DIALECT",
+                "2",
+                "TIMEOUT",
+                "5",
+                "WITHOUTCOUNT"
+            ]
+        );
+        assert!(!redis_args_fetch(
+            "i",
+            "q",
+            10,
+            5,
+            Analysis::English,
+            TotalHits::Exact,
+            Some(&f)
+        )
+        .contains(&"NOCONTENT".to_string()));
+        let q = TextQuery {
+            query_id: 0,
+            terms: vec!["x".into()],
+            expression: None,
+            compound: None,
+        };
+        let fields = [FieldBoost {
+            field: "title".into(),
+            boost: 1.0,
+        }];
+        for mode in [TotalHits::Exact, TotalHits::None] {
+            assert_eq!(
+                query_opensearch_fetch(&fields, &q, 10, mode, None),
+                query_opensearch_with(&fields, &q, 10, mode)
+            );
+            assert_eq!(
+                query_opensearch_fetch(&fields, &q, 10, mode, Some(&f))["_source"],
+                json!({"includes":["title","segment","url"]})
+            );
+        }
+    }
+
+    #[test]
+    fn fetched_fields_are_checked_on_every_hit() {
+        use redis::Value as V;
+        let f: Vec<String> = ["title", "url"].map(String::from).to_vec();
+        let s = |x: &str| V::BulkString(x.as_bytes().to_vec());
+        let hit = |id: &str, attrs: Option<Vec<(&str, V)>>| {
+            let mut m = vec![(s("id"), s(id)), (s("score"), V::Double(1.0))];
+            if let Some(a) = attrs {
+                m.push((
+                    s("extra_attributes"),
+                    V::Map(a.into_iter().map(|(k, v)| (s(k), v)).collect()),
+                ));
+            }
+            V::Map(m)
+        };
+        let reply = |hits: Vec<V>| {
+            V::Map(vec![
+                (s("warning"), V::Array(vec![])),
+                (s("total_results"), V::Int(hits.len() as i64)),
+                (s("results"), V::Array(hits)),
+            ])
+        };
+        let ok = reply(vec![hit(
+            "k:1",
+            Some(vec![("title", s("ab")), ("url", s("http://c"))]),
+        )]);
+        let page = redis_ranked_page_fetch(&ok, 10, false, TotalHits::Exact, Some(&f)).unwrap();
+        assert_eq!(page.fetched_bytes, 10);
+        for (bad, why) in [
+            (
+                reply(vec![hit("k:1", Some(vec![("title", s("ab"))]))]),
+                "missing",
+            ),
+            (
+                reply(vec![hit(
+                    "k:1",
+                    Some(vec![("title", s("a")), ("url", s("u")), ("vector", s("v"))]),
+                )]),
+                "did not ask",
+            ),
+            (
+                reply(vec![hit(
+                    "k:1",
+                    Some(vec![("title", V::Int(1)), ("url", s("u"))]),
+                )]),
+                "non-string",
+            ),
+            (reply(vec![hit("k:1", None)]), "missing"),
+        ] {
+            let e =
+                redis_ranked_page_fetch(&bad, 10, false, TotalHits::Exact, Some(&f)).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
+        // Ids only: no document fields at all.
+        assert!(redis_ranked_page_with(&ok, 10, false, TotalHits::Exact)
+            .unwrap_err()
+            .contains("ids-only"));
+        let ids = reply(vec![hit("k:1", None)]);
+        assert_eq!(
+            redis_ranked_page_with(&ids, 10, false, TotalHits::Exact)
+                .unwrap()
+                .fetched_bytes,
+            0
+        );
+        let os = |source: Option<Value>| {
+            let mut h = json!({"_id":"1","_score":1.0});
+            if let Some(src) = source {
+                h["_source"] = src;
+            }
+            json!({"timed_out":false,"_shards":{"failed":0},
+                "hits":{"total":{"value":1,"relation":"eq"},"hits":[h]}})
+        };
+        let good = os(Some(json!({"title":"ab","url":"http://c"})));
+        assert_eq!(
+            opensearch_ranked_page_fetch(&good, 10, false, TotalHits::Exact, Some(&f))
+                .unwrap()
+                .fetched_bytes,
+            10
+        );
+        for bad in [
+            os(Some(json!({"title":"ab"}))),
+            os(Some(json!({"title":"ab","url":"u","segment":"s"}))),
+            os(Some(json!({"title":"ab","url":3}))),
+            os(None),
+        ] {
+            assert!(
+                opensearch_ranked_page_fetch(&bad, 10, false, TotalHits::Exact, Some(&f)).is_err()
+            );
+        }
+        assert!(
+            opensearch_ranked_page_with(&good, 10, false, TotalHits::Exact)
+                .unwrap_err()
+                .contains("ids-only")
+        );
+        assert!(opensearch_ranked_page_with(&os(None), 10, false, TotalHits::Exact).is_ok());
+        // Even an empty `_source` means the request asked for a source.
+        assert!(
+            opensearch_ranked_page_with(&os(Some(json!({}))), 10, false, TotalHits::Exact)
+                .unwrap_err()
+                .contains("ids-only")
+        );
+    }
+
+    #[test]
+    fn page_count_check_without_a_total_uses_the_exact_count() {
+        let q = |expected: Option<u64>| TextQuery {
+            query_id: 0,
+            terms: vec![],
+            expression: None,
+            compound: Some(crate::compound_text::Query {
+                name: "q".into(),
+                family: "rare-term".into(),
+                conditions: json!({}),
+                expected_count: expected,
+                minimum_count: 1,
+            }),
+        };
+        assert!(check_query_page(&q(Some(3)), None, 3, 10).is_ok());
+        assert!(check_query_page(&q(Some(3)), None, 2, 10).is_err());
+        assert!(check_query_page(&q(Some(30)), None, 10, 10).is_ok());
+        assert!(check_query_page(&q(Some(30)), None, 9, 10).is_err());
+        assert!(check_query_page(&q(None), None, 3, 10).is_err());
+        assert!(check_query_page(&q(Some(3)), Some(3), 3, 10).is_ok());
+        assert!(check_query_page(&q(Some(3)), Some(4), 3, 10).is_err());
+        // Ranked BM25 has no count contract.
+        let ranked = TextQuery {
+            query_id: 0,
+            terms: vec!["x".into()],
+            expression: None,
+            compound: None,
+        };
+        assert!(check_query_page(&ranked, None, 0, 10).is_ok());
+    }
+
+    #[test]
+    fn disk_windows_dispatch_once_probe_off_the_window_and_record_identity() {
+        use crate::msmarco::disk_queries as dq;
+        let (_tmp, dir) = disk_fixture();
+        let schema = disk_schema();
+        let load = |family: &str, extra: Value, top: usize, n: i64| {
+            load_query_set_for(
+                &dir,
+                &parse_spec(Some(&disk_block(family, extra))).unwrap(),
+                Some(&schema),
+                top,
+                n,
+            )
+        };
+        let set = load("rare-term", json!({"offset":3}), 10, 7).unwrap();
+        let w = set.window.as_ref().unwrap();
+        assert_eq!(set.queries.len(), dq::RESERVED + 7);
+        assert_eq!(set.prime_index(), 0);
+        assert_eq!(set.queries[0].query_id, 0);
+        let order = set.dispatch_order(7).unwrap();
+        assert_eq!(order, (dq::RESERVED..dq::RESERVED + 7).collect::<Vec<_>>());
+        let ids: Vec<usize> = order.iter().map(|&i| set.queries[i].query_id).collect();
+        assert_eq!(
+            ids,
+            (dq::RESERVED + 3..dq::RESERVED + 10).collect::<Vec<_>>()
+        );
+        // Never more, never cycling.
+        assert!(set.dispatch_order(8).is_err());
+        assert!(set.dispatch_order(-1).is_ok());
+        // The probe never touches a timed query. (The whole pool: the reserve
+        // took the highest counts, so a short window may need no probe.)
+        let whole = load("two-rare-terms", json!({}), 1, -1).unwrap();
+        match whole.withoutcount_probe_plan(1) {
+            ProbePlan::Run(p) => assert!(p.iter().all(|&i| i > 0 && i < w.timed_from)),
+            other => panic!("{other:?}"),
+        }
+        let docids = load("docid-eq", json!({}), 10, 5).unwrap();
+        assert_eq!(
+            docids.withoutcount_probe_plan(10),
+            ProbePlan::NotNeeded(PROBE_NOT_NEEDED)
+        );
+        // Legacy query sets keep the legacy schedule.
+        let legacy = build_query_set(&["a b".to_string(), "c".to_string()]).unwrap();
+        assert_eq!(legacy.dispatch_order(5).unwrap(), vec![0, 1, 0, 1, 0]);
+        // Result identity: no query list, one family, the window and a
+        // served-queries hash that changes with the window.
+        let profile = index_profile([(
+            Workload::Fulltext,
+            Some(&disk_block("rare-term", json!({}))),
+        )])
+        .unwrap()
+        .unwrap();
+        let fields = resolve_fields(
+            &parse_spec(Some(&disk_block("rare-term", json!({})))).unwrap(),
+            Some(&schema),
+        )
+        .unwrap();
+        let meta = |set: &QuerySet| {
+            result_metadata_for("redis", &fields, set, 10, &profile, &profile.marker()).unwrap()
+        };
+        let m = meta(&set);
+        assert!(m["compound"].get("queries").is_none());
+        assert_eq!(m["compound"]["family"], "rare-term");
+        assert_eq!(m["compound"]["window"]["offset"], 3);
+        assert_eq!(m["compound"]["window"]["first_line"], dq::RESERVED + 3);
+        assert_eq!(
+            m["compound"]["preparation_sha256"],
+            json!(dq::preparation_sha256(&dir).unwrap())
+        );
+        let id = crate::results_dump::CompoundIdentity::from_metadata(Some(&m))
+            .unwrap()
+            .unwrap();
+        let shifted = meta(&load("rare-term", json!({"offset":4}), 10, 7).unwrap());
+        assert_ne!(shifted["compound"]["sha256"], m["compound"]["sha256"]);
+        assert_ne!(
+            shifted["compound"]["served_sha256"],
+            m["compound"]["served_sha256"]
+        );
+        assert_eq!(
+            meta(&load("rare-term", json!({"offset":3}), 10, 7).unwrap())["compound"]["sha256"],
+            json!(id.query_sha256)
+        );
+        // deep-fetch is the top-100 fetch, nothing else.
+        assert!(load("deep-fetch", json!({}), 10, 5)
+            .unwrap_err()
+            .contains("deep-fetch"));
+        assert!(load("deep-fetch", json!({}), 100, 5)
+            .unwrap_err()
+            .contains("fetch"));
+        assert!(load(
+            "deep-fetch",
+            json!({"fetch":["title","segment","url"]}),
+            100,
+            5
+        )
+        .is_ok());
+        // The legacy loader refuses the per-window suite.
+        assert!(load_query_set(
+            &dir,
+            &parse_spec(Some(&disk_block("rare-term", json!({})))).unwrap(),
+            Some(&schema)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn disk_none_refuses_before_connecting_when_the_reserve_cannot_prove_the_probe() {
+        use crate::msmarco::disk_queries as dq;
+        let (_tmp, dir) = disk_fixture();
+        let schema = disk_schema();
+        // The generator's reserve covers every top below the timed maximum,
+        // for every family, so `none` loads and the probe has truncated
+        // pages to compare.
+        for family in dq::Family::ALL {
+            let fetch = family == dq::Family::DeepFetch;
+            let mut extra = json!({"total_hits":"none"});
+            if fetch {
+                extra["fetch"] = json!(["title", "segment", "url"]);
+            }
+            let spec = parse_spec(Some(&disk_block(family.name(), extra))).unwrap();
+            let tops: Vec<usize> = if fetch { vec![100] } else { vec![1, 2, 5, 10] };
+            for top in tops {
+                let set = load_query_set_for(&dir, &spec, Some(&schema), top, 50).unwrap();
+                let w = set.window.as_ref().unwrap();
+                let count = |q: &TextQuery| q.compound.as_ref().unwrap().expected_count.unwrap();
+                if set.queries[w.timed_from..]
+                    .iter()
+                    .any(|q| count(q) > top as u64)
+                {
+                    assert!(
+                        set.queries[1..w.timed_from]
+                            .iter()
+                            .any(|q| count(q) > top as u64),
+                        "{family:?} top {top}"
+                    );
+                }
+            }
+        }
+        // A window whose timed queries are cut by the page but whose reserve
+        // is not (a uniform reserve over a typically-1 family): refused with
+        // the family, top and seed, instead of after deployment by the probe.
+        let spec = parse_spec(Some(&disk_block("url-eq", json!({"total_hits":"none"})))).unwrap();
+        let mut set = load_query_set_for(&dir, &spec, Some(&schema), 1, 50).unwrap();
+        let timed_from = set.window.as_ref().unwrap().timed_from;
+        for (i, q) in set.queries.iter_mut().enumerate() {
+            let c = q.compound.as_mut().unwrap();
+            c.expected_count = Some(if i == timed_from + 3 { 37 } else { 1 });
+        }
+        let e = set.check_probe_reserve(10).unwrap_err();
+        assert!(
+            e.contains("url-eq") && e.contains("seed 1") && e.contains("`top` 10"),
+            "{e}"
+        );
+        assert!(!e.contains("RediSearch before 8.4"), "{e}");
+        // A reserve line over `top` is enough; and no timed query over
+        // `top` needs no probe at all.
+        set.queries[2].compound.as_mut().unwrap().expected_count = Some(11);
+        assert!(set.check_probe_reserve(10).is_ok());
+        set.queries[2].compound.as_mut().unwrap().expected_count = Some(1);
+        assert!(set.check_probe_reserve(37).is_ok());
+        // Legacy sets have no reserve to check.
+        let legacy = build_query_set(&["a b".to_string()]).unwrap();
+        assert!(legacy.check_probe_reserve(1).is_ok());
+    }
+
+    #[test]
+    fn disk_windows_of_one_config_never_overlap_and_never_repeat() {
+        let (_tmp, dir) = disk_fixture();
+        let schema = disk_schema();
+        let a = disk_block("rare-term", json!({"offset":0}));
+        let b = disk_block("rare-term", json!({"offset":10}));
+        let c = disk_block("url-eq", json!({"offset":0}));
+        let check = |blocks: Vec<(&Value, usize)>, n: i64| {
+            check_compound_before_connecting(
+                &dir,
+                blocks.into_iter().map(|(v, t)| (Some(v), t)),
+                Some(&schema),
+                n,
+            )
+        };
+        assert!(check(vec![(&a, 10), (&b, 10), (&c, 10)], 10).is_ok());
+        let e = check(vec![(&a, 10), (&b, 10)], 11).unwrap_err();
+        assert!(e.contains("overlapping"), "{e}");
+        // `--queries -1` runs the rest of the pool from each offset.
+        assert!(check(vec![(&a, 10), (&b, 10)], -1).is_err());
+        assert!(check(vec![(&a, 10)], 100_000)
+            .unwrap_err()
+            .contains("never repeated"));
+        assert!(check_disk_repetitions([Some(&a)].into_iter(), 3)
+            .unwrap_err()
+            .contains("--repetitions"));
+        assert!(check_disk_repetitions([Some(&a)].into_iter(), 1).is_ok());
+        let legacy = json!({"analysis":"parity","fields":{"segment":1.0},
+            "compound":{"suite":"msmarco-v1"}});
+        assert!(check_disk_repetitions([Some(&legacy)].into_iter(), 3).is_ok());
+    }
+
+    #[test]
+    fn disk_windows_never_overlap_across_engine_configs_of_one_engine() {
+        let (_tmp, dir) = disk_fixture();
+        let schema = disk_schema();
+        let a = disk_block("rare-term", json!({"offset":0}));
+        let b = disk_block("rare-term", json!({"offset":10}));
+        let other = disk_block("url-eq", json!({"offset":0}));
+        let legacy = json!({"analysis":"parity","fields":{"segment":1.0}});
+        let cfg =
+            |name: &'static str, engine: &'static str, blocks: Vec<&'static Value>| DiskConfig {
+                name,
+                engine_type: engine,
+                blocks: blocks.into_iter().map(|v| (Some(v), 10)).collect(),
+            };
+        let leak = |v: Value| -> &'static Value { Box::leak(Box::new(v)) };
+        let (a, b, other, legacy) = (leak(a), leak(b), leak(other), leak(legacy));
+        let ds = || {
+            Ok(vec![(
+                "msmarco-disk".to_string(),
+                dir.clone(),
+                Some(schema.clone()),
+            )])
+        };
+        let check =
+            |configs: &[DiskConfig<'_>], n: i64| check_disk_windows_across_configs(configs, ds, n);
+        // The finding: two Redis configs (e.g. differing only in `parallel`)
+        // on the same window — each config alone passes its own check.
+        let same = [
+            cfg("flex-p8", "redis", vec![a]),
+            cfg("flex-p16", "redis", vec![a]),
+        ];
+        for c in &same {
+            assert!(check_compound_before_connecting(
+                &dir,
+                c.blocks.iter().copied(),
+                Some(&schema),
+                10
+            )
+            .is_ok());
+        }
+        let e = check(&same, 10).unwrap_err();
+        assert!(
+            e.contains("'flex-p8' search config #0")
+                && e.contains("'flex-p16' search config #0")
+                && e.contains("redis on dataset 'msmarco-disk'")
+                && e.contains("overlapping"),
+            "{e}"
+        );
+        // Overlap through `--queries`, and the index of a later search config.
+        let e = check(
+            &[
+                cfg("p8", "redis", vec![b]),
+                cfg("p16", "redis", vec![legacy, a]),
+            ],
+            11,
+        )
+        .unwrap_err();
+        assert!(e.contains("'p16' search config #1"), "{e}");
+        // Disjoint windows, another family, or another engine type share
+        // nothing; Redis vs OpenSearch on one window is the comparison itself.
+        assert!(check(
+            &[cfg("p8", "redis", vec![a]), cfg("p16", "redis", vec![b])],
+            10
+        )
+        .is_ok());
+        assert!(check(
+            &[
+                cfg("p8", "redis", vec![a]),
+                cfg("p16", "redis", vec![other])
+            ],
+            10
+        )
+        .is_ok());
+        assert!(check(
+            &[
+                cfg("flex", "redis", vec![a]),
+                cfg("os", "opensearch", vec![a])
+            ],
+            10
+        )
+        .is_ok());
+        // Configs without a disk-suite block never load a dataset.
+        assert!(check_disk_windows_across_configs(
+            &[
+                cfg("x", "redis", vec![legacy]),
+                cfg("y", "redis", vec![legacy])
+            ],
+            || Err("datasets must not be resolved".into()),
+            10
+        )
+        .is_ok());
+        // A window that does not load is left to its own per-config check.
+        assert!(check(&same, 100_000).is_ok());
+    }
+
+    #[test]
+    fn fetch_and_count_check_are_recorded_for_both_engines() {
+        let f: Vec<String> = ["title", "segment", "url"].map(String::from).to_vec();
+        let mut redis = json!({"compound":{"suite":"msmarco-disk-v1"},"engine_settings":{
+            "command":"FT.SEARCH <idx> <query> NOCONTENT VERBATIM WITHSCORES"}});
+        record_fetch(&mut redis, "redis", Some(&f), 4, 99).unwrap();
+        assert_eq!(
+            redis["engine_settings"]["command"],
+            "FT.SEARCH <idx> <query> RETURN 3 title segment url VERBATIM WITHSCORES"
+        );
+        assert_eq!(redis["fetch"]["bytes"], 99);
+        let mut os = json!({"compound":{"suite":"msmarco-disk-v1"},"engine_settings":{"request":{"_source":false}}});
+        record_fetch(&mut os, "opensearch", Some(&f), 4, 99).unwrap();
+        assert_eq!(
+            os["engine_settings"]["request"]["_source"]["includes"],
+            json!(f)
+        );
+        let mut ids = json!({"compound":{"suite":"msmarco-disk-v1"}});
+        record_fetch(&mut ids, "opensearch", None, 0, 0).unwrap();
+        assert!(ids.get("fetch").is_some_and(Value::is_null));
+        let mut legacy = json!({});
+        record_fetch(&mut legacy, "redis", None, 0, 0).unwrap();
+        assert!(legacy.get("fetch").is_none());
+        for (mode, want) in [
+            (TotalHits::Exact, "exact total"),
+            (TotalHits::None, "page length"),
+        ] {
+            let mut m = json!({"compound":{"suite":"msmarco-disk-v1"},
+                "engine_settings":{"command":"FT.SEARCH x"}});
+            let plan = TotalHitsPlan {
+                mode,
+                declared: true,
+                symmetric: true,
+            };
+            record_total_hits(&mut m, "redis", &plan).unwrap();
+            assert!(m["compound"]["count_check"]
+                .as_str()
+                .unwrap()
+                .contains(want));
         }
     }
 }

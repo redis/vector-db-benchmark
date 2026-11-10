@@ -158,6 +158,12 @@ pub fn check_text_spec(spec: &FulltextSpec) -> Result<(), String> {
                 .into(),
         );
     }
+    if spec.fetch.is_some() {
+        return Err(
+            "hybrid-rrf refuses `fulltext.fetch`: its requests return ids only on both engines"
+                .into(),
+        );
+    }
     if spec.allow_multi_shard {
         return Err(
             "hybrid-rrf refuses `fulltext.allow_multi_shard`: each shard keeps its own top W \
@@ -448,6 +454,7 @@ impl QuerySet {
             preparation_sha256: None,
             skipped: self.skipped.clone(),
             total: self.total,
+            window: None,
         }
     }
 }

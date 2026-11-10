@@ -2945,3 +2945,47 @@ fn test_binary_opensearch_text_tag_mapping_and_reuse() {
         .unwrap();
     std::fs::remove_dir_all(&proj.root).ok();
 }
+
+/// msmarco-disk-v1 on OpenSearch: the same queries, fields and checks as
+/// the Redis test (`common::assert_disk_run`).
+#[test]
+fn test_binary_opensearch_disk_suite_families_fetch_and_windows() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{"name":"os-disk","engine":"opensearch",
+        "collection_params":{"number_of_shards":1},"upload_params":{"parallel":1},
+        "search_params":common::disk_search_params()}]);
+    let proj = common::write_disk_project(&configs.to_string());
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    let env = [
+        ("OPENSEARCH_PORT", port.as_str()),
+        ("OPENSEARCH_INDEX", "bench_disk"),
+    ];
+    let dump = proj.root.join("disk-dumps");
+    let n = common::DISK_QUERIES.to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        "os-disk",
+        common::DISK_DATASET,
+        "http://127.0.0.1",
+        &env,
+        &[
+            "--queries",
+            n.as_str(),
+            "--repetitions",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    common::assert_disk_run(&proj.root, "opensearch", "os-disk", &dump);
+    reqwest::blocking::Client::new()
+        .delete(format!("{}/bench_disk", os_base_url()))
+        .send()
+        .ok();
+    std::fs::remove_dir_all(&proj.root).ok();
+}

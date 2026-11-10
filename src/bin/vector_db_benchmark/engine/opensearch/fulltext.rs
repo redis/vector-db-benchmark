@@ -2,7 +2,7 @@
 //! analyzer, the request, the reply contract, the index checks and the result
 //! metadata all come from `vector_db_benchmark::fulltext`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use opensearch::indices::{IndicesGetMappingParts, IndicesGetSettingsParts};
@@ -160,6 +160,8 @@ impl OpenSearchEngine {
             }
         }
         let fields = fulltext::resolve_fields(&spec, dataset.config.schema.as_ref())?;
+        let fetch = fulltext::resolve_fetch(&spec, dataset.config.schema.as_ref())?;
+        let fetch = fetch.as_deref();
         // The live index must have every searched field, as pinned. Refused
         // before the timed window, never searched anyway.
         let profile = self
@@ -172,8 +174,17 @@ impl OpenSearchEngine {
             &fulltext::schema_text_fields(dataset.config.schema.as_ref()),
         )?;
 
-        let set =
-            fulltext::load_query_set(&dataset.get_path()?, &spec, dataset.config.schema.as_ref())?;
+        let top = params
+            .top
+            .map(|t| t as usize)
+            .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT);
+        let set = fulltext::load_query_set_for(
+            &dataset.get_path()?,
+            &spec,
+            dataset.config.schema.as_ref(),
+            top,
+            num_queries,
+        )?;
         if !set.skipped.is_empty() {
             eprintln!(
                 "\tfulltext: {} of {} queries have no searchable term and are skipped",
@@ -181,25 +192,24 @@ impl OpenSearchEngine {
                 set.total
             );
         }
-        let top = params
-            .top
-            .map(|t| t as usize)
-            .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT);
         // Serialized outside the timed window, as on the KNN path.
         let bodies: Vec<Box<serde_json::value::RawValue>> = set
             .queries
             .iter()
             .map(|q| {
-                serde_json::value::to_raw_value(&fulltext::query_opensearch_with(
+                serde_json::value::to_raw_value(&fulltext::query_opensearch_fetch(
                     &fields,
                     q,
                     top,
                     total_hits.mode,
+                    fetch,
                 ))
                 .map_err(|e| e.to_string())
             })
             .collect::<Result<_, _>>()?;
-        let order = fulltext::schedule(bodies.len(), num_queries);
+        let order = set.dispatch_order(num_queries)?;
+        let prime = set.prime_index();
+        let (fetched_hits, fetched_bytes) = (AtomicU64::new(0), AtomicU64::new(0));
         let num_to_run = order.len();
         let parallel = params.parallel.unwrap_or(1).max(1) as usize;
         let capture = params.capture_query_results;
@@ -220,6 +230,7 @@ impl OpenSearchEngine {
                 let (base_url, index_name) = (&base_url, &index_name);
                 let (bodies, order, queries, next, pb) =
                     (&bodies, &order, &set.queries, &next, &pb);
+                let (fetched_hits, fetched_bytes) = (&fetched_hits, &fetched_bytes);
                 pool.spawn(move |ticket| -> WorkerOut {
                     let (mut samples, mut errs, mut cap) = (Vec::new(), Vec::new(), Vec::new());
                     let (mut retried, mut capture_error) = (0u64, None);
@@ -236,7 +247,7 @@ impl OpenSearchEngine {
                         }
                     };
                     // Prime: the cold first round trip stays out of the window.
-                    let _ = knn_send(&rt, &client, index_name, &bodies[0], policy);
+                    let _ = knn_send(&rt, &client, index_name, &bodies[prime], policy);
                     if ticket.arrive_and_wait().is_none() {
                         return (samples, errs, retried, cap, capture_error);
                     }
@@ -252,14 +263,19 @@ impl OpenSearchEngine {
                         let reply = knn_send(&rt, &client, index_name, &bodies[i], policy);
                         let elapsed = start.elapsed();
                         match reply.and_then(|(body, cost)| {
-                            fulltext::opensearch_ranked_page_with(
+                            fulltext::opensearch_ranked_page_fetch(
                                 &body,
                                 top,
                                 capture,
                                 total_hits.mode,
+                                fetch,
                             )
                             .and_then(|p| {
-                                fulltext::check_query_count(&queries[i], p.total)?;
+                                fulltext::check_query_page(&queries[i], p.total, p.returned, top)?;
+                                if fetch.is_some() {
+                                    fetched_hits.fetch_add(p.returned as u64, Ordering::Relaxed);
+                                    fetched_bytes.fetch_add(p.fetched_bytes, Ordering::Relaxed);
+                                }
                                 Ok((p, cost))
                             })
                         }) {
@@ -376,6 +392,13 @@ impl OpenSearchEngine {
             &recorded_marker,
         )?;
         fulltext::record_total_hits(&mut meta, "opensearch", &total_hits)?;
+        fulltext::record_fetch(
+            &mut meta,
+            "opensearch",
+            fetch,
+            fetched_hits.into_inner(),
+            fetched_bytes.into_inner(),
+        )?;
         meta["retried_queries"] = serde_json::json!(retried_queries);
         // Read back from the live index (`_settings`), not from the config.
         meta["number_of_shards"] = serde_json::json!(shards);
