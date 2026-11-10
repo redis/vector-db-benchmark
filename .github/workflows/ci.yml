@@ -76,7 +76,9 @@ jobs:
 
   test:
     name: Unit tests
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-latest (26.04 since Nov 2026) apt ships HDF5 1.14.6 and
+    # hdf5_reader::reads_a_deflate_compressed_train_dataset fails.
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
 
