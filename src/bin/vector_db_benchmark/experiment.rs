@@ -567,6 +567,57 @@ pub fn run(args: &Args) -> Result<(), String> {
     // readings, so one sweep never mixes the in-memory and streaming readers.
     let memory_snapshots =
         std::sync::Arc::new(vector_db_benchmark::upload_stream::MemorySnapshots::default());
+    let new_dataset = |config: &crate::config::DatasetConfig| {
+        Dataset::new(config.clone())
+            .with_upload_reader(args.upload_reader)
+            .with_memory_snapshots(memory_snapshots.clone())
+    };
+    // msmarco-disk-v1: two engine configs of one engine type must not run
+    // overlapping windows of one family on one dataset (the second would be
+    // served from the cache the first warmed). Checked across the whole
+    // invocation before any config connects; the per-config check in
+    // `run_single_experiment` only sees one config. Configs without a
+    // disk-suite block are not looked at.
+    {
+        let configs: Vec<vector_db_benchmark::fulltext::DiskConfig<'_>> = engines
+            .iter()
+            .map(|(name, config)| vector_db_benchmark::fulltext::DiskConfig {
+                name: name.as_str(),
+                engine_type: config.engine.as_deref().unwrap_or("unknown"),
+                blocks: config
+                    .search_params
+                    .iter()
+                    .flatten()
+                    .filter(|sp| sp.workload == Some(Workload::Fulltext))
+                    .map(|sp| {
+                        (
+                            sp.knob(vector_db_benchmark::fulltext::SPEC_KEY),
+                            sp.top
+                                .map(|t| t as usize)
+                                .unwrap_or(vector_db_benchmark::filter_only::DEFAULT_LIMIT),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        vector_db_benchmark::fulltext::check_disk_windows_across_configs(
+            &configs,
+            || {
+                // A dataset whose path cannot be resolved here fails in its
+                // own experiment, as before.
+                Ok(datasets
+                    .iter()
+                    .filter_map(|(name, config)| {
+                        let d = new_dataset(config);
+                        let path = d.get_path().ok()?;
+                        Some((name.to_string(), path, d.config.schema.clone()))
+                    })
+                    .collect())
+            },
+            args.queries,
+        )?;
+    }
+
     'experiments: for (engine_idx, (engine_name, engine_config)) in engines.iter().enumerate() {
         // With --reset-between-configs, only the LAST config keeps its data under
         // --keep-data; earlier configs tear down after finishing so at most one
@@ -619,9 +670,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                 println!("{}", "=".repeat(60));
             });
 
-            let dataset = Dataset::new((*dataset_config).clone())
-                .with_upload_reader(args.upload_reader)
-                .with_memory_snapshots(memory_snapshots.clone());
+            let dataset = new_dataset(dataset_config);
 
             dataset.require_workloads(&plan.workloads)?;
 

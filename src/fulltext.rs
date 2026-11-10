@@ -847,6 +847,28 @@ pub fn check_fields_before_connecting<'a>(
     Ok(())
 }
 
+/// `msmarco-disk-v1` windows already claimed in one invocation, so no two
+/// search configs run the same queries against one engine: within one engine
+/// config ([`check_compound_before_connecting`]) and across the engine configs
+/// of the invocation ([`check_disk_windows_across_configs`]).
+#[derive(Debug, Default)]
+pub struct DiskWindows {
+    claimed: Vec<ClaimedWindow>,
+}
+
+#[derive(Debug)]
+struct ClaimedWindow {
+    /// Engine type and dataset: the cache a window warms. `--host` is one per
+    /// invocation, so it is the same for every claim.
+    scope: String,
+    /// The engine config that claimed it (`None`: this engine config).
+    owner: Option<String>,
+    search_config: usize,
+    family: &'static str,
+    first: usize,
+    last: usize,
+}
+
 /// Validate/generate every compound request before engine creation/upload.
 /// `blocks` are each fulltext search config's block and result size `top`;
 /// `num_queries` is `--queries`. `msmarco-disk-v1` windows are loaded as the
@@ -858,7 +880,32 @@ pub fn check_compound_before_connecting<'a>(
     schema: Option<&Value>,
     num_queries: i64,
 ) -> Result<(), String> {
-    let mut windows: Vec<(usize, &'static str, usize, usize)> = Vec::new();
+    claim_compound_windows(
+        dir,
+        blocks,
+        schema,
+        num_queries,
+        &mut DiskWindows::default(),
+        "",
+        None,
+    )
+}
+
+/// [`check_compound_before_connecting`], recording each `msmarco-disk-v1`
+/// window in `claimed` under `scope` (engine type + dataset). A window of a
+/// family overlapping one already claimed in the same scope is refused,
+/// whether the earlier claim came from this engine config or (`owner` naming
+/// this one) from an earlier engine config of the invocation. Different
+/// scopes (a Redis and an OpenSearch config, two datasets) may share a window.
+pub fn claim_compound_windows<'a>(
+    dir: &Path,
+    blocks: impl Iterator<Item = (Option<&'a Value>, usize)>,
+    schema: Option<&Value>,
+    num_queries: i64,
+    claimed: &mut DiskWindows,
+    scope: &str,
+    owner: Option<&str>,
+) -> Result<(), String> {
     for (i, (block, top)) in blocks.enumerate() {
         let spec = parse_spec(block)?;
         if spec.compound.is_none() {
@@ -871,18 +918,110 @@ pub fn check_compound_before_connecting<'a>(
         let first = set.queries[w.timed_from].query_id;
         let last = set.queries[set.queries.len() - 1].query_id;
         let family = w.family.name();
-        if let Some((j, ..)) = windows
+        if let Some(c) = claimed
+            .claimed
             .iter()
-            .find(|(_, f, a, b)| *f == family && first <= *b && *a <= last)
+            .find(|c| c.scope == scope && c.family == family && first <= c.last && c.first <= last)
         {
+            let name = |o: Option<&str>, n: usize| match o {
+                Some(o) => format!("engine config '{o}' search config #{n}"),
+                None => format!("search config #{n}"),
+            };
+            let on = if scope.is_empty() {
+                String::new()
+            } else {
+                format!(" on {scope}")
+            };
             return Err(format!(
-                "fulltext search configs #{j} and #{i} both run {} family {family} over \
-                 overlapping lines (#{i}: {first}..={last}); give each its own \
-                 `compound.offset` range — a disk-bound window never repeats a query",
-                crate::msmarco::disk_queries::SUITE
+                "fulltext {} and {} both run {} family {family}{on} over overlapping lines \
+                 ({}..={} and {first}..={last}); give each its own `compound.offset` range: \
+                 a disk-bound window never repeats a query, and the second would be served \
+                 from the cache the first warmed",
+                name(c.owner.as_deref(), c.search_config),
+                name(owner, i),
+                crate::msmarco::disk_queries::SUITE,
+                c.first,
+                c.last,
             ));
         }
-        windows.push((i, family, first, last));
+        claimed.claimed.push(ClaimedWindow {
+            scope: scope.to_string(),
+            owner: owner.map(str::to_string),
+            search_config: i,
+            family,
+            first,
+            last,
+        });
+    }
+    Ok(())
+}
+
+/// One engine config's fulltext search blocks, for
+/// [`check_disk_windows_across_configs`].
+pub struct DiskConfig<'a> {
+    pub name: &'a str,
+    pub engine_type: &'a str,
+    /// Each fulltext search config's block and result size `top`.
+    pub blocks: Vec<(Option<&'a Value>, usize)>,
+}
+
+/// A dataset a [`DiskConfig`] runs on: name, directory, schema.
+pub type DiskDataset = (String, std::path::PathBuf, Option<Value>);
+
+/// Refuse, before any engine config of the invocation connects, two engine
+/// configs of one engine type that run overlapping `msmarco-disk-v1` windows
+/// of one family on one dataset: the second would serve the first's queries
+/// from the cache the first warmed (`--host` is one per invocation). Fewer
+/// than two configs with a disk-suite block (every existing config has none)
+/// returns before `datasets` is called. Only disk-suite blocks are claimed;
+/// each config's own check still validates all of its compound blocks.
+pub fn check_disk_windows_across_configs(
+    configs: &[DiskConfig<'_>],
+    datasets: impl FnOnce() -> Result<Vec<DiskDataset>, String>,
+    num_queries: i64,
+) -> Result<(), String> {
+    let is_disk = |b: Option<&Value>| parse_spec(b).is_ok_and(|s| is_disk_suite(&s));
+    let disk: Vec<&DiskConfig<'_>> = configs
+        .iter()
+        .filter(|c| c.blocks.iter().any(|&(b, _)| is_disk(b)))
+        .collect();
+    if disk.len() < 2 {
+        return Ok(());
+    }
+    let datasets = datasets()?;
+    let mut claimed = DiskWindows::default();
+    for c in disk {
+        // Non-disk blocks become `None` (no compound), keeping each block's
+        // search-config index for the message.
+        let blocks: Vec<(Option<&Value>, usize)> = c
+            .blocks
+            .iter()
+            .map(|&(b, top)| (b.filter(|b| is_disk(Some(b))), top))
+            .collect();
+        for (dataset, dir, schema) in &datasets {
+            // A pair whose windows do not load (a dataset without disk query
+            // files, a window past the end) is refused by its own per-config
+            // check when it runs, as before; it never runs a window here.
+            if check_compound_before_connecting(
+                dir,
+                blocks.iter().copied(),
+                schema.as_ref(),
+                num_queries,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            claim_compound_windows(
+                dir,
+                blocks.iter().copied(),
+                schema.as_ref(),
+                num_queries,
+                &mut claimed,
+                &format!("{} on dataset '{dataset}'", c.engine_type),
+                Some(c.name),
+            )?;
+        }
     }
     Ok(())
 }
@@ -5377,6 +5516,101 @@ mod tests {
         let legacy = json!({"analysis":"parity","fields":{"segment":1.0},
             "compound":{"suite":"msmarco-v1"}});
         assert!(check_disk_repetitions([Some(&legacy)].into_iter(), 3).is_ok());
+    }
+
+    #[test]
+    fn disk_windows_never_overlap_across_engine_configs_of_one_engine() {
+        let (_tmp, dir) = disk_fixture();
+        let schema = disk_schema();
+        let a = disk_block("rare-term", json!({"offset":0}));
+        let b = disk_block("rare-term", json!({"offset":10}));
+        let other = disk_block("url-eq", json!({"offset":0}));
+        let legacy = json!({"analysis":"parity","fields":{"segment":1.0}});
+        let cfg =
+            |name: &'static str, engine: &'static str, blocks: Vec<&'static Value>| DiskConfig {
+                name,
+                engine_type: engine,
+                blocks: blocks.into_iter().map(|v| (Some(v), 10)).collect(),
+            };
+        let leak = |v: Value| -> &'static Value { Box::leak(Box::new(v)) };
+        let (a, b, other, legacy) = (leak(a), leak(b), leak(other), leak(legacy));
+        let ds = || {
+            Ok(vec![(
+                "msmarco-disk".to_string(),
+                dir.clone(),
+                Some(schema.clone()),
+            )])
+        };
+        let check =
+            |configs: &[DiskConfig<'_>], n: i64| check_disk_windows_across_configs(configs, ds, n);
+        // The finding: two Redis configs (e.g. differing only in `parallel`)
+        // on the same window — each config alone passes its own check.
+        let same = [
+            cfg("flex-p8", "redis", vec![a]),
+            cfg("flex-p16", "redis", vec![a]),
+        ];
+        for c in &same {
+            assert!(check_compound_before_connecting(
+                &dir,
+                c.blocks.iter().copied(),
+                Some(&schema),
+                10
+            )
+            .is_ok());
+        }
+        let e = check(&same, 10).unwrap_err();
+        assert!(
+            e.contains("'flex-p8' search config #0")
+                && e.contains("'flex-p16' search config #0")
+                && e.contains("redis on dataset 'msmarco-disk'")
+                && e.contains("overlapping"),
+            "{e}"
+        );
+        // Overlap through `--queries`, and the index of a later search config.
+        let e = check(
+            &[
+                cfg("p8", "redis", vec![b]),
+                cfg("p16", "redis", vec![legacy, a]),
+            ],
+            11,
+        )
+        .unwrap_err();
+        assert!(e.contains("'p16' search config #1"), "{e}");
+        // Disjoint windows, another family, or another engine type share
+        // nothing; Redis vs OpenSearch on one window is the comparison itself.
+        assert!(check(
+            &[cfg("p8", "redis", vec![a]), cfg("p16", "redis", vec![b])],
+            10
+        )
+        .is_ok());
+        assert!(check(
+            &[
+                cfg("p8", "redis", vec![a]),
+                cfg("p16", "redis", vec![other])
+            ],
+            10
+        )
+        .is_ok());
+        assert!(check(
+            &[
+                cfg("flex", "redis", vec![a]),
+                cfg("os", "opensearch", vec![a])
+            ],
+            10
+        )
+        .is_ok());
+        // Configs without a disk-suite block never load a dataset.
+        assert!(check_disk_windows_across_configs(
+            &[
+                cfg("x", "redis", vec![legacy]),
+                cfg("y", "redis", vec![legacy])
+            ],
+            || Err("datasets must not be resolved".into()),
+            10
+        )
+        .is_ok());
+        // A window that does not load is left to its own per-config check.
+        assert!(check(&same, 100_000).is_ok());
     }
 
     #[test]

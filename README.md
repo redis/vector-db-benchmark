@@ -2643,9 +2643,13 @@ A search point selects one family and a window:
 - `compound.family` is required; `compound.offset` (default 0) is the first
   timed line of the family. `--queries N` runs lines `offset .. offset + N`
   once each (`--queries -1`: the rest of the family). A window past the end of
-  the family is refused before connecting — queries are never cycled — as are
-  overlapping windows of one family in one invocation and `--repetitions`
-  above 1. Windows across invocations are the caller's to keep disjoint;
+  the family is refused before connecting — queries are never cycled — as is
+  `--repetitions` above 1. So are overlapping windows of one family on one
+  dataset and one engine type anywhere in the invocation, before any engine
+  config connects: within one engine config, and across engine configs (two
+  `redis` configs that differ only in `parallel` cannot both run `offset: 0`;
+  a `redis` and an `opensearch` config can, and must, for the comparison).
+  Windows across invocations are the caller's to keep disjoint;
   each result records its window (`params.fulltext.compound.window`) and the
   SHA-256 of the queries it served.
 - The first line of each family file is the (untimed) prime query and the
