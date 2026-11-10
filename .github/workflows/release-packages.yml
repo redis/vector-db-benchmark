@@ -321,7 +321,10 @@ jobs:
     # refuse-if-exists / same-build skip / overwrite, RPMs before repodata)
     # against fake aws / deb-s3, on every run. No network, no credentials.
     name: Self-test the publish scripts
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-latest (26.04 since Nov 2026) rpm 6 prints `rpm -Kv` as
+    # "Header OpenPGP V4 ...: OK", which publish-yum.sh's signature check does
+    # not match, so the self-test reports the signed RPMs as not signed.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rpm createrepo-c dpkg-dev
