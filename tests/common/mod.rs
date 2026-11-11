@@ -5270,6 +5270,9 @@ pub fn assert_disk_duration_run(root: &Path, config: &str, dump: &Path) {
             + r["completed_after_deadline"].as_u64().unwrap(),
         dispatched as u64
     );
+    // Each of the 2 workers has at most one query in flight at the deadline:
+    // the end-to-end form of "nothing is dispatched after the deadline".
+    assert!(r["completed_after_deadline"].as_u64().unwrap() <= 2, "{r}");
     assert!(
         ft["fetch"]["hits"].as_u64().unwrap() >= dispatched as u64,
         "{ft}"
