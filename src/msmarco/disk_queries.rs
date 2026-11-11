@@ -22,7 +22,11 @@
 //! stopword) with ZERO ambiguous passages in the whole corpus under the
 //! [`text_match::classify`] rule, on the segment text as `analysis: parity`
 //! uploads it (whitespace normalized, no stemming on either engine). A term
-//! contained in any over-long ASCII run of the corpus is excluded too. So the
+//! contained in any over-long ASCII run of the corpus is excluded too, and so
+//! is any term [`text_match::redis_escape_terms`] names for any passage: a
+//! term next to, or joined by, a RediSearch backslash escape or control byte
+//! (`\ term` is the Redis token ` term`, `plant\n` the token `plantn`), whose
+//! Redis count the classifier cannot vouch for. So the
 //! number of passages each engine matches is the document frequency counted
 //! here, and every query carries that EXACT `expected_count`; the runner checks
 //! it on every reply (the total under `total_hits: exact`, the page length
@@ -79,8 +83,11 @@ pub const MANIFEST: &str = "manifest.json";
 /// changes. v2: the probe reserve holds the highest-count items
 /// ([`probe_layout`]); v1 files are refused. v3: a safe `url` / `docid`
 /// that is also a Redis tag piece of an unsafe value ([`redis_tag_pieces`])
-/// is never selected; v2 files are refused.
-pub const GENERATOR: &str = "vdb-msmarco-disk/v3";
+/// is never selected; v2 files are refused. v4: a term
+/// [`text_match::redis_escape_terms`] names for any passage (RediSearch
+/// backslash escapes and control bytes) is never selected, in any text
+/// family; v3 files are refused.
+pub const GENERATOR: &str = "vdb-msmarco-disk/v4";
 /// Domain of the seeded rank keys ([`rank_key`]). It stays at its first value
 /// while only the file layout changes, so the same items are selected.
 pub const KEY_DOMAIN: &str = "vdb-msmarco-disk/v1";
@@ -378,6 +385,8 @@ struct Scanned {
     /// (term, Yes?) for every term not `No` in this passage.
     terms: Vec<(String, bool)>,
     long_runs: Vec<String>,
+    /// [`text_match::redis_escape_terms`] of the passage.
+    escape_terms: Vec<String>,
 }
 
 fn scan_line(line: &str, row: usize) -> Result<Scanned, String> {
@@ -387,6 +396,8 @@ fn scan_line(line: &str, row: usize) -> Result<Scanned, String> {
     let mut verdicts = HashMap::new();
     let mut long_runs = Vec::new();
     text_match::doc_verdicts(&text, &mut verdicts, &mut long_runs);
+    let mut escape_terms = Vec::new();
+    text_match::redis_escape_terms(&text, &mut escape_terms);
     Ok(Scanned {
         docid: r.docid.into_owned(),
         url: r.url.into_owned(),
@@ -396,6 +407,7 @@ fn scan_line(line: &str, row: usize) -> Result<Scanned, String> {
             .map(|(t, v)| (t, v == TextMatch::Yes))
             .collect(),
         long_runs,
+        escape_terms,
     })
 }
 
@@ -583,6 +595,8 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
     // unsafe url / docid (a safe value equal to one is not selectable).
     let mut vocabulary: HashMap<String, (u64, u64)> = HashMap::new();
     let mut long_runs: Vec<String> = Vec::new();
+    let mut escape_poison = HashSet::<String>::new();
+    let mut escape_passages = 0u64;
     let mut url_pieces = HashSet::<String>::new();
     let mut docid_pieces = HashSet::<String>::new();
     let mut urls_unsafe = 0u64;
@@ -599,6 +613,10 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             }
         }
         long_runs.extend(s.long_runs);
+        if !s.escape_terms.is_empty() {
+            escape_passages += 1;
+            escape_poison.extend(s.escape_terms);
+        }
         for (value, pieces, unsafe_rows) in [
             (&s.docid, &mut docid_pieces, &mut docids_unsafe),
             (&s.url, &mut url_pieces, &mut urls_unsafe),
@@ -623,12 +641,24 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
     long_runs.dedup();
     let poison = long_run_poison(&long_runs, &vocabulary);
     let ambiguous_terms = vocabulary.values().filter(|(_, a)| *a > 0).count();
-    let eligible = |t: &str, (yes, amb): (u64, u64), band: (u64, u64)| {
+    // Eligible but for the Redis escape rule: the pool v3 drew from.
+    let eligible_v3 = |t: &str, (yes, amb): (u64, u64), band: (u64, u64)| {
         amb == 0
             && yes >= band.0
             && yes <= band.1
             && !poison.contains(t)
             && text_match::validate_term(t).is_ok()
+    };
+    let eligible = |t: &str, c: (u64, u64), band: (u64, u64)| {
+        eligible_v3(t, c, band) && !escape_poison.contains(t)
+    };
+    // Terms each band loses to the escape rule (before any family's own
+    // exclusions), and over every df.
+    let escape_excluded = |band: (u64, u64)| {
+        vocabulary
+            .iter()
+            .filter(|(t, c)| eligible_v3(t, **c, band) && escape_poison.contains(t.as_str()))
+            .count()
     };
     let pool = |family: Family, exclude: &HashSet<String>| -> Vec<(u64, String, u64)> {
         let band = family.df_band().unwrap();
@@ -870,6 +900,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
                 "df_band": family.df_band().map(|(a, b)| json!([a, b])),
                 "fields": family.fields(),
                 "eligible_pool": pools[&family],
+                "terms_excluded_redis_escape": family.df_band().map(escape_excluded),
                 "expected_count": stats(&counts),
                 "expected_count_timed": stats(&counts[RESERVED..]),
                 "expected_count_probe_reserve": stats(&counts[1..RESERVED]),
@@ -887,6 +918,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         "payloads": {"rows": rows, "bytes": payload_bytes, "sha256": payload_sha256},
         "text_field": TEXT_FIELD,
         "text_match_rules": text_match::RULE_VERSION,
+        "redis_escape_rules": text_match::REDIS_ESCAPE_RULE,
         "analysis": "parity: segment text with every whitespace other than U+0020 replaced by a space (as uploaded), no stemming",
         "df_bands": {"rare": RARE_DF, "pair": PAIR_DF, "deep": DEEP_DF},
         "layout": {"prime_line": 0, "probe_reserve_lines": [1, PROBE_RESERVE], "timed_from_line": RESERVED,
@@ -897,6 +929,9 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             "terms_with_ambiguous_passages": ambiguous_terms,
             "long_runs": long_runs.len(),
             "terms_in_long_runs": poison.len(),
+            "passages_with_redis_escape": escape_passages,
+            "terms_excluded_redis_escape": escape_excluded((1, u64::MAX)),
+            "redis_escape_rule": "a term is not selected if, in any passage, it is a lowercase ASCII-alphanumeric run (raw or ASCII-folded) of a RediSearch toksep piece (cut at unescaped ' \\t,./(){}[]:;~!@#$%^&*-=+|'`\"<>?') that holds a backslash or a control byte, or of that piece as RediSearch normalizes it (escape backslashes and unescaped blanks removed, control bytes removed, lowercased), or of any text after a NUL: RediSearch escapes the byte after a backslash into the token (\\ term is the token ' term', plant\\n the token 'plantn'), which the text_match classifier does not model",
         },
         "tags": {"urls_not_safe": urls_unsafe, "docids_not_safe": docids_unsafe,
                  "safe": "printable ASCII 0x21-0x7E, no ';', at most 2048 bytes",
@@ -906,7 +941,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
                  "docid_rows_excluded_redis_piece_collision": docid_rows_colliding,
                  "redis_piece_rule": "a safe value equal to a Redis tag piece (split on ';', C-isspace trimmed, non-empty) of an unsafe value is not selected: Redis TAG SEPARATOR ; would match the unsafe value's passages too, an OpenSearch keyword would not"},
         "term_overlap": term_overlap,
-        "selection": "per family: eligible items ranked by SHA-256(generator, seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys.",
+        "selection": "per family: eligible items ranked by SHA-256(generator, seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run, not named by the Redis escape rule in any passage. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys.",
         "families": families,
     });
     let text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
@@ -1093,7 +1128,9 @@ pub fn load_window(
 /// terms (df 1), `mid*` terms (df n/150, the deep band at n = 3000), `pair*`
 /// terms (df ≈ n/10), a term ambiguous in some passages (`edge`), a term
 /// that only reaches df through newline normalization (`newl`), a term
-/// inside an over-long run, a folding collision (`cafe`) and unsafe URLs.
+/// inside an over-long run, a folding collision (`cafe`), terms a RediSearch
+/// backslash escape changes (`malingered` after `\ `, `plantn` from
+/// `plant\n`, both in the deep band) and unsafe URLs.
 /// Every value passes the upload validator (`filter_only::domain`) even with
 /// `url` and `docid` declared `keyword` and no prepared filter-only query set
 /// (as in the integration tests), so both engines can ingest it.
@@ -1157,6 +1194,20 @@ fn write_fixture(dir: &Path, n: usize, dim: usize, collisions: bool) -> Result<(
         match i {
             9 => words.push("caf\u{e9}".into()),
             10 => words.push("cafe".into()),
+            _ => {}
+        }
+        // RediSearch escapes (both seen live on MS MARCO): `\ ` joins the
+        // escaped space onto `malingered`, so Redis has one passage fewer
+        // than the classifier; `plant\n` is the Redis token `plantn`, one
+        // passage more.
+        match i % 100 {
+            21 => words.push("malingered".into()),
+            23 => words.push("plantn".into()),
+            _ => {}
+        }
+        match i {
+            22 => words.push("(audio) \\ malingered;".into()),
+            24 => words.push("plant\\n".into()),
             _ => {}
         }
         let url = match i % 100 {
@@ -1302,9 +1353,41 @@ mod tests {
                 r
             })
             .collect();
+        // RediSearch's tokens of each uploaded passage (reference
+        // transcription of its tokenizer, escapes included): every text
+        // family's count must hold on Redis too, not only on the classifier.
+        let redis: Vec<HashSet<String>> = uploaded
+            .iter()
+            .map(|r| text_match::redis_tokens(r["segment"].as_str().unwrap()))
+            .collect();
+        let redis_count = |terms: &[&str], category: Option<&str>| {
+            uploaded
+                .iter()
+                .zip(&redis)
+                .filter(|(r, toks)| {
+                    terms.iter().all(|t| toks.contains(*t))
+                        && category.is_none_or(|c| r["category"] == c)
+                })
+                .count() as u64
+        };
         for family in Family::ALL {
             let l = lines(&out, family);
             assert_eq!(m["families"][family.name()]["lines"], l.len(), "{family:?}");
+            for line in &l {
+                let a = line.as_array().unwrap();
+                let s = |i: usize| a[i].as_str().unwrap();
+                let (_, count) = family.conditions(line).unwrap();
+                let on_redis = match family {
+                    Family::RareTerm | Family::DeepFetch => redis_count(&[s(0)], None),
+                    Family::TwoRareTerms => redis_count(&[s(0), s(1)], None),
+                    Family::RareTermAndCategory => redis_count(&[s(0)], Some(s(1))),
+                    Family::UrlEq | Family::DocidEq => count,
+                };
+                assert_eq!(
+                    on_redis, count,
+                    "{family:?} {line}: RediSearch tokenizes differently"
+                );
+            }
             let mut distinct = HashSet::new();
             for line in &l {
                 assert!(distinct.insert(line.to_string()), "duplicate {line}");
@@ -1354,7 +1437,7 @@ mod tests {
                 .iter()
                 .filter(|t| {
                     let (yes, amb) = df(&corpus, t);
-                    amb == 0 && (lo..=hi).contains(&yes)
+                    amb == 0 && (lo..=hi).contains(&yes) && redis_count(&[t], None) == yes
                 })
                 .count()
         };
@@ -1370,6 +1453,8 @@ mod tests {
             ("edge", "ambiguous passage"),
             ("cafe", "folding"),
             ("uniqi", "inside an over-long run"),
+            ("malingered", "a Redis escape (`\\ malingered`)"),
+            ("plantn", "a Redis escape (`plant\\n`)"),
         ] {
             assert!(
                 !Family::ALL
@@ -1379,6 +1464,27 @@ mod tests {
             );
         }
         assert_eq!(df(&corpus, "newl").1, 0, "newline normalization is applied");
+        // The classifier alone would have kept both escape terms (v3), with
+        // a count Redis does not return.
+        assert_eq!(df(&corpus, "malingered"), (31, 0));
+        assert_eq!(redis_count(&["malingered"], None), 30);
+        assert_eq!(df(&corpus, "plantn"), (30, 0));
+        assert_eq!(redis_count(&["plantn"], None), 31);
+        assert_eq!(m["vocabulary"]["passages_with_redis_escape"], 2);
+        assert_eq!(m["vocabulary"]["terms_excluded_redis_escape"], 2);
+        assert_eq!(m["families"]["rare-term"]["terms_excluded_redis_escape"], 2);
+        assert_eq!(
+            m["families"]["deep-fetch"]["terms_excluded_redis_escape"],
+            2
+        );
+        assert_eq!(
+            m["families"]["two-rare-terms"]["terms_excluded_redis_escape"],
+            0
+        );
+        assert_eq!(
+            m["families"]["url-eq"]["terms_excluded_redis_escape"],
+            Value::Null
+        );
         // Single-term families: the prime is the first key, then the reserve
         // and the timed pool are each in seeded key order (uniform slices).
         for family in [
