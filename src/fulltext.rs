@@ -1494,7 +1494,11 @@ pub fn load_query_set_for(
         Ok(())
     };
     if let Some(family) = crate::compound_text::disk_family(compound)? {
-        family.check_params(top, spec.fetch.is_some())?;
+        family.check_params(
+            top,
+            spec.fetch.is_some(),
+            spec.total_hits == Some(TotalHits::None),
+        )?;
         let count = (num_queries > 0).then_some(num_queries as usize);
         let w = crate::msmarco::disk_queries::load_window(
             dir,
@@ -5426,6 +5430,9 @@ mod tests {
         assert!(load("docid-batch", json!({}), 100, 5)
             .unwrap_err()
             .contains("fetch"));
+        let none = json!({"fetch":["title","segment","url"],"total_hits":"none"});
+        let e = load("docid-batch", none, 100, 5).unwrap_err();
+        assert!(e.contains("exact") && e.contains("WITHOUTCOUNT"), "{e}");
         let batch = load("docid-batch", fetch, 100, 5).unwrap();
         assert!(
             batch
@@ -5480,7 +5487,11 @@ mod tests {
         // The generator's reserve covers every top below the timed maximum,
         // for every family, so `none` loads and the probe has truncated
         // pages to compare.
-        for family in dq::Family::ALL {
+        // (docid-batch refuses `none`; its page is its whole match set.)
+        for family in dq::Family::ALL
+            .into_iter()
+            .filter(|f| *f != dq::Family::DocidBatch)
+        {
             let fixed = family.fixed_top();
             let mut extra = json!({"total_hits":"none"});
             if fixed.is_some() {

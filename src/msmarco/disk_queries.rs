@@ -49,7 +49,10 @@
 //! each query is a disjunction of [`DOCID_BATCH_K`] distinct docids, so a
 //! `top: 100` fetch reads [`DOCID_BATCH_K`] random documents. Its lines are
 //! epochs of seeded random partitions of the docid-eq eligible pool
-//! ([`write_docid_batch`]); within one epoch no docid repeats.
+//! ([`write_docid_batch`]); within one epoch no docid repeats (docids do
+//! repeat across epochs, and the prime and reserve docids come back in later
+//! epochs' timed lines).
+//!
 //! Line 0 of each family file is the connection-priming query (the first
 //! item in key order) and lines 1..=[`PROBE_RESERVE`] are reserved for the
 //! Redis `WITHOUTCOUNT` probe: neither ever appears in a timed window. The
@@ -122,15 +125,17 @@ pub const RESERVED: usize = 1 + PROBE_RESERVE;
 /// Every family must offer at least this many timed queries.
 pub const MIN_PER_FAMILY: usize = 100_000;
 /// Timed queries generated per family unless `--disk-queries-per-family` says
-/// otherwise (capped by the family's eligible pool).
+/// otherwise (capped by the family's eligible pool, except `docid-batch`,
+/// whose epochs reach any count).
 pub const DEFAULT_PER_FAMILY: usize = 1_000_000;
 pub const DEFAULT_SEED: u64 = 1;
 /// The fixed result size of `deep-fetch`.
 pub const DEEP_FETCH_TOP: usize = 100;
 /// Docids per `docid-batch` query, its exact count and its fixed `top`.
-/// 100 matches `deep-fetch`'s page, so the two families fetch the same number
-/// of documents per query: `deep-fetch` from the posting list of one term,
-/// `docid-batch` from uniformly random places in the corpus.
+/// 100 is `deep-fetch`'s page: `deep-fetch` returns its term's df (11–100,
+/// [`DEEP_DF`]) documents from one rare term's posting list, `docid-batch`
+/// always fills the page with 100 documents from uniformly random places in
+/// the corpus.
 pub const DOCID_BATCH_K: usize = 100;
 /// Longest `url` used as a tag value.
 pub const MAX_TAG_LEN: usize = 2048;
@@ -219,16 +224,32 @@ impl Family {
     /// is defined as the top-100 fetch, `docid-batch` as the fetch of all of
     /// its [`DOCID_BATCH_K`] matches; any other result size or the ids-only
     /// variant would be a different measurement under the same name.
-    pub fn check_params(self, top: usize, fetch: bool) -> Result<(), String> {
-        match self.fixed_top() {
-            Some(want) if top != want || !fetch => Err(format!(
-                "{SUITE} family {} is defined as `top: {want}` with `fulltext.fetch`; got top \
-                 {top}{}",
-                self.name(),
-                if fetch { "" } else { " without fetch" }
-            )),
-            _ => Ok(()),
+    ///
+    /// `docid-batch` also refuses `total_hits: "none"`: its page is the whole
+    /// match set, so counting costs nothing, while RediSearch `WITHOUTCOUNT`
+    /// returns some of these 100-tag unions out of score order (seen on
+    /// Redis 8.8), which the per-reply rank check rightly refuses; and with
+    /// no truncated page the `WITHOUTCOUNT` probe has nothing to compare.
+    pub fn check_params(self, top: usize, fetch: bool, total_none: bool) -> Result<(), String> {
+        if let Some(want) = self.fixed_top() {
+            if top != want || !fetch {
+                return Err(format!(
+                    "{SUITE} family {} is defined as `top: {want}` with `fulltext.fetch`; got \
+                     top {top}{}",
+                    self.name(),
+                    if fetch { "" } else { " without fetch" }
+                ));
+            }
         }
+        if self == Family::DocidBatch && total_none {
+            return Err(format!(
+                "{SUITE} family {} needs `total_hits: \"exact\"` (the default): every page is \
+                 the whole 100-document match set, so the count is free, and RediSearch \
+                 WITHOUTCOUNT does not keep these tag unions in score order",
+                self.name()
+            ));
+        }
+        Ok(())
     }
 
     /// Logical conditions (the compound AST) and exact count of one line.
@@ -726,12 +747,13 @@ fn write_docid_batch(
         "batches_per_epoch": per_epoch,
         "docids_unused_per_epoch": pool.len() % k,
         "docids_excluded_duplicate": pool.duplicates,
-        "rule": format!("the pool is every docid-eq eligible docid that occurs on exactly one passage; epoch e ranks the pool by SHA-256(generator, seed, \"docid-batch/epoch-<e>\", docid) and cuts it into consecutive batches of {k} (the last len % {k} unused); epochs follow each other; a line is one batch in key order with count {k}, every docid matching exactly one passage"),
+        "rule": format!("the pool is every docid-eq eligible docid that occurs on exactly one passage; epoch e ranks the pool by SHA-256(key domain \"vdb-msmarco-disk/v1\", seed, \"docid-batch/epoch-<e>\", docid) and cuts it into consecutive batches of {k} (the last len % {k} unused); epochs follow each other; a line is one batch in key order with count {k}, every docid matching exactly one passage"),
     }))
 }
 
 pub struct GenerateOptions {
-    /// Timed queries per family (capped by each family's pool).
+    /// Timed queries per family (capped by each family's pool, except
+    /// `docid-batch`).
     pub per_family: usize,
     pub seed: u64,
     /// The floor every family must reach: [`MIN_PER_FAMILY`], except in unit
@@ -1144,7 +1166,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
                  "docid_rows_excluded_redis_piece_collision": docid_rows_colliding,
                  "redis_piece_rule": "a safe value equal to a Redis tag piece (split on ';', C-isspace trimmed, non-empty) of an unsafe value is not selected: Redis TAG SEPARATOR ; would match the unsafe value's passages too, an OpenSearch keyword would not"},
         "term_overlap": term_overlap,
-        "selection": "per family: eligible items ranked by SHA-256(generator, seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run, not named by the Redis escape rule in any passage. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys. docid-batch: see families.docid-batch.batch.rule.",
+        "selection": "per family: eligible items ranked by SHA-256(key domain \"vdb-msmarco-disk/v1\", seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run, not named by the Redis escape rule in any passage. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys. docid-batch: see families.docid-batch.batch.rule.",
         "families": families,
     });
     let text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
@@ -2018,10 +2040,10 @@ mod tests {
             assert_eq!(Family::parse(f.name()).unwrap(), f);
         }
         assert!(Family::parse("segment").is_err());
-        assert!(Family::DeepFetch.check_params(100, true).is_ok());
-        assert!(Family::DeepFetch.check_params(10, true).is_err());
-        assert!(Family::DeepFetch.check_params(100, false).is_err());
-        assert!(Family::RareTerm.check_params(10, false).is_ok());
+        assert!(Family::DeepFetch.check_params(100, true, false).is_ok());
+        assert!(Family::DeepFetch.check_params(10, true, false).is_err());
+        assert!(Family::DeepFetch.check_params(100, false, false).is_err());
+        assert!(Family::RareTerm.check_params(10, false, false).is_ok());
     }
 
     /// docid-batch: every line is [`DOCID_BATCH_K`] distinct eligible docids
@@ -2214,9 +2236,13 @@ mod tests {
         ] {
             assert!(Family::DocidBatch.conditions(&bad).is_err(), "{bad}");
         }
-        assert!(Family::DocidBatch.check_params(k, true).is_ok());
-        assert!(Family::DocidBatch.check_params(10, true).is_err());
-        assert!(Family::DocidBatch.check_params(k, false).is_err());
+        assert!(Family::DocidBatch.check_params(k, true, false).is_ok());
+        assert!(Family::DocidBatch.check_params(10, true, false).is_err());
+        assert!(Family::DocidBatch.check_params(k, false, false).is_err());
+        let e = Family::DocidBatch.check_params(k, true, true).unwrap_err();
+        assert!(e.contains("exact"), "{e}");
+        assert!(Family::DeepFetch.check_params(100, true, true).is_ok());
+        assert!(Family::DocidEq.check_params(10, false, true).is_ok());
         assert_eq!(Family::DocidBatch.fixed_top(), Some(k));
         assert_eq!(Family::DocidEq.fixed_top(), None);
     }

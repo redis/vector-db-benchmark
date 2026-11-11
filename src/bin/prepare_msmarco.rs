@@ -213,7 +213,8 @@ struct Args {
     add_disk_queries: bool,
 
     /// Timed queries per disk family (`--add-disk-queries`), capped by each
-    /// family's eligible pool; at least 100000.
+    /// family's eligible pool (`docid-batch` is not capped: its epochs reach
+    /// any count); at least 100000.
     #[arg(long, default_value_t = msmarco::disk_queries::DEFAULT_PER_FAMILY, requires = "add_disk_queries")]
     disk_queries_per_family: usize,
 
