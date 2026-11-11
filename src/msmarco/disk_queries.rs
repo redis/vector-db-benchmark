@@ -64,6 +64,9 @@
 //! whose count is typically 1, and the probe would refuse the run. A timed
 //! window is `compound.offset` + `--queries` lines of the rest; the loader
 //! refuses a window that runs past the end of the file instead of cycling.
+//! A point that must run for a fixed time instead opts in to cycling its
+//! window in order with `compound.duration_s` ([`crate::duration_mode`]);
+//! the window loaded is the same, once, and the result records the repeats.
 //!
 //! # Files
 //!
@@ -1262,7 +1265,9 @@ pub fn check_manifest(dir: &Path, manifest: &Value) -> Result<(), String> {
 
 /// Load the window `[offset, offset + count)` of `family`'s timed pool, plus
 /// the priming query and the probe reserve. `count` `None` = the rest of the
-/// pool. A window past the end of the pool is an error: queries never cycle.
+/// pool. A window past the end of the pool is an error: the loader never
+/// cycles (duration mode cycles the loaded window at dispatch,
+/// [`crate::duration_mode`]).
 pub fn load_window(
     dir: &Path,
     family: Family,
@@ -1297,7 +1302,8 @@ pub fn load_window(
             "{SUITE} family {}: the window needs {count} queries from offset {offset}, but the \
              timed pool holds {pool}; queries are never repeated within a run — use a smaller \
              --queries or another offset, or regenerate with a larger \
-             --disk-queries-per-family",
+             --disk-queries-per-family (or keep a window that fits and run it for a time, \
+             cycling it, with `compound.duration_s`)",
             family.name()
         ));
     }

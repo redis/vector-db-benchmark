@@ -18,6 +18,7 @@
 pub mod build_info;
 pub mod compare_results;
 pub mod config;
+pub mod duration_mode;
 pub mod filter_only;
 pub mod fulltext;
 pub mod hybrid;

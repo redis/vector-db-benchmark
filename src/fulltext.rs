@@ -757,7 +757,12 @@ pub fn check_execution_params(
     duration_seconds: Option<f64>,
 ) -> Result<(), String> {
     if target_qps.is_some_and(|v| v != 0.0) || duration_seconds.is_some_and(|v| v != 0.0) {
-        return Err("fulltext supports query-count scheduling only; use --queries, not target-qps/search-duration".into());
+        return Err(format!(
+            "fulltext supports query-count scheduling only; use --queries, not \
+             target-qps/search-duration (an {} window runs for a time with \
+             `compound.duration_s`)",
+            crate::msmarco::disk_queries::SUITE
+        ));
     }
     Ok(())
 }
@@ -1344,6 +1349,9 @@ pub struct DiskWindow {
     pub timed_from: usize,
     /// [`crate::msmarco::disk_queries::Window::record`].
     pub record: Value,
+    /// `compound.duration_s`: cycle the timed window for this many seconds
+    /// ([`crate::duration_mode`]). `None`: each timed query once.
+    pub duration_s: Option<f64>,
 }
 
 /// Which queries the Redis `WITHOUTCOUNT` probe may send.
@@ -1370,7 +1378,10 @@ impl QuerySet {
     /// Which entries of `queries` the timed window dispatches, in order. The
     /// legacy sets keep [`schedule`] (all once, or `num_queries` cycling); a
     /// disk window dispatches each of its timed queries exactly once — it was
-    /// loaded with exactly `num_queries` of them, and anything else is refused.
+    /// loaded with exactly `num_queries` of them, and anything else is refused
+    /// — unless it runs in duration mode ([`Self::deadline`]), where the
+    /// runner cycles this order until the deadline
+    /// ([`crate::duration_mode::Dispatcher`]).
     pub fn dispatch_order(&self, num_queries: i64) -> Result<Vec<usize>, String> {
         let Some(w) = &self.window else {
             return Ok(schedule(self.queries.len(), num_queries));
@@ -1385,6 +1396,40 @@ impl QuerySet {
             ));
         }
         Ok(order)
+    }
+
+    /// How long a duration-mode disk window runs (`compound.duration_s`,
+    /// validated by [`parse_spec`]); `None` for a single-pass window and every
+    /// other query set.
+    pub fn deadline(&self) -> Option<std::time::Duration> {
+        self.window
+            .as_ref()
+            .and_then(|w| w.duration_s)
+            .map(std::time::Duration::from_secs_f64)
+    }
+
+    /// The duration-mode record ([`crate::duration_mode::record`]) of a run of
+    /// this set, stored at `compound.duration` of the result metadata. Does
+    /// nothing for a set without a [`Self::deadline`].
+    pub fn record_duration(
+        &self,
+        meta: &mut Value,
+        dispatched: usize,
+        completed_at: &[f64],
+        latencies: &[f64],
+        span_s: f64,
+    ) {
+        let Some(w) = &self.window else { return };
+        let Some(d) = w.duration_s else { return };
+        meta["compound"]["duration"] = crate::duration_mode::record(
+            d,
+            &w.record,
+            self.queries.len() - w.timed_from,
+            dispatched,
+            completed_at,
+            latencies,
+            span_s,
+        );
     }
 
     /// The queries [`probe_withoutcount`] may send: every query of a legacy
@@ -1531,6 +1576,7 @@ pub fn load_query_set_for(
                 family,
                 timed_from,
                 record,
+                duration_s: compound.duration_s,
             }),
         };
         if spec.total_hits == Some(TotalHits::None) {
@@ -2938,6 +2984,12 @@ pub fn result_metadata_for(
         let scoring_contract = "native-engine-scoring-v1";
         let mut identity = json!({"scoring_contract":scoring_contract,"window":w.record,
             "served_sha256":served});
+        // Duration mode measures a different schedule (the window cycled for
+        // a time), so it is part of the identity; absent, the identity is
+        // exactly the single-pass one.
+        if let Some(d) = w.duration_s {
+            identity["duration_s"] = json!(d);
+        }
         if profile.scalar_indexing.is_reduced() {
             identity["scalar_indexing"] = json!(profile.scalar_indexing);
         }
@@ -2947,6 +2999,9 @@ pub fn result_metadata_for(
             "served_sha256":served,"sha256":sha,"preparation_sha256":set.preparation_sha256,
             "exact_counts":true,"scalar_indexing":profile.scalar_indexing,
             "ordering":"engine score descending; ties unspecified; cross-engine ranks are not relevance truth"});
+        if let Some(d) = w.duration_s {
+            m["compound"]["duration_s"] = json!(d);
+        }
         m["query_source"] = json!(format!(
             "{} family file; query_id is its line (compound.window)",
             crate::msmarco::disk_queries::SUITE
@@ -5023,8 +5078,8 @@ mod tests {
             "no_vector_index":true,"scalar_indexing":"text-tag-only",
             "compound":{"suite":"msmarco-disk-v1","family":family}});
         for (k, v) in extra.as_object().unwrap() {
-            if k == "offset" {
-                b["compound"]["offset"] = v.clone();
+            if k == "offset" || k == "duration_s" {
+                b["compound"][k] = v.clone();
             } else {
                 b[k] = v.clone();
             }
@@ -5544,6 +5599,98 @@ mod tests {
         // Legacy sets have no reserve to check.
         let legacy = build_query_set(&["a b".to_string()]).unwrap();
         assert!(legacy.check_probe_reserve(1).is_ok());
+    }
+
+    /// The single-pass identity of a fixed window of the deterministic disk
+    /// fixture, pinned: it is the value master computed before duration mode
+    /// existed, so a run without `duration_s` keeps its identity.
+    const SINGLE_PASS_IDENTITY: &str =
+        "5a7ddc4c5feff1bd8554c8f2c08ffe8546cd73e35a5a6e7717e2cf53aa5f6df7";
+
+    #[test]
+    fn disk_duration_mode_cycles_the_window_records_it_and_keeps_single_pass_identity() {
+        use crate::duration_mode::Dispatcher;
+        use crate::msmarco::disk_queries as dq;
+        let (_tmp, dir) = disk_fixture();
+        let schema = disk_schema();
+        let load = |extra: Value| {
+            load_query_set_for(
+                &dir,
+                &parse_spec(Some(&disk_block("rare-term", extra))).unwrap(),
+                Some(&schema),
+                10,
+                7,
+            )
+            .unwrap()
+        };
+        // Spec rules: disk suite only, a finite positive duration.
+        for bad in [json!(0), json!(-1), json!(1e12)] {
+            let e =
+                parse_spec(Some(&disk_block("rare-term", json!({"duration_s": bad})))).unwrap_err();
+            assert!(e.contains("duration_s"), "{e}");
+        }
+        let e = parse_spec(Some(&json!({"analysis":"parity","fields":{"segment":1.0},
+            "compound":{"suite":"msmarco-v1","duration_s":600}})))
+        .unwrap_err();
+        assert!(e.contains("duration_s"), "{e}");
+        assert!(check_execution_params(None, Some(600.0))
+            .unwrap_err()
+            .contains("compound.duration_s"));
+
+        let once = load(json!({"offset":3}));
+        let timed = load(json!({"offset":3,"duration_s":600}));
+        assert_eq!(once.deadline(), None);
+        assert_eq!(timed.deadline(), Some(std::time::Duration::from_secs(600)));
+        // The same window, loaded once: duration mode loads nothing more.
+        assert_eq!(timed.queries, once.queries);
+        let order = timed.dispatch_order(7).unwrap();
+        assert_eq!(order, once.dispatch_order(7).unwrap());
+        // Dispatch k sends timed line first_line + (k mod 7).
+        let d = Dispatcher::new(&order, timed.deadline());
+        let start = std::time::Instant::now();
+        let lines: Vec<usize> = (0..17)
+            .map(|_| timed.queries[d.next(start).unwrap().1].query_id)
+            .collect();
+        let want: Vec<usize> = (0..17).map(|k| dq::RESERVED + 3 + k % 7).collect();
+        assert_eq!(lines, want);
+
+        let profile = index_profile([(
+            Workload::Fulltext,
+            Some(&disk_block("rare-term", json!({}))),
+        )])
+        .unwrap()
+        .unwrap();
+        let fields = resolve_fields(
+            &parse_spec(Some(&disk_block("rare-term", json!({})))).unwrap(),
+            Some(&schema),
+        )
+        .unwrap();
+        let meta = |set: &QuerySet| {
+            result_metadata_for("redis", &fields, set, 10, &profile, &profile.marker()).unwrap()
+        };
+        let (mut m_once, mut m_timed) = (meta(&once), meta(&timed));
+        assert_eq!(m_once["compound"]["sha256"], SINGLE_PASS_IDENTITY);
+        assert!(m_once["compound"].get("duration_s").is_none());
+        assert_eq!(m_timed["compound"]["duration_s"], 600.0);
+        assert_ne!(m_timed["compound"]["sha256"], m_once["compound"]["sha256"]);
+        assert_eq!(
+            m_timed["compound"]["served_sha256"],
+            m_once["compound"]["served_sha256"]
+        );
+        // The record: 17 dispatched over a window of 7.
+        once.record_duration(&mut m_once, 7, &[0.1; 7], &[0.01; 7], 1.0);
+        assert!(m_once["compound"].get("duration").is_none());
+        timed.record_duration(&mut m_timed, 17, &[1.0; 17], &[0.01; 17], 600.5);
+        let r = &m_timed["compound"]["duration"];
+        assert_eq!(r["mode"], "cycle-window");
+        assert_eq!(r["window"]["queries"], 7);
+        assert_eq!(r["window"]["offset"], 3);
+        assert_eq!(r["window"]["first_line"], dq::RESERVED + 3);
+        assert_eq!(r["full_passes"], 2);
+        assert_eq!(r["partial_position"], 3);
+        assert_eq!(r["repeated"], true);
+        assert_eq!(r["dispatched"], 17);
+        assert_eq!(r["intervals"][0]["buckets"][0]["completed"], 17);
     }
 
     #[test]

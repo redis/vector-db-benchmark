@@ -7069,3 +7069,43 @@ fn test_binary_redis_disk_suite_families_fetch_and_windows() {
     flush_db(&mut conn);
     fs::remove_dir_all(&proj.root).ok();
 }
+
+/// msmarco-disk-v1 duration mode: a small window cycled in strict dispatch
+/// order for `compound.duration_s`, every reply still checked
+/// (`common::assert_disk_duration_run`).
+#[test]
+fn test_binary_redis_disk_suite_duration_mode_cycles_the_window() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{"name":"redis-disk-duration","engine":"redis",
+        "upload_params":{"parallel":1},"search_params":common::disk_duration_search_params()}]);
+    let proj = common::write_disk_project(&configs.to_string());
+    let port = test_port().to_string();
+    let dump = proj.root.join("disk-duration-dumps");
+    let n = common::DISK_DURATION_WINDOW.to_string();
+    let out = common::run_binary_output(
+        &proj.root,
+        "redis-disk-duration",
+        common::DISK_DATASET,
+        TEST_HOST,
+        &[("REDIS_PORT", port.as_str())],
+        &[
+            "--queries",
+            n.as_str(),
+            "--repetitions",
+            "1",
+            "--fail-on-dropped-queries",
+            "--dump-results",
+            dump.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    common::assert_disk_duration_run(&proj.root, "redis-disk-duration", &dump);
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
