@@ -2604,7 +2604,7 @@ are compiled against the reduced schema.
 The `msmarco-v1` suite repeats 32 queries per family over common terms, so the
 working set stays in memory. `msmarco-disk-v1` is opt-in and identical on both
 engines; each family has at least 100,000 distinct queries, none repeated
-within a run:
+within a run (unless a point opts in to duration mode, below):
 
 | Family | Query | Selection |
 |---|---|---|
@@ -2686,16 +2686,29 @@ A search point selects one family and a window:
   queries dispatched and completed, `full_passes` and `partial_position`
   (dispatched = full_passes × N + partial_position), `repeated` (whether any
   query ran twice), the timed span, `completed_after_deadline`,
-  `qps_by_deadline`, and the completions on the client clock in 10 s and 60 s
-  intervals, each with `completed`, `qps`, `p50_time`, `p95_time`, `p99_time`
-  and `max_time` (seconds).
+  `qps_by_deadline`, `last_completion_s`, and the completions on the client
+  clock in 10 s and 60 s `intervals` (`width_s`, `buckets`), each bucket with
+  `start_s`, `end_s`, `completed`, `qps`, `p50_time`, `p95_time`, `p99_time`
+  and `max_time` (seconds). The buckets cover `[0, duration_s)`, so they sum
+  to `completed_by_deadline`; completions after the deadline are summarized
+  in `after_deadline`. `timed_span_s` runs until every worker has joined (the
+  last completion plus worker teardown, milliseconds). The first failed query
+  stops dispatch and the point is refused.
   `compound.duration_s` is part of the result identity
   (`compound.sha256`), and is absent from it when unset, so single-pass
   identities do not change. Cache caveat: once the window wraps, every query
   has run before and may be served from the page cache or an engine cache
   that the first pass warmed. A cycled point is a cold-read point only while
-  `repeated` is false. Make the window as large as memory allows: it is held
-  in memory for the whole run (about 20 KB per query for `docid-batch`).
+  `repeated` is false. A run that cycles prints a warning. With one window
+  and one duration, a faster engine runs more passes and so repeats more
+  queries: compare `full_passes` before quoting a head-to-head (or size the
+  window so `repeated` stays false on both). Make the window as large as
+  memory allows, within the family's timed pool (the manifest's
+  `timed_queries`): it is held in memory for the whole run (about 20 KB per
+  query for `docid-batch`). Memory also grows with the queries completed:
+  16 bytes each, and with `--dump-results` one record per dispatch (about
+  0.3 KB at `top: 10`, 2.5 KB at `top: 100`), so a long high-QPS point with
+  a dump needs gigabytes.
   `--repetitions` above 1 is still refused. Without `duration_s` nothing
   changes. Example, a 600 s point over a 1M-query window:
 
@@ -2705,7 +2718,7 @@ A search point selects one family and a window:
   ```
 
   ```bash
-  vector-db-benchmark --engines redis-disk --datasets <dataset> \
+  vector-db-benchmark --engines <config> --datasets <dataset> \
     --queries 1000000 --repetitions 1 --fail-on-dropped-queries
   ```
 - The first line of each family file is the (untimed) prime query and the

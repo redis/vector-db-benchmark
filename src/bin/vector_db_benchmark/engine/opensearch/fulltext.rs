@@ -305,12 +305,14 @@ impl OpenSearchEngine {
                                         )),
                                         Err(e) => {
                                             capture_error = Some(e);
+                                            dispatcher.failed();
                                             break;
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
+                                dispatcher.failed();
                                 if capture {
                                     cap.push(RawQueryResult::failed(
                                         query_id,

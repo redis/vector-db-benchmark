@@ -356,12 +356,14 @@ impl RedisEngine {
                                         )),
                                         Err(e) => {
                                             capture_error = Some(e);
+                                            dispatcher.failed();
                                             break;
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
+                                dispatcher.failed();
                                 if fulltext::is_rank_violation(&e) {
                                     rank_violations.fetch_add(1, Ordering::Relaxed);
                                 }

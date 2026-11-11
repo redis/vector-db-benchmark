@@ -1390,7 +1390,8 @@ impl QuerySet {
         if order.is_empty() || (num_queries > 0 && num_queries as usize != order.len()) {
             return Err(format!(
                 "{}: the loaded window holds {} timed queries but --queries is {num_queries}; \
-                 a disk-bound window never repeats a query",
+                 --queries must equal the loaded window (a single pass dispatches each \
+                 query once; duration mode cycles that same window)",
                 crate::msmarco::disk_queries::SUITE,
                 order.len()
             ));
@@ -1421,6 +1422,16 @@ impl QuerySet {
     ) {
         let Some(w) = &self.window else { return };
         let Some(d) = w.duration_s else { return };
+        let window_len = self.queries.len() - w.timed_from;
+        if dispatched > window_len {
+            eprintln!(
+                "⚠  {}: the {window_len}-query window was cycled ({dispatched} dispatched, {} \
+                 full passes): repeated queries may be served from caches the first pass \
+                 warmed (compound.duration.repeated = true)",
+                crate::msmarco::disk_queries::SUITE,
+                dispatched / window_len.max(1)
+            );
+        }
         meta["compound"]["duration"] = crate::duration_mode::record(
             d,
             &w.record,

@@ -19,8 +19,8 @@ pub struct Spec {
     pub family: Option<String>,
     /// `msmarco-disk-v1` only: the first query of the family's timed pool this
     /// search config dispatches. Each window must use its own range, since a
-    /// disk-bound family never repeats a query across search configs (and,
-    /// unless `duration_s` is set, within one) (default 0).
+    /// disk-bound family never repeats a query across search configs, nor
+    /// within one unless `duration_s` is set. Default 0.
     #[serde(default)]
     pub offset: Option<u64>,
     /// `msmarco-disk-v1` only: run the point for this many seconds, cycling

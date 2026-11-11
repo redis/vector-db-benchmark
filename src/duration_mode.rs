@@ -10,16 +10,24 @@
 //! same window for the same time sent the same query sequence (each up to its
 //! own dispatched count).
 //!
-//! No worker starts a query once the deadline has passed. A query started
-//! before it is completed and counted (`completed_after_deadline` says how
-//! many finished after it); the throughput is completed queries over the
-//! timed span, from the shared start to the last completion. The completion
-//! time of every query, on the client's clock, is bucketed into fixed
-//! intervals ([`INTERVALS_S`]) with their counts and latency percentiles, so
-//! per-interval stability is measured, not reconstructed.
+//! The deadline is checked before each dispatch: no worker starts a query
+//! once it has passed (one that passed the check just before may start
+//! microseconds after). A query in flight at the deadline completes and is
+//! counted (`completed_after_deadline` says how many finished after it); the
+//! throughput is completed queries over the timed span, from the shared start
+//! until every worker has joined (`last_completion_s` is recorded beside it).
+//! The completion time of every query (after its reply is checked), on the
+//! client's clock, is bucketed into fixed intervals ([`INTERVALS_S`]) with
+//! their counts and latency percentiles, so per-interval stability is
+//! measured, not reconstructed. The first failed query stops dispatch on
+//! every worker: the run is refused anyway, so it is not kept running to the
+//! deadline.
 //!
-//! The window is loaded once and reused on every pass: memory does not grow
-//! with the duration.
+//! The window is loaded once and reused on every pass; it does not grow with
+//! the duration. What does grow is per completed query: 16 bytes of timing
+//! (latency and completion time), and under `--dump-results` one captured
+//! record per dispatch (its ids and scores), which at high QPS for minutes is
+//! gigabytes.
 //!
 //! A query repeated on a later pass may be served from a cache the first
 //! pass warmed (page cache, engine caches): a window smaller than the number
@@ -27,7 +35,7 @@
 //! records whether any query repeated, and how many full passes ran.
 
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Longest accepted `compound.duration_s` (one week).
@@ -42,9 +50,10 @@ pub const ORDER: &str = "strict dispatch order: dispatch k (0-based, across all 
      until the deadline";
 
 /// How the throughput of a duration-mode point is computed, as recorded.
-pub const QPS_BASIS: &str = "no query is dispatched after the deadline; queries in flight at \
-     the deadline complete and are counted. rps = completed / timed_span_s (shared start to the \
-     last completion); qps_by_deadline = completed_by_deadline / duration_s";
+pub const QPS_BASIS: &str = "the deadline is checked before each dispatch; queries in flight \
+     at the deadline complete and are counted. rps = completed / timed_span_s (shared start until \
+     every worker has joined; last_completion_s is the last completion); qps_by_deadline = \
+     completed_by_deadline / duration_s; intervals cover [0, duration_s) only";
 
 /// Validate a `compound.duration_s` value.
 pub fn check_duration(seconds: f64) -> Result<Duration, String> {
@@ -67,6 +76,7 @@ pub struct Dispatcher<'a> {
     order: &'a [usize],
     next: AtomicUsize,
     deadline: Option<Duration>,
+    stopped: AtomicBool,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -75,6 +85,16 @@ impl<'a> Dispatcher<'a> {
             order,
             next: AtomicUsize::new(0),
             deadline,
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// A query failed. In duration mode no further query is dispatched (the
+    /// run is refused anyway); without a deadline nothing changes and the
+    /// window is dispatched to its end, as before.
+    pub fn failed(&self) {
+        if self.deadline.is_some() {
+            self.stopped.store(true, Ordering::Relaxed);
         }
     }
 
@@ -89,7 +109,10 @@ impl<'a> Dispatcher<'a> {
                 self.order.get(seq).map(|&i| (seq, i))
             }
             Some(deadline) => {
-                if self.order.is_empty() || start.elapsed() >= deadline {
+                if self.order.is_empty()
+                    || self.stopped.load(Ordering::Relaxed)
+                    || start.elapsed() >= deadline
+                {
                     return None;
                 }
                 let seq = self.next.fetch_add(1, Ordering::Relaxed);
@@ -310,6 +333,21 @@ mod tests {
         let old = Instant::now() - Duration::from_millis(5);
         assert_eq!(past.next(old), None);
         assert_eq!(past.dispatched(), 0);
+    }
+
+    #[test]
+    fn a_failure_stops_duration_mode_only() {
+        let order = [1, 2];
+        let start = Instant::now();
+        let timed = Dispatcher::new(&order, Some(Duration::from_secs(3600)));
+        assert!(timed.next(start).is_some());
+        timed.failed();
+        assert_eq!(timed.next(start), None);
+        assert_eq!(timed.dispatched(), 1);
+        let once = Dispatcher::new(&order, None);
+        assert!(once.next(start).is_some());
+        once.failed();
+        assert_eq!(once.next(start), Some((1, 2)));
     }
 
     #[test]

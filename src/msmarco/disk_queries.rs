@@ -34,7 +34,7 @@
 //! under `none`). Tag values are restricted to strings both engines index as
 //! one exact tag (printable ASCII, no `;` — the Redis TAG separator).
 //!
-//! # Deterministic, uniform, never repeated
+//! # Deterministic, uniform, never repeated (unless cycled on purpose)
 //!
 //! Each family's items are ranked by a seeded SHA-256 key of the item and the
 //! first `per_family + RESERVED` are kept. The timed lines are in key order,
