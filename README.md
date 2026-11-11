@@ -2615,6 +2615,11 @@ within a run (unless a point opts in to duration mode, below):
 | `docid-eq` | exact `docid` | every passage with a safe-tag docid (see below) |
 | `deep-fetch` | one rare term, `top: 100`, with `fetch` | df 11–100 |
 | `docid-batch` | `docid` equal to any of 100 docids, `top: 100`, with `fetch` | 100 uniformly random distinct docids (see below) |
+| `docid-batch-500` | `docid` equal to any of 500 docids, `top: 500`, with `fetch` | as `docid-batch`, 500 per line (high pressure, below) |
+| `docid-batch-1000` | `docid` equal to any of 1,000 docids, `top: 1000`, with `fetch` | as `docid-batch`, 1,000 per line |
+| `url-batch` | `url` equal to any of 300 URLs, `top: 100`, with `fetch` | 300 random distinct eligible URLs |
+| `rare-terms-or` | OR of 40 `segment` terms, `top: 100`, with `fetch` | each df 11–100 |
+| `rare-terms-or-and-category` | that OR AND `category`, `top: 100`, with `fetch` | category of one passage of the union |
 
 Generate the query files once per prepared corpus (deterministic for a seed;
 a rerun verifies the existing files byte for byte):
@@ -2646,6 +2651,8 @@ family (`families.<family>.terms_excluded_redis_escape`). Query files from
 generator v4 or earlier are refused; regenerate them. Generator v5 only adds
 `docid-batch`: the six v4 family files it writes are byte-identical to v4's
 (same seed, same SHA-256), so v4 results stay comparable family by family.
+Generator v6 only adds the high-pressure families (below): the seven v5
+family files are byte-identical to v5's, and v5 query files are refused.
 
 A search point selects one family and a window:
 
@@ -2782,6 +2789,71 @@ A search point selects one family and a window:
   each docid at most once. The manifest's `families.docid-batch.batch`
   records `k`, `epochs`, `batches_per_epoch`, the unused docids per epoch, the
   docids excluded as duplicates, and the rule.
+- High-pressure families (generator v6). On Redis Flex the search index stays
+  in RAM and only fetching documents reads flash, so a family drives storage
+  only if it both matches many documents spread over the whole corpus and
+  fetches a large page. Each of these does, with the same semantics, exact
+  count, fetched fields and page size on both engines. All of them require
+  `fetch` and `total_hits: "exact"` (`"none"` is refused before connecting;
+  Redis Flex rejects `WITHOUTCOUNT`), and run at a fixed `top`:
+
+  | Family | Line | Query | `top` | Count |
+  |---|---|---|---|---|
+  | `docid-batch-500` | `[[d1, …, d500], 500]` | `docid` any of 500 random docids | 500 | 500 |
+  | `docid-batch-1000` | `[[d1, …, d1000], 1000]` | `docid` any of 1,000 random docids | 1000 | 1,000 |
+  | `url-batch` | `[[u1, …, u300], n]` | `url` any of 300 random URLs | 100 | passages of those URLs |
+  | `rare-terms-or` | `[[t1, …, t40], n]` | OR of 40 `segment` terms, each df 11–100 | 100 | distinct passages holding any term |
+  | `rare-terms-or-and-category` | `[[t1, …, t40], c, n]` | the same OR AND `category` | 100 | distinct passages of the union in `c` |
+
+  - Redis: `@docid:{d1 | … | dK}` / `@url:{u1 | … | u300}` (one escaped TAG
+    union), `@segment:(t1 | … | t40)` (one field-scoped union of
+    `VERBATIM` words), and `((@segment:(…)) (@category:{c}))`, all under
+    `DIALECT 2`. OpenSearch: `bool.filter` `terms` on the keyword (1,000 and
+    300 values, far below `index.max_terms_count` 65,536; `size` 1,000 is
+    within `index.max_result_window` 10,000), and `bool.should` of one
+    `match` per term with `minimum_should_match: 1` (40 clauses, below
+    `indices.query.bool.max_clause_count` 1,024), inside `bool.must` with the
+    category filter. The constants are compile-time checked against those
+    limits; the manifest records the longest Redis query of each tag-union
+    family (`batch.redis_query_bytes_max`).
+  - Every line is an epoch batch, as in `docid-batch`: epoch `e` ranks the
+    family's pool by a seeded key (`<family>/epoch-e`) and cuts it into
+    batches, so no item repeats within an epoch. Pools: the `docid-batch`
+    pool (docid batches), every `url-eq`-eligible URL (`url-batch`), every
+    term of df 11–100 eligible under the `text_match` rules (zero ambiguous
+    passages, no long run, no Redis escape — the `deep-fetch` pool) for
+    `rare-terms-or*`.
+  - Counts are exact. A docid batch matches K passages. A `url-batch` count is
+    the sum of its URLs' passage counts (distinct URLs, one URL per passage,
+    and the `url-eq` eligibility keeps every URL's count exact on Redis tag
+    pieces). A `rare-terms-or` count is the size of the union of its terms'
+    postings, each passage counted ONCE (two terms in one passage are one
+    match on both engines). `rare-terms-or-and-category` picks the category
+    of the union's passage with the smallest seeded docid key, so its count
+    is at least 1.
+  - Expected sizes on the 10M corpus (a uniform 8.8% sample of the
+    segments): `url-batch` about 300–1,000 passages at 1–3 passages per URL
+    (the manifest records the pool's `pool_mean_count`; retune
+    `URL_BATCH_N` if it is far from that); `rare-terms-or` about 1,100
+    (≈ 40 × the mean df of the band, ~27; bounded by 440 less overlaps and
+    4,000); `rare-terms-or-and-category` that union divided by the number of
+    categories, roughly.
+  - The variable-count families keep the probe layout (the 64 highest
+    counts in the reserve) though their `"none"` is refused. The docid
+    batches have constant counts, so their layout is key order.
+  - Sizes: the tag-union batches hold `--disk-queries-per-family × 100 / K`
+    timed lines (at least 100,000), K being the values per line, so each file
+    holds about as many tag values as `docid-batch` (3–4 GB at 10M): 200,000
+    lines for `docid-batch-500`, 100,000 for `docid-batch-1000`, 333,333 for
+    `url-batch` by default (URLs are longer than docids: ~7 GB). Each loaded
+    query costs the client about K × 0.2 KB (200 KB at K = 1,000): size
+    `--queries` to client memory. `rare-terms-or*` lines are ~0.4 KB (1M
+    lines). Generation keeps `url-batch` and `rare-terms-or*` lines in memory
+    as 4-byte ids (~0.4 GB and ~0.16 GB each).
+  - Only the count is checked: BM25 differs between the engines (IDF, length
+    normalization), so the top 100 of a 1,000-passage union are not the same
+    documents on both; and tag-only unions are unranked (compare those ids as
+    sets).
 - `docid-batch` sizes: with MS MARCO v2.1 docids a line is 3–4 KB, so the
   default file is 3–4 GB (a synthetic 10M-docid pool generated in about 12 s
   at 2 GB peak RSS; the loader hashes the whole file before each search

@@ -5499,7 +5499,7 @@ mod tests {
         let none = json!({"fetch":["title","segment","url"],"total_hits":"none"});
         let e = load("docid-batch", none, 100, 5).unwrap_err();
         assert!(e.contains("exact") && e.contains("WITHOUTCOUNT"), "{e}");
-        let batch = load("docid-batch", fetch, 100, 5).unwrap();
+        let batch = load("docid-batch", fetch.clone(), 100, 5).unwrap();
         assert!(
             batch
                 .queries
@@ -5536,6 +5536,77 @@ mod tests {
                 .len(),
             100
         );
+        // The v6 high-pressure families: fixed page with fetch, exact totals
+        // only, and the request each engine is sent.
+        let fields = [
+            "title".to_string(),
+            "segment".to_string(),
+            "url".to_string(),
+        ];
+        for (family, top) in [
+            (dq::Family::DocidBatch500, dq::DOCID_BATCH_500_K),
+            (dq::Family::DocidBatch1000, dq::DOCID_BATCH_1000_K),
+            (dq::Family::UrlBatch, dq::HIGH_PRESSURE_TOP),
+            (dq::Family::RareTermsOr, dq::HIGH_PRESSURE_TOP),
+            (dq::Family::RareTermsOrAndCategory, dq::HIGH_PRESSURE_TOP),
+        ] {
+            let name = family.name();
+            assert!(load(name, fetch.clone(), 10, 5).unwrap_err().contains(name));
+            assert!(load(name, json!({}), top, 5).unwrap_err().contains("fetch"));
+            let none = json!({"fetch":["title","segment","url"],"total_hits":"none"});
+            let e = load(name, none, top, 5).unwrap_err();
+            assert!(e.contains("exact") && e.contains("WITHOUTCOUNT"), "{e}");
+            let set = load(name, fetch.clone(), top, 5).unwrap();
+            let q = &set.queries[set.window.as_ref().unwrap().timed_from];
+            let expected = q.compound.as_ref().unwrap().expected_count.unwrap();
+            let redis = query_redis(&[], q);
+            let body = query_opensearch_fetch(&[], q, top, TotalHits::Exact, Some(&fields));
+            assert_eq!(body["size"], top);
+            assert_eq!(body["track_total_hits"], true, "{body}");
+            let n = family.batch_size().unwrap();
+            match family {
+                dq::Family::DocidBatch500 | dq::Family::DocidBatch1000 => {
+                    assert_eq!(expected, n as u64);
+                    assert!(redis.starts_with("(@docid:{"), "{redis}");
+                    assert_eq!(redis.matches(" | ").count(), n - 1);
+                    assert_eq!(
+                        body["query"]["bool"]["filter"][0]["terms"]["docid"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        n
+                    );
+                }
+                dq::Family::UrlBatch => {
+                    assert!(redis.starts_with("(@url:{"), "{redis}");
+                    assert_eq!(redis.matches(" | ").count(), n - 1);
+                    assert_eq!(
+                        body["query"]["bool"]["filter"][0]["terms"]["url"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        n
+                    );
+                }
+                dq::Family::RareTermsOr => {
+                    assert!(redis.starts_with("(@segment:("), "{redis}");
+                    assert_eq!(redis.matches(" | ").count(), n - 1);
+                    assert_eq!(body["query"]["bool"]["should"].as_array().unwrap().len(), n);
+                    assert_eq!(body["query"]["bool"]["minimum_should_match"], 1);
+                }
+                _ => {
+                    assert!(redis.starts_with("((@segment:("), "{redis}");
+                    assert!(redis.contains(")) (@category:{"), "{redis}");
+                    assert_eq!(
+                        body["query"]["bool"]["must"][0]["bool"]["should"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        n
+                    );
+                }
+            }
+        }
         // The legacy loader refuses the per-window suite.
         assert!(load_query_set(
             &dir,
@@ -5553,10 +5624,11 @@ mod tests {
         // The generator's reserve covers every top below the timed maximum,
         // for every family, so `none` loads and the probe has truncated
         // pages to compare.
-        // (docid-batch refuses `none`; its page is its whole match set.)
+        // (The batch families refuse `none`: docid batches' pages are their
+        // whole match sets, and every v6 high-pressure family is exact.)
         for family in dq::Family::ALL
             .into_iter()
-            .filter(|f| *f != dq::Family::DocidBatch)
+            .filter(|f| !f.requires_exact_total())
         {
             let fixed = family.fixed_top();
             let mut extra = json!({"total_hits":"none"});
@@ -5613,10 +5685,14 @@ mod tests {
     }
 
     /// The single-pass identity of a fixed window of the deterministic disk
-    /// fixture, pinned: it is the value master computed before duration mode
-    /// existed, so a run without `duration_s` keeps its identity.
+    /// fixture, pinned: duration mode does not change it, so a run without
+    /// `duration_s` keeps its identity. The identity hashes the window record,
+    /// which names the generator and the manifest SHA-256, so it moves with a
+    /// generator bump even when the family file is byte-identical: v5
+    /// (901e8c3, before duration mode) pinned
+    /// `5a7ddc4c5feff1bd8554c8f2c08ffe8546cd73e35a5a6e7717e2cf53aa5f6df7`.
     const SINGLE_PASS_IDENTITY: &str =
-        "5a7ddc4c5feff1bd8554c8f2c08ffe8546cd73e35a5a6e7717e2cf53aa5f6df7";
+        "0f0e0e855ed4f1c52d9631754586f60556566aed1314202a60f47cad797ba206";
 
     #[test]
     fn disk_duration_mode_cycles_the_window_records_it_and_keeps_single_pass_identity() {

@@ -214,6 +214,14 @@ impl Expr {
                 "({})",
                 c.iter().map(Self::redis).collect::<Vec<_>>().join(" ")
             ),
+            // Single-word texts of one field: one field-scoped union,
+            // `@f:(a | b)` (same matches as `@f:(a) | @f:(b)`). Only plain
+            // alphanumeric words, so no precedence or escape question
+            // arises inside the parentheses.
+            Self::Or(c) if c.len() > 1 && Self::same_field_words(c).is_some() => {
+                let (field, words) = Self::same_field_words(c).expect("checked");
+                format!("(@{field}:({}))", words.join(" | "))
+            }
             Self::Or(c) => format!(
                 "({})",
                 c.iter().map(Self::redis).collect::<Vec<_>>().join(" | ")
@@ -261,6 +269,29 @@ impl Expr {
             },
             Self::Leaf(_) => unreachable!("compiler creates leaf predicates only"),
         }
+    }
+    /// The field and words of an OR group whose every child is a text match
+    /// of one ASCII-alphanumeric word on the same field.
+    fn same_field_words(children: &[Expr]) -> Option<(&str, Vec<&str>)> {
+        let mut field = None;
+        let mut words = Vec::with_capacity(children.len());
+        for c in children {
+            let Self::Leaf(Predicate::Leaf {
+                field: f,
+                leaf: Leaf::Text(t),
+            }) = c
+            else {
+                return None;
+            };
+            if t.is_empty() || !t.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return None;
+            }
+            if *field.get_or_insert(f.as_str()) != f.as_str() {
+                return None;
+            }
+            words.push(t.as_str());
+        }
+        field.map(|f| (f, words))
     }
     pub fn opensearch(&self) -> Value {
         match self {
