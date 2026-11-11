@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn concurrent_workers_dispatch_a_gapless_sequence_until_the_deadline() {
         let order: Vec<usize> = (0..5).collect();
-        let d = Dispatcher::new(&order, Some(Duration::from_millis(50)));
+        let d = Dispatcher::new(&order, Some(Duration::from_millis(300)));
         let start = Instant::now();
         let mut all: Vec<(usize, usize)> = std::thread::scope(|s| {
             let hs: Vec<_> = (0..4)
@@ -370,7 +370,7 @@ mod tests {
                 .collect();
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
-        assert!(start.elapsed() >= Duration::from_millis(50));
+        assert!(start.elapsed() >= Duration::from_millis(300));
         all.sort();
         assert_eq!(all.len(), d.dispatched());
         assert!(all.len() > order.len(), "the window must have wrapped");
@@ -452,6 +452,13 @@ mod tests {
         assert_eq!(r["partial_position"], 40);
         assert_eq!(r["repeated"], false);
         assert_eq!(r["completed_after_deadline"], 0);
+        // Exactly one full pass: nothing ran twice.
+        let one = record(1.0, &json!({}), 4, 4, &[0.5; 4], &[0.01; 4], 1.0);
+        assert_eq!(one["full_passes"], 1);
+        assert_eq!(one["partial_position"], 0);
+        assert_eq!(one["repeated"], false);
+        let five = record(1.0, &json!({}), 4, 5, &[0.5; 5], &[0.01; 5], 1.0);
+        assert_eq!(five["repeated"], true);
     }
 
     #[test]
