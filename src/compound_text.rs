@@ -214,6 +214,22 @@ impl Expr {
             Self::Not(p) => format!("(-{})", p.redis()),
             Self::Leaf(Predicate::Leaf { field, leaf }) => match leaf {
                 Leaf::Text(t) => format!("(@{field}:({t}))"),
+                // Several tags of one field: one TAG union, `@f:{a | b}`
+                // (same matches as `@f:{a} | @f:{b}`, one query node).
+                Leaf::Match(ops)
+                    if ops.len() > 1 && ops.iter().all(|v| matches!(v, Operand::Keyword(_))) =>
+                {
+                    format!(
+                        "(@{field}:{{{}}})",
+                        ops.iter()
+                            .map(|v| match v {
+                                Operand::Keyword(s) => esc(s),
+                                Operand::Int(_) => unreachable!("all keywords"),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    )
+                }
                 Leaf::Match(ops) => format!(
                     "({})",
                     ops.iter()
@@ -545,6 +561,25 @@ mod tests {
             e.opensearch(),
             json!({"bool":{"filter":[{"terms":{"category":["A|B {C}"]}}]}})
         );
+        // Several tags of one field: one TAG union on Redis (each tag
+        // escaped, `|` between them unescaped), one `terms` on OpenSearch.
+        let e = Expr::compile(
+            &json!({"category":{"match":{"any":["d_1#0","A|B","x"]}}}),
+            &schema(),
+        )
+        .unwrap();
+        assert_eq!(e.redis(), "(@category:{d\\_1\\#0 | A\\|B | x})");
+        assert_eq!(
+            e.opensearch(),
+            json!({"bool":{"filter":[{"terms":{"category":["d_1#0","A|B","x"]}}]}})
+        );
+        for (row, want) in [("A|B", true), ("x", true), ("d_1", false), ("X", false)] {
+            let row = json!({ "category": row });
+            assert_eq!(e.matches(row.as_object().unwrap()).unwrap(), want, "{row}");
+        }
+        // Integers keep one range per value.
+        let e = Expr::compile(&json!({"doc_len":{"match":{"any":[1,2]}}}), &schema()).unwrap();
+        assert_eq!(e.redis(), "(@doc_len:[1 1] | @doc_len:[2 2])");
         let e = Expr::compile(&json!({"doc_len":{"range":{"gt":3,"lte":5}}}), &schema()).unwrap();
         assert_eq!(
             e.opensearch(),

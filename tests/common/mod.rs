@@ -5041,8 +5041,9 @@ pub fn write_disk_project(engine_configs_json: &str) -> MatchAnyProject {
     }
 }
 
-/// One search config per family, plus a second `rare-term` window; fetch on
-/// and off, `total_hits` exact and none, `deep-fetch` at top 100.
+/// One search config per family, plus a second `rare-term` and a second
+/// `docid-batch` window; fetch on and off, `total_hits` exact and none,
+/// `deep-fetch` and `docid-batch` at top 100.
 pub fn disk_search_params() -> serde_json::Value {
     let point = |family: &str, top: usize, fetch: bool, total: &str, offset: u64| {
         let mut ft = serde_json::json!({"analysis":"parity","fields":{"title":1.0,"segment":1.0},
@@ -5061,6 +5062,8 @@ pub fn disk_search_params() -> serde_json::Value {
         point("url-eq", 10, true, "exact", 0),
         point("docid-eq", 10, false, "none", 0),
         point("deep-fetch", 100, true, "exact", 0),
+        point("docid-batch", 100, true, "exact", 0),
+        point("docid-batch", 100, true, "none", 20),
     ])
 }
 

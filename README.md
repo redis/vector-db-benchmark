@@ -2614,6 +2614,7 @@ within a run:
 | `url-eq` | exact `url` | URLs that are safe tags (see below) |
 | `docid-eq` | exact `docid` | every passage with a safe-tag docid (see below) |
 | `deep-fetch` | one rare term, `top: 100`, with `fetch` | df 11–100 |
+| `docid-batch` | `docid` equal to any of 100 docids, `top: 100`, with `fetch` | 100 uniformly random distinct docids (see below) |
 
 Generate the query files once per prepared corpus (deterministic for a seed;
 a rerun verifies the existing files byte for byte):
@@ -2642,7 +2643,9 @@ and `vocabulary.redis_escape_rule`), the number of passages it applied to
 (`vocabulary.passages_with_redis_escape`) and how many otherwise eligible terms
 it removed, overall (`vocabulary.terms_excluded_redis_escape`) and per text
 family (`families.<family>.terms_excluded_redis_escape`). Query files from
-generator v3 or earlier are refused; regenerate them.
+generator v4 or earlier are refused; regenerate them. Generator v5 only adds
+`docid-batch`: the six v4 family files it writes are byte-identical to v4's
+(same seed, same SHA-256), so v4 results stay comparable family by family.
 
 A search point selects one family and a window:
 
@@ -2681,7 +2684,7 @@ A search point selects one family and a window:
   `_source.includes`. Each field must be a `text` or `keyword` schema field;
   `vector` is refused. Every hit of every reply must carry exactly those
   fields, as strings; recorded as `params.fulltext.fetch` (`hits`, `bytes`).
-- `url-eq` and `docid-eq` need no new index option: the text-tag-only layout
+- `url-eq`, `docid-eq` and `docid-batch` need no new index option: the text-tag-only layout
   already indexes every keyword field (Redis `TAG SEPARATOR ; CASESENSITIVE`,
   OpenSearch `keyword`), and the pre-search validator requires them. A
   selected value is a safe tag (printable ASCII, no space, no `;`) and is
@@ -2693,3 +2696,26 @@ A search point selects one family and a window:
   manifest's `tags` block records how many values and rows were excluded.
   Query files from an earlier generator are refused; regenerate them.
 - `deep-fetch` requires `top: 100` and `fetch`.
+- `docid-batch` requires `top: 100` and `fetch`. It is the disk-heavy family:
+  every other family fetches a few documents per query (`rare-term`,
+  `docid-eq`) or many from a few frequent posting lists (`deep-fetch`), which
+  stay in RAM; each `docid-batch` query fetches 100 documents drawn uniformly
+  from the whole corpus. A line is `[[d1, …, d100], 100]`: Redis
+  `@docid:{d1 | d2 | … | d100}` (one TAG union, each docid escaped, under
+  `DIALECT 2`), OpenSearch `bool.filter` `terms` on the `docid` keyword (one
+  term-set query: `indices.query.bool.max_clause_count` does not apply and
+  100 is far below `index.max_terms_count`, 65,536). Its pool is every
+  `docid-eq`-eligible docid (safe tag, not a Redis tag piece of an unsafe
+  docid) that occurs on exactly one passage, so every count is exactly 100
+  and every page is the whole match set (no `WITHOUTCOUNT` probe). The lines
+  are epochs: epoch `e` ranks the pool by a seeded key (`docid-batch/epoch-e`)
+  and cuts it into consecutive batches of 100, so each batch is a uniformly
+  random 100-subset, and no docid repeats within an epoch (about 100,000
+  batches on the 10M corpus; the last `len % 100` docids of each epoch are
+  unused). Epochs follow each other up to `--disk-queries-per-family` timed
+  queries (default 1,000,000: 11 epochs on the 10M corpus), so the pool is not capped by
+  the corpus size. The manifest's `families.docid-batch.batch` records `k`,
+  `epochs`, `batches_per_epoch`, the unused docids per epoch, the docids
+  excluded as duplicates, and the rule. With MS MARCO v2.1 docids a line is
+  3–4 KB, so the default file is 3–4 GB (generation adds about 15 s; the
+  loader hashes the whole file before each search config).
