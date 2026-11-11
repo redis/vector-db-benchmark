@@ -9,6 +9,7 @@ use super::{redis_value_to_json, RedisEngine};
 use crate::config::SearchParams;
 use crate::dataset::Dataset;
 use crate::engine::{redis_utils, SearchResults};
+use vector_db_benchmark::duration_mode::{Dispatcher, Samples};
 use vector_db_benchmark::fulltext;
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
@@ -22,7 +23,7 @@ pub(super) fn resp3_connection(
         .get_connection()
 }
 
-type WorkerOut = (Vec<f64>, Vec<String>, Vec<RawQueryResult>, Option<String>);
+type WorkerOut = (Samples, Vec<String>, Vec<RawQueryResult>, Option<String>);
 
 impl RedisEngine {
     /// Whether this engine config runs the fulltext workload, i.e. whether
@@ -264,23 +265,26 @@ impl RedisEngine {
         let parallel = params.parallel.unwrap_or(1).max(1) as usize;
         let capture = params.capture_query_results;
         let key_prefix = self.config.key_prefix.as_str();
-        let next = AtomicUsize::new(0);
+        // Each timed query once, or (duration mode) the window cycled in
+        // strict dispatch order until the deadline.
+        let deadline = set.deadline();
+        let dispatcher = Dispatcher::new(&order, deadline);
         let pb = self.create_progress_bar(num_to_run);
 
-        let mut times = Vec::with_capacity(num_to_run);
+        let mut times = Samples::new(deadline.is_some());
         let mut errors = Vec::new();
         let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
         let mut capture_failure: Option<String> = None;
         let measured_start = std::thread::scope(|scope| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(scope, "redis-fulltext", parallel);
             for _ in 0..parallel {
-                let (url, commands, order, queries) =
-                    (&self.redis_url, &commands, &order, &set.queries);
-                let (next, pb, rank_violations) = (&next, &pb, &rank_violations);
+                let (url, commands, queries) = (&self.redis_url, &commands, &set.queries);
+                let (dispatcher, pb, rank_violations) = (&dispatcher, &pb, &rank_violations);
                 let (fetched_hits, fetched_bytes) = (&fetched_hits, &fetched_bytes);
                 let cluster_api = self.config.cluster_api;
                 pool.spawn(move |ticket| -> WorkerOut {
-                    let (mut samples, mut errs, mut cap) = (Vec::new(), Vec::new(), Vec::new());
+                    let (mut errs, mut cap) = (Vec::new(), Vec::new());
+                    let mut samples = Samples::new(deadline.is_some());
                     let mut capture_error = None;
                     let mut conn = match resp3_connection(url, cluster_api) {
                         Ok(c) => c,
@@ -300,15 +304,10 @@ impl RedisEngine {
                     }
                     // Prime: the cold first round trip stays out of the window.
                     let _ = commands[prime].query::<redis::Value>(&mut conn);
-                    if ticket.arrive_and_wait().is_none() {
+                    let Some(t0) = ticket.arrive_and_wait() else {
                         return (samples, errs, cap, capture_error);
-                    }
-                    loop {
-                        let seq = next.fetch_add(1, Ordering::Relaxed);
-                        if seq >= order.len() {
-                            break;
-                        }
-                        let i = order[seq];
+                    };
+                    while let Some((seq, i)) = dispatcher.next(t0) {
                         let start = Instant::now();
                         let reply = commands[i].query::<redis::Value>(&mut conn);
                         let elapsed = start.elapsed().as_secs_f64();
@@ -329,7 +328,7 @@ impl RedisEngine {
                             Ok(p)
                         }) {
                             Ok(page) => {
-                                samples.push(elapsed);
+                                samples.push(elapsed, t0);
                                 // `Some` only under capture: the plain timed
                                 // loop builds no id strings.
                                 if let Some(hits) = page.hits {
@@ -357,12 +356,14 @@ impl RedisEngine {
                                         )),
                                         Err(e) => {
                                             capture_error = Some(e);
+                                            dispatcher.failed();
                                             break;
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
+                                dispatcher.failed();
                                 if fulltext::is_rank_violation(&e) {
                                     rank_violations.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -381,7 +382,7 @@ impl RedisEngine {
             }
             let (workers, start) = pool.start()?;
             for (samples, errs, cap, capture_error) in workers {
-                times.extend(samples);
+                times.append(samples);
                 errors.extend(errs);
                 if let Some(records) = captured.as_mut() {
                     records.extend(cap);
@@ -420,8 +421,14 @@ impl RedisEngine {
             "search",
             self.commandstats_baseline.as_ref(),
         )?;
+        // Duration mode: the queries actually dispatched; otherwise the window.
+        let num_to_run = if deadline.is_some() {
+            dispatcher.dispatched()
+        } else {
+            num_to_run
+        };
         let mut result = crate::engine::compute_search_stats(
-            &times,
+            &times.latencies,
             &[],
             &[],
             &[],
@@ -437,6 +444,13 @@ impl RedisEngine {
         let mut meta =
             fulltext::result_metadata_for("redis", &fields, &set, top, &profile, &recorded_marker)?;
         meta["redis_min_stem_len"] = min_stem_len;
+        set.record_duration(
+            &mut meta,
+            num_to_run,
+            times.completed_at(),
+            &times.latencies,
+            total_time,
+        );
         fulltext::record_total_hits(&mut meta, "redis", &total_hits)?;
         match &withoutcount_probe {
             Some(Ok(probe)) => fulltext::record_withoutcount_probe(&mut meta, probe),

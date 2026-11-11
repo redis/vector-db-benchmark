@@ -19,9 +19,16 @@ pub struct Spec {
     pub family: Option<String>,
     /// `msmarco-disk-v1` only: the first query of the family's timed pool this
     /// search config dispatches. Each window must use its own range, since a
-    /// disk-bound family must never repeat a query (default 0).
+    /// disk-bound family never repeats a query across search configs, nor
+    /// within one unless `duration_s` is set. Default 0.
     #[serde(default)]
     pub offset: Option<u64>,
+    /// `msmarco-disk-v1` only: run the point for this many seconds, cycling
+    /// the window `[offset, offset + --queries)` in strict dispatch order
+    /// ([`crate::duration_mode`]). Absent (the default): each timed query of
+    /// the window is dispatched exactly once.
+    #[serde(default)]
+    pub duration_s: Option<f64>,
 }
 
 /// The disk-bound family of a validated spec, when its suite is
@@ -306,6 +313,16 @@ impl Spec {
                  query list)",
                 dq::SUITE
             ));
+        }
+        if let Some(d) = self.duration_s {
+            if self.suite.as_deref() != Some(dq::SUITE) {
+                return Err(format!(
+                    "compound `duration_s` only applies to suite {} (the other suites run their \
+                     whole query list once)",
+                    dq::SUITE
+                ));
+            }
+            crate::duration_mode::check_duration(d)?;
         }
         disk_family(self)?;
         Ok(())
@@ -614,6 +631,7 @@ mod tests {
             queries: None,
             family: None,
             offset: None,
+            duration_s: None,
         };
         let q = spec.load(dir.path(), &schema()).unwrap();
         assert_eq!(q, spec.load(dir.path(), &schema()).unwrap());

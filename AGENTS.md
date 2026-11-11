@@ -96,6 +96,7 @@ src/
   results_dump.rs     # per-query record contract, --dump-results JSONL (#343)
   fulltext.rs         # ranked BM25 workload: query terms, pinned analyzers, index checks (#339)
   hybrid_rrf.rs       # BM25 + KNN fused by server-side RRF: semantics, requests, reference
+  duration_mode.rs    # msmarco-disk-v1 `compound.duration_s`: cycled dispatch, interval record
   compare_results.rs  # compare-results: overlap/Jaccard/rank/count vs a reference
   start_gate.rs       # Worker barrier for parallel search
   build_info.rs       # commit the binaries were built from: `--version`, `params.build`

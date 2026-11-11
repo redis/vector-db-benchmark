@@ -2,7 +2,7 @@
 //! analyzer, the request, the reply contract, the index checks and the result
 //! metadata all come from `vector_db_benchmark::fulltext`.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use opensearch::indices::{IndicesGetMappingParts, IndicesGetSettingsParts};
@@ -11,12 +11,13 @@ use super::{create_os_client, knn_send, uuid_hex_to_int, OpenSearchEngine, Searc
 use crate::config::SearchParams;
 use crate::dataset::Dataset;
 use crate::engine::SearchResults;
+use vector_db_benchmark::duration_mode::{Dispatcher, Samples};
 use vector_db_benchmark::fulltext;
 use vector_db_benchmark::results_dump::{RawHit, RawQueryResult};
 use vector_db_benchmark::start_gate::WorkerPool;
 
 type WorkerOut = (
-    Vec<f64>,
+    Samples,
     Vec<String>,
     u64,
     Vec<RawQueryResult>,
@@ -214,12 +215,15 @@ impl OpenSearchEngine {
         let parallel = params.parallel.unwrap_or(1).max(1) as usize;
         let capture = params.capture_query_results;
         let policy = SearchRetryPolicy::from_env();
-        let next = AtomicUsize::new(0);
+        // Each timed query once, or (duration mode) the window cycled in
+        // strict dispatch order until the deadline.
+        let deadline = set.deadline();
+        let dispatcher = Dispatcher::new(&order, deadline);
         let pb = self.create_progress_bar(num_to_run);
         let (base_url, timeout, index_name) =
             (self.base_url.clone(), self.timeout, self.index_name.clone());
 
-        let mut times = Vec::with_capacity(num_to_run);
+        let mut times = Samples::new(deadline.is_some());
         let mut errors = Vec::new();
         let mut retried_queries = 0u64;
         let mut captured: Option<Vec<RawQueryResult>> = capture.then(Vec::new);
@@ -228,11 +232,11 @@ impl OpenSearchEngine {
             let mut pool = WorkerPool::new(scope, "opensearch-fulltext", parallel);
             for _ in 0..parallel {
                 let (base_url, index_name) = (&base_url, &index_name);
-                let (bodies, order, queries, next, pb) =
-                    (&bodies, &order, &set.queries, &next, &pb);
+                let (bodies, queries, dispatcher, pb) = (&bodies, &set.queries, &dispatcher, &pb);
                 let (fetched_hits, fetched_bytes) = (&fetched_hits, &fetched_bytes);
                 pool.spawn(move |ticket| -> WorkerOut {
-                    let (mut samples, mut errs, mut cap) = (Vec::new(), Vec::new(), Vec::new());
+                    let (mut errs, mut cap) = (Vec::new(), Vec::new());
+                    let mut samples = Samples::new(deadline.is_some());
                     let (mut retried, mut capture_error) = (0u64, None);
                     let setup = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -248,15 +252,10 @@ impl OpenSearchEngine {
                     };
                     // Prime: the cold first round trip stays out of the window.
                     let _ = knn_send(&rt, &client, index_name, &bodies[prime], policy);
-                    if ticket.arrive_and_wait().is_none() {
+                    let Some(t0) = ticket.arrive_and_wait() else {
                         return (samples, errs, retried, cap, capture_error);
-                    }
-                    loop {
-                        let seq = next.fetch_add(1, Ordering::Relaxed);
-                        if seq >= order.len() {
-                            break;
-                        }
-                        let i = order[seq];
+                    };
+                    while let Some((seq, i)) = dispatcher.next(t0) {
                         let query_id = queries[i].query_id;
                         // Timed: send + receive + decode, as on the KNN path.
                         let start = Instant::now();
@@ -284,7 +283,7 @@ impl OpenSearchEngine {
                                 // (the KNN path's contract).
                                 let t = elapsed.saturating_sub(cost.overhead).as_secs_f64();
                                 retried += u64::from(cost.retried);
-                                samples.push(t);
+                                samples.push(t, t0);
                                 // `Some` only under capture.
                                 if let Some(hits) = page.hits {
                                     let rows = hits
@@ -306,12 +305,14 @@ impl OpenSearchEngine {
                                         )),
                                         Err(e) => {
                                             capture_error = Some(e);
+                                            dispatcher.failed();
                                             break;
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
+                                dispatcher.failed();
                                 if capture {
                                     cap.push(RawQueryResult::failed(
                                         query_id,
@@ -332,7 +333,7 @@ impl OpenSearchEngine {
             }
             let (workers, start) = pool.start()?;
             for (samples, errs, retried, cap, capture_error) in workers {
-                times.extend(samples);
+                times.append(samples);
                 errors.extend(errs);
                 retried_queries += retried;
                 if let Some(records) = captured.as_mut() {
@@ -345,6 +346,12 @@ impl OpenSearchEngine {
             Ok(start)
         })?;
         let total_time = measured_start.elapsed().as_secs_f64();
+        // Duration mode: the queries actually dispatched; otherwise the window.
+        let num_to_run = if deadline.is_some() {
+            dispatcher.dispatched()
+        } else {
+            num_to_run
+        };
         if spec.compound.is_some() && !errors.is_empty() {
             return Err(format!(
                 "compound suite failed ({} errors): {}",
@@ -371,7 +378,7 @@ impl OpenSearchEngine {
             return Err(format!("--dump-results: {e}"));
         }
         let mut result = crate::engine::compute_search_stats(
-            &times,
+            &times.latencies,
             &[],
             &[],
             &[],
@@ -391,6 +398,13 @@ impl OpenSearchEngine {
             &profile,
             &recorded_marker,
         )?;
+        set.record_duration(
+            &mut meta,
+            num_to_run,
+            times.completed_at(),
+            &times.latencies,
+            total_time,
+        );
         fulltext::record_total_hits(&mut meta, "opensearch", &total_hits)?;
         fulltext::record_fetch(
             &mut meta,

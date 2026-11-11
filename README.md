@@ -2604,7 +2604,7 @@ are compiled against the reduced schema.
 The `msmarco-v1` suite repeats 32 queries per family over common terms, so the
 working set stays in memory. `msmarco-disk-v1` is opt-in and identical on both
 engines; each family has at least 100,000 distinct queries, none repeated
-within a run:
+within a run (unless a point opts in to duration mode, below):
 
 | Family | Query | Selection |
 |---|---|---|
@@ -2660,7 +2660,8 @@ A search point selects one family and a window:
 - `compound.family` is required; `compound.offset` (default 0) is the first
   timed line of the family. `--queries N` runs lines `offset .. offset + N`
   once each (`--queries -1`: the rest of the family). A window past the end of
-  the family is refused before connecting — queries are never cycled — as is
+  the family is refused before connecting — by default queries are never
+  cycled (duration mode, below, is the opt-in exception) — as is
   `--repetitions` above 1. So are overlapping windows of one family on one
   dataset and one engine type anywhere in the invocation: within one engine
   config (refused before that config connects), and across engine configs
@@ -2670,6 +2671,56 @@ A search point selects one family and a window:
   Windows across invocations are the caller's to keep disjoint;
   each result records its window (`params.fulltext.compound.window`) and the
   SHA-256 of the queries it served.
+- Duration mode (opt-in): `compound.duration_s` runs the point for that many
+  seconds instead of one pass. The window is still
+  `offset .. offset + --queries`, loaded once. The workers take its queries in
+  strict dispatch order and wrap to the start of the window when they reach
+  its end: dispatch `k`, counted across all workers, sends line
+  `first_line + (k mod N)`, on every engine. No query is dispatched after the
+  deadline. A query in flight at the deadline completes and is counted.
+  `rps` is completed queries over the timed span (start to last completion).
+  Every reply gets the same checks as in a single pass: exact count, score
+  order, fetched fields, and `--fail-on-dropped-queries`.
+  `requested_queries` is the number dispatched.
+  `params.fulltext.compound.duration` records the mode, the window, the
+  queries dispatched and completed, `full_passes` and `partial_position`
+  (dispatched = full_passes × N + partial_position), `repeated` (whether any
+  query ran twice), the timed span, `completed_after_deadline`,
+  `qps_by_deadline`, `last_completion_s`, and the completions on the client
+  clock in 10 s and 60 s `intervals` (`width_s`, `buckets`), each bucket with
+  `start_s`, `end_s`, `completed`, `qps`, `p50_time`, `p95_time`, `p99_time`
+  and `max_time` (seconds). The buckets cover `[0, duration_s)`, so they sum
+  to `completed_by_deadline`; completions after the deadline are summarized
+  in `after_deadline`. `timed_span_s` runs until every worker has joined (the
+  last completion plus worker teardown, milliseconds). The first failed query
+  stops dispatch and the point is refused.
+  `compound.duration_s` is part of the result identity
+  (`compound.sha256`), and is absent from it when unset, so single-pass
+  identities do not change. Cache caveat: once the window wraps, every query
+  has run before and may be served from the page cache or an engine cache
+  that the first pass warmed. A cycled point is a cold-read point only while
+  `repeated` is false. A run that cycles prints a warning. With one window
+  and one duration, a faster engine runs more passes and so repeats more
+  queries: compare `full_passes` before quoting a head-to-head (or size the
+  window so `repeated` stays false on both). Make the window as large as
+  memory allows, within the family's timed pool (the manifest's
+  `timed_queries`): it is held in memory for the whole run (about 20 KB per
+  query for `docid-batch`). Memory also grows with the queries completed:
+  16 bytes each, and with `--dump-results` one record per dispatch (about
+  0.3 KB at `top: 10`, 2.5 KB at `top: 100`), so a long high-QPS point with
+  a dump needs gigabytes.
+  `--repetitions` above 1 is still refused. Without `duration_s` nothing
+  changes. Example, a 600 s point over a 1M-query window:
+
+  ```json
+  "compound": {"suite": "msmarco-disk-v1", "family": "rare-term", "offset": 0,
+               "duration_s": 600}
+  ```
+
+  ```bash
+  vector-db-benchmark --engines <config> --datasets <dataset> \
+    --queries 1000000 --repetitions 1 --fail-on-dropped-queries
+  ```
 - The first line of each family file is the (untimed) prime query and the
   next 64 are reserved for the Redis `WITHOUTCOUNT` probe, which runs only
   when some timed query has more matches than `top`. The reserve holds the 64

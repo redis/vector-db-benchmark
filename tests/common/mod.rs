@@ -5199,3 +5199,111 @@ pub fn assert_disk_run(root: &Path, engine: &str, config: &str, dump: &Path) {
     }
     assert_eq!(dumps, params.as_array().unwrap().len());
 }
+
+/// Duration mode: one `rare-term` point over a [`DISK_DURATION_WINDOW`]-query
+/// window, fetch on, run for [`DISK_DURATION_S`] seconds — long enough to
+/// wrap such a small window many times on a local server.
+pub const DISK_DURATION_WINDOW: usize = 5;
+pub const DISK_DURATION_OFFSET: usize = 40;
+pub const DISK_DURATION_S: f64 = 2.0;
+
+pub fn disk_duration_search_params() -> serde_json::Value {
+    serde_json::json!([{"parallel":2,"top":10,"workload":"fulltext","fulltext":{
+        "analysis":"parity","fields":{"title":1.0,"segment":1.0},"no_vector_index":true,
+        "scalar_indexing":"text-tag-only","total_hits":"exact","fetch":DISK_FETCH,
+        "compound":{"suite":"msmarco-disk-v1","family":"rare-term",
+            "offset":DISK_DURATION_OFFSET,"duration_s":DISK_DURATION_S}}}])
+}
+
+/// Every claim of a [`disk_duration_search_params`] run: the result records
+/// the cycled window and its passes consistently with what was dispatched,
+/// and the dump holds every dispatch, sequence numbers without a gap, dispatch
+/// `k` being window line `k mod window`, each reply carrying its line's exact
+/// count and a full page of distinct ids.
+pub fn assert_disk_duration_run(root: &Path, config: &str, dump: &Path) {
+    use vector_db_benchmark::msmarco::disk_queries::{Family, DIR, RESERVED};
+    let ds = root.join("datasets").join(DISK_DATASET);
+    let mut results = Vec::new();
+    for entry in fs::read_dir(root.join("results")).unwrap() {
+        let p = entry.unwrap().path();
+        let n = p.file_name().unwrap().to_string_lossy().to_string();
+        if n.starts_with(&format!("{config}-")) && n.contains("-search-") {
+            results.push(p);
+        }
+    }
+    assert_eq!(results.len(), 1, "{results:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&results[0]).unwrap()).unwrap();
+    let ft = &doc["params"]["fulltext"];
+    let r = &ft["compound"]["duration"];
+    assert_eq!(ft["compound"]["duration_s"], DISK_DURATION_S, "{ft}");
+    assert_eq!(r["mode"], "cycle-window", "{r}");
+    assert_eq!(r["window"]["queries"], DISK_DURATION_WINDOW, "{r}");
+    assert_eq!(r["window"]["offset"], DISK_DURATION_OFFSET, "{r}");
+    let dispatched = r["dispatched"].as_u64().unwrap() as usize;
+    assert_eq!(doc["results"]["requested_queries"], dispatched, "{doc}");
+    assert_eq!(doc["results"]["failed_queries"], 0, "{doc}");
+    assert_eq!(r["completed"], dispatched, "{r}");
+    assert!(dispatched > 2 * DISK_DURATION_WINDOW, "{r}");
+    assert_eq!(r["repeated"], true, "{r}");
+    assert_eq!(
+        r["full_passes"].as_u64().unwrap() as usize * DISK_DURATION_WINDOW
+            + r["partial_position"].as_u64().unwrap() as usize,
+        dispatched,
+        "{r}"
+    );
+    assert!(
+        r["timed_span_s"].as_f64().unwrap() >= DISK_DURATION_S,
+        "{r}"
+    );
+    for iv in r["intervals"].as_array().unwrap() {
+        let sum: u64 = iv["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["completed"].as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, r["completed_by_deadline"].as_u64().unwrap(), "{iv}");
+    }
+    assert_eq!(
+        r["completed_by_deadline"].as_u64().unwrap()
+            + r["completed_after_deadline"].as_u64().unwrap(),
+        dispatched as u64
+    );
+    // Each of the 2 workers has at most one query in flight at the deadline:
+    // the end-to-end form of "nothing is dispatched after the deadline".
+    assert!(r["completed_after_deadline"].as_u64().unwrap() <= 2, "{r}");
+    assert!(
+        ft["fetch"]["hits"].as_u64().unwrap() >= dispatched as u64,
+        "{ft}"
+    );
+
+    let file_lines: Vec<serde_json::Value> =
+        fs::read_to_string(ds.join(DIR).join(Family::RareTerm.file_name()))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    let files: Vec<_> = fs::read_dir(dump).unwrap().collect();
+    assert_eq!(files.len(), 1);
+    let text = fs::read_to_string(files.into_iter().next().unwrap().unwrap().path()).unwrap();
+    let mut rows: Vec<serde_json::Value> = text
+        .lines()
+        .skip(1)
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    rows.sort_by_key(|r| r["seq"].as_u64().unwrap());
+    assert_eq!(rows.len(), dispatched);
+    for (k, row) in rows.iter().enumerate() {
+        assert!(row["error"].is_null(), "{row}");
+        assert_eq!(row["seq"], k, "{row}");
+        let line = RESERVED + DISK_DURATION_OFFSET + k % DISK_DURATION_WINDOW;
+        assert_eq!(row["query_id"], line, "dispatch {k}: {row}");
+        let (_, count) = Family::RareTerm.conditions(&file_lines[line]).unwrap();
+        assert_eq!(row["total"], count, "{row}");
+        let ids = row["ids"].as_array().unwrap();
+        assert_eq!(ids.len() as u64, count.min(10), "{row}");
+        let distinct: std::collections::HashSet<_> = ids.iter().map(|v| v.to_string()).collect();
+        assert_eq!(distinct.len(), ids.len(), "{row}");
+    }
+}
