@@ -213,7 +213,8 @@ struct Args {
     add_disk_queries: bool,
 
     /// Timed queries per disk family (`--add-disk-queries`), capped by each
-    /// family's eligible pool; at least 100000.
+    /// family's eligible pool (`docid-batch` is not capped: its epochs reach
+    /// any count); at least 100000.
     #[arg(long, default_value_t = msmarco::disk_queries::DEFAULT_PER_FAMILY, requires = "add_disk_queries")]
     disk_queries_per_family: usize,
 
@@ -2151,11 +2152,16 @@ fn add_disk_queries(args: &Args) -> Result<(), String> {
         let mut names: Vec<String> = dq::Family::ALL.iter().map(|f| f.file_name()).collect();
         names.push(dq::MANIFEST.to_string());
         for name in &names {
-            let old = std::fs::read(target.join(name))
-                .map_err(|e| format!("{}: {e}", target.join(name).display()))?;
+            // A file the existing directory lacks (written by an earlier
+            // generator, before its family existed) differs too.
+            let old = match std::fs::read(target.join(name)) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("{}: {e}", target.join(name).display())),
+            };
             let new = std::fs::read(staging.join(name))
                 .map_err(|e| format!("{}: {e}", staging.join(name).display()))?;
-            if old != new {
+            if old.as_ref() != Some(&new) {
                 return Err(format!(
                     "{} differs from a fresh generation ({name}); the new files are in {} — \
                      remove {} yourself to replace it",

@@ -164,7 +164,7 @@ mod tests {
                 .is_ok()
         );
     }
-    /// The msmarco-disk-v1 `url-eq` / `docid-eq` families need no new index
+    /// The msmarco-disk-v1 `url-eq` / `docid-eq` / `docid-batch` families need no new index
     /// flag: the reduced layout already keeps every keyword field, and the
     /// pre-search validators already require each one as a CASESENSITIVE
     /// TAG (Redis) / case-sensitive keyword (OpenSearch). A reduced index

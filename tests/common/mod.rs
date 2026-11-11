@@ -5041,8 +5041,10 @@ pub fn write_disk_project(engine_configs_json: &str) -> MatchAnyProject {
     }
 }
 
-/// One search config per family, plus a second `rare-term` window; fetch on
-/// and off, `total_hits` exact and none, `deep-fetch` at top 100.
+/// One search config per family, plus a second `rare-term` and a second
+/// `docid-batch` window; fetch on and off, `total_hits` exact and none,
+/// `deep-fetch` and `docid-batch` at top 100 (`docid-batch` only `exact`:
+/// it refuses `none`).
 pub fn disk_search_params() -> serde_json::Value {
     let point = |family: &str, top: usize, fetch: bool, total: &str, offset: u64| {
         let mut ft = serde_json::json!({"analysis":"parity","fields":{"title":1.0,"segment":1.0},
@@ -5061,6 +5063,8 @@ pub fn disk_search_params() -> serde_json::Value {
         point("url-eq", 10, true, "exact", 0),
         point("docid-eq", 10, false, "none", 0),
         point("deep-fetch", 100, true, "exact", 0),
+        point("docid-batch", 100, true, "exact", 0),
+        point("docid-batch", 100, true, "exact", 20),
     ])
 }
 
@@ -5116,6 +5120,13 @@ pub fn assert_disk_run(root: &Path, engine: &str, config: &str, dump: &Path) {
         } else {
             assert_eq!(fetch["fields"], serde_json::json!(DISK_FETCH), "{ft}");
             assert!(fetch["hits"].as_u64().unwrap() > 0, "{ft}");
+            if ft["compound"]["family"] == "docid-batch" {
+                // Every timed query fetches its whole batch.
+                assert!(
+                    fetch["hits"].as_u64().unwrap() >= (100 * DISK_QUERIES) as u64,
+                    "{ft}"
+                );
+            }
             assert!(fetch["bytes"].as_u64().unwrap() > 0, "{ft}");
             match engine {
                 "redis" => assert!(ft["engine_settings"]["command"]

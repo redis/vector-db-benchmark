@@ -1494,7 +1494,11 @@ pub fn load_query_set_for(
         Ok(())
     };
     if let Some(family) = crate::compound_text::disk_family(compound)? {
-        family.check_params(top, spec.fetch.is_some())?;
+        family.check_params(
+            top,
+            spec.fetch.is_some(),
+            spec.total_hits == Some(TotalHits::None),
+        )?;
         let count = (num_queries > 0).then_some(num_queries as usize);
         let w = crate::msmarco::disk_queries::load_window(
             dir,
@@ -5417,6 +5421,55 @@ mod tests {
             5
         )
         .is_ok());
+        // docid-batch is the fetch of its whole batch, nothing else; its
+        // page is the whole match set, so `none` needs no probe.
+        let fetch = json!({"fetch":["title","segment","url"]});
+        assert!(load("docid-batch", fetch.clone(), 10, 5)
+            .unwrap_err()
+            .contains("docid-batch"));
+        assert!(load("docid-batch", json!({}), 100, 5)
+            .unwrap_err()
+            .contains("fetch"));
+        let none = json!({"fetch":["title","segment","url"],"total_hits":"none"});
+        let e = load("docid-batch", none, 100, 5).unwrap_err();
+        assert!(e.contains("exact") && e.contains("WITHOUTCOUNT"), "{e}");
+        let batch = load("docid-batch", fetch, 100, 5).unwrap();
+        assert!(
+            batch
+                .queries
+                .iter()
+                .all(|q| q.compound.as_ref().unwrap().expected_count
+                    == Some(dq::DOCID_BATCH_K as u64))
+        );
+        assert_eq!(
+            batch.withoutcount_probe_plan(100),
+            ProbePlan::NotNeeded(PROBE_NOT_NEEDED)
+        );
+        let q = &batch.queries[batch.window.as_ref().unwrap().timed_from];
+        let redis = query_redis(&[], q);
+        assert!(
+            redis.starts_with("(@docid:{") && redis.matches(" | ").count() == 99,
+            "{redis}"
+        );
+        let body = query_opensearch_fetch(
+            &[],
+            q,
+            100,
+            TotalHits::Exact,
+            Some(&[
+                "title".to_string(),
+                "segment".to_string(),
+                "url".to_string(),
+            ]),
+        );
+        assert_eq!(body["size"], 100);
+        assert_eq!(
+            body["query"]["bool"]["filter"][0]["terms"]["docid"]
+                .as_array()
+                .unwrap()
+                .len(),
+            100
+        );
         // The legacy loader refuses the per-window suite.
         assert!(load_query_set(
             &dir,
@@ -5434,14 +5487,21 @@ mod tests {
         // The generator's reserve covers every top below the timed maximum,
         // for every family, so `none` loads and the probe has truncated
         // pages to compare.
-        for family in dq::Family::ALL {
-            let fetch = family == dq::Family::DeepFetch;
+        // (docid-batch refuses `none`; its page is its whole match set.)
+        for family in dq::Family::ALL
+            .into_iter()
+            .filter(|f| *f != dq::Family::DocidBatch)
+        {
+            let fixed = family.fixed_top();
             let mut extra = json!({"total_hits":"none"});
-            if fetch {
+            if fixed.is_some() {
                 extra["fetch"] = json!(["title", "segment", "url"]);
             }
             let spec = parse_spec(Some(&disk_block(family.name(), extra))).unwrap();
-            let tops: Vec<usize> = if fetch { vec![100] } else { vec![1, 2, 5, 10] };
+            let tops: Vec<usize> = match fixed {
+                Some(top) => vec![top],
+                None => vec![1, 2, 5, 10],
+            };
             for top in tops {
                 let set = load_query_set_for(&dir, &spec, Some(&schema), top, 50).unwrap();
                 let w = set.window.as_ref().unwrap();
