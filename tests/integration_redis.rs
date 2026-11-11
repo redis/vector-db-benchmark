@@ -7091,6 +7091,7 @@ fn test_binary_redis_disk_suite_duration_mode_cycles_the_window() {
         TEST_HOST,
         &[("REDIS_PORT", port.as_str())],
         &[
+            "--keep-data",
             "--queries",
             n.as_str(),
             "--repetitions",
