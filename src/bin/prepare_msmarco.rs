@@ -213,8 +213,9 @@ struct Args {
     add_disk_queries: bool,
 
     /// Timed queries per disk family (`--add-disk-queries`), capped by each
-    /// family's eligible pool (`docid-batch` is not capped: its epochs reach
-    /// any count); at least 100000.
+    /// family's eligible pool (the batch families are not capped: their
+    /// epochs reach any count; `docid-batch-500`/`-1000` and `url-batch` hold
+    /// this × 100 / values-per-line, at least 100000); at least 100000.
     #[arg(long, default_value_t = msmarco::disk_queries::DEFAULT_PER_FAMILY, requires = "add_disk_queries")]
     disk_queries_per_family: usize,
 
@@ -2162,9 +2163,14 @@ fn add_disk_queries(args: &Args) -> Result<(), String> {
             let new = std::fs::read(staging.join(name))
                 .map_err(|e| format!("{}: {e}", staging.join(name).display()))?;
             if old.as_ref() != Some(&new) {
+                let what = if old.is_none() {
+                    "lacks a file a fresh generation writes (an earlier generator wrote it)"
+                } else {
+                    "differs from a fresh generation"
+                };
                 return Err(format!(
-                    "{} differs from a fresh generation ({name}); the new files are in {} — \
-                     remove {} yourself to replace it",
+                    "{} {what} ({name}); the new files are in {} — replace {} with them \
+                     (e.g. remove it and move the staging directory into its place)",
                     target.display(),
                     staging.display(),
                     target.display()

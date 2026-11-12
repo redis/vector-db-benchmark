@@ -5012,7 +5012,9 @@ pub fn write_disk_project(engine_configs_json: &str) -> MatchAnyProject {
     dq::generate(
         &ds,
         &dq::GenerateOptions {
-            per_family: 100,
+            // docid-batch-1000 holds per_family / 10 timed lines: 20, one
+            // DISK_QUERIES window.
+            per_family: 200,
             seed: 1,
             min_per_family: 5,
         },
@@ -5065,6 +5067,11 @@ pub fn disk_search_params() -> serde_json::Value {
         point("deep-fetch", 100, true, "exact", 0),
         point("docid-batch", 100, true, "exact", 0),
         point("docid-batch", 100, true, "exact", 20),
+        point("docid-batch-500", 500, true, "exact", 0),
+        point("docid-batch-1000", 1000, true, "exact", 0),
+        point("url-batch", 100, true, "exact", 0),
+        point("rare-terms-or", 100, true, "exact", 0),
+        point("rare-terms-or-and-category", 100, true, "exact", 0),
     ])
 }
 
@@ -5120,8 +5127,20 @@ pub fn assert_disk_run(root: &Path, engine: &str, config: &str, dump: &Path) {
         } else {
             assert_eq!(fetch["fields"], serde_json::json!(DISK_FETCH), "{ft}");
             assert!(fetch["hits"].as_u64().unwrap() > 0, "{ft}");
-            if ft["compound"]["family"] == "docid-batch" {
+            let family = vector_db_benchmark::msmarco::disk_queries::Family::parse(
+                ft["compound"]["family"].as_str().unwrap(),
+            )
+            .unwrap();
+            if family.is_docid_batch() {
                 // Every timed query fetches its whole batch.
+                let k = family.batch_size().unwrap();
+                assert!(
+                    fetch["hits"].as_u64().unwrap() >= (k * DISK_QUERIES) as u64,
+                    "{ft}"
+                );
+            } else if family.batch_size().is_some() {
+                // url-batch / rare-terms-or*: a full 100-hit page each (their
+                // unions are larger than the page on the fixture).
                 assert!(
                     fetch["hits"].as_u64().unwrap() >= (100 * DISK_QUERIES) as u64,
                     "{ft}"
