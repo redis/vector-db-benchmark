@@ -5072,6 +5072,7 @@ pub fn disk_search_params() -> serde_json::Value {
         point("url-batch", 100, true, "exact", 0),
         point("rare-terms-or", 100, true, "exact", 0),
         point("rare-terms-or-and-category", 100, true, "exact", 0),
+        point("rare-terms-or-wide", 100, true, "exact", 0),
     ])
 }
 
@@ -5138,9 +5139,27 @@ pub fn assert_disk_run(root: &Path, engine: &str, config: &str, dump: &Path) {
                     fetch["hits"].as_u64().unwrap() >= (k * DISK_QUERIES) as u64,
                     "{ft}"
                 );
+            } else if family == Family::RareTermsOrWide {
+                // Its unions are mostly smaller than the page (most terms
+                // have df 1-3): at least min(count, 100) per window line
+                // (each reply's page is checked exactly against the dump
+                // below).
+                let offset = ft["compound"]["offset"].as_u64().unwrap() as usize;
+                let want: u64 = fs::read_to_string(ds.join(DIR).join(family.file_name()))
+                    .unwrap()
+                    .lines()
+                    .skip(RESERVED + offset)
+                    .take(DISK_QUERIES)
+                    .map(|l| {
+                        let line: serde_json::Value = serde_json::from_str(l).unwrap();
+                        family.conditions(&line).unwrap().1.min(100)
+                    })
+                    .sum();
+                assert!(fetch["hits"].as_u64().unwrap() >= want, "{ft}");
             } else if family.batch_size().is_some() {
-                // url-batch / rare-terms-or*: a full 100-hit page each (their
-                // unions are larger than the page on the fixture).
+                // url-batch / rare-terms-or, rare-terms-or-and-category: a
+                // full 100-hit page each (their unions are larger than the
+                // page on the fixture).
                 assert!(
                     fetch["hits"].as_u64().unwrap() >= (100 * DISK_QUERIES) as u64,
                     "{ft}"
