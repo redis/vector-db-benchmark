@@ -2163,9 +2163,14 @@ fn add_disk_queries(args: &Args) -> Result<(), String> {
             let new = std::fs::read(staging.join(name))
                 .map_err(|e| format!("{}: {e}", staging.join(name).display()))?;
             if old.as_ref() != Some(&new) {
+                let what = if old.is_none() {
+                    "lacks a file a fresh generation writes (an earlier generator wrote it)"
+                } else {
+                    "differs from a fresh generation"
+                };
                 return Err(format!(
-                    "{} differs from a fresh generation ({name}); the new files are in {} — \
-                     remove {} yourself to replace it",
+                    "{} {what} ({name}); the new files are in {} — replace {} with them \
+                     (e.g. remove it and move the staging directory into its place)",
                     target.display(),
                     staging.display(),
                     target.display()

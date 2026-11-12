@@ -1555,6 +1555,7 @@ pub fn load_query_set_for(
             spec.fetch.is_some(),
             spec.total_hits == Some(TotalHits::None),
         )?;
+        family.check_fetch_fields(spec.fetch.as_deref())?;
         let count = (num_queries > 0).then_some(num_queries as usize);
         let w = crate::msmarco::disk_queries::load_window(
             dir,
@@ -5556,6 +5557,15 @@ mod tests {
             let none = json!({"fetch":["title","segment","url"],"total_hits":"none"});
             let e = load(name, none, top, 5).unwrap_err();
             assert!(e.contains("exact") && e.contains("WITHOUTCOUNT"), "{e}");
+            // Fetch parity: exactly title, segment, url, in that order.
+            for other in [
+                json!({"fetch":["title","segment"]}),
+                json!({"fetch":["url","title","segment"]}),
+                json!({"fetch":["title","segment","url","docid"]}),
+            ] {
+                let e = load(name, other, top, 5).unwrap_err();
+                assert!(e.contains("fetch parity"), "{e}");
+            }
             let set = load(name, fetch.clone(), top, 5).unwrap();
             let q = &set.queries[set.window.as_ref().unwrap().timed_from];
             let expected = q.compound.as_ref().unwrap().expected_count.unwrap();
@@ -5692,7 +5702,7 @@ mod tests {
     /// (901e8c3, before duration mode) pinned
     /// `5a7ddc4c5feff1bd8554c8f2c08ffe8546cd73e35a5a6e7717e2cf53aa5f6df7`.
     const SINGLE_PASS_IDENTITY: &str =
-        "0f0e0e855ed4f1c52d9631754586f60556566aed1314202a60f47cad797ba206";
+        "59742c10771427be1eafb2811b04c25c52693b1669c4152a4e3c8833c5ecca9a";
 
     #[test]
     fn disk_duration_mode_cycles_the_window_records_it_and_keeps_single_pass_identity() {

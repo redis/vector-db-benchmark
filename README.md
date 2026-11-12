@@ -2653,6 +2653,14 @@ generator v4 or earlier are refused; regenerate them. Generator v5 only adds
 (same seed, same SHA-256), so v4 results stay comparable family by family.
 Generator v6 only adds the high-pressure families (below): the seven v5
 family files are byte-identical to v5's, and v5 query files are refused.
+The queries are the same, but a result's compound identity
+(`compound.sha256`) covers the window record, which names the generator and
+the manifest SHA-256. So `compare-results` refuses to pair a v5 result with
+a v6 one, even for a byte-identical family. Pair them by hand: same family,
+offset and seed, and equal `params.fulltext.compound.window.family_file_sha256`.
+Rerunning `--add-disk-queries` on a v5 directory reports the first new file
+as differing (it is missing) and leaves the fresh generation in the staging
+directory: replace the v5 directory with it.
 
 A search point selects one family and a window:
 
@@ -2794,7 +2802,9 @@ A search point selects one family and a window:
   only if it both matches many documents spread over the whole corpus and
   fetches a large page. Each of these does, with the same semantics, exact
   count, fetched fields and page size on both engines. All of them require
-  `fetch` and `total_hits: "exact"` (`"none"` is refused before connecting;
+  `fetch` to be exactly `["title", "segment", "url"]` (any other field list
+  is refused before connecting, so the same stored bytes leave each engine
+  per hit) and `total_hits: "exact"` (`"none"` is refused before connecting;
   Redis Flex rejects `WITHOUTCOUNT`), and run at a fixed `top`:
 
   | Family | Line | Query | `top` | Count |
@@ -2845,15 +2855,45 @@ A search point selects one family and a window:
     timed lines (at least 100,000), K being the values per line, so each file
     holds about as many tag values as `docid-batch` (3–4 GB at 10M): 200,000
     lines for `docid-batch-500`, 100,000 for `docid-batch-1000`, 333,333 for
-    `url-batch` by default (URLs are longer than docids: ~7 GB). Each loaded
-    query costs the client about K × 0.2 KB (200 KB at K = 1,000): size
-    `--queries` to client memory. `rare-terms-or*` lines are ~0.4 KB (1M
-    lines). Generation keeps `url-batch` and `rare-terms-or*` lines in memory
-    as 4-byte ids (~0.4 GB and ~0.16 GB each).
-  - Only the count is checked: BM25 differs between the engines (IDF, length
-    normalization), so the top 100 of a 1,000-passage union are not the same
-    documents on both; and tag-only unions are unranked (compare those ids as
-    sets).
+    `url-batch` by default (URLs are longer than docids: ~7 GB); with MS
+    MARCO docids of ~40 characters a docid file is closer to 4.5 GB. The
+    whole query directory is ~20 GB at 10M. `rare-terms-or*` lines are
+    ~0.4 KB on disk (1M lines).
+  - Client memory. The runner keeps every loaded query three times (its
+    conditions, the compiled expression and the prepared request), measured
+    at about 312 KB per `docid-batch-1000` query, 157 KB per
+    `docid-batch-500`, 164 KB per `url-batch` (~0.55 KB per URL) and ~30 KB
+    per `rare-terms-or*` query (the conditions hold two JSON objects per
+    term). `--queries -1` loads the whole timed pool, 30–55 GB for each of
+    these families, so always set `--queries`. For a 10-minute duration-mode
+    point (`compound.duration_s: 600`) use at most 20,000 queries for
+    `docid-batch-1000`, 40,000 for `docid-batch-500` and `url-batch`, and
+    150,000 for `rare-terms-or` and `rare-terms-or-and-category` (4.5–6.6 GB
+    each). With `--dump-results`, each query's page (up to 1,000 ids) is kept
+    until the run ends and written out: budget a few more GB at top 1,000.
+  - Generator memory. Generation keeps `url-batch` and `rare-terms-or*` lines
+    in memory as 4-byte ids (~0.4 GB and ~0.16 GB each), plus the passage
+    count of every eligible URL (~1 GB at 10M, including the URL strings) and
+    a category and key per passage (12 bytes each): about 2 GB of peak RSS
+    over v5 at 10M.
+  - Only the count is checked. BM25 differs between the engines (IDF and
+    length normalization), so the top 100 of a 1,000-passage `rare-terms-or`
+    union are not the same documents on both. Tag-only unions are unranked:
+    every `url-batch` hit ties (constant Redis tag scores, a zero-score
+    OpenSearch filter), so each engine returns its own document order and the
+    100 fetched passages differ too (compare those ids as sets). The page
+    size and fields are the same, but per-query fetched bytes and their
+    locality are not: compare `params.fulltext.fetch.bytes` before
+    attributing a throughput gap to the engine.
+  - `rare-terms-or-and-category` takes the category of a random passage of
+    the union, so on a corpus with many (or skewed) categories many lines
+    match fewer than 100 passages and fetch a short page (the same on both
+    engines). Its manifest `expected_count` distribution shows how often.
+  - The Redis query of an OR of single words on one field is one
+    field-scoped union, `@f:(a | b)`, for every compound query, not only
+    these families. It matches the same documents as `@f:(a) | @f:(b)`, but
+    an explicit compound query with such an OR now sends a different Redis
+    string under the same identity.
 - `docid-batch` sizes: with MS MARCO v2.1 docids a line is 3–4 KB, so the
   default file is 3–4 GB (a synthetic 10M-docid pool generated in about 12 s
   at 2 GB peak RSS; the loader hashes the whole file before each search

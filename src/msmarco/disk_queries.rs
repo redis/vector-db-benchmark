@@ -202,18 +202,32 @@ pub const DOCID_BATCH_LINE_BUDGET_K: usize = DOCID_BATCH_K;
 pub const OPENSEARCH_MAX_RESULT_WINDOW: usize = 10_000;
 /// OpenSearch `index.max_terms_count` default: the most values of a `terms`.
 pub const OPENSEARCH_MAX_TERMS_COUNT: usize = 65_536;
-/// OpenSearch `indices.query.bool.max_clause_count` default (1,024): a
-/// `rare-terms-or` query is one `bool.should` clause per term.
+/// OpenSearch `indices.query.bool.max_clause_count` default (1,024). Lucene
+/// counts the leaf queries of the whole rewritten query, not per `bool`: a
+/// `rare-terms-or` query has one `match` (one term query) per term, the
+/// category variant one more for the category filter. A `terms` query is
+/// one term-set query and does not count per value.
 pub const OPENSEARCH_MAX_CLAUSE_COUNT: usize = 1_024;
 const _: () = {
-    assert!(DOCID_BATCH_1000_K <= OPENSEARCH_MAX_RESULT_WINDOW);
-    assert!(DOCID_BATCH_1000_K <= OPENSEARCH_MAX_TERMS_COUNT);
-    assert!(URL_BATCH_N <= OPENSEARCH_MAX_TERMS_COUNT);
+    let tag_batches = [
+        DOCID_BATCH_K,
+        DOCID_BATCH_500_K,
+        DOCID_BATCH_1000_K,
+        URL_BATCH_N,
+    ];
+    let mut i = 0;
+    while i < tag_batches.len() {
+        assert!(tag_batches[i] <= OPENSEARCH_MAX_TERMS_COUNT);
+        assert!(tag_batches[i] <= OPENSEARCH_MAX_RESULT_WINDOW);
+        i += 1;
+    }
     assert!(HIGH_PRESSURE_TOP <= OPENSEARCH_MAX_RESULT_WINDOW);
-    // The bool.should of rare-terms-or-and-category sits in a bool.must
-    // beside the category filter: N + 1 clauses.
+    // Every term of rare-terms-or-and-category plus its category filter.
     assert!(RARE_OR_N < OPENSEARCH_MAX_CLAUSE_COUNT);
 };
+/// The fields every v6 high-pressure family fetches, on both engines, in
+/// this order: the same stored bytes leave each engine per hit.
+pub const HIGH_PRESSURE_FETCH: [&str; 3] = ["title", "segment", "url"];
 /// Longest `url` used as a tag value.
 pub const MAX_TAG_LEN: usize = 2048;
 
@@ -357,6 +371,30 @@ impl Family {
     /// and every v6 high-pressure family.
     pub fn requires_exact_total(self) -> bool {
         self.batch_size().is_some()
+    }
+
+    /// The exact `fulltext.fetch` field list a v6 high-pressure family
+    /// requires ([`HIGH_PRESSURE_FETCH`]): fetch parity is the point of these
+    /// families, so another list (fewer, more or other fields) is refused.
+    /// `None` for the v5 families, which only require `fetch` to be set.
+    pub fn fixed_fetch(self) -> Option<&'static [&'static str]> {
+        (self.batch_size().is_some() && self != Family::DocidBatch)
+            .then_some(&HIGH_PRESSURE_FETCH[..])
+    }
+
+    /// Refuse a fetch field list other than [`Family::fixed_fetch`].
+    pub fn check_fetch_fields(self, fetch: Option<&[String]>) -> Result<(), String> {
+        let Some(want) = self.fixed_fetch() else {
+            return Ok(());
+        };
+        if fetch.is_some_and(|f| f.iter().map(String::as_str).eq(want.iter().copied())) {
+            return Ok(());
+        }
+        Err(format!(
+            "{SUITE} family {} fetches exactly {want:?} on every engine (fetch parity); got \
+             {fetch:?}",
+            self.name()
+        ))
     }
 
     /// Search-config requirements the family's name promises. `deep-fetch`
@@ -1123,13 +1161,11 @@ fn write_batches(
     }
     for i in probe_order(line_counts) {
         let l = line(i, all[i]);
+        // Validates the line's shape only (arity, distinct valid items, a
+        // positive count): the count itself is the one computed by the
+        // caller, whose exactness the pass-1/pass-2 df check and the fixture
+        // oracles establish.
         let (_, n) = family.conditions(&l)?;
-        if n != line_counts[i] {
-            return Err(format!(
-                "{SUITE}: {} line {i}: count changed",
-                family.name()
-            ));
-        }
         counts.push(n);
         writeln!(w, "{l}").map_err(|e| e.to_string())?;
     }
@@ -1636,7 +1672,13 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         .unwrap_or(0);
     let or_rule = |family: Family, extra: &str| {
         format!(
-            "the pool is every eligible segment term of df {RARE_OR_DF:?} (zero ambiguous passages,              not in any over-long run, not named by the Redis escape rule: the deep-fetch              eligibility); epoch e ranks the pool by SHA-256(key domain \"vdb-msmarco-disk/v1\",              seed, \"{}/epoch-<e>\", term) and cuts it into consecutive batches of {RARE_OR_N}              (the last len % {RARE_OR_N} unused); a line is one batch in key order; its count is              the number of DISTINCT passages holding any of its terms{extra}",
+            "the pool is every eligible segment term of df {RARE_OR_DF:?} (zero ambiguous \
+             passages, not in any over-long run, not named by the Redis escape rule: the \
+             deep-fetch eligibility); epoch e ranks the pool by SHA-256(key domain \
+             \"vdb-msmarco-disk/v1\", seed, \"{}/epoch-<e>\", term) and cuts it into \
+             consecutive batches of {RARE_OR_N} (the last len % {RARE_OR_N} unused); a line is \
+             one batch in key order; its count is the number of DISTINCT passages holding any \
+             of its terms{extra}",
             family.name()
         )
     };
@@ -2309,11 +2351,12 @@ mod tests {
             let mut distinct = HashSet::new();
             for (i, line) in l.iter().enumerate() {
                 assert!(distinct.insert(line.to_string()), "duplicate {line}");
-                // The batch families' exact counts are proven over every line
+                // The v6 families' exact counts are proven over every line
                 // above (Redis tokens / tag pieces) and in
                 // `high_pressure_families_have_exact_union_counts`; the slow
-                // classifier-per-row Expr oracle samples their lines.
-                if family.batch_size().is_some() && i >= 24 && i % 16 != 0 {
+                // classifier-per-row Expr oracle samples their lines. The v5
+                // families (docid-batch included) keep every line.
+                if family.fixed_fetch().is_some() && i >= 24 && i % 16 != 0 {
                     continue;
                 }
                 let (conditions, count) = family.conditions(line).unwrap();
@@ -2821,9 +2864,123 @@ mod tests {
         assert_ne!(lines(&other, Family::DocidBatch), l);
     }
 
+    /// Every batch family is epochs of seeded random partitions of its pool
+    /// under its OWN key domain `<family>/epoch-<e>`, reconstructed here
+    /// independently: epoch e ranks the pool by `rank_key(seed,
+    /// "<family>/epoch-<e>", item)` and cuts it into consecutive batches of
+    /// the family's batch size (no item twice in an epoch). The file holds
+    /// exactly the first `lines` such batches, each in key order (the docid
+    /// batches in that order; the others in the probe layout, so compared as
+    /// a multiset).
+    #[test]
+    fn every_batch_family_is_epochs_of_its_own_partitions() {
+        let (_tmp, dir) = fixture(3000);
+        let out = dir.join(DIR);
+        let m = generate(&dir, &opts(200, 7), &out).unwrap();
+        for family in Family::ALL.into_iter().filter(|f| f.batch_size().is_some()) {
+            let n = family.batch_size().unwrap();
+            let file: Vec<Vec<String>> = lines(&out, family)
+                .iter()
+                .map(|l| {
+                    l[0].as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .collect();
+            // The pool: every item the file uses (each epoch uses all but
+            // len % n of them, and the fixture runs many epochs).
+            let pool: Vec<String> = file
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                m["families"][family.name()]["eligible_pool"],
+                pool.len(),
+                "{family:?}"
+            );
+            let mut want: Vec<Vec<String>> = Vec::new();
+            let mut epoch = 0;
+            while want.len() < file.len() {
+                let domain = format!("{}/epoch-{epoch}", family.name());
+                let mut keyed: Vec<(u64, &String)> =
+                    pool.iter().map(|i| (rank_key(7, &domain, i), i)).collect();
+                keyed.sort();
+                for chunk in keyed.chunks_exact(n) {
+                    if want.len() == file.len() {
+                        break;
+                    }
+                    want.push(chunk.iter().map(|(_, i)| (*i).clone()).collect());
+                }
+                epoch += 1;
+            }
+            assert_eq!(
+                m["families"][family.name()]["batch"]["epochs"],
+                epoch,
+                "{family:?}"
+            );
+            if family.is_docid_batch() {
+                assert_eq!(file, want, "{family:?}");
+            } else {
+                let (mut a, mut b) = (file.clone(), want.clone());
+                a.sort();
+                b.sort();
+                assert_eq!(a, b, "{family:?}");
+            }
+        }
+    }
+
+    /// The five v6 family files, pinned like the v5 ones: a change to their
+    /// selection, keys, layout or counts changes these.
+    #[test]
+    fn v6_family_files_are_pinned() {
+        let pins = [
+            (
+                Family::DocidBatch500,
+                "29ab80ca450b5740fd878d62b2d87ef438fa95bca2db139b101fd4e266236153",
+                "6a1ee92249700672754c0843eea27d22cbbe0de15959f78fae11fdbe00abd271",
+            ),
+            (
+                Family::DocidBatch1000,
+                "e6b6271f22f07705f92b2adc9b59559a2a1ab8c2e8ce8d8350538e144f502586",
+                "d4f54d82925292784c9973302a3e314540599b10a958043f6636703e7456b5cf",
+            ),
+            (
+                Family::UrlBatch,
+                "dad68b6810a04a02116bd2245569bd648bc0a1fcd85a79c290269334ae1f2f7b",
+                "005173cf7d10bec0ac6827a91d18b8f58db84d6938f4840300c13e00fa1ae525",
+            ),
+            (
+                Family::RareTermsOr,
+                "d993da94437b4ed477f98c8a123132e5a466fa5584958b9e28d26a0e092f0096",
+                "3808e780c76eb2067f13d8798dabb6a02c26eae3a7aa7a3aa6056d52fbdc3cd1",
+            ),
+            (
+                Family::RareTermsOrAndCategory,
+                "96a45cf92c30bb4ab743672399eb7dbf6babb8daad7c9bdfd1f36bc6f2a1c00e",
+                "e0259cc87134f60fdefdeaf71f9eea43ff9ad84bea932bbb1f6110d75c6f6ebc",
+            ),
+        ];
+        let (_tmp, collisions) = fixture(3000);
+        let a = generate(&collisions, &opts(200, 7), &collisions.join(DIR)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("corpus");
+        write_fixture_corpus(&plain, 3000, 4).unwrap();
+        let b = generate(&plain, &opts(100, 1), &plain.join(DIR)).unwrap();
+        for (family, sha_a, sha_b) in pins {
+            assert_eq!(a["families"][family.name()]["sha256"], sha_a, "{family:?}");
+            assert_eq!(b["families"][family.name()]["sha256"], sha_b, "{family:?}");
+        }
+    }
+
     /// The seven v5 families are byte-identical under v6: the SHA-256 of
-    /// each fixture file as generator v5 (901e8c3) wrote it, for both fixtures
-    /// the tests and the integration targets use. The six v4 families kept
+    /// each fixture file as generator v5 (901e8c3) wrote it, for both unit
+    /// fixtures (the integration targets generate with `per_family: 200`
+    /// since v6, so their files are not these). The six v4 families kept
     /// their v4 (fff214c) hashes under v5.
     #[test]
     fn v5_family_files_are_unchanged() {
@@ -2998,6 +3155,12 @@ mod tests {
         assert_eq!(hp["rare_or_df"], json!(RARE_OR_DF));
         assert_eq!(hp["top"], HIGH_PRESSURE_TOP);
         assert_eq!(m["df_bands"]["rare_or"], json!(RARE_OR_DF));
+        // Rule texts are single-spaced prose (no source indentation).
+        for family in Family::ALL {
+            if let Some(rule) = m["families"][family.name()]["batch"]["rule"].as_str() {
+                assert!(!rule.contains("  "), "{family:?}: {rule}");
+            }
+        }
         // Brute-force postings (classifier per passage) of every term used.
         let mut postings: HashMap<String, HashSet<usize>> = HashMap::new();
         for f in [Family::RareTermsOr, Family::RareTermsOrAndCategory] {
@@ -3242,6 +3405,37 @@ mod tests {
             let e = family.check_params(100, true, true).unwrap_err();
             assert!(e.contains("exact"), "{e}");
         }
+        // Fetch parity: the v6 families fetch exactly title, segment, url.
+        let f = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for family in Family::ALL {
+            let pinned = family.fixed_fetch().is_some();
+            assert_eq!(
+                pinned,
+                family.batch_size().is_some() && family != Family::DocidBatch,
+                "{family:?}"
+            );
+            assert!(family
+                .check_fetch_fields(Some(&f(&["title", "segment", "url"])))
+                .is_ok());
+            for bad in [
+                Some(f(&["title", "segment"])),
+                Some(f(&["segment", "title", "url"])),
+                Some(f(&["title", "segment", "url", "docid"])),
+                Some(f(&["docid"])),
+                None,
+            ] {
+                assert_eq!(
+                    family.check_fetch_fields(bad.as_deref()).is_err(),
+                    pinned,
+                    "{family:?} {bad:?}"
+                );
+            }
+        }
+        // The documented parameters, as literals (a retuned constant must
+        // update the docs and the manifest consumers).
+        assert_eq!(RARE_OR_DF, (11, 100));
+        assert_eq!((RARE_OR_N, URL_BATCH_N, HIGH_PRESSURE_TOP), (40, 300, 100));
+        assert_eq!((DOCID_BATCH_500_K, DOCID_BATCH_1000_K), (500, 1000));
         assert_eq!(Family::DocidBatch500.fixed_top(), Some(500));
         assert_eq!(Family::DocidBatch1000.fixed_top(), Some(1000));
         let ids: Vec<String> = (0..DOCID_BATCH_500_K).map(|i| format!("d{i}")).collect();

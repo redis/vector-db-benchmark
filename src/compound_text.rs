@@ -617,6 +617,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.redis(), "(@category:{d\\_1\\#0 | A\\|B | x})");
+        // An OR of single words on one text field is one field-scoped union;
+        // mixed fields, phrases or words with escapable characters keep one
+        // group per leaf.
+        let schema2 = json!({"title":"text","segment":"text"});
+        let r = |v: Value| Expr::compile(&v, &schema2).unwrap().redis();
+        let t = |f: &str, w: &str| json!({f:{"match":{"text":w}}});
+        assert_eq!(
+            r(json!({"or":[t("segment","alpha"),t("segment","beta")]})),
+            "(@segment:(alpha | beta))"
+        );
+        assert_eq!(
+            r(json!({"or":[t("title","alpha"),t("segment","beta")]})),
+            "((@title:(alpha)) | (@segment:(beta)))"
+        );
+        // The compiler only admits single lowercase words, so a word with an
+        // escapable character can reach the renderer only as a hand-built
+        // leaf; the renderer still keeps it out of the shared union.
+        let leaf = |w: &str| {
+            Expr::Leaf(Predicate::Leaf {
+                field: "segment".into(),
+                leaf: Leaf::Text(w.into()),
+            })
+        };
+        assert_eq!(
+            Expr::Or(vec![leaf("alpha"), leaf("x-ray")]).redis(),
+            "((@segment:(alpha)) | (@segment:(x-ray)))"
+        );
         assert_eq!(
             e.opensearch(),
             json!({"bool":{"filter":[{"terms":{"category":["d_1#0","A|B","x"]}}]}})
