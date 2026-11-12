@@ -203,10 +203,11 @@ struct Args {
     add_hybrid_queries: bool,
 
     /// Write the `msmarco-disk-v1` compound query families (rare terms, term
-    /// pairs, rare term AND category, url/docid exact match, deep fetch) into
-    /// `<dataset>/msmarco-disk-v1/` from the corpus on disk: two passes over
-    /// `payloads.jsonl`, nothing else read or rewritten (`PREPARED.json` is
-    /// unchanged). If the directory already exists the families are
+    /// pairs, rare term AND category, url/docid exact match, deep fetch, and
+    /// the docid / url / rare-term-OR batches, `rare-terms-or-wide` included)
+    /// into `<dataset>/msmarco-disk-v1/` from the corpus on disk: two passes
+    /// over `payloads.jsonl`, nothing else read or rewritten (`PREPARED.json`
+    /// is unchanged). If the directory already exists the families are
     /// regenerated and must be byte-identical (a verification); a difference
     /// is an error, never a silent replacement.
     #[arg(long, conflicts_with_all = ["verify", "discover_crc32", "force", "add_derived_fields", "add_hybrid_queries", "add_knn_truth", "from_prepared", "resume_parts"])]

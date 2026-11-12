@@ -5537,8 +5537,9 @@ mod tests {
                 .len(),
             100
         );
-        // The v6 high-pressure families: fixed page with fetch, exact totals
-        // only, and the request each engine is sent.
+        // The v6 high-pressure families and v7's rare-terms-or-wide: fixed
+        // page with fetch, exact totals only, and the request each engine is
+        // sent.
         let fields = [
             "title".to_string(),
             "segment".to_string(),
@@ -5550,6 +5551,7 @@ mod tests {
             (dq::Family::UrlBatch, dq::HIGH_PRESSURE_TOP),
             (dq::Family::RareTermsOr, dq::HIGH_PRESSURE_TOP),
             (dq::Family::RareTermsOrAndCategory, dq::HIGH_PRESSURE_TOP),
+            (dq::Family::RareTermsOrWide, dq::HIGH_PRESSURE_TOP),
         ] {
             let name = family.name();
             assert!(load(name, fetch.clone(), 10, 5).unwrap_err().contains(name));
@@ -5598,7 +5600,7 @@ mod tests {
                         n
                     );
                 }
-                dq::Family::RareTermsOr => {
+                dq::Family::RareTermsOr | dq::Family::RareTermsOrWide => {
                     assert!(redis.starts_with("(@segment:("), "{redis}");
                     assert_eq!(redis.matches(" | ").count(), n - 1);
                     assert_eq!(body["query"]["bool"]["should"].as_array().unwrap().len(), n);
@@ -5635,7 +5637,7 @@ mod tests {
         // for every family, so `none` loads and the probe has truncated
         // pages to compare.
         // (The batch families refuse `none`: docid batches' pages are their
-        // whole match sets, and every v6 high-pressure family is exact.)
+        // whole match sets, and every high-pressure family is exact.)
         for family in dq::Family::ALL
             .into_iter()
             .filter(|f| !f.requires_exact_total())
@@ -5700,9 +5702,11 @@ mod tests {
     /// which names the generator and the manifest SHA-256, so it moves with a
     /// generator bump even when the family file is byte-identical: v5
     /// (901e8c3, before duration mode) pinned
-    /// `5a7ddc4c5feff1bd8554c8f2c08ffe8546cd73e35a5a6e7717e2cf53aa5f6df7`.
+    /// `5a7ddc4c5feff1bd8554c8f2c08ffe8546cd73e35a5a6e7717e2cf53aa5f6df7`,
+    /// v6 (bf947f9)
+    /// `59742c10771427be1eafb2811b04c25c52693b1669c4152a4e3c8833c5ecca9a`.
     const SINGLE_PASS_IDENTITY: &str =
-        "59742c10771427be1eafb2811b04c25c52693b1669c4152a4e3c8833c5ecca9a";
+        "ba69fa26b5dcdcdb912ef71a802b13ecd5feb28d9adf58ff7a43221224a5d562";
 
     #[test]
     fn disk_duration_mode_cycles_the_window_records_it_and_keeps_single_pass_identity() {

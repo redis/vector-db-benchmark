@@ -2620,6 +2620,7 @@ within a run (unless a point opts in to duration mode, below):
 | `url-batch` | `url` equal to any of 300 URLs, `top: 100`, with `fetch` | 300 random distinct eligible URLs |
 | `rare-terms-or` | OR of 40 `segment` terms, `top: 100`, with `fetch` | each df 11–100 |
 | `rare-terms-or-and-category` | that OR AND `category`, `top: 100`, with `fetch` | category of one passage of the union |
+| `rare-terms-or-wide` | OR of 40 `segment` terms, `top: 100`, with `fetch` | each df 1–100 (the `rare-term` pool, v7) |
 
 Generate the query files once per prepared corpus (deterministic for a seed;
 a rerun verifies the existing files byte for byte):
@@ -2653,14 +2654,17 @@ generator v4 or earlier are refused; regenerate them. Generator v5 only adds
 (same seed, same SHA-256), so v4 results stay comparable family by family.
 Generator v6 only adds the high-pressure families (below): the seven v5
 family files are byte-identical to v5's, and v5 query files are refused.
+Generator v7 only adds `rare-terms-or-wide` (below): the twelve v6 family
+files are byte-identical to v6's, and v6 query files are refused.
 The queries are the same, but a result's compound identity
 (`compound.sha256`) covers the window record, which names the generator and
 the manifest SHA-256. So `compare-results` refuses to pair a v5 result with
-a v6 one, even for a byte-identical family. Pair them by hand: same family,
-offset and seed, and equal `params.fulltext.compound.window.family_file_sha256`.
-Rerunning `--add-disk-queries` on a v5 directory reports the first new file
-as differing (it is missing) and leaves the fresh generation in the staging
-directory: replace the v5 directory with it.
+a v6 one (or a v6 result with a v7 one), even for a byte-identical family.
+Pair them by hand: same family, offset and seed, and equal
+`params.fulltext.compound.window.family_file_sha256`. Rerunning
+`--add-disk-queries` on a directory from an earlier generator reports the
+first new file as differing (it is missing) and leaves the fresh generation
+in the staging directory: replace the old directory with it.
 
 A search point selects one family and a window:
 
@@ -2814,6 +2818,7 @@ A search point selects one family and a window:
   | `url-batch` | `[[u1, …, u300], n]` | `url` any of 300 random URLs | 100 | passages of those URLs |
   | `rare-terms-or` | `[[t1, …, t40], n]` | OR of 40 `segment` terms, each df 11–100 | 100 | distinct passages holding any term |
   | `rare-terms-or-and-category` | `[[t1, …, t40], c, n]` | the same OR AND `category` | 100 | distinct passages of the union in `c` |
+  | `rare-terms-or-wide` (v7) | `[[t1, …, t40], n]` | OR of 40 `segment` terms, each df 1–100 | 100 | distinct passages holding any term |
 
   - Redis: `@docid:{d1 | … | dK}` / `@url:{u1 | … | u300}` (one escaped TAG
     union), `@segment:(t1 | … | t40)` (one field-scoped union of
@@ -2832,7 +2837,18 @@ A search point selects one family and a window:
     pool (docid batches), every `url-eq`-eligible URL (`url-batch`), every
     term of df 11–100 eligible under the `text_match` rules (zero ambiguous
     passages, no long run, no Redis escape — the `deep-fetch` pool) for
-    `rare-terms-or*`.
+    `rare-terms-or` and `rare-terms-or-and-category`, and every eligible term
+    of df 1–100 (the `rare-term` pool, same rules) for `rare-terms-or-wide`.
+  - Why `rare-terms-or-wide` (v7). The df 11–100 pool holds only 156,060
+    terms on the 10M corpus, so a `rare-terms-or` epoch is 3,901 lines and
+    the same terms, postings and passages come back every few thousand
+    queries: in a 10-minute run both Redis Flex and OpenSearch served it
+    entirely from RAM / page cache, which is not a disk test. The df 1–100
+    pool holds 3,179,660 eligible terms (mean df ≈ 3.0), so a
+    `rare-terms-or-wide` epoch is ~79,500 lines (~20× longer) and a line's
+    passages are spread over the whole corpus. A 150,000-query window spans
+    about two epochs, so each term comes back about twice instead of ~38
+    times.
   - Counts are exact. A docid batch matches K passages. A `url-batch` count is
     the sum of its URLs' passage counts (distinct URLs, one URL per passage,
     and the `url-eq` eligibility keeps every URL's count exact on Redis tag
@@ -2847,7 +2863,11 @@ A search point selects one family and a window:
     `URL_BATCH_N` if it is far from that); `rare-terms-or` about 1,100
     (≈ 40 × the mean df of the band, ~27; bounded by 440 less overlaps and
     4,000); `rare-terms-or-and-category` that union divided by the number of
-    categories, roughly.
+    categories, roughly; `rare-terms-or-wide` about 120 (40 × ~3.0, less
+    overlaps), so many of its lines match fewer than 100 passages and fetch
+    a short page (the same on both engines). Its manifest records how many
+    (`families.rare-terms-or-wide.batch.lines_below_top`, with the
+    `expected_count` distribution and `batch.pool_mean_df`).
   - The variable-count families keep the probe layout (the 64 highest
     counts in the reserve) though their `"none"` is refused. The docid
     batches have constant counts, so their layout is key order.
@@ -2858,7 +2878,8 @@ A search point selects one family and a window:
     `url-batch` by default (URLs are longer than docids: ~7 GB); with MS
     MARCO docids of ~40 characters a docid file is closer to 4.5 GB. The
     whole query directory is ~20 GB at 10M. `rare-terms-or*` lines are
-    ~0.4 KB on disk (1M lines).
+    ~0.4 KB on disk (1M lines; `rare-terms-or-wide` terms are a little
+    longer on average).
   - Client memory. The runner keeps every loaded query three times (its
     conditions, the compiled expression and the prepared request), measured
     at about 312 KB per `docid-batch-1000` query, 157 KB per
@@ -2868,14 +2889,17 @@ A search point selects one family and a window:
     these families, so always set `--queries`. For a 10-minute duration-mode
     point (`compound.duration_s: 600`) use at most 20,000 queries for
     `docid-batch-1000`, 40,000 for `docid-batch-500` and `url-batch`, and
-    150,000 for `rare-terms-or` and `rare-terms-or-and-category` (4.5–6.6 GB
-    each). With `--dump-results`, each query's page (up to 1,000 ids) is kept
+    150,000 for `rare-terms-or`, `rare-terms-or-and-category` and
+    `rare-terms-or-wide` (4.5–6.6 GB each; the default 1,000,000 timed lines
+    hold six such disjoint windows). With `--dump-results`, each query's page (up to 1,000 ids) is kept
     until the run ends and written out: budget a few more GB at top 1,000.
   - Generator memory. Generation keeps `url-batch` and `rare-terms-or*` lines
     in memory as 4-byte ids (~0.4 GB and ~0.16 GB each), plus the passage
     count of every eligible URL (~1 GB at 10M, including the URL strings) and
     a category and key per passage (12 bytes each): about 2 GB of peak RSS
-    over v5 at 10M.
+    over v5 at 10M. v7 adds the `rare-terms-or-wide` lines (~0.16 GB), its
+    ~3.2M-term pool and index (a few hundred MB at 10M) and its postings in
+    one flat array (~9.5M row ids, ~40 MB).
   - Only the count is checked. BM25 differs between the engines (IDF and
     length normalization), so the top 100 of a 1,000-passage `rare-terms-or`
     union are not the same documents on both. Tag-only unions are unranked:

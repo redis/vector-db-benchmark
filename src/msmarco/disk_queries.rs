@@ -21,6 +21,7 @@
 //! | `url-batch` | `url` any of [`URL_BATCH_N`] random URLs, `top: 100`, `fetch` | the passages of those URLs |
 //! | `rare-terms-or` | OR of [`RARE_OR_N`] `segment` terms, each df [`RARE_OR_DF`], `top: 100`, `fetch` | the DISTINCT passages holding any term |
 //! | `rare-terms-or-and-category` | that OR AND the `category` of one of its passages | ≥1 |
+//! | `rare-terms-or-wide` | OR of [`RARE_OR_N`] `segment` terms, each df [`RARE_OR_WIDE_DF`] (the `rare-term` pool), `top: 100`, `fetch` | the DISTINCT passages holding any term |
 //!
 //! # Exact by construction
 //!
@@ -72,6 +73,9 @@
 //! passage, `url-eq` eligibility); a `rare-terms-or` line is the size of the
 //! union of its terms' postings, each passage ONCE ([`union_rows`]); the
 //! category variant counts the union's passages in the chosen category. The
+//! v7 family `rare-terms-or-wide` is `rare-terms-or` drawn from the much
+//! larger `rare-term` pool ([`RARE_OR_WIDE_DF`]), so its epoch is ~20× longer
+//! and its passages spread over the whole corpus with far less reuse. The
 //! tag-union batches hold `per_family × 100 / items` timed lines
 //! ([`tag_batch_timed_lines`]) so their files stay near `docid-batch`'s
 //! size. Parameters are constants checked at compile time against the
@@ -132,7 +136,10 @@ pub const MANIFEST: &str = "manifest.json";
 /// families `docid-batch-500`, `docid-batch-1000`, `url-batch`,
 /// `rare-terms-or` and `rare-terms-or-and-category`; the seven v5 family
 /// files are byte-identical; v5 files are refused (they lack the new files).
-pub const GENERATOR: &str = "vdb-msmarco-disk/v6";
+/// v7: adds `rare-terms-or-wide` ([`RARE_OR_WIDE_DF`]); the twelve v6 family
+/// files are byte-identical (same rules, same keys); v6 files are refused
+/// (they lack `rare-terms-or-wide.jsonl`).
+pub const GENERATOR: &str = "vdb-msmarco-disk/v7";
 /// Domain of the seeded rank keys ([`rank_key`]). It stays at its first value
 /// while only the file layout changes, so the same items are selected.
 pub const KEY_DOMAIN: &str = "vdb-msmarco-disk/v1";
@@ -188,9 +195,21 @@ pub const RARE_OR_N: usize = 40;
 /// overlaps, at most 4,000); the band is [`DEEP_DF`]'s, which holds more
 /// than [`MIN_PER_FAMILY`] eligible terms on the 10M corpus.
 pub const RARE_OR_DF: (u64, u64) = (11, 100);
-/// The fixed page (`top`, with `fetch`) of `url-batch`, `rare-terms-or` and
-/// `rare-terms-or-and-category`: their match sets are larger, so each query
-/// fetches a full 100-document page.
+/// Document-frequency band of each `rare-terms-or-wide` term: [`RARE_DF`],
+/// the `rare-term` pool (same eligibility rules). [`RARE_OR_DF`] holds only
+/// ~156K eligible terms on the 10M corpus, so a `rare-terms-or` epoch is
+/// ~3,900 lines and the same terms, postings and passages come back every
+/// few thousand queries: in a 10-minute run both Redis Flex and OpenSearch
+/// served it entirely from RAM / page cache, which is not a disk test. The
+/// full rare band holds ~3.18M eligible terms (mean df ≈ 3), so an epoch is
+/// ~79K lines (~20× longer) and a line's ~120 passages are spread over the
+/// whole corpus; some lines match fewer than [`HIGH_PRESSURE_TOP`] passages
+/// (a short page, the same on both engines; the manifest records how many).
+pub const RARE_OR_WIDE_DF: (u64, u64) = RARE_DF;
+/// The fixed page (`top`, with `fetch`) of `url-batch` and the
+/// `rare-terms-or*` families: their match sets are larger, so each query
+/// fetches a full 100-document page (`rare-terms-or-wide`'s often are not:
+/// a short page, the same on both engines).
 pub const HIGH_PRESSURE_TOP: usize = 100;
 /// The tag values per line whose line budget the tag-union batches share:
 /// `docid-batch-K` holds `per_family × 100 / K` timed lines and `url-batch`
@@ -225,8 +244,8 @@ const _: () = {
     // Every term of rare-terms-or-and-category plus its category filter.
     assert!(RARE_OR_N < OPENSEARCH_MAX_CLAUSE_COUNT);
 };
-/// The fields every v6 high-pressure family fetches, on both engines, in
-/// this order: the same stored bytes leave each engine per hit.
+/// The fields every high-pressure family (v6 and v7) fetches, on both
+/// engines, in this order: the same stored bytes leave each engine per hit.
 pub const HIGH_PRESSURE_FETCH: [&str; 3] = ["title", "segment", "url"];
 /// Longest `url` used as a tag value.
 pub const MAX_TAG_LEN: usize = 2048;
@@ -245,10 +264,11 @@ pub enum Family {
     UrlBatch,
     RareTermsOr,
     RareTermsOrAndCategory,
+    RareTermsOrWide,
 }
 
 impl Family {
-    pub const ALL: [Family; 12] = [
+    pub const ALL: [Family; 13] = [
         Family::RareTerm,
         Family::TwoRareTerms,
         Family::RareTermAndCategory,
@@ -261,6 +281,7 @@ impl Family {
         Family::UrlBatch,
         Family::RareTermsOr,
         Family::RareTermsOrAndCategory,
+        Family::RareTermsOrWide,
     ];
 
     pub fn name(self) -> &'static str {
@@ -277,6 +298,7 @@ impl Family {
             Family::UrlBatch => "url-batch",
             Family::RareTermsOr => "rare-terms-or",
             Family::RareTermsOrAndCategory => "rare-terms-or-and-category",
+            Family::RareTermsOrWide => "rare-terms-or-wide",
         }
     }
 
@@ -303,6 +325,7 @@ impl Family {
             Family::TwoRareTerms => Some(PAIR_DF),
             Family::DeepFetch => Some(DEEP_DF),
             Family::RareTermsOr | Family::RareTermsOrAndCategory => Some(RARE_OR_DF),
+            Family::RareTermsOrWide => Some(RARE_OR_WIDE_DF),
             Family::UrlEq
             | Family::DocidEq
             | Family::DocidBatch
@@ -315,9 +338,11 @@ impl Family {
     /// Fields the family's conditions use (text, then tags).
     pub fn fields(self) -> &'static [&'static str] {
         match self {
-            Family::RareTerm | Family::TwoRareTerms | Family::DeepFetch | Family::RareTermsOr => {
-                &[TEXT_FIELD]
-            }
+            Family::RareTerm
+            | Family::TwoRareTerms
+            | Family::DeepFetch
+            | Family::RareTermsOr
+            | Family::RareTermsOrWide => &[TEXT_FIELD],
             Family::RareTermAndCategory | Family::RareTermsOrAndCategory => {
                 &[TEXT_FIELD, "category"]
             }
@@ -337,7 +362,9 @@ impl Family {
             Family::DocidBatch500 => Some(DOCID_BATCH_500_K),
             Family::DocidBatch1000 => Some(DOCID_BATCH_1000_K),
             Family::UrlBatch => Some(URL_BATCH_N),
-            Family::RareTermsOr | Family::RareTermsOrAndCategory => Some(RARE_OR_N),
+            Family::RareTermsOr | Family::RareTermsOrAndCategory | Family::RareTermsOrWide => {
+                Some(RARE_OR_N)
+            }
             _ => None,
         }
     }
@@ -360,21 +387,22 @@ impl Family {
             Family::DocidBatch | Family::DocidBatch500 | Family::DocidBatch1000 => {
                 self.batch_size()
             }
-            Family::UrlBatch | Family::RareTermsOr | Family::RareTermsOrAndCategory => {
-                Some(HIGH_PRESSURE_TOP)
-            }
+            Family::UrlBatch
+            | Family::RareTermsOr
+            | Family::RareTermsOrAndCategory
+            | Family::RareTermsOrWide => Some(HIGH_PRESSURE_TOP),
             _ => None,
         }
     }
 
     /// Whether the family refuses `total_hits: "none"`: the docid batches
-    /// and every v6 high-pressure family.
+    /// and every high-pressure family (v6, and v7's `rare-terms-or-wide`).
     pub fn requires_exact_total(self) -> bool {
         self.batch_size().is_some()
     }
 
-    /// The exact `fulltext.fetch` field list a v6 high-pressure family
-    /// requires ([`HIGH_PRESSURE_FETCH`]): fetch parity is the point of these
+    /// The exact `fulltext.fetch` field list a high-pressure family (v6 and
+    /// v7) requires ([`HIGH_PRESSURE_FETCH`]): fetch parity is the point of these
     /// families, so another list (fewer, more or other fields) is refused.
     /// `None` for the v5 families, which only require `fetch` to be set.
     pub fn fixed_fetch(self) -> Option<&'static [&'static str]> {
@@ -463,7 +491,8 @@ impl Family {
             | Family::DocidBatch500
             | Family::DocidBatch1000
             | Family::UrlBatch
-            | Family::RareTermsOr => 2,
+            | Family::RareTermsOr
+            | Family::RareTermsOrWide => 2,
             Family::TwoRareTerms | Family::RareTermAndCategory | Family::RareTermsOrAndCategory => {
                 3
             }
@@ -494,7 +523,7 @@ impl Family {
                 let urls = batch_items(self, &a[0], is_safe_tag, "a safe url tag")?;
                 json!({"url": {"match": {"any": urls}}})
             }
-            Family::RareTermsOr | Family::RareTermsOrAndCategory => {
+            Family::RareTermsOr | Family::RareTermsOrAndCategory | Family::RareTermsOrWide => {
                 let terms = batch_items(
                     self,
                     &a[0],
@@ -502,7 +531,7 @@ impl Family {
                     "a text_match term",
                 )?;
                 let any = json!({"or": terms.iter().map(|t| text(t)).collect::<Vec<_>>()});
-                if self == Family::RareTermsOr {
+                if self != Family::RareTermsOrAndCategory {
                     any
                 } else {
                     let cat = s(1)?;
@@ -1375,6 +1404,23 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         .enumerate()
         .map(|(i, (_, t, _))| (t.as_str(), i as u32))
         .collect();
+    // rare-terms-or-wide: every eligible term of RARE_OR_WIDE_DF (the
+    // rare-term pool, ~3.2M terms at 10M), its postings collected in pass 2
+    // into one flat array (CSR: term i's rows are
+    // wide_rows[wide_start[i]..wide_start[i + 1]], sized from the pass-1 df).
+    let wide_pool = pool(Family::RareTermsOrWide, &HashSet::new());
+    let wide_index: HashMap<&str, u32> = wide_pool
+        .iter()
+        .enumerate()
+        .map(|(i, (_, t, _))| (t.as_str(), i as u32))
+        .collect();
+    let mut wide_start: Vec<usize> = Vec::with_capacity(wide_pool.len() + 1);
+    wide_start.push(0);
+    for (_, _, df) in &wide_pool {
+        wide_start.push(wide_start.last().unwrap() + *df as usize);
+    }
+    let mut wide_rows: Vec<u32> = vec![0; *wide_start.last().unwrap()];
+    let mut wide_fill: Vec<u32> = vec![0; wide_pool.len()];
     // Pair-pool term ids in lexicographic order, so an id-sorted pair is a
     // term-sorted pair.
     let mut pair_terms: Vec<(&str, u64)> =
@@ -1424,6 +1470,19 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             if let Some(&i) = rare_or_index.get(t.as_str()) {
                 rare_or_postings[i as usize].push(row32);
                 rare_or_row = true;
+            }
+            if let Some(&i) = wide_index.get(t.as_str()) {
+                let i = i as usize;
+                let at = wide_start[i] + wide_fill[i] as usize;
+                if at >= wide_start[i + 1] {
+                    return Err(format!(
+                        "{SUITE}: term {t:?} matched more passages in pass 2 than its df {} in \
+                         pass 1",
+                        wide_pool[i].2
+                    ));
+                }
+                wide_rows[at] = row32;
+                wide_fill[i] += 1;
             }
             if let Some(&i) = rac_index.get(t.as_str()) {
                 rac_cats[i].push(s.category.clone());
@@ -1602,6 +1661,17 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         floor(family, rare_or_pool.len())?;
         pools.insert(family, rare_or_pool.len());
     }
+    for (i, (_, t, df)) in wide_pool.iter().enumerate() {
+        if u64::from(wide_fill[i]) != *df {
+            return Err(format!(
+                "{SUITE}: term {t:?} matched {} passages in pass 2 but {df} in pass 1",
+                wide_fill[i]
+            ));
+        }
+    }
+    drop(wide_fill);
+    floor(Family::RareTermsOrWide, wide_pool.len())?;
+    pools.insert(Family::RareTermsOrWide, wide_pool.len());
     let postings = |line: &[u32]| -> Vec<&[u32]> {
         line.iter()
             .map(|&i| rare_or_postings[i as usize].as_slice())
@@ -1657,6 +1727,33 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             .count()
     };
     let rare_or_overlap = overlap_lines(&rare_or_lines, &rare_or_counts);
+    // rare-terms-or-wide: rare-terms-or's construction over the wide pool.
+    let wide_postings = |line: &[u32]| -> Vec<&[u32]> {
+        line.iter()
+            .map(|&i| &wide_rows[wide_start[i as usize]..wide_start[i as usize + 1]])
+            .collect()
+    };
+    let wide_batches = Batches::new(
+        Family::RareTermsOrWide,
+        wide_pool.len(),
+        |i| wide_pool[i as usize].1.as_str(),
+        seed,
+        cap,
+    )?;
+    let wide_lines: Vec<&[u32]> = wide_batches.lines().collect();
+    let wide_counts: Vec<u64> = wide_lines
+        .par_iter()
+        .map(|l| union_rows(&wide_postings(l)).len() as u64)
+        .collect();
+    let wide_overlap = wide_lines
+        .iter()
+        .zip(&wide_counts)
+        .filter(|(l, n)| l.iter().map(|&i| wide_pool[i as usize].2).sum::<u64>() > **n)
+        .count();
+    let wide_below_top = wide_counts
+        .iter()
+        .filter(|&&n| n < HIGH_PRESSURE_TOP as u64)
+        .count();
     let mean = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len().max(1) as f64;
     let url_pool_mean = mean(&url_pool.iter().map(|(_, n)| *n).collect::<Vec<_>>());
     let rare_or_pool_mean = mean(
@@ -1665,20 +1762,26 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             .map(|(_, _, df)| *df)
             .collect::<Vec<_>>(),
     );
+    let wide_pool_mean = mean(&wide_pool.iter().map(|(_, _, df)| *df).collect::<Vec<_>>());
     let url_redis_max = url_batches
         .lines()
         .map(|l| redis_tag_union_len("url", l.iter().map(|&i| url_pool[i as usize].0.as_str())))
         .max()
         .unwrap_or(0);
     let or_rule = |family: Family, extra: &str| {
+        let pool_of = match family {
+            Family::RareTermsOrWide => "rare-term",
+            _ => "deep-fetch",
+        };
         format!(
-            "the pool is every eligible segment term of df {RARE_OR_DF:?} (zero ambiguous \
+            "the pool is every eligible segment term of df {:?} (zero ambiguous \
              passages, not in any over-long run, not named by the Redis escape rule: the \
-             deep-fetch eligibility); epoch e ranks the pool by SHA-256(key domain \
+             {pool_of} eligibility); epoch e ranks the pool by SHA-256(key domain \
              \"vdb-msmarco-disk/v1\", seed, \"{}/epoch-<e>\", term) and cuts it into \
              consecutive batches of {RARE_OR_N} (the last len % {RARE_OR_N} unused); a line is \
              one batch in key order; its count is the number of DISTINCT passages holding any \
              of its terms{extra}",
+            family.df_band().expect("a text family"),
             family.name()
         )
     };
@@ -1781,6 +1884,29 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             batch["categories"] = json!(categories.len());
             batch["opensearch_bool_should_clauses"] = json!(RARE_OR_N);
             batch["opensearch_max_clause_count"] = json!(OPENSEARCH_MAX_CLAUSE_COUNT);
+        } else if family == Family::RareTermsOrWide {
+            write_batches(
+                &mut w,
+                family,
+                &wide_batches,
+                |i, l| {
+                    let terms: Vec<&str> = l
+                        .iter()
+                        .map(|&t| wide_pool[t as usize].1.as_str())
+                        .collect();
+                    json!([terms, wide_counts[i]])
+                },
+                &wide_counts,
+                &mut counts,
+            )
+            .map_err(err)?;
+            batch = wide_batches.record(wide_pool.len(), or_rule(family, ""));
+            batch["df_band"] = json!(RARE_OR_WIDE_DF);
+            batch["pool_mean_df"] = json!(wide_pool_mean);
+            batch["lines_with_overlapping_terms"] = json!(wide_overlap);
+            batch["lines_below_top"] = json!(wide_below_top);
+            batch["opensearch_bool_should_clauses"] = json!(RARE_OR_N);
+            batch["opensearch_max_clause_count"] = json!(OPENSEARCH_MAX_CLAUSE_COUNT);
         } else {
             let l = probe_layout(family, lines.remove(&family).expect("every family"))?;
             counts.reserve(l.len());
@@ -1824,7 +1950,8 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         "text_match_rules": text_match::RULE_VERSION,
         "redis_escape_rules": text_match::REDIS_ESCAPE_RULE,
         "analysis": "parity: segment text with every whitespace other than U+0020 replaced by a space (as uploaded), no stemming",
-        "df_bands": {"rare": RARE_DF, "pair": PAIR_DF, "deep": DEEP_DF, "rare_or": RARE_OR_DF},
+        "df_bands": {"rare": RARE_DF, "pair": PAIR_DF, "deep": DEEP_DF, "rare_or": RARE_OR_DF,
+                     "rare_or_wide": RARE_OR_WIDE_DF},
         "high_pressure": {
             "docid_batch_500_k": DOCID_BATCH_500_K,
             "docid_batch_1000_k": DOCID_BATCH_1000_K,
@@ -1832,6 +1959,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             "url_batch_n": URL_BATCH_N,
             "rare_or_n": RARE_OR_N,
             "rare_or_df": RARE_OR_DF,
+            "rare_or_wide_df": RARE_OR_WIDE_DF,
             "top": HIGH_PRESSURE_TOP,
             "total_hits": "exact (none is refused for every batch family)",
             "opensearch_limits": {"max_result_window": OPENSEARCH_MAX_RESULT_WINDOW,
@@ -1858,7 +1986,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
                  "docid_rows_excluded_redis_piece_collision": docid_rows_colliding,
                  "redis_piece_rule": "a safe value equal to a Redis tag piece (split on ';', C-isspace trimmed, non-empty) of an unsafe value is not selected: Redis TAG SEPARATOR ; would match the unsafe value's passages too, an OpenSearch keyword would not"},
         "term_overlap": term_overlap,
-        "selection": "per family: eligible items ranked by SHA-256(key domain \"vdb-msmarco-disk/v1\", seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run, not named by the Redis escape rule in any passage. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys. docid-batch, docid-batch-500, docid-batch-1000, url-batch, rare-terms-or, rare-terms-or-and-category: see families.<family>.batch.rule (rare-terms-or* draw from the deep-fetch eligible terms, re-ranked per epoch under their own family name).",
+        "selection": "per family: eligible items ranked by SHA-256(key domain \"vdb-msmarco-disk/v1\", seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run, not named by the Redis escape rule in any passage. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys. docid-batch, docid-batch-500, docid-batch-1000, url-batch, rare-terms-or, rare-terms-or-and-category, rare-terms-or-wide: see families.<family>.batch.rule (rare-terms-or and rare-terms-or-and-category draw from the deep-fetch eligible terms, rare-terms-or-wide from the rare-term eligible terms, each re-ranked per epoch under its own family name).",
         "families": families,
     });
     let text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
@@ -2325,7 +2453,9 @@ mod tests {
                     }
                     // A passage matches when its Redis tokens hold ANY term
                     // (each passage once).
-                    Family::RareTermsOr | Family::RareTermsOrAndCategory => {
+                    Family::RareTermsOr
+                    | Family::RareTermsOrAndCategory
+                    | Family::RareTermsOrWide => {
                         let terms: Vec<&str> = a[0]
                             .as_array()
                             .unwrap()
@@ -2420,6 +2550,16 @@ mod tests {
         );
         assert_eq!(
             m["families"]["deep-fetch"]["eligible_pool"],
+            eligible(11, 100)
+        );
+        // rare-terms-or-wide draws from the whole rare band (the rare-term
+        // pool), not rare-terms-or's df 11-100.
+        assert_eq!(
+            m["families"]["rare-terms-or-wide"]["eligible_pool"],
+            eligible(1, 100)
+        );
+        assert_eq!(
+            m["families"]["rare-terms-or"]["eligible_pool"],
             eligible(11, 100)
         );
         for (term, why) in [
@@ -2669,15 +2809,25 @@ mod tests {
             .contains("SHA-256"));
         std::fs::write(&f, body).unwrap();
         assert!(load_window(&dir, Family::UrlEq, 0, Some(1)).is_ok());
-        // A v5 manifest (no high-pressure families) or a v4 one is refused
-        // for every family, as v5 refused v4: regenerate.
+        // A v6 manifest (no rare-terms-or-wide), a v5 one (no high-pressure
+        // families) or a v4 one is refused for every family, as v6 refused
+        // v5: regenerate.
         let mp = dir.join(DIR).join(MANIFEST);
         let manifest = std::fs::read_to_string(&mp).unwrap();
-        for old in ["vdb-msmarco-disk/v5", "vdb-msmarco-disk/v4"] {
+        for old in [
+            "vdb-msmarco-disk/v6",
+            "vdb-msmarco-disk/v5",
+            "vdb-msmarco-disk/v4",
+        ] {
             let stale = manifest.replace(GENERATOR, old);
             assert_ne!(stale, manifest);
             std::fs::write(&mp, stale).unwrap();
-            for family in [Family::UrlEq, Family::DocidBatch, Family::RareTermsOr] {
+            for family in [
+                Family::UrlEq,
+                Family::DocidBatch,
+                Family::RareTermsOr,
+                Family::RareTermsOrWide,
+            ] {
                 let e = load_window(&dir, family, 0, Some(1)).unwrap_err();
                 assert!(e.contains(old) && e.contains(GENERATOR), "{e}");
             }
@@ -2934,10 +3084,11 @@ mod tests {
         }
     }
 
-    /// The five v6 family files, pinned like the v5 ones: a change to their
-    /// selection, keys, layout or counts changes these.
+    /// The five v6 family files are byte-identical under v7: the SHA-256 of
+    /// each fixture file as generator v6 (bf947f9) wrote it. With
+    /// `v5_family_files_are_unchanged` this pins all twelve v6 files.
     #[test]
-    fn v6_family_files_are_pinned() {
+    fn v6_family_files_are_unchanged() {
         let pins = [
             (
                 Family::DocidBatch500,
@@ -3021,8 +3172,10 @@ mod tests {
                 "d1bb81f6e6c46922f5c55a9713794c31861172b90789e4bf8fe91cb2483b9288",
             ),
         ];
-        // Every v5 family is pinned; the rest are the v6 additions.
-        assert_eq!(pins.len() + 5, Family::ALL.len());
+        // Every v5 family is pinned; the rest are the five v6 additions
+        // (`v6_family_files_are_unchanged`) and the v7 one
+        // (`v7_family_file_is_pinned`).
+        assert_eq!(pins.len() + 5 + 1, Family::ALL.len());
         let (_tmp, collisions) = fixture(3000);
         let a = generate(&collisions, &opts(200, 7), &collisions.join(DIR)).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -3033,6 +3186,27 @@ mod tests {
             assert_eq!(a["families"][family.name()]["sha256"], sha_a, "{family:?}");
             assert_eq!(b["families"][family.name()]["sha256"], sha_b, "{family:?}");
         }
+    }
+
+    /// The v7 family file, pinned like the v6 ones: a change to its
+    /// selection, keys, layout or counts changes these.
+    #[test]
+    fn v7_family_file_is_pinned() {
+        let (_tmp, collisions) = fixture(3000);
+        let a = generate(&collisions, &opts(200, 7), &collisions.join(DIR)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("corpus");
+        write_fixture_corpus(&plain, 3000, 4).unwrap();
+        let b = generate(&plain, &opts(100, 1), &plain.join(DIR)).unwrap();
+        let name = Family::RareTermsOrWide.name();
+        assert_eq!(
+            a["families"][name]["sha256"],
+            "cfed8fc041a870d2f1cd37f1d2272cb89673d58f7f5ee84bff8854432bc7caa0"
+        );
+        assert_eq!(
+            b["families"][name]["sha256"],
+            "7d112208e9a332fb94c95e96ea42d0755ac2f5a6304a0848d2c32416128be6f1"
+        );
     }
 
     #[test]
@@ -3153,18 +3327,31 @@ mod tests {
         assert_eq!(hp["url_batch_n"], URL_BATCH_N);
         assert_eq!(hp["rare_or_n"], RARE_OR_N);
         assert_eq!(hp["rare_or_df"], json!(RARE_OR_DF));
+        assert_eq!(hp["rare_or_wide_df"], json!(RARE_OR_WIDE_DF));
         assert_eq!(hp["top"], HIGH_PRESSURE_TOP);
         assert_eq!(m["df_bands"]["rare_or"], json!(RARE_OR_DF));
+        assert_eq!(m["df_bands"]["rare_or_wide"], json!(RARE_OR_WIDE_DF));
         // Rule texts are single-spaced prose (no source indentation).
         for family in Family::ALL {
             if let Some(rule) = m["families"][family.name()]["batch"]["rule"].as_str() {
                 assert!(!rule.contains("  "), "{family:?}: {rule}");
             }
         }
-        // Brute-force postings (classifier per passage) of every term used.
+        // Brute-force postings (classifier per passage) of every term used
+        // (rare-terms-or-wide: of the sampled lines checked below; every
+        // line's count is checked on Redis tokens in
+        // `generated_counts_match_a_brute_force_oracle`).
+        let wide_sample = |i: usize| i < 24 || i.is_multiple_of(16);
         let mut postings: HashMap<String, HashSet<usize>> = HashMap::new();
-        for f in [Family::RareTermsOr, Family::RareTermsOrAndCategory] {
-            for line in lines(&out, f) {
+        for f in [
+            Family::RareTermsOr,
+            Family::RareTermsOrAndCategory,
+            Family::RareTermsOrWide,
+        ] {
+            for (i, line) in lines(&out, f).into_iter().enumerate() {
+                if f == Family::RareTermsOrWide && !wide_sample(i) {
+                    continue;
+                }
                 for t in line[0].as_array().unwrap() {
                     let t = t.as_str().unwrap();
                     if !postings.contains_key(t) {
@@ -3325,6 +3512,67 @@ mod tests {
                 want
             );
         }
+
+        // rare-terms-or-wide: the same union over the rare-term pool (df
+        // 1-100): its pool is rare-term's, far larger than rare-terms-or's,
+        // so its epoch is longer, and it does use terms below df 11.
+        let f = &m["families"]["rare-terms-or-wide"];
+        assert_eq!(f["df_band"], json!(RARE_DF));
+        assert_eq!(f["batch"]["df_band"], json!(RARE_DF));
+        assert_eq!(
+            f["eligible_pool"],
+            m["families"]["rare-term"]["eligible_pool"]
+        );
+        let wide_pool = f["eligible_pool"].as_u64().unwrap() as usize;
+        assert!(
+            wide_pool
+                > 10 * m["families"]["rare-terms-or"]["eligible_pool"]
+                    .as_u64()
+                    .unwrap() as usize
+        );
+        assert_eq!(f["batch"]["batches_per_epoch"], wide_pool / RARE_OR_N);
+        assert_eq!(f["batch"]["items_unused_per_epoch"], wide_pool % RARE_OR_N);
+        assert!(f["batch"]["rule"]
+            .as_str()
+            .unwrap()
+            .contains("rare-term eligibility"));
+        let wide = lines(&out, Family::RareTermsOrWide);
+        assert_eq!(wide.len(), 200 + RESERVED);
+        let (mut below_df11, mut overlapping, mut below_top) = (0, 0, 0);
+        for (i, line) in wide.iter().enumerate() {
+            let (_, n) = Family::RareTermsOrWide.conditions(line).unwrap();
+            if n < HIGH_PRESSURE_TOP as u64 {
+                below_top += 1;
+            }
+            if !wide_sample(i) {
+                continue;
+            }
+            let terms: Vec<&str> = line[0]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(terms.len(), RARE_OR_N);
+            let df_sum: u64 = terms.iter().map(|t| df_of(t)).sum();
+            assert_eq!(n, union_of(&terms).len() as u64, "{line}");
+            assert!(terms.iter().all(|t| (1..=100).contains(&df_of(t))));
+            below_df11 += terms.iter().filter(|t| df_of(t) < 11).count();
+            if n < df_sum {
+                overlapping += 1;
+            }
+        }
+        assert!(
+            below_df11 > 0,
+            "rare-terms-or-wide must use the df 1-10 terms"
+        );
+        assert!(
+            overlapping > 0,
+            "the fixture must exercise overlapping terms"
+        );
+        // Short pages are expected (mean df ~3): recorded, not refused.
+        assert!(below_top > 0);
+        assert_eq!(f["batch"]["lines_below_top"], below_top);
     }
 
     #[test]
@@ -3379,7 +3627,32 @@ mod tests {
         dup_terms[1] = dup_terms[0].clone();
         let mut bad_term = terms.clone();
         bad_term[0] = "the".into();
+        // rare-terms-or-wide renders exactly as rare-terms-or.
+        let (wide, n) = Family::RareTermsOrWide
+            .conditions(&json!([terms, 37]))
+            .unwrap();
+        assert_eq!(n, 37);
+        assert_eq!(
+            wide,
+            Family::RareTermsOr
+                .conditions(&json!([terms, 37]))
+                .unwrap()
+                .0
+        );
+        let expr = crate::compound_text::Expr::compile(&wide, &schema).unwrap();
+        assert_eq!(expr.redis(), format!("(@segment:({}))", terms.join(" | ")));
+        let os = expr.opensearch();
+        assert_eq!(os["bool"]["minimum_should_match"], 1);
+        assert_eq!(os["bool"]["should"].as_array().unwrap().len(), RARE_OR_N);
+        assert_eq!(Family::RareTermsOrWide.fields(), [TEXT_FIELD]);
+        assert_eq!(Family::RareTermsOrWide.df_band(), Some((1, 100)));
+        assert_eq!(Family::RareTermsOrWide.batch_size(), Some(RARE_OR_N));
         for (family, bad) in [
+            (Family::RareTermsOrWide, json!([terms[1..], 5])),
+            (Family::RareTermsOrWide, json!([dup_terms, 5])),
+            (Family::RareTermsOrWide, json!([bad_term, 5])),
+            (Family::RareTermsOrWide, json!([terms, 0])),
+            (Family::RareTermsOrWide, json!([terms, "cat03", 5])),
             (Family::RareTermsOr, json!([terms[1..], 5])),
             (Family::RareTermsOr, json!([dup_terms, 5])),
             (Family::RareTermsOr, json!([bad_term, 5])),
@@ -3397,6 +3670,7 @@ mod tests {
             Family::UrlBatch,
             Family::RareTermsOr,
             Family::RareTermsOrAndCategory,
+            Family::RareTermsOrWide,
         ] {
             assert_eq!(family.fixed_top(), Some(HIGH_PRESSURE_TOP));
             assert!(family.check_params(100, true, false).is_ok());
@@ -3405,7 +3679,8 @@ mod tests {
             let e = family.check_params(100, true, true).unwrap_err();
             assert!(e.contains("exact"), "{e}");
         }
-        // Fetch parity: the v6 families fetch exactly title, segment, url.
+        // Fetch parity: the v6 and v7 families fetch exactly title, segment,
+        // url.
         let f = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for family in Family::ALL {
             let pinned = family.fixed_fetch().is_some();
@@ -3434,6 +3709,8 @@ mod tests {
         // The documented parameters, as literals (a retuned constant must
         // update the docs and the manifest consumers).
         assert_eq!(RARE_OR_DF, (11, 100));
+        assert_eq!(RARE_OR_WIDE_DF, (1, 100));
+        assert_eq!(RARE_OR_WIDE_DF, RARE_DF);
         assert_eq!((RARE_OR_N, URL_BATCH_N, HIGH_PRESSURE_TOP), (40, 300, 100));
         assert_eq!((DOCID_BATCH_500_K, DOCID_BATCH_1000_K), (500, 1000));
         assert_eq!(Family::DocidBatch500.fixed_top(), Some(500));
