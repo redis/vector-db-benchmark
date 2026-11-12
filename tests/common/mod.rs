@@ -5144,7 +5144,10 @@ pub fn assert_disk_run(root: &Path, engine: &str, config: &str, dump: &Path) {
                 // have df 1-3): at least min(count, 100) per window line
                 // (each reply's page is checked exactly against the dump
                 // below).
-                let offset = ft["compound"]["offset"].as_u64().unwrap() as usize;
+                // The recorded metadata keeps the window under
+                // `compound.window` (the configured `compound.offset` is
+                // not echoed back).
+                let offset = ft["compound"]["window"]["offset"].as_u64().unwrap() as usize;
                 let want: u64 = fs::read_to_string(ds.join(DIR).join(family.file_name()))
                     .unwrap()
                     .lines()
