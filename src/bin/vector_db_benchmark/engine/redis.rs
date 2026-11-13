@@ -421,7 +421,12 @@ impl RedisEngine {
         let reduced = ft_profile
             .as_ref()
             .is_some_and(|p| p.scalar_indexing.is_reduced());
-        if reduced {
+        // Flex disk index: same fresh-creation contract as text-tag-only. FT.CREATE
+        // without SKIPINITIALSCAN starts a background scan that, on a Flex DB whose
+        // RAM is (by design) at its limit, fails with SEARCH_INDEX_BG_OOM_FAIL and
+        // then refuses to index new documents. The prefix must be empty instead.
+        let skip_scan = reduced || flex_disk.is_some();
+        if skip_scan {
             // Flex cannot delete indexed hashes with DD. Never turn a rebuild
             // into an incomplete SKIPINITIALSCAN index over stale keys.
             if self.config.shared_corpus {
@@ -449,7 +454,7 @@ impl RedisEngine {
         // shared-corpus mode (#188) the docs are SHARED across configs and
         // uploaded once, so drop the index WITHOUT DD to preserve them for the
         // other configs' indexes (build-many over one corpus).
-        if !reduced {
+        if !skip_scan {
             let mut cmd = redis::cmd("FT.DROPINDEX");
             cmd.arg(&self.config.index_name);
             if !self.config.shared_corpus {
@@ -473,7 +478,7 @@ impl RedisEngine {
         // #339: a config that runs the fulltext workload pins the stopword list
         // explicitly (it equals the RediSearch default) so FT.INFO reports it
         // and the fulltext arm can refuse an index built any other way.
-        if reduced {
+        if skip_scan {
             cmd.arg("SKIPINITIALSCAN");
         }
         if ft_profile.is_some() {
