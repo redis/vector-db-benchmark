@@ -1966,7 +1966,9 @@ fn hybrid_duration_summary(
         "duration_s_total": total_s,
         "dispatched": sum("dispatched"),
         "completed": sum("completed"),
+        "failed": sum("failed"),
         "completed_by_deadline": sum("completed_by_deadline"),
+        "completed_after_deadline": sum("completed_after_deadline"),
         "per_bucket": "results.hybrid.buckets[].duration (passes, qps_by_deadline, latency, \
                        mean_recall and first-pass recall of each bucket)",
     })))
@@ -2066,6 +2068,13 @@ mod hybrid_driver_tests {
         assert_eq!(summary["duration_s_per_bucket"], 2.0);
         assert_eq!(summary["duration_s_total"], 4.0);
         assert_eq!(summary["dispatched"], 12);
+        assert_eq!(summary["completed"], 12);
+        assert_eq!(summary["failed"], 0);
+        assert_eq!(
+            summary["completed_by_deadline"].as_u64().unwrap()
+                + summary["completed_after_deadline"].as_u64().unwrap(),
+            12
+        );
         assert_eq!(out.requested_queries, 12);
         // A single pass carries no record, and its bucket report serializes
         // without the key (unchanged output).

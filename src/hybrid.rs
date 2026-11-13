@@ -1351,6 +1351,26 @@ pub fn check_params(
     }
 }
 
+/// A hybrid duration point lasts up to one duration per bucket (plus the
+/// tail, priming and profiling), and `--search-timeout` bounds the whole
+/// point. A timeout below `buckets x duration` would kill a long point
+/// partway through, after most of its time was spent: refuse it at startup.
+pub fn check_search_timeout(duration: Option<f64>, search_timeout: f64) -> Result<(), String> {
+    let Some(d) = duration.filter(|d| *d > 0.0) else {
+        return Ok(());
+    };
+    let needed = Bucket::ALL.len() as f64 * d;
+    if search_timeout > 0.0 && search_timeout < needed {
+        return Err(format!(
+            "--search-timeout {search_timeout} is shorter than a hybrid duration point: the \
+             duration applies per selectivity bucket, so the point runs about {} x {d} = \
+             {needed} s (plus tail and priming); raise --search-timeout above that",
+            Bucket::ALL.len()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1798,5 +1818,11 @@ mod tests {
         let e = check_params(Some(10), None, None, 100).unwrap_err();
         assert!(e.contains("--queries"), "{e}");
         assert!(check_params(Some(10), None, Some(600.0), 100).is_err());
+        // The watchdog must outlast every bucket's duration.
+        assert!(check_search_timeout(Some(600.0), 0.0).is_ok());
+        assert!(check_search_timeout(Some(600.0), 2500.0).is_ok());
+        assert!(check_search_timeout(None, 900.0).is_ok());
+        let e = check_search_timeout(Some(600.0), 900.0).unwrap_err();
+        assert!(e.contains("2400"), "{e}");
     }
 }

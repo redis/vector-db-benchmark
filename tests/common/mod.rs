@@ -5508,6 +5508,14 @@ pub fn assert_hybrid_duration_point(root: &Path, config: &str, dump_dir: &Path, 
     assert_eq!(s["buckets"], 4, "{config}: {s}");
     assert_eq!(s["duration_s_per_bucket"], duration_s, "{config}");
     assert_eq!(s["dispatched"], dispatched, "{config}");
+    assert_eq!(s["failed"], 0, "{config}: {s}");
+    assert_eq!(s["completed"], dispatched, "{config}: {s}");
+    assert_eq!(
+        s["completed_by_deadline"].as_u64().unwrap()
+            + s["completed_after_deadline"].as_u64().unwrap(),
+        dispatched,
+        "{config}: {s}"
+    );
     assert_eq!(results["requested_queries"], dispatched, "{config}");
     let dumps = read_dumps(dump_dir);
     assert_eq!(dumps.len(), 1, "{config}");

@@ -401,15 +401,19 @@ pub fn supports_search_duration(engine_type: &str, open_loop: bool) -> bool {
     }
 }
 
-/// A duration (`--search-duration` or a config's `duration_seconds`) is a
-/// search-only mode of the vector and hybrid workloads. The filter-only arm
-/// and the mixed (`--update-search-ratio`) phases run their query set once,
-/// so a duration there would label a single pass with a duration it did not
-/// run; both are refused before anything is downloaded. Fulltext and
+/// A duration (`--search-duration` or a config's `duration_seconds`, the
+/// flag taking precedence as at search time) is a search-only mode of the
+/// vector and hybrid workloads, on the engines that implement it
+/// ([`supports_search_duration`]). The filter-only arm, the mixed
+/// (`--update-search-ratio`) phases and every other engine run their query
+/// set once, so a duration there would label a single pass with a duration it
+/// did not run; all are refused before anything is downloaded. Fulltext and
 /// hybrid-rrf refuse it in their own parameter checks.
 pub fn check_duration_supported(
+    engine_type: &str,
     workload: Workload,
     duration: Option<f64>,
+    target_qps: Option<f64>,
     mixed_phases: bool,
 ) -> Result<(), String> {
     if !duration.is_some_and(|d| d != 0.0) {
@@ -428,6 +432,20 @@ pub fn check_duration_supported(
              (the mixed phases run their query set once)"
                 .into(),
         );
+    }
+    if matches!(workload, Workload::Vector | Workload::Hybrid) {
+        let open_loop = target_qps.is_some_and(|q| q != 0.0);
+        if !supports_search_duration(engine_type, open_loop) {
+            return Err(format!(
+                "engine \"{engine_type}\" does not implement {} search; it would run its \
+                 query set once under a duration it did not run",
+                if open_loop {
+                    "open-loop (target_qps)"
+                } else {
+                    "closed-loop duration"
+                }
+            ));
+        }
     }
     Ok(())
 }
@@ -655,15 +673,27 @@ mod tests {
         }
         // Without a duration nothing is refused.
         for w in Workload::ALL {
-            check_duration_supported(w, None, true).unwrap();
-            check_duration_supported(w, Some(0.0), true).unwrap();
+            check_duration_supported("qdrant", w, None, None, true).unwrap();
+            check_duration_supported("qdrant", w, Some(0.0), None, true).unwrap();
         }
-        check_duration_supported(Workload::Vector, Some(600.0), false).unwrap();
-        check_duration_supported(Workload::Hybrid, Some(600.0), false).unwrap();
-        let e = check_duration_supported(Workload::FilterOnly, Some(600.0), false).unwrap_err();
+        let d = Some(600.0);
+        for e in ["redis", "opensearch"] {
+            check_duration_supported(e, Workload::Vector, d, None, false).unwrap();
+            check_duration_supported(e, Workload::Hybrid, d, None, false).unwrap();
+        }
+        check_duration_supported("vertex", Workload::Vector, d, Some(50.0), false).unwrap();
+        let e =
+            check_duration_supported("redis", Workload::FilterOnly, d, None, false).unwrap_err();
         assert!(e.contains("filter-only"), "{e}");
-        let e = check_duration_supported(Workload::Vector, Some(600.0), true).unwrap_err();
+        let e = check_duration_supported("redis", Workload::Vector, d, None, true).unwrap_err();
         assert!(e.contains("--update-search-ratio"), "{e}");
+        // An engine without the mode (e.g. a config-file duration_seconds,
+        // which the CLI engine gate does not see) is refused.
+        let e = check_duration_supported("qdrant", Workload::Vector, d, None, false).unwrap_err();
+        assert!(e.contains("closed-loop duration"), "{e}");
+        let e = check_duration_supported("opensearch", Workload::Vector, d, Some(50.0), false)
+            .unwrap_err();
+        assert!(e.contains("open-loop"), "{e}");
     }
 
     #[test]
