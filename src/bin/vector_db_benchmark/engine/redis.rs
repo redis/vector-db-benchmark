@@ -3021,6 +3021,7 @@ impl Engine for RedisEngine {
                     let mut cap: Vec<RawQueryResult> = Vec::new();
                     let mut tally = vector_db_benchmark::duration_mode::CycleTally::default();
 
+                    let setup_t0 = Instant::now();
                     let client = match RedisClient::open(redis_url.as_str(), cluster_api) {
                         Ok(c) => c,
                         Err(e) => {
@@ -3045,7 +3046,11 @@ impl Engine for RedisEngine {
                             Ok(c) => break c,
                             Err(e) if attempt < connect_retries => {
                                 attempt += 1;
-                                eprintln!("CONNECT_RETRY worker setup attempt {attempt}/{connect_retries}: {e}");
+                                eprintln!(
+                                    "CONNECT_RETRY epoch_ms={} attempt {attempt}/{connect_retries} after {} ms: {e}",
+                                    epoch_ms_now(),
+                                    setup_t0.elapsed().as_millis()
+                                );
                                 std::thread::sleep(Duration::from_secs(attempt as u64));
                             }
                             Err(e) => {
@@ -3054,6 +3059,13 @@ impl Engine for RedisEngine {
                             }
                         }
                     };
+                    if connect_retries > 0 {
+                        eprintln!(
+                            "CONNECT_SETUP epoch_ms={} ms={} retries={attempt}",
+                            epoch_ms_now(),
+                            setup_t0.elapsed().as_millis()
+                        );
+                    }
                     // Bound a blackholed endpoint to a finite wait instead of the
                     // kernel TCP-retransmit budget (minutes). Kept above the 90s
                     // server-side FT.SEARCH TIMEOUT so it never preempts it.
@@ -3242,6 +3254,13 @@ impl Engine for RedisEngine {
             // shared measurement start and release them simultaneously. No arrival
             // offset is needed now — the cold setup is already behind the gate.
             let (per_worker, measured_start) = pool.start()?;
+            if std::env::var("REDIS_CONNECT_RETRIES").is_ok() {
+                // pool.start() returns after the workers finish; back out the gate-open wall time.
+                eprintln!(
+                    "START_GATE_OPEN epoch_ms={}",
+                    epoch_ms_now().saturating_sub(measured_start.elapsed().as_millis())
+                );
+            }
 
             for (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally) in per_worker {
                 if let Some(records) = captured.as_mut() {
@@ -5220,4 +5239,12 @@ mod redis_index_ready_tests {
             Ok(false)
         );
     }
+}
+
+/// Wall-clock milliseconds since the Unix epoch (REDIS_CONNECT_RETRIES logging only).
+fn epoch_ms_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
