@@ -1923,6 +1923,28 @@ impl OpenSearchEngine {
         } else {
             queries.len()
         };
+        // Closed-loop `--search-duration` (KNN and hybrid passes): the shared
+        // cycled schedule (`duration_mode`), the same on every engine that
+        // implements it. It cycles the same `num_to_run` positions a single
+        // pass would run, so the bodies below cover every dispatch.
+        let cycle = if filter_only {
+            if crate::engine::closed_loop_duration(params)?.is_some() {
+                return Err(
+                    "--search-duration is not supported by the filter-only workload".into(),
+                );
+            }
+            None
+        } else {
+            crate::engine::CycleMode::from_params(params, queries.len(), num_queries)?
+        };
+        if let Some(c) = &cycle {
+            if c.set_len != num_to_run {
+                return Err(format!(
+                    "duration mode cycles {} queries but {num_to_run} were prepared",
+                    c.set_len
+                ));
+            }
+        }
 
         // Precompute per-query `top` and the fully serialized request bodies
         // BEFORE the parallel region so the timed window wraps only the RPC
@@ -1976,10 +1998,13 @@ impl OpenSearchEngine {
         // window, where an env lookup is avoidable client CPU work.
         let search_policy = SearchRetryPolicy::from_env();
 
-        let pb = self.create_progress_bar(num_to_run);
+        let pb = self.create_progress_bar(if cycle.is_some() { 0 } else { num_to_run });
         let base_url = self.base_url.clone();
         let timeout = self.timeout;
         let index_name = self.index_name.clone();
+        let dispatcher = cycle.as_ref().map(|c| c.dispatcher());
+        let set_len = cycle.as_ref().map_or(0, |c| c.set_len);
+        let mut cycle_tally = vector_db_benchmark::duration_mode::CycleTally::default();
 
         // Gate-synchronized start so connection setup AND the cold first query
         // fall OUTSIDE the measured window. Every worker connects + primes, then
@@ -2010,6 +2035,7 @@ impl OpenSearchEngine {
                 let query_ids = &query_ids;
                 let query_idx = Arc::clone(&query_idx);
                 let pb = &pb;
+                let dispatcher = dispatcher.as_ref();
 
                 pool.spawn(move |ticket| {
                     let mut t = Vec::new();
@@ -2025,6 +2051,7 @@ impl OpenSearchEngine {
                     let mut cap: Vec<RawQueryResult> = Vec::new();
                     let mut capture_error: Option<String> = None;
                     let mut totals: Vec<(usize, u64)> = Vec::new();
+                    let mut tally = vector_db_benchmark::duration_mode::CycleTally::default();
 
                     let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -2049,6 +2076,7 @@ impl OpenSearchEngine {
                                 cap,
                                 capture_error,
                                 totals,
+                                tally,
                             );
                         }
                     };
@@ -2072,6 +2100,7 @@ impl OpenSearchEngine {
                                 cap,
                                 capture_error,
                                 totals,
+                                tally,
                             );
                         }
                     };
@@ -2085,7 +2114,7 @@ impl OpenSearchEngine {
 
                     // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
-                    if ticket.arrive_and_wait().is_none() {
+                    let Some(start_time) = ticket.arrive_and_wait() else {
                         return (
                             t,
                             p,
@@ -2099,14 +2128,28 @@ impl OpenSearchEngine {
                             cap,
                             capture_error,
                             totals,
+                            tally,
                         );
-                    }
+                    };
 
                     loop {
-                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= num_to_run {
-                            break;
-                        }
+                        // `seq` is the dispatch ordinal, `idx` the position in
+                        // the prepared set (equal outside duration mode, where
+                        // the shared dispatcher checks the deadline before each
+                        // dispatch and cycles the set).
+                        let (seq, idx) = match dispatcher {
+                            Some(d) => match d.next(start_time) {
+                                Some(next) => next,
+                                None => break,
+                            },
+                            None => {
+                                let idx = query_idx.fetch_add(1, Ordering::Relaxed);
+                                if idx >= num_to_run {
+                                    break;
+                                }
+                                (idx, idx)
+                            }
+                        };
 
                         let top = tops[idx];
                         let query_id = query_ids[idx];
@@ -2118,6 +2161,8 @@ impl OpenSearchEngine {
                         let response =
                             knn_send(&rt, &client, &index_name, &raw_bodies[idx], search_policy);
                         let elapsed = query_start.elapsed();
+                        // Completion on the shared clock, duration mode only.
+                        let completed_at = dispatcher.map(|_| start_time.elapsed().as_secs_f64());
 
                         if filter_only {
                             match response.and_then(|(body, cost)| {
@@ -2148,7 +2193,7 @@ impl OpenSearchEngine {
                                         match hits {
                                             Ok(hits) => cap.push(RawQueryResult::ok(
                                                 query_id,
-                                                idx,
+                                                seq,
                                                 hits,
                                                 Some(page.total),
                                                 elapsed.as_secs_f64(),
@@ -2164,13 +2209,13 @@ impl OpenSearchEngine {
                                     if capture {
                                         cap.push(RawQueryResult::failed(
                                             query_id,
-                                            idx,
+                                            seq,
                                             elapsed.as_secs_f64(),
                                             &e,
                                         ));
                                     }
                                     if errors.len() < 3 {
-                                        errors.push(format!("Filter-only query {idx} failed: {e}"));
+                                        errors.push(format!("Filter-only query {seq} failed: {e}"));
                                     }
                                 }
                             }
@@ -2201,6 +2246,9 @@ impl OpenSearchEngine {
                                     &neighbors[idx],
                                     top,
                                 );
+                                if let Some(at) = completed_at {
+                                    tally.push(seq, set_len, m.recall, at);
+                                }
                                 t.push(query_time);
                                 p.push(m.precision);
                                 r.push(m.recall);
@@ -2209,7 +2257,7 @@ impl OpenSearchEngine {
                                 if capture {
                                     cap.push(RawQueryResult::ok(
                                         query_id,
-                                        idx,
+                                        seq,
                                         result_ids
                                             .iter()
                                             .map(|&(row, score)| RawHit {
@@ -2226,11 +2274,11 @@ impl OpenSearchEngine {
                                 // Not counted here: `compute_search_stats` derives
                                 // failed_queries as requested - succeeded, uniformly
                                 // for every engine.
-                                eprintln!("Search query {} failed: {}", idx, e);
+                                eprintln!("Search query {} failed: {}", seq, e);
                                 if capture {
                                     cap.push(RawQueryResult::failed(
                                         query_id,
-                                        idx,
+                                        seq,
                                         elapsed.as_secs_f64(),
                                         e,
                                     ));
@@ -2253,6 +2301,7 @@ impl OpenSearchEngine {
                         cap,
                         capture_error,
                         totals,
+                        tally,
                     )
                 })?;
             }
@@ -2274,8 +2323,10 @@ impl OpenSearchEngine {
                 cap,
                 capture_error,
                 totals,
+                tally,
             ) in per_worker
             {
+                cycle_tally.merge(tally);
                 observed_totals.extend(totals);
                 if let Some(records) = captured.as_mut() {
                     records.extend(cap);
@@ -2317,14 +2368,17 @@ impl OpenSearchEngine {
         // Queries that succeeded only after a retry are surfaced separately: they
         // are not losses, but they identify load shedding. Scalar latency includes
         // backoff; the existing KNN contract excludes it.
+        // Queries dispatched: the prepared set once, or as many as the
+        // duration-mode dispatcher handed out before the deadline.
+        let requested = dispatcher.as_ref().map_or(num_to_run, |d| d.dispatched());
         let retried = retried_queries;
         if retried > 0 {
             eprintln!(
                 "⚠  {} of {} search queries succeeded only after a retry ({:.2}%) — the server \
                  was shedding load; backoff is {} the reported latency",
                 retried,
-                num_to_run,
-                100.0 * retried as f64 / num_to_run.max(1) as f64,
+                requested,
+                100.0 * retried as f64 / requested.max(1) as f64,
                 if filter_only {
                     "included in"
                 } else {
@@ -2338,9 +2392,12 @@ impl OpenSearchEngine {
             return Err(format!("--dump-results: {e}"));
         }
         let mut result = crate::engine::compute_search_stats(
-            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, num_to_run,
+            &times, &precs, &recs, &mrr_vals, &ndcg_vals, total_time, top, parallel, requested,
         )?;
         result.query_records = captured;
+        if let Some(c) = &cycle {
+            c.attach(&mut result, requested, &cycle_tally)?;
+        }
         if filter_only {
             // Per-query count gate (#340): every answer against its prepared
             // count. `query_set` is always `Some` on this path.

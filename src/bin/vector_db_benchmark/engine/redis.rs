@@ -19,8 +19,8 @@ use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::{Dataset, UploadSource};
 use crate::engine::index_naming::{derive_index_name, derive_key_prefix};
 use crate::engine::{
-    attach_open_loop_metrics, closed_loop_duration, zero_search_results, CorpusCount, Engine,
-    OpenLoopPlan, SearchResults, UpdateSearchRatio, UploadStats,
+    attach_open_loop_metrics, zero_search_results, CorpusCount, Engine, OpenLoopPlan,
+    SearchResults, UpdateSearchRatio, UploadStats,
 };
 use crate::metrics::compute_metrics;
 use vector_db_benchmark::indexing_wait::WaitPhase;
@@ -2839,7 +2839,10 @@ impl Engine for RedisEngine {
         // where top defaults to len(query.expected_result) per query).
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let open_loop = OpenLoopPlan::from_params(params)?;
-        let closed_loop_duration = closed_loop_duration(params)?;
+        // Closed-loop `--search-duration`: the shared cycled schedule
+        // (`duration_mode`), the same on every engine that implements it.
+        let cycle = crate::engine::CycleMode::from_params(params, queries.len(), num_queries)?;
+        let closed_loop_duration = cycle.as_ref().map(|c| c.duration);
         let num_to_run = if closed_loop_duration.is_some() {
             usize::MAX
         } else {
@@ -2921,6 +2924,9 @@ impl Engine for RedisEngine {
         if neighbors.len() < queries.len() {
             return Err("dataset ground-truth shorter than query set".into());
         }
+        let dispatcher = cycle.as_ref().map(|c| c.dispatcher());
+        let set_len = cycle.as_ref().map_or(0, |c| c.set_len);
+        let mut cycle_tally = vector_db_benchmark::duration_mode::CycleTally::default();
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(s, "redis-search", parallel);
@@ -2936,6 +2942,7 @@ impl Engine for RedisEngine {
                 let query_idx = Arc::clone(&query_idx);
                 let index_name = index_name.as_str();
                 let pb = &pb;
+                let dispatcher = dispatcher.as_ref();
 
                 pool.spawn(move |ticket| {
                     // Thread-local sample buffers — no cross-thread synchronization
@@ -2953,6 +2960,7 @@ impl Engine for RedisEngine {
                     // Per-query capture for --dump-results, filled AFTER each
                     // latency sample is taken.
                     let mut cap: Vec<RawQueryResult> = Vec::new();
+                    let mut tally = vector_db_benchmark::duration_mode::CycleTally::default();
 
                     let client = match RedisClient::open(redis_url.as_str(), cluster_api) {
                         Ok(c) => c,
@@ -2962,14 +2970,14 @@ impl Engine for RedisEngine {
                             // reported as `parallel`. Settle the ticket with the
                             // reason; the coordinator turns it into a hard error.
                             ticket.fail(format!("redis client open failed: {e}"));
-                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
+                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally);
                         }
                     };
                     let mut conn = match client.get_connection() {
                         Ok(c) => c,
                         Err(e) => {
                             ticket.fail(format!("redis connect failed: {e}"));
-                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
+                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally);
                         }
                     };
                     // Bound a blackholed endpoint to a finite wait instead of the
@@ -3003,21 +3011,25 @@ impl Engine for RedisEngine {
                     // Signal "connected + primed", then block until the coordinator
                     // stamps the shared measurement start and releases everyone.
                     let Some(start_time) = ticket.arrive_and_wait() else {
-                        return (t, p, r, mr, nd, sd, e2e, dropped, late, cap);
+                        return (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally);
                     };
 
                     loop {
-                        if closed_loop_duration
-                            .map(|duration| Instant::now() >= start_time + duration)
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
-                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= num_to_run {
-                            break;
-                        }
-                        let query_pos = idx % query_count;
+                        // Duration mode: the shared dispatcher checks the
+                        // deadline before each dispatch and cycles the set.
+                        let (idx, query_pos) = match dispatcher {
+                            Some(d) => match d.next(start_time) {
+                                Some(next) => next,
+                                None => break,
+                            },
+                            None => {
+                                let idx = query_idx.fetch_add(1, Ordering::Relaxed);
+                                if idx >= num_to_run {
+                                    break;
+                                }
+                                (idx, idx % query_count)
+                            }
+                        };
 
                         let scheduled_at = open_loop.map(|plan| {
                             let delay = plan.wait_for_slot(start_time, idx);
@@ -3092,6 +3104,16 @@ impl Engine for RedisEngine {
                                 let ordered_ids: Vec<i64> =
                                     result_ids.iter().map(|(id, _)| *id).collect();
                                 let m = compute_metrics(&ordered_ids, &neighbors[query_pos], top);
+                                if dispatcher.is_some() {
+                                    tally.push(
+                                        idx,
+                                        set_len,
+                                        m.recall,
+                                        completion
+                                            .saturating_duration_since(start_time)
+                                            .as_secs_f64(),
+                                    );
+                                }
                                 if capture {
                                     cap.push(RawQueryResult::ok(
                                         query_pos,
@@ -3138,7 +3160,7 @@ impl Engine for RedisEngine {
                     if pb_pending > 0 {
                         pb.inc(pb_pending);
                     }
-                    (t, p, r, mr, nd, sd, e2e, dropped, late, cap)
+                    (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally)
                 })?;
             }
 
@@ -3147,10 +3169,11 @@ impl Engine for RedisEngine {
             // offset is needed now — the cold setup is already behind the gate.
             let (per_worker, measured_start) = pool.start()?;
 
-            for (t, p, r, mr, nd, sd, e2e, dropped, late, cap) in per_worker {
+            for (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally) in per_worker {
                 if let Some(records) = captured.as_mut() {
                     records.extend(cap);
                 }
+                cycle_tally.merge(tally);
                 times.extend(t);
                 precs.extend(p);
                 recs.extend(r);
@@ -3170,10 +3193,13 @@ impl Engine for RedisEngine {
         let total_time = measured_start.elapsed().as_secs_f64();
 
         let top = explicit_top.unwrap_or_else(|| neighbors.first().map(|n| n.len()).unwrap_or(10));
-        let attempted_queries = query_idx
-            .load(Ordering::Relaxed)
-            .min(num_to_run)
-            .saturating_sub(dropped_queries);
+        let attempted_queries = match &dispatcher {
+            Some(d) => d.dispatched(),
+            None => query_idx
+                .load(Ordering::Relaxed)
+                .min(num_to_run)
+                .saturating_sub(dropped_queries),
+        };
 
         if times.is_empty() {
             // Genuinely zero attempts (no queries offered/dispatched) is an error.
@@ -3185,6 +3211,9 @@ impl Engine for RedisEngine {
             }
             let mut results = zero_search_results(total_time, top, parallel, attempted_queries);
             results.query_records = captured;
+            if let Some(c) = &cycle {
+                c.attach(&mut results, attempted_queries, &cycle_tally)?;
+            }
             if let Some(plan) = open_loop {
                 attach_open_loop_metrics(
                     &mut results,
@@ -3219,6 +3248,9 @@ impl Engine for RedisEngine {
             attempted_queries,
         )?;
         results.query_records = captured;
+        if let Some(c) = &cycle {
+            c.attach(&mut results, attempted_queries, &cycle_tally)?;
+        }
         // In open-loop mode, drops are distinct from attempted request failures.
         if let Some(plan) = open_loop {
             attach_open_loop_metrics(

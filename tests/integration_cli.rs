@@ -1091,13 +1091,13 @@ fn hybrid_misconfiguration_fails_before_configure_or_upload() {
         assert!(!stdout.contains("Running experiment"), "{stdout}");
     }
     // 0a. The CLI open-loop flags are merged into search configs only at
-    // search time; Redis passes the duration-bounded engine gate, so they must
-    // still be refused for hybrid at startup, not after the upload.
-    // (--target-qps alone is refused earlier: it needs --search-duration.)
-    for flag in [
-        &["--search-duration", "60"][..],
-        &["--target-qps", "100", "--search-duration", "60"][..],
-    ] {
+    // search time; Redis passes the duration-bounded engine gate, so open
+    // loop must still be refused for hybrid at startup, not after the upload.
+    // (--target-qps alone is refused earlier: it needs --search-duration.
+    // A closed-loop --search-duration alone is accepted: it applies per
+    // bucket.)
+    {
+        let flag = &["--target-qps", "100", "--search-duration", "60"][..];
         let e = envs(None);
         let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let mut cmd = std::process::Command::new(common::binary_path());
@@ -1121,7 +1121,7 @@ fn hybrid_misconfiguration_fails_before_configure_or_upload() {
         );
         assert!(!out.status.success(), "{flag:?}");
         assert!(
-            stderr.contains("target_qps / duration_seconds are not supported"),
+            stderr.contains("target_qps (open loop) is not supported"),
             "{flag:?}: {stderr}"
         );
         assert!(!stdout.contains("Experiment stage:"), "{flag:?}: {stdout}");

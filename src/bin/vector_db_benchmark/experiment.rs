@@ -269,6 +269,20 @@ pub fn run(args: &Args) -> Result<(), String> {
             .any(|mixed| mixed);
         vector_db_benchmark::workload::check_update_search_ratio(&plan, mixed_phases)
             .map_err(|e| format!("config '{name}': {e}"))?;
+        // Closed-loop duration is a search-only mode of the vector and hybrid
+        // arms; a mixed phase or a filter-only config would otherwise run
+        // once and publish a result under a duration it did not run.
+        {
+            let cli_duration = (args.search_duration > 0.0).then_some(args.search_duration);
+            for (i, sp) in config.search_params.iter().flatten().enumerate() {
+                vector_db_benchmark::workload::check_duration_supported(
+                    plan.workload(i)?,
+                    sp.duration_seconds.or(cli_duration),
+                    mixed_phases,
+                )
+                .map_err(|e| format!("config '{name}' search config #{i}: {e}"))?;
+            }
+        }
         // A conflicting filter-only result limit on the shared index is refused
         // here, before any download; the search stage applies the same rule.
         if plan.layout == IndexLayout::Full {
@@ -428,16 +442,24 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     if args.target_qps > 0.0 || args.search_duration > 0.0 {
+        let open_loop = args.target_qps > 0.0;
         let unsupported: Vec<_> = engines
             .iter()
             .filter_map(|(name, config)| {
                 let engine_type = config.engine.as_deref().unwrap_or("unknown");
-                (!matches!(engine_type, "redis" | "vertex")).then_some(name.as_str())
+                (!vector_db_benchmark::workload::supports_search_duration(engine_type, open_loop))
+                    .then_some(name.as_str())
             })
             .collect();
         if !unsupported.is_empty() {
             return Err(format!(
-                "duration-bounded search currently supports Redis and Vertex only; unsupported: {}",
+                "{}; unsupported: {}",
+                if open_loop {
+                    "open-loop search (--target-qps) currently supports Redis and Vertex only"
+                } else {
+                    "closed-loop duration search (--search-duration) currently supports Redis, \
+                     OpenSearch and Vertex only"
+                },
                 unsupported.join(", ")
             ));
         }
@@ -3096,6 +3118,12 @@ fn build_search_result_json(
             "in_latency_samples": false,
         });
     }
+    // Closed-loop `--search-duration` (vector / hybrid): how the point cycled
+    // its query set, the deadline accounting and recall incl. first pass.
+    // Absent on every other run, so their documents are unchanged.
+    if let Some(d) = &results.duration {
+        result["results"]["duration"] = d.clone();
+    }
     // Hybrid (#341): the per-bucket report, and the metric schema's width
     // profile describes the FILTERED ground truth the run was scored against.
     if let Some(h) = &results.hybrid {
@@ -5590,5 +5618,14 @@ mod hybrid_serialization_tests {
         let doc = build(&plain);
         assert!(doc["results"].get("hybrid").is_none());
         assert!(doc["metrics_schema"].get("ground_truth_source").is_none());
+        // `results.duration` is published only by a duration-mode point.
+        assert!(doc["results"].get("duration").is_none());
+        let timed = SearchResults {
+            duration: Some(serde_json::json!({"mode": "cycle-query-set", "full_passes": 3})),
+            ..plain
+        };
+        let doc = build(&timed);
+        assert_eq!(doc["results"]["duration"]["mode"], "cycle-query-set");
+        assert_eq!(doc["results"]["duration"]["full_passes"], 3);
     }
 }

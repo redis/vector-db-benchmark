@@ -47,8 +47,8 @@ use crate::engine::vertex_grpc::{
     VertexGrpcWorker,
 };
 use crate::engine::{
-    attach_open_loop_metrics, closed_loop_duration, zero_search_results, Engine, OpenLoopPlan,
-    SearchResults, UpdateSearchRatio, UploadStats,
+    attach_open_loop_metrics, zero_search_results, Engine, OpenLoopPlan, SearchResults,
+    UpdateSearchRatio, UploadStats,
 };
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -1782,7 +1782,10 @@ impl Engine for VertexEngine {
 
         let explicit_top: Option<usize> = params.top.map(|t| t as usize);
         let open_loop = OpenLoopPlan::from_params(params)?;
-        let closed_loop_duration = closed_loop_duration(params)?;
+        // Closed-loop `--search-duration`: the shared cycled schedule
+        // (`duration_mode`), the same on every engine that implements it.
+        let cycle = crate::engine::CycleMode::from_params(params, queries.len(), num_queries)?;
+        let closed_loop_duration = cycle.as_ref().map(|c| c.duration);
         let num_to_run = if closed_loop_duration.is_some() {
             usize::MAX
         } else {
@@ -1868,12 +1871,16 @@ impl Engine for VertexEngine {
         let mut end_to_end_latencies: Vec<f64> = Vec::new();
         let mut dropped_queries = 0usize;
         let mut late_queries = 0usize;
+        let dispatcher = cycle.as_ref().map(|c| c.dispatcher());
+        let set_len = cycle.as_ref().map_or(0, |c| c.set_len);
+        let mut cycle_tally = vector_db_benchmark::duration_mode::CycleTally::default();
 
         let measured_start = std::thread::scope(|s| -> Result<Instant, String> {
             let mut pool = WorkerPool::new(s, "vertex-search", workers);
             for worker_id in 0..workers {
                 let query_idx = Arc::clone(&query_idx);
                 let pb = &pb;
+                let dispatcher = dispatcher.as_ref();
                 pool.spawn(move |ticket| {
                     let mut t = Vec::new();
                     let mut p = Vec::new();
@@ -1885,6 +1892,7 @@ impl Engine for VertexEngine {
                     let mut dropped = 0usize;
                     let mut late = 0usize;
                     let mut pb_pending: u64 = 0;
+                    let mut tally = vector_db_benchmark::duration_mode::CycleTally::default();
 
                     let mut client = match VertexWorker::new(VertexWorkerConfig {
                         transport: query_transport,
@@ -1901,7 +1909,7 @@ impl Engine for VertexEngine {
                             // reports; settle the ticket with the reason and let the
                             // coordinator turn it into a hard error.
                             ticket.fail(format!("vertex worker client build failed: {e}"));
-                            return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                            return (t, p, r, mr, nd, sd, e2e, dropped, late, tally);
                         }
                     };
 
@@ -1930,21 +1938,25 @@ impl Engine for VertexEngine {
                     // Block until the coordinator stamps the shared measurement
                     // start, so no measured request predates the timer.
                     let Some(schedule_start) = ticket.arrive_and_wait() else {
-                        return (t, p, r, mr, nd, sd, e2e, dropped, late);
+                        return (t, p, r, mr, nd, sd, e2e, dropped, late, tally);
                     };
 
                     loop {
-                        if closed_loop_duration
-                            .map(|duration| Instant::now() >= schedule_start + duration)
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
-                        let idx = query_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= num_to_run {
-                            break;
-                        }
-                        let query_pos = idx % queries.len();
+                        // Duration mode: the shared dispatcher checks the
+                        // deadline before each dispatch and cycles the set.
+                        let (idx, query_pos) = match dispatcher {
+                            Some(d) => match d.next(schedule_start) {
+                                Some(next) => next,
+                                None => break,
+                            },
+                            None => {
+                                let idx = query_idx.fetch_add(1, Ordering::Relaxed);
+                                if idx >= num_to_run {
+                                    break;
+                                }
+                                (idx, idx % queries.len())
+                            }
+                        };
                         let request = client.request(
                             deployed_index_id,
                             &queries[query_pos],
@@ -2002,6 +2014,16 @@ impl Engine for VertexEngine {
                                 r.push(m.recall);
                                 mr.push(m.mrr);
                                 nd.push(m.ndcg);
+                                if dispatcher.is_some() {
+                                    tally.push(
+                                        idx,
+                                        set_len,
+                                        m.recall,
+                                        completion
+                                            .saturating_duration_since(schedule_start)
+                                            .as_secs_f64(),
+                                    );
+                                }
                                 if let Some((scheduled, _)) = scheduled_at {
                                     e2e.push(
                                         completion
@@ -2021,7 +2043,7 @@ impl Engine for VertexEngine {
                     if pb_pending > 0 {
                         pb.inc(pb_pending);
                     }
-                    (t, p, r, mr, nd, sd, e2e, dropped, late)
+                    (t, p, r, mr, nd, sd, e2e, dropped, late, tally)
                 })?;
             }
             // Wait for every worker to finish connecting, then stamp the
@@ -2035,7 +2057,8 @@ impl Engine for VertexEngine {
                     Instant::now()
                 }
             })?;
-            for (t, p, r, mr, nd, sd, e2e, dropped, late) in per_worker {
+            for (t, p, r, mr, nd, sd, e2e, dropped, late, tally) in per_worker {
+                cycle_tally.merge(tally);
                 latencies.extend(t);
                 precisions.extend(p);
                 recalls.extend(r);
@@ -2053,10 +2076,13 @@ impl Engine for VertexEngine {
         let total_time = measured_start.elapsed().as_secs_f64();
 
         let succeeded = latencies.len();
-        let attempted_queries = query_idx
-            .load(Ordering::Relaxed)
-            .min(num_to_run)
-            .saturating_sub(dropped_queries);
+        let attempted_queries = match &dispatcher {
+            Some(d) => d.dispatched(),
+            None => query_idx
+                .load(Ordering::Relaxed)
+                .min(num_to_run)
+                .saturating_sub(dropped_queries),
+        };
         if succeeded == 0 {
             // Genuinely zero attempts is an error; an overload-shed / all-failed
             // run that DID attempt work is a real data point — report rps=0 with
@@ -2065,6 +2091,9 @@ impl Engine for VertexEngine {
                 return Err("No searches completed (all queries failed)".to_string());
             }
             let mut results = zero_search_results(total_time, top, parallel, attempted_queries);
+            if let Some(c) = &cycle {
+                c.attach(&mut results, attempted_queries, &cycle_tally)?;
+            }
             if let Some(plan) = open_loop {
                 attach_open_loop_metrics(
                     &mut results,
@@ -2096,6 +2125,9 @@ impl Engine for VertexEngine {
             parallel,
             attempted_queries,
         )?;
+        if let Some(c) = &cycle {
+            c.attach(&mut results, attempted_queries, &cycle_tally)?;
+        }
         if let Some(plan) = open_loop {
             attach_open_loop_metrics(
                 &mut results,
