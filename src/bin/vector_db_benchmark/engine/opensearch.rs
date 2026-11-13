@@ -498,6 +498,73 @@ impl OpenSearchEngine {
         Ok(())
     }
 
+    /// See the OPENSEARCH_TIME_TO_SEARCHABLE call site in `upload`.
+    fn time_to_searchable(&self, vectors: &[Vec<f32>], upload_time: f64) -> Result<(), String> {
+        let expected = vectors.len() as u64;
+        let t0 = Instant::now();
+        self.refresh()?;
+        let refresh_s = t0.elapsed().as_secs_f64();
+        let mut polls = 0u32;
+        let count = loop {
+            polls += 1;
+            let resp = self
+                .rt
+                .block_on(self.client.count(CountParts::Index(&[&self.index_name])).send())
+                .map_err(|e| format!("time-to-searchable: _count failed: {e}"))?;
+            let body: serde_json::Value = self
+                .rt
+                .block_on(resp.json())
+                .map_err(|e| format!("time-to-searchable: _count returned no JSON: {e}"))?;
+            let c = body["count"].as_u64().unwrap_or(0);
+            if c >= expected || t0.elapsed().as_secs() > 3600 {
+                break c;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        };
+        let count_ok_s = t0.elapsed().as_secs_f64();
+        let q = serde_json::json!({
+            "size": 10,
+            "_source": false,
+            "query": {"knn": {"vector": {"vector": vectors[0], "k": 10}}}
+        });
+        let resp = self
+            .rt
+            .block_on(
+                self.client
+                    .search(SearchParts::Index(&[&self.index_name]))
+                    .body(q)
+                    .send(),
+            )
+            .map_err(|e| format!("time-to-searchable: k-NN probe failed: {e}"))?;
+        let knn_status = resp.status_code().as_u16();
+        let body: serde_json::Value = self
+            .rt
+            .block_on(resp.json())
+            .map_err(|e| format!("time-to-searchable: k-NN probe returned no JSON: {e}"))?;
+        let knn_hits = body["hits"]["hits"].as_array().map_or(0, |a| a.len());
+        let searchable_s = t0.elapsed().as_secs_f64();
+        let rec = serde_json::json!({
+            "upload_time_s": upload_time,
+            "refresh_s": refresh_s,
+            "count_ok_s": count_ok_s,
+            "count_polls": polls,
+            "count": count,
+            "expected": expected,
+            "knn_status": knn_status,
+            "knn_hits": knn_hits,
+            "searchable_after_upload_s": searchable_s,
+        });
+        println!("TIME_TO_SEARCHABLE {rec}");
+        if let Ok(path) = std::env::var("OPENSEARCH_TIME_TO_SEARCHABLE_OUT") {
+            std::fs::write(&path, rec.to_string())
+                .map_err(|e| format!("time-to-searchable: cannot write {path}: {e}"))?;
+        }
+        if count != expected || knn_hits == 0 || !(200..300).contains(&knn_status) {
+            return Err(format!("time-to-searchable check failed: {rec}"));
+        }
+        Ok(())
+    }
+
     /// Refresh the index to make just-uploaded documents searchable. Required
     /// because we set `refresh_interval: -1` (no periodic refresh) during upload.
     fn refresh(&self) -> Result<(), String> {
@@ -2600,6 +2667,15 @@ impl Engine for OpenSearchEngine {
             upload_time,
             vectors.len() as f64 / upload_time
         );
+
+        // Opt-in (OPENSEARCH_TIME_TO_SEARCHABLE=1): time the first refresh after a
+        // refresh_interval=-1 bulk load, until `_count` equals the uploaded count AND an
+        // unfiltered k-NN query returns hits, BEFORE the force merge. This adds one
+        // refresh that the default sequence does not have; index_wait_time then spans
+        // both this step and the merge. A no-op unless the variable is set.
+        if std::env::var("OPENSEARCH_TIME_TO_SEARCHABLE").as_deref() == Ok("1") {
+            self.time_to_searchable(&vectors, upload_time)?;
+        }
 
         // Force merge, which flushes and then refreshes — see `force_merge`; the
         // merge is invisible to queries until that refresh, so it is also what
