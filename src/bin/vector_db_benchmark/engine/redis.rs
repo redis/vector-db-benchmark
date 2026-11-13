@@ -405,6 +405,19 @@ impl RedisEngine {
         let vector_size = dataset.vector_size();
 
         let ft_profile = self.fulltext_profile()?;
+        // Redis Flex 8.8 builds search indexes on disk. Its FT.CREATE rejects
+        // SORTABLE on any field ("Disk index does not support SORTABLE fields")
+        // and rejects a disk HNSW field unless M, EF_CONSTRUCTION, EF_RUNTIME
+        // and RERANK are all given explicitly (RERANK takes the literal
+        // true/false). Opt-in via REDIS_FLEX_DISK_INDEX=1; EF_RUNTIME here is only
+        // the index default, every query still binds its own EF_RUNTIME $EF.
+        let flex_disk = flex_disk_index_opts()?;
+        if let Some((ef_rt, rerank)) = flex_disk {
+            crate::effective_config::record_effective(
+                "REDIS_FLEX_DISK_INDEX",
+                serde_json::json!({"enabled": true, "create_ef_runtime": ef_rt, "rerank": rerank, "sortable": false}),
+            );
+        }
         let reduced = ft_profile
             .as_ref()
             .is_some_and(|p| p.scalar_indexing.is_reduced());
@@ -540,8 +553,8 @@ impl RedisEngine {
                 }
             } else {
                 // HNSW (default): TYPE+DIM+DISTANCE_METRIC + M + EF_CONSTRUCTION.
-                let num_attrs =
-                    10 + if self.config.hnsw_sq8.compression.is_some() {
+                let num_attrs = if flex_disk.is_some() { 14 } else { 10 }
+                    + if self.config.hnsw_sq8.compression.is_some() {
                         2
                     } else {
                         0
@@ -556,6 +569,10 @@ impl RedisEngine {
                 cmd.arg("DISTANCE_METRIC").arg(distance_metric);
                 cmd.arg("M").arg(self.config.m);
                 cmd.arg("EF_CONSTRUCTION").arg(self.config.ef_construction);
+                if let Some((ef_rt, rerank)) = flex_disk {
+                    cmd.arg("EF_RUNTIME").arg(ef_rt);
+                    cmd.arg("RERANK").arg(if rerank { "true" } else { "false" });
+                }
                 if let Some(compression) = &self.config.hnsw_sq8.compression {
                     cmd.arg("COMPRESSION").arg(compression);
                 }
@@ -599,18 +616,24 @@ impl RedisEngine {
                             {
                                 cmd.arg("CASESENSITIVE");
                             }
-                            if !reduced {
+                            if !reduced && flex_disk.is_none() {
                                 cmd.arg("SORTABLE").arg("UNF");
                             }
                         }
                         "int" | "float" => {
-                            cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
+                            cmd.arg(field_name).arg("NUMERIC");
+                            if flex_disk.is_none() {
+                                cmd.arg("SORTABLE");
+                            }
                         }
                         // datetime is stored as epoch seconds (see upload) and
                         // indexed NUMERIC so range filters work with either ISO or
                         // numeric bounds.
                         "datetime" => {
-                            cmd.arg(field_name).arg("NUMERIC").arg("SORTABLE");
+                            cmd.arg(field_name).arg("NUMERIC");
+                            if flex_disk.is_none() {
+                                cmd.arg("SORTABLE");
+                            }
                         }
                         // #339 parity: only the searched text fields are
                         // indexed, NOSTEM; english / no fulltext: all, stemmed.
@@ -618,19 +641,22 @@ impl RedisEngine {
                             Some(p) if !p.indexes_text_field(field_name) => {}
                             Some(p) if !p.stems() => {
                                 cmd.arg(field_name).arg("TEXT").arg("NOSTEM");
-                                if !reduced {
+                                if !reduced && flex_disk.is_none() {
                                     cmd.arg("SORTABLE");
                                 }
                             }
                             _ => {
                                 cmd.arg(field_name).arg("TEXT");
-                                if !reduced {
+                                if !reduced && flex_disk.is_none() {
                                     cmd.arg("SORTABLE");
                                 }
                             }
                         },
                         "geo" => {
-                            cmd.arg(field_name).arg("GEO").arg("SORTABLE");
+                            cmd.arg(field_name).arg("GEO");
+                            if flex_disk.is_none() {
+                                cmd.arg("SORTABLE");
+                            }
                         }
                         _ => {}
                     }
@@ -1256,6 +1282,27 @@ impl RedisEngine {
         );
         pb
     }
+}
+
+/// `REDIS_FLEX_DISK_INDEX=1` -> `Some((create-time EF_RUNTIME, RERANK))` from
+/// `REDIS_FLEX_DISK_EF_RUNTIME` (default 10) and `REDIS_FLEX_DISK_RERANK`
+/// (default true). Unset/0 -> `None` (upstream FT.CREATE unchanged).
+fn flex_disk_index_opts() -> Result<Option<(u32, bool)>, String> {
+    match std::env::var("REDIS_FLEX_DISK_INDEX").ok().as_deref() {
+        None | Some("") | Some("0") | Some("false") => return Ok(None),
+        Some("1") | Some("true") => {}
+        Some(v) => return Err(format!("REDIS_FLEX_DISK_INDEX must be 0/1/true/false, got {v:?}")),
+    }
+    let ef_rt = match std::env::var("REDIS_FLEX_DISK_EF_RUNTIME") {
+        Ok(v) => v.parse::<u32>().map_err(|_| format!("REDIS_FLEX_DISK_EF_RUNTIME must be a positive integer, got {v:?}"))?,
+        Err(_) => 10,
+    };
+    let rerank = match std::env::var("REDIS_FLEX_DISK_RERANK").ok().as_deref() {
+        None | Some("true") | Some("1") => true,
+        Some("false") | Some("0") => false,
+        Some(v) => return Err(format!("REDIS_FLEX_DISK_RERANK must be true/false, got {v:?}")),
+    };
+    Ok(Some((ef_rt, rerank)))
 }
 
 /// Encode a vector to the little-endian byte layout RediSearch expects for the
