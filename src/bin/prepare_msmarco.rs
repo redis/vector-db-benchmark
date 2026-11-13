@@ -203,8 +203,9 @@ struct Args {
     add_hybrid_queries: bool,
 
     /// Write the `msmarco-disk-v1` compound query families (rare terms, term
-    /// pairs, rare term AND category, url/docid exact match, deep fetch, and
-    /// the docid / url / rare-term-OR batches, `rare-terms-or-wide` included)
+    /// pairs, rare term AND category, url/docid exact match, deep fetch, the
+    /// docid / url / rare-term-OR batches, `rare-terms-or-wide` included, and
+    /// the `corpus-sweep-or` epochs over the whole corpus)
     /// into `<dataset>/msmarco-disk-v1/` from the corpus on disk: two passes
     /// over `payloads.jsonl`, nothing else read or rewritten (`PREPARED.json`
     /// is unchanged). If the directory already exists the families are

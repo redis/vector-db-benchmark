@@ -22,6 +22,7 @@
 //! | `rare-terms-or` | OR of [`RARE_OR_N`] `segment` terms, each df [`RARE_OR_DF`], `top: 100`, `fetch` | the DISTINCT passages holding any term |
 //! | `rare-terms-or-and-category` | that OR AND the `category` of one of its passages | ≥1 |
 //! | `rare-terms-or-wide` | OR of [`RARE_OR_N`] `segment` terms, each df [`RARE_OR_WIDE_DF`] (the `rare-term` pool), `top: 100`, `fetch` | the DISTINCT passages holding any term |
+//! | `corpus-sweep-or` | OR of up to [`SWEEP_MAX_TERMS`] `segment` terms (df [`SWEEP_DF`]) and the `docid`s of passages no such term reaches, `top: 200`, `fetch` | every match ([`SWEEP_TOP`] at most): one epoch fetches the whole corpus |
 //!
 //! # Exact by construction
 //!
@@ -83,6 +84,21 @@
 //! [`OPENSEARCH_MAX_TERMS_COUNT`], [`OPENSEARCH_MAX_CLAUSE_COUNT`]) and
 //! recorded in the manifest (`high_pressure`, `families.<f>.batch`).
 //!
+//! # Corpus sweep (v8)
+//!
+//! A family whose fetched set fits in a cache is eventually served from it.
+//! `corpus-sweep-or` fetches EVERY passage at least once per epoch
+//! ([`rarest_term`], [`sweep_lines`], [`pack_sweep`]): every passage's
+//! rarest eligible `segment` term of df [`SWEEP_DF`] (ties by term) is
+//! chosen, and those terms' postings cover every passage that has one; the
+//! passages none reaches are added by `docid` (most of a large corpus: the
+//! zero-ambiguity rule rejects nearly every frequent term, so on the 10M
+//! corpus the terms reach 37% of the passages, and no df bound reaches 43%).
+//! Each epoch shuffles the terms and docids by seeded keys and packs them
+//! greedily into lines whose `sum(df) + docids` stays within [`SWEEP_TOP`],
+//! the page, so every match is fetched. A cache smaller than the corpus
+//! keeps missing.
+//!
 //! Line 0 of each family file is the connection-priming query (the first
 //! item in key order) and lines 1..=[`PROBE_RESERVE`] are reserved for the
 //! Redis `WITHOUTCOUNT` probe: neither ever appears in a timed window. The
@@ -139,7 +155,11 @@ pub const MANIFEST: &str = "manifest.json";
 /// v7: adds `rare-terms-or-wide` ([`RARE_OR_WIDE_DF`]); the twelve v6 family
 /// files are byte-identical (same rules, same keys); v6 files are refused
 /// (they lack `rare-terms-or-wide.jsonl`).
-pub const GENERATOR: &str = "vdb-msmarco-disk/v7";
+/// v8: adds `corpus-sweep-or` ([`SWEEP_DF`], [`SWEEP_TOP`],
+/// [`SWEEP_MAX_TERMS`]); the thirteen v7 family files are byte-identical
+/// (same rules, same keys); v7 files are refused (they lack
+/// `corpus-sweep-or.jsonl`).
+pub const GENERATOR: &str = "vdb-msmarco-disk/v8";
 /// Domain of the seeded rank keys ([`rank_key`]). It stays at its first value
 /// while only the file layout changes, so the same items are selected.
 pub const KEY_DOMAIN: &str = "vdb-msmarco-disk/v1";
@@ -206,6 +226,27 @@ pub const RARE_OR_DF: (u64, u64) = (11, 100);
 /// whole corpus; some lines match fewer than [`HIGH_PRESSURE_TOP`] passages
 /// (a short page, the same on both engines; the manifest records how many).
 pub const RARE_OR_WIDE_DF: (u64, u64) = RARE_DF;
+/// Document-frequency band of the `corpus-sweep-or` terms: [`RARE_DF`], the
+/// `rare-term` pool (same eligibility rules, the same postings as
+/// `rare-terms-or-wide`). Every passage holding one of these terms is
+/// reached by its rarest one. A wider band would not reach much more: on the
+/// 10M corpus the band covers 37.0% of the passages, df ≤ 200 39.4%, df ≤
+/// 2,000 42.1% and no bound 42.9% (an eligible term has zero ambiguous
+/// passages in the whole corpus, which almost no frequent term has), so the
+/// rest is reached by `docid`; and a term must fit a line ([`SWEEP_TOP`]).
+pub const SWEEP_DF: (u64, u64) = RARE_DF;
+/// The fixed page (`top`, with `fetch`) of `corpus-sweep-or` and the bound
+/// of each line's `sum(df) + docids`: the line's distinct matches are at
+/// most that sum, so the page holds every match and the line's whole match
+/// set is fetched. 200 is twice the other high-pressure pages: twice the
+/// documents per query for the same per-query overhead, and room for a
+/// df-100 term next to others, so few lines end short.
+pub const SWEEP_TOP: usize = 200;
+/// Most `segment` terms in one `corpus-sweep-or` line (most terms have df 1,
+/// so without it a line could hold up to [`SWEEP_TOP`] term clauses). Far
+/// below [`OPENSEARCH_MAX_CLAUSE_COUNT`] (the terms, plus one `terms` query
+/// for the docids).
+pub const SWEEP_MAX_TERMS: usize = 64;
 /// The fixed page (`top`, with `fetch`) of `url-batch` and the
 /// `rare-terms-or*` families: their match sets are larger, so each query
 /// fetches a full 100-document page (`rare-terms-or-wide`'s often are not:
@@ -243,8 +284,17 @@ const _: () = {
     assert!(HIGH_PRESSURE_TOP <= OPENSEARCH_MAX_RESULT_WINDOW);
     // Every term of rare-terms-or-and-category plus its category filter.
     assert!(RARE_OR_N < OPENSEARCH_MAX_CLAUSE_COUNT);
+    // corpus-sweep-or: its terms plus the docid `terms` query; the docids
+    // (at most SWEEP_TOP) in one `terms` query; every term fits a line.
+    assert!(SWEEP_MAX_TERMS < OPENSEARCH_MAX_CLAUSE_COUNT);
+    assert!(SWEEP_TOP <= OPENSEARCH_MAX_TERMS_COUNT);
+    assert!(SWEEP_TOP <= OPENSEARCH_MAX_RESULT_WINDOW);
+    assert!(SWEEP_DF.1 <= SWEEP_TOP as u64);
+    // The sweep reuses rare-terms-or-wide's pool and postings.
+    assert!(SWEEP_DF.0 == RARE_OR_WIDE_DF.0 && SWEEP_DF.1 == RARE_OR_WIDE_DF.1);
+    assert!(SWEEP_MAX_TERMS > 0);
 };
-/// The fields every high-pressure family (v6 and v7) fetches, on both
+/// The fields every high-pressure family (v6, v7 and v8) fetches, on both
 /// engines, in this order: the same stored bytes leave each engine per hit.
 pub const HIGH_PRESSURE_FETCH: [&str; 3] = ["title", "segment", "url"];
 /// Longest `url` used as a tag value.
@@ -265,10 +315,11 @@ pub enum Family {
     RareTermsOr,
     RareTermsOrAndCategory,
     RareTermsOrWide,
+    CorpusSweepOr,
 }
 
 impl Family {
-    pub const ALL: [Family; 13] = [
+    pub const ALL: [Family; 14] = [
         Family::RareTerm,
         Family::TwoRareTerms,
         Family::RareTermAndCategory,
@@ -282,6 +333,7 @@ impl Family {
         Family::RareTermsOr,
         Family::RareTermsOrAndCategory,
         Family::RareTermsOrWide,
+        Family::CorpusSweepOr,
     ];
 
     pub fn name(self) -> &'static str {
@@ -299,6 +351,7 @@ impl Family {
             Family::RareTermsOr => "rare-terms-or",
             Family::RareTermsOrAndCategory => "rare-terms-or-and-category",
             Family::RareTermsOrWide => "rare-terms-or-wide",
+            Family::CorpusSweepOr => "corpus-sweep-or",
         }
     }
 
@@ -326,6 +379,7 @@ impl Family {
             Family::DeepFetch => Some(DEEP_DF),
             Family::RareTermsOr | Family::RareTermsOrAndCategory => Some(RARE_OR_DF),
             Family::RareTermsOrWide => Some(RARE_OR_WIDE_DF),
+            Family::CorpusSweepOr => Some(SWEEP_DF),
             Family::UrlEq
             | Family::DocidEq
             | Family::DocidBatch
@@ -346,6 +400,7 @@ impl Family {
             Family::RareTermAndCategory | Family::RareTermsOrAndCategory => {
                 &[TEXT_FIELD, "category"]
             }
+            Family::CorpusSweepOr => &[TEXT_FIELD, "docid"],
             Family::UrlEq | Family::UrlBatch => &["url"],
             Family::DocidEq
             | Family::DocidBatch
@@ -356,6 +411,7 @@ impl Family {
 
     /// Items per line of a batch family: the docids of a `docid-batch*`
     /// line, the URLs of `url-batch`, the terms of `rare-terms-or*`.
+    /// `None` for `corpus-sweep-or`, whose lines vary in size.
     pub fn batch_size(self) -> Option<usize> {
         match self {
             Family::DocidBatch => Some(DOCID_BATCH_K),
@@ -391,22 +447,25 @@ impl Family {
             | Family::RareTermsOr
             | Family::RareTermsOrAndCategory
             | Family::RareTermsOrWide => Some(HIGH_PRESSURE_TOP),
+            Family::CorpusSweepOr => Some(SWEEP_TOP),
             _ => None,
         }
     }
 
     /// Whether the family refuses `total_hits: "none"`: the docid batches
-    /// and every high-pressure family (v6, and v7's `rare-terms-or-wide`).
+    /// and every high-pressure family (v6, v7's `rare-terms-or-wide` and
+    /// v8's `corpus-sweep-or`).
     pub fn requires_exact_total(self) -> bool {
-        self.batch_size().is_some()
+        self.batch_size().is_some() || self == Family::CorpusSweepOr
     }
 
-    /// The exact `fulltext.fetch` field list a high-pressure family (v6 and
-    /// v7) requires ([`HIGH_PRESSURE_FETCH`]): fetch parity is the point of these
+    /// The exact `fulltext.fetch` field list a high-pressure family (v6, v7
+    /// and v8) requires ([`HIGH_PRESSURE_FETCH`]): fetch parity is the point of these
     /// families, so another list (fewer, more or other fields) is refused.
     /// `None` for the v5 families, which only require `fetch` to be set.
     pub fn fixed_fetch(self) -> Option<&'static [&'static str]> {
-        (self.batch_size().is_some() && self != Family::DocidBatch)
+        ((self.batch_size().is_some() && self != Family::DocidBatch)
+            || self == Family::CorpusSweepOr)
             .then_some(&HIGH_PRESSURE_FETCH[..])
     }
 
@@ -493,9 +552,10 @@ impl Family {
             | Family::UrlBatch
             | Family::RareTermsOr
             | Family::RareTermsOrWide => 2,
-            Family::TwoRareTerms | Family::RareTermAndCategory | Family::RareTermsOrAndCategory => {
-                3
-            }
+            Family::TwoRareTerms
+            | Family::RareTermAndCategory
+            | Family::RareTermsOrAndCategory
+            | Family::CorpusSweepOr => 3,
         };
         if a.len() != arity {
             return Err(format!(
@@ -544,6 +604,7 @@ impl Family {
                     json!({"and": [any, tag("category", cat)]})
                 }
             }
+            Family::CorpusSweepOr => sweep_conditions(&a[0], &a[1], count)?,
             Family::DocidBatch | Family::DocidBatch500 | Family::DocidBatch1000 => {
                 unreachable!("handled above")
             }
@@ -584,6 +645,83 @@ fn batch_items<'a>(
         out.push(s);
     }
     Ok(out)
+}
+
+/// The distinct strings of a variable-size list (at most `max`), each
+/// passing `valid`.
+fn distinct_items<'a>(
+    family: Family,
+    items: &'a Value,
+    max: usize,
+    valid: impl Fn(&str) -> bool,
+    what: &str,
+) -> Result<Vec<&'a str>, String> {
+    let name = family.name();
+    let a = items
+        .as_array()
+        .ok_or_else(|| format!("{SUITE} {name}: the {what} list is not an array"))?;
+    if a.len() > max {
+        return Err(format!(
+            "{SUITE} {name}: a line holds at most {max} {what}s; got {}",
+            a.len()
+        ));
+    }
+    let mut seen = HashSet::with_capacity(a.len());
+    let mut out = Vec::with_capacity(a.len());
+    for v in a {
+        let s = v
+            .as_str()
+            .filter(|s| valid(s))
+            .ok_or_else(|| format!("{SUITE} {name}: {v} is not a valid {what}"))?;
+        if !seen.insert(s) {
+            return Err(format!("{SUITE} {name}: {s:?} repeats in one line"));
+        }
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// The conditions of a `corpus-sweep-or` line `[[t1, …], [d1, …], n]`: the
+/// OR of at most [`SWEEP_MAX_TERMS`] distinct `segment` terms and `docid`
+/// equal to any of at most [`SWEEP_TOP`] distinct safe docids (either list
+/// may be empty, not both); `n` is at most [`SWEEP_TOP`], the page. Terms
+/// render as one field-scoped union (`@segment:(t1 | …)`), docids as one tag
+/// union, and the two are OR-ed.
+fn sweep_conditions(terms: &Value, docids: &Value, count: u64) -> Result<Value, String> {
+    let family = Family::CorpusSweepOr;
+    let name = family.name();
+    let terms = distinct_items(
+        family,
+        terms,
+        SWEEP_MAX_TERMS,
+        |t| text_match::validate_term(t).is_ok(),
+        "text_match term",
+    )?;
+    let docids = distinct_items(family, docids, SWEEP_TOP, is_safe_tag, "safe docid tag")?;
+    if terms.is_empty() && docids.is_empty() {
+        return Err(format!("{SUITE} {name}: a line holds no term and no docid"));
+    }
+    if count > SWEEP_TOP as u64 {
+        return Err(format!(
+            "{SUITE} {name}: count {count} is above the page {SWEEP_TOP}: the line's matches \
+             would not all be fetched"
+        ));
+    }
+    let text = |t: &str| json!({TEXT_FIELD: {"match": {"text": t}}});
+    let mut parts = Vec::with_capacity(2);
+    match terms.as_slice() {
+        [] => {}
+        [t] => parts.push(text(t)),
+        many => parts.push(json!({"or": many.iter().map(|t| text(t)).collect::<Vec<_>>()})),
+    }
+    if !docids.is_empty() {
+        parts.push(json!({"docid": {"match": {"any": docids}}}));
+    }
+    Ok(if parts.len() == 1 {
+        parts.pop().expect("one part")
+    } else {
+        json!({ "or": parts })
+    })
 }
 
 /// The conditions of a docid-batch line `[[d1, …, dK], K]`: `docid` equal
@@ -938,6 +1076,137 @@ pub fn union_rows(lists: &[&[u32]]) -> Vec<u32> {
     rows.sort_unstable();
     rows.dedup();
     rows
+}
+
+/// The `corpus-sweep-or` choice for one passage: of its candidate terms
+/// `(id, df, term)` (the eligible terms of [`SWEEP_DF`] it holds), the one
+/// with the smallest df, ties broken by the term (byte order), so the choice
+/// does not depend on the order the candidates come in. `None` if it holds
+/// none (the passage is reached by its docid instead).
+pub fn rarest_term<'a>(candidates: impl Iterator<Item = (u32, u64, &'a str)>) -> Option<u32> {
+    candidates
+        .min_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)))
+        .map(|(id, _, _)| id)
+}
+
+/// One item of a `corpus-sweep-or` epoch: a term (its df is its weight, the
+/// passages it matches) or a docid (weight 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepUnit {
+    pub weight: u64,
+    pub is_term: bool,
+}
+
+/// Cut a `corpus-sweep-or` epoch (its units, in their seeded key order)
+/// into lines, greedily and in order: a unit joins the current line while
+/// the line's total weight stays within [`SWEEP_TOP`] and, for a term, its
+/// terms within [`SWEEP_MAX_TERMS`]; otherwise it starts the next line.
+/// Returns each line's end offset into `units` (lines are consecutive, the
+/// last ends at `units.len()`). A line's distinct matches are at most its
+/// weight, so the page holds all of them. Every weight must be 1..=
+/// [`SWEEP_TOP`].
+pub fn pack_sweep(units: &[SweepUnit]) -> Result<Vec<usize>, String> {
+    let mut ends = Vec::new();
+    let (mut weight, mut terms, mut len) = (0u64, 0usize, 0usize);
+    for (i, u) in units.iter().enumerate() {
+        if u.weight == 0 || u.weight > SWEEP_TOP as u64 {
+            return Err(format!(
+                "{SUITE}: a corpus-sweep-or unit of weight {} does not fit a line of {SWEEP_TOP}",
+                u.weight
+            ));
+        }
+        let fits = weight + u.weight <= SWEEP_TOP as u64 && (!u.is_term || terms < SWEEP_MAX_TERMS);
+        if len > 0 && !fits {
+            ends.push(i);
+            (weight, terms, len) = (0, 0, 0);
+        }
+        weight += u.weight;
+        terms += usize::from(u.is_term);
+        len += 1;
+    }
+    if len > 0 {
+        ends.push(units.len());
+    }
+    Ok(ends)
+}
+
+/// The flag of a `corpus-sweep-or` unit id that names a docid (the id is
+/// its docid-pool index), not a term (the id is its term-pool index).
+pub const SWEEP_DOCID: u32 = 1 << 31;
+
+/// `corpus-sweep-or` lines: `units` (term ids, and docid ids with
+/// [`SWEEP_DOCID`] set), line `i` being `units[ends[i - 1]..ends[i]]`; and
+/// the length of each epoch (the last one's whole length, though the file
+/// may end inside it).
+#[derive(Debug, PartialEq, Eq)]
+pub struct SweepLines {
+    pub units: Vec<u32>,
+    pub ends: Vec<usize>,
+    pub epoch_lines: Vec<usize>,
+}
+
+/// Build `lines` `corpus-sweep-or` lines from the chosen `terms` (`term(i)`
+/// is its text and df) and the `docids` of the passages no term reaches.
+/// Epoch `e` keys every unit by SHA-256(key domain, seed,
+/// `"corpus-sweep-or/epoch-<e>/term"` or `".../docid"`, its text), sorts by
+/// key (then id), and cuts that order into lines with [`pack_sweep`]; the
+/// epochs follow each other until there are `lines` lines. Every epoch holds
+/// every unit exactly once, so it matches every passage the terms' postings
+/// and the docids reach.
+pub fn sweep_lines<'a>(
+    terms: &[u32],
+    docids: &[u32],
+    term: impl Fn(u32) -> (&'a str, u64) + Sync,
+    docid: impl Fn(u32) -> &'a str + Sync,
+    seed: u64,
+    lines: usize,
+) -> Result<SweepLines, String> {
+    if terms.iter().chain(docids).any(|&i| i & SWEEP_DOCID != 0) {
+        return Err(format!(
+            "{SUITE}: corpus-sweep-or: an id above {SWEEP_DOCID}"
+        ));
+    }
+    if terms.is_empty() && docids.is_empty() {
+        return Err(format!("{SUITE}: corpus-sweep-or has no term and no docid"));
+    }
+    let mut out = SweepLines {
+        units: Vec::new(),
+        ends: Vec::with_capacity(lines),
+        epoch_lines: Vec::new(),
+    };
+    while out.ends.len() < lines {
+        let epoch = out.epoch_lines.len();
+        let (dt, dd) = (
+            format!("corpus-sweep-or/epoch-{epoch}/term"),
+            format!("corpus-sweep-or/epoch-{epoch}/docid"),
+        );
+        let mut keyed: Vec<(u64, u32)> = terms
+            .par_iter()
+            .map(|&i| (rank_key(seed, &dt, term(i).0), i))
+            .chain(
+                docids
+                    .par_iter()
+                    .map(|&i| (rank_key(seed, &dd, docid(i)), i | SWEEP_DOCID)),
+            )
+            .collect();
+        keyed.par_sort_unstable();
+        let ends = pack_sweep(
+            &keyed
+                .iter()
+                .map(|&(_, u)| SweepUnit {
+                    weight: if u & SWEEP_DOCID == 0 { term(u).1 } else { 1 },
+                    is_term: u & SWEEP_DOCID == 0,
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        out.epoch_lines.push(ends.len());
+        let take = ends.len().min(lines - out.ends.len());
+        let base = out.units.len();
+        out.units
+            .extend(keyed[..ends[take - 1]].iter().map(|&(_, u)| u));
+        out.ends.extend(ends[..take].iter().map(|e| base + e));
+    }
+    Ok(out)
 }
 
 /// The pool items ranked by their epoch key, `rank_key(seed,
@@ -1421,6 +1690,14 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
     }
     let mut wide_rows: Vec<u32> = vec![0; *wide_start.last().unwrap()];
     let mut wide_fill: Vec<u32> = vec![0; wide_pool.len()];
+    // corpus-sweep-or: its terms are the wide pool (SWEEP_DF ==
+    // RARE_OR_WIDE_DF). Pass 2 marks each passage's rarest one
+    // ([`rarest_term`]) in `sweep_chosen`, and records for each docid-eq
+    // eligible docid (in `batch_arena` order) whether its passage holds one.
+    let mut sweep_chosen: Vec<bool> = vec![false; wide_pool.len()];
+    let mut sweep_candidates: Vec<u32> = Vec::new();
+    let mut batch_covered: Vec<bool> = Vec::new();
+    let mut sweep_covered_rows = 0u64;
     // Pair-pool term ids in lexicographic order, so an id-sorted pair is a
     // term-sorted pair.
     let mut pair_terms: Vec<(&str, u64)> =
@@ -1461,6 +1738,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
     let mut url_counts: HashMap<String, u64> = HashMap::new();
     let (bytes2, sha2) = for_each_row(&payloads, |row, s| {
         ids.clear();
+        sweep_candidates.clear();
         let row32 = u32::try_from(row).map_err(|_| "too many passages")?;
         let mut rare_or_row = false;
         for (t, yes) in &s.terms {
@@ -1483,6 +1761,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
                 }
                 wide_rows[at] = row32;
                 wide_fill[i] += 1;
+                sweep_candidates.push(i as u32);
             }
             if let Some(&i) = rac_index.get(t.as_str()) {
                 rac_cats[i].push(s.category.clone());
@@ -1515,6 +1794,15 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             row_cat[row] = c;
             row_key[row] = rank_key(seed, "rare-terms-or-and-category/passage", &s.docid);
         }
+        let sweep_choice = rarest_term(
+            sweep_candidates
+                .iter()
+                .map(|&i| (i, wide_pool[i as usize].2, wide_pool[i as usize].1.as_str())),
+        );
+        if let Some(i) = sweep_choice {
+            sweep_chosen[i as usize] = true;
+            sweep_covered_rows += 1;
+        }
         if is_safe_tag(&s.docid) {
             if docid_pieces.contains(&s.docid) {
                 docid_rows_colliding += 1;
@@ -1523,6 +1811,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
                 docid_rows += 1;
                 batch_arena.push_str(&s.docid);
                 batch_ends.push(batch_arena.len());
+                batch_covered.push(sweep_choice.is_some());
                 docids.add((rank_key(seed, "docid-eq", &s.docid), s.docid));
             }
         }
@@ -1754,6 +2043,92 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         .iter()
         .filter(|&&n| n < HIGH_PRESSURE_TOP as u64)
         .count();
+    // corpus-sweep-or: the chosen terms (S) and the docids of the passages no
+    // SWEEP_DF term reaches, shuffled once by their seeded keys and packed
+    // into one epoch of lines (`pack_sweep`), which the file repeats.
+    let sweep_terms: Vec<u32> = (0..wide_pool.len() as u32)
+        .filter(|&i| sweep_chosen[i as usize])
+        .collect();
+    // Every covered passage is in its own chosen term's postings, and every
+    // row of a SWEEP_DF term's postings is covered: the union of S's
+    // postings is exactly the covered passages.
+    let mut reached = vec![false; passages as usize];
+    for &i in &sweep_terms {
+        for &r in &wide_rows[wide_start[i as usize]..wide_start[i as usize + 1]] {
+            reached[r as usize] = true;
+        }
+    }
+    let sweep_reached = reached.iter().filter(|&&b| b).count() as u64;
+    drop(reached);
+    if sweep_reached != sweep_covered_rows {
+        return Err(format!(
+            "{SUITE}: corpus-sweep-or: the chosen terms' postings hold {sweep_reached} passages \
+             but {sweep_covered_rows} passages chose a term"
+        ));
+    }
+    let sweep_docids: Vec<u32> = batch_pool
+        .ids
+        .iter()
+        .copied()
+        .filter(|&i| !batch_covered[i as usize])
+        .collect();
+    drop(batch_covered);
+    let sweep_unreachable = passages - sweep_covered_rows - sweep_docids.len() as u64;
+    // Its eligible pool is the term pool (the docids are every eligible
+    // docid of the passages no term reaches, `batch.coverage`).
+    pools.insert(Family::CorpusSweepOr, wide_pool.len());
+    let sweep_weight = |u: u32| -> u64 {
+        if u & SWEEP_DOCID == 0 {
+            wide_pool[u as usize].2
+        } else {
+            1
+        }
+    };
+    let SweepLines {
+        units: sweep_units,
+        ends: sweep_ends,
+        epoch_lines: sweep_epoch_lines,
+    } = sweep_lines(
+        &sweep_terms,
+        &sweep_docids,
+        |i| (wide_pool[i as usize].1.as_str(), wide_pool[i as usize].2),
+        |i| batch_pool.get(i),
+        seed,
+        cap,
+    )?;
+    let sweep_line = |i: usize| -> &[u32] {
+        let start = if i == 0 { 0 } else { sweep_ends[i - 1] };
+        &sweep_units[start..sweep_ends[i]]
+    };
+    let sweep_counts: Vec<u64> = (0..sweep_ends.len())
+        .into_par_iter()
+        .map(|i| {
+            let line = sweep_line(i);
+            let postings: Vec<&[u32]> = line
+                .iter()
+                .filter(|&&u| u & SWEEP_DOCID == 0)
+                .map(|&u| &wide_rows[wide_start[u as usize]..wide_start[u as usize + 1]])
+                .collect();
+            // A docid's passage holds no SWEEP_DF term: disjoint from the
+            // postings.
+            let docids = line.iter().filter(|&&u| u & SWEEP_DOCID != 0).count();
+            (union_rows(&postings).len() + docids) as u64
+        })
+        .collect();
+    // Epoch 0's lines (the statistics of one epoch).
+    let sweep_epoch0 = sweep_epoch_lines[0].min(cap);
+    let sweep_per_line = |f: &dyn Fn(&[u32]) -> u64| -> Vec<u64> {
+        (0..sweep_epoch0).map(|i| f(sweep_line(i))).collect()
+    };
+    let sweep_line_terms =
+        sweep_per_line(&|l| l.iter().filter(|&&u| u & SWEEP_DOCID == 0).count() as u64);
+    let sweep_line_docids =
+        sweep_per_line(&|l| l.iter().filter(|&&u| u & SWEEP_DOCID != 0).count() as u64);
+    let sweep_line_weight = sweep_per_line(&|l| l.iter().map(|&u| sweep_weight(u)).sum());
+    let sweep_term_df: Vec<u64> = sweep_terms
+        .iter()
+        .map(|&i| wide_pool[i as usize].2)
+        .collect();
     let mean = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len().max(1) as f64;
     let url_pool_mean = mean(&url_pool.iter().map(|(_, n)| *n).collect::<Vec<_>>());
     let rare_or_pool_mean = mean(
@@ -1907,6 +2282,93 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             batch["lines_below_top"] = json!(wide_below_top);
             batch["opensearch_bool_should_clauses"] = json!(RARE_OR_N);
             batch["opensearch_max_clause_count"] = json!(OPENSEARCH_MAX_CLAUSE_COUNT);
+        } else if family == Family::CorpusSweepOr {
+            for i in probe_order(&sweep_counts) {
+                let line = sweep_line(i);
+                let terms: Vec<&str> = line
+                    .iter()
+                    .filter(|&&u| u & SWEEP_DOCID == 0)
+                    .map(|&u| wide_pool[u as usize].1.as_str())
+                    .collect();
+                let docids: Vec<&str> = line
+                    .iter()
+                    .filter(|&&u| u & SWEEP_DOCID != 0)
+                    .map(|&u| batch_pool.get(u & !SWEEP_DOCID))
+                    .collect();
+                let l = json!([terms, docids, sweep_counts[i]]);
+                let (_, n) = family.conditions(&l).map_err(err)?;
+                counts.push(n);
+                writeln!(w, "{l}").map_err(|e| err(e.to_string()))?;
+            }
+            let epoch0 = &sweep_counts[..sweep_epoch0];
+            let both = |t: u64, d: u64| t > 0 && d > 0;
+            let lines_of = |f: &dyn Fn(u64, u64) -> bool| {
+                sweep_line_terms
+                    .iter()
+                    .zip(&sweep_line_docids)
+                    .filter(|(t, d)| f(**t, **d))
+                    .count()
+            };
+            let distinct = sweep_covered_rows + sweep_docids.len() as u64;
+            batch = json!({
+                "rule": format!(
+                    "every passage's rarest eligible segment term of df {SWEEP_DF:?} (zero \
+                     ambiguous passages, not in any over-long run, not named by the Redis escape \
+                     rule: the rare-term eligibility; smallest df, ties by the term's bytes) is \
+                     chosen, and the chosen terms' postings cover every passage holding such a \
+                     term; every other passage whose docid is docid-eq eligible and unique is \
+                     added by docid. Epoch e orders the chosen terms and those docids by \
+                     SHA-256(key domain \"vdb-msmarco-disk/v1\", seed, \
+                     \"corpus-sweep-or/epoch-<e>/term\" or \"corpus-sweep-or/epoch-<e>/docid\", \
+                     item) and packs them greedily in that order into lines: an item joins the \
+                     line while sum(df of its terms) + docids <= {SWEEP_TOP} and terms <= \
+                     {SWEEP_MAX_TERMS}, else it starts the next line. Every reachable passage is \
+                     matched, and fetched (a line's count is at most {SWEEP_TOP}, its page), at \
+                     least once per epoch; epochs follow each other, then the lines take the \
+                     probe layout. A line is [terms, docids, count], terms and docids each in \
+                     key order; its count is the number of DISTINCT passages holding any of its \
+                     terms plus its docids (disjoint: a docid's passage holds no term of the \
+                     band)"
+                ),
+                "df_band": SWEEP_DF,
+                "top": SWEEP_TOP,
+                "max_terms": SWEEP_MAX_TERMS,
+                "epoch_order": "reshuffled: each epoch is a new seeded order of the same terms and docids (every passage once per epoch at least, at a new position; no line repeats)",
+                "epoch_lines": sweep_epoch_lines[0],
+                "epoch_lines_each": sweep_epoch_lines,
+                "epochs": sweep_epoch_lines.len(),
+                "epochs_in_file": cap as f64 / sweep_epoch_lines[0] as f64,
+                "epoch_expected_count": stats(epoch0),
+                "epoch_fetched_passages": epoch0.iter().sum::<u64>(),
+                "epoch_distinct_passages": distinct,
+                "epoch_line_weight": stats(&sweep_line_weight),
+                "epoch_statistics": "epoch 0 (its lines in the file, all of them unless the file is shorter than an epoch)",
+                "lines_below_top": sweep_counts.iter().filter(|&&n| n < SWEEP_TOP as u64).count(),
+                "coverage": {
+                    "passages": passages,
+                    "by_term": sweep_covered_rows,
+                    "by_docid": sweep_docids.len(),
+                    "unreachable": sweep_unreachable,
+                    "fraction": distinct as f64 / passages.max(1) as f64,
+                    "by_term_fraction": sweep_covered_rows as f64 / passages.max(1) as f64,
+                    "unreachable_rule": "a passage holding no term of the band whose docid is not docid-eq eligible (unsafe, a Redis tag piece of an unsafe docid) or occurs on more than one passage",
+                },
+                "terms": {
+                    "pool": wide_pool.len(),
+                    "chosen": sweep_terms.len(),
+                    "df_sum": sweep_term_df.iter().sum::<u64>(),
+                    "df": stats(&sweep_term_df),
+                },
+                "terms_per_line": stats(&sweep_line_terms),
+                "docids_per_line": stats(&sweep_line_docids),
+                "lines_terms_only": lines_of(&|t, d| t > 0 && d == 0),
+                "lines_docids_only": lines_of(&|t, d| t == 0 && d > 0),
+                "lines_terms_and_docids": lines_of(&both),
+                "opensearch_bool_should_clauses_max": SWEEP_MAX_TERMS + 1,
+                "opensearch_max_clause_count": OPENSEARCH_MAX_CLAUSE_COUNT,
+                "opensearch_terms_count_max": SWEEP_TOP,
+                "opensearch_max_terms_count": OPENSEARCH_MAX_TERMS_COUNT,
+            });
         } else {
             let l = probe_layout(family, lines.remove(&family).expect("every family"))?;
             counts.reserve(l.len());
@@ -1951,7 +2413,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
         "redis_escape_rules": text_match::REDIS_ESCAPE_RULE,
         "analysis": "parity: segment text with every whitespace other than U+0020 replaced by a space (as uploaded), no stemming",
         "df_bands": {"rare": RARE_DF, "pair": PAIR_DF, "deep": DEEP_DF, "rare_or": RARE_OR_DF,
-                     "rare_or_wide": RARE_OR_WIDE_DF},
+                     "rare_or_wide": RARE_OR_WIDE_DF, "sweep": SWEEP_DF},
         "high_pressure": {
             "docid_batch_500_k": DOCID_BATCH_500_K,
             "docid_batch_1000_k": DOCID_BATCH_1000_K,
@@ -1961,6 +2423,9 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
             "rare_or_df": RARE_OR_DF,
             "rare_or_wide_df": RARE_OR_WIDE_DF,
             "top": HIGH_PRESSURE_TOP,
+            "sweep_df": SWEEP_DF,
+            "sweep_top": SWEEP_TOP,
+            "sweep_max_terms": SWEEP_MAX_TERMS,
             "total_hits": "exact (none is refused for every batch family)",
             "opensearch_limits": {"max_result_window": OPENSEARCH_MAX_RESULT_WINDOW,
                                   "max_terms_count": OPENSEARCH_MAX_TERMS_COUNT,
@@ -1986,7 +2451,7 @@ pub fn generate(dir: &Path, opts: &GenerateOptions, out: &Path) -> Result<Value,
                  "docid_rows_excluded_redis_piece_collision": docid_rows_colliding,
                  "redis_piece_rule": "a safe value equal to a Redis tag piece (split on ';', C-isspace trimmed, non-empty) of an unsafe value is not selected: Redis TAG SEPARATOR ; would match the unsafe value's passages too, an OpenSearch keyword would not"},
         "term_overlap": term_overlap,
-        "selection": "per family: eligible items ranked by SHA-256(key domain \"vdb-msmarco-disk/v1\", seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run, not named by the Redis escape rule in any passage. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys. docid-batch, docid-batch-500, docid-batch-1000, url-batch, rare-terms-or, rare-terms-or-and-category, rare-terms-or-wide: see families.<family>.batch.rule (rare-terms-or and rare-terms-or-and-category draw from the deep-fetch eligible terms, rare-terms-or-wide from the rare-term eligible terms, each re-ranked per epoch under its own family name).",
+        "selection": "per family: eligible items ranked by SHA-256(key domain \"vdb-msmarco-disk/v1\", seed, family, item); the smallest kept in key order. rare-term-and-category terms are disjoint from rare-term terms; deep-fetch is drawn from its own band independently (overlaps recorded in term_overlap). Terms: zero ambiguous passages, not in any over-long run, not named by the Redis escape rule in any passage. rare-term-and-category: the category of the term's passage with the smallest seeded docid key. two-rare-terms: co-occurring pairs (one passage has both) ranked by a SplitMix64 mix of the two term keys. docid-batch, docid-batch-500, docid-batch-1000, url-batch, rare-terms-or, rare-terms-or-and-category, rare-terms-or-wide: see families.<family>.batch.rule (rare-terms-or and rare-terms-or-and-category draw from the deep-fetch eligible terms, rare-terms-or-wide from the rare-term eligible terms, each re-ranked per epoch under its own family name). corpus-sweep-or: see families.corpus-sweep-or.batch.rule (every passage's rarest rare-term eligible term, plus the docids of the passages none reaches, in one fixed epoch).",
         "families": families,
     });
     let text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
@@ -2183,7 +2648,20 @@ pub fn load_window(
 /// `url` and `docid` declared `keyword` and no prepared filter-only query set
 /// (as in the integration tests), so both engines can ingest it.
 pub fn write_fixture_corpus(dir: &Path, n: usize, dim: usize) -> Result<(), String> {
-    write_fixture(dir, n, dim, false)
+    write_fixture(dir, n, dim, false, false)
+}
+
+/// [`write_fixture_corpus`] where every passage `i % 100 == 37` holds only
+/// its two `pair*` words (df ≈ n/10, above [`SWEEP_DF`]): no rare term
+/// reaches it, so `corpus-sweep-or` must reach it by `docid`, as it does
+/// most passages of the MS MARCO corpus. It passes the upload validator like
+/// the default corpus; the integration disk suite uploads it.
+pub fn write_fixture_corpus_with_sweep_gaps(
+    dir: &Path,
+    n: usize,
+    dim: usize,
+) -> Result<(), String> {
+    write_fixture(dir, n, dim, false, true)
 }
 
 /// [`write_fixture_corpus`] plus unsafe URLs and docids whose Redis tag
@@ -2200,10 +2678,16 @@ pub fn write_fixture_corpus_with_tag_piece_collisions(
     n: usize,
     dim: usize,
 ) -> Result<(), String> {
-    write_fixture(dir, n, dim, true)
+    write_fixture(dir, n, dim, true, false)
 }
 
-fn write_fixture(dir: &Path, n: usize, dim: usize, collisions: bool) -> Result<(), String> {
+fn write_fixture(
+    dir: &Path,
+    n: usize,
+    dim: usize,
+    collisions: bool,
+    sweep_gaps: bool,
+) -> Result<(), String> {
     use rand::{Rng, SeedableRng};
     fn letters(mut i: usize) -> String {
         let mut s = String::new();
@@ -2228,6 +2712,9 @@ fn write_fixture(dir: &Path, n: usize, dim: usize, collisions: bool) -> Result<(
             format!("pair{}", letters(a)),
             format!("pair{}", letters(b)),
         ];
+        if sweep_gaps && i % 100 == 37 {
+            words.drain(..2);
+        }
         match i % 50 {
             0 => words.push("edge.Case".into()),
             1 => words.push("edge".into()),
@@ -2319,8 +2806,9 @@ mod tests {
         (tmp, dir)
     }
 
-    /// The default fixture is what the integration tests upload: it must pass
-    /// the upload validator with `url`/`docid` as keywords (the schema of
+    /// The default fixture (and its sweep-gap variant, which the integration
+    /// tests upload) must pass the upload validator with `url`/`docid` as
+    /// keywords (the schema of
     /// `tests/common` `write_disk_project`); the collision fixture must not.
     #[test]
     fn default_fixture_passes_the_upload_validator_collision_fixture_does_not() {
@@ -2338,6 +2826,10 @@ mod tests {
         let dir = tmp.path().join("corpus");
         write_fixture_corpus(&dir, 3000, 4).unwrap();
         check(&dir).unwrap();
+        // The sweep-gap variant is the one the integration tests upload.
+        let gaps = tmp.path().join("gaps");
+        write_fixture_corpus_with_sweep_gaps(&gaps, 3000, 4).unwrap();
+        check(&gaps).unwrap();
         let (_tmp, dir) = fixture(3000);
         assert!(check(&dir).is_err());
     }
@@ -2469,6 +2961,27 @@ mod tests {
                             .filter(|(r, toks)| {
                                 terms.iter().any(|t| toks.contains(*t))
                                     && cat.is_none_or(|c| r["category"] == c)
+                            })
+                            .count() as u64
+                    }
+                    // Any term on its Redis tokens, or any docid among its
+                    // Redis tag pieces.
+                    Family::CorpusSweepOr => {
+                        let strs = |v: &Value| -> HashSet<String> {
+                            v.as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|v| v.as_str().unwrap().to_string())
+                                .collect()
+                        };
+                        let (terms, docids) = (strs(&a[0]), strs(&a[1]));
+                        uploaded
+                            .iter()
+                            .zip(&redis)
+                            .filter(|(r, toks)| {
+                                terms.iter().any(|t| toks.contains(t))
+                                    || redis_tag_pieces(r["docid"].as_str().unwrap())
+                                        .any(|p| docids.contains(p))
                             })
                             .count() as u64
                     }
@@ -2809,12 +3322,13 @@ mod tests {
             .contains("SHA-256"));
         std::fs::write(&f, body).unwrap();
         assert!(load_window(&dir, Family::UrlEq, 0, Some(1)).is_ok());
-        // A v6 manifest (no rare-terms-or-wide), a v5 one (no high-pressure
-        // families) or a v4 one is refused for every family, as v6 refused
-        // v5: regenerate.
+        // A v7 manifest (no corpus-sweep-or), a v6 one (no
+        // rare-terms-or-wide), a v5 one (no high-pressure families) or a v4
+        // one is refused for every family, as v7 refused v6: regenerate.
         let mp = dir.join(DIR).join(MANIFEST);
         let manifest = std::fs::read_to_string(&mp).unwrap();
         for old in [
+            "vdb-msmarco-disk/v7",
             "vdb-msmarco-disk/v6",
             "vdb-msmarco-disk/v5",
             "vdb-msmarco-disk/v4",
@@ -2827,6 +3341,7 @@ mod tests {
                 Family::DocidBatch,
                 Family::RareTermsOr,
                 Family::RareTermsOrWide,
+                Family::CorpusSweepOr,
             ] {
                 let e = load_window(&dir, family, 0, Some(1)).unwrap_err();
                 assert!(e.contains(old) && e.contains(GENERATOR), "{e}");
@@ -3173,9 +3688,10 @@ mod tests {
             ),
         ];
         // Every v5 family is pinned; the rest are the five v6 additions
-        // (`v6_family_files_are_unchanged`) and the v7 one
-        // (`v7_family_file_is_pinned`).
-        assert_eq!(pins.len() + 5 + 1, Family::ALL.len());
+        // (`v6_family_files_are_unchanged`), the v7 one
+        // (`v7_family_file_is_unchanged`) and the v8 one
+        // (`v8_family_file_is_pinned`).
+        assert_eq!(pins.len() + 5 + 1 + 1, Family::ALL.len());
         let (_tmp, collisions) = fixture(3000);
         let a = generate(&collisions, &opts(200, 7), &collisions.join(DIR)).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -3188,10 +3704,11 @@ mod tests {
         }
     }
 
-    /// The v7 family file, pinned like the v6 ones: a change to its
-    /// selection, keys, layout or counts changes these.
+    /// The v7 family file is byte-identical under v8: the SHA-256 of each
+    /// fixture file as generator v7 (5ba5429) wrote it. With the v5 and v6
+    /// tests this pins all thirteen v7 files.
     #[test]
-    fn v7_family_file_is_pinned() {
+    fn v7_family_file_is_unchanged() {
         let (_tmp, collisions) = fixture(3000);
         let a = generate(&collisions, &opts(200, 7), &collisions.join(DIR)).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -3207,6 +3724,36 @@ mod tests {
             b["families"][name]["sha256"],
             "7d112208e9a332fb94c95e96ea42d0755ac2f5a6304a0848d2c32416128be6f1"
         );
+    }
+
+    /// The v8 family file, pinned like the earlier ones: a change to its
+    /// cover, keys, packing, layout or counts changes these. The third
+    /// corpus has passages no rare term reaches (docid units).
+    #[test]
+    fn v8_family_file_is_pinned() {
+        let (_tmp, collisions) = fixture(3000);
+        let a = generate(&collisions, &opts(200, 7), &collisions.join(DIR)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("corpus");
+        write_fixture_corpus(&plain, 3000, 4).unwrap();
+        let b = generate(&plain, &opts(100, 1), &plain.join(DIR)).unwrap();
+        let gaps = tmp.path().join("gaps");
+        write_fixture_corpus_with_sweep_gaps(&gaps, 3000, 4).unwrap();
+        let c = generate(&gaps, &opts(200, 1), &gaps.join(DIR)).unwrap();
+        let name = Family::CorpusSweepOr.name();
+        assert_eq!(
+            a["families"][name]["sha256"],
+            "98b3053661621fff275a67be1db3b1a63978cb43065cb3b893d63bf60b87f7a6"
+        );
+        assert_eq!(
+            b["families"][name]["sha256"],
+            "fbe0ea0ce211f4d9dd7bfa8844b7acd040af802034603b6e05c6398fccf39c70"
+        );
+        assert_eq!(
+            c["families"][name]["sha256"],
+            "fec5871e9f7fb962670f36733c77d12be717cacb9affa95003bf4e2b77bc6590"
+        );
+        assert_eq!(c["families"][name]["batch"]["coverage"]["by_docid"], 30);
     }
 
     #[test]
@@ -3329,6 +3876,10 @@ mod tests {
         assert_eq!(hp["rare_or_df"], json!(RARE_OR_DF));
         assert_eq!(hp["rare_or_wide_df"], json!(RARE_OR_WIDE_DF));
         assert_eq!(hp["top"], HIGH_PRESSURE_TOP);
+        assert_eq!(hp["sweep_df"], json!(SWEEP_DF));
+        assert_eq!(hp["sweep_top"], SWEEP_TOP);
+        assert_eq!(hp["sweep_max_terms"], SWEEP_MAX_TERMS);
+        assert_eq!(m["df_bands"]["sweep"], json!(SWEEP_DF));
         assert_eq!(m["df_bands"]["rare_or"], json!(RARE_OR_DF));
         assert_eq!(m["df_bands"]["rare_or_wide"], json!(RARE_OR_WIDE_DF));
         // Rule texts are single-spaced prose (no source indentation).
@@ -3679,14 +4230,15 @@ mod tests {
             let e = family.check_params(100, true, true).unwrap_err();
             assert!(e.contains("exact"), "{e}");
         }
-        // Fetch parity: the v6 and v7 families fetch exactly title, segment,
-        // url.
+        // Fetch parity: the v6, v7 and v8 families fetch exactly title,
+        // segment, url.
         let f = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for family in Family::ALL {
             let pinned = family.fixed_fetch().is_some();
             assert_eq!(
                 pinned,
-                family.batch_size().is_some() && family != Family::DocidBatch,
+                (family.batch_size().is_some() && family != Family::DocidBatch)
+                    || family == Family::CorpusSweepOr,
                 "{family:?}"
             );
             assert!(family
@@ -3743,5 +4295,447 @@ mod tests {
         // sha256(b"vdb-msmarco-disk/v1\0" + (1).to_bytes(8, "big") +
         // b"rare-term\0frizzes")[:8], big-endian.
         assert_eq!(rank_key(1, "rare-term", "frizzes"), RARE_FRIZZES);
+    }
+
+    #[test]
+    fn rarest_term_is_the_smallest_df_then_the_smallest_term() {
+        let c = [
+            (0u32, 5u64, "beta"),
+            (1, 2, "zeta"),
+            (2, 2, "alpha"),
+            (3, 9, "aaa"),
+        ];
+        assert_eq!(rarest_term(c.iter().copied()), Some(2));
+        assert_eq!(rarest_term(c.iter().rev().copied()), Some(2));
+        assert_eq!(rarest_term(c[..1].iter().copied()), Some(0));
+        assert_eq!(rarest_term(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn pack_sweep_fills_lines_greedily_within_top_and_max_terms() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let units: Vec<SweepUnit> = (0..20_000)
+            .map(|_| {
+                if rng.gen_bool(0.5) {
+                    let df = if rng.gen_bool(0.6) {
+                        1
+                    } else {
+                        rng.gen_range(1..=SWEEP_DF.1)
+                    };
+                    SweepUnit {
+                        weight: df,
+                        is_term: true,
+                    }
+                } else {
+                    SweepUnit {
+                        weight: 1,
+                        is_term: false,
+                    }
+                }
+            })
+            .collect();
+        let ends = pack_sweep(&units).unwrap();
+        assert_eq!(pack_sweep(&units).unwrap(), ends, "deterministic");
+        assert_eq!(*ends.last().unwrap(), units.len());
+        let mut start = 0;
+        for &end in &ends {
+            assert!(end > start);
+            let line = &units[start..end];
+            let weight: u64 = line.iter().map(|u| u.weight).sum();
+            let terms = line.iter().filter(|u| u.is_term).count();
+            assert!(weight <= SWEEP_TOP as u64);
+            assert!(terms <= SWEEP_MAX_TERMS);
+            // Greedy: the unit after the line did not fit it.
+            if let Some(next) = units.get(end) {
+                assert!(
+                    weight + next.weight > SWEEP_TOP as u64
+                        || (next.is_term && terms == SWEEP_MAX_TERMS)
+                );
+            }
+            start = end;
+        }
+        // df-1 terms alone: the term cap closes the lines.
+        let ones = vec![
+            SweepUnit {
+                weight: 1,
+                is_term: true
+            };
+            1000
+        ];
+        let ends = pack_sweep(&ones).unwrap();
+        assert_eq!(ends[0], SWEEP_MAX_TERMS);
+        assert!(ends.windows(2).all(|w| w[1] - w[0] <= SWEEP_MAX_TERMS));
+        // Docids alone fill whole pages.
+        let docids = vec![
+            SweepUnit {
+                weight: 1,
+                is_term: false
+            };
+            1000
+        ];
+        assert_eq!(
+            pack_sweep(&docids).unwrap()[..2],
+            [SWEEP_TOP, 2 * SWEEP_TOP]
+        );
+        for weight in [0, SWEEP_TOP as u64 + 1] {
+            assert!(pack_sweep(&[SweepUnit {
+                weight,
+                is_term: true
+            }])
+            .is_err());
+        }
+        assert!(pack_sweep(&[]).unwrap().is_empty());
+    }
+
+    /// A synthetic corpus with a long-tailed vocabulary and passages no
+    /// term reaches: the cover (each passage's rarest term) plus those
+    /// passages' docids, every epoch of `sweep_lines` matching every passage,
+    /// each unit once, lines within the page and the term cap.
+    #[test]
+    fn sweep_epochs_reach_every_passage() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let (n, vocab) = (20_000usize, 6_000usize);
+        let mut holds: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (p, h) in holds.iter_mut().enumerate() {
+            if p % 9 == 4 {
+                continue; // no term at all
+            }
+            for _ in 0..rng.gen_range(1..=8) {
+                // Skewed: low ids are frequent (some above SWEEP_DF).
+                let t = (rng.gen::<f64>().powi(4) * vocab as f64) as u32;
+                if !h.contains(&t) {
+                    h.push(t);
+                }
+            }
+        }
+        let mut postings: Vec<Vec<u32>> = vec![Vec::new(); vocab];
+        for (p, h) in holds.iter().enumerate() {
+            for &t in h {
+                postings[t as usize].push(p as u32);
+            }
+        }
+        let df = |t: u32| postings[t as usize].len() as u64;
+        let in_band = |t: u32| (SWEEP_DF.0..=SWEEP_DF.1).contains(&df(t));
+        assert!(
+            (0..vocab as u32).any(|t| df(t) > SWEEP_DF.1),
+            "frequent terms"
+        );
+        let names: Vec<String> = (0..vocab).map(|t| format!("term{t}")).collect();
+        let docnames: Vec<String> = (0..n).map(|p| format!("doc_{p}")).collect();
+        let mut chosen = vec![false; vocab];
+        let mut uncovered = Vec::new();
+        for (p, h) in holds.iter().enumerate() {
+            let pick = rarest_term(
+                h.iter()
+                    .filter(|&&t| in_band(t))
+                    .map(|&t| (t, df(t), names[t as usize].as_str())),
+            );
+            match pick {
+                Some(t) => chosen[t as usize] = true,
+                None => uncovered.push(p as u32),
+            }
+        }
+        let terms: Vec<u32> = (0..vocab as u32).filter(|&t| chosen[t as usize]).collect();
+        assert!(uncovered.len() > n / 9, "{}", uncovered.len());
+        let build = |seed: u64, lines: usize| {
+            sweep_lines(
+                &terms,
+                &uncovered,
+                |t| (names[t as usize].as_str(), df(t)),
+                |p| docnames[p as usize].as_str(),
+                seed,
+                lines,
+            )
+            .unwrap()
+        };
+        let sl = build(3, 2_000);
+        assert_eq!(sl.ends.len(), 2_000);
+        assert!(sl.epoch_lines.len() >= 3, "{:?}", sl.epoch_lines);
+        assert_eq!(build(3, 2_000), sl, "deterministic");
+        assert_ne!(build(4, 2_000), sl, "seeded");
+        let line = |i: usize| &sl.units[if i == 0 { 0 } else { sl.ends[i - 1] }..sl.ends[i]];
+        let mut first = 0;
+        let mut epoch_lines: Vec<Vec<&[u32]>> = Vec::new();
+        for &len in &sl.epoch_lines {
+            let last = (first + len).min(sl.ends.len());
+            epoch_lines.push((first..last).map(line).collect());
+            first = last;
+        }
+        // Every complete epoch: each unit once, every passage matched.
+        let complete = &epoch_lines[..epoch_lines.len() - 1];
+        for (e, lines) in complete.iter().enumerate() {
+            let mut units: Vec<u32> = lines.iter().flat_map(|l| l.iter().copied()).collect();
+            units.sort_unstable();
+            let mut want: Vec<u32> = terms
+                .iter()
+                .copied()
+                .chain(uncovered.iter().map(|&p| p | SWEEP_DOCID))
+                .collect();
+            want.sort_unstable();
+            assert_eq!(units, want, "epoch {e}: each unit once");
+            let mut reached = vec![false; n];
+            for l in lines {
+                let mut matched = HashSet::new();
+                let mut weight = 0;
+                for &u in l.iter() {
+                    if u & SWEEP_DOCID != 0 {
+                        matched.insert(u & !SWEEP_DOCID);
+                        weight += 1;
+                    } else {
+                        matched.extend(postings[u as usize].iter().copied());
+                        weight += df(u);
+                    }
+                }
+                assert!(weight <= SWEEP_TOP as u64);
+                assert!(matched.len() <= SWEEP_TOP, "every match fetched");
+                assert!(l.iter().filter(|&&u| u & SWEEP_DOCID == 0).count() <= SWEEP_MAX_TERMS);
+                for p in matched {
+                    reached[p as usize] = true;
+                }
+            }
+            assert!(reached.iter().all(|&r| r), "epoch {e} misses a passage");
+        }
+        // Reshuffled: epoch 1 does not repeat epoch 0's lines.
+        assert_ne!(complete[0][..10], complete[1][..10]);
+    }
+
+    /// `corpus-sweep-or` on a fixture where 30 passages hold no rare term:
+    /// an independent derivation (brute-force eligibility, Redis tokens,
+    /// each passage's rarest term, the docids of the rest, the seeded epoch
+    /// orders) gives the file's lines exactly, and every epoch matches every
+    /// passage of the corpus.
+    #[test]
+    fn corpus_sweep_or_is_epochs_of_its_cover_and_docids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("gaps");
+        write_fixture_corpus_with_sweep_gaps(&dir, 3000, 4).unwrap();
+        let out = dir.join(DIR);
+        let m = generate(&dir, &opts(200, 7), &out).unwrap();
+        let corpus = rows(&dir);
+        let toks: Vec<HashSet<String>> = corpus
+            .iter()
+            .map(|r| {
+                text_match::redis_tokens(&crate::fulltext::normalize_whitespace(
+                    r["segment"].as_str().unwrap(),
+                ))
+            })
+            .collect();
+        let vocab: BTreeMap<String, ()> = corpus
+            .iter()
+            .flat_map(|r| {
+                r["segment"]
+                    .as_str()
+                    .unwrap()
+                    .split(|c: char| !c.is_ascii_alphabetic())
+                    .map(str::to_ascii_lowercase)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|t| text_match::validate_term(t).is_ok())
+            .map(|t| (t, ()))
+            .collect();
+        // Eligible (as the rare-term pool): zero ambiguous passages, df in
+        // the band, and Redis matching exactly the classifier's passages.
+        let mut postings: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for t in vocab.keys() {
+            let (yes, amb) = df(&corpus, t);
+            let on_redis: Vec<usize> = (0..corpus.len())
+                .filter(|&p| toks[p].contains(t.as_str()))
+                .collect();
+            if amb == 0 && (SWEEP_DF.0..=SWEEP_DF.1).contains(&yes) && on_redis.len() as u64 == yes
+            {
+                postings.insert(t, on_redis);
+            }
+        }
+        assert_eq!(
+            m["families"]["corpus-sweep-or"]["eligible_pool"],
+            postings.len()
+        );
+        let mut by_passage: Vec<Option<&str>> = vec![None; corpus.len()];
+        for (t, rows) in &postings {
+            for &p in rows {
+                let df = |t: &str| postings[t].len();
+                if by_passage[p].is_none_or(|b| (rows.len(), *t) < (df(b), b)) {
+                    by_passage[p] = Some(t);
+                }
+            }
+        }
+        let chosen: std::collections::BTreeSet<&str> =
+            by_passage.iter().flatten().copied().collect();
+        let docids: Vec<&str> = (0..corpus.len())
+            .filter(|&p| by_passage[p].is_none())
+            .map(|p| corpus[p]["docid"].as_str().unwrap())
+            .collect();
+        // The passages i % 100 == 37 hold only frequent pair terms.
+        assert_eq!(docids.len(), 30);
+        let batch = &m["families"]["corpus-sweep-or"]["batch"];
+        assert_eq!(batch["coverage"]["by_term"], 2970);
+        assert_eq!(batch["coverage"]["by_docid"], 30);
+        assert_eq!(batch["coverage"]["unreachable"], 0);
+        assert_eq!(batch["coverage"]["fraction"], 1.0);
+        assert_eq!(batch["terms"]["chosen"], chosen.len());
+        assert_eq!(batch["epoch_distinct_passages"], 3000);
+        // The epochs, re-derived.
+        let file = lines(&out, Family::CorpusSweepOr);
+        let mut want: Vec<Value> = Vec::new();
+        let mut epochs = Vec::new();
+        while want.len() < file.len() {
+            let e = epochs.len();
+            let mut keyed: Vec<(u64, bool, &str)> = chosen
+                .iter()
+                .map(|t| {
+                    (
+                        rank_key(7, &format!("corpus-sweep-or/epoch-{e}/term"), t),
+                        true,
+                        *t,
+                    )
+                })
+                .chain(docids.iter().map(|d| {
+                    (
+                        rank_key(7, &format!("corpus-sweep-or/epoch-{e}/docid"), d),
+                        false,
+                        *d,
+                    )
+                }))
+                .collect();
+            keyed.sort();
+            let weight = |&(_, term, s): &(u64, bool, &str)| {
+                if term {
+                    postings[s].len() as u64
+                } else {
+                    1
+                }
+            };
+            let units: Vec<SweepUnit> = keyed
+                .iter()
+                .map(|k| SweepUnit {
+                    weight: weight(k),
+                    is_term: k.1,
+                })
+                .collect();
+            let ends = pack_sweep(&units).unwrap();
+            epochs.push(ends.len());
+            let mut reached: HashSet<String> = HashSet::new();
+            let mut start = 0;
+            for &end in &ends {
+                let line = &keyed[start..end];
+                let terms: Vec<&str> = line.iter().filter(|k| k.1).map(|k| k.2).collect();
+                let ds: Vec<&str> = line.iter().filter(|k| !k.1).map(|k| k.2).collect();
+                let mut rows: HashSet<usize> = HashSet::new();
+                for t in &terms {
+                    rows.extend(postings[t].iter().copied());
+                }
+                for p in &rows {
+                    reached.insert(corpus[*p]["docid"].as_str().unwrap().to_string());
+                }
+                reached.extend(ds.iter().map(|d| d.to_string()));
+                if want.len() < file.len() {
+                    want.push(json!([terms, ds, rows.len() + ds.len()]));
+                }
+                start = end;
+            }
+            assert_eq!(reached.len(), 3000, "epoch {e} reaches every passage");
+        }
+        assert_eq!(batch["epoch_lines_each"], json!(epochs));
+        assert_eq!(batch["epoch_lines"], epochs[0]);
+        let mut a: Vec<String> = file.iter().map(Value::to_string).collect();
+        let mut b: Vec<String> = want.iter().map(Value::to_string).collect();
+        // Line 0 is the first line generated (the prime).
+        assert_eq!(a[0], b[0]);
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+        // Lines with both terms and docids, within the page and the cap.
+        let mut mixed = 0;
+        for line in &file {
+            let (_, n) = Family::CorpusSweepOr.conditions(line).unwrap();
+            assert!(n <= SWEEP_TOP as u64);
+            let terms = line[0].as_array().unwrap();
+            let ds = line[1].as_array().unwrap();
+            assert!(terms.len() <= SWEEP_MAX_TERMS);
+            let weight: u64 = terms
+                .iter()
+                .map(|t| postings[t.as_str().unwrap()].len() as u64)
+                .sum::<u64>()
+                + ds.len() as u64;
+            assert!(weight <= SWEEP_TOP as u64);
+            if !terms.is_empty() && !ds.is_empty() {
+                mixed += 1;
+            }
+        }
+        assert!(mixed > 0);
+    }
+
+    #[test]
+    fn corpus_sweep_or_lines_round_trip_and_reject_malformed() {
+        let f = Family::CorpusSweepOr;
+        let schema = json!({"segment":"text","docid":"keyword"});
+        let render = |line: Value| {
+            let (c, n) = f.conditions(&line).unwrap();
+            let expr = crate::compound_text::Expr::compile(&c, &schema).unwrap();
+            (expr.redis(), expr.opensearch(), n)
+        };
+        // Terms and docids: one field-scoped union OR one tag union.
+        let (redis, os, n) = render(json!([["alpha", "beta"], ["d_1#0", "d_2"], 7]));
+        assert_eq!(n, 7);
+        assert_eq!(
+            redis,
+            "((@segment:(alpha | beta)) | (@docid:{d\\_1\\#0 | d\\_2}))"
+        );
+        assert_eq!(os["bool"]["minimum_should_match"], 1);
+        let should = os["bool"]["should"].as_array().unwrap();
+        assert_eq!(should.len(), 2);
+        assert_eq!(should[0]["bool"]["should"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            should[1]["bool"]["filter"][0]["terms"]["docid"],
+            json!(["d_1#0", "d_2"])
+        );
+        // Terms only, one term, docids only.
+        assert_eq!(
+            render(json!([["alpha", "beta"], [], 3])).0,
+            "(@segment:(alpha | beta))"
+        );
+        assert_eq!(render(json!([["alpha"], [], 3])).0, "(@segment:(alpha))");
+        assert_eq!(render(json!([[], ["d_1"], 1])).0, "(@docid:{d\\_1})");
+        let many: Vec<String> = (0..SWEEP_MAX_TERMS)
+            .map(|i| format!("term{}", (b'a' + (i % 26) as u8) as char).repeat(1 + i / 26))
+            .collect();
+        assert!(f.conditions(&json!([many, [], SWEEP_TOP])).is_ok());
+        let mut too_many = many.clone();
+        too_many.push("extra".into());
+        for bad in [
+            json!([too_many, [], 5]),
+            json!([["alpha", "alpha"], [], 5]),
+            json!([["the"], [], 5]),
+            json!([["alpha"], ["d 1"], 5]),
+            json!([["alpha"], ["d1;x"], 5]),
+            json!([["alpha"], ["d1", "d1"], 5]),
+            json!([[], [], 5]),
+            json!([["alpha"], [], 0]),
+            json!([["alpha"], [], SWEEP_TOP + 1]),
+            json!([["alpha"], 5]),
+            json!(["alpha", [], 5]),
+            json!([["alpha"], "d1", 5]),
+        ] {
+            assert!(f.conditions(&bad).is_err(), "{bad}");
+        }
+        // Defined as top 200 with fetch, exact totals, title/segment/url.
+        assert_eq!(f.fixed_top(), Some(SWEEP_TOP));
+        assert!(f.check_params(SWEEP_TOP, true, false).is_ok());
+        assert!(f.check_params(100, true, false).is_err());
+        assert!(f.check_params(SWEEP_TOP, false, false).is_err());
+        assert!(f
+            .check_params(SWEEP_TOP, true, true)
+            .unwrap_err()
+            .contains("exact"));
+        assert!(f.requires_exact_total());
+        assert_eq!(f.fixed_fetch(), Some(&HIGH_PRESSURE_FETCH[..]));
+        assert_eq!(f.fields(), [TEXT_FIELD, "docid"]);
+        assert_eq!(f.df_band(), Some((1, 100)));
+        assert_eq!(f.batch_size(), None);
+        assert_eq!(Family::parse("corpus-sweep-or"), Ok(f));
+        // The documented parameters.
+        assert_eq!((SWEEP_DF, SWEEP_TOP, SWEEP_MAX_TERMS), ((1, 100), 200, 64));
     }
 }
