@@ -43,6 +43,9 @@ fn scalar_search_reports_measured_retries_but_not_priming_retries() {
                         Err(e) => panic!("mock accept: {e}"),
                     }
                 };
+                // An accepted socket inherits O_NONBLOCK from the listener on
+                // BSD/macOS (not on Linux): read it blocking, bounded by the timeout.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
@@ -145,6 +148,9 @@ fn unsupported_query_effort_server_fails_before_index_mutation() {
                 Err(e) => panic!("mock accept: {e}"),
             }
         };
+        // An accepted socket inherits O_NONBLOCK from the listener on
+        // BSD/macOS (not on Linux): read it blocking, bounded by the timeout.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();

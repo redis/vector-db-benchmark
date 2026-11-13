@@ -99,6 +99,9 @@ fn run(script: Vec<Reply>, options: MergeOptions) -> Result<(), String> {
                     Err(e) => panic!("accept: {e}"),
                 }
             };
+            // An accepted socket inherits O_NONBLOCK from the listener on
+            // BSD/macOS (not on Linux): read it blocking, bounded by the timeout.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

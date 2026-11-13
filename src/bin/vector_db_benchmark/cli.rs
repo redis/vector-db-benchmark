@@ -176,8 +176,11 @@ pub struct Args {
     #[arg(long, default_value = "0.0")]
     pub target_qps: f64,
 
-    /// Measured search duration in seconds. With --target-qps this is open-loop;
-    /// without it Redis and Vertex run unrestricted closed-loop for this long.
+    /// Measured search duration in seconds. With --target-qps this is open-loop
+    /// (Redis, Vertex); without it the vector and hybrid workloads run
+    /// closed-loop for this long on Redis, OpenSearch and Vertex, cycling the
+    /// query set (or its first --queries) in order until the deadline and
+    /// recording `results.duration`. Hybrid applies it per selectivity bucket.
     #[arg(long, default_value = "0.0")]
     pub search_duration: f64,
 

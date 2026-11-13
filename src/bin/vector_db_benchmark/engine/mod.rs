@@ -246,6 +246,11 @@ pub struct SearchResults {
     /// query). `--dump-results` records carry these as `expected`, never the
     /// dataset's KNN neighbours, which are not the truth of a fused query.
     pub hybrid_rrf_expected: Option<Vec<Vec<i64>>>,
+    /// Closed-loop `--search-duration` on the vector / hybrid arm only: the
+    /// `vector_db_benchmark::duration_mode::cycle_record` of the point
+    /// (passes over the query set, deadline accounting, recall incl. first
+    /// pass). Emitted as `results.duration`; absent on every other run.
+    pub duration: Option<serde_json::Value>,
 }
 
 /// What a hybrid run publishes beyond the common search statistics.
@@ -501,6 +506,66 @@ pub fn closed_loop_duration(params: &SearchParams) -> Result<Option<Duration>, S
         );
     }
     Ok(Some(Duration::from_secs_f64(seconds)))
+}
+
+/// The cycled query set of a closed-loop `--search-duration` vector / hybrid
+/// point, shared by every engine that implements it so the schedule is the
+/// same everywhere: `order` is `0..set_len` (the query set, or its first
+/// `--queries`), and the dispatcher wraps it until the deadline.
+pub struct CycleMode {
+    pub duration: Duration,
+    pub set_len: usize,
+    pub order: Vec<usize>,
+}
+
+impl CycleMode {
+    /// `None` unless `params` asks for a closed-loop duration.
+    pub fn from_params(
+        params: &SearchParams,
+        available: usize,
+        num_queries: i64,
+    ) -> Result<Option<Self>, String> {
+        let Some(duration) = closed_loop_duration(params)? else {
+            return Ok(None);
+        };
+        let set_len = vector_db_benchmark::duration_mode::cycle_set_len(available, num_queries);
+        if set_len == 0 {
+            return Err("duration mode needs at least one query to cycle".into());
+        }
+        println!(
+            "\tDuration mode: cycling {set_len} queries in order for {:.1}s",
+            duration.as_secs_f64()
+        );
+        Ok(Some(Self {
+            duration,
+            set_len,
+            order: (0..set_len).collect(),
+        }))
+    }
+
+    pub fn dispatcher(&self) -> vector_db_benchmark::duration_mode::Dispatcher<'_> {
+        vector_db_benchmark::duration_mode::Dispatcher::new(&self.order, Some(self.duration))
+    }
+
+    /// Record the point on `results` (whose `latencies` / `recalls` must be
+    /// aligned with `tally`), as `results.duration`.
+    pub fn attach(
+        &self,
+        results: &mut SearchResults,
+        dispatched: usize,
+        tally: &vector_db_benchmark::duration_mode::CycleTally,
+    ) -> Result<(), String> {
+        results.duration = Some(vector_db_benchmark::duration_mode::cycle_record(
+            self.duration.as_secs_f64(),
+            self.set_len,
+            dispatched,
+            tally,
+            &results.latencies,
+            &results.recalls,
+            results.total_time,
+        )?);
+        Ok(())
+    }
 }
 
 /// Add open-loop queueing/arrival metrics without changing closed-loop statistics.
@@ -1782,6 +1847,8 @@ pub fn run_hybrid_buckets(
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut total_time, mut requested, mut parallel) = (0.0, 0usize, 1usize);
     let mut records: Option<Vec<RawQueryResult>> = None;
+    // Duration mode applies per bucket: each pass carries its own record.
+    let mut durations: Vec<Option<serde_json::Value>> = Vec::new();
     for (bucket, positions) in set.by_bucket() {
         println!(
             "\tHybrid bucket {bucket}: {} queries over {} predicate(s)",
@@ -1804,7 +1871,7 @@ pub fn run_hybrid_buckets(
             ));
         }
         let meta: Vec<&hy::HybridQueryMeta> = positions.iter().map(|&i| &set.meta[i]).collect();
-        let report = hy::bucket_report(
+        let mut report = hy::bucket_report(
             bucket,
             &r.latencies,
             &r.recalls,
@@ -1821,6 +1888,19 @@ pub fn run_hybrid_buckets(
             report.p90_time * 1e3,
             report.p99_time * 1e3
         );
+        if let Some(d) = &r.duration {
+            println!(
+                "\t  {bucket}: duration mode, {} dispatched ({} full passes over {} queries), \
+                 qps_by_deadline={:.1}, first-pass recall={}",
+                d["dispatched"],
+                d["full_passes"],
+                d["queries"],
+                d["qps_by_deadline"].as_f64().unwrap_or(0.0),
+                d["first_pass"]["mean_recall"]
+            );
+        }
+        report.duration = r.duration.clone();
+        durations.push(r.duration);
         buckets.push(report);
         if let Some(raw) = r.query_records {
             records
@@ -1840,6 +1920,7 @@ pub fn run_hybrid_buckets(
         &times, &precs, &recs, &mrrs, &ndcgs, total_time, top, parallel, requested,
     )?;
     out.query_records = records;
+    out.duration = hybrid_duration_summary(&durations)?;
     out.hybrid = Some(HybridOutcome {
         report: hy::HybridReport {
             query_file: hy::HYBRID_QUERIES_FILE,
@@ -1853,6 +1934,44 @@ pub fn run_hybrid_buckets(
             .stats(top),
     });
     Ok(out)
+}
+
+/// The run-level `results.duration` of a hybrid point: `None` when no pass
+/// ran in duration mode, else a summary over the per-bucket records (which
+/// stay under `results.hybrid.buckets[].duration`). A run where only some
+/// buckets carry a record is a harness bug and is refused.
+fn hybrid_duration_summary(
+    per_bucket: &[Option<serde_json::Value>],
+) -> Result<Option<serde_json::Value>, String> {
+    let records: Vec<&serde_json::Value> = per_bucket.iter().flatten().collect();
+    if records.is_empty() {
+        return Ok(None);
+    }
+    if records.len() != per_bucket.len() {
+        return Err(format!(
+            "hybrid duration mode: {} of {} bucket passes ran in duration mode",
+            records.len(),
+            per_bucket.len()
+        ));
+    }
+    let sum = |key: &str| -> u64 { records.iter().filter_map(|r| r[key].as_u64()).sum() };
+    let total_s: f64 = records
+        .iter()
+        .filter_map(|r| r["duration_s"].as_f64())
+        .sum();
+    Ok(Some(serde_json::json!({
+        "mode": "cycle-query-set per bucket",
+        "duration_s_per_bucket": records[0]["duration_s"],
+        "buckets": records.len(),
+        "duration_s_total": total_s,
+        "dispatched": sum("dispatched"),
+        "completed": sum("completed"),
+        "failed": sum("failed"),
+        "completed_by_deadline": sum("completed_by_deadline"),
+        "completed_after_deadline": sum("completed_after_deadline"),
+        "per_bucket": "results.hybrid.buckets[].duration (passes, qps_by_deadline, latency, \
+                       mean_recall and first-pass recall of each bucket)",
+    })))
 }
 
 #[cfg(test)]
@@ -1902,6 +2021,100 @@ mod hybrid_driver_tests {
                 .collect()
         });
         r
+    }
+
+    #[test]
+    fn duration_records_land_on_their_bucket_and_are_summarised() {
+        use vector_db_benchmark::duration_mode::{cycle_record, CycleTally};
+        let s = set();
+        let timed = |p: &[usize]| {
+            let mut r = pass_result(p.len() * 3, 0.01, 2.0, false);
+            let mut tally = CycleTally::default();
+            for seq in 0..p.len() * 3 {
+                tally.push(seq, p.len(), 0.5, 0.1);
+            }
+            r.duration = Some(
+                cycle_record(
+                    2.0,
+                    p.len(),
+                    p.len() * 3,
+                    &tally,
+                    &r.latencies,
+                    &r.recalls,
+                    2.0,
+                )
+                .unwrap(),
+            );
+            r
+        };
+        let out = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, p| Ok((timed(p), serde_json::json!({}))),
+        )
+        .unwrap();
+        let report = &out.hybrid.as_ref().unwrap().report;
+        for b in &report.buckets {
+            let d = b.duration.as_ref().expect("bucket record");
+            assert_eq!(d["queries"], 2);
+            assert_eq!(d["full_passes"], 3);
+            assert_eq!(d["first_pass"]["completed"], 2);
+            assert_eq!(b.requested_queries, 6);
+        }
+        let summary = out.duration.as_ref().unwrap();
+        assert_eq!(summary["buckets"], 2);
+        assert_eq!(summary["duration_s_per_bucket"], 2.0);
+        assert_eq!(summary["duration_s_total"], 4.0);
+        assert_eq!(summary["dispatched"], 12);
+        assert_eq!(summary["completed"], 12);
+        assert_eq!(summary["failed"], 0);
+        assert_eq!(
+            summary["completed_by_deadline"].as_u64().unwrap()
+                + summary["completed_after_deadline"].as_u64().unwrap(),
+            12
+        );
+        assert_eq!(out.requested_queries, 12);
+        // A single pass carries no record, and its bucket report serializes
+        // without the key (unchanged output).
+        let single = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, p| {
+                Ok((
+                    pass_result(p.len(), 0.01, 1.0, false),
+                    serde_json::json!({}),
+                ))
+            },
+        )
+        .unwrap();
+        assert!(single.duration.is_none());
+        let v = serde_json::to_value(&single.hybrid.unwrap().report).unwrap();
+        for b in v["buckets"].as_array().unwrap() {
+            assert!(b.get("duration").is_none(), "{b}");
+        }
+        // Some buckets timed and some not is a harness bug.
+        let mut first = true;
+        let e = run_hybrid_buckets(
+            &s,
+            10,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            |_, p| {
+                let r = if first {
+                    timed(p)
+                } else {
+                    pass_result(p.len(), 0.01, 1.0, false)
+                };
+                first = false;
+                Ok((r, serde_json::json!({})))
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("1 of 2"), "{e}");
     }
 
     #[test]

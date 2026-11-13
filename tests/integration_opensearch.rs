@@ -2436,6 +2436,87 @@ fn os_reuse_refused(
     std::fs::remove_dir_all(&proj.root).ok();
 }
 
+/// Closed-loop `--search-duration` on the OpenSearch vector workload: the
+/// same cycled schedule and record as Redis (`assert_vector_duration_point`):
+/// the first `--queries 5` cycled in strict order until the deadline, every
+/// executed query scored and dumped.
+#[test]
+fn test_binary_opensearch_closed_loop_duration_cycles_the_query_set() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-dur", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 2, "top": 10, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dur-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-dur",
+        "dur-test",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_dur")
+        ],
+        &[
+            "--search-duration",
+            "2",
+            "--queries",
+            "5",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+        ]
+    ));
+    common::assert_vector_duration_point(&proj.root, "os-dur", &dump, 2.0, 5);
+    let _ = os_client()
+        .delete(format!("{}/bench_dur", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(proj.root).ok();
+}
+
+/// Closed-loop `--search-duration` on the OpenSearch hybrid workload, per
+/// bucket, with the same assertions as Redis (`assert_hybrid_duration_point`).
+#[test]
+fn test_binary_opensearch_hybrid_closed_loop_duration_per_bucket() {
+    wait_for_opensearch();
+    let configs = serde_json::json!([{
+        "name": "os-hyb-dur", "engine": "opensearch",
+        "collection_params": {"number_of_shards": 1},
+        "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                           "search_params": {"ef": 200}}],
+        "upload_params": {"parallel": 2, "batch_size": 500}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = std::env::var("OPENSEARCH_PORT").unwrap_or_else(|_| OS_PORT.to_string());
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "os-hyb-dur",
+        "hybrid-test",
+        "http://127.0.0.1",
+        &[
+            ("OPENSEARCH_PORT", &port),
+            ("OPENSEARCH_INDEX", "bench_hybrid_dur")
+        ],
+        &[
+            "--search-duration",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+        ]
+    ));
+    common::assert_hybrid_duration_point(&proj.root, "os-hyb-dur", &dump, 1.0);
+    let _ = os_client()
+        .delete(format!("{}/bench_hybrid_dur", os_base_url()))
+        .send();
+    std::fs::remove_dir_all(proj.root).ok();
+}
+
 /// #341: the hybrid workload on OpenSearch — lucene `knn` with the predicate
 /// as its `filter` and an explicit `k`, one timed pass per selectivity bucket,
 /// recall against the brute-forced FILTERED truth per bucket. The k-NN

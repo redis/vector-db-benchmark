@@ -1187,6 +1187,12 @@ pub struct BucketReport {
     /// Engine evidence for the pass (Redis: vector search modes; OpenSearch:
     /// filtered k-NN request counter).
     pub engine: Value,
+    /// Closed-loop duration mode only: the pass's
+    /// [`crate::duration_mode::cycle_record`] (passes over this bucket's
+    /// queries, deadline accounting, recall incl. first pass). Omitted on a
+    /// single pass, so its report is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<Value>,
 }
 
 /// Per-bucket statistics from one pass's successful-query samples.
@@ -1239,6 +1245,7 @@ pub fn bucket_report(
         max_selectivity: sel.fold(f64::NEG_INFINITY, f64::max),
         predicates,
         engine,
+        duration: None,
     })
 }
 
@@ -1297,11 +1304,15 @@ pub fn remap_records(
 }
 
 /// The search config of a hybrid run must pin `top` (a ground truth up to
-/// 1000 wide would otherwise set k), and may not use the open-loop or
-/// duration modes (their per-bucket accounting is not defined). `--queries N`
-/// is refused too: each bucket is its own pass, so N would silently mean N
-/// PER BUCKET and the run's `requested_queries` would no longer match the
-/// flag. A hybrid run always runs the whole query set.
+/// 1000 wide would otherwise set k), and may not use the open-loop mode (its
+/// per-bucket accounting is not defined). The closed-loop duration mode
+/// (`--search-duration`) is accepted and applies PER BUCKET: each bucket's
+/// pass cycles that bucket's queries in order for the full duration, so a
+/// hybrid point lasts (number of buckets) x duration. `--queries N` is
+/// refused: each bucket is its own pass, so N would silently mean N PER
+/// BUCKET and the run's `requested_queries` would no longer match the flag.
+/// A hybrid run always runs (or, with a duration, cycles) the whole query
+/// set of each bucket.
 pub fn check_params(
     top: Option<i64>,
     target_qps: Option<f64>,
@@ -1315,12 +1326,20 @@ pub fn check_params(
              bucket; drop --queries for hybrid configs"
         ));
     }
-    if target_qps.is_some() || duration.is_some() {
+    if target_qps.is_some() {
         return Err(
-            "the hybrid workload runs one closed-loop pass per selectivity bucket; target_qps / \
-             duration_seconds are not supported"
+            "the hybrid workload runs one closed-loop pass per selectivity bucket; target_qps \
+             (open loop) is not supported"
                 .into(),
         );
+    }
+    if let Some(d) = duration {
+        if !d.is_finite() || d <= 0.0 || d > 1e9 {
+            return Err(format!(
+                "the hybrid duration (per bucket) must be finite, greater than zero and at most \
+                 1e9 seconds, not {d}"
+            ));
+        }
     }
     match top {
         Some(t) if t > 0 => Ok(t as usize),
@@ -1330,6 +1349,26 @@ pub fn check_params(
                 .into(),
         ),
     }
+}
+
+/// A hybrid duration point lasts up to one duration per bucket (plus the
+/// tail, priming and profiling), and `--search-timeout` bounds the whole
+/// point. A timeout below `buckets x duration` would kill a long point
+/// partway through, after most of its time was spent: refuse it at startup.
+pub fn check_search_timeout(duration: Option<f64>, search_timeout: f64) -> Result<(), String> {
+    let Some(d) = duration.filter(|d| *d > 0.0) else {
+        return Ok(());
+    };
+    let needed = Bucket::ALL.len() as f64 * d;
+    if search_timeout > 0.0 && search_timeout < needed {
+        return Err(format!(
+            "--search-timeout {search_timeout} is shorter than a hybrid duration point: the \
+             duration applies per selectivity bucket, so the point runs about {} x {d} = \
+             {needed} s (plus tail and priming); raise --search-timeout above that",
+            Bucket::ALL.len()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1767,8 +1806,23 @@ mod tests {
         assert!(check_params(None, None, None, -1).is_err());
         assert!(check_params(Some(0), None, None, -1).is_err());
         assert!(check_params(Some(10), Some(5.0), None, -1).is_err());
-        assert!(check_params(Some(10), None, Some(5.0), -1).is_err());
+        // Closed-loop duration applies per bucket; open loop stays refused.
+        assert_eq!(check_params(Some(10), None, Some(600.0), -1).unwrap(), 10);
+        assert!(check_params(Some(10), Some(5.0), Some(600.0), -1).is_err());
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 2e9] {
+            assert!(
+                check_params(Some(10), None, Some(bad), -1).is_err(),
+                "{bad}"
+            );
+        }
         let e = check_params(Some(10), None, None, 100).unwrap_err();
         assert!(e.contains("--queries"), "{e}");
+        assert!(check_params(Some(10), None, Some(600.0), 100).is_err());
+        // The watchdog must outlast every bucket's duration.
+        assert!(check_search_timeout(Some(600.0), 0.0).is_ok());
+        assert!(check_search_timeout(Some(600.0), 2500.0).is_ok());
+        assert!(check_search_timeout(None, 900.0).is_ok());
+        let e = check_search_timeout(Some(600.0), 900.0).unwrap_err();
+        assert!(e.contains("2400"), "{e}");
     }
 }

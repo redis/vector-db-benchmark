@@ -33,6 +33,11 @@
 //! pass warmed (page cache, engine caches): a window smaller than the number
 //! of queries the run dispatches is no longer a cold-read workload. The result
 //! records whether any query repeated, and how many full passes ran.
+//!
+//! The same schedule also drives the closed-loop `--search-duration` mode of
+//! the vector and hybrid workloads ([`cycle_record`]): there the cycled set
+//! is the search config's query set (or a hybrid bucket's), and every
+//! completed query, repeats included, is scored against its ground truth.
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -249,6 +254,42 @@ pub fn record(
     latencies: &[f64],
     span_s: f64,
 ) -> Value {
+    let mut out = json!({
+        "mode": "cycle-window",
+        "window": {
+            "offset": window["offset"],
+            "queries": window_len,
+            "first_line": window["first_line"],
+            "last_line": window["last_line"],
+        },
+        "order": ORDER,
+    });
+    if let (Value::Object(o), Value::Object(t)) = (
+        &mut out,
+        timing(
+            duration_s,
+            window_len,
+            dispatched,
+            completed_at,
+            latencies,
+            span_s,
+        ),
+    ) {
+        o.extend(t);
+    }
+    out
+}
+
+/// The schedule and timing keys both duration modes record: passes over the
+/// cycled set, completions before and after the deadline, and the intervals.
+fn timing(
+    duration_s: f64,
+    set_len: usize,
+    dispatched: usize,
+    completed_at: &[f64],
+    latencies: &[f64],
+    span_s: f64,
+) -> Value {
     let by_deadline = completed_at.iter().filter(|&&t| t < duration_s).count();
     let (late_lat, last): (Vec<f64>, f64) = (
         completed_at
@@ -264,20 +305,12 @@ pub fn record(
         a.extend(s);
     }
     json!({
-        "mode": "cycle-window",
         "duration_s": duration_s,
-        "window": {
-            "offset": window["offset"],
-            "queries": window_len,
-            "first_line": window["first_line"],
-            "last_line": window["last_line"],
-        },
-        "order": ORDER,
         "dispatched": dispatched,
         "completed": completed_at.len(),
-        "full_passes": dispatched.checked_div(window_len).unwrap_or(0),
-        "partial_position": dispatched.checked_rem(window_len).unwrap_or(0),
-        "repeated": dispatched > window_len,
+        "full_passes": dispatched.checked_div(set_len).unwrap_or(0),
+        "partial_position": dispatched.checked_rem(set_len).unwrap_or(0),
+        "repeated": dispatched > set_len,
         "timed_span_s": span_s,
         "last_completion_s": last,
         "completed_by_deadline": by_deadline,
@@ -290,6 +323,143 @@ pub fn record(
             .map(|&w| intervals(completed_at, latencies, duration_s, w))
             .collect::<Vec<_>>(),
     })
+}
+
+// ── Closed-loop `--search-duration` for the vector and hybrid workloads ──
+//
+// The same schedule as `compound.duration_s`, over a search config's query
+// set instead of a disk window: dispatch `k` (0-based, across all workers)
+// sends query `k mod n` of the set (n = the set, or its first `--queries`),
+// the deadline is checked before each dispatch, queries in flight at the
+// deadline complete and are counted. Every completed query, repeats included,
+// is scored against its own ground truth. Every engine that implements the
+// mode drives it through [`Dispatcher`] and records it with
+// [`cycle_record`], so two engines that ran the same set for the same time
+// sent the same query sequence (each up to its own dispatched count).
+//
+// Unlike `compound.duration_s`, a failed query does not stop dispatch: as in
+// a single pass, it is counted in `failed_queries` (and refused under
+// `--fail-on-dropped-queries`), not folded into the statistics.
+
+/// The dispatch order of a vector / hybrid duration-mode point, as recorded.
+pub const CYCLE_ORDER: &str = "strict dispatch order: dispatch k (0-based, across all workers) \
+     sends query (k mod queries) of the set; the set wraps to its start when exhausted, until \
+     the deadline";
+
+/// How recall is computed in a vector / hybrid duration-mode point.
+pub const CYCLE_RECALL_BASIS: &str = "every completed query, repeats included, is scored \
+     against its own ground truth: mean_recall averages all of them (it equals the result's \
+     mean_recall); first_pass.mean_recall covers dispatches 0..queries only, each query of the \
+     set at most once";
+
+/// The number of queries a duration-mode point cycles: the whole set, or its
+/// first `num_queries` when that is positive (`--queries N`).
+pub fn cycle_set_len(available: usize, num_queries: i64) -> usize {
+    if num_queries > 0 {
+        (num_queries as usize).min(available)
+    } else {
+        available
+    }
+}
+
+/// One worker's (or, merged, the whole point's) record of its successful
+/// queries in a vector / hybrid duration-mode point: each completion time,
+/// in the same order as the worker's latency and recall samples, and the
+/// recall of the queries dispatched in the first pass.
+#[derive(Debug, Default, Clone)]
+pub struct CycleTally {
+    completed_at: Vec<f64>,
+    first_pass_recall_sum: f64,
+    first_pass_completed: usize,
+}
+
+impl CycleTally {
+    /// Record a successful query: dispatch `seq` of a set of `set_len`,
+    /// scored `recall`, completed `completed_at` seconds after the shared
+    /// start. Call exactly once per latency sample the worker keeps.
+    pub fn push(&mut self, seq: usize, set_len: usize, recall: f64, completed_at: f64) {
+        self.completed_at.push(completed_at);
+        if seq < set_len {
+            self.first_pass_recall_sum += recall;
+            self.first_pass_completed += 1;
+        }
+    }
+
+    /// Append another worker's tally (in the same order its samples are
+    /// appended to the latency and recall vectors).
+    pub fn merge(&mut self, other: CycleTally) {
+        self.completed_at.extend(other.completed_at);
+        self.first_pass_recall_sum += other.first_pass_recall_sum;
+        self.first_pass_completed += other.first_pass_completed;
+    }
+
+    pub fn completed_at(&self) -> &[f64] {
+        &self.completed_at
+    }
+}
+
+/// The record of a vector / hybrid duration-mode point (`results.duration`,
+/// or `duration` of a hybrid bucket). `latencies` / `recalls` are the point's
+/// successful-query samples, aligned with `tally`; `dispatched` the queries
+/// sent; `span_s` the timed span the result's `rps` is computed over.
+pub fn cycle_record(
+    duration_s: f64,
+    set_len: usize,
+    dispatched: usize,
+    tally: &CycleTally,
+    latencies: &[f64],
+    recalls: &[f64],
+    span_s: f64,
+) -> Result<Value, String> {
+    let n = tally.completed_at.len();
+    if latencies.len() != n || recalls.len() != n {
+        return Err(format!(
+            "duration mode: {n} completion times but {} latencies and {} recalls",
+            latencies.len(),
+            recalls.len()
+        ));
+    }
+    if n > dispatched {
+        return Err(format!(
+            "duration mode: {n} completed queries but only {dispatched} dispatched"
+        ));
+    }
+    let mut sorted = latencies.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mean = |sum: f64, k: usize| (k > 0).then(|| sum / k as f64);
+    let mut out = json!({
+        "mode": "cycle-query-set",
+        "queries": set_len,
+        "order": CYCLE_ORDER,
+        "failed": dispatched - n,
+        "latency": {
+            "mean_time": mean(latencies.iter().sum(), n),
+            "p50_time": (n > 0).then(|| percentile(&sorted, 0.50)),
+            "p90_time": (n > 0).then(|| percentile(&sorted, 0.90)),
+            "p99_time": (n > 0).then(|| percentile(&sorted, 0.99)),
+        },
+        "mean_recall": mean(recalls.iter().sum(), n),
+        "first_pass": {
+            "completed": tally.first_pass_completed,
+            "complete": tally.first_pass_completed == set_len,
+            "mean_recall": mean(tally.first_pass_recall_sum, tally.first_pass_completed),
+        },
+        "recall_basis": CYCLE_RECALL_BASIS,
+    });
+    if let (Value::Object(o), Value::Object(t)) = (
+        &mut out,
+        timing(
+            duration_s,
+            set_len,
+            dispatched,
+            &tally.completed_at,
+            latencies,
+            span_s,
+        ),
+    ) {
+        o.extend(t);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -459,6 +629,78 @@ mod tests {
         assert_eq!(one["repeated"], false);
         let five = record(1.0, &json!({}), 4, 5, &[0.5; 5], &[0.01; 5], 1.0);
         assert_eq!(five["repeated"], true);
+    }
+
+    #[test]
+    fn cycle_set_len_honours_a_positive_query_cap_only() {
+        assert_eq!(cycle_set_len(1677, -1), 1677);
+        assert_eq!(cycle_set_len(1677, 0), 1677);
+        assert_eq!(cycle_set_len(1677, 100), 100);
+        assert_eq!(cycle_set_len(10, 100), 10);
+    }
+
+    #[test]
+    fn cycle_tally_scores_the_first_pass_separately() {
+        // Set of 3; worker A completed seqs 0, 2, 4; worker B seqs 1, 3, 5.
+        let mut a = CycleTally::default();
+        a.push(0, 3, 1.0, 0.1);
+        a.push(2, 3, 0.5, 0.2);
+        a.push(4, 3, 0.0, 0.3);
+        let mut b = CycleTally::default();
+        b.push(1, 3, 0.6, 0.1);
+        b.push(3, 3, 0.2, 0.2);
+        b.push(5, 3, 0.2, 1.5);
+        a.merge(b);
+        assert_eq!(a.completed_at(), &[0.1, 0.2, 0.3, 0.1, 0.2, 1.5]);
+        let lat = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06];
+        let rec = [1.0, 0.5, 0.0, 0.6, 0.2, 0.2];
+        let r = cycle_record(1.0, 3, 7, &a, &lat, &rec, 1.6).unwrap();
+        assert_eq!(r["mode"], "cycle-query-set");
+        assert_eq!(r["queries"], 3);
+        assert_eq!(r["duration_s"], 1.0);
+        assert_eq!(r["dispatched"], 7);
+        assert_eq!(r["completed"], 6);
+        // One dispatched query did not complete (it failed).
+        assert_eq!(r["failed"], 1);
+        assert_eq!(r["full_passes"], 2);
+        assert_eq!(r["partial_position"], 1);
+        assert_eq!(r["repeated"], true);
+        assert_eq!(r["completed_by_deadline"], 5);
+        assert_eq!(r["completed_after_deadline"], 1);
+        assert_eq!(r["qps_by_deadline"], 5.0);
+        assert_eq!(r["timed_span_s"], 1.6);
+        // Recall over every completed query, repeats included...
+        let all = r["mean_recall"].as_f64().unwrap();
+        assert!((all - 2.5 / 6.0).abs() < 1e-12, "{all}");
+        // ...and over the first pass (seqs 0..3) only.
+        assert_eq!(r["first_pass"]["completed"], 3);
+        assert_eq!(r["first_pass"]["complete"], true);
+        let first = r["first_pass"]["mean_recall"].as_f64().unwrap();
+        assert!((first - 2.1 / 3.0).abs() < 1e-12, "{first}");
+        assert_eq!(r["latency"]["p50_time"], 0.035);
+        let p99 = r["latency"]["p99_time"].as_f64().unwrap();
+        assert!((p99 - 0.0595).abs() < 1e-12, "{p99}");
+        assert_eq!(r["intervals"][0]["buckets"][0]["completed"], 5);
+    }
+
+    #[test]
+    fn cycle_record_refuses_misaligned_samples() {
+        let mut t = CycleTally::default();
+        t.push(0, 2, 1.0, 0.1);
+        assert!(cycle_record(1.0, 2, 1, &t, &[0.1, 0.2], &[1.0, 1.0], 1.0).is_err());
+        assert!(cycle_record(1.0, 2, 1, &t, &[0.1], &[], 1.0).is_err());
+        // More completions than dispatches cannot happen.
+        assert!(cycle_record(1.0, 2, 0, &t, &[0.1], &[1.0], 1.0).is_err());
+        // An unfinished first pass says so.
+        let r = cycle_record(1.0, 2, 1, &t, &[0.1], &[1.0], 1.0).unwrap();
+        assert_eq!(r["first_pass"]["complete"], false);
+        assert_eq!(r["repeated"], false);
+        // Nothing completed: the statistics are null, not 0.
+        let none = cycle_record(1.0, 2, 3, &CycleTally::default(), &[], &[], 1.0).unwrap();
+        assert!(none["mean_recall"].is_null());
+        assert!(none["first_pass"]["mean_recall"].is_null());
+        assert!(none["latency"]["p50_time"].is_null());
+        assert_eq!(none["failed"], 3);
     }
 
     #[test]

@@ -5371,3 +5371,167 @@ pub fn assert_disk_duration_run(root: &Path, config: &str, dump: &Path) {
         assert_eq!(distinct.len(), ids.len(), "{row}");
     }
 }
+
+/// Closed-loop `--search-duration` (vector / hybrid): the checks every
+/// engine's duration-mode record must pass, whatever the engine. `d` is a
+/// `results.duration` (vector) or `results.hybrid.buckets[].duration`
+/// (hybrid) record; `set_len` the queries it must have cycled.
+pub fn assert_duration_record(d: &serde_json::Value, duration_s: f64, set_len: u64, ctx: &str) {
+    let u = |k: &str| {
+        d[k].as_u64()
+            .unwrap_or_else(|| panic!("{ctx}: {k} missing: {d}"))
+    };
+    assert_eq!(d["mode"], "cycle-query-set", "{ctx}: {d}");
+    assert_eq!(d["duration_s"], duration_s, "{ctx}");
+    assert_eq!(d["queries"], set_len, "{ctx}");
+    let (dispatched, completed) = (u("dispatched"), u("completed"));
+    assert_eq!(u("failed"), 0, "{ctx}: {d}");
+    assert_eq!(completed, dispatched, "{ctx}");
+    // The set wrapped, more than once, in whole passes plus a remainder.
+    assert!(
+        u("full_passes") >= 2,
+        "{ctx}: the set must have wrapped: {d}"
+    );
+    assert_eq!(d["repeated"], true, "{ctx}");
+    assert_eq!(
+        u("full_passes") * set_len + u("partial_position"),
+        dispatched,
+        "{ctx}"
+    );
+    // Deadline accounting: nothing is lost between the two sides of it, and
+    // the timed span covers at least the duration.
+    let by_deadline = u("completed_by_deadline");
+    assert_eq!(
+        by_deadline + u("completed_after_deadline"),
+        completed,
+        "{ctx}"
+    );
+    let qps = d["qps_by_deadline"].as_f64().unwrap();
+    assert!(
+        (qps - by_deadline as f64 / duration_s).abs() < 1e-9,
+        "{ctx}"
+    );
+    assert!(
+        d["timed_span_s"].as_f64().unwrap() >= duration_s,
+        "{ctx}: {d}"
+    );
+    let ten: u64 = d["intervals"][0]["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["completed"].as_u64().unwrap())
+        .sum();
+    assert_eq!(ten, by_deadline, "{ctx}: intervals cover [0, duration)");
+    // Recall: every query of the first pass, and every executed query.
+    assert_eq!(d["first_pass"]["complete"], true, "{ctx}: {d}");
+    assert_eq!(d["first_pass"]["completed"], set_len, "{ctx}");
+    assert!(d["first_pass"]["mean_recall"].as_f64().is_some(), "{ctx}");
+    assert!(d["mean_recall"].as_f64().is_some(), "{ctx}");
+    let lat = &d["latency"];
+    let (p50, p90, p99) = (
+        lat["p50_time"].as_f64().unwrap(),
+        lat["p90_time"].as_f64().unwrap(),
+        lat["p99_time"].as_f64().unwrap(),
+    );
+    assert!(0.0 < p50 && p50 <= p90 && p90 <= p99, "{ctx}: {lat}");
+}
+
+/// A vector duration-mode point end to end: its `results.duration` record,
+/// the result's own figures agreeing with it, and one dump record per
+/// dispatch in strict cycled order (`query_id == seq mod set_len`).
+pub fn assert_vector_duration_point(
+    root: &Path,
+    config: &str,
+    dump_dir: &Path,
+    duration_s: f64,
+    set_len: u64,
+) {
+    let doc = search_docs_of_workload(root, config, "vector");
+    assert_eq!(doc.len(), 1, "{config}: one vector search file");
+    let (params, results) = (&doc[0]["params"], &doc[0]["results"]);
+    assert_eq!(params["duration_seconds"], duration_s, "{config}");
+    let d = &results["duration"];
+    assert_duration_record(d, duration_s, set_len, config);
+    assert_eq!(results["requested_queries"], d["dispatched"], "{config}");
+    assert_eq!(results["succeeded_queries"], d["completed"], "{config}");
+    let close = |a: &serde_json::Value, b: &serde_json::Value, what: &str| {
+        let (a, b) = (a.as_f64().unwrap(), b.as_f64().unwrap());
+        assert!((a - b).abs() < 1e-9, "{config}: {what} {a} vs {b}");
+    };
+    close(&results["mean_recall"], &d["mean_recall"], "mean_recall");
+    close(&results["p50_time"], &d["latency"]["p50_time"], "p50");
+    close(&results["p99_time"], &d["latency"]["p99_time"], "p99");
+    let dumps = read_dumps(dump_dir);
+    assert_eq!(dumps.len(), 1, "{config}");
+    let mut records: Vec<_> = dumps[0].records.iter().collect();
+    records.sort_by_key(|r| r.seq);
+    assert_eq!(
+        records.len() as u64,
+        d["dispatched"].as_u64().unwrap(),
+        "{config}: one record per dispatch, repeats included"
+    );
+    for (k, r) in records.iter().enumerate() {
+        assert_eq!(r.seq, k, "{config}: gapless dispatch order");
+        assert_eq!(
+            r.query_id as u64,
+            k as u64 % set_len,
+            "{config}: cycled order"
+        );
+        assert!(r.error.is_none(), "{config}: {:?}", r.error);
+    }
+}
+
+/// A hybrid duration-mode point: every bucket's pass cycled its own queries
+/// for the full duration (each bucket carries a record), the run-level
+/// summary adds them up, and the dump holds one record per dispatch.
+pub fn assert_hybrid_duration_point(root: &Path, config: &str, dump_dir: &Path, duration_s: f64) {
+    let doc = search_docs_of_workload(root, config, "hybrid");
+    assert_eq!(doc.len(), 1, "{config}: one hybrid search file");
+    let results = &doc[0]["results"];
+    let buckets = results["hybrid"]["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 4, "{config}");
+    let mut dispatched = 0;
+    for b in buckets {
+        let ctx = format!("{config} bucket {}", b["bucket"]);
+        let d = &b["duration"];
+        assert_duration_record(d, duration_s, 12, &ctx);
+        assert_eq!(b["requested_queries"], d["dispatched"], "{ctx}");
+        assert_eq!(b["failed_queries"], 0, "{ctx}");
+        let (a, m) = (
+            b["mean_recall"].as_f64().unwrap(),
+            d["mean_recall"].as_f64().unwrap(),
+        );
+        assert!((a - m).abs() < 1e-9, "{ctx}: {a} vs {m}");
+        dispatched += d["dispatched"].as_u64().unwrap();
+    }
+    let s = &results["duration"];
+    assert_eq!(s["buckets"], 4, "{config}: {s}");
+    assert_eq!(s["duration_s_per_bucket"], duration_s, "{config}");
+    assert_eq!(s["dispatched"], dispatched, "{config}");
+    assert_eq!(s["failed"], 0, "{config}: {s}");
+    assert_eq!(s["completed"], dispatched, "{config}: {s}");
+    assert_eq!(
+        s["completed_by_deadline"].as_u64().unwrap()
+            + s["completed_after_deadline"].as_u64().unwrap(),
+        dispatched,
+        "{config}: {s}"
+    );
+    assert_eq!(results["requested_queries"], dispatched, "{config}");
+    let dumps = read_dumps(dump_dir);
+    assert_eq!(dumps.len(), 1, "{config}");
+    let mut seqs: Vec<usize> = dumps[0].records.iter().map(|r| r.seq).collect();
+    seqs.sort_unstable();
+    assert_eq!(
+        seqs,
+        (0..dispatched as usize).collect::<Vec<_>>(),
+        "{config}"
+    );
+    // Every query of the set was executed at least twice (two full passes).
+    let mut per_query = std::collections::HashMap::new();
+    for r in &dumps[0].records {
+        assert!(r.error.is_none(), "{config}: {:?}", r.error);
+        *per_query.entry(r.query_id).or_insert(0u64) += 1;
+    }
+    assert_eq!(per_query.len(), HYBRID_QUERIES, "{config}");
+    assert!(per_query.values().all(|&n| n >= 2), "{config}");
+}

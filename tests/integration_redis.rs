@@ -5309,6 +5309,82 @@ fn test_binary_redis_dump_results_declared_filter_only() {
     fs::remove_dir_all(&proj.root).ok();
 }
 
+/// Closed-loop `--search-duration` on the vector workload: the query set
+/// (here its first `--queries 5`) is cycled in strict order until the
+/// deadline, every executed query (repeats included) is scored and dumped,
+/// and `results.duration` records the passes, deadline accounting and
+/// recall. The same assertions run against OpenSearch
+/// (`common::assert_vector_duration_point`).
+#[test]
+fn test_binary_redis_closed_loop_duration_cycles_the_query_set() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{
+        "name": "redis-dur", "engine": "redis",
+        "search_params": [{"parallel": 2, "top": 10, "search_params": {"ef": 64}}],
+        "upload_params": {"parallel": 1, "batch_size": 100}
+    }]);
+    let proj = common::write_match_any_project("dur-test", &configs.to_string(), 8);
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-dur",
+        "dur-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--search-duration",
+            "2",
+            "--queries",
+            "5",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+        ]
+    ));
+    common::assert_vector_duration_point(&proj.root, "redis-dur", &dump, 2.0, 5);
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
+/// Closed-loop `--search-duration` on the hybrid workload applies per
+/// bucket: each selectivity bucket's pass cycles its 12 queries for the full
+/// duration. Same assertions as OpenSearch (`assert_hybrid_duration_point`).
+#[test]
+fn test_binary_redis_hybrid_closed_loop_duration_per_bucket() {
+    wait_for_redis();
+    let mut conn = get_test_connection();
+    flush_db(&mut conn);
+    let configs = serde_json::json!([{
+        "name": "redis-hyb-dur", "engine": "redis",
+        "search_params": [{"parallel": 2, "top": 10, "workload": "hybrid",
+                           "search_params": {"ef": 200}}],
+        "upload_params": {"parallel": 2, "batch_size": 500}
+    }]);
+    let proj = common::write_msmarco_hybrid_project("hybrid-test", &configs.to_string());
+    let dump = proj.root.join("dumps");
+    let port = test_port().to_string();
+    assert!(common::run_binary_extra(
+        &proj.root,
+        "redis-hyb-dur",
+        "hybrid-test",
+        "localhost",
+        &[("REDIS_PORT", &port)],
+        &[
+            "--search-duration",
+            "1",
+            "--dump-results",
+            dump.to_str().unwrap(),
+            "--fail-on-dropped-queries",
+        ]
+    ));
+    common::assert_hybrid_duration_point(&proj.root, "redis-hyb-dur", &dump, 1.0);
+    flush_db(&mut conn);
+    fs::remove_dir_all(&proj.root).ok();
+}
+
 /// #343 review: `--target-qps` + `--dump-results`. An open-loop request that is
 /// dropped for lateness is never dispatched: it gets no record and is excluded
 /// from `requested_queries`, so the capture check (records == requested) holds

@@ -820,6 +820,104 @@ fn update_search_ratio_with_a_non_vector_search_config_fails_before_connecting()
     assert!(!stderr.contains("--update-search-ratio runs"), "{stderr}");
 }
 
+/// Closed-loop `--search-duration` / `duration_seconds` is refused at startup
+/// (missing corpus, unreachable link, closed ports: nothing may happen first)
+/// wherever it would run the query set once under a duration it did not run:
+/// the filter-only workload, a mixed phase, and an engine without the mode,
+/// including a config-file `duration_seconds` with the CLI flag absent (the
+/// CLI engine gate does not see it) and a config `duration_seconds: 0`
+/// overridden by the flag. A hybrid point whose `--search-timeout` is shorter
+/// than buckets x duration is refused too.
+#[test]
+fn duration_where_it_would_run_once_is_refused_before_download_or_connection() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let datasets = root.path().join("datasets");
+    std::fs::create_dir(&datasets).unwrap();
+    std::fs::write(
+        datasets.join("datasets.json"),
+        json!([{
+            "name":"dur-fixture", "type":"tar", "path":"missing-corpus",
+            "vector_size":1,"distance":"l2","schema":{"tag":"keyword"},
+            "link":"http://127.0.0.1:9/must-not-download.tar.gz"
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let engines_file = root.path().join("engines.json");
+    std::fs::write(
+        &engines_file,
+        json!([
+            {"name":"dur-fo","engine":"redis","search_params":[
+                {"parallel":1,"workload":"filter-only","duration_seconds":0}]},
+            {"name":"dur-vec","engine":"redis","search_params":[{"parallel":1}]},
+            {"name":"dur-qdrant","engine":"qdrant","search_params":[
+                {"parallel":1,"duration_seconds":60}]},
+            {"name":"dur-hyb","engine":"opensearch","search_params":[
+                {"parallel":1,"top":10,"workload":"hybrid"}]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let run = |config: &str, extra: &[&str]| {
+        let out = Command::new(common::binary_path())
+            .current_dir(root.path())
+            .args([
+                "--engines",
+                config,
+                "--datasets",
+                "dur-fixture",
+                "--host",
+                "127.0.0.1",
+            ])
+            .args(extra)
+            .arg("--engines-file")
+            .arg(&engines_file)
+            .env("REDIS_PORT", "9")
+            .env("OPENSEARCH_PORT", "9")
+            .env("QDRANT_PORT", "9")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for (config, extra, expected) in [
+        (
+            "dur-fo",
+            &["--search-duration", "60"][..],
+            "not supported by the filter-only workload",
+        ),
+        (
+            "dur-vec",
+            &["--search-duration", "60", "--update-search-ratio", "1:10"][..],
+            "not supported with --update-search-ratio",
+        ),
+        (
+            "dur-qdrant",
+            &[][..],
+            "engine \"qdrant\" does not implement closed-loop duration search",
+        ),
+        (
+            "dur-hyb",
+            &["--search-duration", "600", "--search-timeout", "900"][..],
+            "shorter than a hybrid duration point",
+        ),
+    ] {
+        let (ok, stdout, stderr) = run(config, extra);
+        assert!(!ok, "{config}: {stdout}");
+        assert!(stderr.contains(expected), "{config}: {stderr}");
+        assert!(!stdout.contains("Experiment stage:"), "{config}: {stdout}");
+        assert!(!stdout.contains("Running experiment"), "{config}: {stdout}");
+    }
+    // The accepting side (supported engine, timeout long enough) is covered
+    // by the unit tests of `workload::check_duration_supported` and
+    // `hybrid::check_search_timeout`; running it here would only wait on
+    // the closed port and the unreachable download.
+}
+
 /// #339 review: refusals that happen before anything touches the server (a
 /// closed port: the refusal must come first), on both engines.
 ///
@@ -1091,13 +1189,13 @@ fn hybrid_misconfiguration_fails_before_configure_or_upload() {
         assert!(!stdout.contains("Running experiment"), "{stdout}");
     }
     // 0a. The CLI open-loop flags are merged into search configs only at
-    // search time; Redis passes the duration-bounded engine gate, so they must
-    // still be refused for hybrid at startup, not after the upload.
-    // (--target-qps alone is refused earlier: it needs --search-duration.)
-    for flag in [
-        &["--search-duration", "60"][..],
-        &["--target-qps", "100", "--search-duration", "60"][..],
-    ] {
+    // search time; Redis passes the duration-bounded engine gate, so open
+    // loop must still be refused for hybrid at startup, not after the upload.
+    // (--target-qps alone is refused earlier: it needs --search-duration.
+    // A closed-loop --search-duration alone is accepted: it applies per
+    // bucket.)
+    {
+        let flag = &["--target-qps", "100", "--search-duration", "60"][..];
         let e = envs(None);
         let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let mut cmd = std::process::Command::new(common::binary_path());
@@ -1121,7 +1219,7 @@ fn hybrid_misconfiguration_fails_before_configure_or_upload() {
         );
         assert!(!out.status.success(), "{flag:?}");
         assert!(
-            stderr.contains("target_qps / duration_seconds are not supported"),
+            stderr.contains("target_qps (open loop) is not supported"),
             "{flag:?}: {stderr}"
         );
         assert!(!stdout.contains("Experiment stage:"), "{flag:?}: {stdout}");
