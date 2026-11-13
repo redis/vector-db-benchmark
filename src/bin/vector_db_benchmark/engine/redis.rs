@@ -3032,11 +3032,26 @@ impl Engine for RedisEngine {
                             return (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally);
                         }
                     };
-                    let mut conn = match client.get_connection() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            ticket.fail(format!("redis connect failed: {e}"));
-                            return (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally);
+                    // Opt-in REDIS_CONNECT_RETRIES=N: retry a failed worker connect up to N
+                    // more times (1 s, 2 s, ... backoff) BEFORE the start gate, i.e. outside
+                    // every timed window. Default 0 = upstream behaviour (fail the ticket).
+                    let connect_retries: u32 = std::env::var("REDIS_CONNECT_RETRIES")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let mut attempt: u32 = 0;
+                    let mut conn = loop {
+                        match client.get_connection() {
+                            Ok(c) => break c,
+                            Err(e) if attempt < connect_retries => {
+                                attempt += 1;
+                                eprintln!("CONNECT_RETRY worker setup attempt {attempt}/{connect_retries}: {e}");
+                                std::thread::sleep(Duration::from_secs(attempt as u64));
+                            }
+                            Err(e) => {
+                                ticket.fail(format!("redis connect failed: {e}"));
+                                return (t, p, r, mr, nd, sd, e2e, dropped, late, cap, tally);
+                            }
                         }
                     };
                     // Bound a blackholed endpoint to a finite wait instead of the
