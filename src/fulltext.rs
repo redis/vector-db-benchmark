@@ -5537,9 +5537,9 @@ mod tests {
                 .len(),
             100
         );
-        // The v6 high-pressure families and v7's rare-terms-or-wide: fixed
-        // page with fetch, exact totals only, and the request each engine is
-        // sent.
+        // The v6 high-pressure families, v7's rare-terms-or-wide and v8's
+        // corpus-sweep-or: fixed page with fetch, exact totals only, and the
+        // request each engine is sent.
         let fields = [
             "title".to_string(),
             "segment".to_string(),
@@ -5552,6 +5552,7 @@ mod tests {
             (dq::Family::RareTermsOr, dq::HIGH_PRESSURE_TOP),
             (dq::Family::RareTermsOrAndCategory, dq::HIGH_PRESSURE_TOP),
             (dq::Family::RareTermsOrWide, dq::HIGH_PRESSURE_TOP),
+            (dq::Family::CorpusSweepOr, dq::SWEEP_TOP),
         ] {
             let name = family.name();
             assert!(load(name, fetch.clone(), 10, 5).unwrap_err().contains(name));
@@ -5575,6 +5576,14 @@ mod tests {
             let body = query_opensearch_fetch(&[], q, top, TotalHits::Exact, Some(&fields));
             assert_eq!(body["size"], top);
             assert_eq!(body["track_total_hits"], true, "{body}");
+            if family == dq::Family::CorpusSweepOr {
+                // Every match fits the page; on this fixture every passage
+                // holds a rare term, so a line is one segment union.
+                assert!(expected <= top as u64);
+                assert!(redis.starts_with("(@segment:("), "{redis}");
+                assert_eq!(body["query"]["bool"]["minimum_should_match"], 1);
+                continue;
+            }
             let n = family.batch_size().unwrap();
             match family {
                 dq::Family::DocidBatch500 | dq::Family::DocidBatch1000 => {
@@ -5704,9 +5713,11 @@ mod tests {
     /// (901e8c3, before duration mode) pinned
     /// `5a7ddc4c5feff1bd8554c8f2c08ffe8546cd73e35a5a6e7717e2cf53aa5f6df7`,
     /// v6 (bf947f9)
-    /// `59742c10771427be1eafb2811b04c25c52693b1669c4152a4e3c8833c5ecca9a`.
+    /// `59742c10771427be1eafb2811b04c25c52693b1669c4152a4e3c8833c5ecca9a`,
+    /// v7 (5ba5429)
+    /// `ba69fa26b5dcdcdb912ef71a802b13ecd5feb28d9adf58ff7a43221224a5d562`.
     const SINGLE_PASS_IDENTITY: &str =
-        "ba69fa26b5dcdcdb912ef71a802b13ecd5feb28d9adf58ff7a43221224a5d562";
+        "8121352a2bf481e810a7212970ee6714169c7f0d70657279bbcfe5442d4d1ed9";
 
     #[test]
     fn disk_duration_mode_cycles_the_window_records_it_and_keeps_single_pass_identity() {

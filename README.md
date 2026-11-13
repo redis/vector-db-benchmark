@@ -2621,6 +2621,7 @@ within a run (unless a point opts in to duration mode, below):
 | `rare-terms-or` | OR of 40 `segment` terms, `top: 100`, with `fetch` | each df 11–100 |
 | `rare-terms-or-and-category` | that OR AND `category`, `top: 100`, with `fetch` | category of one passage of the union |
 | `rare-terms-or-wide` | OR of 40 `segment` terms, `top: 100`, with `fetch` | each df 1–100 (the `rare-term` pool, v7) |
+| `corpus-sweep-or` | OR of up to 64 `segment` terms and `docid`s, `top: 200`, with `fetch` | every passage at least once per epoch (v8) |
 
 Generate the query files once per prepared corpus (deterministic for a seed;
 a rerun verifies the existing files byte for byte):
@@ -2656,10 +2657,14 @@ Generator v6 only adds the high-pressure families (below): the seven v5
 family files are byte-identical to v5's, and v5 query files are refused.
 Generator v7 only adds `rare-terms-or-wide` (below): the twelve v6 family
 files are byte-identical to v6's, and v6 query files are refused.
+Generator v8 only adds `corpus-sweep-or` (below): the thirteen v7 family
+files are byte-identical to v7's (checked on the 1M and 10M corpora), and
+v7 query files are refused.
 The queries are the same, but a result's compound identity
 (`compound.sha256`) covers the window record, which names the generator and
 the manifest SHA-256. So `compare-results` refuses to pair a v5 result with
-a v6 one (or a v6 result with a v7 one), even for a byte-identical family.
+a v6 one (or a v6 result with a v7 one, or a v7 result with a v8 one), even
+for a byte-identical family.
 Pair them by hand: same family, offset and seed, and equal
 `params.fulltext.compound.window.family_file_sha256`. Rerunning
 `--add-disk-queries` on a directory from an earlier generator reports the
@@ -2819,6 +2824,7 @@ A search point selects one family and a window:
   | `rare-terms-or` | `[[t1, …, t40], n]` | OR of 40 `segment` terms, each df 11–100 | 100 | distinct passages holding any term |
   | `rare-terms-or-and-category` | `[[t1, …, t40], c, n]` | the same OR AND `category` | 100 | distinct passages of the union in `c` |
   | `rare-terms-or-wide` (v7) | `[[t1, …, t40], n]` | OR of 40 `segment` terms, each df 1–100 | 100 | distinct passages holding any term |
+  | `corpus-sweep-or` (v8) | `[[t1, …], [d1, …], n]` | OR of ≤ 64 `segment` terms (df 1–100) and `docid` any of the `d`s | 200 | distinct passages holding any term, plus the docids (≤ 200) |
 
   - Redis: `@docid:{d1 | … | dK}` / `@url:{u1 | … | u300}` (one escaped TAG
     union), `@segment:(t1 | … | t40)` (one field-scoped union of
@@ -2849,6 +2855,36 @@ A search point selects one family and a window:
     passages are spread over the whole corpus. A 150,000-query window spans
     about two epochs, so each term comes back about twice instead of ~38
     times.
+  - Why `corpus-sweep-or` (v8). Even `rare-terms-or-wide` fetches only the
+    top 100 of its matches, a set that fit Redis Flex's RAM tier (~6.2M of
+    the 10M documents) after an epoch. `corpus-sweep-or` fetches EVERY
+    passage of the corpus at least once per epoch, at a fresh seeded
+    position each epoch, so any cache smaller than the corpus misses. Each
+    passage's rarest eligible `segment` term of df 1–100 (the `rare-term`
+    pool; ties by the term) is chosen, and those terms' postings cover every
+    passage that holds such a term. A text cover alone cannot reach the
+    whole corpus: on the 10M corpus df ≤ 100 covers 37.0% of the passages,
+    df ≤ 200 39.4%, df ≤ 2,000 42.1% and any df 42.9%, because an eligible
+    term must have zero ambiguous passages corpus-wide, which almost no
+    frequent term has. So every other passage is added by its `docid` (the
+    `docid-batch` pool: safe, not a Redis tag piece, unique). Epoch `e`
+    orders the terms and docids by seeded keys
+    (`corpus-sweep-or/epoch-e/term` / `…/docid`) and packs them greedily into
+    lines whose `sum(df) + docids` stays within 200, with at most 64 terms;
+    since a line matches at most that many passages, the page of 200 fetches
+    all of them. On the 10M corpus: 1,860,417 terms (df sum 7,270,291)
+    cover 3,704,836 passages and 6,295,123 docids the other 62.95% (none
+    unreachable); an epoch is ~69,700 lines with a mean count of 194.6
+    (p50 200, min 74 in the file), ~27 terms and ~90 docids per line, every
+    line holding both; it fetches 13.57M documents (the term-covered
+    passages ~2× each); the default 1,000,065-line file holds 14.3 epochs
+    (4.4 GB). The manifest records all of it under
+    `families.corpus-sweep-or.batch` (`coverage`, `terms`, `epoch_lines`,
+    `epoch_lines_each`, `epoch_expected_count`, `epoch_fetched_passages`,
+    `epoch_distinct_passages`, `terms_per_line`, `docids_per_line`).
+    Redis: `((@segment:(t1 | …)) | (@docid:{d1 | …}))`; OpenSearch: a
+    `bool.should` of the terms' `bool.should` and a docid `terms` filter
+    (at most 65 clauses).
   - Counts are exact. A docid batch matches K passages. A `url-batch` count is
     the sum of its URLs' passage counts (distinct URLs, one URL per passage,
     and the `url-eq` eligibility keeps every URL's count exact on Redis tag
@@ -2891,7 +2927,11 @@ A search point selects one family and a window:
     `docid-batch-1000`, 40,000 for `docid-batch-500` and `url-batch`, and
     150,000 for `rare-terms-or`, `rare-terms-or-and-category` and
     `rare-terms-or-wide` (4.5–6.6 GB each; the default 1,000,000 timed lines
-    hold six such disjoint windows). With `--dump-results`, each query's page (up to 1,000 ids) is kept
+    hold six such disjoint windows). A `corpus-sweep-or` line holds ~90
+    docids and ~27 terms, so budget it like a `docid-batch` query plus a
+    `rare-terms-or` one (an estimate, not measured: ~50 KB, so at most
+    ~100,000 queries, about 1.4 epochs at 10M; a window shorter than an
+    epoch does not reach the whole corpus). With `--dump-results`, each query's page (up to 1,000 ids) is kept
     until the run ends and written out: budget a few more GB at top 1,000.
   - Generator memory. Generation keeps `url-batch` and `rare-terms-or*` lines
     in memory as 4-byte ids (~0.4 GB and ~0.16 GB each), plus the passage
@@ -2899,7 +2939,11 @@ A search point selects one family and a window:
     a category and key per passage (12 bytes each): about 2 GB of peak RSS
     over v5 at 10M. v7 adds the `rare-terms-or-wide` lines (~0.16 GB), its
     ~3.2M-term pool and index (a few hundred MB at 10M) and its postings in
-    one flat array (~9.5M row ids, ~40 MB).
+    one flat array (~9.5M row ids, ~40 MB). v8's `corpus-sweep-or` reuses
+    those postings and adds a byte per term and per docid, its lines as
+    4-byte ids (~0.45 GB at 10M) and one epoch's keys at a time: the whole
+    10M generation took 5.7 minutes at 5.2 GB peak RSS on a 12-core laptop
+    (v7: 5.5 GB).
   - Only the count is checked. BM25 differs between the engines (IDF and
     length normalization), so the top 100 of a 1,000-passage `rare-terms-or`
     union are not the same documents on both. Tag-only unions are unranked:
