@@ -1289,6 +1289,12 @@ impl RedisEngine {
     }
 }
 
+/// Cached `REDIS_FLEX_DISK_INDEX` for the per-query path (DIALECT choice).
+fn flex_disk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(flex_disk_index_opts(), Ok(Some(_))))
+}
+
 /// `REDIS_FLEX_DISK_INDEX=1` -> `Some((create-time EF_RUNTIME, RERANK))` from
 /// `REDIS_FLEX_DISK_EF_RUNTIME` (default 10) and `REDIS_FLEX_DISK_RERANK`
 /// (default true). Unset/0 -> `None` (upstream FT.CREATE unchanged).
@@ -2105,7 +2111,8 @@ fn build_ft_search_cmd(
         .arg(1)
         .arg("vector_score")
         .arg("DIALECT")
-        .arg(4)
+        // Flex: "DIALECT 4 is not supported in Redis Flex" -> 2 (same KNN result set).
+        .arg(if flex_disk_enabled() { 2 } else { 4 })
         .arg("TIMEOUT")
         .arg(query_timeout);
 
