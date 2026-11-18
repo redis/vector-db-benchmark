@@ -4,20 +4,26 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use azure_data_cosmos::models::{ContainerProperties, ThroughputProperties, VectorIndexType};
+use azure_data_cosmos::feed::FeedRange;
+use azure_data_cosmos::models::{
+    ContainerProperties, ThroughputProperties, VectorDistanceFunction, VectorIndexType,
+};
 use azure_data_cosmos::options::{
     ContentResponseOnWrite, CreateContainerOptions, MaxItemCountHint, OperationOptionsBuilder,
-    QueryOptions,
+    QueryOptions, ReadFeedRangesOptions,
 };
 use azure_data_cosmos::{
     AccountReference, ContainerClient, CosmosClient, CosmosRuntime, FeedScope, Query,
     RoutingStrategy,
 };
 use futures::{stream, StreamExt, TryStreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use tokio::sync::Semaphore;
 use vector_db_benchmark::cosmosdb::{
-    container_name, container_policy, index_type, knn_query, validate_corpus_size,
-    validate_hit_count, validate_top, verify_policy, DiskAnnBuildOptions, SearchDiagnostics,
+    container_name, container_policy, index_type, knn_query, merge_partition_hits,
+    validate_corpus_size, validate_hit_count, validate_top, vector_distance_function,
+    verify_partition_search, verify_policy, DiskAnnBuildOptions, PartitionFanout, QueryHit,
+    SearchDiagnostics,
 };
 use vector_db_benchmark::start_gate::WorkerPool;
 use vector_db_benchmark::workload::IndexLayout;
@@ -32,25 +38,14 @@ struct Item<'a> {
     embedding: &'a [f32],
 }
 
-#[derive(Deserialize)]
-struct Hit {
-    id: String,
-}
-
 const SEARCH_LIST_SIZE: &str = "search_list_size_multiplier";
 const QUANTIZED_VECTOR_LIST: &str = "quantized_vector_list_multiplier";
+const PARTITION_CONCURRENCY: &str = "partition_concurrency";
 
-fn diskann_multiplier(
-    params: &SearchParams,
-    kind: &VectorIndexType,
-    key: &str,
-) -> Result<Option<NonZeroU32>, String> {
+fn positive_knob(params: &SearchParams, key: &str) -> Result<Option<NonZeroU32>, String> {
     params
         .knob(key)
         .map(|value| {
-            if *kind != VectorIndexType::DiskANN {
-                return Err(format!("Cosmos DB {key} requires DiskANN"));
-            }
             value
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok())
@@ -58,6 +53,18 @@ fn diskann_multiplier(
                 .ok_or_else(|| format!("Cosmos DB {key} must be a positive 32-bit integer"))
         })
         .transpose()
+}
+
+fn diskann_multiplier(
+    params: &SearchParams,
+    kind: &VectorIndexType,
+    key: &str,
+) -> Result<Option<NonZeroU32>, String> {
+    let value = positive_knob(params, key)?;
+    if value.is_some() && *kind != VectorIndexType::DiskANN {
+        return Err(format!("Cosmos DB {key} requires DiskANN"));
+    }
+    Ok(value)
 }
 
 pub struct CosmosDbEngine {
@@ -84,8 +91,12 @@ impl CosmosDbEngine {
             if let Some(top) = params.top {
                 validate_top(usize::try_from(top).map_err(|_| "Cosmos DB top must be positive")?)?;
             }
-            let unsupported =
-                |key: &String| !matches!(key.as_str(), SEARCH_LIST_SIZE | QUANTIZED_VECTOR_LIST);
+            let unsupported = |key: &String| {
+                !matches!(
+                    key.as_str(),
+                    SEARCH_LIST_SIZE | QUANTIZED_VECTOR_LIST | PARTITION_CONCURRENCY
+                )
+            };
             if params.calibration_param.is_some()
                 || params.num_candidates.is_some()
                 || params
@@ -100,11 +111,12 @@ impl CosmosDbEngine {
                 })
             {
                 return Err(
-                    "Cosmos DB supports only DiskANN search multipliers as tuning knobs".into(),
+                    "Cosmos DB supports only DiskANN search multipliers and partition_concurrency as tuning knobs".into(),
                 );
             }
             diskann_multiplier(params, &kind, SEARCH_LIST_SIZE)?;
             diskann_multiplier(params, &kind, QUANTIZED_VECTOR_LIST)?;
+            positive_knob(params, PARTITION_CONCURRENCY)?;
         }
         let collection = config.collection_params.as_ref();
         if collection.is_some_and(|p| {
@@ -455,6 +467,7 @@ impl Engine for CosmosDbEngine {
         let search_list_size = diskann_multiplier(params, &self.index_type, SEARCH_LIST_SIZE)?;
         let quantized_vector_list =
             diskann_multiplier(params, &self.index_type, QUANTIZED_VECTOR_LIST)?;
+        let partition_concurrency = positive_knob(params, PARTITION_CONCURRENCY)?;
 
         let queries = vectors[..limit]
             .iter()
@@ -462,7 +475,13 @@ impl Engine for CosmosDbEngine {
                 if vector.len() != dataset.vector_size() as usize {
                     return Err("Cosmos DB query vector has the wrong number of dimensions".into());
                 }
-                knn_query(vector, top, search_list_size, quantized_vector_list)
+                knn_query(
+                    vector,
+                    top,
+                    search_list_size,
+                    quantized_vector_list,
+                    partition_concurrency.is_some(),
+                )
             })
             .collect::<Result<Vec<_>, String>>()?;
         let container = self
@@ -470,6 +489,34 @@ impl Engine for CosmosDbEngine {
             .as_ref()
             .ok_or("Cosmos DB container is unavailable")?;
         let rt = &self.rt;
+        let partition_search = partition_concurrency.map(|concurrency| {
+            let ranges = rt.block_on(read_search_ranges(container))?;
+            let per_query_concurrency = (concurrency.get() as usize).min(ranges.len());
+            let shared_request_limit = parallel.max(per_query_concurrency);
+            let summary = PartitionFanout {
+                feed_ranges: ranges.len(),
+                per_query_concurrency,
+                shared_request_limit,
+            };
+            let search = PartitionSearch {
+                ranges,
+                summary,
+                metric: vector_distance_function(dataset.distance())?,
+                permits: Semaphore::new(shared_request_limit),
+            };
+            for index in (0..limit).step_by((limit / 3).max(1)).take(3) {
+                let stock_query = knn_query(&vectors[index], top, search_list_size, quantized_vector_list, false)?;
+                let (stock, _) = rt.block_on(query_hits(container, &stock_query, top, FeedScope::full_container()))?;
+                let (partitioned, _) = rt.block_on(search_hits(container, &queries[index], top, Some(&search)))?;
+                verify_partition_search(&stock, &partitioned).map_err(|e| format!("Cosmos DB parity check for query {index}: {e}"))?;
+            }
+            println!(
+                "Cosmos DB feed-range search verified against SDK on sampled queries: {} ranges, {} per query, {} in flight",
+                summary.feed_ranges, summary.per_query_concurrency, summary.shared_request_limit
+            );
+            Ok::<_, String>(search)
+        }).transpose()?;
+        let partition_search = partition_search.as_ref();
         let next = AtomicUsize::new(0);
         let (samples, elapsed) = std::thread::scope(|scope| {
             let mut pool = WorkerPool::new(scope, "cosmosdb-search", parallel);
@@ -480,9 +527,12 @@ impl Engine for CosmosDbEngine {
                 pool.spawn(move |ticket| {
                     let mut samples = Vec::new();
                     // Warm the worker's first request outside the measured window.
-                    if let Err(error) =
-                        rt.block_on(query_hits(container, &queries[worker % limit], top))
-                    {
+                    if let Err(error) = rt.block_on(search_hits(
+                        container,
+                        &queries[worker % limit],
+                        top,
+                        partition_search,
+                    )) {
                         ticket.fail(format!("Cosmos DB worker {worker} warm-up failed: {error}"));
                         return Ok(samples);
                     }
@@ -494,7 +544,7 @@ impl Engine for CosmosDbEngine {
                         let Some(query) = queries.get(idx) else { break };
                         let started = Instant::now();
                         let (hits, diagnostics) = rt
-                            .block_on(query_hits(container, query, top))
+                            .block_on(search_hits(container, query, top, partition_search))
                             .map_err(|e| format!("Cosmos DB query {idx} failed: {e}"))?;
                         let latency = started.elapsed().as_secs_f64();
                         let ids = hits
@@ -517,6 +567,11 @@ impl Engine for CosmosDbEngine {
             let (batches, start) = pool.start()?;
             Ok::<_, String>((batches, start.elapsed().as_secs_f64()))
         })?;
+        if let Some(search) = partition_search {
+            if rt.block_on(read_search_ranges(container))? != search.ranges {
+                return Err("Cosmos DB feed ranges changed during the measured search".into());
+            }
+        }
         let (mut times, mut precision, mut recall, mut mrr, mut ndcg) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut diagnostics = SearchDiagnostics::default();
@@ -530,6 +585,7 @@ impl Engine for CosmosDbEngine {
                 diagnostics.add_query(query_diagnostics);
             }
         }
+        diagnostics.partition_fanout = partition_search.map(|search| search.summary);
         if diagnostics.http_429_attempts > 0 {
             eprintln!(
                 "Cosmos DB search at parallel={parallel} observed {} HTTP 429 responses. Latency includes SDK backoff and retries.",
@@ -574,20 +630,70 @@ impl Engine for CosmosDbEngine {
     }
 }
 
+struct PartitionSearch {
+    ranges: Vec<FeedRange>,
+    summary: PartitionFanout,
+    metric: VectorDistanceFunction,
+    permits: Semaphore,
+}
+
+async fn read_search_ranges(container: &ContainerClient) -> Result<Vec<FeedRange>, String> {
+    let ranges = container
+        .read_feed_ranges(Some(
+            ReadFeedRangesOptions::default().with_force_refresh(true),
+        ))
+        .await
+        .map_err(|e| format!("Could not read Cosmos DB feed ranges: {e}"))?;
+    if ranges.is_empty() {
+        return Err("Cosmos DB returned no feed ranges".into());
+    }
+    Ok(ranges)
+}
+
+async fn search_hits(
+    container: &ContainerClient,
+    query: &Query,
+    top: usize,
+    partition_search: Option<&PartitionSearch>,
+) -> Result<(Vec<QueryHit>, SearchDiagnostics), String> {
+    let Some(search) = partition_search else {
+        return query_hits(container, query, top, FeedScope::full_container()).await;
+    };
+    let (hits, diagnostics) = stream::iter(&search.ranges)
+        .map(|range| async {
+            let _permit = search.permits.acquire().await.map_err(|e| e.to_string())?;
+            query_hits(container, query, top, FeedScope::range(range.clone())).await
+        })
+        .buffer_unordered(search.summary.per_query_concurrency)
+        .try_fold(
+            (Vec::new(), SearchDiagnostics::default()),
+            |(mut hits, mut diagnostics), (range_hits, range_diagnostics)| async move {
+                hits.extend(range_hits);
+                diagnostics.add_query(range_diagnostics);
+                Ok((hits, diagnostics))
+            },
+        )
+        .await?;
+    Ok((
+        merge_partition_hits(hits, top, &search.metric)?,
+        diagnostics,
+    ))
+}
+
 async fn query_hits(
     container: &ContainerClient,
     query: &Query,
     top: usize,
-) -> Result<(Vec<Hit>, SearchDiagnostics), String> {
+    scope: FeedScope,
+) -> Result<(Vec<QueryHit>, SearchDiagnostics), String> {
     let mut pages = container
-        .query_items::<Hit>(query.clone(), FeedScope::full_container(), None)
+        .query_items::<QueryHit>(query.clone(), scope, None)
         .await
         .map_err(|error| error.to_string())?
         .into_pages();
     let mut hits = Vec::new();
     let mut combined = SearchDiagnostics::default();
-    // The SDK merges ORDER BY across partitions. Check the resulting global
-    // limit anyway, including pages where the server sends no hits.
+    // Enforce TOP K within the given scope across all SDK pages.
     while let Some(page) = pages.try_next().await.map_err(|error| error.to_string())? {
         validate_hit_count(hits.len() + page.items().len(), top)?;
         let diagnostics = page.diagnostics();

@@ -229,6 +229,18 @@ scope. SDK backoff and retries are part of the measured search latency.
 Check `attempts_without_status` and `queries_without_request_diagnostics`
 when interpreting the 429 count.
 
+By default, the adapter uses the SDK's full-container query, which drains
+the partitions sequentially for `ORDER BY VectorDistance`. Set
+`"search_params": { "partition_concurrency": 9 }` on a search entry to
+query disjoint physical feed ranges concurrently and merge their scored
+top-K candidates into one global top K. The effective per-query concurrency
+is capped by the number of feed ranges. Across all workers, the maximum
+number of in-flight range queries is the greater of the worker count and the
+effective per-query concurrency. Before timing, the adapter compares sampled
+result IDs with the SDK's full-container query. It aborts if the results
+disagree or the feed ranges change during search. Fan-out results record the
+effective limits alongside RU charge and HTTP attempts for all ranges.
+
 For DiskANN, each search entry can set positive integer
 `search_params.search_list_size_multiplier` and
 `search_params.quantized_vector_list_multiplier`. These map to the

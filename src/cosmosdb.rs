@@ -6,9 +6,10 @@ use azure_data_cosmos::models::{
 };
 use azure_data_cosmos::Query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 const VECTOR_PATH: &str = "/embedding";
 const VECTOR_EXCLUSION: &str = "/embedding/*";
@@ -76,6 +77,18 @@ impl DiskAnnBuildOptions {
     }
 }
 
+/// Cosmos DB metric corresponding to a benchmark corpus's distance.
+pub fn vector_distance_function(distance: &str) -> Result<VectorDistanceFunction, String> {
+    match distance.to_ascii_lowercase().as_str() {
+        "cosine" | "angular" => Ok(VectorDistanceFunction::Cosine),
+        "l2" | "euclidean" => Ok(VectorDistanceFunction::Euclidean),
+        "dot" | "ip" => Ok(VectorDistanceFunction::DotProduct),
+        _ => Err(format!(
+            "Cosmos DB does not support dataset distance '{distance}'"
+        )),
+    }
+}
+
 /// Use the dataset metric and dimension in the server-side policy.
 pub fn container_policy(
     name: String,
@@ -84,16 +97,7 @@ pub fn container_policy(
     dimensions: i64,
     build: DiskAnnBuildOptions,
 ) -> Result<ContainerProperties, String> {
-    let distance = match distance.to_ascii_lowercase().as_str() {
-        "cosine" | "angular" => VectorDistanceFunction::Cosine,
-        "l2" | "euclidean" => VectorDistanceFunction::Euclidean,
-        "dot" | "ip" => VectorDistanceFunction::DotProduct,
-        _ => {
-            return Err(format!(
-                "Cosmos DB does not support dataset distance '{distance}'"
-            ))
-        }
-    };
+    let distance = vector_distance_function(distance)?;
     let max_dimensions = if index_type == VectorIndexType::Flat {
         505
     } else {
@@ -212,6 +216,15 @@ pub struct SearchDiagnostics {
     pub http_429_attempts: usize,
     pub attempts_without_status: usize,
     pub queries_without_request_diagnostics: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_fanout: Option<PartitionFanout>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PartitionFanout {
+    pub feed_ranges: usize,
+    pub per_query_concurrency: usize,
+    pub shared_request_limit: usize,
 }
 
 impl SearchDiagnostics {
@@ -242,7 +255,9 @@ impl SearchDiagnostics {
         self.request_attempts += query.request_attempts;
         self.http_429_attempts += query.http_429_attempts;
         self.attempts_without_status += query.attempts_without_status;
-        self.queries_without_request_diagnostics += usize::from(query.request_attempts == 0);
+        self.queries_without_request_diagnostics += usize::from(
+            query.request_attempts == 0 || query.queries_without_request_diagnostics > 0,
+        );
     }
 }
 
@@ -263,6 +278,7 @@ pub fn knn_query(
     top: usize,
     search_list_size_multiplier: Option<std::num::NonZeroU32>,
     quantized_vector_list_multiplier: Option<std::num::NonZeroU32>,
+    project_distance: bool,
 ) -> Result<Query, String> {
     validate_top(top)?;
     if vector.iter().any(|v| !v.is_finite()) {
@@ -276,11 +292,83 @@ pub fn knn_query(
             ", {{\"searchListSizeMultiplier\": {search}, \"quantizedVectorListMultiplier\": {quantized}}}"
         ),
     };
+    let distance = format!("VectorDistance(c.embedding, @vector, false{options})");
+    let projection = if project_distance {
+        format!("c.id, {distance} AS distance")
+    } else {
+        "c.id".into()
+    };
     Query::from(format!(
-        "SELECT TOP {top} c.id FROM c ORDER BY VectorDistance(c.embedding, @vector, false{options})"
+        "SELECT TOP {top} {projection} FROM c ORDER BY {distance}"
     ))
     .with_parameter("@vector", vector)
     .map_err(|e| format!("Could not bind Cosmos DB query vector: {e}"))
+}
+
+#[derive(Deserialize)]
+pub struct QueryHit {
+    pub id: String,
+    pub distance: Option<f64>,
+}
+
+/// Select the global top K from the scored candidates of disjoint feed ranges.
+pub fn merge_partition_hits(
+    hits: Vec<QueryHit>,
+    top: usize,
+    metric: &VectorDistanceFunction,
+) -> Result<Vec<QueryHit>, String> {
+    // The SQL vector ORDER BY is best-first for every metric. Its projected
+    // value is a similarity for cosine/dot product and a distance for L2.
+    let higher_is_better = match metric {
+        VectorDistanceFunction::Cosine | VectorDistanceFunction::DotProduct => true,
+        VectorDistanceFunction::Euclidean => false,
+        _ => return Err("Unsupported Cosmos DB vector score ordering".into()),
+    };
+    let mut candidates = hits
+        .into_iter()
+        .map(|hit| {
+            let distance = hit
+                .distance
+                .filter(|distance| distance.is_finite())
+                .ok_or("Cosmos DB partition query returned a hit without a finite distance")?;
+            Ok((hit, distance))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut seen = HashSet::with_capacity(candidates.len());
+    for (hit, _) in &candidates {
+        if !seen.insert(hit.id.as_str()) {
+            return Err(format!(
+                "Cosmos DB partition queries returned duplicate id {}",
+                hit.id
+            ));
+        }
+    }
+    candidates.sort_unstable_by(|(left, a), (right, b)| {
+        let order = a.total_cmp(b);
+        (if higher_is_better {
+            order.reverse()
+        } else {
+            order
+        })
+        .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates.truncate(top);
+    Ok(candidates.into_iter().map(|(hit, _)| hit).collect())
+}
+
+/// Verify that the same query covers the same IDs under both routing modes.
+pub fn verify_partition_search(stock: &[QueryHit], partitioned: &[QueryHit]) -> Result<(), String> {
+    let stock_ids: HashSet<_> = stock.iter().map(|hit| &hit.id).collect();
+    let partitioned_ids: HashSet<_> = partitioned.iter().map(|hit| &hit.id).collect();
+    if stock.len() != partitioned.len() || stock_ids != partitioned_ids {
+        return Err(format!(
+            "Cosmos DB partition search disagrees with the SDK's global top K ({} vs {} hits, {} shared IDs)",
+            stock.len(),
+            partitioned.len(),
+            stock_ids.intersection(&partitioned_ids).count(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -419,7 +507,7 @@ mod tests {
 
     #[test]
     fn vector_queries_request_indexed_top_k_and_bind_the_vector() {
-        let query = to_value(knn_query(&[0.5, -0.25], 10, None, None).unwrap()).unwrap();
+        let query = to_value(knn_query(&[0.5, -0.25], 10, None, None, false).unwrap()).unwrap();
         assert_eq!(
             query["query"],
             "SELECT TOP 10 c.id FROM c ORDER BY VectorDistance(c.embedding, @vector, false)"
@@ -428,13 +516,61 @@ mod tests {
             query["parameters"],
             json!([{"name": "@vector", "value": [0.5, -0.25]}])
         );
-        assert!(knn_query(&[0.5], 0, None, None).is_err());
-        assert!(knn_query(&[0.5], 1001, None, None).is_err());
-        let tuned = to_value(knn_query(&[0.5], 10, 5.try_into().ok(), 20.try_into().ok()).unwrap())
-            .unwrap();
+        assert!(knn_query(&[0.5], 0, None, None, false).is_err());
+        assert!(knn_query(&[0.5], 1001, None, None, false).is_err());
+        let tuned =
+            to_value(knn_query(&[0.5], 10, 5.try_into().ok(), 20.try_into().ok(), false).unwrap())
+                .unwrap();
         assert_eq!(
             tuned["query"],
             r#"SELECT TOP 10 c.id FROM c ORDER BY VectorDistance(c.embedding, @vector, false, {"searchListSizeMultiplier": 5, "quantizedVectorListMultiplier": 20})"#
+        );
+        let scored = to_value(knn_query(&[0.5], 10, None, None, true).unwrap()).unwrap();
+        assert_eq!(
+            scored["query"],
+            "SELECT TOP 10 c.id, VectorDistance(c.embedding, @vector, false) AS distance FROM c ORDER BY VectorDistance(c.embedding, @vector, false)"
+        );
+    }
+
+    #[test]
+    fn partition_merge_selects_global_top_k_and_rejects_incomplete_hits() {
+        let hit = |id: &str, distance| QueryHit {
+            id: id.into(),
+            distance,
+        };
+        let candidates = || {
+            vec![
+                hit("0", Some(0.9)),
+                hit("2", Some(0.3)),
+                hit("1", Some(0.3)),
+                hit("3", Some(0.1)),
+            ]
+        };
+        for (metric, expected) in [
+            (VectorDistanceFunction::Euclidean, ["3", "1"]),
+            (VectorDistanceFunction::Cosine, ["0", "1"]),
+            (VectorDistanceFunction::DotProduct, ["0", "1"]),
+        ] {
+            let merged = merge_partition_hits(candidates(), 2, &metric).unwrap();
+            assert_eq!(
+                merged.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(verify_partition_search(
+                &[hit(expected[1], None), hit(expected[0], None)],
+                &merged
+            )
+            .is_ok());
+            assert!(
+                verify_partition_search(&[hit("2", None), hit(expected[0], None)], &merged)
+                    .is_err()
+            );
+        }
+        let metric = VectorDistanceFunction::Cosine;
+        assert!(merge_partition_hits(vec![hit("0", None)], 1, &metric).is_err());
+        assert!(
+            merge_partition_hits(vec![hit("0", Some(0.1)), hit("0", Some(0.2))], 1, &metric)
+                .is_err()
         );
     }
 

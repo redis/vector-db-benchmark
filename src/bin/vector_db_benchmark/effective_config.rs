@@ -191,6 +191,9 @@ const DECLARED_KEY_ALLOWLIST: &[&str] = &[
     // Cosmos DB DiskANN
     "indexing_search_list_size",
     "quantization_byte_size",
+    "search_list_size_multiplier",
+    "quantized_vector_list_multiplier",
+    "partition_concurrency",
     // SVS-VAMANA
     "svs-vamana_config",
     "GRAPH_MAX_DEGREE",
