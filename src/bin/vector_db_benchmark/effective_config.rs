@@ -188,6 +188,9 @@ const DECLARED_KEY_ALLOWLIST: &[&str] = &[
     "type",
     "number_of_shards",
     "is_tenant",
+    // Cosmos DB DiskANN
+    "indexing_search_list_size",
+    "quantization_byte_size",
     // SVS-VAMANA
     "svs-vamana_config",
     "GRAPH_MAX_DEGREE",

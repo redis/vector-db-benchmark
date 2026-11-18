@@ -240,6 +240,30 @@ The shipped `cosmosdb-diskann` config compares the service defaults with
 search-list multipliers of 1, 5, 10, and 20 at parallelism 1 and 8, all at
 top-10. The quantized-vector-list multiplier uses the service default.
 
+To sweep DiskANN index builds, use `--engines 'cosmosdb-diskann-build-*'`
+with a dataset of at least 64 dimensions. Each named config provisions its
+own container and uses the same top-10 searches at parallelism 1 and 8 with
+service-default query settings. The presets vary
+`collection_params.indexing_search_list_size` at 50, 100, and 200 with
+quantization fixed at 32 bytes, and vary `collection_params.quantization_byte_size`
+at 16, 32, and 64 with the indexing search list fixed at 100. The benchmark
+checks the realized values before search, including on container reuse.
+With the Rust SDK, the build search list accepts integers from 25 to 500
+and the quantization size accepts integers from 1 to the smaller of 512
+and the vector dimension. Omit a build setting to use the Azure default.
+See the [Rust SDK vector index model](https://github.com/Azure/azure-sdk-for-rust/blob/d7e28a1cd76e11d51f005e5d502a6c1c6299f74a/sdk/cosmos/azure_data_cosmos/src/models/indexing_policy.rs#L274-L290).
+
+The opt-in DBpedia example uses 10,000 RU/s per container. It runs four
+index builds and measures top-100 searches at parallelism 1 and 100. The
+command uses the registered 975K DBpedia dataset with 100 reference neighbors.
+Run it from a repository checkout.
+
+```bash
+vector-db-benchmark \
+  --engines-file experiments/examples/cosmosdb-dbpedia-index-sweep.json \
+  --datasets dbpedia-openai-975K-1536-angular-100neighbors
+```
+
 The adapter benchmarks dense, unfiltered top-K queries across the whole
 container. It verifies the vector policy and corpus cardinality. The
 `cosmosdb-flat` configuration supports up to 505 dimensions. The

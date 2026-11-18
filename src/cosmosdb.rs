@@ -7,6 +7,7 @@ use azure_data_cosmos::models::{
 use azure_data_cosmos::Query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const VECTOR_PATH: &str = "/embedding";
@@ -31,12 +32,57 @@ pub fn container_name(config: &str, dataset: &str) -> String {
     format!("vdb-benchmark-{}", URL_SAFE_NO_PAD.encode(hash.finalize()))
 }
 
+/// Optional DiskANN index-build settings. Absent fields leave policy defaults
+/// to Azure, including its dimension-dependent quantization size.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiskAnnBuildOptions {
+    indexing_search_list_size: Option<u32>,
+    quantization_byte_size: Option<u32>,
+}
+
+impl DiskAnnBuildOptions {
+    /// Validate supplied collection parameters against the data-plane SDK's
+    /// limits. The dimension-dependent cap is checked when building the policy.
+    pub fn from_config(
+        kind: &VectorIndexType,
+        indexing_search_list_size: Option<&Value>,
+        quantization_byte_size: Option<&Value>,
+    ) -> Result<Self, String> {
+        if *kind != VectorIndexType::DiskANN
+            && (indexing_search_list_size.is_some() || quantization_byte_size.is_some())
+        {
+            return Err("Cosmos DB collection index-build options require DiskANN".into());
+        }
+
+        let parse = |value: &Value, key: &str, min: u32, max: u32| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| (min..=max).contains(value))
+                .ok_or_else(|| {
+                    format!(
+                        "Cosmos DB collection_params.{key} must be an integer from {min} to {max}"
+                    )
+                })
+        };
+        Ok(Self {
+            indexing_search_list_size: indexing_search_list_size
+                .map(|value| parse(value, "indexing_search_list_size", 25, 500))
+                .transpose()?,
+            quantization_byte_size: quantization_byte_size
+                .map(|value| parse(value, "quantization_byte_size", 1, 512))
+                .transpose()?,
+        })
+    }
+}
+
 /// Use the dataset metric and dimension in the server-side policy.
 pub fn container_policy(
     name: String,
     index_type: VectorIndexType,
     distance: &str,
     dimensions: i64,
+    build: DiskAnnBuildOptions,
 ) -> Result<ContainerProperties, String> {
     let distance = match distance.to_ascii_lowercase().as_str() {
         "cosine" | "angular" => VectorDistanceFunction::Cosine,
@@ -59,11 +105,23 @@ pub fn container_policy(
         ));
     }
 
+    let mut vector_index = VectorIndex::new(VECTOR_PATH, index_type);
+    if let Some(size) = build.indexing_search_list_size {
+        vector_index = vector_index.with_indexing_search_list_size(size);
+    }
+    if let Some(size) = build.quantization_byte_size {
+        if i64::from(size) > dimensions {
+            return Err(format!(
+                "Cosmos DB collection_params.quantization_byte_size ({size}) exceeds the vector dimensions ({dimensions})"
+            ));
+        }
+        vector_index = vector_index.with_quantization_byte_size(size);
+    }
     let mut indexing = IndexingPolicy::default()
         .with_indexing_mode(IndexingMode::Consistent)
         .with_included_path("/*")
         .with_excluded_path(VECTOR_EXCLUSION)
-        .with_vector_index(VectorIndex::new(VECTOR_PATH, index_type));
+        .with_vector_index(vector_index);
     indexing.automatic = true;
     let mut properties = ContainerProperties::new(name, "/id".into());
     properties.indexing_policy = Some(indexing);
@@ -107,12 +165,19 @@ pub fn verify_policy(
                 // Azure fills in service-selected DiskANN defaults on readback.
                 // Compare the fields we set and record the full realized policy.
                 && matches!(p.vector_indexes.as_slice(), [index] if expected_index.is_some_and(|expected| {
-                    index.path == expected.path && index.index_type == expected.index_type
+                    index.path == expected.path
+                        && index.index_type == expected.index_type
+                        && expected.indexing_search_list_size.is_none_or(|size| {
+                            index.indexing_search_list_size == Some(size)
+                        })
+                        && expected.quantization_byte_size.is_none_or(|size| {
+                            index.quantization_byte_size == Some(size)
+                        })
                 }))
         })
     {
         return Err(format!(
-            "Cosmos DB container '{}' has an incompatible partition key, embedding policy or vector index",
+            "Cosmos DB container '{}' has an incompatible partition key, embedding policy, vector index or index-build settings",
             actual.id
         ));
     }
@@ -225,7 +290,15 @@ mod tests {
 
     #[test]
     fn distance_and_diskann_policy_are_in_the_wire_request() {
-        let p = container_policy("bench".into(), VectorIndexType::DiskANN, "dot", 1024).unwrap();
+        let defaults = DiskAnnBuildOptions::default();
+        let p = container_policy(
+            "bench".into(),
+            VectorIndexType::DiskANN,
+            "dot",
+            1024,
+            defaults,
+        )
+        .unwrap();
         let wire = to_value(&p).unwrap();
         assert_eq!(wire["partitionKey"]["paths"], json!(["/id"]));
         assert_eq!(
@@ -239,6 +312,9 @@ mod tests {
             wire["indexingPolicy"]["vectorIndexes"][0]["type"],
             "diskANN"
         );
+        let default_index = &wire["indexingPolicy"]["vectorIndexes"][0];
+        assert!(default_index.get("quantizationByteSize").is_none());
+        assert!(default_index.get("indexingSearchListSize").is_none());
         let mut realized = wire;
         let vector_index = &mut realized["indexingPolicy"]["vectorIndexes"][0];
         vector_index["quantizerType"] = json!("product");
@@ -249,10 +325,96 @@ mod tests {
         realized["indexingPolicy"]["vectorIndexes"][0]["type"] = json!("flat");
         let wrong_index = serde_json::from_value(realized).unwrap();
         assert!(verify_policy(&wrong_index, &p).is_err());
-        let other = container_policy("bench".into(), VectorIndexType::DiskANN, "l2", 1024).unwrap();
+        let other = container_policy(
+            "bench".into(),
+            VectorIndexType::DiskANN,
+            "l2",
+            1024,
+            defaults,
+        )
+        .unwrap();
         assert!(verify_policy(&p, &other).is_err());
         assert!(verify_policy(&p, &p).is_ok());
-        assert!(container_policy("bench".into(), VectorIndexType::Flat, "cosine", 506).is_err());
+        assert!(container_policy(
+            "bench".into(),
+            VectorIndexType::Flat,
+            "cosine",
+            506,
+            defaults
+        )
+        .is_err());
+    }
+
+    fn tuned_diskann_policy() -> ContainerProperties {
+        let kind = VectorIndexType::DiskANN;
+        let options =
+            DiskAnnBuildOptions::from_config(&kind, Some(&json!(150)), Some(&json!(32))).unwrap();
+        container_policy("bench".into(), kind, "cosine", 100, options).unwrap()
+    }
+
+    #[test]
+    fn diskann_build_settings_are_in_wire_policy() {
+        let wire = to_value(tuned_diskann_policy()).unwrap();
+        let index = &wire["indexingPolicy"]["vectorIndexes"][0];
+        assert_eq!(index["indexingSearchListSize"], 150);
+        assert_eq!(index["quantizationByteSize"], 32);
+    }
+
+    #[test]
+    fn diskann_build_readback_requires_all_explicit_settings() {
+        let expected = tuned_diskann_policy();
+        let wire = to_value(&expected).unwrap();
+        let actual = serde_json::from_value(wire.clone()).unwrap();
+        assert!(verify_policy(&actual, &expected).is_ok());
+        for key in ["indexingSearchListSize", "quantizationByteSize"] {
+            let mut changed = wire.clone();
+            let index = &mut changed["indexingPolicy"]["vectorIndexes"][0];
+            index[key] = json!(100);
+            let actual = serde_json::from_value(changed.clone()).unwrap();
+            assert!(
+                verify_policy(&actual, &expected).is_err(),
+                "mismatched {key}"
+            );
+            changed["indexingPolicy"]["vectorIndexes"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            let actual = serde_json::from_value(changed).unwrap();
+            assert!(verify_policy(&actual, &expected).is_err(), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn diskann_build_settings_validate_types_and_bounds() {
+        let kind = VectorIndexType::DiskANN;
+        for (indexing_search_list, min, max) in [(true, 25, 500), (false, 1, 512)] {
+            let parse = |value: &Value| {
+                if indexing_search_list {
+                    DiskAnnBuildOptions::from_config(&kind, Some(value), None)
+                } else {
+                    DiskAnnBuildOptions::from_config(&kind, None, Some(value))
+                }
+            };
+            assert!(parse(&json!(min)).is_ok());
+            assert!(parse(&json!(max)).is_ok());
+            for invalid in [json!(min - 1), json!(max + 1), json!(64.0), json!("64")] {
+                assert!(
+                    parse(&invalid).is_err(),
+                    "accepted invalid setting {invalid}"
+                );
+            }
+        }
+        assert!(
+            DiskAnnBuildOptions::from_config(&VectorIndexType::Flat, Some(&json!(100)), None)
+                .is_err()
+        );
+        assert!(
+            DiskAnnBuildOptions::from_config(&VectorIndexType::Flat, None, Some(&json!(32)))
+                .is_err()
+        );
+        let options = DiskAnnBuildOptions::from_config(&kind, None, Some(&json!(32))).unwrap();
+        assert!(container_policy("bench".into(), kind.clone(), "cosine", 32, options).is_ok());
+        assert!(container_policy("bench".into(), kind, "cosine", 31, options).is_err());
     }
 
     #[test]

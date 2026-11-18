@@ -17,7 +17,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use vector_db_benchmark::cosmosdb::{
     container_name, container_policy, index_type, knn_query, validate_corpus_size,
-    validate_hit_count, validate_top, verify_policy, SearchDiagnostics,
+    validate_hit_count, validate_top, verify_policy, DiskAnnBuildOptions, SearchDiagnostics,
 };
 use vector_db_benchmark::start_gate::WorkerPool;
 use vector_db_benchmark::workload::IndexLayout;
@@ -65,6 +65,7 @@ pub struct CosmosDbEngine {
     database: String,
     container_name: String,
     index_type: VectorIndexType,
+    build_options: DiskAnnBuildOptions,
     upload_parallel: usize,
     search_params: Vec<SearchParams>,
     throughput: Option<u64>,
@@ -109,15 +110,33 @@ impl CosmosDbEngine {
         if collection.is_some_and(|p| {
             p.hnsw_config.is_some()
                 || p.index_options.is_some()
-                || p.extra
-                    .as_ref()
-                    .is_some_and(|extra| extra.keys().any(|k| k != "ru_per_second"))
+                || p.extra.as_ref().is_some_and(|extra| {
+                    extra.keys().any(|key| {
+                        !matches!(
+                            key.as_str(),
+                            "ru_per_second"
+                                | "indexing_search_list_size"
+                                | "quantization_byte_size"
+                        )
+                    })
+                })
         }) {
-            return Err("Cosmos DB collection_params supports only ru_per_second".into());
+            return Err(
+                "Cosmos DB collection_params supports only ru_per_second, indexing_search_list_size and quantization_byte_size"
+                    .into(),
+            );
         }
-        let configured_ru = collection
-            .and_then(|p| p.extra.as_ref())
-            .and_then(|options| options.get("ru_per_second"))
+        let collection_option = |key| {
+            collection
+                .and_then(|p| p.extra.as_ref())
+                .and_then(|p| p.get(key))
+        };
+        let build_options = DiskAnnBuildOptions::from_config(
+            &kind,
+            collection_option("indexing_search_list_size"),
+            collection_option("quantization_byte_size"),
+        )?;
+        let configured_ru = collection_option("ru_per_second")
             .map(|value| {
                 value.as_u64().filter(|ru| *ru >= 400).ok_or(
                     "Cosmos DB collection_params.ru_per_second must be an integer of at least 400",
@@ -198,6 +217,7 @@ impl CosmosDbEngine {
             database,
             container_name: container_name(&config.name, dataset),
             index_type: kind,
+            build_options,
             upload_parallel,
             search_params,
             throughput,
@@ -237,6 +257,7 @@ impl CosmosDbEngine {
             self.index_type.clone(),
             dataset.distance(),
             dataset.vector_size(),
+            self.build_options,
         )
     }
 }
