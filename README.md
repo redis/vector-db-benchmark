@@ -236,6 +236,9 @@ For DiskANN, each search entry can set positive integer
 `quantizedVectorListMultiplier`. Leave both unset for the service defaults.
 Add multiple search entries under one engine config to sweep query-time
 settings on the same index, keeping `top` fixed for recall comparisons.
+The shipped `cosmosdb-diskann` config compares the service defaults with
+search-list multipliers of 1, 5, 10, and 20 at parallelism 1 and 8, all at
+top-10. The quantized-vector-list multiplier uses the service default.
 
 The adapter benchmarks dense, unfiltered top-K queries across the whole
 container. It verifies the vector policy and corpus cardinality. The

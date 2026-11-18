@@ -16,7 +16,15 @@
     "upload_params": { "parallel": 8 },
     "search_params": [
       { "top": 10, "parallel": 1 },
-      { "top": 10, "parallel": 8 }
+      { "top": 10, "parallel": 8 },
+      { "top": 10, "parallel": 1, "search_params": { "search_list_size_multiplier": 1 } },
+      { "top": 10, "parallel": 1, "search_params": { "search_list_size_multiplier": 5 } },
+      { "top": 10, "parallel": 1, "search_params": { "search_list_size_multiplier": 10 } },
+      { "top": 10, "parallel": 1, "search_params": { "search_list_size_multiplier": 20 } },
+      { "top": 10, "parallel": 8, "search_params": { "search_list_size_multiplier": 1 } },
+      { "top": 10, "parallel": 8, "search_params": { "search_list_size_multiplier": 5 } },
+      { "top": 10, "parallel": 8, "search_params": { "search_list_size_multiplier": 10 } },
+      { "top": 10, "parallel": 8, "search_params": { "search_list_size_multiplier": 20 } }
     ]
   }
 ]
