@@ -22,8 +22,8 @@ use tokio::sync::Semaphore;
 use vector_db_benchmark::cosmosdb::{
     container_name, container_policy, index_type, knn_query, merge_partition_hits,
     validate_corpus_size, validate_hit_count, validate_top, vector_distance_function,
-    verify_partition_search, verify_policy, DiskAnnBuildOptions, PartitionFanout, QueryHit,
-    SearchDiagnostics,
+    verify_partition_search, verify_policy, DiskAnnBuildOptions, PartitionConcurrency,
+    PartitionFanout, QueryHit, SearchDiagnostics,
 };
 use vector_db_benchmark::start_gate::WorkerPool;
 use vector_db_benchmark::workload::IndexLayout;
@@ -116,7 +116,7 @@ impl CosmosDbEngine {
             }
             diskann_multiplier(params, &kind, SEARCH_LIST_SIZE)?;
             diskann_multiplier(params, &kind, QUANTIZED_VECTOR_LIST)?;
-            positive_knob(params, PARTITION_CONCURRENCY)?;
+            PartitionConcurrency::from_config(params.knob(PARTITION_CONCURRENCY))?;
         }
         let collection = config.collection_params.as_ref();
         if collection.is_some_and(|p| {
@@ -467,7 +467,8 @@ impl Engine for CosmosDbEngine {
         let search_list_size = diskann_multiplier(params, &self.index_type, SEARCH_LIST_SIZE)?;
         let quantized_vector_list =
             diskann_multiplier(params, &self.index_type, QUANTIZED_VECTOR_LIST)?;
-        let partition_concurrency = positive_knob(params, PARTITION_CONCURRENCY)?;
+        let partition_concurrency =
+            PartitionConcurrency::from_config(params.knob(PARTITION_CONCURRENCY))?;
 
         let queries = vectors[..limit]
             .iter()
@@ -491,7 +492,7 @@ impl Engine for CosmosDbEngine {
         let rt = &self.rt;
         let partition_search = partition_concurrency.map(|concurrency| {
             let ranges = rt.block_on(read_search_ranges(container))?;
-            let per_query_concurrency = (concurrency.get() as usize).min(ranges.len());
+            let per_query_concurrency = concurrency.resolve(ranges.len());
             let shared_request_limit = parallel.max(per_query_concurrency);
             let summary = PartitionFanout {
                 feed_ranges: ranges.len(),

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 
 const VECTOR_PATH: &str = "/embedding";
 const VECTOR_EXCLUSION: &str = "/embedding/*";
@@ -227,6 +228,40 @@ pub struct PartitionFanout {
     pub shared_request_limit: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum PartitionConcurrency {
+    Auto,
+    Limit(NonZeroU32),
+}
+
+impl PartitionConcurrency {
+    /// Missing selects the stock SDK path. Explicit fan-out accepts "auto" or a cap.
+    pub fn from_config(value: Option<&Value>) -> Result<Option<Self>, String> {
+        value
+            .map(|value| {
+                if value.as_str() == Some("auto") {
+                    return Ok(Self::Auto);
+                }
+                value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .and_then(NonZeroU32::new)
+                    .map(Self::Limit)
+                    .ok_or_else(|| {
+                        "Cosmos DB partition_concurrency must be \"auto\" or a positive 32-bit integer".into()
+                    })
+            })
+            .transpose()
+    }
+
+    pub fn resolve(&self, feed_ranges: usize) -> usize {
+        match self {
+            Self::Auto => feed_ranges,
+            Self::Limit(cap) => feed_ranges.min(cap.get() as usize),
+        }
+    }
+}
+
 impl SearchDiagnostics {
     /// Use the exact SDK totals and count HTTP statuses from either individual
     /// attempts or their compacted rollup. Omitted statuses remain unknown.
@@ -276,8 +311,8 @@ pub fn validate_corpus_size(kind: &VectorIndexType, count: u64) -> Result<(), St
 pub fn knn_query(
     vector: &[f32],
     top: usize,
-    search_list_size_multiplier: Option<std::num::NonZeroU32>,
-    quantized_vector_list_multiplier: Option<std::num::NonZeroU32>,
+    search_list_size_multiplier: Option<NonZeroU32>,
+    quantized_vector_list_multiplier: Option<NonZeroU32>,
     project_distance: bool,
 ) -> Result<Query, String> {
     validate_top(top)?;
@@ -530,6 +565,24 @@ mod tests {
             scored["query"],
             "SELECT TOP 10 c.id, VectorDistance(c.embedding, @vector, false) AS distance FROM c ORDER BY VectorDistance(c.embedding, @vector, false)"
         );
+    }
+
+    #[test]
+    fn partition_concurrency_uses_the_realized_feed_range_count() {
+        assert_eq!(PartitionConcurrency::from_config(None).unwrap(), None);
+        let auto = PartitionConcurrency::from_config(Some(&json!("auto")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(auto.resolve(5), 5);
+        assert_eq!(auto.resolve(12), 12);
+        let limited = PartitionConcurrency::from_config(Some(&json!(9)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(limited.resolve(5), 5);
+        assert_eq!(limited.resolve(12), 9);
+        for invalid in [json!(0), json!(-1), json!(1.5), json!("9"), json!(null)] {
+            assert!(PartitionConcurrency::from_config(Some(&invalid)).is_err());
+        }
     }
 
     #[test]

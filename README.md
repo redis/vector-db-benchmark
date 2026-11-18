@@ -231,10 +231,11 @@ when interpreting the 429 count.
 
 By default, the adapter uses the SDK's full-container query, which drains
 the partitions sequentially for `ORDER BY VectorDistance`. Set
-`"search_params": { "partition_concurrency": 9 }` on a search entry to
+`"search_params": { "partition_concurrency": "auto" }` on a search entry to
 query disjoint physical feed ranges concurrently and merge their scored
-top-K candidates into one global top K. The effective per-query concurrency
-is capped by the number of feed ranges. Across all workers, the maximum
+top-K candidates into one global top K. The adapter looks up the feed ranges
+before timing. `"auto"` uses their count as the per-query concurrency, and
+a positive integer caps it at that value. Across all workers, the maximum
 number of in-flight range queries is the greater of the worker count and the
 effective per-query concurrency. Before timing, the adapter compares sampled
 result IDs with the SDK's full-container query. It aborts if the results
