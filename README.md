@@ -197,6 +197,15 @@ vector-db-benchmark --engines cosmosdb-flat --datasets random-100 --skip-if-exis
 make integration-test-cosmosdb
 ```
 
+For an Azure-hosted benchmark over Private Link, place the client VM in the
+Cosmos DB region. Create a NoSQL private endpoint with subresource `Sql` and
+link the `privatelink.documents.azure.com` private DNS zone to the VM's virtual
+network. Keep `AZURE_COSMOS_ENDPOINT` set to the standard account URL
+(`https://<account>.documents.azure.com:443/`). From the VM, run
+`nslookup <account>.documents.azure.com` and confirm the address matches the
+private endpoint before running the benchmark. See Microsoft's
+[Cosmos DB Private Link setup guide](https://learn.microsoft.com/en-us/azure/cosmos-db/how-to-configure-private-endpoints).
+
 The benchmark creates the database if needed and provisions a dedicated
 container per config and dataset. It uses manual throughput of 400 RU/s by
 default. Set `AZURE_COSMOS_RU_PER_SECOND=serverless` for a serverless account,
@@ -219,6 +228,14 @@ for measured query pages. Warm-ups and verification queries are outside this
 scope. SDK backoff and retries are part of the measured search latency.
 Check `attempts_without_status` and `queries_without_request_diagnostics`
 when interpreting the 429 count.
+
+For DiskANN, each search entry can set positive integer
+`search_params.search_list_size_multiplier` and
+`search_params.quantized_vector_list_multiplier`. These map to the
+`VectorDistance` query options `searchListSizeMultiplier` and
+`quantizedVectorListMultiplier`. Leave both unset for the service defaults.
+Add multiple search entries under one engine config to sweep query-time
+settings on the same index, keeping `top` fixed for recall comparisons.
 
 The adapter benchmarks dense, unfiltered top-K queries across the whole
 container. It verifies the vector policy and corpus cardinality. The

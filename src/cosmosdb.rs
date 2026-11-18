@@ -193,13 +193,26 @@ pub fn validate_corpus_size(kind: &VectorIndexType, count: u64) -> Result<(), St
 
 /// Build a server-side TOP K query. The service uses the policy's distance
 /// function. TOP is a validated integer literal and the vector is bound.
-pub fn knn_query(vector: &[f32], top: usize) -> Result<Query, String> {
+pub fn knn_query(
+    vector: &[f32],
+    top: usize,
+    search_list_size_multiplier: Option<std::num::NonZeroU32>,
+    quantized_vector_list_multiplier: Option<std::num::NonZeroU32>,
+) -> Result<Query, String> {
     validate_top(top)?;
     if vector.iter().any(|v| !v.is_finite()) {
         return Err("Cosmos DB query vector contains a non-finite value".into());
     }
+    let options = match (search_list_size_multiplier, quantized_vector_list_multiplier) {
+        (None, None) => String::new(),
+        (Some(search), None) => format!(", {{\"searchListSizeMultiplier\": {search}}}"),
+        (None, Some(quantized)) => format!(", {{\"quantizedVectorListMultiplier\": {quantized}}}"),
+        (Some(search), Some(quantized)) => format!(
+            ", {{\"searchListSizeMultiplier\": {search}, \"quantizedVectorListMultiplier\": {quantized}}}"
+        ),
+    };
     Query::from(format!(
-        "SELECT TOP {top} c.id FROM c ORDER BY VectorDistance(c.embedding, @vector, false)"
+        "SELECT TOP {top} c.id FROM c ORDER BY VectorDistance(c.embedding, @vector, false{options})"
     ))
     .with_parameter("@vector", vector)
     .map_err(|e| format!("Could not bind Cosmos DB query vector: {e}"))
@@ -244,7 +257,7 @@ mod tests {
 
     #[test]
     fn vector_queries_request_indexed_top_k_and_bind_the_vector() {
-        let query = to_value(knn_query(&[0.5, -0.25], 10).unwrap()).unwrap();
+        let query = to_value(knn_query(&[0.5, -0.25], 10, None, None).unwrap()).unwrap();
         assert_eq!(
             query["query"],
             "SELECT TOP 10 c.id FROM c ORDER BY VectorDistance(c.embedding, @vector, false)"
@@ -253,8 +266,14 @@ mod tests {
             query["parameters"],
             json!([{"name": "@vector", "value": [0.5, -0.25]}])
         );
-        assert!(knn_query(&[0.5], 0).is_err());
-        assert!(knn_query(&[0.5], 1001).is_err());
+        assert!(knn_query(&[0.5], 0, None, None).is_err());
+        assert!(knn_query(&[0.5], 1001, None, None).is_err());
+        let tuned = to_value(knn_query(&[0.5], 10, 5.try_into().ok(), 20.try_into().ok()).unwrap())
+            .unwrap();
+        assert_eq!(
+            tuned["query"],
+            r#"SELECT TOP 10 c.id FROM c ORDER BY VectorDistance(c.embedding, @vector, false, {"searchListSizeMultiplier": 5, "quantizedVectorListMultiplier": 20})"#
+        );
     }
 
     #[test]

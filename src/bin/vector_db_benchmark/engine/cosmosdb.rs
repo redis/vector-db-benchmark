@@ -1,5 +1,6 @@
 //! Azure Cosmos DB for NoSQL adapter using the official Rust SDK.
 
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -36,6 +37,29 @@ struct Hit {
     id: String,
 }
 
+const SEARCH_LIST_SIZE: &str = "search_list_size_multiplier";
+const QUANTIZED_VECTOR_LIST: &str = "quantized_vector_list_multiplier";
+
+fn diskann_multiplier(
+    params: &SearchParams,
+    kind: &VectorIndexType,
+    key: &str,
+) -> Result<Option<NonZeroU32>, String> {
+    params
+        .knob(key)
+        .map(|value| {
+            if *kind != VectorIndexType::DiskANN {
+                return Err(format!("Cosmos DB {key} requires DiskANN"));
+            }
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .and_then(NonZeroU32::new)
+                .ok_or_else(|| format!("Cosmos DB {key} must be a positive 32-bit integer"))
+        })
+        .transpose()
+}
+
 pub struct CosmosDbEngine {
     name: String,
     database: String,
@@ -59,15 +83,27 @@ impl CosmosDbEngine {
             if let Some(top) = params.top {
                 validate_top(usize::try_from(top).map_err(|_| "Cosmos DB top must be positive")?)?;
             }
+            let unsupported =
+                |key: &String| !matches!(key.as_str(), SEARCH_LIST_SIZE | QUANTIZED_VECTOR_LIST);
             if params.calibration_param.is_some()
                 || params.num_candidates.is_some()
-                || params.extra.as_ref().is_some_and(|p| !p.is_empty())
+                || params
+                    .extra
+                    .as_ref()
+                    .is_some_and(|p| p.keys().any(unsupported))
                 || params.search_params.as_ref().is_some_and(|p| {
-                    p.ef.is_some() || p.extra.as_ref().is_some_and(|extra| !extra.is_empty())
+                    p.ef.is_some()
+                        || p.extra
+                            .as_ref()
+                            .is_some_and(|extra| extra.keys().any(unsupported))
                 })
             {
-                return Err("Cosmos DB does not support search tuning or calibration knobs".into());
+                return Err(
+                    "Cosmos DB supports only DiskANN search multipliers as tuning knobs".into(),
+                );
             }
+            diskann_multiplier(params, &kind, SEARCH_LIST_SIZE)?;
+            diskann_multiplier(params, &kind, QUANTIZED_VECTOR_LIST)?;
         }
         let collection = config.collection_params.as_ref();
         if collection.is_some_and(|p| {
@@ -395,6 +431,9 @@ impl Engine for CosmosDbEngine {
             Some(t) => usize::try_from(t).map_err(|_| "Cosmos DB top must be positive")?,
             None => neighbors[0].len(),
         };
+        let search_list_size = diskann_multiplier(params, &self.index_type, SEARCH_LIST_SIZE)?;
+        let quantized_vector_list =
+            diskann_multiplier(params, &self.index_type, QUANTIZED_VECTOR_LIST)?;
 
         let queries = vectors[..limit]
             .iter()
@@ -402,7 +441,7 @@ impl Engine for CosmosDbEngine {
                 if vector.len() != dataset.vector_size() as usize {
                     return Err("Cosmos DB query vector has the wrong number of dimensions".into());
                 }
-                knn_query(vector, top)
+                knn_query(vector, top, search_list_size, quantized_vector_list)
             })
             .collect::<Result<Vec<_>, String>>()?;
         let container = self
