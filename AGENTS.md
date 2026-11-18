@@ -2,10 +2,10 @@
 
 ## Project Overview
 
-Rust implementation of a vector database benchmarking tool. **15 engines**:
+Rust implementation of a vector database benchmarking tool. **16 engines**:
 Redis (RediSearch), VectorSets, Valkey, Dragonfly, KiviDB, Elasticsearch,
 OpenSearch, Qdrant, pgvector, Weaviate, Milvus, MongoDB, Chroma, Turbopuffer,
-Vertex AI.
+Vertex AI, Azure Cosmos DB for NoSQL.
 
 The thing this repo optimises for is **not being wrong**. Its dominant historical
 bug class is a run that completes, reports a plausible number, and measured
@@ -62,6 +62,7 @@ make integration-test-{valkey,dragonfly,kividb,chroma}
 make integration-test-{pgvector,qdrant,elasticsearch,opensearch}
 make integration-test-{weaviate,milvus,mongodb}
 make integration-test-vertex          # cloud-only, needs real GCP credentials
+make integration-test-cosmosdb        # cloud-only, needs a Cosmos DB account key
 make integration-test-no-docker
 ```
 
@@ -107,7 +108,7 @@ src/
   bin/
     vector_db_benchmark/
       main.rs cli.rs config.rs dataset.rs download.rs experiment.rs ground_truth.rs
-      engine/         # 15 engines + shared: mod.rs redis_utils.rs filter_guard.rs
+      engine/         # 16 engines + shared: mod.rs redis_utils.rs filter_guard.rs
                       #   index_naming.rs geo.rs
     generate_dataset.rs   # -> `generate-dataset`, writes the synthetic-* fixtures
     prepare_msmarco.rs    # -> `prepare-msmarco`, builds/verifies MS MARCO corpora
@@ -454,6 +455,7 @@ now covers more engines than `v0/` did; the table below is the mapping.
 | Dragonfly | — | `dragonfly` | `redis` 0.27 (RESP) |
 | KiviDB | — | `kividb` | `redis` 0.27 (RESP) |
 | Chroma | — | `chroma` | `reqwest` (REST v2) |
+| Azure Cosmos DB for NoSQL | — | `cosmosdb` | `azure_data_cosmos` 1.0 |
 | Vertex AI | — | `vertex` | `tonic`/`prost` (gRPC) + `reqwest` — cloud-only |
 
 \* Valkey GLIDE has no Rust crate ([valkey-io/valkey-glide#828](https://github.com/valkey-io/valkey-glide/issues/828), closed NOT_PLANNED). GLIDE maintainers recommend `redis-rs` for Rust.

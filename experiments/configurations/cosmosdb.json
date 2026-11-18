@@ -1,0 +1,22 @@
+[
+  {
+    "name": "cosmosdb-flat",
+    "engine": "cosmosdb",
+    "algorithm": "flat",
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 }
+    ]
+  }
+]

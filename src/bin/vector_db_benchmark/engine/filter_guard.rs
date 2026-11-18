@@ -1064,7 +1064,8 @@ fn every_engine_read_of_query_conditions_is_paired_with_a_resolver() {
         // and OpenSearch hybrid arms' `read_hybrid_query_set`; +2: the Redis
         // and OpenSearch hybrid-rrf arms' `read_queries`, each resolved with
         // `hybrid_rrf::refuse_conditions` (a declared condition is an error).
-        (28, 28),
+        // +2: Cosmos DB refuses declared filters before provisioning and search.
+        (30, 30),
         "the read/resolve census changed; confirm the new site is guarded"
     );
 }

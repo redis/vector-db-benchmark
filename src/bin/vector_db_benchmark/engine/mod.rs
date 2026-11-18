@@ -7,6 +7,7 @@
 //! - `Searcher` trait = BaseSearcher
 
 mod chroma;
+mod cosmosdb;
 mod dragonfly;
 mod elasticsearch;
 #[cfg(test)]
@@ -1173,7 +1174,11 @@ pub fn resolved_number_of_shards(
 }
 
 /// Create an engine based on config
-pub fn create_engine(engine_config: &EngineConfig, host: &str) -> Result<Box<dyn Engine>, String> {
+pub fn create_engine(
+    engine_config: &EngineConfig,
+    host: &str,
+    dataset: &str,
+) -> Result<Box<dyn Engine>, String> {
     let engine_type = engine_config.engine.as_deref().unwrap_or("unknown");
 
     // HNSW SQ8 keys are typed on the shared HnswConfig and read only by Redis;
@@ -1204,8 +1209,9 @@ pub fn create_engine(engine_config: &EngineConfig, host: &str) -> Result<Box<dyn
         "kividb" => Ok(Box::new(KividbEngine::new(engine_config, host)?)),
         "vertex" => Ok(Box::new(VertexEngine::new(engine_config, host)?)),
         "chroma" => Ok(Box::new(ChromaEngine::new(engine_config, host)?)),
+        "cosmosdb" => Ok(Box::new(cosmosdb::CosmosDbEngine::new(engine_config, dataset)?)),
         other => Err(format!(
-            "Unsupported engine type: '{}'. Supported: 'redis', 'vectorsets', 'elasticsearch', 'opensearch', 'qdrant', 'weaviate', 'pgvector', 'milvus', 'mongodb', 'valkey', 'turbopuffer', 'dragonfly', 'kividb', 'vertex', 'chroma'.",
+            "Unsupported engine type: '{}'. Supported: 'redis', 'vectorsets', 'elasticsearch', 'opensearch', 'qdrant', 'weaviate', 'pgvector', 'milvus', 'mongodb', 'valkey', 'turbopuffer', 'dragonfly', 'kividb', 'vertex', 'chroma', 'cosmosdb'.",
             other
         )),
     }
@@ -2281,7 +2287,7 @@ mod sq8_engine_guard_tests {
                 "collection_params": { "hnsw_config": hnsw }
             }))
             .unwrap();
-            match create_engine(&cfg, "localhost") {
+            match create_engine(&cfg, "localhost", "test") {
                 Ok(_) => panic!("{engine} accepted HNSW SQ8 keys it does not read"),
                 Err(e) => assert!(e.contains("read only by the redis engine"), "{engine}: {e}"),
             }

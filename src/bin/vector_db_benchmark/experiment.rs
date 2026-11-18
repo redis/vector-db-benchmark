@@ -173,6 +173,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         "kividb",
         "vertex",
         "chroma",
+        "cosmosdb",
     ];
     let mut engines: Vec<_> = engine_configs
         .iter()
@@ -748,7 +749,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             );
 
             // Create engine
-            let mut engine = create_engine(&engine_config, &args.host)?;
+            let mut engine = create_engine(&engine_config, &args.host, &dataset.config.name)?;
 
             // Shard count this run will be measured at, recorded in the result
             // files so it does not have to be inferred from the config name (#211).
@@ -1648,9 +1649,9 @@ fn run_single_experiment(
     } else {
         // `--skip-upload` means: the server already holds the corpus I want —
         // do not create, drop, recreate or otherwise modify it. `configure()` is
-        // destructive on 14 of the 15 engines (FT.DROPINDEX ... DD, SCAN+UNLINK,
+        // destructive on many engines (FT.DROPINDEX ... DD, SCAN+UNLINK,
         // collection.drop(), DROP TABLE, DELETE /collections/<n>, indices.delete,
-        // DEL <key> — only Vertex is not), so it must NOT run here under any flag
+        // DEL <key>), so it must NOT run here under any flag
         // combination.
         //
         // This used to have an `else if args.skip_vector_index` arm that called

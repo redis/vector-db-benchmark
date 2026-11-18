@@ -2136,6 +2136,7 @@ mod shipped_config_knob_guard {
         ("kividb", &["kividb.rs"]),
         ("vertex", &["vertex.rs", "vertex_grpc.rs"]),
         ("chroma", &["chroma.rs"]),
+        ("cosmosdb", &["cosmosdb.rs"]),
     ];
 
     /// Top-level `search_params[]` knobs consumed by the runner

@@ -167,6 +167,7 @@ host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 | **Vertex AI** (Vector Search) | `reqwest` (Vertex AI REST v1) | HTTP/REST (cloud) | L2, Cosine, Dot | Yes [\*\*\*\*](#vertex-note) |
 | **Chroma** | `reqwest` (Chroma v2 REST API) | HTTP/REST | L2, Cosine, IP | Yes [\*\*\*\*\*](#chroma-note) |
 | **KiviDB** | `redis` 1.8.1 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*\*\*\*](#kividb-note) |
+| **Azure Cosmos DB for NoSQL** | `azure_data_cosmos` 1.0 | Azure SDK (cloud) | L2, Cosine, Dot | No |
 
 <a id="valkey-client-note"></a>
 \* **Valkey client note:** Valkey GLIDE has no published Rust crate ([valkey-io/valkey-glide#828](https://github.com/valkey-io/valkey-glide/issues/828), closed NOT_PLANNED). The GLIDE maintainers recommend using `redis-rs` for Rust and upstream their improvements to it. The `redis` crate works with Valkey since it speaks the same RESP protocol.
@@ -182,6 +183,40 @@ host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 
 <a id="chroma-note"></a>
 \*\*\*\*\* **Chroma note:** Uses **Chroma** (OSS) via its **v2 REST API** — a collection of records (`ids` + `embeddings` + scalar `metadatas`) queried with `query` + a `where` document. **Metadata filters** map directly onto the canonical model: `match` → `$eq`, `match_any` → `$in`, `range` → `$gte`/`$gt`/`$lte`/`$lt`, and **AND / OR / nested boolean** to Chroma's native `$and` / `$or` (which nest arbitrarily). Supported datatypes: **keyword, int, float, bool, uuid, datetime** (stored as epoch-seconds int, like Milvus, so numeric range operators apply). **Full-text** (`{match:{text}}`) is supported via `where_document` `$contains` — the `text`-typed field's value is uploaded as each record's Chroma `document`. **NOT supported** by Chroma's metadata engine: **geo-radius** and multi-valued **`labels` arrays** (Chroma metadata values are scalar only). Geo is a *permanent* gap, not a to-do: Chroma's `where` is a closed enum of `field OP literal` comparisons with no geospatial operator, no attribute-vs-attribute comparison and no arithmetic, and a spherical cap is not an axis-aligned box in any query-independent coordinate system — so there is no exact encoding, and an inexact bounding box would under-constrain the query while looking filtered (#223). Since #219 these are a hard **error**, not a silent drop — and a condition tree containing a geo leaf is refused *whole*, so a `geo AND keyword` query cannot quietly run as keyword-only. See the note below. Runs over HTTP/REST via Docker; set the host port with `CHROMA_PORT` (default `8000`, test compose maps `8003`), and optionally `CHROMA_COLLECTION` / `CHROMA_TENANT` / `CHROMA_DATABASE`. Distance space (`l2`/`cosine`/`ip`) is set per collection from the dataset metric.
+
+### Azure Cosmos DB for NoSQL
+
+Enable **Vector Search for NoSQL API** on your Cosmos DB account. Set
+`AZURE_COSMOS_ENDPOINT` to the account URL and provide the account key through
+the `AZURE_COSMOS_KEY` environment variable.
+
+```bash
+export AZURE_COSMOS_DATABASE=vdb-benchmark
+export AZURE_COSMOS_RU_PER_SECOND=400
+vector-db-benchmark --engines cosmosdb-flat --datasets random-100 --skip-if-exists false
+make integration-test-cosmosdb
+```
+
+The benchmark creates the database if needed and provisions a dedicated
+container per config and dataset. It uses manual throughput of 400 RU/s by
+default. Set `AZURE_COSMOS_RU_PER_SECOND=serverless` for a serverless account,
+or set a higher manual throughput for a larger provisioned run. For a
+throughput sweep, give each engine config its own name and a
+`"collection_params": { "ru_per_second": 1000 }` override. Search and upload
+parallelism are independently configurable. Set
+`AZURE_COSMOS_REGION` to prefer an Azure region by name. The runner removes
+its container after a successful run unless you pass `--keep-data`. The
+database remains available for subsequent runs. Use `--skip-upload` to reuse
+an existing container. An upload refuses to overwrite it.
+
+The adapter benchmarks dense, unfiltered top-K queries across the whole
+container. It verifies the vector policy and corpus cardinality. The
+`cosmosdb-flat` configuration supports up to 505 dimensions. The
+`cosmosdb-diskann` configuration supports up to 4,096 dimensions and requires
+at least 1,000 vectors. Cosmos DB can scan while an index builds or while a
+physical partition has too few vectors. Results report the realized index
+policy and explicitly mark index usage as unverified. See
+[Azure Cosmos DB vector indexing](https://learn.microsoft.com/azure/cosmos-db/nosql/vector-search).
 
 <a id="unexpressible-filter-note"></a>
 ### Filters an engine cannot express are a hard error (#219)
@@ -1298,12 +1333,11 @@ vector-db-benchmark compare-results dumps/opensearch-hrrf dumps/redis-hrrf --ref
 `--skip-upload` asserts *"the server already holds the corpus I want"*. Three
 rules follow, and all three are enforced:
 
-1. **The configure phase never runs.** `configure()` is destructive on **14 of the
-   15 engines** — `FT.DROPINDEX … DD` (Redis), `FT.DROPINDEX` + `SCAN`/`UNLINK`
+1. **The configure phase never runs.** `configure()` is destructive on many engines — `FT.DROPINDEX … DD` (Redis), `FT.DROPINDEX` + `SCAN`/`UNLINK`
    (Valkey / Dragonfly / KiviDB), `collection.drop()` (MongoDB), `DROP TABLE`
    (pgvector), `DELETE /collections/<n>` (Qdrant / Chroma / Weaviate / Milvus /
    Turbopuffer), `indices.delete` (Elasticsearch / OpenSearch), `DEL <key>`
-   (VectorSets). Only Vertex is non-destructive. Until #238 the
+   (VectorSets). Vertex and Cosmos DB preserve existing data during configuration. Until #238 the
    `--skip-upload --skip-vector-index` combination still called it: the flags that
    mean *"do not upload, do not build an index, just use what is there"* deleted
    the corpus and then benchmarked the empty index — printing a QPS number and

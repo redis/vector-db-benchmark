@@ -323,6 +323,11 @@ integration-test-vertex:
 	@echo "=== Vertex AI integration tests (cloud-only, needs GCP credentials) ==="
 	cargo test --test integration_vertex --release -- --test-threads=1
 
+.PHONY: integration-test-cosmosdb
+integration-test-cosmosdb:
+	@echo "=== Azure Cosmos DB for NoSQL integration tests (cloud-only) ==="
+	cargo test --test integration_cosmosdb --release -- --nocapture --test-threads=1
+
 .PHONY: integration-test-no-docker
 integration-test-no-docker:
 	@echo "=== Running integration tests (assumes redis on port 6399) ==="
@@ -572,6 +577,7 @@ help:
 	@echo "  make integration-test-kividb          - KiviDB 1.1.2"
 	@echo "  make integration-test-chroma          - Chroma"
 	@echo "  make integration-test-vertex          - Vertex AI (cloud-only, needs GCP creds)"
+	@echo "  make integration-test-cosmosdb        - Azure Cosmos DB for NoSQL (cloud-only)"
 	@echo ""
 	@echo "  Docker:"
 	@echo "  make docker-build                - Build Docker image (IMAGE_TAG=latest)"

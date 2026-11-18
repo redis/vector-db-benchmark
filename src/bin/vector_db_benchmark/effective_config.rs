@@ -108,6 +108,7 @@ const SECRET_MARKERS: &[&str] = &[
     // and this one did not.
     "PWD",
     "API_KEY",
+    "AZURE_COSMOS_KEY",
     "APIKEY",
     "ACCESS_KEY",
     "PRIVATE_KEY",
@@ -208,6 +209,7 @@ const DECLARED_KEY_ALLOWLIST: &[&str] = &[
     "default_segment_number",
     // upload
     "parallel",
+    "ru_per_second",
     "batch_size",
     "timeout",
     // a single-letter key that a shipped config genuinely uses

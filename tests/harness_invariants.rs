@@ -755,6 +755,7 @@ fn inv_p7_the_scanned_test_target_set_is_pinned() {
         "harness_invariants.rs",
         "integration_chroma.rs",
         "integration_cli.rs",
+        "integration_cosmosdb.rs",
         "integration_dragonfly.rs",
         "integration_elasticsearch.rs",
         "integration_kividb.rs",
