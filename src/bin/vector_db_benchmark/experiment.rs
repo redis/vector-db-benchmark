@@ -1649,7 +1649,7 @@ fn run_single_experiment(
     } else {
         // `--skip-upload` means: the server already holds the corpus I want —
         // do not create, drop, recreate or otherwise modify it. `configure()` is
-        // destructive on many engines (FT.DROPINDEX ... DD, SCAN+UNLINK,
+        // destructive on 14 of the 16 engines (FT.DROPINDEX ... DD, SCAN+UNLINK,
         // collection.drop(), DROP TABLE, DELETE /collections/<n>, indices.delete,
         // DEL <key>), so it must NOT run here under any flag
         // combination.
@@ -3109,6 +3109,9 @@ fn build_search_result_json(
     result["results"]["p90_time"] = json!(results.p90_time);
     result["results"]["schedule_delay_p90_time"] = json!(results.schedule_delay_p90_time);
     result["results"]["end_to_end_p90_time"] = json!(results.end_to_end_p90_time);
+    if let Some(diagnostics) = results.cosmosdb_search_diagnostics {
+        result["results"]["cosmosdb_search_diagnostics"] = json!(diagnostics);
+    }
 
     let gt_stats = ground_truth.and_then(|gt| gt.stats(results.top));
     result["metrics_schema"] = metrics_schema(gt_stats.as_ref());

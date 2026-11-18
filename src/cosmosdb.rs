@@ -6,6 +6,7 @@ use azure_data_cosmos::models::{
 };
 use azure_data_cosmos::Query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const VECTOR_PATH: &str = "/embedding";
@@ -128,6 +129,58 @@ pub fn validate_top(top: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Reject an SDK response that exceeds the global TOP K across all its pages.
+pub fn validate_hit_count(hits: usize, top: usize) -> Result<(), String> {
+    if hits > top {
+        return Err(format!(
+            "Cosmos DB returned {hits} hits for global TOP {top}"
+        ));
+    }
+    Ok(())
+}
+
+/// SDK diagnostics accumulated over the pages of measured queries.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct SearchDiagnostics {
+    pub request_charge_ru: f64,
+    pub request_attempts: usize,
+    pub http_429_attempts: usize,
+    pub attempts_without_status: usize,
+    pub queries_without_request_diagnostics: usize,
+}
+
+impl SearchDiagnostics {
+    /// Use the exact SDK totals and count HTTP statuses from either individual
+    /// attempts or their compacted rollup. Omitted statuses remain unknown.
+    pub fn observe_page(
+        &mut self,
+        request_charge_ru: f64,
+        request_attempts: usize,
+        attempt_statuses: impl IntoIterator<Item = (u16, usize)>,
+    ) {
+        self.request_charge_ru += request_charge_ru;
+        self.request_attempts += request_attempts;
+        let mut classified = 0;
+        for (status, count) in attempt_statuses {
+            if (100..600).contains(&status) {
+                classified += count;
+            }
+            if status == 429 {
+                self.http_429_attempts += count;
+            }
+        }
+        self.attempts_without_status += request_attempts.saturating_sub(classified);
+    }
+
+    pub fn add_query(&mut self, query: Self) {
+        self.request_charge_ru += query.request_charge_ru;
+        self.request_attempts += query.request_attempts;
+        self.http_429_attempts += query.http_429_attempts;
+        self.attempts_without_status += query.attempts_without_status;
+        self.queries_without_request_diagnostics += usize::from(query.request_attempts == 0);
+    }
+}
+
 /// Fail on corpora too small to qualify for the service's DiskANN threshold.
 pub fn validate_corpus_size(kind: &VectorIndexType, count: u64) -> Result<(), String> {
     if *kind == VectorIndexType::DiskANN && count < 1000 {
@@ -209,5 +262,32 @@ mod tests {
         assert!(validate_corpus_size(&VectorIndexType::DiskANN, 999).is_err());
         assert!(validate_corpus_size(&VectorIndexType::DiskANN, 1000).is_ok());
         assert!(validate_corpus_size(&VectorIndexType::Flat, 999).is_ok());
+    }
+
+    #[test]
+    fn hit_count_rejects_concatenated_partition_top_k_lists() {
+        assert!(validate_hit_count(2, 3).is_ok());
+        assert!(validate_hit_count(3, 3).is_ok());
+        assert!(validate_hit_count(6, 3).is_err());
+    }
+
+    #[test]
+    fn search_diagnostics_sum_pages_retries_and_missing_statuses() {
+        let mut query = SearchDiagnostics::default();
+        query.observe_page(4.5, 5, [(429, 3), (200, 1)]);
+        query.observe_page(2.0, 1, [(200, 1)]);
+        let mut run = SearchDiagnostics::default();
+        run.add_query(query);
+        run.add_query(SearchDiagnostics::default());
+        assert_eq!(
+            to_value(run).unwrap(),
+            json!({
+                "request_charge_ru": 6.5,
+                "request_attempts": 6,
+                "http_429_attempts": 3,
+                "attempts_without_status": 1,
+                "queries_without_request_diagnostics": 1,
+            })
+        );
     }
 }

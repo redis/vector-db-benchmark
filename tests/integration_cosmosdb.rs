@@ -62,6 +62,13 @@ fn flat_search_matches_the_fixture_and_cleans_up_the_container() {
     println!("Cosmos DB Flat random-100 recall@1: {recall}");
     assert_eq!(recall, 1.0);
     assert_eq!(uploaded["results"]["failed_queries"], 0);
+    let diagnostics = &uploaded["results"]["cosmosdb_search_diagnostics"];
+    assert!(diagnostics["request_charge_ru"].as_f64().unwrap() > 0.0);
+    assert!(
+        diagnostics["request_attempts"].as_u64().unwrap()
+            >= uploaded["results"]["succeeded_queries"].as_u64().unwrap()
+    );
+    assert_eq!(diagnostics["queries_without_request_diagnostics"], 0);
     let metadata = &uploaded["server_metadata"]["after"]["cosmosdb"];
     assert_eq!(
         metadata["vector_indexing_policy"]["vectorIndexes"][0]["type"],

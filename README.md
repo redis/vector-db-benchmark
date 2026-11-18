@@ -203,11 +203,22 @@ default. Set `AZURE_COSMOS_RU_PER_SECOND=serverless` for a serverless account,
 or set a higher manual throughput for a larger provisioned run. For a
 throughput sweep, give each engine config its own name and a
 `"collection_params": { "ru_per_second": 1000 }` override. Search and upload
-parallelism are independently configurable. Set
+parallelism are independently configurable. The 400 RU/s default is suitable
+for smoke tests. If the SDK exhausts its HTTP 429 retry budget during upload,
+reduce `upload_params.parallel` or set the SDK's
+`AZURE_COSMOS_MAX_THROTTLE_RETRY_COUNT` for the upload run. Set
 `AZURE_COSMOS_REGION` to prefer an Azure region by name. The runner removes
 its container after a successful run unless you pass `--keep-data`. The
 database remains available for subsequent runs. Use `--skip-upload` to reuse
-an existing container. An upload refuses to overwrite it.
+an existing container with a complete corpus. A failed run can leave a
+provisioned container that continues billing until you remove it.
+
+Each Cosmos search result carries `results.cosmosdb_search_diagnostics` with
+the SDK's request charge, request attempt count, and observed HTTP 429 count
+for measured query pages. Warm-ups and verification queries are outside this
+scope. SDK backoff and retries are part of the measured search latency.
+Check `attempts_without_status` and `queries_without_request_diagnostics`
+when interpreting the 429 count.
 
 The adapter benchmarks dense, unfiltered top-K queries across the whole
 container. It verifies the vector policy and corpus cardinality. The
@@ -1333,7 +1344,7 @@ vector-db-benchmark compare-results dumps/opensearch-hrrf dumps/redis-hrrf --ref
 `--skip-upload` asserts *"the server already holds the corpus I want"*. Three
 rules follow, and all three are enforced:
 
-1. **The configure phase never runs.** `configure()` is destructive on many engines — `FT.DROPINDEX … DD` (Redis), `FT.DROPINDEX` + `SCAN`/`UNLINK`
+1. **The configure phase never runs.** `configure()` is destructive on 14 of the 16 engines — `FT.DROPINDEX … DD` (Redis), `FT.DROPINDEX` + `SCAN`/`UNLINK`
    (Valkey / Dragonfly / KiviDB), `collection.drop()` (MongoDB), `DROP TABLE`
    (pgvector), `DELETE /collections/<n>` (Qdrant / Chroma / Weaviate / Milvus /
    Turbopuffer), `indices.delete` (Elasticsearch / OpenSearch), `DEL <key>`

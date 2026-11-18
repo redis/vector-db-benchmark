@@ -115,6 +115,8 @@ pub struct UpdateSearchRatio {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct SearchResults {
+    /// Charges and HTTP attempts reported by the Cosmos SDK for this search.
+    pub cosmosdb_search_diagnostics: Option<vector_db_benchmark::cosmosdb::SearchDiagnostics>,
     /// Metadata-only result contract and count checksums; absent on KNN runs.
     pub filter_only: Option<vector_db_benchmark::filter_only::Stats>,
     pub total_time: f64,

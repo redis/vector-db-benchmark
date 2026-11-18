@@ -2374,12 +2374,19 @@ mod tests {
             ("REDIS_AUTH", "s3cret"),
             ("VERTEX_ACCESS_TOKEN", "ya29.xyz"),
             ("MONGODB_PASSWORD", "pw"),
+            ("AZURE_COSMOS_KEY", "synthetic-cosmos-key"),
         ] {
             r.observe_env(name, Some(raw));
         }
         let s = r.snapshot();
         let serialized = serde_json::to_string(&s).unwrap();
-        for leak in ["hunter2", "sk-abc", "s3cret", "ya29.xyz"] {
+        for leak in [
+            "hunter2",
+            "sk-abc",
+            "s3cret",
+            "ya29.xyz",
+            "synthetic-cosmos-key",
+        ] {
             assert!(
                 !serialized.contains(leak),
                 "{leak} leaked into the artifact"
@@ -2387,6 +2394,7 @@ mod tests {
         }
         // …but the fact that authentication was configured survives.
         assert_eq!(s["env"]["ELASTIC_PASSWORD"], REDACTED);
+        assert_eq!(s["env"]["AZURE_COSMOS_KEY"], REDACTED);
     }
 
     #[test]

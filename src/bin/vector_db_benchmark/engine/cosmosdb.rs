@@ -15,8 +15,8 @@ use azure_data_cosmos::{
 use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use vector_db_benchmark::cosmosdb::{
-    container_name, container_policy, index_type, knn_query, validate_corpus_size, validate_top,
-    verify_policy,
+    container_name, container_policy, index_type, knn_query, validate_corpus_size,
+    validate_hit_count, validate_top, verify_policy, SearchDiagnostics,
 };
 use vector_db_benchmark::start_gate::WorkerPool;
 use vector_db_benchmark::workload::IndexLayout;
@@ -124,6 +124,8 @@ impl CosmosDbEngine {
             .into_iter()
             .map(Into::into)
             .collect();
+        // The SDK consumes this environment setting when the runtime starts.
+        let _ = crate::effective_config::env_opt("AZURE_COSMOS_MAX_THROTTLE_RETRY_COUNT");
         let throughput = if let Some(ru) = configured_ru {
             Some(ru)
         } else {
@@ -244,7 +246,7 @@ impl Engine for CosmosDbEngine {
             match database.create_container(policy, options).await {
                 Ok(_) => Ok(()),
                 Err(e) if u16::from(e.status().status_code()) == 409 => Err(format!(
-                    "Cosmos DB container '{}' already exists. Use --skip-upload to reuse it, or remove it explicitly before uploading.",
+                    "Cosmos DB container '{}' already exists. An earlier failed run may have left it provisioned. Use --skip-upload for a complete corpus, or remove the container explicitly before uploading.",
                     self.container_name
                 )),
                 Err(e) => Err(format!("Could not create Cosmos DB container: {e}")),
@@ -418,7 +420,8 @@ impl Engine for CosmosDbEngine {
                 pool.spawn(move |ticket| {
                     let mut samples = Vec::new();
                     // Warm the worker's first request outside the measured window.
-                    if let Err(error) = rt.block_on(query_hits(container, &queries[worker % limit]))
+                    if let Err(error) =
+                        rt.block_on(query_hits(container, &queries[worker % limit], top))
                     {
                         ticket.fail(format!("Cosmos DB worker {worker} warm-up failed: {error}"));
                         return Ok(samples);
@@ -430,8 +433,8 @@ impl Engine for CosmosDbEngine {
                         let idx = next.fetch_add(1, Ordering::Relaxed);
                         let Some(query) = queries.get(idx) else { break };
                         let started = Instant::now();
-                        let hits = rt
-                            .block_on(query_hits(container, query))
+                        let (hits, diagnostics) = rt
+                            .block_on(query_hits(container, query, top))
                             .map_err(|e| format!("Cosmos DB query {idx} failed: {e}"))?;
                         let latency = started.elapsed().as_secs_f64();
                         let ids = hits
@@ -446,7 +449,7 @@ impl Engine for CosmosDbEngine {
                             &neighbors[idx],
                             top,
                         );
-                        samples.push((latency, metrics));
+                        samples.push((latency, metrics, diagnostics));
                     }
                     Ok::<_, String>(samples)
                 })?;
@@ -456,18 +459,28 @@ impl Engine for CosmosDbEngine {
         })?;
         let (mut times, mut precision, mut recall, mut mrr, mut ndcg) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut diagnostics = SearchDiagnostics::default();
         for batch in samples {
-            for (latency, m) in batch? {
+            for (latency, m, query_diagnostics) in batch? {
                 times.push(latency);
                 precision.push(m.precision);
                 recall.push(m.recall);
                 mrr.push(m.mrr);
                 ndcg.push(m.ndcg);
+                diagnostics.add_query(query_diagnostics);
             }
         }
-        compute_search_stats(
+        if diagnostics.http_429_attempts > 0 {
+            eprintln!(
+                "Cosmos DB search at parallel={parallel} observed {} HTTP 429 responses. Latency includes SDK backoff and retries.",
+                diagnostics.http_429_attempts
+            );
+        }
+        let mut results = compute_search_stats(
             &times, &precision, &recall, &mrr, &ndcg, elapsed, top, parallel, limit,
-        )
+        )?;
+        results.cosmosdb_search_diagnostics = Some(diagnostics);
+        Ok(results)
     }
 
     fn server_metadata(&mut self) -> Option<serde_json::Value> {
@@ -504,12 +517,44 @@ impl Engine for CosmosDbEngine {
 async fn query_hits(
     container: &ContainerClient,
     query: &Query,
-) -> azure_data_cosmos::Result<Vec<Hit>> {
-    container
+    top: usize,
+) -> Result<(Vec<Hit>, SearchDiagnostics), String> {
+    let mut pages = container
         .query_items::<Hit>(query.clone(), FeedScope::full_container(), None)
-        .await?
-        .try_collect()
         .await
+        .map_err(|error| error.to_string())?
+        .into_pages();
+    let mut hits = Vec::new();
+    let mut combined = SearchDiagnostics::default();
+    // The SDK merges ORDER BY across partitions. Check the resulting global
+    // limit anyway, including pages where the server sends no hits.
+    while let Some(page) = pages.try_next().await.map_err(|error| error.to_string())? {
+        validate_hit_count(hits.len() + page.items().len(), top)?;
+        let diagnostics = page.diagnostics();
+        let charge = diagnostics.total_request_charge().value();
+        let attempts = diagnostics.request_count();
+        if let Some(compacted) = diagnostics.compaction() {
+            combined.observe_page(
+                charge,
+                attempts,
+                compacted
+                    .runs
+                    .iter()
+                    .map(|run| (u16::from(run.status.status_code()), run.count)),
+            );
+        } else {
+            combined.observe_page(
+                charge,
+                attempts,
+                diagnostics
+                    .requests()
+                    .iter()
+                    .map(|request| (u16::from(request.status().status_code()), 1)),
+            );
+        }
+        hits.extend(page.into_items());
+    }
+    Ok((hits, combined))
 }
 
 fn refuse_filter(_: &serde_json::Value) -> Result<Option<()>, String> {
