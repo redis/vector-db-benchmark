@@ -498,8 +498,9 @@ impl Engine for CosmosDbEngine {
                 feed_ranges: ranges.len(),
                 per_query_concurrency,
                 shared_request_limit,
+                preflight_retries: 0,
             };
-            let search = PartitionSearch {
+            let mut search = PartitionSearch {
                 ranges,
                 summary,
                 metric: vector_distance_function(dataset.distance())?,
@@ -507,13 +508,15 @@ impl Engine for CosmosDbEngine {
             };
             for index in (0..limit).step_by((limit / 3).max(1)).take(3) {
                 let stock_query = knn_query(&vectors[index], top, search_list_size, quantized_vector_list, false)?;
-                let (stock, _) = rt.block_on(query_hits(container, &stock_query, top, FeedScope::full_container()))?;
-                let (partitioned, _) = rt.block_on(search_hits(container, &queries[index], top, Some(&search)))?;
-                verify_partition_search(&stock, &partitioned).map_err(|e| format!("Cosmos DB parity check for query {index}: {e}"))?;
+                let retries = rt
+                    .block_on(check_partition_parity(container, &stock_query, &queries[index], top, &search))
+                    .map_err(|e| format!("Cosmos DB parity check for query {index}: {e}"))?;
+                search.summary.preflight_retries += retries;
             }
             println!(
-                "Cosmos DB feed-range search verified against SDK on sampled queries: {} ranges, {} per query, {} in flight",
-                summary.feed_ranges, summary.per_query_concurrency, summary.shared_request_limit
+                "Cosmos DB feed-range search verified against SDK on sampled queries: {} ranges, {} per query, {} in flight, {} parity retries",
+                summary.feed_ranges, summary.per_query_concurrency, summary.shared_request_limit,
+                search.summary.preflight_retries
             );
             Ok::<_, String>(search)
         }).transpose()?;
@@ -636,6 +639,30 @@ struct PartitionSearch {
     summary: PartitionFanout,
     metric: VectorDistanceFunction,
     permits: Semaphore,
+}
+
+async fn check_partition_parity(
+    container: &ContainerClient,
+    stock_query: &Query,
+    partition_query: &Query,
+    top: usize,
+    search: &PartitionSearch,
+) -> Result<usize, String> {
+    // DiskANN can return different neighbors at the cutoff for repeated
+    // requests, including two stock requests. Retry the sampled pair while
+    // still requiring exact ID agreement before any timing.
+    const MAX_RETRIES: usize = 3;
+    let mut retries = 0;
+    loop {
+        let (stock, _) =
+            query_hits(container, stock_query, top, FeedScope::full_container()).await?;
+        let (partitioned, _) = search_hits(container, partition_query, top, Some(search)).await?;
+        let verdict = verify_partition_search(&stock, &partitioned);
+        if verdict.is_ok() || retries == MAX_RETRIES {
+            return verdict.map(|()| retries);
+        }
+        retries += 1;
+    }
 }
 
 async fn read_search_ranges(container: &ContainerClient) -> Result<Vec<FeedRange>, String> {

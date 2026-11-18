@@ -238,9 +238,11 @@ before timing. `"auto"` uses their count as the per-query concurrency, and
 a positive integer caps it at that value. Across all workers, the maximum
 number of in-flight range queries is the greater of the worker count and the
 effective per-query concurrency. Before timing, the adapter compares sampled
-result IDs with the SDK's full-container query. It aborts if the results
-disagree or the feed ranges change during search. Fan-out results record the
-effective limits alongside RU charge and HTTP attempts for all ranges.
+result IDs with the SDK's full-container query. If a sampled pair differs, it
+can retry the pair up to three times to account for DiskANN result variability.
+Persistent mismatches or a feed-range change invalidate the repetition.
+Fan-out results record the preflight retry count and effective limits
+alongside RU charge and HTTP attempts for all ranges.
 
 For DiskANN, each search entry can set positive integer
 `search_params.search_list_size_multiplier` and

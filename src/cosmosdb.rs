@@ -226,6 +226,7 @@ pub struct PartitionFanout {
     pub feed_ranges: usize,
     pub per_query_concurrency: usize,
     pub shared_request_limit: usize,
+    pub preflight_retries: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
