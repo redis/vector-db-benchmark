@@ -6,12 +6,16 @@ use azure_data_cosmos::models::{
 };
 use azure_data_cosmos::Query;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::future::Future;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 const VECTOR_PATH: &str = "/embedding";
 const VECTOR_EXCLUSION: &str = "/embedding/*";
@@ -508,6 +512,202 @@ pub fn index_probe_deadline(value: Option<&str>) -> Result<Option<Duration>, Str
     Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
+/// Pause between index-use polls: a tenth of the time already waited, within
+/// 2 to 30 seconds. The recorded index wait is then at most about a tenth
+/// too long, and a long build is not polled with a scan every few seconds.
+pub fn index_probe_interval(waited: Duration) -> Duration {
+    (waited / 10).clamp(Duration::from_secs(2), Duration::from_secs(30))
+}
+
+/// The charges of the feed ranges that are not served by the index yet.
+pub fn describe_waiting(probes: &[IndexProbe]) -> String {
+    const SHOWN: usize = 8;
+    let waiting: Vec<_> = probes.iter().filter(|p| !p.index_in_use()).collect();
+    let mut text = waiting
+        .iter()
+        .take(SHOWN)
+        .map(|p| {
+            format!(
+                "range {}: index query {:.2} RU, forced scan {:.2} RU",
+                p.feed_range, p.index_ru, p.scan_ru
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if waiting.len() > SHOWN {
+        text.push_str(&format!("; and {} more", waiting.len() - SHOWN));
+    }
+    text
+}
+
+/// Which of the two probe queries to run on a feed range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeQuery {
+    ForcedScan,
+    IndexRequested,
+}
+
+/// Wait until every feed range answers the index-requested query for clearly
+/// less than its forced scan. `charges` returns (range index, RU) for the
+/// listed ranges. The forced scan runs once per range, and only ranges still
+/// waiting are queried again. `waited` and `pause` are the clock.
+pub fn await_index_use(
+    feed_ranges: usize,
+    deadline: Duration,
+    mut charges: impl FnMut(ProbeQuery, &[usize]) -> Result<Vec<(usize, f64)>, String>,
+    waited: impl Fn() -> Duration,
+    mut pause: impl FnMut(Duration),
+) -> Result<Vec<IndexProbe>, String> {
+    let mut probes: Vec<IndexProbe> = (0..feed_ranges)
+        .map(|feed_range| IndexProbe {
+            feed_range,
+            scan_ru: f64::NAN,
+            index_ru: f64::NAN,
+        })
+        .collect();
+    let mut pending: Vec<usize> = (0..feed_ranges).collect();
+    let mut query = ProbeQuery::ForcedScan;
+    loop {
+        let answers = charges(query, &pending)?;
+        let mut answered: Vec<usize> = answers.iter().map(|(range, _)| *range).collect();
+        answered.sort_unstable();
+        if answered != pending {
+            return Err(format!(
+                "Cosmos DB index-use probe asked feed ranges {pending:?} and got answers for {answered:?}"
+            ));
+        }
+        for (feed_range, ru) in answers {
+            match query {
+                ProbeQuery::ForcedScan => probes[feed_range].scan_ru = ru,
+                ProbeQuery::IndexRequested => probes[feed_range].index_ru = ru,
+            }
+        }
+        if query == ProbeQuery::ForcedScan {
+            query = ProbeQuery::IndexRequested;
+            continue;
+        }
+        pending.retain(|&feed_range| !probes[feed_range].index_in_use());
+        if pending.is_empty() {
+            return Ok(probes);
+        }
+        let Some(remaining) = deadline
+            .checked_sub(waited())
+            .filter(|left| !left.is_zero())
+        else {
+            return Err(format!(
+                "Cosmos DB DiskANN index is not serving {} of {feed_ranges} feed ranges after {}s. An index-requested query still costs as much as a forced scan ({}). The index may still be building, or a range may hold too few vectors. Raise AZURE_COSMOS_INDEX_PROBE_SECONDS, or set it to 0 to run unverified.",
+                pending.len(),
+                deadline.as_secs(),
+                describe_waiting(&probes)
+            ));
+        };
+        println!(
+            "Waiting for the Cosmos DB DiskANN index on {} of {feed_ranges} feed ranges after {:.0}s ({})",
+            pending.len(),
+            waited().as_secs_f64(),
+            describe_waiting(&probes)
+        );
+        pause(index_probe_interval(waited()).min(remaining));
+    }
+}
+
+/// Delay before retrying an upload write that Azure throttled, or `None`
+/// once the budget is spent. The SDK retries a 429 a few times on its own.
+/// This budget sits on top of that, so a corpus larger than a smoke test
+/// still uploads at a throughput below what the writers ask for.
+pub fn upload_throttle_backoff(retry: u32) -> Option<Duration> {
+    const RETRIES: u32 = 60;
+    (retry < RETRIES)
+        .then(|| Duration::from_millis(250 << retry.min(5)).min(Duration::from_secs(5)))
+}
+
+/// Run `write` until it succeeds, fails for a reason other than throttling,
+/// or exhausts [`upload_throttle_backoff`]. Every retry is counted.
+pub async fn retry_throttled<T, E, Write, Sleep>(
+    mut write: impl FnMut() -> Write,
+    throttled: impl Fn(&E) -> bool,
+    sleep: impl Fn(Duration) -> Sleep,
+    retries: &AtomicUsize,
+) -> Result<T, E>
+where
+    Write: Future<Output = Result<T, E>>,
+    Sleep: Future<Output = ()>,
+{
+    let mut retry = 0;
+    loop {
+        match write().await {
+            Err(error) if throttled(&error) => {
+                let Some(delay) = upload_throttle_backoff(retry) else {
+                    return Err(error);
+                };
+                retries.fetch_add(1, Ordering::Relaxed);
+                retry += 1;
+                sleep(delay).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Sum a per-range count over disjoint feed ranges, `concurrency` at a time.
+/// A split during the count could count a row twice or not at all, so the
+/// ranges are read again afterwards and must be unchanged.
+pub async fn count_stable_ranges<R, Ranges, Count>(
+    read_ranges: impl Fn() -> Ranges,
+    concurrency: usize,
+    count: impl Fn(R) -> Count,
+) -> Result<u64, String>
+where
+    R: Clone + PartialEq,
+    Ranges: Future<Output = Result<Vec<R>, String>>,
+    Count: Future<Output = Result<u64, String>>,
+{
+    let ranges = read_ranges().await?;
+    let total = stream::iter(ranges.iter().cloned())
+        .map(&count)
+        .buffer_unordered(concurrency.max(1))
+        .try_fold(0_u64, |total, rows| async move { Ok(total + rows) })
+        .await?;
+    if read_ranges().await? != ranges {
+        return Err("Cosmos DB feed ranges changed during the row count".into());
+    }
+    Ok(total)
+}
+
+/// Query every feed range, at most `per_query` at a time for this query and
+/// one `permits` permit per request across all queries, then select the
+/// global top K and add up the diagnostics.
+pub async fn fan_out_hits<R, Hits>(
+    ranges: &[R],
+    per_query: usize,
+    permits: &Semaphore,
+    top: usize,
+    metric: &VectorDistanceFunction,
+    query: impl Fn(R) -> Hits,
+) -> Result<(Vec<QueryHit>, SearchDiagnostics), String>
+where
+    R: Clone,
+    Hits: Future<Output = Result<(Vec<QueryHit>, SearchDiagnostics), String>>,
+{
+    let query = &query;
+    let (hits, diagnostics) = stream::iter(ranges.iter().cloned())
+        .map(|range| async move {
+            let _permit = permits.acquire().await.map_err(|e| e.to_string())?;
+            query(range).await
+        })
+        .buffer_unordered(per_query.max(1))
+        .try_fold(
+            (Vec::new(), SearchDiagnostics::default()),
+            |(mut hits, mut diagnostics), (range_hits, range_diagnostics)| async move {
+                hits.extend(range_hits);
+                diagnostics.add_query(range_diagnostics);
+                Ok((hits, diagnostics))
+            },
+        )
+        .await?;
+    Ok((merge_partition_hits(hits, top, metric)?, diagnostics))
+}
+
 #[derive(Deserialize)]
 pub struct QueryHit {
     pub id: String,
@@ -614,6 +814,43 @@ impl ParityTally {
         }
         Ok(())
     }
+}
+
+/// Query indices spread evenly over the first `limit` queries, at most `samples`.
+pub fn parity_sample_indices(limit: usize, samples: usize) -> Vec<usize> {
+    (0..limit)
+        .step_by((limit / samples.max(1)).max(1))
+        .take(samples)
+        .collect()
+}
+
+/// Run `sample` for each query index, `concurrency` at a time. It returns the
+/// two stock responses and the fan-out response. The tally of all samples
+/// must then pass [`ParityTally::verdict`].
+pub async fn sample_parity<Sample>(
+    indices: Vec<usize>,
+    concurrency: usize,
+    sample: impl Fn(usize) -> Sample,
+) -> Result<ParityTally, String>
+where
+    Sample: Future<Output = Result<[Vec<QueryHit>; 3], String>>,
+{
+    let sample = &sample;
+    let outcomes: Vec<_> = stream::iter(indices)
+        .map(|index| async move {
+            sample(index)
+                .await
+                .map_err(|e| format!("Cosmos DB parity check for query {index}: {e}"))
+        })
+        .buffer_unordered(concurrency.max(1))
+        .try_collect()
+        .await?;
+    let mut tally = ParityTally::default();
+    for [stock, stock_repeat, partitioned] in &outcomes {
+        tally.observe(stock, stock_repeat, partitioned)?;
+    }
+    tally.verdict()?;
+    Ok(tally)
 }
 
 #[cfg(test)]
@@ -1032,6 +1269,294 @@ mod tests {
                 "attempts_without_status": 1,
                 "queries_without_request_diagnostics": 1,
             })
+        );
+    }
+
+    /// A clock that only `pause` advances, plus a record of every probe call.
+    struct ProbeRun {
+        clock: std::cell::Cell<Duration>,
+        calls: std::cell::RefCell<Vec<(ProbeQuery, Vec<usize>)>>,
+        pauses: std::cell::RefCell<Vec<Duration>>,
+    }
+
+    /// Each range's index starts serving once the clock reaches `ready_at`.
+    fn run_probe(ready_at: &[u64], deadline: u64) -> (Result<Vec<IndexProbe>, String>, ProbeRun) {
+        let run = ProbeRun {
+            clock: Default::default(),
+            calls: Default::default(),
+            pauses: Default::default(),
+        };
+        let result = await_index_use(
+            ready_at.len(),
+            Duration::from_secs(deadline),
+            |query, ranges| {
+                run.calls.borrow_mut().push((query, ranges.to_vec()));
+                Ok(ranges
+                    .iter()
+                    .map(|&range| {
+                        let ready = run.clock.get() >= Duration::from_secs(ready_at[range]);
+                        let served = query == ProbeQuery::IndexRequested && ready;
+                        (range, if served { 6.0 } else { 300.0 })
+                    })
+                    .collect())
+            },
+            || run.clock.get(),
+            |pause| {
+                run.pauses.borrow_mut().push(pause);
+                run.clock.set(run.clock.get() + pause);
+            },
+        );
+        (result, run)
+    }
+
+    #[test]
+    fn index_wait_scans_once_and_polls_only_the_ranges_still_waiting() {
+        let (probes, run) = run_probe(&[0, 3, 0], 600);
+        let probes = probes.unwrap();
+        assert!(probes.iter().all(IndexProbe::index_in_use));
+        assert_eq!(
+            probes[1],
+            IndexProbe {
+                feed_range: 1,
+                scan_ru: 300.0,
+                index_ru: 6.0
+            }
+        );
+        let calls = run.calls.borrow();
+        assert_eq!(calls[0], (ProbeQuery::ForcedScan, vec![0, 1, 2]));
+        assert_eq!(calls[1], (ProbeQuery::IndexRequested, vec![0, 1, 2]));
+        // Ranges 0 and 2 passed on the first poll. Only range 1 is asked again.
+        assert!(calls[2..]
+            .iter()
+            .all(|call| *call == (ProbeQuery::IndexRequested, vec![1])));
+        assert_eq!(calls.len(), 4);
+        assert_eq!(*run.pauses.borrow(), [Duration::from_secs(2); 2]);
+    }
+
+    #[test]
+    fn index_wait_fails_at_the_deadline_and_names_the_charges() {
+        let (result, run) = run_probe(&[0, u64::MAX], 100);
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("not serving 1 of 2 feed ranges after 100s"),
+            "{error}"
+        );
+        assert!(
+            error.contains("range 1: index query 300.00 RU, forced scan 300.00 RU"),
+            "{error}"
+        );
+        // Range 0 is served, so it is not listed as waiting.
+        assert!(!error.contains("range 0:"), "{error}");
+        // It never sleeps past the deadline.
+        assert_eq!(
+            run.pauses.borrow().iter().sum::<Duration>(),
+            Duration::from_secs(100)
+        );
+        // An answer for the wrong ranges is an error, not a panic or a pass.
+        // The clock advances, so a missing check ends at the deadline.
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let wrong = await_index_use(
+            2,
+            Duration::from_secs(1),
+            |_, _| Ok(vec![(0, 1.0)]),
+            || clock.get(),
+            |pause| clock.set(clock.get() + pause),
+        );
+        assert!(wrong.unwrap_err().contains("got answers for [0]"));
+    }
+
+    #[test]
+    fn index_poll_interval_grows_with_the_wait() {
+        let interval = |seconds| index_probe_interval(Duration::from_secs(seconds));
+        assert_eq!(interval(0), Duration::from_secs(2));
+        assert_eq!(interval(60), Duration::from_secs(6));
+        assert_eq!(interval(3600), Duration::from_secs(30));
+        let many: Vec<_> = (0..10)
+            .map(|feed_range| IndexProbe {
+                feed_range,
+                scan_ru: 9.0,
+                index_ru: 9.0,
+            })
+            .collect();
+        let text = describe_waiting(&many);
+        assert!(text.starts_with("range 0: index query 9.00 RU, forced scan 9.00 RU; range 1"));
+        assert!(text.ends_with("; and 2 more"), "{text}");
+    }
+
+    #[test]
+    fn throttled_writes_are_retried_until_the_budget_is_spent() {
+        assert_eq!(upload_throttle_backoff(0), Some(Duration::from_millis(250)));
+        assert_eq!(upload_throttle_backoff(3), Some(Duration::from_secs(2)));
+        assert_eq!(upload_throttle_backoff(59), Some(Duration::from_secs(5)));
+        assert_eq!(upload_throttle_backoff(60), None);
+
+        let run = |outcomes: Vec<Result<u8, u16>>| {
+            let retries = AtomicUsize::new(0);
+            let slept = std::cell::RefCell::new(Vec::new());
+            let mut outcomes = outcomes.into_iter();
+            let result = futures::executor::block_on(retry_throttled(
+                || {
+                    let outcome = outcomes.next().unwrap_or(Err(429));
+                    async move { outcome }
+                },
+                |status: &u16| *status == 429,
+                |delay| {
+                    slept.borrow_mut().push(delay);
+                    async {}
+                },
+                &retries,
+            ));
+            (result, retries.into_inner(), slept.into_inner())
+        };
+        let (result, retries, slept) = run(vec![Err(429), Err(429), Ok(7)]);
+        assert_eq!((result, retries), (Ok(7), 2));
+        assert_eq!(
+            slept,
+            [Duration::from_millis(250), Duration::from_millis(500)]
+        );
+        // Any other failure is returned at once.
+        assert_eq!(run(vec![Err(429), Err(503), Ok(7)]).0, Err(503));
+        // Endless throttling ends with the 429 after the whole budget.
+        let (result, retries, _) = run(vec![]);
+        assert_eq!((result, retries), (Err(429), 60));
+    }
+
+    /// Pending once, so `buffer_unordered` has to interleave the futures.
+    async fn yield_once() {
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if std::mem::replace(&mut yielded, true) {
+                return std::task::Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
+    #[test]
+    fn row_count_sums_ranges_and_rejects_a_split() {
+        let count = |ranges_after: Vec<u64>| {
+            let reads = std::cell::Cell::new(0);
+            futures::executor::block_on(count_stable_ranges(
+                || {
+                    reads.set(reads.get() + 1);
+                    let ranges = if reads.get() == 1 {
+                        vec![10, 20, 30]
+                    } else {
+                        ranges_after.clone()
+                    };
+                    async move { Ok(ranges) }
+                },
+                2,
+                |rows: u64| async move {
+                    yield_once().await;
+                    if rows == 0 {
+                        Err("boom".to_string())
+                    } else {
+                        Ok(rows)
+                    }
+                },
+            ))
+        };
+        assert_eq!(count(vec![10, 20, 30]), Ok(60));
+        assert!(count(vec![10, 20, 15, 15])
+            .unwrap_err()
+            .contains("feed ranges changed"));
+    }
+
+    #[test]
+    fn fan_out_merges_the_global_top_k_within_the_request_limit() {
+        let scored = |id: &str, distance| QueryHit {
+            id: id.into(),
+            distance: Some(distance),
+        };
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let fan_out = |per_query, permits| {
+            peak.store(0, Ordering::Relaxed);
+            let permits = Semaphore::new(permits);
+            futures::executor::block_on(fan_out_hits(
+                &[0_usize, 1, 2, 3],
+                per_query,
+                &permits,
+                2,
+                &VectorDistanceFunction::Cosine,
+                |range| {
+                    let (in_flight, peak) = (&in_flight, &peak);
+                    async move {
+                        peak.fetch_max(
+                            in_flight.fetch_add(1, Ordering::Relaxed) + 1,
+                            Ordering::Relaxed,
+                        );
+                        yield_once().await;
+                        in_flight.fetch_sub(1, Ordering::Relaxed);
+                        if range == 3 && per_query == 1 {
+                            return Err("range 3 failed".to_string());
+                        }
+                        let mut diagnostics = SearchDiagnostics::default();
+                        diagnostics.observe_page(2.5, 1, [(200, 1)]);
+                        let name = format!("r{range}");
+                        Ok((
+                            vec![
+                                scored(&name, range as f64),
+                                scored(&format!("{name}b"), -1.0),
+                            ],
+                            diagnostics,
+                        ))
+                    }
+                },
+            ))
+        };
+        let (hits, diagnostics) = fan_out(4, 4).unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
+            ["r3", "r2"]
+        );
+        assert_eq!(diagnostics.request_charge_ru, 10.0);
+        assert_eq!(diagnostics.request_attempts, 4);
+        assert_eq!(peak.load(Ordering::Relaxed), 4);
+        // The shared permits cap in-flight requests below the per-query limit.
+        fan_out(4, 2).unwrap();
+        assert_eq!(peak.load(Ordering::Relaxed), 2);
+        // So does the per-query limit, and a failed range fails the query.
+        assert_eq!(fan_out(1, 4).err().unwrap(), "range 3 failed");
+        assert_eq!(peak.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn parity_samples_spread_over_the_queries_and_must_pass_the_verdict() {
+        assert_eq!(
+            parity_sample_indices(100, 8),
+            [0, 12, 24, 36, 48, 60, 72, 84]
+        );
+        assert_eq!(parity_sample_indices(3, 8), [0, 1, 2]);
+        assert!(parity_sample_indices(0, 8).is_empty());
+
+        let sample = |fan_out_ids: &'static [&'static str]| {
+            futures::executor::block_on(sample_parity(vec![0, 5], 2, |index| async move {
+                yield_once().await;
+                if index == 5 && fan_out_ids.is_empty() {
+                    return Err("timeout".to_string());
+                }
+                Ok([hits(&["a", "b"]), hits(&["a", "b"]), hits(fan_out_ids)])
+            }))
+        };
+        let tally = sample(&["b", "a"]).unwrap();
+        assert_eq!(
+            tally,
+            ParityTally {
+                samples: 2,
+                stock_repeat_missing_ids: 0,
+                cross_mode_missing_ids: 0
+            }
+        );
+        assert!(sample(&["a", "c"])
+            .unwrap_err()
+            .contains("fan-out missed 4 stock IDs"));
+        assert_eq!(
+            sample(&[]).unwrap_err(),
+            "Cosmos DB parity check for query 5: timeout"
         );
     }
 }

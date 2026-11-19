@@ -20,11 +20,12 @@ use futures::{stream, StreamExt, TryStreamExt};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use vector_db_benchmark::cosmosdb::{
-    container_name, container_policy, index_probe_deadline, index_type, knn_query,
-    manual_throughput, merge_partition_hits, positive_u32, reject_unknown_keys, scan_query,
-    upload_parallel, validate_corpus_size, validate_hit_count, validate_query_vector, validate_top,
+    await_index_use, container_name, container_policy, count_stable_ranges, fan_out_hits,
+    index_probe_deadline, index_type, knn_query, manual_throughput, parity_sample_indices,
+    positive_u32, reject_unknown_keys, retry_throttled, sample_parity, scan_query, upload_parallel,
+    validate_corpus_size, validate_hit_count, validate_query_vector, validate_top,
     vector_distance_function, verify_policy, DiskAnnBuildOptions, IndexProbe, KnnQueryText,
-    ParityTally, PartitionConcurrency, PartitionFanout, QueryHit, SearchDiagnostics,
+    ParityTally, PartitionConcurrency, PartitionFanout, ProbeQuery, QueryHit, SearchDiagnostics,
 };
 use vector_db_benchmark::start_gate::WorkerPool;
 use vector_db_benchmark::workload::IndexLayout;
@@ -33,7 +34,7 @@ use super::{compute_search_stats, CorpusCount, Engine, SearchResults, UploadStat
 use crate::config::{EngineConfig, SearchParams};
 use crate::dataset::Dataset;
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 struct Item<'a> {
     id: &'a str,
     embedding: &'a [f32],
@@ -62,7 +63,6 @@ const PARITY_SAMPLES: usize = 8;
 const ROW_COUNT_CONCURRENCY: usize = 16;
 /// TOP K of the index-use probe queries.
 const INDEX_PROBE_TOP: usize = 10;
-const INDEX_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// Feed ranges probed at once.
 const INDEX_PROBE_CONCURRENCY: usize = 16;
 /// Sampled parity queries in flight at once.
@@ -244,6 +244,73 @@ impl CosmosDbEngine {
         )
     }
 
+    /// Write every row and check the stored row count. Returns the write
+    /// time and the row count.
+    fn upload_corpus(&mut self, dataset: &Dataset) -> Result<(f64, usize), String> {
+        let (ids, vectors, _) = dataset.read_vectors(dataset.needs_normalization())?;
+        validate_corpus_size(&self.index_type, ids.len() as u64)?;
+        let dimensions = dataset.vector_size() as usize;
+        if vectors
+            .iter()
+            .any(|vector| vector.len() != dimensions || vector.iter().any(|v| !v.is_finite()))
+        {
+            return Err(
+                "Cosmos DB corpus contains a vector with invalid dimensions or values".into(),
+            );
+        }
+        let container = self
+            .container
+            .as_ref()
+            .ok_or("Cosmos DB container is unavailable")?;
+        let throttle_retries = AtomicUsize::new(0);
+        let upload_start = Instant::now();
+        self.rt.block_on(async {
+            let throttle_retries = &throttle_retries;
+            stream::iter(ids.iter().zip(&vectors))
+                .map(|(id, vector)| async move {
+                    let id = id.to_string();
+                    let item = Item {
+                        id: &id,
+                        embedding: vector,
+                    };
+                    // The SDK gives up on a throttled write after its own
+                    // retries. Back off and send it again.
+                    retry_throttled(
+                        || container.upsert_item(id.clone(), &id, item, None),
+                        |error| u16::from(error.status().status_code()) == 429,
+                        tokio::time::sleep,
+                        throttle_retries,
+                    )
+                    .await
+                    .map_err(|e| format!("Cosmos DB upload failed for row {id}: {e}"))
+                })
+                .buffer_unordered(self.upload_parallel)
+                .try_for_each(|_| async { Ok(()) })
+                .await
+        })?;
+        let upload_time = upload_start.elapsed().as_secs_f64();
+        let upload_count = ids.len();
+        drop((ids, vectors));
+        let throttle_retries = throttle_retries.into_inner();
+        if throttle_retries > 0 {
+            eprintln!(
+                "Cosmos DB upload at parallel={} resent {throttle_retries} throttled writes after the SDK's own HTTP 429 retries. Upload time includes that backoff. Raise the container's RU/s or lower upload_params.parallel to avoid it.",
+                self.upload_parallel
+            );
+        }
+        // The row-count scan is verification, so it stays out of both times.
+        let count = self
+            .corpus_row_count()?
+            .ok_or("Cosmos DB did not return a row count")?;
+        if count.rows != upload_count as u64 {
+            return Err(format!(
+                "Cosmos DB stored {} rows of {upload_count} uploaded",
+                count.rows
+            ));
+        }
+        Ok((upload_time, upload_count))
+    }
+
     /// Wait until every feed range answers an index-requested query for
     /// clearly less than a forced scan of that range costs. Azure scans while
     /// a DiskANN index builds or a range holds too few vectors, so a matching
@@ -267,49 +334,21 @@ impl CosmosDbEngine {
         let rt = &self.rt;
         let ranges = rt.block_on(read_search_ranges(&container))?;
         let started = Instant::now();
-        // One forced scan per range is the costly part, so run the ranges
-        // concurrently. Only ranges still waiting are queried again.
-        let every_range: Vec<usize> = (0..ranges.len()).collect();
-        let mut probes: Vec<IndexProbe> = rt
-            .block_on(probe_charges(&container, &scan, &ranges, &every_range))?
-            .into_iter()
-            .map(|(feed_range, scan_ru)| IndexProbe {
-                feed_range,
-                scan_ru,
-                index_ru: f64::NAN,
-            })
-            .collect();
-        probes.sort_by_key(|probe| probe.feed_range);
-        loop {
-            let pending: Vec<usize> = probes
-                .iter()
-                .filter(|probe| !probe.index_in_use())
-                .map(|probe| probe.feed_range)
-                .collect();
-            for (feed_range, index_ru) in
-                rt.block_on(probe_charges(&container, &indexed, &ranges, &pending))?
-            {
-                probes[feed_range].index_ru = index_ru;
-            }
-            let waiting: Vec<_> = probes.iter().filter(|p| !p.index_in_use()).collect();
-            if waiting.is_empty() {
-                break;
-            }
-            let Some(remaining) = deadline.checked_sub(started.elapsed()) else {
-                return Err(format!(
-                    "Cosmos DB DiskANN index is not serving {} of {} feed ranges after {}s (index-requested query costs as much as a forced scan: {waiting:?}). The index may still be building, or a range may hold too few vectors. Raise AZURE_COSMOS_INDEX_PROBE_SECONDS, or set it to 0 to run unverified.",
-                    waiting.len(),
-                    probes.len(),
-                    deadline.as_secs()
-                ));
-            };
-            println!(
-                "Waiting for the Cosmos DB DiskANN index on {} of {} feed ranges",
-                waiting.len(),
-                probes.len()
-            );
-            std::thread::sleep(INDEX_PROBE_INTERVAL.min(remaining));
-        }
+        // One forced scan per range is the costly part, so the ranges run
+        // concurrently.
+        let probes = await_index_use(
+            ranges.len(),
+            deadline,
+            |query, pending| {
+                let query = match query {
+                    ProbeQuery::ForcedScan => &scan,
+                    ProbeQuery::IndexRequested => &indexed,
+                };
+                rt.block_on(probe_charges(&container, query, &ranges, pending))
+            },
+            || started.elapsed(),
+            std::thread::sleep,
+        )?;
         if rt.block_on(read_search_ranges(&container))? != ranges {
             return Err("Cosmos DB feed ranges changed during the index-use probe".into());
         }
@@ -378,54 +417,30 @@ impl Engine for CosmosDbEngine {
     }
 
     fn upload(&mut self, dataset: &Dataset) -> Result<UploadStats, String> {
-        let (ids, vectors, _) = dataset.read_vectors(dataset.needs_normalization())?;
-        validate_corpus_size(&self.index_type, ids.len() as u64)?;
-        let dimensions = dataset.vector_size() as usize;
-        if vectors
-            .iter()
-            .any(|vector| vector.len() != dimensions || vector.iter().any(|v| !v.is_finite()))
-        {
-            return Err(
-                "Cosmos DB corpus contains a vector with invalid dimensions or values".into(),
-            );
-        }
-        let container = self
-            .container
-            .as_ref()
-            .ok_or("Cosmos DB container is unavailable")?;
-        let upload_start = Instant::now();
-        self.rt.block_on(async {
-            stream::iter(ids.iter().zip(&vectors))
-                .map(|(id, vector)| async move {
-                    let id = id.to_string();
-                    let item = Item {
-                        id: &id,
-                        embedding: vector,
-                    };
-                    container
-                        .upsert_item(id.clone(), &id, item, None)
-                        .await
-                        .map_err(|e| format!("Cosmos DB upload failed for row {id}: {e}"))
-                })
-                .buffer_unordered(self.upload_parallel)
-                .try_for_each(|_| async { Ok(()) })
-                .await
-        })?;
-        let upload_time = upload_start.elapsed().as_secs_f64();
-        let upload_count = ids.len();
-        drop((ids, vectors));
-        // The row-count scan is verification, so it stays out of both times.
-        let count = self
-            .corpus_row_count()?
-            .ok_or("Cosmos DB did not return a row count")?;
-        if count.rows != upload_count as u64 {
-            return Err(format!(
-                "Cosmos DB stored {} rows of {upload_count} uploaded",
-                count.rows
-            ));
-        }
+        // A partial corpus is of no use to a later run, and the container
+        // bills until it is removed. A complete corpus is kept below even if
+        // the index probe then fails, because `--skip-upload` can reuse it.
+        let (upload_time, upload_count) = match self.upload_corpus(dataset) {
+            Ok(uploaded) => uploaded,
+            Err(error) if self.created_container => {
+                let error = error.trim_end_matches('.');
+                return Err(match self.delete() {
+                    Ok(()) => format!(
+                        "{error}. Removed container '{}', which this run created.",
+                        self.container_name
+                    ),
+                    Err(delete) => format!(
+                        "{error}. Container '{}' is still provisioned and billing: {delete}",
+                        self.container_name
+                    ),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         // For DiskANN, total time adds the wait until the index serves queries.
-        self.verify_index_use(dataset)?;
+        self.verify_index_use(dataset).map_err(|error| {
+            format!("{error} The uploaded corpus is complete and was kept. Rerun with --skip-upload to search it.")
+        })?;
         Ok(UploadStats {
             upload_time,
             total_time: upload_time + self.index_wait_seconds.unwrap_or(0.0),
@@ -443,19 +458,11 @@ impl Engine for CosmosDbEngine {
         // bounded and never reads the stored vectors. The SDK drains a
         // full-container query one range at a time, so count the disjoint
         // feed ranges concurrently instead.
-        let count = self.rt.block_on(async {
-            let ranges = read_search_ranges(&container).await?;
-            let count = stream::iter(&ranges)
-                .map(|range| count_ids(&container, FeedScope::range(range.clone())))
-                .buffer_unordered(ROW_COUNT_CONCURRENCY)
-                .try_fold(0_u64, |total, rows| async move { Ok(total + rows) })
-                .await?;
-            // A split during the count could count a row twice or not at all.
-            if read_search_ranges(&container).await? != ranges {
-                return Err("Cosmos DB feed ranges changed during the row count".to_string());
-            }
-            Ok(count)
-        })?;
+        let count = self.rt.block_on(count_stable_ranges(
+            || read_search_ranges(&container),
+            ROW_COUNT_CONCURRENCY,
+            |range| count_ids(&container, FeedScope::range(range)),
+        ))?;
         validate_corpus_size(&self.index_type, count)?;
         Ok(Some(CorpusCount::exact(count)))
     }
@@ -551,25 +558,12 @@ impl Engine for CosmosDbEngine {
                 metric: vector_distance_function(dataset.distance())?,
                 permits: Semaphore::new(shared_request_limit),
             };
-            let samples = (0..limit).step_by((limit / PARITY_SAMPLES).max(1)).take(PARITY_SAMPLES);
-            let outcomes = rt.block_on(
-                stream::iter(samples)
-                    .map(|index| {
-                        let (search, stock_text, vector) = (&search, &stock_text, &vectors[index]);
-                        async move {
-                            parity_sample(container, stock_text, text, vector, top, search)
-                                .await
-                                .map_err(|e| format!("Cosmos DB parity check for query {index}: {e}"))
-                        }
-                    })
-                    .buffer_unordered(PARITY_CONCURRENCY)
-                    .try_collect::<Vec<_>>(),
-            )?;
-            for (stock, stock_repeat, partitioned) in &outcomes {
-                search.summary.parity.observe(stock, stock_repeat, partitioned)?;
-            }
-            let parity = search.summary.parity;
-            parity.verdict()?;
+            let parity = rt.block_on(sample_parity(
+                parity_sample_indices(limit, PARITY_SAMPLES),
+                PARITY_CONCURRENCY,
+                |index| parity_sample(container, &stock_text, text, &vectors[index], top, &search),
+            ))?;
+            search.summary.parity = parity;
             println!(
                 "Cosmos DB feed-range search verified against SDK on {} sampled queries: {} ranges, {} per query, {} in flight; fan-out missed {} stock IDs, repeated stock requests missed {}",
                 parity.samples, summary.feed_ranges, summary.per_query_concurrency, summary.shared_request_limit,
@@ -713,13 +707,13 @@ async fn parity_sample(
     vector: &[f32],
     top: usize,
     search: &PartitionSearch,
-) -> Result<(Vec<QueryHit>, Vec<QueryHit>, Vec<QueryHit>), String> {
+) -> Result<[Vec<QueryHit>; 3], String> {
     let ((stock, _), (stock_repeat, _), (partitioned, _)) = futures::try_join!(
         search_hits(container, stock_text, vector, top, None),
         search_hits(container, stock_text, vector, top, None),
         search_hits(container, partition_text, vector, top, Some(search)),
     )?;
-    Ok((stock, stock_repeat, partitioned))
+    Ok([stock, stock_repeat, partitioned])
 }
 
 /// Request charge of `query` on each listed feed range, as (range index, RU).
@@ -785,31 +779,17 @@ async fn search_hits(
         )
         .await;
     };
-    let (hits, diagnostics) = stream::iter(&search.ranges)
-        .map(|range| async {
-            let _permit = search.permits.acquire().await.map_err(|e| e.to_string())?;
-            query_hits(
-                container,
-                text.bind(vector)?,
-                top,
-                FeedScope::range(range.clone()),
-            )
-            .await
-        })
-        .buffer_unordered(search.summary.per_query_concurrency)
-        .try_fold(
-            (Vec::new(), SearchDiagnostics::default()),
-            |(mut hits, mut diagnostics), (range_hits, range_diagnostics)| async move {
-                hits.extend(range_hits);
-                diagnostics.add_query(range_diagnostics);
-                Ok((hits, diagnostics))
-            },
-        )
-        .await?;
-    Ok((
-        merge_partition_hits(hits, top, &search.metric)?,
-        diagnostics,
-    ))
+    fan_out_hits(
+        &search.ranges,
+        search.summary.per_query_concurrency,
+        &search.permits,
+        top,
+        &search.metric,
+        |range| async move {
+            query_hits(container, text.bind(vector)?, top, FeedScope::range(range)).await
+        },
+    )
+    .await
 }
 
 async fn query_hits(

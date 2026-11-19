@@ -213,13 +213,17 @@ or set a higher manual throughput for a larger provisioned run. For a
 throughput sweep, give each engine config its own name and a
 `"collection_params": { "ru_per_second": 1000 }` override. Search and upload
 parallelism are independently configurable. The 400 RU/s default is suitable
-for smoke tests. If the SDK exhausts its HTTP 429 retry budget during upload,
-reduce `upload_params.parallel` or set the SDK's
-`AZURE_COSMOS_MAX_THROTTLE_RETRY_COUNT` for the upload run. Set
+for smoke tests. When the SDK exhausts its HTTP 429 retry budget on an upload
+write, the runner backs off and sends the write again, up to 60 times per
+row, and reports how many writes it resent. Upload time includes that
+backoff, so raise the RU/s or reduce `upload_params.parallel` for a
+meaningful upload figure. Set
 `AZURE_COSMOS_REGION` to prefer an Azure region by name. The runner removes
 its container after a successful run unless you pass `--keep-data`. The
 database remains available for subsequent runs. Use `--skip-upload` to reuse
-an existing container with a complete corpus. A failed run can leave a
+an existing container with a complete corpus. If the upload fails, the
+runner removes the container it created. A run that fails later, for example
+on the index-use probe or during search, leaves a complete corpus in a
 provisioned container that continues billing until you remove it.
 
 Each Cosmos search result carries `results.cosmosdb_search_diagnostics` with
@@ -293,7 +297,8 @@ container. It verifies the vector policy and corpus cardinality. The
 at least 1,000 vectors. Cosmos DB can scan while an index builds or while a
 physical partition has too few vectors. Before any DiskANN search, the adapter
 therefore probes each feed range. It runs one forced scan and then repeats an
-index-requested query every 30 seconds until that query costs less than half
+index-requested query, at first every 2 seconds and then less often up to
+every 30 seconds, until that query costs less than half
 the scan's request charge on every range. The run fails if a range does not
 get there within 30 minutes. Set `AZURE_COSMOS_INDEX_PROBE_SECONDS` to change
 the limit, or to `0` to skip the probe. Results record the per-range charges
