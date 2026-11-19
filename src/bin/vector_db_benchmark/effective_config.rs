@@ -1047,6 +1047,23 @@ pub fn env_opt(name: &str) -> Option<String> {
     value
 }
 
+/// Record every set environment variable whose name starts with `prefix`.
+///
+/// For a client library that reads its own settings from the environment
+/// (transport, retry and pool options the adapter never names). They change
+/// what a run measures, so they belong in the artifact like any other knob.
+/// Secrets are redacted by name as usual.
+pub fn observe_env_prefix(prefix: &str) {
+    let mut names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| name.starts_with(prefix))
+        .collect();
+    names.sort();
+    for name in names {
+        let _ = env_opt(&name);
+    }
+}
+
 /// Record a resolved knob that did not come straight from one environment
 /// variable — a value chosen between the environment, the configuration file
 /// and a built-in default, or read back off the server.
@@ -2206,6 +2223,22 @@ mod tests {
                 None => std::env::remove_var(self.0),
             }
         }
+    }
+
+    #[test]
+    fn a_prefix_scan_records_settings_the_adapter_never_names() {
+        let _l = test_lock();
+        let _a = EnvGuard::set("VDBB_PREFIX_TEST_POOL_SIZE", Some("32"));
+        let _b = EnvGuard::set("VDBB_PREFIX_TEST_API_KEY", Some("prefix-secret"));
+        let _c = EnvGuard::set("VDBB_OTHER_TEST_SETTING", Some("ignored"));
+        reset();
+        observe_env_prefix("VDBB_PREFIX_TEST_");
+        let s = snapshot();
+        assert_eq!(s["env"]["VDBB_PREFIX_TEST_POOL_SIZE"], "32");
+        assert_eq!(s["effective"]["VDBB_PREFIX_TEST_POOL_SIZE"], "32");
+        assert_eq!(s["env"]["VDBB_PREFIX_TEST_API_KEY"], REDACTED);
+        assert!(!serde_json::to_string(&s).unwrap().contains("prefix-secret"));
+        assert!(s["env"].get("VDBB_OTHER_TEST_SETTING").is_none());
     }
 
     #[test]

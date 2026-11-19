@@ -11,6 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 const VECTOR_PATH: &str = "/embedding";
 const VECTOR_EXCLUSION: &str = "/embedding/*";
@@ -75,6 +76,75 @@ impl DiskAnnBuildOptions {
                 .map(|value| parse(value, "quantization_byte_size", 1, 512))
                 .transpose()?,
         })
+    }
+}
+
+/// Reject a config key the adapter does not read, so a typo cannot run as a
+/// default and be reported under the declared name.
+pub fn reject_unknown_keys<'a>(
+    keys: impl IntoIterator<Item = &'a String>,
+    allowed: &[&str],
+    message: &str,
+) -> Result<(), String> {
+    if keys.into_iter().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(message.into());
+    }
+    Ok(())
+}
+
+/// A tuning knob that must be a positive 32-bit integer.
+pub fn positive_u32(value: &Value, key: &str) -> Result<NonZeroU32, String> {
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| format!("Cosmos DB {key} must be a positive 32-bit integer"))
+}
+
+/// Manual RU/s for the container. A per-config value wins over the
+/// environment setting. `None` means a serverless account.
+pub fn manual_throughput(configured: Option<&Value>, env: &str) -> Result<Option<u64>, String> {
+    if let Some(value) = configured {
+        return value
+            .as_u64()
+            .filter(|ru| *ru >= 400)
+            .map(Some)
+            .ok_or_else(|| {
+                "Cosmos DB collection_params.ru_per_second must be an integer of at least 400"
+                    .into()
+            });
+    }
+    if env == "serverless" {
+        return Ok(None);
+    }
+    env.parse::<u64>()
+        .ok()
+        .filter(|ru| *ru >= 400)
+        .map(Some)
+        .ok_or_else(|| "AZURE_COSMOS_RU_PER_SECOND must be at least 400, or serverless".into())
+}
+
+/// Concurrent single-item upserts. The adapter sends one item per request.
+pub fn upload_parallel(params: Option<&Value>) -> Result<usize, String> {
+    const DEFAULT: usize = 8;
+    let Some(params) = params else {
+        return Ok(DEFAULT);
+    };
+    let options = params
+        .as_object()
+        .ok_or("Cosmos DB upload_params must be an object")?;
+    reject_unknown_keys(
+        options.keys(),
+        &["parallel"],
+        "Cosmos DB upload_params supports only parallel (one item per request)",
+    )?;
+    match options.get("parallel") {
+        None => Ok(DEFAULT),
+        Some(parallel) => parallel
+            .as_u64()
+            .and_then(|p| usize::try_from(p).ok())
+            .filter(|p| *p > 0)
+            .ok_or_else(|| "Cosmos DB upload parallel must be positive".into()),
     }
 }
 
@@ -226,7 +296,7 @@ pub struct PartitionFanout {
     pub feed_ranges: usize,
     pub per_query_concurrency: usize,
     pub shared_request_limit: usize,
-    pub preflight_retries: usize,
+    pub parity: ParityTally,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -307,8 +377,59 @@ pub fn validate_corpus_size(kind: &VectorIndexType, count: u64) -> Result<(), St
     Ok(())
 }
 
-/// Build a server-side TOP K query. The service uses the policy's distance
-/// function. TOP is a validated integer literal and the vector is bound.
+/// The text of a server-side TOP K query, built once per search. The service
+/// uses the policy's distance function and TOP is a validated integer literal.
+/// Only the bound vector differs between requests, so a search keeps one text
+/// and binds each vector when it sends the request. Pre-building every query
+/// would hold each vector a second time as JSON values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnnQueryText(String);
+
+impl KnnQueryText {
+    pub fn new(
+        top: usize,
+        search_list_size_multiplier: Option<NonZeroU32>,
+        quantized_vector_list_multiplier: Option<NonZeroU32>,
+        project_distance: bool,
+    ) -> Result<Self, String> {
+        validate_top(top)?;
+        let options = match (search_list_size_multiplier, quantized_vector_list_multiplier) {
+            (None, None) => String::new(),
+            (Some(search), None) => format!(", {{\"searchListSizeMultiplier\": {search}}}"),
+            (None, Some(quantized)) => {
+                format!(", {{\"quantizedVectorListMultiplier\": {quantized}}}")
+            }
+            (Some(search), Some(quantized)) => format!(
+                ", {{\"searchListSizeMultiplier\": {search}, \"quantizedVectorListMultiplier\": {quantized}}}"
+            ),
+        };
+        Ok(Self(query_text(
+            top,
+            &format!("false{options}"),
+            project_distance,
+        )))
+    }
+
+    /// Bind one query vector. The caller checks it with
+    /// [`validate_query_vector`] before timing, so this does no validation.
+    pub fn bind(&self, vector: &[f32]) -> Result<Query, String> {
+        bind_vector(self.0.clone(), vector)
+    }
+}
+
+/// A query vector must match the container's dimensions and be finite. JSON
+/// has no encoding for NaN or infinity, so one would be sent as `null`.
+pub fn validate_query_vector(vector: &[f32], dimensions: usize) -> Result<(), String> {
+    if vector.len() != dimensions {
+        return Err("Cosmos DB query vector has the wrong number of dimensions".into());
+    }
+    if vector.iter().any(|v| !v.is_finite()) {
+        return Err("Cosmos DB query vector contains a non-finite value".into());
+    }
+    Ok(())
+}
+
+/// Build and bind one validated TOP K query.
 pub fn knn_query(
     vector: &[f32],
     top: usize,
@@ -316,29 +437,75 @@ pub fn knn_query(
     quantized_vector_list_multiplier: Option<NonZeroU32>,
     project_distance: bool,
 ) -> Result<Query, String> {
+    validate_query_vector(vector, vector.len())?;
+    KnnQueryText::new(
+        top,
+        search_list_size_multiplier,
+        quantized_vector_list_multiplier,
+        project_distance,
+    )?
+    .bind(vector)
+}
+
+/// The same TOP K query with the service's brute-force flag set, so it scans
+/// every vector in scope. Its request charge is the baseline that the
+/// index-use probe compares an index-requested query against.
+pub fn scan_query(vector: &[f32], top: usize) -> Result<Query, String> {
     validate_top(top)?;
-    if vector.iter().any(|v| !v.is_finite()) {
-        return Err("Cosmos DB query vector contains a non-finite value".into());
-    }
-    let options = match (search_list_size_multiplier, quantized_vector_list_multiplier) {
-        (None, None) => String::new(),
-        (Some(search), None) => format!(", {{\"searchListSizeMultiplier\": {search}}}"),
-        (None, Some(quantized)) => format!(", {{\"quantizedVectorListMultiplier\": {quantized}}}"),
-        (Some(search), Some(quantized)) => format!(
-            ", {{\"searchListSizeMultiplier\": {search}, \"quantizedVectorListMultiplier\": {quantized}}}"
-        ),
-    };
-    let distance = format!("VectorDistance(c.embedding, @vector, false{options})");
+    validate_query_vector(vector, vector.len())?;
+    bind_vector(query_text(top, "true", false), vector)
+}
+
+fn query_text(top: usize, distance_arguments: &str, project_distance: bool) -> String {
+    let distance = format!("VectorDistance(c.embedding, @vector, {distance_arguments})");
     let projection = if project_distance {
         format!("c.id, {distance} AS distance")
     } else {
         "c.id".into()
     };
-    Query::from(format!(
-        "SELECT TOP {top} {projection} FROM c ORDER BY {distance}"
-    ))
-    .with_parameter("@vector", vector)
-    .map_err(|e| format!("Could not bind Cosmos DB query vector: {e}"))
+    format!("SELECT TOP {top} {projection} FROM c ORDER BY {distance}")
+}
+
+fn bind_vector(text: String, vector: &[f32]) -> Result<Query, String> {
+    Query::from(text)
+        .with_parameter("@vector", vector)
+        .map_err(|e| format!("Could not bind Cosmos DB query vector: {e}"))
+}
+
+/// An index-requested query must cost less than this share of a forced scan
+/// of the same feed range before the range counts as served by DiskANN.
+pub const INDEX_PROBE_MAX_RU_RATIO: f64 = 0.5;
+
+/// Request charges of one feed range's forced scan and index-requested query.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct IndexProbe {
+    pub feed_range: usize,
+    pub scan_ru: f64,
+    pub index_ru: f64,
+}
+
+impl IndexProbe {
+    /// Azure answers an index-requested query with a scan while the index is
+    /// building or the range holds too few vectors. A scan costs what the
+    /// forced scan costs, so only a clearly cheaper query shows index use.
+    pub fn index_in_use(&self) -> bool {
+        self.scan_ru > 0.0
+            && self.index_ru > 0.0
+            && self.index_ru < self.scan_ru * INDEX_PROBE_MAX_RU_RATIO
+    }
+}
+
+/// How long to wait for every feed range to serve from its DiskANN index.
+/// Unset uses 30 minutes. `0` skips the probe and leaves index use unverified.
+pub fn index_probe_deadline(value: Option<&str>) -> Result<Option<Duration>, String> {
+    const DEFAULT_SECONDS: u64 = 1800;
+    let seconds = match value {
+        None => DEFAULT_SECONDS,
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            "AZURE_COSMOS_INDEX_PROBE_SECONDS must be a whole number of seconds, or 0 to skip the probe"
+        })?,
+    };
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 #[derive(Deserialize)]
@@ -392,19 +559,61 @@ pub fn merge_partition_hits(
     Ok(candidates.into_iter().map(|(hit, _)| hit).collect())
 }
 
-/// Verify that the same query covers the same IDs under both routing modes.
-pub fn verify_partition_search(stock: &[QueryHit], partitioned: &[QueryHit]) -> Result<(), String> {
-    let stock_ids: HashSet<_> = stock.iter().map(|hit| &hit.id).collect();
-    let partitioned_ids: HashSet<_> = partitioned.iter().map(|hit| &hit.id).collect();
-    if stock.len() != partitioned.len() || stock_ids != partitioned_ids {
-        return Err(format!(
-            "Cosmos DB partition search disagrees with the SDK's global top K ({} vs {} hits, {} shared IDs)",
-            stock.len(),
-            partitioned.len(),
-            stock_ids.intersection(&partitioned_ids).count(),
-        ));
+/// Fan-out may miss this many times the IDs that a repeated stock request
+/// misses. Two stock comparisons are counted per sample, so 2 is the expected
+/// ratio when both routes behave alike. 3 leaves headroom for sampling noise.
+pub const PARITY_CROSS_MODE_ALLOWANCE: usize = 3;
+
+/// Agreement between the stock SDK query and the feed-range fan-out on
+/// sampled queries, measured against the stock query's own repeatability.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ParityTally {
+    pub samples: usize,
+    /// IDs of one stock response that a repeated stock request did not return.
+    pub stock_repeat_missing_ids: usize,
+    /// IDs of the two stock responses that the fan-out response did not return.
+    pub cross_mode_missing_ids: usize,
+}
+
+impl ParityTally {
+    /// Record one sampled query: two stock responses and one fan-out response.
+    pub fn observe(
+        &mut self,
+        stock: &[QueryHit],
+        stock_repeat: &[QueryHit],
+        partitioned: &[QueryHit],
+    ) -> Result<(), String> {
+        if stock.len() != stock_repeat.len() || stock.len() != partitioned.len() {
+            return Err(format!(
+                "Cosmos DB routing modes returned different hit counts ({} and {} stock, {} fan-out)",
+                stock.len(),
+                stock_repeat.len(),
+                partitioned.len()
+            ));
+        }
+        let ids = |hits: &[QueryHit]| -> HashSet<String> {
+            hits.iter().map(|hit| hit.id.clone()).collect()
+        };
+        let (stock, stock_repeat, partitioned) = (ids(stock), ids(stock_repeat), ids(partitioned));
+        self.samples += 1;
+        self.stock_repeat_missing_ids += stock.difference(&stock_repeat).count();
+        self.cross_mode_missing_ids +=
+            stock.difference(&partitioned).count() + stock_repeat.difference(&partitioned).count();
+        Ok(())
     }
-    Ok(())
+
+    /// Fan-out must agree with the stock query about as well as the stock
+    /// query agrees with itself. An exact engine therefore needs exact parity.
+    pub fn verdict(&self) -> Result<(), String> {
+        let allowed = self.stock_repeat_missing_ids * PARITY_CROSS_MODE_ALLOWANCE;
+        if self.samples == 0 || self.cross_mode_missing_ids > allowed {
+            return Err(format!(
+                "Cosmos DB partition search disagrees with the SDK's global top K: fan-out missed {} stock IDs over {} sampled queries, and repeated stock requests missed {} (allowance {allowed})",
+                self.cross_mode_missing_ids, self.samples, self.stock_repeat_missing_ids
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +778,27 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_query_text_is_the_query_knn_query_builds() {
+        let multiplier = 5.try_into().ok();
+        for project_distance in [false, true] {
+            let text = KnnQueryText::new(10, multiplier, None, project_distance).unwrap();
+            for vector in [[0.5_f32, -0.25], [1.0, 2.0]] {
+                assert_eq!(
+                    to_value(text.bind(&vector).unwrap()).unwrap(),
+                    to_value(knn_query(&vector, 10, multiplier, None, project_distance).unwrap())
+                        .unwrap()
+                );
+            }
+        }
+        assert!(KnnQueryText::new(0, None, None, false).is_err());
+        assert!(KnnQueryText::new(1001, None, None, false).is_err());
+        assert!(validate_query_vector(&[0.5, 0.25], 2).is_ok());
+        assert!(validate_query_vector(&[0.5], 2).is_err());
+        assert!(validate_query_vector(&[0.5, f32::INFINITY], 2).is_err());
+        assert!(knn_query(&[f32::NAN], 10, None, None, false).is_err());
+    }
+
+    #[test]
     fn partition_concurrency_uses_the_realized_feed_range_count() {
         assert_eq!(PartitionConcurrency::from_config(None).unwrap(), None);
         let auto = PartitionConcurrency::from_config(Some(&json!("auto")))
@@ -610,15 +840,6 @@ mod tests {
                 merged.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
                 expected
             );
-            assert!(verify_partition_search(
-                &[hit(expected[1], None), hit(expected[0], None)],
-                &merged
-            )
-            .is_ok());
-            assert!(
-                verify_partition_search(&[hit("2", None), hit(expected[0], None)], &merged)
-                    .is_err()
-            );
         }
         let metric = VectorDistanceFunction::Cosine;
         assert!(merge_partition_hits(vec![hit("0", None)], 1, &metric).is_err());
@@ -626,6 +847,158 @@ mod tests {
             merge_partition_hits(vec![hit("0", Some(0.1)), hit("0", Some(0.2))], 1, &metric)
                 .is_err()
         );
+    }
+
+    fn hits(ids: &[&str]) -> Vec<QueryHit> {
+        ids.iter()
+            .map(|id| QueryHit {
+                id: (*id).into(),
+                distance: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parity_requires_exact_agreement_when_stock_repeats_exactly() {
+        let mut exact = ParityTally::default();
+        exact
+            .observe(&hits(&["1", "2"]), &hits(&["2", "1"]), &hits(&["1", "2"]))
+            .unwrap();
+        assert_eq!(
+            exact,
+            ParityTally {
+                samples: 1,
+                stock_repeat_missing_ids: 0,
+                cross_mode_missing_ids: 0
+            }
+        );
+        assert!(exact.verdict().is_ok());
+
+        let mut wrong = ParityTally::default();
+        wrong
+            .observe(&hits(&["1", "2"]), &hits(&["1", "2"]), &hits(&["1", "3"]))
+            .unwrap();
+        assert_eq!(wrong.cross_mode_missing_ids, 2);
+        assert!(wrong.verdict().is_err());
+        assert!(ParityTally::default().verdict().is_err());
+    }
+
+    #[test]
+    fn parity_allows_fanout_the_variation_stock_shows_against_itself() {
+        // Stock misses one ID against itself. Fan-out may miss up to three.
+        let mut within = ParityTally::default();
+        within
+            .observe(
+                &hits(&["1", "2", "3"]),
+                &hits(&["1", "2", "4"]),
+                &hits(&["1", "2", "5"]),
+            )
+            .unwrap();
+        assert_eq!(within.stock_repeat_missing_ids, 1);
+        assert_eq!(within.cross_mode_missing_ids, 2);
+        assert!(within.verdict().is_ok());
+
+        let mut beyond = ParityTally::default();
+        beyond
+            .observe(
+                &hits(&["1", "2", "3"]),
+                &hits(&["1", "2", "4"]),
+                &hits(&["1", "8", "9"]),
+            )
+            .unwrap();
+        assert_eq!(beyond.cross_mode_missing_ids, 4);
+        assert!(beyond.verdict().is_err());
+
+        // The tally is cumulative: a later exact sample does not reset it.
+        beyond
+            .observe(&hits(&["1"]), &hits(&["1"]), &hits(&["1"]))
+            .unwrap();
+        assert_eq!(beyond.samples, 2);
+        assert!(beyond.verdict().is_err());
+        assert!(ParityTally::default()
+            .observe(&hits(&["1", "2"]), &hits(&["1", "2"]), &hits(&["1"]))
+            .is_err());
+    }
+
+    #[test]
+    fn index_probe_needs_a_query_clearly_cheaper_than_a_forced_scan() {
+        let probe = |scan_ru, index_ru| IndexProbe {
+            feed_range: 0,
+            scan_ru,
+            index_ru,
+        };
+        assert!(probe(1000.0, 499.0).index_in_use());
+        assert!(!probe(1000.0, 500.0).index_in_use());
+        assert!(!probe(1000.0, 1000.0).index_in_use());
+        assert!(!probe(0.0, 0.0).index_in_use());
+        assert!(!probe(1000.0, 0.0).index_in_use());
+        let scan = to_value(scan_query(&[0.5], 10).unwrap()).unwrap();
+        assert_eq!(
+            scan["query"],
+            "SELECT TOP 10 c.id FROM c ORDER BY VectorDistance(c.embedding, @vector, true)"
+        );
+        assert!(scan_query(&[f32::NAN], 10).is_err());
+        assert!(scan_query(&[0.5], 0).is_err());
+    }
+
+    #[test]
+    fn index_probe_deadline_defaults_and_can_be_skipped() {
+        assert_eq!(
+            index_probe_deadline(None).unwrap(),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(
+            index_probe_deadline(Some("90")).unwrap(),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(index_probe_deadline(Some("0")).unwrap(), None);
+        for invalid in ["", "-1", "1.5", "soon"] {
+            assert!(index_probe_deadline(Some(invalid)).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn config_values_are_validated_before_any_request() {
+        let keys = [String::from("parallel"), String::from("batch_size")];
+        assert!(reject_unknown_keys(&keys[..1], &["parallel"], "no").is_ok());
+        assert_eq!(
+            reject_unknown_keys(&keys, &["parallel"], "no"),
+            Err("no".into())
+        );
+
+        assert_eq!(positive_u32(&json!(5), "k").unwrap().get(), 5);
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("5"),
+            json!(1u64 << 32),
+        ] {
+            assert!(positive_u32(&invalid, "k").is_err(), "{invalid}");
+        }
+
+        assert_eq!(manual_throughput(None, "400").unwrap(), Some(400));
+        assert_eq!(manual_throughput(None, "serverless").unwrap(), None);
+        assert_eq!(
+            manual_throughput(Some(&json!(1000)), "serverless").unwrap(),
+            Some(1000)
+        );
+        assert!(manual_throughput(None, "399").is_err());
+        assert!(manual_throughput(None, "auto").is_err());
+        assert!(manual_throughput(Some(&json!(399)), "400").is_err());
+        assert!(manual_throughput(Some(&json!("1000")), "400").is_err());
+
+        assert_eq!(upload_parallel(None).unwrap(), 8);
+        assert_eq!(upload_parallel(Some(&json!({}))).unwrap(), 8);
+        assert_eq!(upload_parallel(Some(&json!({"parallel": 16}))).unwrap(), 16);
+        for invalid in [
+            json!({"parallel": 0}),
+            json!({"parallel": "4"}),
+            json!({"batch_size": 10}),
+            json!([4]),
+        ] {
+            assert!(upload_parallel(Some(&invalid)).is_err(), "{invalid}");
+        }
     }
 
     #[test]

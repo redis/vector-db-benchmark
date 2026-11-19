@@ -237,12 +237,19 @@ top-K candidates into one global top K. The adapter looks up the feed ranges
 before timing. `"auto"` uses their count as the per-query concurrency, and
 a positive integer caps it at that value. Across all workers, the maximum
 number of in-flight range queries is the greater of the worker count and the
-effective per-query concurrency. Before timing, the adapter compares sampled
-result IDs with the SDK's full-container query. If a sampled pair differs, it
-can retry the pair up to three times to account for DiskANN result variability.
-Persistent mismatches or a feed-range change invalidate the repetition.
-Fan-out results record the preflight retry count and effective limits
-alongside RU charge and HTTP attempts for all ranges.
+effective per-query concurrency. When the worker count exceeds the range
+count, range queries wait for a free slot inside the measured latency, so
+compare a fan-out row with a stock row on throughput and recall, not on tail
+latency.
+
+Before timing, the adapter runs up to eight sampled queries under both modes,
+with the stock query sent twice. Repeated DiskANN requests can return
+different neighbors at the cutoff, so the stock query's disagreement with
+itself sets the bar. Fan-out may miss at most three times as many stock IDs
+as the repeated stock request misses. Flat is exact, so it needs identical
+IDs. A larger difference or a feed-range change fails the run. Fan-out
+results record both counts under `partition_fanout.parity`, with the
+effective limits, RU charge, and HTTP attempts for all ranges.
 
 For DiskANN, each search entry can set positive integer
 `search_params.search_list_size_multiplier` and
@@ -284,8 +291,18 @@ container. It verifies the vector policy and corpus cardinality. The
 `cosmosdb-flat` configuration supports up to 505 dimensions. The
 `cosmosdb-diskann` configuration supports up to 4,096 dimensions and requires
 at least 1,000 vectors. Cosmos DB can scan while an index builds or while a
-physical partition has too few vectors. Results report the realized index
-policy and explicitly mark index usage as unverified. See
+physical partition has too few vectors. Before any DiskANN search, the adapter
+therefore probes each feed range. It runs one forced scan and then repeats an
+index-requested query every 30 seconds until that query costs less than half
+the scan's request charge on every range. The run fails if a range does not
+get there within 30 minutes. Set `AZURE_COSMOS_INDEX_PROBE_SECONDS` to change
+the limit, or to `0` to skip the probe. Results record the per-range charges
+and `vector_index_use_verified`, which is `false` when the probe was skipped.
+The SDK reads further `AZURE_COSMOS_*` settings from the environment, such
+as retry and connection options. Every such variable that is set is recorded
+in the result's effective configuration, with the account key redacted.
+After an upload, `upload_time` covers the upserts and `total_time` adds the
+probe's wait for the index. The row-count check is in neither. See
 [Azure Cosmos DB vector indexing](https://learn.microsoft.com/azure/cosmos-db/nosql/vector-search).
 
 <a id="unexpressible-filter-note"></a>
