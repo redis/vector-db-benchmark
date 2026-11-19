@@ -108,6 +108,7 @@ const SECRET_MARKERS: &[&str] = &[
     // and this one did not.
     "PWD",
     "API_KEY",
+    "AZURE_COSMOS_KEY",
     "APIKEY",
     "ACCESS_KEY",
     "PRIVATE_KEY",
@@ -187,6 +188,12 @@ const DECLARED_KEY_ALLOWLIST: &[&str] = &[
     "type",
     "number_of_shards",
     "is_tenant",
+    // Cosmos DB DiskANN
+    "indexing_search_list_size",
+    "quantization_byte_size",
+    "search_list_size_multiplier",
+    "quantized_vector_list_multiplier",
+    "partition_concurrency",
     // SVS-VAMANA
     "svs-vamana_config",
     "GRAPH_MAX_DEGREE",
@@ -208,6 +215,7 @@ const DECLARED_KEY_ALLOWLIST: &[&str] = &[
     "default_segment_number",
     // upload
     "parallel",
+    "ru_per_second",
     "batch_size",
     "timeout",
     // a single-letter key that a shipped config genuinely uses
@@ -1037,6 +1045,23 @@ pub fn env_opt(name: &str) -> Option<String> {
     let value = raw.filter(|s| !s.trim().is_empty());
     rec.record_effective(name, value.clone().map(Value::from).unwrap_or(Value::Null));
     value
+}
+
+/// Record every set environment variable whose name starts with `prefix`.
+///
+/// For a client library that reads its own settings from the environment
+/// (transport, retry and pool options the adapter never names). They change
+/// what a run measures, so they belong in the artifact like any other knob.
+/// Secrets are redacted by name as usual.
+pub fn observe_env_prefix(prefix: &str) {
+    let mut names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| name.starts_with(prefix))
+        .collect();
+    names.sort();
+    for name in names {
+        let _ = env_opt(&name);
+    }
 }
 
 /// Record a resolved knob that did not come straight from one environment
@@ -2201,6 +2226,22 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_scan_records_settings_the_adapter_never_names() {
+        let _l = test_lock();
+        let _a = EnvGuard::set("VDBB_PREFIX_TEST_POOL_SIZE", Some("32"));
+        let _b = EnvGuard::set("VDBB_PREFIX_TEST_API_KEY", Some("prefix-secret"));
+        let _c = EnvGuard::set("VDBB_OTHER_TEST_SETTING", Some("ignored"));
+        reset();
+        observe_env_prefix("VDBB_PREFIX_TEST_");
+        let s = snapshot();
+        assert_eq!(s["env"]["VDBB_PREFIX_TEST_POOL_SIZE"], "32");
+        assert_eq!(s["effective"]["VDBB_PREFIX_TEST_POOL_SIZE"], "32");
+        assert_eq!(s["env"]["VDBB_PREFIX_TEST_API_KEY"], REDACTED);
+        assert!(!serde_json::to_string(&s).unwrap().contains("prefix-secret"));
+        assert!(s["env"].get("VDBB_OTHER_TEST_SETTING").is_none());
+    }
+
+    #[test]
     fn env_parsed_records_the_number_the_caller_received() {
         let _l = test_lock();
         let _g = EnvGuard::set("VDBB_TEST_BUDGET_MS", Some("250"));
@@ -2372,12 +2413,19 @@ mod tests {
             ("REDIS_AUTH", "s3cret"),
             ("VERTEX_ACCESS_TOKEN", "ya29.xyz"),
             ("MONGODB_PASSWORD", "pw"),
+            ("AZURE_COSMOS_KEY", "synthetic-cosmos-key"),
         ] {
             r.observe_env(name, Some(raw));
         }
         let s = r.snapshot();
         let serialized = serde_json::to_string(&s).unwrap();
-        for leak in ["hunter2", "sk-abc", "s3cret", "ya29.xyz"] {
+        for leak in [
+            "hunter2",
+            "sk-abc",
+            "s3cret",
+            "ya29.xyz",
+            "synthetic-cosmos-key",
+        ] {
             assert!(
                 !serialized.contains(leak),
                 "{leak} leaked into the artifact"
@@ -2385,6 +2433,7 @@ mod tests {
         }
         // …but the fact that authentication was configured survives.
         assert_eq!(s["env"]["ELASTIC_PASSWORD"], REDACTED);
+        assert_eq!(s["env"]["AZURE_COSMOS_KEY"], REDACTED);
     }
 
     #[test]

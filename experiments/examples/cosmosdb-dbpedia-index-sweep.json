@@ -1,0 +1,206 @@
+[
+  {
+    "name": "cosmosdb-diskann-10000ru-buildlist-50-qbytes-256",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": {
+      "ru_per_second": 10000,
+      "indexing_search_list_size": 50,
+      "quantization_byte_size": 256
+    },
+    "upload_params": {
+      "parallel": 16
+    },
+    "search_params": [
+      {
+        "top": 100,
+        "parallel": 1
+      },
+      {
+        "top": 100,
+        "parallel": 100
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 1
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 5
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 10
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 20
+        }
+      }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann-10000ru-buildlist-200-qbytes-256",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": {
+      "ru_per_second": 10000,
+      "indexing_search_list_size": 200,
+      "quantization_byte_size": 256
+    },
+    "upload_params": {
+      "parallel": 16
+    },
+    "search_params": [
+      {
+        "top": 100,
+        "parallel": 1
+      },
+      {
+        "top": 100,
+        "parallel": 100
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 1
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 5
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 10
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 20
+        }
+      }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann-10000ru-buildlist-100-qbytes-128",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": {
+      "ru_per_second": 10000,
+      "indexing_search_list_size": 100,
+      "quantization_byte_size": 128
+    },
+    "upload_params": {
+      "parallel": 16
+    },
+    "search_params": [
+      {
+        "top": 100,
+        "parallel": 1
+      },
+      {
+        "top": 100,
+        "parallel": 100
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 1
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 5
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 10
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 20
+        }
+      }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann-10000ru-buildlist-100-qbytes-512",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": {
+      "ru_per_second": 10000,
+      "indexing_search_list_size": 100,
+      "quantization_byte_size": 512
+    },
+    "upload_params": {
+      "parallel": 16
+    },
+    "search_params": [
+      {
+        "top": 100,
+        "parallel": 1
+      },
+      {
+        "top": 100,
+        "parallel": 100
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 1
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 5
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 10
+        }
+      },
+      {
+        "top": 100,
+        "parallel": 100,
+        "search_params": {
+          "search_list_size_multiplier": 20
+        }
+      }
+    ]
+  }
+]

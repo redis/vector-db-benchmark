@@ -53,6 +53,8 @@ sha2 = "0.11"
 crc32fast = "1.5"
 hdrhistogram = "7.5"
 base64 = "0.22"
+azure_data_cosmos = { version = "1.0", default-features = false, features = ["control_plane", "hmac_rust", "key_auth", "native_tls"] }
+futures = "0.3"
 
 # Only for `--features release-static` (the prebuilt release archives, #366):
 # compile HDF5, zlib and OpenSSL from source and link them statically, so the

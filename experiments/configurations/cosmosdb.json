@@ -1,0 +1,85 @@
+[
+  {
+    "name": "cosmosdb-flat",
+    "engine": "cosmosdb",
+    "algorithm": "flat",
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 },
+      { "top": 10, "parallel": 1, "search_params": { "search_list_size_multiplier": 1 } },
+      { "top": 10, "parallel": 1, "search_params": { "search_list_size_multiplier": 5 } },
+      { "top": 10, "parallel": 1, "search_params": { "search_list_size_multiplier": 10 } },
+      { "top": 10, "parallel": 1, "search_params": { "search_list_size_multiplier": 20 } },
+      { "top": 10, "parallel": 8, "search_params": { "search_list_size_multiplier": 1 } },
+      { "top": 10, "parallel": 8, "search_params": { "search_list_size_multiplier": 5 } },
+      { "top": 10, "parallel": 8, "search_params": { "search_list_size_multiplier": 10 } },
+      { "top": 10, "parallel": 8, "search_params": { "search_list_size_multiplier": 20 } }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann-build-list50-bytes32",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": { "indexing_search_list_size": 50, "quantization_byte_size": 32 },
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann-build-list100-bytes32",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": { "indexing_search_list_size": 100, "quantization_byte_size": 32 },
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann-build-list200-bytes32",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": { "indexing_search_list_size": 200, "quantization_byte_size": 32 },
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann-build-list100-bytes16",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": { "indexing_search_list_size": 100, "quantization_byte_size": 16 },
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 }
+    ]
+  },
+  {
+    "name": "cosmosdb-diskann-build-list100-bytes64",
+    "engine": "cosmosdb",
+    "algorithm": "diskANN",
+    "collection_params": { "indexing_search_list_size": 100, "quantization_byte_size": 64 },
+    "upload_params": { "parallel": 8 },
+    "search_params": [
+      { "top": 10, "parallel": 1 },
+      { "top": 10, "parallel": 8 }
+    ]
+  }
+]

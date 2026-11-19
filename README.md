@@ -167,6 +167,7 @@ host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 | **Vertex AI** (Vector Search) | `reqwest` (Vertex AI REST v1) | HTTP/REST (cloud) | L2, Cosine, Dot | Yes [\*\*\*\*](#vertex-note) |
 | **Chroma** | `reqwest` (Chroma v2 REST API) | HTTP/REST | L2, Cosine, IP | Yes [\*\*\*\*\*](#chroma-note) |
 | **KiviDB** | `redis` 1.8.1 | RESP protocol | L2, Cosine, IP | Yes [\*\*\*\*\*\*](#kividb-note) |
+| **Azure Cosmos DB for NoSQL** | `azure_data_cosmos` 1.0 | Azure SDK (cloud) | L2, Cosine, Dot | No |
 
 <a id="valkey-client-note"></a>
 \* **Valkey client note:** Valkey GLIDE has no published Rust crate ([valkey-io/valkey-glide#828](https://github.com/valkey-io/valkey-glide/issues/828), closed NOT_PLANNED). The GLIDE maintainers recommend using `redis-rs` for Rust and upstream their improvements to it. The `redis` crate works with Valkey since it speaks the same RESP protocol.
@@ -182,6 +183,132 @@ host's Redis on Linux, and on Docker Desktop only with host networking enabled):
 
 <a id="chroma-note"></a>
 \*\*\*\*\* **Chroma note:** Uses **Chroma** (OSS) via its **v2 REST API** — a collection of records (`ids` + `embeddings` + scalar `metadatas`) queried with `query` + a `where` document. **Metadata filters** map directly onto the canonical model: `match` → `$eq`, `match_any` → `$in`, `range` → `$gte`/`$gt`/`$lte`/`$lt`, and **AND / OR / nested boolean** to Chroma's native `$and` / `$or` (which nest arbitrarily). Supported datatypes: **keyword, int, float, bool, uuid, datetime** (stored as epoch-seconds int, like Milvus, so numeric range operators apply). **Full-text** (`{match:{text}}`) is supported via `where_document` `$contains` — the `text`-typed field's value is uploaded as each record's Chroma `document`. **NOT supported** by Chroma's metadata engine: **geo-radius** and multi-valued **`labels` arrays** (Chroma metadata values are scalar only). Geo is a *permanent* gap, not a to-do: Chroma's `where` is a closed enum of `field OP literal` comparisons with no geospatial operator, no attribute-vs-attribute comparison and no arithmetic, and a spherical cap is not an axis-aligned box in any query-independent coordinate system — so there is no exact encoding, and an inexact bounding box would under-constrain the query while looking filtered (#223). Since #219 these are a hard **error**, not a silent drop — and a condition tree containing a geo leaf is refused *whole*, so a `geo AND keyword` query cannot quietly run as keyword-only. See the note below. Runs over HTTP/REST via Docker; set the host port with `CHROMA_PORT` (default `8000`, test compose maps `8003`), and optionally `CHROMA_COLLECTION` / `CHROMA_TENANT` / `CHROMA_DATABASE`. Distance space (`l2`/`cosine`/`ip`) is set per collection from the dataset metric.
+
+### Azure Cosmos DB for NoSQL
+
+Enable **Vector Search for NoSQL API** on your Cosmos DB account. Set
+`AZURE_COSMOS_ENDPOINT` to the account URL and provide the account key through
+the `AZURE_COSMOS_KEY` environment variable.
+
+```bash
+export AZURE_COSMOS_DATABASE=vdb-benchmark
+export AZURE_COSMOS_RU_PER_SECOND=400
+vector-db-benchmark --engines cosmosdb-flat --datasets random-100 --skip-if-exists false
+make integration-test-cosmosdb
+```
+
+For an Azure-hosted benchmark over Private Link, place the client VM in the
+Cosmos DB region. Create a NoSQL private endpoint with subresource `Sql` and
+link the `privatelink.documents.azure.com` private DNS zone to the VM's virtual
+network. Keep `AZURE_COSMOS_ENDPOINT` set to the standard account URL
+(`https://<account>.documents.azure.com:443/`). From the VM, run
+`nslookup <account>.documents.azure.com` and confirm the address matches the
+private endpoint before running the benchmark. See Microsoft's
+[Cosmos DB Private Link setup guide](https://learn.microsoft.com/en-us/azure/cosmos-db/how-to-configure-private-endpoints).
+
+The benchmark creates the database if needed and provisions a dedicated
+container per config and dataset. It uses manual throughput of 400 RU/s by
+default. Set `AZURE_COSMOS_RU_PER_SECOND=serverless` for a serverless account,
+or set a higher manual throughput for a larger provisioned run. For a
+throughput sweep, give each engine config its own name and a
+`"collection_params": { "ru_per_second": 1000 }` override. Search and upload
+parallelism are independently configurable. The 400 RU/s default is suitable
+for smoke tests. When the SDK exhausts its HTTP 429 retry budget on an upload
+write, the runner backs off and sends the write again, up to 60 times per
+row, and reports how many writes it resent. Upload time includes that
+backoff, so raise the RU/s or reduce `upload_params.parallel` for a
+meaningful upload figure. Set
+`AZURE_COSMOS_REGION` to prefer an Azure region by name. The runner removes
+its container after a successful run unless you pass `--keep-data`. The
+database remains available for subsequent runs. Use `--skip-upload` to reuse
+an existing container with a complete corpus. If the upload fails, the
+runner removes the container it created. A run that fails later, for example
+on the index-use probe or during search, leaves a complete corpus in a
+provisioned container that continues billing until you remove it.
+
+Each Cosmos search result carries `results.cosmosdb_search_diagnostics` with
+the SDK's request charge, request attempt count, and observed HTTP 429 count
+for measured query pages. Warm-ups and verification queries are outside this
+scope. SDK backoff and retries are part of the measured search latency.
+Check `attempts_without_status` and `queries_without_request_diagnostics`
+when interpreting the 429 count.
+
+By default, the adapter uses the SDK's full-container query, which drains
+the partitions sequentially for `ORDER BY VectorDistance`. Set
+`"search_params": { "partition_concurrency": "auto" }` on a search entry to
+query disjoint physical feed ranges concurrently and merge their scored
+top-K candidates into one global top K. The adapter looks up the feed ranges
+before timing. `"auto"` uses their count as the per-query concurrency, and
+a positive integer caps it at that value. Across all workers, the maximum
+number of in-flight range queries is the greater of the worker count and the
+effective per-query concurrency. When the worker count exceeds the range
+count, range queries wait for a free slot inside the measured latency, so
+compare a fan-out row with a stock row on throughput and recall, not on tail
+latency.
+
+Before timing, the adapter runs up to eight sampled queries under both modes,
+with the stock query sent twice. Repeated DiskANN requests can return
+different neighbors at the cutoff, so the stock query's disagreement with
+itself sets the bar. Fan-out may miss at most three times as many stock IDs
+as the repeated stock request misses. Flat is exact, so it needs identical
+IDs. A larger difference or a feed-range change fails the run. Fan-out
+results record both counts under `partition_fanout.parity`, with the
+effective limits, RU charge, and HTTP attempts for all ranges.
+
+For DiskANN, each search entry can set positive integer
+`search_params.search_list_size_multiplier` and
+`search_params.quantized_vector_list_multiplier`. These map to the
+`VectorDistance` query options `searchListSizeMultiplier` and
+`quantizedVectorListMultiplier`. Leave both unset for the service defaults.
+Add multiple search entries under one engine config to sweep query-time
+settings on the same index, keeping `top` fixed for recall comparisons.
+The shipped `cosmosdb-diskann` config compares the service defaults with
+search-list multipliers of 1, 5, 10, and 20 at parallelism 1 and 8, all at
+top-10. The quantized-vector-list multiplier uses the service default.
+
+To sweep DiskANN index builds, use `--engines 'cosmosdb-diskann-build-*'`
+with a dataset of at least 64 dimensions. Each named config provisions its
+own container and uses the same top-10 searches at parallelism 1 and 8 with
+service-default query settings. The presets vary
+`collection_params.indexing_search_list_size` at 50, 100, and 200 with
+quantization fixed at 32 bytes, and vary `collection_params.quantization_byte_size`
+at 16, 32, and 64 with the indexing search list fixed at 100. The benchmark
+checks the realized values before search, including on container reuse.
+With the Rust SDK, the build search list accepts integers from 25 to 500
+and the quantization size accepts integers from 1 to the smaller of 512
+and the vector dimension. Omit a build setting to use the Azure default.
+See the [Rust SDK vector index model](https://github.com/Azure/azure-sdk-for-rust/blob/d7e28a1cd76e11d51f005e5d502a6c1c6299f74a/sdk/cosmos/azure_data_cosmos/src/models/indexing_policy.rs#L274-L290).
+
+The opt-in DBpedia example uses 10,000 RU/s per container. It runs four
+index builds and measures top-100 searches at parallelism 1 and 100. The
+command uses the registered 975K DBpedia dataset with 100 reference neighbors.
+Run it from a repository checkout.
+
+```bash
+vector-db-benchmark \
+  --engines-file experiments/examples/cosmosdb-dbpedia-index-sweep.json \
+  --datasets dbpedia-openai-975K-1536-angular-100neighbors
+```
+
+The adapter benchmarks dense, unfiltered top-K queries across the whole
+container. It verifies the vector policy and corpus cardinality. The
+`cosmosdb-flat` configuration supports up to 505 dimensions. The
+`cosmosdb-diskann` configuration supports up to 4,096 dimensions and requires
+at least 1,000 vectors. Cosmos DB can scan while an index builds or while a
+physical partition has too few vectors. Before any DiskANN search, the adapter
+therefore probes each feed range. It runs one forced scan and then repeats an
+index-requested query, at first every 2 seconds and then less often up to
+every 30 seconds, until that query costs less than half
+the scan's request charge on every range. The run fails if a range does not
+get there within 30 minutes. Set `AZURE_COSMOS_INDEX_PROBE_SECONDS` to change
+the limit, or to `0` to skip the probe. Results record the per-range charges
+and `vector_index_use_verified`, which is `false` when the probe was skipped.
+The SDK reads further `AZURE_COSMOS_*` settings from the environment, such
+as retry and connection options. Every such variable that is set is recorded
+in the result's effective configuration, with the account key redacted.
+After an upload, `upload_time` covers the upserts and `total_time` adds the
+probe's wait for the index. The row-count check is in neither. See
+[Azure Cosmos DB vector indexing](https://learn.microsoft.com/azure/cosmos-db/nosql/vector-search).
 
 <a id="unexpressible-filter-note"></a>
 ### Filters an engine cannot express are a hard error (#219)
@@ -1298,12 +1425,11 @@ vector-db-benchmark compare-results dumps/opensearch-hrrf dumps/redis-hrrf --ref
 `--skip-upload` asserts *"the server already holds the corpus I want"*. Three
 rules follow, and all three are enforced:
 
-1. **The configure phase never runs.** `configure()` is destructive on **14 of the
-   15 engines** — `FT.DROPINDEX … DD` (Redis), `FT.DROPINDEX` + `SCAN`/`UNLINK`
+1. **The configure phase never runs.** `configure()` is destructive on 14 of the 16 engines — `FT.DROPINDEX … DD` (Redis), `FT.DROPINDEX` + `SCAN`/`UNLINK`
    (Valkey / Dragonfly / KiviDB), `collection.drop()` (MongoDB), `DROP TABLE`
    (pgvector), `DELETE /collections/<n>` (Qdrant / Chroma / Weaviate / Milvus /
    Turbopuffer), `indices.delete` (Elasticsearch / OpenSearch), `DEL <key>`
-   (VectorSets). Only Vertex is non-destructive. Until #238 the
+   (VectorSets). Vertex and Cosmos DB preserve existing data during configuration. Until #238 the
    `--skip-upload --skip-vector-index` combination still called it: the flags that
    mean *"do not upload, do not build an index, just use what is there"* deleted
    the corpus and then benchmarked the empty index — printing a QPS number and
